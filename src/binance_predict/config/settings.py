@@ -1,0 +1,135 @@
+"""
+BTC 5min LLM 预测系统 V2 - 全局配置模块
+
+从 .env 文件和环境变量加载配置，使用 pydantic-settings 进行类型安全校验。
+所有配置项集中管理，确保前后端数据一致性（对应用户规则 8）。
+"""
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    """全局配置，从 .env 文件加载"""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+    )
+
+    # --- LLM API 配置 ---
+    # DeepSeek 原生 API Key（用于决策模型 deepseek-v4-pro）
+    deepseek_api_key: str = ""
+    # DeepSeek 原生 API base_url
+    deepseek_base_url: str = "https://api.deepseek.com/v1"
+    # 百炼 DashScope API Key（用于复盘模型 qwen3.7-max）
+    dashscope_api_key: str = ""
+    # 百炼 OpenAI 兼容接口 base_url
+    dashscope_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    # 决策 LLM 模型名（每 60s 调用一次，走 DeepSeek 原生 API）
+    decision_model: str = "deepseek-v4-pro"
+    # 复盘 LLM 模型名（T+5min 到期后调用，走百炼 DashScope）
+    review_model: str = "qwen3.7-max"
+
+    # --- 数据库配置 ---
+    # PostgreSQL + TimescaleDB 异步连接字符串
+    database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/binance_predict"
+    # --- Binance API 配置 ---
+    # 现货 WebSocket 地址（公开行情，无需 API Key）
+    binance_spot_ws_url: str = "wss://stream.binance.com:9443/ws"
+    # --- 预测参数 ---
+    # 交易品种
+    symbol: str = "BTCUSDT"
+    # 预测周期
+    horizon: str = "5m"
+    # 噪声阈值：future_return 绝对值小于此值视为 NOISE
+    noise_threshold: float = 0.0005
+
+    # --- 置信度运营门槛 ---
+    confidence_strong: float = 0.75
+    confidence_normal: float = 0.60
+    confidence_weak: float = 0.50
+
+    # --- 服务配置 ---
+    api_port: int = 8000
+    log_level: str = "INFO"
+
+    # --- Binance Prediction Trading 配置 ---
+    # Binance API Key（用于预测市场交易，需在币安后台开启 Prediction Trading 权限）
+    binance_api_key: str = ""
+    # Binance API Secret
+    binance_api_secret: str = ""
+    # 预测市场单笔交易金额（USDT）
+    prediction_trade_amount_usdt: float = 2.0
+    # 预测市场钱包地址
+    prediction_wallet_address: str = ""
+    # 预测市场钱包 ID
+    prediction_wallet_id: str = ""
+
+    # --- Sentiment Agent 分阶段外层超时（秒，AgentScheduler 层）---
+    # 由 AgentScheduler 用 asyncio.wait_for 施加的硬兜底超时（design.md 决策 4）。
+    # 外层超时 > 对应 LLM 内层超时，使 LLM 先以干净异常返回，外层仅作最终保护。
+    # 每个字段均可经 .env 独立覆盖（如 AGENT_TIMEOUT_LEARN=120）。
+    # Validate 阶段：纯对比无 LLM 调用，10s 足够
+    agent_timeout_validate: float = 10.0
+    # Predict 阶段：时间敏感、轻量单次匹配
+    agent_timeout_predict: float = 30.0
+    # Learn 阶段：重载（分析最近 50 窗口 + 最多 2 次重试）
+    agent_timeout_learn: float = 110.0
+    # Evolve 阶段：重载（全模式 + 最近 12 次预测 + 最多 2 次重试）
+    agent_timeout_evolve: float = 110.0
+
+    # --- Sentiment Agent LLM 内层超时（秒，LLMService 层）---
+    # 由各阶段 LLM 方法用 asyncio.wait_for 施加（design.md 决策 4）。
+    # Validate 无 LLM 调用，故不设内层超时。每个字段均可经 .env 独立覆盖。
+    # Predict 阶段 LLM 调用超时（< agent_timeout_predict）
+    agent_llm_timeout_predict: float = 25.0
+    # Learn 阶段 LLM 调用超时（< agent_timeout_learn）
+    agent_llm_timeout_learn: float = 100.0
+    # Evolve 阶段 LLM 调用超时（< agent_timeout_evolve）
+    agent_llm_timeout_evolve: float = 100.0
+
+    # --- Sentiment Agent 行为参数 ---
+    # 自动交易总开关：默认关闭，必须显式设置 AGENT_AUTO_TRADE=true 才允许自动下单。
+    agent_auto_trade: bool = False
+    # 交易置信度阈值：仅当总开关开启、direction∈{UP,DOWN} 且 confidence > 此值才执行交易。
+    agent_trade_confidence_threshold: float = 0.6
+    # Evolve 触发间隔：每累计完成 N 次 Validate 触发一次 Evolve（Req 5.1 / 6.5）
+    agent_evolve_interval: int = 12
+    # Learn 窗口数：Learn 阶段选取最近 N 个 outcome 非空的情绪窗口（Req 2.2）
+    agent_learn_window_count: int = 50
+    # Predict 触发采样点：当前窗口累计有效采样点达到 N 个时触发 Predict（Req 3.1）
+    agent_predict_trigger_samples: int = 10
+    # ACTIVE 模式数上限：超过则 Evolve 强制淘汰超额部分（Req 5.8）
+    agent_active_pattern_cap: int = 30
+    # 淘汰保护最小样本数：sample_count <= 此值的模式不因上限被淘汰（Req 5.8）
+    agent_min_sample: int = 5
+
+    @property
+    def agent_phase_timeouts(self) -> dict[str, float]:
+        """分阶段外层超时映射（秒），供 AgentScheduler 按阶段取超时（design.md 决策 4）。
+
+        取值来自上方标量字段，覆盖请改对应 .env 项（如 AGENT_TIMEOUT_PREDICT）。
+        """
+        return {
+            "VALIDATE": self.agent_timeout_validate,
+            "PREDICT": self.agent_timeout_predict,
+            "LEARN": self.agent_timeout_learn,
+            "EVOLVE": self.agent_timeout_evolve,
+        }
+
+    @property
+    def agent_llm_timeouts(self) -> dict[str, float]:
+        """分阶段 LLM 内层超时映射（秒），供 LLMService 各阶段方法施加内层超时（design.md 决策 4）。
+
+        取值来自上方标量字段，覆盖请改对应 .env 项（如 AGENT_LLM_TIMEOUT_LEARN）。
+        """
+        return {
+            "PREDICT": self.agent_llm_timeout_predict,
+            "LEARN": self.agent_llm_timeout_learn,
+            "EVOLVE": self.agent_llm_timeout_evolve,
+        }
+
+
+# 全局单例配置
+settings = Settings()
