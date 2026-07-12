@@ -54,6 +54,14 @@ class Settings(BaseSettings):
     api_port: int = 8000
     log_level: str = "INFO"
 
+    # --- 安全配置 ---
+    # CORS 允许的前端源（逗号分隔，如 "http://localhost:5173,https://example.com"）。
+    # 空字符串默认仅允许 localhost 开发源。生产环境必须显式指定。
+    cors_allowed_origins: str = ""
+    # API Bearer Token 认证密钥。空字符串时禁用认证（仅开发环境）。
+    # 生产环境必须设置，否则所有 API 端点对外开放。
+    api_auth_token: str = ""
+
     # --- Binance Prediction Trading 配置 ---
     # Binance API Key（用于预测市场交易，需在币安后台开启 Prediction Trading 权限）
     binance_api_key: str = ""
@@ -89,6 +97,56 @@ class Settings(BaseSettings):
     # Evolve 阶段 LLM 调用超时（< agent_timeout_evolve）
     agent_llm_timeout_evolve: float = 100.0
 
+    # --- LLM 成本配置（元/百万 Token）---
+    llm_input_price_per_1m: float = 12.0   # DeepSeek 输入价格
+    llm_output_price_per_1m: float = 24.0  # DeepSeek 输出价格
+
+    # --- 告警配置 ---
+    agent_alert_enabled: bool = True
+    agent_alert_consecutive_failures: int = 3
+    agent_alert_daily_cost_limit_usd: float = 10.0
+    agent_alert_queue_depth_threshold: int = 50
+    # Fix #19: 告警达阈时是否自动阻断交易（熔断器）。
+    # 为 True 时，LLM 成本超限或阶段连续失败超阈会置位阻断标志，
+    # 由 evaluate_trade_gate 拒绝新交易，避免异常状态下持续下单。
+    agent_alert_block_trades: bool = True
+
+    # --- 风控统计缓存（Fix #20）---
+    # RiskController.refresh_daily_stats 的 TTL（秒），避免短时间内重复全量查询。
+    risk_stats_cache_ttl_sec: float = 30.0
+
+    # --- LLM 输出语义验证 ---
+    agent_llm_validation_enabled: bool = True
+    agent_llm_validation_strict: bool = False  # False=仅记录 SOFT_WARN
+
+    # --- 风控参数（Plan 步骤 8/9/10）---
+    agent_risk_control_enabled: bool = True
+    agent_min_pattern_win_rate: float = 0.4
+    agent_min_pattern_samples: int = 5
+    agent_max_consecutive_losses: int = 5
+    agent_max_daily_trades: int = 20
+    agent_max_daily_loss_usdt: float = 10.0
+    agent_prediction_min_remaining_seconds: int = 30
+
+    # --- 双 Worker 架构（Plan 步骤 11/12）---
+    agent_dual_worker_enabled: bool = True
+    agent_predict_max_queue_wait: float = 15.0
+
+    # --- 模式去重（Plan 步骤 14/15）---
+    agent_dedup_enabled: bool = True
+    agent_dedup_auto_downgrade: bool = False  # True=自动将重复 CREATE 转为 UPDATE
+
+    # --- 模式发现双模式配置 ---
+    # manual: 手动触发深度分析（用户控制 token 消耗）
+    # auto: 保留旧逻辑，窗口归档自动 Learn（token 消耗不可控）
+    agent_learn_mode: str = "manual"
+    # 手动模式：深度分析最大窗口数
+    agent_deep_learn_max_windows: int = 100
+    # 手动模式：聚类压缩后目标窗口数
+    agent_deep_learn_target_clusters: int = 25
+    # 手动模式：LLM max_tokens（深度分析输出上限，基于实测：全量窗口输入~30k tokens，reasoning+discoveries 输出~10k tokens）
+    agent_deep_learn_max_tokens: int = 16384
+
     # --- Sentiment Agent 行为参数 ---
     # 自动交易总开关：默认关闭，必须显式设置 AGENT_AUTO_TRADE=true 才允许自动下单。
     agent_auto_trade: bool = False
@@ -104,6 +162,18 @@ class Settings(BaseSettings):
     agent_active_pattern_cap: int = 30
     # 淘汰保护最小样本数：sample_count <= 此值的模式不因上限被淘汰（Req 5.8）
     agent_min_sample: int = 5
+
+    @property
+    def allowed_origins_list(self) -> list[str]:
+        """解析 CORS 允许源列表。空值回退到 localhost 开发默认值。"""
+        if self.cors_allowed_origins.strip():
+            return [o.strip() for o in self.cors_allowed_origins.split(",") if o.strip()]
+        return [
+            "http://localhost:5173",
+            "http://localhost:8000",
+            "http://127.0.0.1:5173",
+            "http://127.0.0.1:8000",
+        ]
 
     @property
     def agent_phase_timeouts(self) -> dict[str, float]:

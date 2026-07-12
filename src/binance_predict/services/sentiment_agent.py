@@ -15,8 +15,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
@@ -35,16 +37,29 @@ from ..db.models import (
 from .agent_logic import (
     PatternRow,
     PatternStat,
+    TradeGateContext,
     WindowRow,
+    compress_windows_for_deep_learn,
     compute_is_correct,
+    compute_pattern_fingerprint,
+    detect_duplicate_pattern,
+    evaluate_trade_gate,
+    is_prediction_stale,
     plan_active_patterns,
     plan_learn_windows,
     recompute_win_rate,
     select_retire_candidates,
     should_trade,
 )
+from .alerting import AlertService
 from .llm_service import LLMService
+from .llm_validator import (
+    validate_evolve_output,
+    validate_learn_output,
+    validate_predict_output,
+)
 from .prediction_trading import BinancePredictionTrader
+from .risk_control import RiskController
 
 if TYPE_CHECKING:
     from ..models.schemas import ChangeType
@@ -65,16 +80,29 @@ class SentimentAgent:
     - evolve()：完整实现（任务 6.9）
     """
 
-    def __init__(self, llm: LLMService, trader: BinancePredictionTrader) -> None:
+    def __init__(
+        self,
+        llm: LLMService,
+        trader: BinancePredictionTrader,
+        risk_controller: RiskController | None = None,
+        alert_service: AlertService | None = None,
+    ) -> None:
         """
         初始化 SentimentAgent。
 
         Args:
             llm: 结构化 LLM 调用服务（Instructor Tool Calling 通道）
             trader: Binance 预测市场交易执行服务
+            risk_controller: 风控控制器（可选，None 时自动创建默认实例）
+            alert_service: 告警服务（可选，Fix #19：交易门控查询其
+                trading_blocked 熔断标志。由 AgentScheduler 在创建后注入）
         """
         self._llm = llm
         self._trader = trader
+        self._risk_controller = risk_controller or RiskController()
+        self._alert_service = alert_service
+        # 深度分析并发锁：防止多个 deep_learn/commit 同时执行
+        self._deep_learn_lock = asyncio.Lock()
 
     # ======================================================================
     # Validate 阶段（Req 4.1 / 4.2 / 4.3 / 4.4）
@@ -117,6 +145,9 @@ class SentimentAgent:
                 select(AgentPrediction)
                 .where(
                     AgentPrediction.is_correct.is_(None),
+                    # Fix #9: 增加 sentiment_window_id IS NULL 条件，
+                    # 防止已被其他窗口验证的预测被重复匹配（双重验证保护）
+                    AgentPrediction.sentiment_window_id.is_(None),
                     AgentPrediction.prediction_time >= window_start_dt,
                     AgentPrediction.prediction_time <= window_end_dt,
                 )
@@ -417,6 +448,12 @@ class SentimentAgent:
         - LLM 调用在事务开启前完成（避免长事务占用连接池）
         - 使用独立 async_session_factory() 会话
         """
+        # [DEPRECATED] 双模式架构下 Learn 仅在 auto 模式由 scheduler 调用
+        # 推荐使用 POST /api/sentiment/agent/deep-learn 触发手动深度分析
+        logger.debug(
+            "SentimentAgent.learn() 调用 [deprecated] | "
+            "双模式架构下建议使用 deep_learn() API"
+        )
         # ========== Step 1 & 2：读取数据（只读会话）==========
         windows_dicts: list[dict] = []
         patterns_dicts: list[dict] = []
@@ -513,6 +550,35 @@ class SentimentAgent:
             logger.info("Learn: LLM 未返回任何模式发现，本次 Learn 结束")
             return
 
+        # ========== Step 3.5：LLM 输出语义验证（Plan 步骤 5）==========
+        if settings.agent_llm_validation_enabled:
+            active_ids = {p["id"] for p in patterns_dicts}
+            hard_failures, soft_warnings = validate_learn_output(
+                learn_output, active_ids
+            )
+            if soft_warnings:
+                for w in soft_warnings:
+                    logger.warning("Learn 语义验证 SOFT: {}", w)
+            if hard_failures:
+                for f in hard_failures:
+                    logger.error("Learn 语义验证 HARD: {}", f)
+                # 过滤掉 HARD_FAIL 的 discoveries
+                original_count = len(learn_output.discoveries)
+                learn_output.discoveries = [
+                    d for i, d in enumerate(learn_output.discoveries)
+                    if not any(
+                        f"discoveries[{i}]" in f for f in hard_failures
+                    )
+                ]
+                logger.info(
+                    "Learn: 语义验证过滤 {}/{} 条发现",
+                    original_count - len(learn_output.discoveries),
+                    original_count,
+                )
+                if not learn_output.discoveries:
+                    logger.info("Learn: 所有发现被过滤，本次 Learn 结束")
+                    return
+
         logger.info(
             "Learn: LLM 返回 {} 条模式发现 | reasoning={}...",
             len(learn_output.discoveries),
@@ -520,30 +586,85 @@ class SentimentAgent:
         )
 
         # ========== Step 4：写入模式变更（独立事务，每条操作用 savepoint 隔离）==========
+        # 记录本批次已创建的模式指纹，用于批内去重
+        batch_created_patterns: list[dict] = []
+
         async with async_session_factory() as session:
             for idx, discovery in enumerate(learn_output.discoveries, 1):
                 try:
-                    async with session.begin_nested():  # savepoint：失败仅回滚此子事务
-                        # 构建 pattern_data（与 apply_pattern_change 接口对齐）
-                        pattern_data = {
-                            "pattern_name": discovery.pattern_name,
-                            "description": discovery.description,
-                            "curve_features": discovery.curve_features,
-                            "conditions": discovery.conditions,
-                            "predicted_direction": discovery.predicted_direction,
-                            "confidence_score": discovery.confidence_score,
-                            "change_reason": discovery.change_reason,
-                        }
-                        if discovery.operation == "UPDATE":
-                            pattern_data["target_pattern_id"] = discovery.target_pattern_id
+                    # Fix #10: 在去重检查前初始化标志，避免后续重置覆盖
+                    is_dedup_downgrade = False
+                    # Plan 步骤 15：CREATE 前去重检查
+                    if (
+                        discovery.operation == "CREATE"
+                        and settings.agent_dedup_enabled
+                    ):
+                        # 同时检查已有模式和本批次已创建的模式
+                        all_patterns_for_dedup = patterns_dicts + batch_created_patterns
+                        existing_id = detect_duplicate_pattern(
+                            discovery.curve_features,
+                            discovery.predicted_direction,
+                            all_patterns_for_dedup,
+                        )
+                        if existing_id is not None:
+                            logger.warning(
+                                "Learn: 疑似重复模式 '{}'，与 id={} 指纹一致 | "
+                                "auto_downgrade={}",
+                                discovery.pattern_name,
+                                existing_id,
+                                settings.agent_dedup_auto_downgrade,
+                            )
+                            if settings.agent_dedup_auto_downgrade:
+                                # 将 CREATE 降级为 UPDATE，仅更新 curve_features 和 conditions
+                                discovery.operation = "UPDATE"
+                                discovery.target_pattern_id = existing_id
+                                discovery.change_reason = (
+                                    f"去重降级: 与 id={existing_id} 指纹一致，"
+                                    f"原 CREATE 转为 UPDATE"
+                                )
+                                is_dedup_downgrade = True
+                            else:
+                                # 未启用 auto_downgrade，仅记录警告，跳过该条
+                                continue
 
-                        await self.apply_pattern_change(
+                    async with session.begin_nested():  # savepoint：失败仅回滚此子事务
+                        if is_dedup_downgrade:
+                            # 去重降级：仅更新 curve_features 和 conditions，保留原 name/description
+                            pattern_data = {
+                                "curve_features": discovery.curve_features,
+                                "conditions": discovery.conditions,
+                                "change_reason": discovery.change_reason,
+                                "target_pattern_id": discovery.target_pattern_id,
+                            }
+                        else:
+                            # 正常操作：全字段
+                            pattern_data = {
+                                "pattern_name": discovery.pattern_name,
+                                "description": discovery.description,
+                                "curve_features": discovery.curve_features,
+                                "conditions": discovery.conditions,
+                                "predicted_direction": discovery.predicted_direction,
+                                "confidence_score": discovery.confidence_score,
+                                "change_reason": discovery.change_reason,
+                            }
+                            if discovery.operation == "UPDATE":
+                                pattern_data["target_pattern_id"] = discovery.target_pattern_id
+
+                        new_pattern = await self.apply_pattern_change(
                             session=session,
                             operation=discovery.operation,
                             pattern_data=pattern_data,
                             phase="LEARN",
                             evolve_phase_id=None,  # Learn 触发，无 evolve_phase_id
                         )
+
+                        # 记录新创建的模式用于批内去重
+                        if discovery.operation == "CREATE" and new_pattern is not None:
+                            batch_created_patterns.append({
+                                "id": new_pattern.id,
+                                "curve_features": new_pattern.curve_features,
+                                "predicted_direction": new_pattern.predicted_direction,
+                            })
                 except Exception as exc:
                     # savepoint 已自动回滚，session 仍可继续
                     logger.error(
@@ -562,6 +683,296 @@ class SentimentAgent:
             await session.commit()
 
         logger.info("Learn: 阶段完成 | 成功处理模式变更")
+
+    # ======================================================================
+    # 深度分析（手动触发，双模式架构）
+    # ======================================================================
+
+    async def deep_learn(
+        self,
+        max_windows: int | None = None,
+    ) -> dict:
+        """
+        深度模式发现（手动触发）：分析全量历史窗口，返回发现结果供用户预览。
+
+        与 learn() 的区别：
+        - 读取全量窗口（不限于最近 50）
+        - 全量原始曲线直接输入 LLM（不压缩，保留完整曲线形态）
+        - LLM max_tokens 更大（16384）
+        - **不直接写入 DB**，返回 discoveries 列表
+
+        Args:
+            max_windows: 最大读取窗口数，默认使用 settings.agent_deep_learn_max_windows
+
+        Returns:
+            dict 包含：
+            - reasoning: LLM 分析推理过程
+            - discoveries: 序列化的发现列表
+            用户可通过 commit_deep_learn() 确认后写入 DB
+        """
+        # 并发保护：同一时刻只允许一个 deep_learn 执行
+        if self._deep_learn_lock.locked():
+            raise RuntimeError("已有深度分析任务正在执行，请稍后重试")
+
+        async with self._deep_learn_lock:
+            if max_windows is None:
+                max_windows = settings.agent_deep_learn_max_windows
+
+            logger.info(
+                "Deep Learn: 开始全量历史分析 | max_windows={}",
+                max_windows,
+            )
+
+            # Step 1: 从 DB 读取全量窗口（全量原始数据，不压缩）
+            async with async_session_factory() as session:
+                stmt = (
+                    select(SentimentWindow)
+                    .where(SentimentWindow.outcome.isnot(None))
+                    .order_by(SentimentWindow.start_time.desc())
+                    .limit(max_windows)
+                )
+                result = await session.execute(stmt)
+                raw_windows = result.scalars().all()
+
+                # 序列化为 dict（保留完整曲线数据）
+                windows_dicts = [
+                    {
+                        "id": w.id,
+                        "start_time": w.start_time,
+                        "end_time": w.end_time,
+                        "curve_up_pct": w.curve_up_pct,
+                        "curve_down_pct": w.curve_down_pct,
+                        "outcome": w.outcome,
+                        "actual_return": w.actual_return,
+                        "sample_count": w.sample_count,
+                    }
+                    for w in raw_windows
+                ]
+
+                # 查询 ACTIVE 模式
+                pattern_stmt = select(PatternMemory).where(PatternMemory.status == "ACTIVE")
+                pattern_result = await session.execute(pattern_stmt)
+                active_patterns = [
+                    {
+                        "id": p.id,
+                        "pattern_name": p.pattern_name,
+                        "description": p.description,
+                        "curve_features": p.curve_features,
+                        "conditions": p.conditions,
+                        "predicted_direction": p.predicted_direction,
+                        "win_rate": p.win_rate,
+                        "sample_count": p.sample_count,
+                        "confidence_score": p.confidence_score,
+                    }
+                    for p in pattern_result.scalars().all()
+                ]
+
+            logger.info(
+                "Deep Learn: 数据准备完成 | 窗口数={} | ACTIVE 模式={}",
+                len(windows_dicts),
+                len(active_patterns),
+            )
+
+            if not windows_dicts:
+                logger.warning("Deep Learn: 无可用历史窗口，跳过分析")
+                return {"reasoning": "", "discoveries": []}
+
+            # Step 2: LLM 深度分析（全量原始窗口直接输入，不压缩）
+            timeout = settings.agent_llm_timeouts.get("LEARN", 100.0)
+            try:
+                learn_output = await self._llm.agent_deep_learn(
+                    windows=windows_dicts,
+                    active_patterns=active_patterns,
+                    timeout=timeout,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Deep Learn: LLM 调用失败 | error_type={} | error={}",
+                    type(exc).__name__,
+                    str(exc),
+                )
+                raise
+
+            logger.info(
+                "Deep Learn: LLM 返回 {} 条发现 | reasoning={}...",
+                len(learn_output.discoveries),
+                learn_output.reasoning[:200] if learn_output.reasoning else "",
+            )
+
+            # Step 3: 序列化返回（不写入 DB）
+            discoveries_serialized = []
+            for d in learn_output.discoveries:
+                discoveries_serialized.append({
+                    "operation": d.operation,
+                    "target_pattern_id": d.target_pattern_id,
+                    "pattern_name": d.pattern_name,
+                    "description": d.description,
+                    "curve_features": d.curve_features,
+                    "conditions": d.conditions,
+                    "predicted_direction": d.predicted_direction,
+                    "confidence_score": d.confidence_score,
+                    "change_reason": d.change_reason,
+                })
+
+            return {
+                "reasoning": learn_output.reasoning or "",
+                "discoveries": discoveries_serialized,
+            }
+
+    async def commit_deep_learn(
+        self,
+        discoveries: list[dict],
+    ) -> int:
+        """
+        将用户确认的 discoveries 写入 pattern_memory。
+
+        复用 apply_pattern_change + savepoint 隔离逻辑，
+        与 learn() Step 4 相同的写入机制，并包含去重检查。
+
+        Args:
+            discoveries: 用户确认后的发现列表（来自 deep_learn 返回值）
+
+        Returns:
+            成功写入的模式数量
+        """
+        # 并发保护
+        if self._deep_learn_lock.locked():
+            raise RuntimeError("已有深度分析任务正在执行，请稍后重试")
+
+        async with self._deep_learn_lock:
+            if not discoveries:
+                logger.info("Commit Deep Learn: 无 discoveries 待写入")
+                return 0
+
+            logger.info(
+                "Commit Deep Learn: 开始写入 {} 条发现",
+                len(discoveries),
+            )
+
+            # 读取现有 ACTIVE 模式用于去重检查
+            existing_patterns: list[dict] = []
+            async with async_session_factory() as read_session:
+                pattern_stmt = select(PatternMemory).where(PatternMemory.status == "ACTIVE")
+                pattern_result = await read_session.execute(pattern_stmt)
+                existing_patterns = [
+                    {
+                        "id": p.id,
+                        "curve_features": p.curve_features,
+                        "predicted_direction": p.predicted_direction,
+                    }
+                    for p in pattern_result.scalars().all()
+                ]
+
+            # 记录本批次已创建的模式指纹，用于批内去重
+            batch_created_patterns: list[dict] = []
+            written_count = 0
+
+            async with async_session_factory() as session:
+                for idx, d in enumerate(discoveries, 1):
+                    try:
+                        operation = d.get("operation", "CREATE")
+
+                        # CREATE 前去重检查（与 learn() 相同逻辑）
+                        if operation == "CREATE" and settings.agent_dedup_enabled:
+                            all_patterns_for_dedup = existing_patterns + batch_created_patterns
+                            existing_id = detect_duplicate_pattern(
+                                d.get("curve_features", {}),
+                                d.get("predicted_direction", ""),
+                                all_patterns_for_dedup,
+                            )
+                            if existing_id is not None:
+                                logger.warning(
+                                    "Commit Deep Learn: 疑似重复模式 '{}'，与 id={} 指纹一致 | "
+                                    "auto_downgrade={}",
+                                    d.get("pattern_name"),
+                                    existing_id,
+                                    settings.agent_dedup_auto_downgrade,
+                                )
+                                if settings.agent_dedup_auto_downgrade:
+                                    # 将 CREATE 降级为 UPDATE
+                                    operation = "UPDATE"
+                                    d["operation"] = "UPDATE"
+                                    d["target_pattern_id"] = existing_id
+                                    d["change_reason"] = (
+                                        f"去重降级: 与 id={existing_id} 指纹一致，"
+                                        f"原 CREATE 转为 UPDATE"
+                                    )
+                                else:
+                                    # 未启用 auto_downgrade，跳过该条
+                                    logger.info(
+                                        "Commit Deep Learn: 跳过重复模式 '{}' ",
+                                        d.get("pattern_name"),
+                                    )
+                                    continue
+
+                        async with session.begin_nested():
+                            if operation == "UPDATE":
+                                # UPDATE 操作：使用指定字段
+                                pattern_data = {
+                                    "pattern_name": d.get("pattern_name"),
+                                    "description": d.get("description"),
+                                    "curve_features": d.get("curve_features"),
+                                    "conditions": d.get("conditions"),
+                                    "predicted_direction": d.get("predicted_direction"),
+                                    "confidence_score": d.get("confidence_score", 0.5),
+                                    "change_reason": d.get("change_reason", ""),
+                                    "target_pattern_id": d.get("target_pattern_id"),
+                                }
+                            else:
+                                # CREATE 操作
+                                pattern_data = {
+                                    "pattern_name": d.get("pattern_name"),
+                                    "description": d.get("description"),
+                                    "curve_features": d.get("curve_features"),
+                                    "conditions": d.get("conditions"),
+                                    "predicted_direction": d.get("predicted_direction"),
+                                    "confidence_score": d.get("confidence_score", 0.5),
+                                    "change_reason": d.get("change_reason", ""),
+                                }
+
+                            new_pattern = await self.apply_pattern_change(
+                                session=session,
+                                operation=operation,
+                                pattern_data=pattern_data,
+                                phase="DEEP_LEARN",  # 使用专用阶段标识
+                                evolve_phase_id=None,
+                            )
+
+                            # 记录新创建的模式用于批内去重
+                            if operation == "CREATE" and new_pattern is not None:
+                                batch_created_patterns.append({
+                                    "id": new_pattern.id,
+                                    "curve_features": new_pattern.curve_features,
+                                    "predicted_direction": new_pattern.predicted_direction,
+                                })
+
+                            written_count += 1
+                            logger.info(
+                                "Commit Deep Learn: {}/{} 写入成功 | {} '{}'",
+                                idx,
+                                len(discoveries),
+                                operation,
+                                d.get("pattern_name"),
+                            )
+                    except Exception as exc:
+                        logger.error(
+                            "Commit Deep Learn: {}/{} 写入失败 | {} '{}' | error={}",
+                            idx,
+                            len(discoveries),
+                            d.get("operation"),
+                            d.get("pattern_name"),
+                            str(exc),
+                        )
+                        continue
+
+                await session.commit()
+
+            logger.info(
+                "Commit Deep Learn: 完成 | 成功写入 {}/{} 条",
+                written_count,
+                len(discoveries),
+            )
+            return written_count
 
     # ======================================================================
     # Predict 阶段（Req 3.2 / 3.3 / 3.4 / 3.5 / 3.6 / 10.1 / 10.2 / 10.3 / 11.1）
@@ -695,6 +1106,56 @@ class SentimentAgent:
             predict_output.matched_pattern_name,
         )
 
+        # ========== Step 3.5：LLM 输出语义验证（Plan 步骤 5）==========
+        if settings.agent_llm_validation_enabled:
+            active_ids = {p["id"] for p in patterns_dicts}
+            hard_failures, soft_warnings = validate_predict_output(
+                predict_output, active_ids
+            )
+            if soft_warnings:
+                for w in soft_warnings:
+                    logger.warning("Predict 语义验证 SOFT: {}", w)
+            if hard_failures:
+                for f in hard_failures:
+                    logger.error("Predict 语义验证 HARD: {}", f)
+                # HARD_FAIL 时降级为 NO_TRADE
+                logger.warning(
+                    "Predict: 语义验证 HARD_FAIL，降级为 NO_TRADE | failures={}",
+                    hard_failures,
+                )
+                return await self._write_prediction_and_trade(
+                    predicted_direction="NO_TRADE",
+                    matched_pattern_id=None,
+                    matched_pattern_name=None,
+                    confidence=0.0,
+                    entry_timing="SKIP",
+                    reasoning=f"语义验证失败: {hard_failures}",
+                    sentiment_window_id=sentiment_window_id,
+                    skip_trade_reason="LLM 输出语义验证失败",
+                )
+
+        # ========== Step 3.6：时间窗口保护（Plan 步骤 10）==========
+        remaining_after_llm = max(0, (window_end_ms - int(time.time() * 1000)) // 1000)
+        if is_prediction_stale(
+            remaining_after_llm,
+            min_remaining=settings.agent_prediction_min_remaining_seconds,
+        ):
+            logger.warning(
+                "Predict: 预测已过时 | 剩余 {}s < 阈值 {}s | 降级为 NO_TRADE",
+                remaining_after_llm,
+                settings.agent_prediction_min_remaining_seconds,
+            )
+            return await self._write_prediction_and_trade(
+                predicted_direction="NO_TRADE",
+                matched_pattern_id=None,
+                matched_pattern_name=None,
+                confidence=0.0,
+                entry_timing="SKIP",
+                reasoning=f"预测已过时（剩余 {remaining_after_llm}s）",
+                sentiment_window_id=sentiment_window_id,
+                skip_trade_reason=f"预测已过时(剩余 {remaining_after_llm}s)",
+            )
+
         # ========== Step 4 & 5 & 6：写入预测 + 交易门控 ==========
         return await self._write_prediction_and_trade(
             predicted_direction=predict_output.direction,
@@ -721,9 +1182,10 @@ class SentimentAgent:
         """
         Predict 阶段共享辅助：写入 AgentPrediction 记录并执行交易门控。
 
+        现在使用 evaluate_trade_gate 进行扩展门控（Plan 步骤 9）。
+
         单次 session 内完成：flush 获取 id → 交易执行 → 回填 trade_order_id → commit，
-        保证预测记录与 trade_order_id 在同一事务内原子提交，避免两次 session 间崩溃
-        导致 trade_order_id 永远为 None 的不一致问题。
+        保证预测记录与 trade_order_id 在同一事务内原子提交。
 
         Args:
             predicted_direction: 预测方向 UP | DOWN | NO_TRADE
@@ -740,13 +1202,61 @@ class SentimentAgent:
         """
         now = datetime.now(tz=timezone.utc)
 
-        # 交易门控（纯函数判定）
-        do_trade, trade_reason = should_trade(
-            predicted_direction,
-            confidence,
-            threshold=settings.agent_trade_confidence_threshold,
-            auto_trade_enabled=settings.agent_auto_trade,
-        )
+        # 交易门控（扩展版，Plan 步骤 8/9）
+        if settings.agent_risk_control_enabled:
+            # 刷新日内风控统计
+            await self._risk_controller.refresh_daily_stats()
+
+        # 查询匹配模式的胜率/样本数/状态（如有）
+        matched_win_rate: float | None = None
+        matched_sample_count: int | None = None
+        matched_pattern_status: str | None = None
+        if matched_pattern_id is not None:
+            async with async_session_factory() as session:
+                pat_stmt = select(PatternMemory).where(PatternMemory.id == matched_pattern_id)
+                pat_result = await session.execute(pat_stmt)
+                pat = pat_result.scalar_one_or_none()
+                if pat is not None:
+                    matched_win_rate = pat.win_rate
+                    matched_sample_count = pat.sample_count
+                    matched_pattern_status = pat.status
+
+        # 风控开关决定门控深度：
+        # - 开启：扩展 8 级规则链（方向 + 置信度 + 模式证据 + 风控维度）
+        # - 关闭：仅基础门控（方向 + 置信度），跳过风控维度
+        if settings.agent_risk_control_enabled:
+            gate_ctx = TradeGateContext(
+                direction=predicted_direction,
+                confidence=confidence,
+                auto_trade_enabled=settings.agent_auto_trade,
+                threshold=settings.agent_trade_confidence_threshold,
+                matched_pattern_win_rate=matched_win_rate,
+                matched_pattern_sample_count=matched_sample_count,
+                recent_loss_streak=self._risk_controller.recent_loss_streak,
+                daily_trade_count=self._risk_controller.daily_trade_count,
+                daily_pnl=self._risk_controller.daily_pnl,
+                alert_blocked=(
+                    self._alert_service.trading_blocked
+                    if self._alert_service is not None
+                    else False
+                ),
+            )
+            do_trade, trade_reason = evaluate_trade_gate(
+                gate_ctx,
+                min_pattern_samples=settings.agent_min_pattern_samples,
+                min_pattern_win_rate=settings.agent_min_pattern_win_rate,
+                max_consecutive_losses=settings.agent_max_consecutive_losses,
+                max_daily_trades=settings.agent_max_daily_trades,
+                max_daily_loss_usdt=settings.agent_max_daily_loss_usdt,
+            )
+        else:
+            # 风控关闭：仅基础门控（方向 + 置信度）
+            do_trade, trade_reason = should_trade(
+                direction=predicted_direction,
+                confidence=confidence,
+                threshold=settings.agent_trade_confidence_threshold,
+                auto_trade_enabled=settings.agent_auto_trade,
+            )
         # 若调用方已指定 skip_trade_reason（如 LLM 失败），优先使用
         final_skip_reason = skip_trade_reason if skip_trade_reason else (
             None if do_trade else trade_reason
@@ -780,6 +1290,18 @@ class SentimentAgent:
 
             # ---- 交易执行 / 跳过 ----
             if do_trade and not skip_trade_reason:
+                # 交易前二次确认：匹配模式仍为 ACTIVE（防止双 Worker 时序窗口）
+                if matched_pattern_id is not None and matched_pattern_status != "ACTIVE":
+                    logger.warning(
+                        "Predict: 匹配模式已非 ACTIVE | pattern_id={} status={} | 跳过交易",
+                        matched_pattern_id,
+                        matched_pattern_status,
+                    )
+                    pred.skip_trade_reason = f"模式已退役/暂停（status={matched_pattern_status}）"
+                    final_skip_reason = pred.skip_trade_reason
+                    do_trade = False
+
+            if do_trade and not skip_trade_reason:
                 # 交易门控通过且非预设跳过场景 → 执行交易
                 logger.info(
                     "Predict: 交易门控通过 | reason='{}' | 调用 execute_trade",
@@ -798,10 +1320,14 @@ class SentimentAgent:
                             "Predict: 交易完成 | order.id={} | 已回填 trade_order_id",
                             order.id,
                         )
+                        from .metrics import metrics_collector
+                        metrics_collector.record_trade("EXECUTED", trade_reason)
                     else:
                         logger.warning(
                             "Predict: execute_trade 返回 None（交易未成功），不回填 trade_order_id"
                         )
+                        from .metrics import metrics_collector
+                        metrics_collector.record_trade("FAILED", "execute_trade returned None")
                 except Exception as trade_exc:
                     # 交易失败不影响预测记录——记录错误但不回退预测
                     logger.error(
@@ -814,6 +1340,8 @@ class SentimentAgent:
                     "Predict: 跳过交易 | reason='{}'",
                     final_skip_reason,
                 )
+                from .metrics import metrics_collector
+                metrics_collector.record_trade("SKIPPED", final_skip_reason or "")
 
             # 原子提交：pred 记录 + trade_order_id（如有）在同一事务内
             await session.commit()
@@ -941,6 +1469,35 @@ class SentimentAgent:
             logger.info("Evolve: LLM 未返回任何进化操作，本次 Evolve 结束")
             return
 
+        # ========== Step 2.5：LLM 输出语义验证（Plan 步骤 5）==========
+        if settings.agent_llm_validation_enabled:
+            all_ids = {p["id"] for p in all_patterns_dicts}
+            hard_failures, soft_warnings = validate_evolve_output(
+                evolve_output, all_ids
+            )
+            if soft_warnings:
+                for w in soft_warnings:
+                    logger.warning("Evolve 语义验证 SOFT: {}", w)
+            if hard_failures:
+                for f in hard_failures:
+                    logger.error("Evolve 语义验证 HARD: {}", f)
+                # 过滤掉 HARD_FAIL 的 operations
+                original_count = len(evolve_output.operations)
+                evolve_output.operations = [
+                    op for i, op in enumerate(evolve_output.operations)
+                    if not any(
+                        f"operations[{i}]" in f for f in hard_failures
+                    )
+                ]
+                logger.info(
+                    "Evolve: 语义验证过滤 {}/{} 条操作",
+                    original_count - len(evolve_output.operations),
+                    original_count,
+                )
+                if not evolve_output.operations:
+                    logger.info("Evolve: 所有操作被过滤，本次 Evolve 结束")
+                    return
+
         logger.info(
             "Evolve: LLM 返回 {} 条进化操作 | reasoning={}...",
             len(evolve_output.operations),
@@ -948,7 +1505,8 @@ class SentimentAgent:
         )
 
         # ========== Step 3：生成唯一 evolve_phase_id ==========
-        evolve_phase_id = uuid.uuid4().hex
+        # Fix #22: 使用截断的 UUID（前8位）+ 时间戳，保持可读性且符合 DB 字段长度
+        evolve_phase_id = f"{uuid.uuid4().hex[:8]}-{int(time.time())}"
 
         # ========== Step 4：应用进化操作（独立事务，含冷启动保护）==========
         async with async_session_factory() as session:
@@ -1101,15 +1659,49 @@ class SentimentAgent:
                     )
                 else:
                     # 构建 PatternStat 列表用于 select_retire_candidates
-                    pattern_stats = [
-                        PatternStat(
-                            id=p.id,
-                            status=p.status,
-                            win_rate=p.win_rate,
-                            sample_count=p.sample_count,
+                    # Plan 步骤 13：批量查询所有 ACTIVE 模式的最近预测，计算 recent_win_rate
+                    pattern_ids = [p.id for p in cap_active_patterns]
+                    recent_pred_stmt = (
+                        select(
+                            AgentPrediction.matched_pattern_id,
+                            AgentPrediction.is_correct,
                         )
-                        for p in cap_active_patterns
-                    ]
+                        .where(
+                            AgentPrediction.matched_pattern_id.in_(pattern_ids),
+                            AgentPrediction.is_correct.isnot(None),
+                        )
+                        .order_by(
+                            AgentPrediction.matched_pattern_id,
+                            AgentPrediction.prediction_time.desc(),
+                        )
+                    )
+                    recent_pred_result = await session.execute(recent_pred_stmt)
+                    all_recent_preds = recent_pred_result.all()
+
+                    # 按 pattern_id 分组，每组取前 10 条
+                    preds_by_pattern: dict[int, list] = defaultdict(list)
+                    for row in all_recent_preds:
+                        pid = row[0]
+                        if len(preds_by_pattern[pid]) < 10:
+                            preds_by_pattern[pid].append(row[1])
+
+                    pattern_stats = []
+                    for p in cap_active_patterns:
+                        recent_wr: float | None = None
+                        recent_preds = preds_by_pattern.get(p.id, [])
+                        if recent_preds:
+                            correct = sum(1 for v in recent_preds if v is True)
+                            recent_wr = correct / len(recent_preds)
+
+                        pattern_stats.append(
+                            PatternStat(
+                                id=p.id,
+                                status=p.status,
+                                win_rate=p.win_rate,
+                                sample_count=p.sample_count,
+                                recent_win_rate=recent_wr,
+                            )
+                        )
                     # select_retire_candidates 内部已含冷启动保护（active < 3 → []）
                     retire_ids = select_retire_candidates(
                         patterns=pattern_stats,

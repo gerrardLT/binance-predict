@@ -15,15 +15,17 @@ BTC 5min LLM 预测系统 V3 - FastAPI 主应用
 from __future__ import annotations
 
 import asyncio
+import calendar
 import json
 import math
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from loguru import logger
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,12 +33,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .config.settings import settings
 from .db.engine import async_session_factory, get_db
 from .db.models import Base, PredictionMarketSample, SentimentWindow
+from .models.schemas import CommitDeepLearnRequest
 from .services.agent_scheduler import AgentScheduler
 from .services.data_collector import BinanceDataCollector
 from .services.llm_service import LLMService
 from .services.prediction_trading import BinancePredictionTrader
 from .services.prediction_market_data import PredictionMarketDataService, MarketQuoteData
 from .services.sentiment_agent import SentimentAgent
+from .services.metrics import metrics_collector
 
 # ============================================================
 # 全局服务实例
@@ -51,6 +55,9 @@ market_data_service = PredictionMarketDataService()  # 只读市场数据（与�
 from collections import deque as _deque
 _pm_history: _deque = _deque(maxlen=2000)  # 约 8 小时（15s × 2000）
 
+# Fix #5/#6: 全局状态写入锁，保护 tracker/archiver 共享变量的读写一致性
+_state_lock = asyncio.Lock()
+
 # 模块级窗口状态变量（tracker/archiver/predict 共享）
 _current_window_end: int | None = None
 _window_entry_price: float | None = None
@@ -58,6 +65,9 @@ _pm_market_info: dict = {}  # 最新预测市场元数据（供图表 API 只读
 
 # AgentScheduler 全局实例（lifespan 中初始化，tracker/archiver 引用发布事件）
 agent_scheduler: AgentScheduler | None = None
+
+# SentimentAgent 全局实例（lifespan 中初始化，供 deep-learn API 调用）
+sentiment_agent: SentimentAgent | None = None
 
 # PREDICT 事件触发标志：同一窗口仅触发一次（Req 3.1），窗口切换时重置
 _predict_triggered_for_window: bool = False
@@ -99,15 +109,12 @@ async def _prediction_market_tracker() -> None:
             sleep_sec = (POLL_INTERVAL - (local_sec_in_min % POLL_INTERVAL)) % POLL_INTERVAL
             if sleep_sec < 0.1:
                 sleep_sec = POLL_INTERVAL
-            target_epoch = now + sleep_sec
-            t = time.localtime(target_epoch)
-            aligned_sec = (t.tm_sec // POLL_INTERVAL) * POLL_INTERVAL
-            aligned_ts = int(time.mktime((
-                t.tm_year, t.tm_mon, t.tm_mday,
-                t.tm_hour, t.tm_min, aligned_sec,
-                t.tm_wday, t.tm_yday, t.tm_isdst
-            ))) * 1000
             await asyncio.sleep(sleep_sec)
+
+            # Fix #13: 使用 UTC 时间戳计算对齐后的毫秒时间戳，
+            # 避免 time.mktime 依赖本地时区导致非 UTC 环境下的时间戳偏差
+            aligned_epoch = now + sleep_sec
+            aligned_ts = int(round(aligned_epoch)) * 1000
 
             # 通过只读服务获取市场报价（不修改交易模块状态）
             try:
@@ -135,16 +142,27 @@ async def _prediction_market_tracker() -> None:
             # 检测 5 分钟窗口切换：end_date 变化说明进入了新市场
             new_window_end = quote.end_date
             if new_window_end != _current_window_end:
-                if _current_window_end is not None:
-                    logger.info("5分钟市场窗口切换 | 清空图表缓存 | {} → {}", _current_window_end, new_window_end)
-                    _pm_history.clear()
-                _current_window_end = new_window_end
-                # Bug 1.3 修复：窗口切换时重置 _restored_current_window
-                _restored_current_window = False
-                # Bug 1.5 修复：窗口开始时快照 entry_price
-                _window_entry_price = collector.store.mid_price
-                # 窗口切换时重置 PREDICT 触发标志（Req 3.1，同一窗口仅触发一次）
-                _predict_triggered_for_window = False
+                # Fix #5: 使用锁保护全局状态写入，防止 archiver 读到半写状态
+                async with _state_lock:
+                    if _current_window_end is not None:
+                        logger.info("5分钟市场窗口切换 | 清空图表缓存 | {} → {}", _current_window_end, new_window_end)
+                        _pm_history.clear()
+                    _current_window_end = new_window_end
+                    # Bug 1.3 修复：窗口切换时重置 _restored_current_window
+                    _restored_current_window = False
+                    # Bug 1.5 修复：窗口开始时快照 entry_price。优先用内存最新
+                    # mid_price 快照（非阻塞），避免在 _state_lock 内做阻塞 REST 调用。
+                    _window_entry_price = collector.store.mid_price
+                    # Fix #12: 内存快照无效时用 REST 后备补偿（罕见路径），仍无效则告警
+                    if not _window_entry_price or _window_entry_price <= 0:
+                        _window_entry_price = await collector.fetch_mid_price()
+                        if not _window_entry_price or _window_entry_price <= 0:
+                            logger.warning(
+                                "窗口切换时 entry_price 异常({})，将在归档时重新获取",
+                                _window_entry_price,
+                            )
+                    # 窗口切换时重置 PREDICT 触发标志（Req 3.1，同一窗口仅触发一次）
+                    _predict_triggered_for_window = False
 
                 # 首次进入窗口（含启动/重载）：从 DB 恢复当前窗口的采样数据
                 if not _restored_current_window:
@@ -296,9 +314,23 @@ async def _sentiment_window_archiver() -> None:
                     curve_up = [{"t": s.timestamp, "v": s.up_pct} for s in samples if s.up_pct is not None]
                     curve_down = [{"t": s.timestamp, "v": s.down_pct} for s in samples if s.down_pct is not None]
 
-                    # Bug 1.7 修复：使用快照价格替代 kline 匹配
+                    # Bug 1.7 修复：使用内存快照价格替代 kline 匹配
                     entry_price = _window_entry_price  # 窗口开始时的 mid_price 快照
-                    exit_price = collector.store.mid_price  # 归档时实时 mid_price
+                    exit_price = collector.store.mid_price  # 归档时实时 mid_price 快照
+
+                    # Fix #12: entry_price 异常时重试获取，避免生成无效归档记录
+                    if not entry_price or entry_price <= 0:
+                        logger.warning(
+                            "情绪窗口归档 | {}~{} | entry_price 异常({})，重试获取",
+                            start_ms, end_ms, entry_price,
+                        )
+                        entry_price = await collector.fetch_mid_price()
+                        if not entry_price or entry_price <= 0:
+                            logger.error(
+                                "情绪窗口跳过 | {}~{} | entry_price 始终无效，跳过本次归档",
+                                start_ms, end_ms,
+                            )
+                            continue
 
                     # 计算实际结果
                     actual_return = None
@@ -420,9 +452,10 @@ async def lifespan(app: FastAPI):
 
     # 4. 实例化并启动 AgentScheduler（Req 2.1/6.1/11.2）
     # 在 tracker/archiver 的 while 循环开始前完成，保证时序安全
-    global agent_scheduler
-    sentiment_agent = SentimentAgent(llm=llm_service, trader=prediction_trader)
-    agent_scheduler = AgentScheduler(agent=sentiment_agent, trader=prediction_trader)
+    global agent_scheduler, sentiment_agent
+    _sentiment_agent = SentimentAgent(llm=llm_service, trader=prediction_trader)
+    sentiment_agent = _sentiment_agent
+    agent_scheduler = AgentScheduler(agent=_sentiment_agent, trader=prediction_trader)
     await agent_scheduler.start()  # 含冷启动检查（Req 11.2）
     logger.info("SentimentAgent + AgentScheduler 已就绪（冷启动检查完成）")
 
@@ -441,6 +474,9 @@ async def lifespan(app: FastAPI):
     if agent_scheduler is not None:
         await agent_scheduler.stop()
     await collector.stop()
+    # Fix #15: 关闭复用的 httpx 客户端，避免连接泄漏
+    await market_data_service.aclose()
+    await prediction_trader.aclose()
     for t in tasks:
         t.cancel()
     logger.info("系统已关闭")
@@ -457,14 +493,39 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS 中间件
+# CORS 中间件（安全修复 #1：禁止 allow_origins=["*"] + credentials=True）
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 开发环境，生产应限制
+    allow_origins=settings.allowed_origins_list,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
+
+
+# ============================================================
+# API 认证依赖（安全修复 #2：Bearer Token 保护敏感端点）
+# ============================================================
+
+_bearer_scheme = HTTPBearer(auto_error=False)
+
+
+async def _require_auth(
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+) -> None:
+    """Bearer Token 认证依赖。
+
+    仅当 settings.api_auth_token 非空时生效。空值表示开发环境，放行所有请求。
+    生产环境必须配置 API_AUTH_TOKEN，否则端点对外完全开放。
+    """
+    if not settings.api_auth_token:
+        return  # 开发模式：未配置 token 则跳过认证
+    if credentials is None or credentials.credentials != settings.api_auth_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing authentication token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
 
 # ============================================================
@@ -485,7 +546,10 @@ async def health_check():
 # --- 交易订单 API ---
 
 @app.get("/api/trades/latest")
-async def get_latest_trade(db: AsyncSession = Depends(get_db)):
+async def get_latest_trade(
+    _: None = Depends(_require_auth),
+    db: AsyncSession = Depends(get_db),
+):
     """获取最近一次交易订单"""
     from sqlalchemy import select
     from .db.models import TradeOrderModel
@@ -515,19 +579,23 @@ async def get_latest_trade(db: AsyncSession = Depends(get_db)):
 
 
 @app.get("/api/prediction-markets")
-async def list_prediction_markets():
+async def list_prediction_markets(
+    _: None = Depends(_require_auth),
+):
     """查询当前活跃的 BTC 预测市场"""
     markets = await prediction_trader.list_markets()
     return {
         "count": len(markets),
         "markets": markets[:5],  # 只返回前 5 个
-        "up_token_id": prediction_trader._up_token_id,
-        "down_token_id": prediction_trader._down_token_id,
+        "has_up_token": bool(prediction_trader._up_token_id),
+        "has_down_token": bool(prediction_trader._down_token_id),
     }
 
 
 @app.get("/api/prediction-wallet")
-async def get_prediction_wallet():
+async def get_prediction_wallet(
+    _: None = Depends(_require_auth),
+):
     """获取预测钱包信息（walletAddress + walletId，自动从 Binance API 获取）"""
     if not prediction_trader._api_key:
         return {"error": "Binance API Key 未配置"}
@@ -536,8 +604,14 @@ async def get_prediction_wallet():
     if not wallet:
         return {"error": "未找到预测钱包，请先在 Binance App 中开通预测市场"}
 
+    def _mask_addr(addr: str | None) -> str | None:
+        """地址脱敏：仅展示前6后4位"""
+        if not addr:
+            return None
+        return f"{addr[:6]}...{addr[-4:]}" if len(addr) > 12 else "***"
+
     return {
-        "wallet_address": wallet.get("walletAddress"),
+        "wallet_address": _mask_addr(wallet.get("walletAddress")),
         "wallet_id": wallet.get("walletId"),
         "registered_time": wallet.get("registeredTime"),
     }
@@ -564,11 +638,17 @@ async def get_prediction_market_chart():
     返回每 15s 采样的 UP/DOWN chance 百分比时序数据，
     以及当前 5 分钟市场的元数据（参与者、交易量、截止时间等）。
     """
+    # Fix #5/#6: 在锁下快照读取，确保 history 和 market_info 一致性
+    # Fix #16: 限制返回最近 400 个点（约 1.5 小时），避免响应体过大
+    async with _state_lock:
+        history_snapshot = list(_pm_history)[-400:]
+        market_snapshot = dict(_pm_market_info)
+
     return {
         "symbol": settings.symbol,
         "poll_interval_sec": 15,
-        "points": list(_pm_history),
-        "market": _pm_market_info,
+        "points": history_snapshot,
+        "market": market_snapshot,
     }
 
 
@@ -583,6 +663,7 @@ async def get_prediction_market_chart():
 @app.get("/api/sentiment/windows")
 async def get_sentiment_windows(
     limit: int = 50,
+    _: None = Depends(_require_auth),
     db: AsyncSession = Depends(get_db),
 ):
     """查询历史情绪窗口列表"""
@@ -651,7 +732,9 @@ async def run_sentiment_prediction(
 # ============================================================
 
 @app.post("/api/sentiment/momentum-predict")
-async def run_momentum_predict():
+async def run_momentum_predict(
+    _: None = Depends(_require_auth),
+):
     """
     概率动量预测（独立方案，纯算法）
 
@@ -704,6 +787,7 @@ async def get_agent_predictions(
     start: datetime | None = None,
     end: datetime | None = None,
     direction: str | None = None,
+    _: None = Depends(_require_auth),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -755,6 +839,7 @@ async def get_agent_predictions(
 
 @app.get("/api/sentiment/agent/patterns")
 async def get_agent_patterns(
+    _: None = Depends(_require_auth),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -803,6 +888,7 @@ async def get_agent_patterns(
 async def get_pattern_history(
     pattern_id: int,
     limit: int = 200,
+    _: None = Depends(_require_auth),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -842,6 +928,7 @@ async def get_pattern_history(
 
 @app.get("/api/sentiment/agent/status")
 async def get_agent_status(
+    _: None = Depends(_require_auth),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -872,4 +959,88 @@ async def get_agent_status(
         "validate_counter": validate_counter,
         "active_pattern_count": active_pattern_count,
         "scheduler_running": scheduler_running,
+        "queue_depth": agent_scheduler.queue_depth if agent_scheduler is not None else -1,
+        "metrics_summary": {
+            "llm_total_cost": metrics_collector.get_snapshot().get("llm", {}).get("total_cost", 0.0),
+            "llm_call_count": metrics_collector.get_snapshot().get("llm", {}).get("call_count", 0),
+        },
     }
+
+
+@app.get("/api/sentiment/agent/metrics")
+async def get_agent_metrics(
+    _: None = Depends(_require_auth),
+):
+    """
+    查询 Agent 运行时详细指标（Req 17 可观测性）
+
+    返回各阶段执行统计、LLM token 用量与估算成本、交易决策统计、队列深度。
+    """
+    return metrics_collector.get_snapshot()
+
+
+# ============================================================
+# 深度模式发现 API（双模式架构）
+# ============================================================
+
+
+@app.post("/api/sentiment/agent/deep-learn")
+async def trigger_deep_learn(
+    max_windows: int = 100,
+    _: None = Depends(_require_auth),
+):
+    """
+    触发手动深度模式发现（预览模式）。
+
+    分析全量历史窗口，返回发现结果供用户审核。
+    不写入 DB，需通过 /commit 端点确认写入。
+    """
+    if sentiment_agent is None:
+        return {"status": "error", "message": "Agent 尚未初始化，请等待系统启动完成"}
+
+    try:
+        result = await sentiment_agent.deep_learn(max_windows=max_windows)
+        return {
+            "status": "ok",
+            "reasoning": result.get("reasoning", ""),
+            "discoveries": result.get("discoveries", []),
+            "count": len(result.get("discoveries", [])),
+            "message": "预览模式，数据尚未写入 DB。确认后请调用 POST /api/sentiment/agent/deep-learn/commit",
+        }
+    except RuntimeError as e:
+        # 并发冲突
+        return {"status": "busy", "message": str(e)}
+    except Exception as e:
+        logger.error("深度分析失败: {}", e)
+        return {"status": "error", "message": "深度分析失败，请查看服务端日志"}
+
+
+@app.post("/api/sentiment/agent/deep-learn/commit")
+async def commit_deep_learn(
+    request: CommitDeepLearnRequest,
+    _: None = Depends(_require_auth),
+):
+    """
+    将用户确认的模式发现写入 pattern_memory。
+
+    discoveries 来自 POST /api/sentiment/agent/deep-learn 的返回值。
+    请求体使用 Pydantic Schema 校验，确保数据完整性。
+    """
+    if sentiment_agent is None:
+        return {"status": "error", "message": "Agent 尚未初始化，请等待系统启动完成"}
+
+    if not request.discoveries:
+        return {"status": "error", "message": "discoveries 为空，无内容可写入"}
+
+    # 将 Pydantic 模型转换为 dict 列表
+    discoveries_dicts = [d.model_dump() for d in request.discoveries]
+
+    try:
+        count = await sentiment_agent.commit_deep_learn(discoveries_dicts)
+        return {"status": "ok", "written": count}
+    except RuntimeError as e:
+        # 并发冲突
+        return {"status": "busy", "message": str(e)}
+    except Exception as e:
+        logger.error("深度分析写入失败: {}", e)
+        return {"status": "error", "message": "写入失败，请查看服务端日志"}

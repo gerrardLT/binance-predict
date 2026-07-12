@@ -133,3 +133,16 @@ class PatternChangeLogRecord(BaseModel):
     change_reason: str = Field(description="变更原因")
     evolve_phase_id: str | None = Field(default=None, description="触发该变更的 Evolve 执行 ID")
     created_at: datetime | None = Field(default=None, description="变更时间 UTC")
+
+
+# ============================================================
+# API 请求模型
+# ============================================================
+
+class CommitDeepLearnRequest(BaseModel):
+    """深度分析确认写入请求。"""
+
+    discoveries: list[PatternDiscovery] = Field(
+        default_factory=list,
+        description="用户确认后的发现列表（来自 POST /api/sentiment/agent/deep-learn 的返回值）"
+    )

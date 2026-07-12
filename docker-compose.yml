@@ -1,0 +1,57 @@
+# ============================================================
+# 本地开发环境：docker compose up -d
+# ============================================================
+# 启动三个服务：
+#   db       - TimescaleDB（PostgreSQL 16 兼容）
+#   backend  - FastAPI 后端（自动执行 alembic 迁移）
+#   frontend - React 前端（Nginx + API 反向代理）
+# ============================================================
+
+services:
+  db:
+    image: timescale/timescaledb:latest-pg16
+    container_name: bp-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: binance_predict
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    container_name: bp-backend
+    ports:
+      - "8002:8000"
+    env_file:
+      - .env
+    environment:
+      # 覆盖 .env 中的 localhost 为 Docker 服务名
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/binance_predict
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    container_name: bp-frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  pgdata:

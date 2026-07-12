@@ -1,0 +1,65 @@
+# ============================================================
+# 生产环境 docker-compose（VPS 部署用）
+# ============================================================
+# 镜像从 GHCR 拉取，由 GitHub Actions CI/CD 自动构建推送。
+# 使用方式：
+#   1. 将此文件放置到 VPS 的 /opt/binance-predict/
+#   2. 创建 .env 文件（含所有生产环境变量）
+#   3. docker compose -f docker-compose.prod.yml pull
+#   4. docker compose -f docker-compose.prod.yml up -d
+# ============================================================
+
+services:
+  db:
+    image: timescale/timescaledb:latest-pg16
+    container_name: bp-db
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+      POSTGRES_DB: ${DB_NAME:-binance_predict}
+    ports:
+      - "127.0.0.1:5432:5432"  # 仅本地可访问
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  backend:
+    image: ghcr.io/gerrardlt/binance-predict-backend:latest
+    container_name: bp-backend
+    ports:
+      - "127.0.0.1:8002:8000"  # 仅本地可访问（由 Nginx 反向代理）
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${DB_USER:-postgres}:${DB_PASSWORD:-changeme}@db:5432/${DB_NAME:-binance_predict}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  frontend:
+    image: ghcr.io/gerrardlt/binance-predict-frontend:latest
+    container_name: bp-frontend
+    ports:
+      - "8082:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      - app-network
+
+volumes:
+  pgdata:
+
+networks:
+  app-network:
+    driver: bridge

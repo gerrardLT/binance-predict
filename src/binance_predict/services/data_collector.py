@@ -8,6 +8,7 @@ import ssl
 import time
 from dataclasses import dataclass
 
+import httpx
 import websockets
 from loguru import logger
 
@@ -109,3 +110,44 @@ class BinanceDataCollector:
             self.store.best_ask = float(data["a"])
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             logger.warning("现货 bookTicker 消息解析异常: {} | raw={}", exc, raw_msg[:200])
+
+    async def fetch_mid_price(self) -> float:
+        """通过 REST API 获取最新 bookTicker 并更新 mid_price。
+
+        WebSocket bookTicker 流可能失效，此方法作为可靠后备，
+        在窗口切换和归档时按需调用（约每 5 分钟 2 次）。
+
+        Returns:
+            中间价浮点数；若 REST 和缓存均无法获取有效价格则返回 0.0，
+            调用方应检查返回值 > 0 以避免除零错误。
+        """
+        url = "https://api.binance.com/api/v3/ticker/bookTicker"
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(url, params={"symbol": settings.symbol})
+                resp.raise_for_status()
+                data = resp.json()
+                bid = float(data["bidPrice"])
+                ask = float(data["askPrice"])
+                if bid <= 0 or ask <= 0:
+                    logger.error("REST bookTicker 返回无效价格: bid={} ask={}", bid, ask)
+                    return self._safe_cached_mid_price()
+                self.store.best_bid = bid
+                self.store.best_ask = ask
+                self.store.last_ws_spot_update = time.time()
+                mid = (bid + ask) / 2
+                logger.debug("REST mid_price 更新 | bid={} ask={} mid={:.2f}", bid, ask, mid)
+                return mid
+        except Exception as exc:
+            logger.warning("REST fetch_mid_price 失败: {} | 回退使用缓存 mid_price={:.2f}", exc, self.store.mid_price)
+            return self._safe_cached_mid_price()
+
+    def _safe_cached_mid_price(self) -> float:
+        """返回缓存的 mid_price，若为 0.0 则记录严重警告。"""
+        cached = self.store.mid_price
+        if cached <= 0:
+            logger.critical(
+                "fetch_mid_price 缓存 mid_price 为 0.0，"
+                "WebSocket 可能从未连接成功。请检查 Binance WS 连接状态。"
+            )
+        return cached

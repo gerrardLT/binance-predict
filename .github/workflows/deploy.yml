@@ -1,0 +1,121 @@
+# ============================================================
+# 构建 + 部署流水线：push to main → 构建镜像 → 推送 GHCR → 部署 VPS
+# ============================================================
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false  # 部署不可取消，避免镜像不一致
+
+env:
+  REGISTRY: ghcr.io
+  BACKEND_IMAGE: ghcr.io/${{ github.repository_owner }}/binance-predict-backend
+  FRONTEND_IMAGE: ghcr.io/${{ github.repository_owner }}/binance-predict-frontend
+
+jobs:
+  test:
+    name: Test Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Run tests
+        run: uv run pytest tests/ -v --tb=short
+
+  build-and-push:
+    name: Build & Push Images
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push backend
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/backend.Dockerfile
+          push: true
+          tags: |
+            ${{ env.BACKEND_IMAGE }}:latest
+            ${{ env.BACKEND_IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build & push frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/frontend.Dockerfile
+          push: true
+          tags: |
+            ${{ env.FRONTEND_IMAGE }}:latest
+            ${{ env.FRONTEND_IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to VPS
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    # 仅在配置了 VPS Secrets 时执行
+    if: ${{ secrets.VPS_HOST != '' }}
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || '22' }}
+          script: |
+            set -euo pipefail
+            cd /www/wwwroot/binance-predict
+
+            # 写入生产 .env（仅当 ENV_FILE_CONTENT 配置时覆盖，否则使用服务器上已有的 .env）
+            if [ -n "${{ secrets.ENV_FILE_CONTENT }}" ]; then
+              echo "${{ secrets.ENV_FILE_CONTENT }}" | base64 -d > .env
+            fi
+
+            # 登录 GHCR 拉取私有镜像
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            # 拉取最新镜像
+            docker compose -f docker-compose.bt.yml pull
+
+            # 滚动重启
+            docker compose -f docker-compose.bt.yml up -d --remove-orphans
+
+            # 清理悬空镜像
+            docker image prune -f
+
+            # 验证后端健康
+            sleep 5
+            curl -sf http://localhost:8002/api/health || echo "WARN: health check failed"

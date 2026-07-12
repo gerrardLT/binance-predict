@@ -1,0 +1,21 @@
+# ============================================================
+# 宝塔面板 - 使用宿主机 PostgreSQL 版本
+# ============================================================
+# 适用场景：宝塔已安装 PostgreSQL，不想用 Docker 内数据库
+# 与 docker-compose.bt.yml 的区别：去掉 db 容器，后端直连宿主机 PG
+#
+# 注意：.env 中 DATABASE_URL 需要改为宿主机地址：
+#   DATABASE_URL=postgresql+asyncpg://用户名:密码@host.docker.internal:5432/binance_predict
+# ============================================================
+
+services:
+  backend:
+    image: ghcr.io/gerrardlt/binance-predict-backend:latest
+    container_name: bp-backend
+    ports:
+      - "127.0.0.1:8002:8000"  # 宝塔 Nginx 反向代理到此端口
+    env_file:
+      - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # 容器内访问宿主机
+    restart: unless-stopped

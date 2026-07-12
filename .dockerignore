@@ -1,0 +1,37 @@
+# Git
+.git/
+.gitignore
+
+# Python
+.venv/
+__pycache__/
+*.py[oc]
+*.egg-info/
+.pytest_cache/
+.hypothesis/
+
+# Env
+.env
+.env.*
+!.env.example
+
+# Node
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# IDE / Editor
+.kiro/
+.qoder/
+.playwright-cli/
+.vscode/
+
+# Docs / Review
+docs/
+semantic-review/
+output/
+review_diff.txt
+
+# OS
+Thumbs.db
+.DS_Store

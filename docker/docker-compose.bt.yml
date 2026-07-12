@@ -1,0 +1,57 @@
+# ============================================================
+# 宝塔面板生产环境 docker-compose
+# ============================================================
+# 与标准 docker-compose.prod.yml 的区别：
+#   - 去掉 frontend 容器（由宝塔 Nginx 反向代理）
+#   - 后端端口映射到宿主机，由宝塔 Nginx 转发
+#
+# 使用方式：
+#   1. 将此文件放置到 VPS 的项目目录
+#   2. 创建 .env 文件
+#   3. docker compose -f docker-compose.bt.yml pull
+#   4. docker compose -f docker-compose.bt.yml up -d
+# ============================================================
+
+services:
+  db:
+    image: timescale/timescaledb:latest-pg16
+    container_name: bp-db
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+      POSTGRES_DB: ${DB_NAME:-binance_predict}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  backend:
+    image: ghcr.io/gerrardlt/binance-predict-backend:latest
+    container_name: bp-backend
+    ports:
+      - "127.0.0.1:8002:8000"  # 宝塔 Nginx 反向代理到此端口
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${DB_USER:-postgres}:${DB_PASSWORD:-changeme}@db:5432/${DB_NAME:-binance_predict}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - app-network
+
+volumes:
+  pgdata:
+
+networks:
+  app-network:
+    driver: bridge
