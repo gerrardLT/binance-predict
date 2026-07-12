@@ -6,6 +6,12 @@ Provides shared fixtures for mocking the main module's dependencies.
 
 from __future__ import annotations
 
+import os
+
+# CI 环境无 .env，设置 dummy API Key 避免模块级 LLMService() 初始化失败
+os.environ.setdefault("DEEPSEEK_API_KEY", "test-dummy-key")
+os.environ.setdefault("DASHSCOPE_API_KEY", "test-dummy-key")
+
 import asyncio
 from collections import deque
 from unittest.mock import AsyncMock, MagicMock, patch
