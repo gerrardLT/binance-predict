@@ -3,7 +3,7 @@
 # ============================================================
 # 镜像从 GHCR 拉取，由 GitHub Actions CI/CD 自动构建推送。
 # 使用方式：
-#   1. 将此文件放置到 VPS 的 /opt/binance-predict/
+#   1. 将此文件放置到 VPS 的 /www/wwwroot/binance-predict/
 #   2. 创建 .env 文件（含所有生产环境变量）
 #   3. docker compose -f docker-compose.prod.yml pull
 #   4. docker compose -f docker-compose.prod.yml up -d

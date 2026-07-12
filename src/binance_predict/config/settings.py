@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     review_model: str = "qwen3.7-max"
 
     # --- 数据库配置 ---
+    # Docker 部署时 compose 读取这三个变量初始化 DB + 构建 DATABASE_URL
+    db_user: str = "postgres"
+    db_password: str = "changeme"
+    db_name: str = "binance_predict"
     # PostgreSQL + TimescaleDB 异步连接字符串
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/binance_predict"
     # --- Binance API 配置 ---
