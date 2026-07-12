@@ -85,25 +85,37 @@ jobs:
     name: Deploy to VPS
     needs: build-and-push
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     steps:
+      - uses: actions/checkout@v4
+
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
-          port: ${{ secrets.VPS_PORT || '22' }}
+          port: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
+          envs: GITHUB_ACTOR,GITHUB_TOKEN,ENV_FILE_CONTENT
           script: |
             set -euo pipefail
             cd /www/wwwroot/binance-predict
 
+            # 同步最新 docker-compose 文件（从 GitHub 下载，确保 VPS 与仓库一致）
+            curl -fsSL -H "Authorization: token ${GITHUB_TOKEN}" \
+              "https://raw.githubusercontent.com/${GITHUB_ACTOR}/binance-predict/main/docker/docker-compose.bt.yml" \
+              -o docker-compose.bt.yml || echo "WARN: failed to update docker-compose.bt.yml, using existing file"
+
             # 写入生产 .env（仅当 ENV_FILE_CONTENT 配置时覆盖，否则使用服务器上已有的 .env）
-            if [ -n "${{ secrets.ENV_FILE_CONTENT }}" ]; then
-              echo "${{ secrets.ENV_FILE_CONTENT }}" | base64 -d > .env
+            # 通过环境变量传递，避免 secrets 内联展开的特殊字符问题
+            if [ -n "${ENV_FILE_CONTENT:-}" ]; then
+              echo "$ENV_FILE_CONTENT" | base64 -d > .env
             fi
 
-            # 登录 GHCR 拉取私有镜像
-            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            # 登录 GHCR 拉取私有镜像（通过环境变量传递，避免内联展开）
+            echo "${GITHUB_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
 
             # 拉取最新镜像
             docker compose -f docker-compose.bt.yml pull
@@ -114,6 +126,19 @@ jobs:
             # 清理悬空镜像
             docker image prune -f
 
-            # 验证后端健康
-            sleep 5
-            curl -sf http://localhost:8002/api/health || echo "WARN: health check failed"
+            # 验证后端健康（重试机制，最多等待 30 秒）
+            for i in $(seq 1 10); do
+              if curl -sf http://localhost:8002/api/health; then
+                echo ""
+                echo "Health check passed"
+                break
+              fi
+              if [ "$i" -eq 10 ]; then
+                echo "WARN: health check failed after 30s"
+              fi
+              sleep 3
+            done
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ENV_FILE_CONTENT: ${{ secrets.ENV_FILE_CONTENT }}
