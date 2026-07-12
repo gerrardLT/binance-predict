@@ -85,8 +85,6 @@ jobs:
     name: Deploy to VPS
     needs: build-and-push
     runs-on: ubuntu-latest
-    # 仅在配置了 VPS Secrets 时执行
-    if: ${{ secrets.VPS_HOST != '' }}
     steps:
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1
