@@ -50,7 +50,13 @@ def run_migrations_offline() -> None:
 
 def do_run_migrations(connection: Connection) -> None:
     """在同步连接上运行迁移"""
-    context.configure(connection=connection, target_metadata=target_metadata)
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        # asyncpg 在事务内执行 DDL 时，新建表对后续语句不可见
+        # 禁用事务性 DDL 可避免此外键引用报错
+        transactional_ddl=False,
+    )
 
     with context.begin_transaction():
         context.run_migrations()
