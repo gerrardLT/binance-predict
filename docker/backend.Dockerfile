@@ -18,7 +18,7 @@ RUN uv sync --frozen --no-dev --no-install-project
 
 # 复制源码和迁移脚本
 COPY src/ src/
-COPY main.py alembic.ini ./
+COPY main.py alembic.ini README.md ./
 COPY alembic/ alembic/
 
 # 安装项目本身（hatchling 构建 wheel）
