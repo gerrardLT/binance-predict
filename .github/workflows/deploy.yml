@@ -105,8 +105,8 @@ jobs:
 
             # 同步最新 docker-compose 文件（从 GitHub 下载，确保 VPS 与仓库一致）
             curl -fsSL -H "Authorization: token ${GITHUB_TOKEN}" \
-              "https://raw.githubusercontent.com/${GITHUB_ACTOR}/binance-predict/main/docker/docker-compose.bt.yml" \
-              -o docker-compose.bt.yml || echo "WARN: failed to update docker-compose.bt.yml, using existing file"
+              "https://raw.githubusercontent.com/${GITHUB_ACTOR}/binance-predict/main/docker/docker-compose.prod.yml" \
+              -o docker-compose.prod.yml || echo "WARN: failed to update docker-compose.prod.yml, using existing file"
 
             # 写入生产 .env（仅当 ENV_FILE_CONTENT 配置时覆盖，否则使用服务器上已有的 .env）
             # 通过环境变量传递，避免 secrets 内联展开的特殊字符问题
@@ -118,10 +118,10 @@ jobs:
             echo "${GITHUB_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
 
             # 拉取最新镜像
-            docker compose -f docker-compose.bt.yml pull
+            docker compose -f docker-compose.prod.yml pull
 
             # 滚动重启
-            docker compose -f docker-compose.bt.yml up -d --remove-orphans
+            docker compose -f docker-compose.prod.yml up -d --remove-orphans
 
             # 清理悬空镜像
             docker image prune -f

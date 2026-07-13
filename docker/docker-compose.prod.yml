@@ -47,7 +47,7 @@ services:
   frontend:
     image: ghcr.io/gerrardlt/binance-predict-frontend:latest
     ports:
-      - "8082:80"
+      - "127.0.0.1:8082:80"  # 仅本地可访问（由宝塔 Nginx 反向代理）
     depends_on:
       - backend
     restart: unless-stopped
