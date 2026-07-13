@@ -9,9 +9,17 @@
 #   4. docker compose -f docker-compose.prod.yml up -d
 # ============================================================
 
+# Docker 容器日志（stderr）统一限额，防止 json-file 无限增长撑爆磁盘
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
 services:
   db:
     image: timescale/timescaledb:latest-pg16
+    logging: *default-logging
     environment:
       POSTGRES_USER: ${DB_USER:-postgres}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
@@ -32,12 +40,15 @@ services:
 
   backend:
     image: ghcr.io/gerrardlt/binance-predict-backend:latest
+    logging: *default-logging
     ports:
       - "127.0.0.1:8002:8000"  # 仅本地可访问（由 Nginx 反向代理）
     env_file:
       - .env
     environment:
       DATABASE_URL: postgresql+asyncpg://${DB_USER:-postgres}:${DB_PASSWORD:-changeme}@db:5432/${DB_NAME:-binance_predict}
+    volumes:
+      - bp-logs:/app/logs  # loguru 文件日志持久化（部署重建不丢失）
     depends_on:
       db:
         condition: service_healthy
@@ -47,6 +58,7 @@ services:
 
   frontend:
     image: ghcr.io/gerrardlt/binance-predict-frontend:latest
+    logging: *default-logging
     ports:
       - "8082:80"  # 对外开放，可通过 IP:8082 直接访问前端
     depends_on:
@@ -57,6 +69,7 @@ services:
 
 volumes:
   pgdata:
+  bp-logs:
 
 networks:
   app-network:

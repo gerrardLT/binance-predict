@@ -47,6 +47,9 @@ COPY --from=builder /app/alembic /app/alembic
 # 将虚拟环境 bin 加入 PATH
 ENV PATH="/app/.venv/bin:$PATH"
 
+# 创建日志目录并授权给非 root 用户（供 loguru 文件输出，配合命名卷持久化）
+RUN mkdir -p /app/logs && chown -R app:app /app/logs
+
 # 切换到非 root 用户
 USER app
 

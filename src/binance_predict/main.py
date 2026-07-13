@@ -63,6 +63,13 @@ _current_window_end: int | None = None
 _window_entry_price: float | None = None
 _pm_market_info: dict = {}  # 最新预测市场元数据（供图表 API 只读访问）
 
+# 刚关闭窗口的快照（tracker 在窗口切换时写入，archiver 读取归档）：
+# 修复归档器读取"正在填充的当前窗口"导致采样点不足、sentiment_windows 长期不增长的竞态问题。
+_last_closed_window_end: int | None = None
+_last_closed_window_entry_price: float | None = None
+_last_closed_window_exit_price: float | None = None
+_last_archived_window_end: int | None = None  # 去重：避免同一已关闭窗口重复归档
+
 # AgentScheduler 全局实例（lifespan 中初始化，tracker/archiver 引用发布事件）
 agent_scheduler: AgentScheduler | None = None
 
@@ -89,6 +96,7 @@ async def _prediction_market_tracker() -> None:
     避免修改交易模块状态（Bug 1.1 修复）。
     """
     global _current_window_end, _window_entry_price, _pm_market_info, _predict_triggered_for_window
+    global _last_closed_window_end, _last_closed_window_entry_price, _last_closed_window_exit_price
 
     POLL_INTERVAL = 15  # 秒
     _restored_current_window = False  # 标记是否已从 DB 恢复当前窗口数据
@@ -145,6 +153,11 @@ async def _prediction_market_tracker() -> None:
                 # Fix #5: 使用锁保护全局状态写入，防止 archiver 读到半写状态
                 async with _state_lock:
                     if _current_window_end is not None:
+                        # 修复：记录刚关闭窗口的快照供 archiver 归档。
+                        # 入场价 = 旧窗口起点快照；出场价 = 本次切换时刻的 mid_price（即旧窗口终点）。
+                        _last_closed_window_end = _current_window_end
+                        _last_closed_window_entry_price = _window_entry_price
+                        _last_closed_window_exit_price = collector.store.mid_price
                         logger.info("5分钟市场窗口切换 | 清空图表缓存 | {} → {}", _current_window_end, new_window_end)
                         _pm_history.clear()
                     _current_window_end = new_window_end
@@ -273,6 +286,8 @@ async def _sentiment_window_archiver() -> None:
     from sqlalchemy import select as sa_select, delete as sa_delete, func as sa_func
     from sqlalchemy.exc import IntegrityError
 
+    global _last_archived_window_end
+
     # 等待第一个 5 分钟边界
     await asyncio.sleep(10)
 
@@ -287,12 +302,22 @@ async def _sentiment_window_archiver() -> None:
                 sleep_to_boundary = 5 * 60
             await asyncio.sleep(sleep_to_boundary + 15)  # 多等 15 秒确保 tracker 的边界采样已写入
 
-            # 使用模块级 _current_window_end 计算窗口范围（Bug 1.10 修复）
-            if _current_window_end is None:
-                logger.debug("情绪窗口跳过 | tracker 尚未就绪（_current_window_end 为 None）")
+            # 修复：归档"刚关闭"的窗口，而非正在填充的当前窗口。
+            # 原实现读 _current_window_end（当前活跃窗口），但 archiver 在边界+15s 唤醒时
+            # tracker 通常已把 _current_window_end 推进到新窗口，导致查询到刚开始、
+            # 采样点不足(<8)的新窗口 → sentiment_windows 长期不增长。改用切换时的快照。
+            async with _state_lock:
+                closed_end = _last_closed_window_end
+                closed_entry = _last_closed_window_entry_price
+                closed_exit = _last_closed_window_exit_price
+            if closed_end is None:
+                logger.debug("情绪窗口跳过 | 尚无已关闭窗口（_last_closed_window_end 为 None）")
+                continue
+            if closed_end == _last_archived_window_end:
+                logger.debug("情绪窗口跳过 | 窗口 {} 已归档，等待下一次窗口切换", closed_end)
                 continue
 
-            end_ms = int(_current_window_end)
+            end_ms = int(closed_end)
             start_ms = end_ms - 5 * 60 * 1000
 
             async with async_session_factory() as db:
@@ -314,9 +339,10 @@ async def _sentiment_window_archiver() -> None:
                     curve_up = [{"t": s.timestamp, "v": s.up_pct} for s in samples if s.up_pct is not None]
                     curve_down = [{"t": s.timestamp, "v": s.down_pct} for s in samples if s.down_pct is not None]
 
-                    # Bug 1.7 修复：使用内存快照价格替代 kline 匹配
-                    entry_price = _window_entry_price  # 窗口开始时的 mid_price 快照
-                    exit_price = collector.store.mid_price  # 归档时实时 mid_price 快照
+                    # 修复：使用窗口切换时快照的价格。
+                    # entry_price = 已关闭窗口起点快照；exit_price = 切换时刻价（窗口终点）。
+                    entry_price = closed_entry
+                    exit_price = closed_exit if (closed_exit and closed_exit > 0) else collector.store.mid_price
 
                     # Fix #12: entry_price 异常时重试获取，避免生成无效归档记录
                     if not entry_price or entry_price <= 0:
@@ -383,8 +409,11 @@ async def _sentiment_window_archiver() -> None:
                                 window.id, start_ms, end_ms,
                             )
 
+                        _last_archived_window_end = end_ms  # 标记已归档，避免重复
+
                     except IntegrityError:
                         await db.rollback()
+                        _last_archived_window_end = end_ms  # 已存在也标记，停止重复尝试
                         logger.debug("情绪窗口已存在（跳过重复归档）| {}~{}", start_ms, end_ms)
 
                 # 清理 1 小时前的旧采样记录（防止 DB 无限增长）
@@ -408,9 +437,55 @@ async def _sentiment_window_archiver() -> None:
 # 应用生命周期
 # ============================================================
 
+def setup_logging() -> None:
+    """
+    配置 loguru 日志输出。
+
+    默认 loguru 仅输出到 stderr（会随容器重建丢失、无 rotation）。
+    此函数在 stderr 之外追加持久化文件输出：
+    - 按天切割（log_rotation），保留 log_retention
+    - enqueue=True：多协程/线程安全写入
+    - 文件级别始终 >= 配置的 log_level
+
+    settings.log_dir 为空字符串时跳过文件日志（仅保留默认 stderr）。
+    """
+    import os
+    import sys
+
+    level = settings.log_level.upper()
+
+    # 重置默认 handler，统一 stderr 格式与级别
+    logger.remove()
+    logger.add(sys.stderr, level=level, backtrace=False, diagnose=False)
+
+    if not settings.log_dir:
+        logger.warning("log_dir 为空，跳过文件日志（仅 stderr 输出）")
+        return
+
+    try:
+        os.makedirs(settings.log_dir, exist_ok=True)
+        log_path = os.path.join(settings.log_dir, "app.log")
+        logger.add(
+            log_path,
+            level=level,
+            rotation=settings.log_rotation,
+            retention=settings.log_retention,
+            compression="zip",
+            enqueue=True,
+            backtrace=False,
+            diagnose=False,
+            encoding="utf-8",
+        )
+        logger.info("文件日志已启用 | {} | 切割={} | 保留={}", log_path, settings.log_rotation, settings.log_retention)
+    except Exception as e:
+        # 文件日志失败不应阻断启动，退回 stderr
+        logger.warning("文件日志初始化失败，仅使用 stderr 输出: {}", e)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
+    setup_logging()
     logger.info("BTC 5min LLM 预测系统 V3 启动中...")
 
     # 1. 数据库表初始化

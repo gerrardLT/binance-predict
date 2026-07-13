@@ -155,11 +155,11 @@ function ChangeTypeBadge({ type }: { type: string }) {
 
 function Card({ title, children, className = '' }: { title: string; children: React.ReactNode; className?: string }) {
   return (
-    <div className={`bg-white rounded-xl border border-gray-200 shadow-sm ${className}`}>
-      <div className="px-5 py-3 border-b border-gray-100">
+    <div className={`bg-white rounded-xl border border-gray-200 shadow-sm flex flex-col ${className}`}>
+      <div className="px-4 py-2 border-b border-gray-100 shrink-0">
         <h2 className="text-sm font-semibold text-gray-700">{title}</h2>
       </div>
-      <div className="p-5">{children}</div>
+      <div className="p-4 flex-1 min-h-0 overflow-auto">{children}</div>
     </div>
   )
 }
@@ -431,165 +431,161 @@ function AgentTab() {
   const fmtTime = (s: string | null) => s ? new Date(s).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '--'
 
   return (
-    <div className="space-y-6">
-      {/* (a) Agent 状态 */}
-      <Card title="Agent 运行状态">
+    <div className="flex flex-col gap-3 h-[calc(100vh-60px)]">
+      {/* (a) Agent 状态（紧凑三指标横排） */}
+      <div className="bg-white rounded-xl border border-gray-200 shadow-sm px-5 py-2.5 shrink-0">
         {status ? (
-          <div className="grid grid-cols-3 gap-4">
-            <div className="text-center">
-              <div className="flex items-center justify-center gap-2 mb-1">
-                <StatusDot ok={status.scheduler_running} />
-                <span className="text-sm text-gray-600">调度器</span>
-              </div>
-              <div className={`text-lg font-bold ${status.scheduler_running ? 'text-green-600' : 'text-red-600'}`}>
+          <div className="flex items-center justify-around gap-4">
+            <div className="flex items-center gap-2">
+              <StatusDot ok={status.scheduler_running} />
+              <span className="text-xs text-gray-500">调度器</span>
+              <span className={`text-sm font-bold ${status.scheduler_running ? 'text-green-600' : 'text-red-600'}`}>
                 {status.scheduler_running ? '运行中' : '已停止'}
-              </div>
+              </span>
             </div>
-            <div className="text-center">
-              <div className="text-sm text-gray-600 mb-1">ACTIVE 模式数</div>
-              <div className="text-lg font-bold text-gray-900 font-mono">{status.active_pattern_count}</div>
+            <div className="h-4 w-px bg-gray-200" />
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-gray-500">ACTIVE 模式</span>
+              <span className="text-sm font-bold text-gray-900 font-mono">{status.active_pattern_count}</span>
             </div>
-            <div className="text-center">
-              <div className="text-sm text-gray-600 mb-1">累计验证次数</div>
-              <div className="text-lg font-bold text-gray-900 font-mono">{status.validate_counter}</div>
+            <div className="h-4 w-px bg-gray-200" />
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-gray-500">累计验证</span>
+              <span className="text-sm font-bold text-gray-900 font-mono">{status.validate_counter}</span>
             </div>
           </div>
         ) : <div className="text-gray-400 text-center text-sm">加载中...</div>}
-      </Card>
+      </div>
 
-      {/* (b) 模式库 */}
-      <Card title="模式库（Pattern Memory）">
-        <div className="flex justify-between items-center mb-3">
-          <div className="text-xs text-gray-400">LLM 自主发现/命名/进化的情绪曲线模式。点击行查看详情与进化轨迹。</div>
-          <button onClick={refreshPatterns} className="px-3 py-1 text-xs rounded bg-gray-100 text-gray-600 hover:bg-gray-200 transition">刷新</button>
-        </div>
-        {patterns.length === 0 ? (
-          <div className="text-center text-gray-400 py-8 text-sm">暂无模式（Agent 冷启动学习中，需积累情绪窗口后自动发现）</div>
-        ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-xs">
-              <thead>
-                <tr className="border-b border-gray-200 text-gray-500">
-                  <th className="py-2 px-2 text-left">模式名称</th>
-                  <th className="py-2 px-2 text-left">方向</th>
-                  <th className="py-2 px-2 text-left">状态</th>
-                  <th className="py-2 px-2 text-right">胜率</th>
-                  <th className="py-2 px-2 text-right">样本数</th>
-                  <th className="py-2 px-2 text-right">置信度</th>
-                </tr>
-              </thead>
-              <tbody>
-                {patterns.map(p => (
-                  <Fragment key={p.id}>
-                    <tr className="border-b border-gray-100 hover:bg-gray-50 cursor-pointer" onClick={() => setExpandedPattern(expandedPattern === p.id ? null : p.id)}>
-                      <td className="py-2 px-2 font-medium text-gray-800">{p.pattern_name}</td>
-                      <td className="py-2 px-2"><DirectionBadge direction={p.predicted_direction} /></td>
-                      <td className="py-2 px-2"><StatusBadge status={p.status} /></td>
-                      <td className="py-2 px-2 text-right font-mono">{(p.win_rate * 100).toFixed(1)}%</td>
-                      <td className="py-2 px-2 text-right font-mono">{p.sample_count}</td>
-                      <td className="py-2 px-2 text-right font-mono">{(p.confidence_score * 100).toFixed(0)}%</td>
-                    </tr>
-                    {expandedPattern === p.id && (
-                      <tr className="bg-gray-50">
-                        <td colSpan={6} className="py-3 px-4">
-                          <div className="text-xs text-gray-700 mb-2"><b>描述：</b>{p.description}</div>
-                          <div className="grid grid-cols-2 gap-3 mb-2">
-                            <div>
-                              <div className="text-xs font-bold text-gray-500 mb-1">曲线特征 (curve_features)</div>
-                              <pre className="text-xs bg-white p-2 rounded border border-gray-200 overflow-x-auto max-h-40">{JSON.stringify(p.curve_features, null, 2)}</pre>
-                            </div>
-                            <div>
-                              <div className="text-xs font-bold text-gray-500 mb-1">适用条件 (conditions)</div>
-                              <pre className="text-xs bg-white p-2 rounded border border-gray-200 overflow-x-auto max-h-40">{JSON.stringify(p.conditions, null, 2)}</pre>
-                            </div>
-                          </div>
-                          <button onClick={(e) => { e.stopPropagation(); toggleHistory(p.id) }} className="px-3 py-1 text-xs rounded bg-blue-100 text-blue-700 hover:bg-blue-200 transition">
-                            {historyFor === p.id ? '收起进化轨迹' : '查看进化轨迹'}
-                          </button>
-                          {historyFor === p.id && (
-                            <div className="mt-3">
-                              {loading ? <div className="text-xs text-gray-400">加载中...</div> : history.length === 0 ? (
-                                <div className="text-xs text-gray-400">暂无变更记录</div>
-                              ) : (
-                                <ul className="space-y-2">
-                                  {history.map(h => (
-                                    <li key={h.id} className="flex items-start gap-2 text-xs">
-                                      <span className="text-gray-400 shrink-0 font-mono">{fmtTime(h.created_at)}</span>
-                                      <ChangeTypeBadge type={h.change_type} />
-                                      <span className="px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 shrink-0">{h.phase}</span>
-                                      <span className="text-gray-700">{h.change_reason}</span>
-                                    </li>
-                                  ))}
-                                </ul>
-                              )}
-                            </div>
-                          )}
-                        </td>
-                      </tr>
-                    )}
-                  </Fragment>
-                ))}
-              </tbody>
-            </table>
+      {/* (b) 模式库 + 预测历史：左右并列 */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 min-h-0 flex-1">
+        {/* 模式库（Pattern Memory） */}
+        <Card title="模式库（Pattern Memory）">
+          <div className="flex justify-between items-center mb-2">
+            <div className="text-[11px] text-gray-400">LLM 自主发现的情绪曲线模式，点击行查看详情</div>
+            <button onClick={refreshPatterns} className="px-2 py-0.5 text-[11px] rounded bg-gray-100 text-gray-600 hover:bg-gray-200 transition">刷新</button>
           </div>
-        )}
-      </Card>
-
-      {/* (c) Agent 预测历史 */}
-      <Card title="Agent 预测历史">
-        <div className="flex justify-between items-center mb-3">
-          <select
-            value={dirFilter}
-            onChange={e => { setDirFilter(e.target.value); refreshPredictions(e.target.value || undefined) }}
-            className="px-3 py-1 border border-gray-200 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-blue-500"
-          >
-            <option value="">全部方向</option>
-            <option value="UP">UP</option>
-            <option value="DOWN">DOWN</option>
-            <option value="NO_TRADE">NO_TRADE</option>
-          </select>
-          <button onClick={() => refreshPredictions(dirFilter || undefined)} className="px-3 py-1 text-xs rounded bg-gray-100 text-gray-600 hover:bg-gray-200 transition">刷新</button>
-        </div>
-        {predictions.length === 0 ? (
-          <div className="text-center text-gray-400 py-8 text-sm">暂无预测记录</div>
-        ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-xs">
-              <thead>
-                <tr className="border-b border-gray-200 text-gray-500">
-                  <th className="py-2 px-2 text-left">时间</th>
-                  <th className="py-2 px-2 text-left">方向</th>
-                  <th className="py-2 px-2 text-right">置信度</th>
-                  <th className="py-2 px-2 text-left">匹配模式</th>
-                  <th className="py-2 px-2 text-left">入场时机</th>
-                  <th className="py-2 px-2 text-left">验证</th>
-                  <th className="py-2 px-2 text-left">交易</th>
-                </tr>
-              </thead>
-              <tbody>
-                {predictions.map(p => (
-                  <tr key={p.id} className="border-b border-gray-100 hover:bg-gray-50">
-                    <td className="py-2 px-2 text-gray-600 font-mono">{fmtTime(p.prediction_time)}</td>
-                    <td className="py-2 px-2"><DirectionBadge direction={p.predicted_direction} /></td>
-                    <td className="py-2 px-2 text-right font-mono">{(p.confidence * 100).toFixed(0)}%</td>
-                    <td className="py-2 px-2 text-gray-700">{p.matched_pattern_name || '—'}</td>
-                    <td className="py-2 px-2 text-gray-500">{p.entry_timing}</td>
-                    <td className="py-2 px-2">
-                      {p.is_correct === null ? <span className="text-gray-400">待验证</span> :
-                        p.is_correct ? <span className="text-green-600 font-bold">✓ {p.actual_outcome}</span> :
-                          <span className="text-red-600 font-bold">✗ {p.actual_outcome}</span>}
-                    </td>
-                    <td className="py-2 px-2">
-                      {p.trade_order_id != null ? <span className="text-orange-600">已下单#{p.trade_order_id}</span> :
-                        <span className="text-gray-400" title={p.skip_trade_reason || ''}>{p.skip_trade_reason ? '跳过' : '—'}</span>}
-                    </td>
+          {patterns.length === 0 ? (
+            <div className="text-center text-gray-400 py-10 text-sm">暂无模式（需积累情绪窗口后自动发现）</div>
+          ) : (
+            <div className="overflow-auto">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="border-b border-gray-200 text-gray-500">
+                    <th className="py-1.5 px-1.5 text-left">模式名称</th>
+                    <th className="py-1.5 px-1.5 text-left">方向</th>
+                    <th className="py-1.5 px-1.5 text-left">状态</th>
+                    <th className="py-1.5 px-1.5 text-right">胜率</th>
+                    <th className="py-1.5 px-1.5 text-right">样本</th>
+                    <th className="py-1.5 px-1.5 text-right">置信度</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {patterns.map(p => (
+                    <Fragment key={p.id}>
+                      <tr className="border-b border-gray-100 hover:bg-gray-50 cursor-pointer" onClick={() => setExpandedPattern(expandedPattern === p.id ? null : p.id)}>
+                        <td className="py-1.5 px-1.5 font-medium text-gray-800">{p.pattern_name}</td>
+                        <td className="py-1.5 px-1.5"><DirectionBadge direction={p.predicted_direction} /></td>
+                        <td className="py-1.5 px-1.5"><StatusBadge status={p.status} /></td>
+                        <td className="py-1.5 px-1.5 text-right font-mono">{(p.win_rate * 100).toFixed(1)}%</td>
+                        <td className="py-1.5 px-1.5 text-right font-mono">{p.sample_count}</td>
+                        <td className="py-1.5 px-1.5 text-right font-mono">{(p.confidence_score * 100).toFixed(0)}%</td>
+                      </tr>
+                      {expandedPattern === p.id && (
+                        <tr className="bg-gray-50">
+                          <td colSpan={6} className="py-2 px-3">
+                            <div className="text-xs text-gray-700 mb-2"><b>描述：</b>{p.description}</div>
+                            <div className="grid grid-cols-2 gap-2 mb-2">
+                              <div>
+                                <div className="text-[10px] font-bold text-gray-500 mb-1">曲线特征</div>
+                                <pre className="text-[10px] bg-white p-1.5 rounded border border-gray-200 overflow-x-auto max-h-32">{JSON.stringify(p.curve_features, null, 2)}</pre>
+                              </div>
+                              <div>
+                                <div className="text-[10px] font-bold text-gray-500 mb-1">适用条件</div>
+                                <pre className="text-[10px] bg-white p-1.5 rounded border border-gray-200 overflow-x-auto max-h-32">{JSON.stringify(p.conditions, null, 2)}</pre>
+                              </div>
+                            </div>
+                            <button onClick={(e) => { e.stopPropagation(); toggleHistory(p.id) }} className="px-2 py-0.5 text-[10px] rounded bg-blue-100 text-blue-700 hover:bg-blue-200 transition">
+                              {historyFor === p.id ? '收起进化轨迹' : '查看进化轨迹'}
+                            </button>
+                            {historyFor === p.id && (
+                              <div className="mt-2">
+                                {loading ? <div className="text-[10px] text-gray-400">加载中...</div> : history.length === 0 ? (
+                                  <div className="text-[10px] text-gray-400">暂无变更记录</div>
+                                ) : (
+                                  <ul className="space-y-1.5">
+                                    {history.map(h => (
+                                      <li key={h.id} className="flex items-start gap-1.5 text-[10px]">
+                                        <span className="text-gray-400 shrink-0 font-mono">{fmtTime(h.created_at)}</span>
+                                        <ChangeTypeBadge type={h.change_type} />
+                                        <span className="px-1 py-0.5 rounded bg-gray-100 text-gray-500 shrink-0">{h.phase}</span>
+                                        <span className="text-gray-700">{h.change_reason}</span>
+                                      </li>
+                                    ))}
+                                  </ul>
+                                )}
+                              </div>
+                            )}
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Card>
+
+        {/* Agent 预测历史 */}
+        <Card title="Agent 预测历史">
+          <div className="flex justify-between items-center mb-2">
+            <select
+              value={dirFilter}
+              onChange={e => { setDirFilter(e.target.value); refreshPredictions(e.target.value || undefined) }}
+              className="px-2 py-0.5 border border-gray-200 rounded-lg text-[11px] focus:outline-none focus:ring-2 focus:ring-blue-500"
+            >
+              <option value="">全部方向</option>
+              <option value="UP">UP</option>
+              <option value="DOWN">DOWN</option>
+              <option value="NO_TRADE">NO_TRADE</option>
+            </select>
+            <button onClick={() => refreshPredictions(dirFilter || undefined)} className="px-2 py-0.5 text-[11px] rounded bg-gray-100 text-gray-600 hover:bg-gray-200 transition">刷新</button>
           </div>
-        )}
-      </Card>
+          {predictions.length === 0 ? (
+            <div className="text-center text-gray-400 py-10 text-sm">暂无预测记录</div>
+          ) : (
+            <div className="overflow-auto">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="border-b border-gray-200 text-gray-500">
+                    <th className="py-1.5 px-1.5 text-left">时间</th>
+                    <th className="py-1.5 px-1.5 text-left">方向</th>
+                    <th className="py-1.5 px-1.5 text-right">置信度</th>
+                    <th className="py-1.5 px-1.5 text-left">匹配模式</th>
+                    <th className="py-1.5 px-1.5 text-left">验证</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {predictions.map(p => (
+                    <tr key={p.id} className="border-b border-gray-100 hover:bg-gray-50">
+                      <td className="py-1.5 px-1.5 text-gray-600 font-mono">{fmtTime(p.prediction_time)}</td>
+                      <td className="py-1.5 px-1.5"><DirectionBadge direction={p.predicted_direction} /></td>
+                      <td className="py-1.5 px-1.5 text-right font-mono">{(p.confidence * 100).toFixed(0)}%</td>
+                      <td className="py-1.5 px-1.5 text-gray-700 truncate max-w-[120px]" title={p.matched_pattern_name || ''}>{p.matched_pattern_name || '—'}</td>
+                      <td className="py-1.5 px-1.5">
+                        {p.is_correct === null ? <span className="text-gray-400">待验证</span> :
+                          p.is_correct ? <span className="text-green-600 font-bold">✓ {p.actual_outcome}</span> :
+                            <span className="text-red-600 font-bold">✗ {p.actual_outcome}</span>}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Card>
+      </div>
     </div>
   )
 }

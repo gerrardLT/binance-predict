@@ -57,6 +57,10 @@ class Settings(BaseSettings):
     # --- 服务配置 ---
     api_port: int = 8000
     log_level: str = "INFO"
+    # 日志文件目录（容器内路径，通过挂载持久化到宿主机）。空字符串禁用文件日志。
+    log_dir: str = "logs"
+    log_rotation: str = "00:00"  # 每天零点切割
+    log_retention: str = "14 days"  # 保留 14 天
 
     # --- 安全配置 ---
     # CORS 允许的前端源（逗号分隔，如 "http://localhost:5173,https://example.com"）。
