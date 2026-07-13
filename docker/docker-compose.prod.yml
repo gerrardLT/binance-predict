@@ -12,7 +12,6 @@
 services:
   db:
     image: timescale/timescaledb:latest-pg16
-    container_name: bp-db
     environment:
       POSTGRES_USER: ${DB_USER:-postgres}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
@@ -32,7 +31,6 @@ services:
 
   backend:
     image: ghcr.io/gerrardlt/binance-predict-backend:latest
-    container_name: bp-backend
     ports:
       - "127.0.0.1:8002:8000"  # 仅本地可访问（由 Nginx 反向代理）
     env_file:
@@ -48,7 +46,6 @@ services:
 
   frontend:
     image: ghcr.io/gerrardlt/binance-predict-frontend:latest
-    container_name: bp-frontend
     ports:
       - "8082:80"
     depends_on:

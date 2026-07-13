@@ -26,8 +26,72 @@ depends_on = None
 
 
 def upgrade() -> None:
-    """升级：建 pattern_memory / agent_predictions / pattern_change_log 三张表，
+    """升级：建基础表（trade_orders / prediction_market_samples / sentiment_windows）
+    + Agent Loop 三张表（pattern_memory / agent_predictions / pattern_change_log），
     并为 trade_orders 追加 agent_prediction_id 列与循环外键。"""
+
+    # ------------------------------------------------------------------
+    # 0a) 交易订单表 trade_orders
+    # ------------------------------------------------------------------
+    op.create_table(
+        "trade_orders",
+        sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
+        sa.Column("prediction_id", sa.Integer(), nullable=True, comment="关联的预测 ID（旧 K 线决策路径，退役后不再写入）"),
+        sa.Column("market_id", sa.BigInteger(), nullable=True, comment="Binance 预测市场 ID"),
+        sa.Column("token_id", sa.String(length=50), nullable=True, comment="Outcome Token ID"),
+        sa.Column("side", sa.String(length=10), nullable=False, comment="BUY | SELL"),
+        sa.Column("amount_in", sa.String(length=50), nullable=False, comment="输入金额（wei 格式）"),
+        sa.Column("amount_out", sa.String(length=50), nullable=True, comment="输出金额（wei 格式）"),
+        sa.Column("order_id", sa.String(length=50), nullable=True, comment="Binance 返回的订单 ID"),
+        sa.Column("status", sa.String(length=20), nullable=False, server_default="PENDING", comment="PENDING | FILLED | FAILED"),
+        sa.Column("quote_json", postgresql.JSONB(), nullable=True, comment="报价响应 JSON"),
+        sa.Column("error_message", sa.Text(), nullable=True, comment="错误信息（仅 FAILED 时）"),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index("ix_trade_orders_prediction_id", "trade_orders", ["prediction_id"], unique=False)
+
+    # ------------------------------------------------------------------
+    # 0b) 预测市场情绪采样表 prediction_market_samples
+    # ------------------------------------------------------------------
+    op.create_table(
+        "prediction_market_samples",
+        sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
+        sa.Column("timestamp", sa.BigInteger(), nullable=False, comment="毫秒时间戳"),
+        sa.Column("up_price", sa.Float(), nullable=True, comment="UP token 价格"),
+        sa.Column("down_price", sa.Float(), nullable=True, comment="DOWN token 价格"),
+        sa.Column("up_pct", sa.Float(), nullable=True, comment="UP 百分比"),
+        sa.Column("down_pct", sa.Float(), nullable=True, comment="DOWN 百分比"),
+        sa.Column("participants", sa.Integer(), nullable=True, comment="参与人数"),
+        sa.Column("trade_volume", sa.Float(), nullable=True, comment="交易量"),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index("ix_pm_samples_timestamp", "prediction_market_samples", ["timestamp"], unique=False)
+
+    # ------------------------------------------------------------------
+    # 0c) 情绪窗口表 sentiment_windows
+    # ------------------------------------------------------------------
+    op.create_table(
+        "sentiment_windows",
+        sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
+        sa.Column("start_time", sa.BigInteger(), nullable=False, comment="窗口开始时间戳（ms，5 分钟整点）"),
+        sa.Column("end_time", sa.BigInteger(), nullable=False, comment="窗口结束时间戳（ms）"),
+        sa.Column("curve_up_pct", postgresql.JSONB(), nullable=True, comment="UP% 时间序列 [{t, v}, ...]"),
+        sa.Column("curve_down_pct", postgresql.JSONB(), nullable=True, comment="DOWN% 时间序列 [{t, v}, ...]"),
+        sa.Column("sample_count", sa.Integer(), nullable=False, server_default="0", comment="窗口内采样点数"),
+        sa.Column("entry_price", sa.Float(), nullable=True, comment="窗口开始时 BTC 价格"),
+        sa.Column("exit_price", sa.Float(), nullable=True, comment="窗口结束时 BTC 价格"),
+        sa.Column("actual_return", sa.Float(), nullable=True, comment="实际收益率 (exit/entry - 1)"),
+        sa.Column("outcome", sa.String(length=10), nullable=True, comment="实际结果: UP / DOWN / NOISE"),
+        sa.Column("avg_participants", sa.Float(), nullable=True, comment="窗口内平均参与人数"),
+        sa.Column("avg_trade_volume", sa.Float(), nullable=True, comment="窗口内平均交易量"),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("start_time", "end_time", name="uq_sw_start_end"),
+    )
+    op.create_index("ix_sw_start_time", "sentiment_windows", ["start_time"], unique=False)
+    op.create_index("ix_sw_outcome", "sentiment_windows", ["outcome"], unique=False)
 
     # ------------------------------------------------------------------
     # 1) 模式记忆表 pattern_memory（Req 1.1/1.2/1.3）
@@ -165,7 +229,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     """降级：逆序回滚。先解开 trade_orders→agent_predictions 循环外键，
-    再删列，最后按依赖逆序删除三张表（连同各自索引）。"""
+    再删列，最后按依赖逆序删除所有表（连同各自索引）。"""
 
     # 1) 先按名 DROP 循环外键，解开 trade_orders ↔ agent_predictions 的环
     op.drop_constraint("fk_trade_orders_agent_prediction_id", "trade_orders", type_="foreignkey")
@@ -187,3 +251,14 @@ def downgrade() -> None:
     op.drop_index("ix_pattern_memory_status", table_name="pattern_memory")
     op.drop_index("ix_pattern_memory_name", table_name="pattern_memory")
     op.drop_table("pattern_memory")
+
+    # 6) 基础表（逆序删除，先删有外键引用的表）
+    op.drop_index("ix_sw_outcome", table_name="sentiment_windows")
+    op.drop_index("ix_sw_start_time", table_name="sentiment_windows")
+    op.drop_table("sentiment_windows")
+
+    op.drop_index("ix_pm_samples_timestamp", table_name="prediction_market_samples")
+    op.drop_table("prediction_market_samples")
+
+    op.drop_index("ix_trade_orders_prediction_id", table_name="trade_orders")
+    op.drop_table("trade_orders")

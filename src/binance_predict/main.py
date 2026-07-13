@@ -411,7 +411,7 @@ async def _sentiment_window_archiver() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
-    logger.info("BTC 5min LLM 预测系统 V2 启动中...")
+    logger.info("BTC 5min LLM 预测系统 V3 启动中...")
 
     # 1. 数据库表初始化
     # 优先使用 Alembic 迁移（alembic upgrade head），若无迁移则 fallback 到 create_all
@@ -487,9 +487,9 @@ async def lifespan(app: FastAPI):
 # ============================================================
 
 app = FastAPI(
-    title="BTC 5min LLM 预测系统 V2",
+    title="BTC 5min LLM 预测系统 V3",
     description="LLM 驱动的 BTC 5 分钟方向预测，支持用户自定义规则注入",
-    version="2.0.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 

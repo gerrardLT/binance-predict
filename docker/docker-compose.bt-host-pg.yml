@@ -19,3 +19,11 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"  # 容器内访问宿主机
     restart: unless-stopped
+    networks:
+      - app-network
+
+volumes: {}
+
+networks:
+  app-network:
+    driver: bridge

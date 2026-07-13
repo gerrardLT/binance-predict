@@ -1,5 +1,5 @@
 """
-BTC 5min LLM 预测系统 V2 - 启动入口
+BTC 5min LLM 预测系统 V3 - 启动入口
 
 通过 uvicorn 启动 FastAPI 应用，端口从 .env 读取（默认 8000）。
 """

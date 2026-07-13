@@ -15,7 +15,6 @@ from collections import deque
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-import pytest_asyncio
 from hypothesis import given, settings as hyp_settings, assume
 from hypothesis import strategies as st
 
@@ -164,8 +163,8 @@ async def test_normal_archive_preservation(sample_count):
         samples.append(sample)
 
     # Replicate the archiver's curve building logic (from main.py)
-    # This is the CURRENT unfixed threshold (3), but we test with >= 8
-    if len(samples) < 3:
+    # 归档门槛 = 8（与 main.py _sentiment_window_archiver 一致，Bug 1.6 修复）
+    if len(samples) < 8:
         archived = False
     else:
         # Build curve data (same as archiver)

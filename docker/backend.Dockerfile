@@ -57,4 +57,5 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:8000/api/health || exit 1
 
 # 启动：先执行数据库迁移，再启动应用
-CMD ["sh", "-c", "alembic upgrade head && python main.py"]
+# 迁移失败时输出详细错误并退出，避免静默失败
+CMD ["sh", "-c", "if alembic upgrade head; then exec python main.py; else echo 'ERROR: alembic migration failed'; exit 1; fi"]
