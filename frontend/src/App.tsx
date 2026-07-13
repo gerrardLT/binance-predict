@@ -116,6 +116,18 @@ interface LLMTraceDetail extends LLMTraceSummary {
   assistant_output: Record<string, unknown> | null
 }
 
+interface DeepLearnDiscovery {
+  operation: 'CREATE' | 'UPDATE'
+  target_pattern_id: number | null
+  pattern_name: string
+  description: string
+  curve_features: Record<string, unknown>
+  conditions: Record<string, unknown>
+  predicted_direction: 'UP' | 'DOWN'
+  confidence_score: number
+  change_reason: string
+}
+
 // ============================================================
 // API helpers（仅保留路径B/C相关端点）
 // ============================================================
@@ -134,6 +146,14 @@ const api = {
     fetch('/api/llm/traces' + (phase ? `?phase=${phase}` : '')).then(r => r.json()),
   getLLMTraceDetail: (id: number) =>
     fetch(`/api/llm/traces/${id}`).then(r => r.json()),
+  triggerDeepLearn: (maxWindows = 100) =>
+    fetch(`/api/sentiment/agent/deep-learn?max_windows=${maxWindows}`, { method: 'POST' }).then(r => r.json()),
+  commitDeepLearn: (discoveries: DeepLearnDiscovery[]) =>
+    fetch('/api/sentiment/agent/deep-learn/commit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ discoveries }),
+    }).then(r => r.json()),
 }
 
 // ============================================================
@@ -417,6 +437,7 @@ function AgentTab() {
   const [history, setHistory] = useState<PatternChangeLog[]>([])
   const [historyFor, setHistoryFor] = useState<number | null>(null)
   const [loading, setLoading] = useState(false)
+  const [dlOpen, setDlOpen] = useState(false)
 
   const refreshStatus = useCallback(() => {
     api.getAgentStatus().then(setStatus).catch(() => {})
@@ -459,9 +480,9 @@ function AgentTab() {
   return (
     <div className="flex flex-col gap-3 h-[calc(100vh-60px)]">
       {/* (a) Agent 状态（紧凑三指标横排） */}
-      <div className="bg-white rounded-xl border border-gray-200 shadow-sm px-5 py-2.5 shrink-0">
+      <div className="bg-white rounded-xl border border-gray-200 shadow-sm px-5 py-2.5 shrink-0 flex items-center gap-4">
         {status ? (
-          <div className="flex items-center justify-around gap-4">
+          <div className="flex items-center justify-around gap-4 flex-1">
             <div className="flex items-center gap-2">
               <StatusDot ok={status.scheduler_running} />
               <span className="text-xs text-gray-500">调度器</span>
@@ -480,7 +501,14 @@ function AgentTab() {
               <span className="text-sm font-bold text-gray-900 font-mono">{status.validate_counter}</span>
             </div>
           </div>
-        ) : <div className="text-gray-400 text-center text-sm">加载中...</div>}
+        ) : <div className="text-gray-400 text-center text-sm flex-1">加载中...</div>}
+        <button
+          onClick={() => setDlOpen(true)}
+          className="shrink-0 px-3 py-1.5 text-xs font-semibold text-white bg-purple-600 rounded-lg hover:bg-purple-700 transition"
+          title="全量历史深度分析：预览发现结果，审核后写入模式库"
+        >
+          🔬 深度学习
+        </button>
       </div>
 
       {/* (b) 模式库 + 预测历史：左右并列 */}
@@ -612,6 +640,9 @@ function AgentTab() {
           )}
         </Card>
       </div>
+
+      {/* 深度学习：预览 + 审核 + 提交（模态） */}
+      {dlOpen && <DeepLearnModal onClose={() => setDlOpen(false)} onCommitted={refreshPatterns} />}
     </div>
   )
 }
@@ -789,6 +820,194 @@ function TraceSection({ title, text, collapsedHeight = false }: { title: string;
       <pre className={`text-[10px] bg-white p-1.5 rounded border border-gray-200 overflow-auto whitespace-pre-wrap break-words ${collapsedHeight ? 'max-h-40' : 'max-h-64'}`}>
         {text}
       </pre>
+    </div>
+  )
+}
+
+// ============================================================
+// 深度学习模态：全量分析预览 → 勾选审核 → 写入模式库
+// ============================================================
+
+function DeepLearnModal({ onClose, onCommitted }: { onClose: () => void; onCommitted: () => void }) {
+  const [maxWindows, setMaxWindows] = useState(100)
+  const [phase, setPhase] = useState<'idle' | 'analyzing' | 'review' | 'committing'>('idle')
+  const [reasoning, setReasoning] = useState('')
+  const [discoveries, setDiscoveries] = useState<DeepLearnDiscovery[]>([])
+  const [checked, setChecked] = useState<Set<number>>(new Set())
+  const [msg, setMsg] = useState('')
+  const [expanded, setExpanded] = useState<number | null>(null)
+
+  const runAnalyze = async () => {
+    setPhase('analyzing'); setMsg('')
+    try {
+      const res = await api.triggerDeepLearn(maxWindows)
+      if (res.status === 'ok') {
+        const ds: DeepLearnDiscovery[] = Array.isArray(res.discoveries) ? res.discoveries : []
+        setReasoning(res.reasoning || '')
+        setDiscoveries(ds)
+        setChecked(new Set(ds.map((_, i) => i)))  // 默认全选
+        setPhase('review')
+        if (ds.length === 0) setMsg('LLM 未发现任何新模式（本次已产生一条 DEEP_LEARN 轨迹）')
+      } else if (res.status === 'busy') {
+        setMsg(res.message || '已有深度分析任务在执行，请稍后重试'); setPhase('idle')
+      } else {
+        setMsg(res.message || '分析失败'); setPhase('idle')
+      }
+    } catch (e) {
+      setMsg(`请求失败: ${(e as Error).message}`); setPhase('idle')
+    }
+  }
+
+  const toggle = (i: number) => {
+    setChecked(prev => {
+      const next = new Set(prev)
+      if (next.has(i)) next.delete(i); else next.add(i)
+      return next
+    })
+  }
+
+  const runCommit = async () => {
+    const selected = discoveries.filter((_, i) => checked.has(i))
+    if (selected.length === 0) { setMsg('请至少勾选一条模式'); return }
+    setPhase('committing'); setMsg('')
+    try {
+      const res = await api.commitDeepLearn(selected)
+      if (res.status === 'ok') {
+        setMsg(`✅ 已写入 ${res.written} 条模式到模式库`)
+        onCommitted()
+        setDiscoveries([]); setChecked(new Set())
+        setPhase('review')
+      } else if (res.status === 'busy') {
+        setMsg(res.message || '写入冲突，请重试'); setPhase('review')
+      } else {
+        setMsg(res.message || '写入失败'); setPhase('review')
+      }
+    } catch (e) {
+      setMsg(`请求失败: ${(e as Error).message}`); setPhase('review')
+    }
+  }
+
+  const selectedCount = checked.size
+
+  return (
+    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
+      <div
+        className="bg-white rounded-xl shadow-2xl w-full max-w-3xl max-h-[85vh] flex flex-col"
+        onClick={e => e.stopPropagation()}
+      >
+        {/* 头部 */}
+        <div className="px-5 py-3 border-b border-gray-200 flex items-center justify-between shrink-0">
+          <div>
+            <h2 className="text-sm font-bold text-gray-800">🔬 深度模式学习</h2>
+            <p className="text-[11px] text-gray-400 mt-0.5">全量历史窗口深度分析，预览发现结果，勾选后写入模式库</p>
+          </div>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-700 text-xl leading-none px-1">✕</button>
+        </div>
+
+        {/* 主体 */}
+        <div className="flex-1 min-h-0 overflow-auto p-5 space-y-4">
+          {/* 分析参数 */}
+          <div className="flex items-center gap-3">
+            <label className="text-xs text-gray-600">分析窗口数上限</label>
+            <input
+              type="number"
+              min={1}
+              value={maxWindows}
+              onChange={e => setMaxWindows(Math.max(1, Number(e.target.value) || 1))}
+              disabled={phase === 'analyzing' || phase === 'committing'}
+              className="w-24 px-2 py-1 border border-gray-200 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-purple-500 disabled:bg-gray-100"
+            />
+            <button
+              onClick={runAnalyze}
+              disabled={phase === 'analyzing' || phase === 'committing'}
+              className="px-3 py-1.5 text-xs font-semibold text-white bg-purple-600 rounded-lg hover:bg-purple-700 disabled:opacity-50 transition"
+            >
+              {phase === 'analyzing' ? '🔄 LLM 分析中...' : '开始分析'}
+            </button>
+          </div>
+
+          {/* 推理过程 */}
+          {reasoning && (
+            <div>
+              <div className="text-[11px] font-bold text-gray-500 mb-1">🧠 分析推理</div>
+              <pre className="text-[11px] text-gray-700 bg-gray-50 p-2 rounded border border-gray-200 overflow-auto max-h-40 whitespace-pre-wrap break-words">{reasoning}</pre>
+            </div>
+          )}
+
+          {/* 发现列表 */}
+          {discoveries.length > 0 && (
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <div className="text-[11px] font-bold text-gray-500">
+                  发现 {discoveries.length} 条 · 已选 {selectedCount} 条
+                </div>
+                <div className="flex gap-2">
+                  <button onClick={() => setChecked(new Set(discoveries.map((_, i) => i)))} className="text-[10px] px-2 py-0.5 rounded bg-gray-100 text-gray-600 hover:bg-gray-200">全选</button>
+                  <button onClick={() => setChecked(new Set())} className="text-[10px] px-2 py-0.5 rounded bg-gray-100 text-gray-600 hover:bg-gray-200">清空</button>
+                </div>
+              </div>
+              <div className="space-y-2">
+                {discoveries.map((d, i) => (
+                  <div key={i} className="border border-gray-200 rounded-lg">
+                    <label className="flex gap-2 items-start p-2.5 cursor-pointer hover:bg-gray-50">
+                      <input type="checkbox" checked={checked.has(i)} onChange={() => toggle(i)} className="mt-1 accent-purple-600" />
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 mb-1 flex-wrap">
+                          <ChangeTypeBadge type={d.operation} />
+                          <span className="font-semibold text-sm text-gray-800">{d.pattern_name}</span>
+                          <DirectionBadge direction={d.predicted_direction} />
+                          <span className="text-[10px] text-gray-500 font-mono">conf {(d.confidence_score * 100).toFixed(0)}%</span>
+                          {d.operation === 'UPDATE' && d.target_pattern_id != null && (
+                            <span className="text-[10px] text-amber-600 font-mono">→ 更新 #{d.target_pattern_id}</span>
+                          )}
+                        </div>
+                        <div className="text-xs text-gray-600 mb-1">{d.description}</div>
+                        <div className="text-[11px] text-gray-500"><b>理由：</b>{d.change_reason}</div>
+                        <button
+                          type="button"
+                          onClick={e => { e.preventDefault(); setExpanded(expanded === i ? null : i) }}
+                          className="mt-1 text-[10px] text-blue-600 hover:underline"
+                        >
+                          {expanded === i ? '收起特征/条件' : '查看特征/条件'}
+                        </button>
+                        {expanded === i && (
+                          <div className="grid grid-cols-2 gap-2 mt-1.5">
+                            <div>
+                              <div className="text-[10px] font-bold text-gray-400 mb-0.5">曲线特征</div>
+                              <pre className="text-[10px] bg-gray-50 p-1.5 rounded border border-gray-200 overflow-auto max-h-32">{JSON.stringify(d.curve_features, null, 2)}</pre>
+                            </div>
+                            <div>
+                              <div className="text-[10px] font-bold text-gray-400 mb-0.5">适用条件</div>
+                              <pre className="text-[10px] bg-gray-50 p-1.5 rounded border border-gray-200 overflow-auto max-h-32">{JSON.stringify(d.conditions, null, 2)}</pre>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    </label>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* 底部 */}
+        <div className="px-5 py-3 border-t border-gray-200 flex items-center justify-between gap-3 shrink-0">
+          <span className={`text-xs ${msg.startsWith('✅') ? 'text-green-600' : 'text-gray-500'}`}>{msg}</span>
+          <div className="flex gap-2 shrink-0">
+            <button onClick={onClose} className="px-3 py-1.5 text-xs font-medium text-gray-600 bg-gray-100 rounded-lg hover:bg-gray-200 transition">关闭</button>
+            {discoveries.length > 0 && (
+              <button
+                onClick={runCommit}
+                disabled={phase === 'committing' || selectedCount === 0}
+                className="px-3 py-1.5 text-xs font-semibold text-white bg-green-600 rounded-lg hover:bg-green-700 disabled:opacity-50 transition"
+              >
+                {phase === 'committing' ? '写入中...' : `写入选中的 ${selectedCount} 条模式`}
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
     </div>
   )
 }
