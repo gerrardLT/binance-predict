@@ -213,43 +213,55 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen bg-gray-50">
-      <header className="bg-white border-b border-gray-200 sticky top-0 z-10">
-        <div className="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <h1 className="text-lg font-bold text-gray-900">BTC 情绪曲线自进化 Agent 系统 V3</h1>
+    <div className="min-h-screen bg-gray-50 flex flex-col">
+      <header className="bg-white/90 backdrop-blur border-b border-gray-200 sticky top-0 z-10">
+        <div className="max-w-6xl mx-auto px-4 py-2 flex items-center justify-between gap-4">
+          {/* 左上角：紧凑标题 */}
+          <div className="flex items-center gap-2 shrink-0">
+            <span className="inline-block w-1.5 h-4 bg-blue-500 rounded-full" />
+            <h1 className="text-sm font-bold text-gray-800 whitespace-nowrap">BTC 情绪 Agent V3</h1>
+          </div>
+
+          {/* 中部：标签切换 */}
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => setTab('market')}
+              className={`px-3 py-1 text-xs font-medium rounded-md transition ${
+                tab === 'market' ? 'bg-blue-50 text-blue-600' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-50'
+              }`}
+            >
+              市场情绪
+            </button>
+            <button
+              onClick={() => setTab('agent')}
+              className={`px-3 py-1 text-xs font-medium rounded-md transition ${
+                tab === 'agent' ? 'bg-blue-50 text-blue-600' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-50'
+              }`}
+            >
+              Agent 自进化
+            </button>
+          </div>
+
+          {/* 右上角：行情 + 价格 */}
+          <div className="flex items-center gap-3 text-xs text-gray-500 shrink-0">
             {health && (
-              <div className="flex items-center gap-2 text-xs text-gray-500">
-                <StatusDot ok={health.ws_spot_connected} />
-                <span>现货</span>
-                <StatusDot ok={health.rest_api_ok} />
-                <span>REST</span>
-              </div>
+              <>
+                <div className="flex items-center gap-1.5">
+                  <StatusDot ok={health.ws_spot_connected} />
+                  <span className="text-[10px]">现货</span>
+                  <StatusDot ok={health.rest_api_ok} />
+                  <span className="text-[10px]">REST</span>
+                </div>
+                <div className="font-mono text-gray-700 font-semibold">
+                  ${health.mid_price > 0 ? health.mid_price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '--'}
+                </div>
+              </>
             )}
           </div>
-          {health && (
-            <div className="text-xs text-gray-400 font-mono">
-              {health.symbol} ${health.mid_price > 0 ? health.mid_price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '--'}
-            </div>
-          )}
-        </div>
-        <div className="max-w-6xl mx-auto px-4 flex gap-4">
-          <button
-            onClick={() => setTab('market')}
-            className={`pb-2 text-sm font-medium border-b-2 transition ${tab === 'market' ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700'}`}
-          >
-            市场情绪
-          </button>
-          <button
-            onClick={() => setTab('agent')}
-            className={`pb-2 text-sm font-medium border-b-2 transition ${tab === 'agent' ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700'}`}
-          >
-            Agent 自进化
-          </button>
         </div>
       </header>
 
-      <main className="max-w-6xl mx-auto px-4 py-6">
+      <main className="max-w-6xl w-full mx-auto px-4 py-4 flex-1">
         {tab === 'market' && (
           <div className="space-y-6">
             <Card title="BTC 5分钟内涨或跌（Binance Prediction Markets）">
@@ -271,7 +283,7 @@ export default function App() {
               )}
               {pmPoints.length > 0 ? (
                 <>
-                  <ResponsiveContainer width="100%" height={400}>
+                  <ResponsiveContainer width="100%" height={520}>
                     <AreaChart data={pmPoints.map(d => ({
                       time: new Date(d.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
                       up_pct: d.up_pct,
