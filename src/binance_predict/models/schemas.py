@@ -146,3 +146,30 @@ class CommitDeepLearnRequest(BaseModel):
         default_factory=list,
         description="用户确认后的发现列表（来自 POST /api/sentiment/agent/deep-learn 的返回值）"
     )
+
+
+# ============================================================
+# LLM 调用轨迹（前端「LLM 轨迹」面板）
+# ============================================================
+
+class LLMTraceSummary(BaseModel):
+    """LLM 轨迹列表项（不含完整 prompt，供 5s 轮询列表使用）。"""
+
+    id: int = Field(description="轨迹唯一标识")
+    phase: str = Field(description="LEARN | DEEP_LEARN | PREDICT | EVOLVE")
+    model: str = Field(description="调用的模型名")
+    reasoning: str | None = Field(default=None, description="LLM 推理文本")
+    result_summary: str | None = Field(default=None, description="关键结论摘要")
+    prompt_tokens: int | None = Field(default=None, description="输入 token")
+    completion_tokens: int | None = Field(default=None, description="输出 token")
+    estimated_cost_yuan: float | None = Field(default=None, description="估算成本（元）")
+    latency_s: float | None = Field(default=None, description="调用耗时（秒）")
+    created_at: datetime | None = Field(default=None, description="调用时间 UTC")
+
+
+class LLMTraceRecord(LLMTraceSummary):
+    """LLM 轨迹完整详情（含系统提示词、用户输入与完整输出）。"""
+
+    system_prompt: str = Field(default="", description="完整系统提示词")
+    user_message: str = Field(default="", description="完整用户输入")
+    assistant_output: dict | None = Field(default=None, description="LLM 结构化输出完整 JSON")

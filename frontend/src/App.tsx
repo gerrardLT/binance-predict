@@ -97,6 +97,25 @@ interface PatternChangeLog {
   created_at: string | null
 }
 
+interface LLMTraceSummary {
+  id: number
+  phase: string
+  model: string
+  reasoning: string | null
+  result_summary: string | null
+  prompt_tokens: number | null
+  completion_tokens: number | null
+  estimated_cost_yuan: number | null
+  latency_s: number | null
+  created_at: string | null
+}
+
+interface LLMTraceDetail extends LLMTraceSummary {
+  system_prompt: string
+  user_message: string
+  assistant_output: Record<string, unknown> | null
+}
+
 // ============================================================
 // API helpers（仅保留路径B/C相关端点）
 // ============================================================
@@ -111,6 +130,10 @@ const api = {
     fetch('/api/sentiment/agent/predictions' + (direction ? `?direction=${direction}` : '')).then(r => r.json()),
   getPatternHistory: (id: number) =>
     fetch(`/api/sentiment/agent/patterns/${id}/history`).then(r => r.json()),
+  getLLMTraces: (phase?: string) =>
+    fetch('/api/llm/traces' + (phase ? `?phase=${phase}` : '')).then(r => r.json()),
+  getLLMTraceDetail: (id: number) =>
+    fetch(`/api/llm/traces/${id}`).then(r => r.json()),
 }
 
 // ============================================================
@@ -374,6 +397,9 @@ export default function App() {
 
         {tab === 'agent' && <AgentTab />}
       </main>
+
+      {/* 右侧悬浮：LLM 轨迹面板（全局可见，5 秒轮询） */}
+      <LLMTracePanel />
     </div>
   )
 }
@@ -586,6 +612,183 @@ function AgentTab() {
           )}
         </Card>
       </div>
+    </div>
+  )
+}
+
+// ============================================================
+// LLM 轨迹面板（右侧悬浮抽屉，5 秒轮询）
+// ============================================================
+
+const PHASE_META: Record<string, { label: string; cls: string }> = {
+  LEARN: { label: 'LEARN', cls: 'bg-blue-100 text-blue-700' },
+  DEEP_LEARN: { label: 'DEEP', cls: 'bg-purple-100 text-purple-700' },
+  PREDICT: { label: 'PREDICT', cls: 'bg-green-100 text-green-700' },
+  EVOLVE: { label: 'EVOLVE', cls: 'bg-amber-100 text-amber-700' },
+}
+
+function PhaseBadge({ phase }: { phase: string }) {
+  const m = PHASE_META[phase] || { label: phase, cls: 'bg-gray-100 text-gray-600' }
+  return <span className={`px-1.5 py-0.5 text-[10px] font-bold rounded ${m.cls}`}>{m.label}</span>
+}
+
+function LLMTracePanel() {
+  const [open, setOpen] = useState(false)
+  const [traces, setTraces] = useState<LLMTraceSummary[]>([])
+  const [phaseFilter, setPhaseFilter] = useState<string>('')
+  const [expandedId, setExpandedId] = useState<number | null>(null)
+  const [detail, setDetail] = useState<LLMTraceDetail | null>(null)
+  const [loadingDetail, setLoadingDetail] = useState(false)
+
+  const refresh = useCallback(() => {
+    api.getLLMTraces(phaseFilter || undefined)
+      .then(d => setTraces(Array.isArray(d) ? d : []))
+      .catch(() => {})
+  }, [phaseFilter])
+
+  // 仅在面板打开时轮询（5 秒）
+  useEffect(() => {
+    if (!open) return
+    refresh()
+    const timer = setInterval(refresh, 5000)
+    return () => clearInterval(timer)
+  }, [open, refresh])
+
+  const toggleDetail = async (id: number) => {
+    if (expandedId === id) {
+      setExpandedId(null)
+      setDetail(null)
+      return
+    }
+    setExpandedId(id)
+    setDetail(null)
+    setLoadingDetail(true)
+    try {
+      const d = await api.getLLMTraceDetail(id)
+      setDetail(d && typeof d === 'object' && 'id' in d ? d : null)
+    } catch {
+      setDetail(null)
+    } finally {
+      setLoadingDetail(false)
+    }
+  }
+
+  const fmtTime = (s: string | null) =>
+    s ? new Date(s).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '--'
+
+  return (
+    <>
+      {/* 悬浮触发按钮（右侧边缘，竖排文字） */}
+      {!open && (
+        <button
+          onClick={() => setOpen(true)}
+          className="fixed right-0 top-1/2 -translate-y-1/2 z-40 bg-indigo-600 text-white text-xs font-bold px-2 py-3 rounded-l-lg shadow-lg hover:bg-indigo-700 transition"
+          style={{ writingMode: 'vertical-rl' }}
+          title="查看 LLM 调用轨迹"
+        >
+          🧠 LLM 轨迹
+        </button>
+      )}
+
+      {/* 右侧抽屉 */}
+      <div
+        className={`fixed top-0 right-0 h-screen w-[440px] max-w-[92vw] bg-white shadow-2xl border-l border-gray-200 z-50 flex flex-col transition-transform duration-300 ${open ? 'translate-x-0' : 'translate-x-full'}`}
+      >
+        {/* 头部 */}
+        <div className="px-4 py-2.5 border-b border-gray-200 flex items-center justify-between shrink-0">
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-bold text-gray-800">🧠 LLM 调用轨迹</span>
+            <span className="text-[10px] text-gray-400">每 5 秒刷新</span>
+          </div>
+          <button onClick={() => setOpen(false)} className="text-gray-400 hover:text-gray-700 text-lg leading-none px-1">✕</button>
+        </div>
+
+        {/* 阶段筛选 */}
+        <div className="px-4 py-2 border-b border-gray-100 flex items-center gap-1 flex-wrap shrink-0">
+          {['', 'LEARN', 'DEEP_LEARN', 'PREDICT', 'EVOLVE'].map(p => (
+            <button
+              key={p || 'ALL'}
+              onClick={() => { setPhaseFilter(p); setExpandedId(null); setDetail(null) }}
+              className={`px-2 py-0.5 text-[10px] font-medium rounded transition ${
+                phaseFilter === p ? 'bg-indigo-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+              }`}
+            >
+              {p === '' ? '全部' : (PHASE_META[p]?.label ?? p)}
+            </button>
+          ))}
+        </div>
+
+        {/* 轨迹列表 */}
+        <div className="flex-1 min-h-0 overflow-auto p-3 space-y-2">
+          {traces.length === 0 ? (
+            <div className="text-center text-gray-400 py-10 text-sm">暂无 LLM 调用记录</div>
+          ) : (
+            traces.map(t => (
+              <div key={t.id} className="border border-gray-200 rounded-lg overflow-hidden">
+                <button
+                  onClick={() => toggleDetail(t.id)}
+                  className="w-full text-left px-3 py-2 hover:bg-gray-50 transition"
+                >
+                  <div className="flex items-center justify-between gap-2 mb-1">
+                    <div className="flex items-center gap-1.5">
+                      <PhaseBadge phase={t.phase} />
+                      <span className="text-[10px] text-gray-400 font-mono">{fmtTime(t.created_at)}</span>
+                    </div>
+                    <span className="text-[10px] text-gray-400 font-mono">
+                      {t.latency_s != null ? `${t.latency_s.toFixed(1)}s` : ''}
+                    </span>
+                  </div>
+                  {t.result_summary && (
+                    <div className="text-[11px] font-mono text-indigo-700 mb-0.5">{t.result_summary}</div>
+                  )}
+                  {t.reasoning && (
+                    <div className="text-[11px] text-gray-600 line-clamp-2">{t.reasoning}</div>
+                  )}
+                  <div className="flex items-center gap-3 mt-1 text-[10px] text-gray-400 font-mono">
+                    <span>tok {t.prompt_tokens ?? '?'}/{t.completion_tokens ?? '?'}</span>
+                    {t.estimated_cost_yuan != null && <span>¥{t.estimated_cost_yuan.toFixed(4)}</span>}
+                    <span className="truncate">{t.model}</span>
+                  </div>
+                </button>
+
+                {/* 展开详情 */}
+                {expandedId === t.id && (
+                  <div className="border-t border-gray-100 bg-gray-50 px-3 py-2 space-y-2">
+                    {loadingDetail ? (
+                      <div className="text-[10px] text-gray-400">加载详情中...</div>
+                    ) : !detail ? (
+                      <div className="text-[10px] text-red-400">详情加载失败</div>
+                    ) : (
+                      <>
+                        <TraceSection title="Reasoning（推理）" text={detail.reasoning || '（无）'} />
+                        <TraceSection title="System Prompt（系统提示词）" text={detail.system_prompt} collapsedHeight />
+                        <TraceSection title="User Message（输入）" text={detail.user_message} collapsedHeight />
+                        <div>
+                          <div className="text-[10px] font-bold text-gray-500 mb-1">Assistant Output（结构化输出）</div>
+                          <pre className="text-[10px] bg-white p-1.5 rounded border border-gray-200 overflow-auto max-h-64 whitespace-pre-wrap break-words">
+                            {detail.assistant_output ? JSON.stringify(detail.assistant_output, null, 2) : '（无）'}
+                          </pre>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+    </>
+  )
+}
+
+function TraceSection({ title, text, collapsedHeight = false }: { title: string; text: string; collapsedHeight?: boolean }) {
+  return (
+    <div>
+      <div className="text-[10px] font-bold text-gray-500 mb-1">{title}</div>
+      <pre className={`text-[10px] bg-white p-1.5 rounded border border-gray-200 overflow-auto whitespace-pre-wrap break-words ${collapsedHeight ? 'max-h-40' : 'max-h-64'}`}>
+        {text}
+      </pre>
     </div>
   )
 }

@@ -84,6 +84,9 @@ class LLMService:
             settings.deepseek_base_url,
         )
 
+        # LLM 轨迹落库任务引用集合（fire-and-forget，防止 task 被 GC）
+        self._trace_tasks: set = set()
+
     # =================================================================
     # Sentiment_Agent 三阶段结构化 LLM 调用（Learn / Predict / Evolve）
     #
@@ -146,6 +149,7 @@ class LLMService:
             timeout=timeout,
         )
         self._record_llm_usage("LEARN", user_message, t0, completion)
+        self._spawn_trace("LEARN", LEARN_SYSTEM_PROMPT, user_message, result, t0, completion)
         return result
 
     async def agent_deep_learn(
@@ -194,6 +198,7 @@ class LLMService:
             timeout=timeout,
         )
         self._record_llm_usage("DEEP_LEARN", user_message, t0, completion)
+        self._spawn_trace("DEEP_LEARN", DEEP_LEARN_SYSTEM_PROMPT, user_message, result, t0, completion)
         return result
 
     async def agent_predict(
@@ -251,6 +256,7 @@ class LLMService:
             timeout=timeout,
         )
         self._record_llm_usage("PREDICT", user_message, t0, completion)
+        self._spawn_trace("PREDICT", PREDICT_SYSTEM_PROMPT, user_message, result, t0, completion)
         return result
 
     async def agent_evolve(
@@ -303,9 +309,107 @@ class LLMService:
             timeout=timeout,
         )
         self._record_llm_usage("EVOLVE", user_message, t0, completion)
+        self._spawn_trace("EVOLVE", EVOLVE_SYSTEM_PROMPT, user_message, result, t0, completion)
         return result
 
     # ---- 三阶段 user message 组装辅助（无 I/O，纯文本拼装）----
+
+    # ================================================================
+    # LLM 轨迹落库（前端「LLM 轨迹」面板 / 流程审查）
+    # 写入为 fire-and-forget：不阻塞主决策流程，失败仅告警。
+    # ================================================================
+
+    @staticmethod
+    def _extract_usage(completion: object | None) -> tuple[int | None, int | None]:
+        """从 raw completion 提取真实 token 用量，缺失返回 (None, None)。"""
+        usage = getattr(completion, "usage", None) if completion is not None else None
+        pt = ct = None
+        if usage is not None:
+            p = getattr(usage, "prompt_tokens", None)
+            c = getattr(usage, "completion_tokens", None)
+            if isinstance(p, int) and p > 0:
+                pt = p
+            if isinstance(c, int) and c >= 0:
+                ct = c
+        return pt, ct
+
+    @staticmethod
+    def _summarize_result(result: object) -> str | None:
+        """生成关键结论摘要（供轨迹列表快速浏览）。"""
+        direction = getattr(result, "direction", None)
+        if direction is not None:
+            conf = getattr(result, "confidence", 0.0) or 0.0
+            timing = getattr(result, "entry_timing", "")
+            return f"direction={direction} conf={conf:.2f} timing={timing}"[:200]
+        discoveries = getattr(result, "discoveries", None)
+        if discoveries is not None:
+            return f"discoveries={len(discoveries)}"[:200]
+        operations = getattr(result, "operations", None)
+        if operations is not None:
+            return f"operations={len(operations)}"[:200]
+        return None
+
+    def _spawn_trace(
+        self,
+        phase: str,
+        system_prompt: str,
+        user_message: str,
+        result: object,
+        start_monotonic: float,
+        completion: object | None,
+    ) -> None:
+        """组装并异步落库一条 LLM 轨迹（fire-and-forget，绝不影响主流程）。"""
+        try:
+            latency = time.monotonic() - start_monotonic
+            prompt_tokens, completion_tokens = self._extract_usage(completion)
+            if prompt_tokens is None:
+                prompt_tokens = self._estimate_tokens(user_message)
+            if completion_tokens is None:
+                completion_tokens = max(1, int(prompt_tokens * 0.3))
+            est_cost = (
+                prompt_tokens * settings.llm_input_price_per_1m
+                + completion_tokens * settings.llm_output_price_per_1m
+            ) / 1_000_000
+            try:
+                output_dict = result.model_dump()  # type: ignore[attr-defined]
+            except Exception:
+                output_dict = None
+            reasoning = getattr(result, "reasoning", None)
+            summary = self._summarize_result(result)
+
+            task = asyncio.create_task(
+                self._write_trace(
+                    phase=phase,
+                    system_prompt=system_prompt,
+                    user_message=user_message,
+                    assistant_output=output_dict,
+                    reasoning=reasoning,
+                    result_summary=summary,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    estimated_cost_yuan=est_cost,
+                    latency_s=latency,
+                )
+            )
+            self._trace_tasks.add(task)
+            task.add_done_callback(self._trace_tasks.discard)
+        except Exception as e:  # 组装/入队失败也不能影响主流程
+            logger.warning("LLM 轨迹入队失败（忽略，不影响主流程）: {}", e)
+
+    async def _write_trace(self, **fields: object) -> None:
+        """将一条 LLM 轨迹写入 llm_traces 表（独立会话，失败仅告警）。"""
+        from ..db.engine import async_session_factory
+        from ..db.models import LLMTrace
+
+        try:
+            async with async_session_factory() as session:
+                session.add(LLMTrace(model=self._decision_model, **fields))
+                await session.commit()
+        except Exception as e:
+            logger.warning(
+                "LLM 轨迹落库失败（忽略）: phase={} err={}",
+                fields.get("phase"), e,
+            )
 
     def _record_llm_usage(
         self,

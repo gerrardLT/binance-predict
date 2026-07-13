@@ -1119,3 +1119,86 @@ async def commit_deep_learn(
     except Exception as e:
         logger.error("深度分析写入失败: {}", e)
         return {"status": "error", "message": "写入失败，请查看服务端日志"}
+
+
+# ============================================================
+# LLM 轨迹审计 API（前端「LLM 轨迹」面板 / 流程审查）
+# ============================================================
+
+
+@app.get("/api/llm/traces")
+async def get_llm_traces(
+    phase: str | None = None,
+    limit: int = 50,
+    _: None = Depends(_require_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    查询 LLM 调用轨迹列表（倒序，最新在前）。
+
+    列表仅返回轻量摘要字段（不含完整 prompt/输出），供前端悬浮面板快速浏览。
+    支持按 phase（LEARN|DEEP_LEARN|PREDICT|EVOLVE）筛选，limit 限制条数（默认 50）。
+    """
+    from sqlalchemy import select as sa_select
+    from .db.models import LLMTrace
+    from .models.schemas import LLMTraceSummary
+
+    limit = max(1, min(limit, 200))
+    stmt = sa_select(LLMTrace)
+    if phase:
+        stmt = stmt.where(LLMTrace.phase == phase)
+    stmt = stmt.order_by(LLMTrace.created_at.desc()).limit(limit)
+    result = await db.execute(stmt)
+    rows = result.scalars().all()
+
+    return [
+        LLMTraceSummary(
+            id=r.id,
+            phase=r.phase,
+            model=r.model,
+            reasoning=r.reasoning,
+            result_summary=r.result_summary,
+            prompt_tokens=r.prompt_tokens,
+            completion_tokens=r.completion_tokens,
+            estimated_cost_yuan=r.estimated_cost_yuan,
+            latency_s=r.latency_s,
+            created_at=r.created_at,
+        ).model_dump()
+        for r in rows
+    ]
+
+
+@app.get("/api/llm/traces/{trace_id}")
+async def get_llm_trace_detail(
+    trace_id: int,
+    _: None = Depends(_require_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    查询单条 LLM 调用轨迹完整详情（含 system_prompt / user_message / 结构化输出）。
+    """
+    from sqlalchemy import select as sa_select
+    from .db.models import LLMTrace
+    from .models.schemas import LLMTraceRecord
+
+    stmt = sa_select(LLMTrace).where(LLMTrace.id == trace_id)
+    result = await db.execute(stmt)
+    r = result.scalar_one_or_none()
+    if r is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="轨迹不存在")
+
+    return LLMTraceRecord(
+        id=r.id,
+        phase=r.phase,
+        model=r.model,
+        reasoning=r.reasoning,
+        result_summary=r.result_summary,
+        prompt_tokens=r.prompt_tokens,
+        completion_tokens=r.completion_tokens,
+        estimated_cost_yuan=r.estimated_cost_yuan,
+        latency_s=r.latency_s,
+        created_at=r.created_at,
+        system_prompt=r.system_prompt,
+        user_message=r.user_message,
+        assistant_output=r.assistant_output,
+    ).model_dump()

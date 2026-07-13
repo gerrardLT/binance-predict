@@ -355,7 +355,69 @@ class PatternChangeLog(Base):
     )
     evolve_phase_id: Mapped[str | None] = mapped_column(
         String(40), nullable=True,
-        comment="触发该变更的 Evolve 执行 ID（LEARN 触发时为 NULL，Req 8.2）"
+        comment="触发该变更的 Evolve 执行 ID（LEARN 触发时为 NULL，Req 8.2）",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+# ============================================================
+# LLM 调用轨迹审计表（前端「LLM 轨迹」面板 / 流程审查用）
+# ============================================================
+
+class LLMTrace(Base):
+    """
+    LLM 单次调用的完整轨迹审计记录。
+
+    覆盖 Sentiment_Agent 四个 LLM 阶段（LEARN / DEEP_LEARN / PREDICT / EVOLVE）
+    每次调用的系统提示词、用户输入、结构化输出（含 reasoning）、token 用量、
+    耗时与估算成本。用于人工审查「LLM 被喂了什么、想了什么、决定了什么」，
+    判断整套自进化流程是否偏离预期。
+
+    写入为 fire-and-forget（不阻塞主决策流程），失败仅告警不影响预测。
+    """
+    __tablename__ = "llm_traces"
+    __table_args__ = (
+        Index("ix_llm_traces_created_at", "created_at"),
+        Index("ix_llm_traces_phase", "phase"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    phase: Mapped[str] = mapped_column(
+        String(20), nullable=False, comment="LEARN | DEEP_LEARN | PREDICT | EVOLVE"
+    )
+    model: Mapped[str] = mapped_column(
+        String(60), nullable=False, comment="调用的模型名"
+    )
+    system_prompt: Mapped[str] = mapped_column(
+        Text, nullable=False, comment="完整系统提示词"
+    )
+    user_message: Mapped[str] = mapped_column(
+        Text, nullable=False, comment="完整用户输入（含曲线/模式库上下文）"
+    )
+    assistant_output: Mapped[dict | None] = mapped_column(
+        JSONB, nullable=True, comment="LLM 结构化输出完整 JSON（含 reasoning 与结论）"
+    )
+    reasoning: Mapped[str | None] = mapped_column(
+        Text, nullable=True,
+        comment="LLM 推理文本（从 assistant_output.reasoning 抽取，便于列表展示）"
+    )
+    result_summary: Mapped[str | None] = mapped_column(
+        String(200), nullable=True,
+        comment="关键结论摘要（如 direction=UP conf=0.72 / discoveries=3）"
+    )
+    prompt_tokens: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment="输入 token（真实或估算）"
+    )
+    completion_tokens: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment="输出 token"
+    )
+    estimated_cost_yuan: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="估算成本（元）"
+    )
+    latency_s: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="LLM 调用耗时（秒）"
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
