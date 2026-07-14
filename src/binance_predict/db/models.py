@@ -422,3 +422,37 @@ class LLMTrace(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+# ============================================================
+# Agent 运行健康快照表（监控系统定期落库，供趋势回看 / LLM 诊断）
+# ============================================================
+
+class HealthSnapshot(Base):
+    """
+    Agent 运行健康报告的持久化快照。
+
+    后台监控循环按 settings.agent_health_snapshot_interval 周期，将
+    HealthService.build_report 产出的完整报告落库一条。overall_status 与
+    alert_count 单列冗余存储，便于按状态/时间快速筛选；report 保存完整 JSON
+    以便回看当时的全部指标（窗口连续性/匹配率/校准/调度器/LLM）。
+    """
+    __tablename__ = "health_snapshots"
+    __table_args__ = (
+        Index("ix_health_snapshots_created_at", "created_at"),
+        Index("ix_health_snapshots_status", "overall_status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    overall_status: Mapped[str] = mapped_column(
+        String(10), nullable=False, comment="OK | WARN | CRITICAL"
+    )
+    alert_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", comment="当次告警条数"
+    )
+    report: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, comment="HealthReport 完整 JSON"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )

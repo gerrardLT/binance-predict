@@ -173,3 +173,62 @@ class LLMTraceRecord(LLMTraceSummary):
     system_prompt: str = Field(default="", description="完整系统提示词")
     user_message: str = Field(default="", description="完整用户输入")
     assistant_output: dict | None = Field(default=None, description="LLM 结构化输出完整 JSON")
+
+
+# ============================================================
+# Agent 运行健康监控（services/health.py + GET /api/agent/health）
+# ============================================================
+
+HealthStatus = Literal["OK", "WARN", "CRITICAL"]
+
+
+class CalibrationBucket(BaseModel):
+    """置信度分桶校准：某置信度区间的预测数、平均置信度与实际命中率。"""
+
+    range: str = Field(description="置信度区间，如 '0.60~0.70'")
+    count: int = Field(description="该区间已验证（is_correct 非空）预测数", ge=0)
+    avg_confidence: float = Field(description="该区间平均置信度")
+    hit_rate: float | None = Field(default=None, description="实际命中率 correct/count；该区间无样本为空")
+    gap: float | None = Field(
+        default=None, description="avg_confidence - hit_rate；正值=过度自信，负值=过度保守"
+    )
+
+
+class HealthAlert(BaseModel):
+    """单条健康告警。"""
+
+    level: Literal["WARN", "CRITICAL"] = Field(description="告警级别")
+    code: str = Field(description="告警码，如 WINDOW_STALE | NO_MATCH | LLM_FAILURES")
+    message: str = Field(description="人类可读告警说明")
+
+
+class HealthReport(BaseModel):
+    """Agent 运行健康报告：5 类指标聚合 + 派生状态 + 告警 + 自然语言诊断。
+
+    既作为 GET /api/agent/health 的响应体，也是后台轮询落库（HealthSnapshot）
+    与 CLI 打印的统一数据结构。summary 为自然语言诊断，供人或 LLM 一眼读懂。
+    """
+
+    generated_at: datetime = Field(description="报告生成时间 UTC")
+    overall_status: HealthStatus = Field(description="总体状态 OK | WARN | CRITICAL")
+    alerts: list[HealthAlert] = Field(default_factory=list, description="当前触发的告警")
+    window_continuity: dict = Field(
+        default_factory=dict,
+        description="窗口连续性：last_window_age_s / gap_count / recent_count / expected_interval_s",
+    )
+    predict_stats: dict = Field(
+        default_factory=dict,
+        description="predict 统计：total / matched / match_rate / direction_distribution / active_pattern_count",
+    )
+    calibration: list[CalibrationBucket] = Field(
+        default_factory=list, description="置信度分桶校准表（样本不足时为空）"
+    )
+    scheduler: dict = Field(
+        default_factory=dict,
+        description="调度器：queue_depth / phase_ages_s / uptime_seconds（内存态，CLI --db-only 时为空）",
+    )
+    llm: dict = Field(
+        default_factory=dict,
+        description="LLM：call_count / total_cost / phase_success_rates / consecutive_failures（内存态）",
+    )
+    summary: str = Field(default="", description="自然语言诊断，供人/LLM 一眼读懂")

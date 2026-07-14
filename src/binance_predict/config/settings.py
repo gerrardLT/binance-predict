@@ -119,6 +119,60 @@ class Settings(BaseSettings):
     # 由 evaluate_trade_gate 拒绝新交易，避免异常状态下持续下单。
     agent_alert_block_trades: bool = True
 
+    # --- Agent 运行健康监控（services/health.py + GET /api/agent/health）---
+    # 后台监控 loop 总开关：为 True 时 lifespan 启动 _health_monitor_loop
+    agent_health_monitor_enabled: bool = True
+    # 后台轮询/告警检查间隔（秒）：每次 build_report 并检查 CRITICAL 告警
+    agent_health_monitor_interval: float = 60.0
+    # 健康快照落库间隔（秒）：>= monitor_interval，控制 health_snapshots 表增长
+    agent_health_snapshot_interval: float = 300.0
+    # 窗口停摆告警阈值（秒）：最近窗口距今超过此值判 CRITICAL WINDOW_STALE
+    agent_health_window_stale_seconds: float = 600.0
+    # 匹配率/方向分布统计取最近 N 条 AgentPrediction
+    agent_health_recent_predictions: int = 20
+    # 窗口连续性 gap 检测取最近 N 条 SentimentWindow
+    agent_health_recent_windows: int = 60
+    # 置信度校准最小样本数：低于此值 summary 标注样本不足、不做校准判断
+    agent_health_min_calibration_samples: int = 30
+    # 置信度校准取最近 N 条已验证预测（限制全表扫描，避免随数据量增长逐渐变慢）
+    agent_health_calibration_sample_limit: int = 500
+    # LLM 阶段成功率告警下限：低于此值判 WARN LLM_ERROR_RATE
+    agent_health_llm_success_rate_floor: float = 0.8
+    # PREDICT 心跳停摆倍数：最近成功距今 > 倍数×300s 判 CRITICAL PREDICT_STALE
+    agent_health_predict_stale_multiplier: float = 2.0
+    # health_snapshots 保留天数：落库后清理早于此天数的旧快照，防止无限增长
+    agent_health_snapshot_retention_days: int = 7
+
+    # --- 告警推送去重抑制 ---
+    # 同一告警 code 在此窗口（秒）内只推送一次，避免 60s 轮询反复轰炸。
+    # 仅作用于主动推送渠道（邮件/webhook），不影响日志与落库。
+    agent_alert_suppress_seconds: float = 900.0
+
+    # --- 告警邮件推送（SMTP，主渠道；非 OK 状态且有新告警时触发）---
+    # 总开关；为 False 时不发邮件（即便配置了 SMTP）
+    agent_alert_email_enabled: bool = False
+    # SMTP 服务器地址与端口（587=STARTTLS，465=SSL 需另配；默认走 STARTTLS）
+    agent_alert_smtp_host: str = ""
+    agent_alert_smtp_port: int = 587
+    # SMTP 登录凭据（多数邮箱用「授权码」而非登录密码）
+    agent_alert_smtp_user: str = ""
+    agent_alert_smtp_password: str = ""
+    # 是否使用 STARTTLS（587 端口置 True；若服务器为 465 SSL 端口请置 False 并自行适配）
+    agent_alert_smtp_use_tls: bool = True
+    # 发件人地址；留空则回退到 smtp_user
+    agent_alert_email_from: str = ""
+    # 收件人（逗号分隔，可多个）；空则不发
+    agent_alert_email_to: str = ""
+    # SMTP 连接/发送超时（秒）
+    agent_alert_email_timeout: float = 10.0
+
+    # --- 告警 Webhook 推送（通用 JSON POST，可选备用渠道）---
+    # 空字符串禁用 webhook。目标为通用 JSON 接收端；接入钉钉/飞书/Telegram
+    # 自定义机器人时 payload 格式各异，如需适配请告知具体平台。
+    agent_alert_webhook_url: str = ""
+    # webhook POST 超时（秒）
+    agent_alert_webhook_timeout: float = 5.0
+
     # --- 风控统计缓存（Fix #20）---
     # RiskController.refresh_daily_stats 的 TTL（秒），避免短时间内重复全量查询。
     risk_stats_cache_ttl_sec: float = 30.0

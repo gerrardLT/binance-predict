@@ -433,6 +433,93 @@ async def _sentiment_window_archiver() -> None:
             await asyncio.sleep(30)
 
 
+async def _health_monitor_loop() -> None:
+    """Agent 运行健康后台监控循环。
+
+    按 settings.agent_health_monitor_interval 周期构建健康报告：
+    - 非 OK 状态（WARN/CRITICAL）写日志，并经 alert_notifier 按 code 去重后
+      主动推送（邮件 + 可选 webhook；同 code 在抑制窗口内不重发）
+    - 每 settings.agent_health_snapshot_interval 落一条 HealthSnapshot 供趋势回看，
+      并清理早于保留窗口的旧快照
+
+    只读聚合 + 可选落库，异常仅告警不影响主决策流程。
+    """
+    from .db.models import HealthSnapshot
+    from .services.health import health_service
+    from .services.alerting import alert_notifier
+
+    if not settings.agent_health_monitor_enabled:
+        logger.info("Agent 健康监控已禁用（agent_health_monitor_enabled=False）")
+        return
+
+    await asyncio.sleep(30)  # 等待调度器/采集器预热，避免冷启动误报
+    last_snapshot_at = 0.0
+    logger.info(
+        "Agent 健康监控已启动 | 轮询={}s | 落库={}s | 抑制窗口={}s",
+        settings.agent_health_monitor_interval,
+        settings.agent_health_snapshot_interval,
+        settings.agent_alert_suppress_seconds,
+    )
+
+    while True:
+        try:
+            snapshot, consecutive_failures, queue_depth = _collect_memory_state()
+            async with async_session_factory() as db:
+                report = await health_service.build_report(
+                    db,
+                    metrics_snapshot=snapshot,
+                    consecutive_failures=consecutive_failures,
+                    queue_depth=queue_depth,
+                )
+
+                # 非 OK 状态写日志；新告警经邮件/webhook 主动推送（同 code 抑制窗口内不重发）
+                if report.overall_status == "CRITICAL":
+                    logger.warning("[HEALTH] CRITICAL | {}", report.summary)
+                elif report.overall_status == "WARN":
+                    logger.info("[HEALTH] WARN | {}", report.summary)
+                await alert_notifier.notify(report)
+
+                # 周期性落库 + 清理旧快照
+                now = time.time()
+                if now - last_snapshot_at >= settings.agent_health_snapshot_interval:
+                    db.add(HealthSnapshot(
+                        overall_status=report.overall_status,
+                        alert_count=len(report.alerts),
+                        report=report.model_dump(mode="json"),
+                    ))
+                    await db.commit()
+                    last_snapshot_at = now
+                    await _cleanup_old_health_snapshots(db)
+
+            await asyncio.sleep(settings.agent_health_monitor_interval)
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning("Agent 健康监控异常: {}", e)
+            await asyncio.sleep(settings.agent_health_monitor_interval)
+
+
+async def _cleanup_old_health_snapshots(db: AsyncSession) -> None:
+    """删除早于保留窗口的 health_snapshots 记录，防止表无限增长。失败仅告警。"""
+    from sqlalchemy import delete as sa_delete
+    from .db.models import HealthSnapshot
+
+    cutoff = datetime.now(timezone.utc) - timedelta(
+        days=settings.agent_health_snapshot_retention_days
+    )
+    try:
+        result = await db.execute(
+            sa_delete(HealthSnapshot).where(HealthSnapshot.created_at < cutoff)
+        )
+        if result.rowcount and result.rowcount > 0:
+            await db.commit()
+            logger.debug("清理旧健康快照 | 删除 {} 条（早于 {}）", result.rowcount, cutoff.isoformat())
+    except Exception as e:
+        await db.rollback()
+        logger.warning("清理旧健康快照失败: {}", e)
+
+
 # ============================================================
 # 应用生命周期
 # ============================================================
@@ -538,8 +625,9 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(collector.connect_spot_ws(), name="spot_ws"),
         asyncio.create_task(_prediction_market_tracker(), name="pm_tracker"),
         asyncio.create_task(_sentiment_window_archiver(), name="sw_archiver"),
+        asyncio.create_task(_health_monitor_loop(), name="health_monitor"),
     ]
-    logger.info("现货 WS + 预测市场追踪 + 情绪窗口归档已启动")
+    logger.info("现货 WS + 预测市场追踪 + 情绪窗口归档 + 健康监控已启动")
 
     yield  # 应用运行中
 
@@ -1052,6 +1140,48 @@ async def get_agent_metrics(
     返回各阶段执行统计、LLM token 用量与估算成本、交易决策统计、队列深度。
     """
     return metrics_collector.get_snapshot()
+
+
+def _collect_memory_state() -> tuple[dict, dict, int | None]:
+    """采集进程内内存态指标，供 HealthService 融合。
+
+    Returns:
+        (metrics_snapshot, consecutive_failures, queue_depth)
+        - metrics_snapshot: metrics_collector.get_snapshot()
+        - consecutive_failures: {phase: 连续失败数}
+        - queue_depth: 调度器当前队列深度；scheduler 未就绪时为 None
+    """
+    snapshot = metrics_collector.get_snapshot()
+    consecutive_failures = {
+        phase: metrics_collector.get_consecutive_failures(phase)
+        for phase in ("PREDICT", "VALIDATE", "LEARN", "EVOLVE")
+    }
+    queue_depth = agent_scheduler.queue_depth if agent_scheduler is not None else None
+    return snapshot, consecutive_failures, queue_depth
+
+
+@app.get("/api/agent/health")
+async def get_agent_health(
+    _: None = Depends(_require_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Agent 运行健康报告（监控系统主端点）
+
+    聚合 5 类关键指标（窗口连续性 / predict 匹配率 / 置信度校准 / 调度器心跳 /
+    LLM 错误率），派生告警与总体状态，并附自然语言诊断 summary，供人与 LLM
+    直接读取做运行诊断。返回结构见 models.schemas.HealthReport。
+    """
+    from .services.health import health_service
+
+    snapshot, consecutive_failures, queue_depth = _collect_memory_state()
+    report = await health_service.build_report(
+        db,
+        metrics_snapshot=snapshot,
+        consecutive_failures=consecutive_failures,
+        queue_depth=queue_depth,
+    )
+    return report.model_dump()
 
 
 # ============================================================
