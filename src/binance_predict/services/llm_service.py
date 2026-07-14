@@ -201,6 +201,106 @@ class LLMService:
         self._spawn_trace("DEEP_LEARN", DEEP_LEARN_SYSTEM_PROMPT, user_message, result, t0, completion)
         return result
 
+    async def agent_deep_learn_stream(
+        self,
+        windows: list[dict],
+        active_patterns: list[dict],
+        idle_timeout: float,
+    ):
+        """深度模式发现（流式版）：逐 token 推送 LLM 输出，供前端实时打字机展示。
+
+        与 agent_deep_learn 的差异：
+        - 使用 Instructor create_partial 流式生成，逐步产出「部分完整」的 LearnOutput
+        - 不施加一次性总超时，改为「空闲超时」：仅当相邻两次分片间隔超过 idle_timeout
+          才判定超时（只要模型在持续吐字就不算超时），彻底规避旧的 100s 硬超时被掐问题
+        - 迭代结束后用最终对象落一条 DEEP_LEARN 轨迹（token 用量为估算值）
+
+        产出事件（dict）：
+        - {"type": "reasoning", "delta": str}  reasoning 新增片段（打字机增量）
+        - {"type": "progress", "discoveries": int}  当前已解析出的发现条数
+        - {"type": "done", "result": LearnOutput}  最终完整结构化结果
+        - {"type": "error", "message": str}  空闲超时或流式异常
+
+        Raises: 不向上抛异常，所有失败均以 {"type": "error"} 事件产出，交由上层转成 SSE。
+        """
+        user_message = self._build_deep_learn_user_msg(windows, active_patterns)
+        logger.info(
+            "开始深度分析 LLM 流式调用 | model={} | windows={} | active_patterns={} | idle_timeout={}s",
+            settings.decision_model,
+            len(windows),
+            len(active_patterns),
+            idle_timeout,
+        )
+        t0 = time.monotonic()
+        try:
+            stream = self._decision_client.create_partial(
+                response_model=LearnOutput,
+                messages=[
+                    {"role": "system", "content": DEEP_LEARN_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_message},
+                ],
+                max_tokens=settings.agent_deep_learn_max_tokens,
+                temperature=0.1,
+                extra_body={"thinking": {"type": "disabled"}},
+            )
+        except Exception as exc:
+            logger.error(
+                "Deep Learn(stream): 建流失败 | error_type={} | error={}",
+                type(exc).__name__,
+                str(exc),
+            )
+            yield {"type": "error", "message": f"{type(exc).__name__}: {exc}"}
+            return
+
+        it = stream.__aiter__()
+        last_reasoning = ""
+        last_count = 0
+        final = None
+        while True:
+            try:
+                partial = await asyncio.wait_for(it.__anext__(), timeout=idle_timeout)
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError:
+                logger.error(
+                    "Deep Learn(stream): 空闲超时 | idle_timeout={}s | 已收到 reasoning={} 字符",
+                    idle_timeout,
+                    len(last_reasoning),
+                )
+                yield {
+                    "type": "error",
+                    "message": f"LLM 空闲超时（{idle_timeout:.0f}s 内无新输出）",
+                }
+                return
+            except Exception as exc:
+                logger.error(
+                    "Deep Learn(stream): 流式迭代异常 | error_type={} | error={}",
+                    type(exc).__name__,
+                    str(exc),
+                )
+                yield {"type": "error", "message": f"{type(exc).__name__}: {exc}"}
+                return
+
+            final = partial
+            reasoning = getattr(partial, "reasoning", None) or ""
+            if len(reasoning) > len(last_reasoning):
+                delta = reasoning[len(last_reasoning):]
+                last_reasoning = reasoning
+                yield {"type": "reasoning", "delta": delta}
+            cur_count = len(getattr(partial, "discoveries", None) or [])
+            if cur_count != last_count:
+                last_count = cur_count
+                yield {"type": "progress", "discoveries": cur_count}
+
+        if final is None:
+            yield {"type": "error", "message": "LLM 未返回任何内容"}
+            return
+
+        # 迭代完成：记录用量 + 落轨迹（流式无 completion 对象，token 为估算值）
+        self._record_llm_usage("DEEP_LEARN", user_message, t0, None)
+        self._spawn_trace("DEEP_LEARN", DEEP_LEARN_SYSTEM_PROMPT, user_message, final, t0, None)
+        yield {"type": "done", "result": final}
+
     async def agent_predict(
         self,
         current_curve: list[dict],

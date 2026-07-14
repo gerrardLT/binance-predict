@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, Fragment } from 'react'
+import { useState, useEffect, useCallback, useRef, Fragment } from 'react'
 import {
   XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, Area, AreaChart, ReferenceLine,
@@ -126,6 +126,15 @@ interface DeepLearnDiscovery {
   predicted_direction: 'UP' | 'DOWN'
   confidence_score: number
   change_reason: string
+}
+
+// 深度学习流式（SSE）事件：与后端 deep_learn_stream 产出的 dict 严格对齐
+interface DeepLearnStreamEvent {
+  type: 'step' | 'reasoning' | 'progress' | 'done' | 'error'
+  message?: string
+  delta?: string
+  discoveries?: number | DeepLearnDiscovery[]
+  reasoning?: string
 }
 
 // ============================================================
@@ -836,23 +845,67 @@ function DeepLearnModal({ onClose, onCommitted }: { onClose: () => void; onCommi
   const [checked, setChecked] = useState<Set<number>>(new Set())
   const [msg, setMsg] = useState('')
   const [expanded, setExpanded] = useState<number | null>(null)
+  const [liveLog, setLiveLog] = useState<string[]>([])
+  const [progressCount, setProgressCount] = useState(0)
+  const reasoningRef = useRef<HTMLPreElement>(null)
+
+  // reasoning 增量到达时自动滚到底部（打字机跟随）
+  useEffect(() => {
+    const el = reasoningRef.current
+    if (el) el.scrollTop = el.scrollHeight
+  }, [reasoning])
 
   const runAnalyze = async () => {
     setPhase('analyzing'); setMsg('')
+    setReasoning(''); setDiscoveries([]); setChecked(new Set())
+    setLiveLog([]); setProgressCount(0)
     try {
-      const res = await api.triggerDeepLearn(maxWindows)
-      if (res.status === 'ok') {
-        const ds: DeepLearnDiscovery[] = Array.isArray(res.discoveries) ? res.discoveries : []
-        setReasoning(res.reasoning || '')
-        setDiscoveries(ds)
-        setChecked(new Set(ds.map((_, i) => i)))  // 默认全选
-        setPhase('review')
-        if (ds.length === 0) setMsg('LLM 未发现任何新模式（本次已产生一条 DEEP_LEARN 轨迹）')
-      } else if (res.status === 'busy') {
-        setMsg(res.message || '已有深度分析任务在执行，请稍后重试'); setPhase('idle')
-      } else {
-        setMsg(res.message || '分析失败'); setPhase('idle')
+      const resp = await fetch(
+        `/api/sentiment/agent/deep-learn/stream?max_windows=${maxWindows}`,
+        { method: 'POST' },
+      )
+      if (!resp.ok || !resp.body) {
+        setMsg(`请求失败: HTTP ${resp.status}`); setPhase('idle'); return
       }
+      const reader = resp.body.getReader()
+      const decoder = new TextDecoder()
+      let buf = ''
+      let reasoningAcc = ''
+      let doneReceived = false
+
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += decoder.decode(value, { stream: true })
+        // SSE 帧以空行分隔：data: <json>\n\n
+        const frames = buf.split('\n\n')
+        buf = frames.pop() ?? ''
+        for (const frame of frames) {
+          const line = frame.replace(/^data:\s?/, '').trim()
+          if (!line) continue
+          let ev: DeepLearnStreamEvent
+          try { ev = JSON.parse(line) } catch { continue }
+          if (ev.type === 'step') {
+            setLiveLog(prev => [...prev, ev.message ?? ''])
+          } else if (ev.type === 'reasoning') {
+            reasoningAcc += ev.delta ?? ''
+            setReasoning(reasoningAcc)
+          } else if (ev.type === 'progress') {
+            setProgressCount(typeof ev.discoveries === 'number' ? ev.discoveries : 0)
+          } else if (ev.type === 'error') {
+            setMsg(`分析失败: ${ev.message ?? '未知错误'}`); setPhase('idle'); return
+          } else if (ev.type === 'done') {
+            doneReceived = true
+            const ds: DeepLearnDiscovery[] = Array.isArray(ev.discoveries) ? ev.discoveries : []
+            setReasoning(ev.reasoning || reasoningAcc)
+            setDiscoveries(ds)
+            setChecked(new Set(ds.map((_, i) => i)))  // 默认全选
+            setPhase('review')
+            if (ds.length === 0) setMsg('LLM 未发现任何新模式（本次已产生一条 DEEP_LEARN 轨迹）')
+          }
+        }
+      }
+      if (!doneReceived) { setMsg('分析连接中断（未收到完成信号）'); setPhase('idle') }
     } catch (e) {
       setMsg(`请求失败: ${(e as Error).message}`); setPhase('idle')
     }
@@ -926,11 +979,40 @@ function DeepLearnModal({ onClose, onCommitted }: { onClose: () => void; onCommi
             </button>
           </div>
 
-          {/* 推理过程 */}
-          {reasoning && (
+          {/* 实时日志（阶段性进度） */}
+          {liveLog.length > 0 && (
             <div>
-              <div className="text-[11px] font-bold text-gray-500 mb-1">🧠 分析推理</div>
-              <pre className="text-[11px] text-gray-700 bg-gray-50 p-2 rounded border border-gray-200 overflow-auto max-h-40 whitespace-pre-wrap break-words">{reasoning}</pre>
+              <div className="text-[11px] font-bold text-gray-500 mb-1">📡 实时日志</div>
+              <div className="text-[11px] font-mono text-gray-600 bg-gray-50 p-2 rounded border border-gray-200 space-y-0.5">
+                {liveLog.map((l, i) => (
+                  <div key={i} className="flex gap-1.5">
+                    <span className="text-gray-300 shrink-0">›</span>
+                    <span className="break-words">{l}</span>
+                  </div>
+                ))}
+                {phase === 'analyzing' && (
+                  <div className="flex gap-1.5 text-purple-500">
+                    <span className="shrink-0">›</span>
+                    <span>LLM 流式生成中{progressCount > 0 ? ` · 已解析 ${progressCount} 条模式` : '…'}</span>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* 推理过程（流式打字机） */}
+          {(reasoning || phase === 'analyzing') && (
+            <div>
+              <div className="text-[11px] font-bold text-gray-500 mb-1">
+                🧠 分析推理{phase === 'analyzing' && <span className="ml-1 text-purple-500 font-normal">（实时）</span>}
+              </div>
+              <pre
+                ref={reasoningRef}
+                className="text-[11px] text-gray-700 bg-gray-50 p-2 rounded border border-gray-200 overflow-auto max-h-52 whitespace-pre-wrap break-words"
+              >
+                {reasoning}
+                {phase === 'analyzing' && <span className="inline-block w-1.5 h-3 ml-0.5 align-middle bg-purple-500 animate-pulse" />}
+              </pre>
             </div>
           )}
 

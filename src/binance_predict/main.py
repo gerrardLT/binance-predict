@@ -1090,6 +1090,42 @@ async def trigger_deep_learn(
         return {"status": "error", "message": "深度分析失败，请查看服务端日志"}
 
 
+@app.post("/api/sentiment/agent/deep-learn/stream")
+async def stream_deep_learn(
+    max_windows: int = 100,
+    _: None = Depends(_require_auth),
+):
+    """流式深度模式发现（SSE）：逐 token 推送 LLM 输出，供前端实时打字机展示。
+
+    与 POST /deep-learn 的一次性返回不同，本端点以 text/event-stream 逐帧推送：
+    每帧一行 `data: <json>\\n\\n`，json.type ∈ {step, reasoning, progress, done, error}。
+    done 帧携带最终 reasoning 与 discoveries（供前端勾选后走 /commit 写入）。
+    不写 DB；成功后会落一条 DEEP_LEARN 轨迹。
+    """
+
+    async def event_gen():
+        if sentiment_agent is None:
+            yield f"data: {json.dumps({'type': 'error', 'message': 'Agent 尚未初始化，请等待系统启动完成'}, ensure_ascii=False)}\n\n"
+            return
+        try:
+            async for ev in sentiment_agent.deep_learn_stream(max_windows=max_windows):
+                yield f"data: {json.dumps(ev, ensure_ascii=False, default=str)}\n\n"
+        except Exception as e:
+            logger.error("流式深度分析异常: {} | {}", type(e).__name__, e)
+            payload = {"type": "error", "message": f"{type(e).__name__}: {e}"}
+            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # 显式关闭代理缓冲，确保逐帧下发
+        },
+    )
+
+
 @app.post("/api/sentiment/agent/deep-learn/commit")
 async def commit_deep_learn(
     request: CommitDeepLearnRequest,

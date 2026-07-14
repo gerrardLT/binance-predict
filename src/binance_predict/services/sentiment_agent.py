@@ -819,6 +819,142 @@ class SentimentAgent:
                 "discoveries": discoveries_serialized,
             }
 
+    async def deep_learn_stream(
+        self,
+        max_windows: int | None = None,
+    ):
+        """深度模式发现（流式版）：逐步产出事件供前端 SSE 实时展示（打字机效果）。
+
+        流程与 deep_learn 一致（读全量窗口 → LLM 分析 → 序列化 discoveries，不写 DB），
+        区别在于全程以事件流形式产出，且 LLM 调用走 create_partial 流式 + 空闲超时。
+
+        产出事件（dict，交由 main 转成 SSE data 帧）：
+        - {"type": "step",      "message": str}        阶段性进度（读取窗口/开始调用等）
+        - {"type": "reasoning", "delta": str}          reasoning 增量（打字机）
+        - {"type": "progress",  "discoveries": int}    已解析发现条数
+        - {"type": "done",      "reasoning": str, "discoveries": list}  最终结果（供勾选提交）
+        - {"type": "error",     "message": str}        并发冲突/空闲超时/流式异常
+
+        并发保护与 deep_learn 共用 self._deep_learn_lock（二者互斥）。
+        """
+        if self._deep_learn_lock.locked():
+            yield {"type": "error", "message": "已有深度分析任务正在执行，请稍后重试"}
+            return
+
+        async with self._deep_learn_lock:
+            if max_windows is None:
+                max_windows = settings.agent_deep_learn_max_windows
+
+            logger.info("Deep Learn(stream): 开始全量历史分析 | max_windows={}", max_windows)
+            yield {"type": "step", "message": f"开始全量历史分析（max_windows={max_windows}）"}
+
+            # Step 1: 读取全量窗口 + ACTIVE 模式（与 deep_learn 相同）
+            async with async_session_factory() as session:
+                stmt = (
+                    select(SentimentWindow)
+                    .where(SentimentWindow.outcome.isnot(None))
+                    .order_by(SentimentWindow.start_time.desc())
+                    .limit(max_windows)
+                )
+                result = await session.execute(stmt)
+                raw_windows = result.scalars().all()
+                windows_dicts = [
+                    {
+                        "id": w.id,
+                        "start_time": w.start_time,
+                        "end_time": w.end_time,
+                        "curve_up_pct": w.curve_up_pct,
+                        "curve_down_pct": w.curve_down_pct,
+                        "outcome": w.outcome,
+                        "actual_return": w.actual_return,
+                        "sample_count": w.sample_count,
+                    }
+                    for w in raw_windows
+                ]
+
+                pattern_stmt = select(PatternMemory).where(PatternMemory.status == "ACTIVE")
+                pattern_result = await session.execute(pattern_stmt)
+                active_patterns = [
+                    {
+                        "id": p.id,
+                        "pattern_name": p.pattern_name,
+                        "description": p.description,
+                        "curve_features": p.curve_features,
+                        "conditions": p.conditions,
+                        "predicted_direction": p.predicted_direction,
+                        "win_rate": p.win_rate,
+                        "sample_count": p.sample_count,
+                        "confidence_score": p.confidence_score,
+                    }
+                    for p in pattern_result.scalars().all()
+                ]
+
+            logger.info(
+                "Deep Learn(stream): 数据准备完成 | 窗口数={} | ACTIVE 模式={}",
+                len(windows_dicts),
+                len(active_patterns),
+            )
+            yield {
+                "type": "step",
+                "message": f"数据准备完成：窗口 {len(windows_dicts)} 个 · ACTIVE 模式 {len(active_patterns)} 条",
+            }
+
+            if not windows_dicts:
+                logger.warning("Deep Learn(stream): 无可用历史窗口，跳过分析")
+                yield {"type": "done", "reasoning": "", "discoveries": []}
+                return
+
+            # Step 2: 流式 LLM 深度分析（空闲超时，全程转发事件）
+            yield {"type": "step", "message": f"调用 LLM（model={settings.decision_model}）分析中…"}
+            final = None
+            async for ev in self._llm.agent_deep_learn_stream(
+                windows=windows_dicts,
+                active_patterns=active_patterns,
+                idle_timeout=settings.agent_deep_learn_idle_timeout,
+            ):
+                if ev.get("type") == "done":
+                    final = ev.get("result")
+                elif ev.get("type") == "error":
+                    yield ev
+                    return
+                else:
+                    # reasoning / progress 直接透传给前端
+                    yield ev
+
+            if final is None:
+                yield {"type": "error", "message": "LLM 未返回任何内容"}
+                return
+
+            # Step 3: 序列化 discoveries（防御式：跳过分片未填满的项）
+            discoveries_serialized = []
+            for d in getattr(final, "discoveries", None) or []:
+                op = getattr(d, "operation", None)
+                name = getattr(d, "pattern_name", None)
+                direction = getattr(d, "predicted_direction", None)
+                if not op or not name or not direction:
+                    continue
+                discoveries_serialized.append({
+                    "operation": op,
+                    "target_pattern_id": getattr(d, "target_pattern_id", None),
+                    "pattern_name": name,
+                    "description": getattr(d, "description", "") or "",
+                    "curve_features": getattr(d, "curve_features", None) or {},
+                    "conditions": getattr(d, "conditions", None) or {},
+                    "predicted_direction": direction,
+                    "confidence_score": getattr(d, "confidence_score", None) or 0.0,
+                    "change_reason": getattr(d, "change_reason", "") or "",
+                })
+
+            logger.info(
+                "Deep Learn(stream): 完成 | 有效发现={}",
+                len(discoveries_serialized),
+            )
+            yield {
+                "type": "done",
+                "reasoning": getattr(final, "reasoning", None) or "",
+                "discoveries": discoveries_serialized,
+            }
+
     async def commit_deep_learn(
         self,
         discoveries: list[dict],
@@ -1447,6 +1583,16 @@ class SentimentAgent:
             len(retired_patterns),
             len(recent_predictions_dicts),
         )
+
+        # ========== 空库短路：无任何可进化模式时跳过 LLM 调用 ==========
+        # 冷启动/manual 模式下模式库长期为空，此时 Evolve 无对象可反思，
+        # 若仍调用 LLM 只会稳定返回「无操作」并浪费 token 与 heavy 队列时间。
+        if not all_patterns_dicts:
+            logger.info(
+                "Evolve: 模式库为空（无 ACTIVE 且无近期 RETIRED），"
+                "跳过本次 Evolve（不调用 LLM）"
+            )
+            return
 
         # ========== Step 2：LLM 调用（在事务外完成，避免长事务）==========
         try:

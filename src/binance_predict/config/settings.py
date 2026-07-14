@@ -154,6 +154,9 @@ class Settings(BaseSettings):
     agent_deep_learn_target_clusters: int = 25
     # 手动模式：LLM max_tokens（深度分析输出上限，基于实测：全量窗口输入~30k tokens，reasoning+discoveries 输出~10k tokens）
     agent_deep_learn_max_tokens: int = 16384
+    # 手动模式：流式深度分析「空闲超时」（秒）。仅当两次 token 之间的间隔超过该值才判定超时，
+    # 不再对整体调用施加硬性总超时——只要模型在持续吐字就允许长时间运行（替代旧的 100s 一次性超时）。
+    agent_deep_learn_idle_timeout: float = 60.0
 
     # --- Sentiment Agent 行为参数 ---
     # 自动交易总开关：默认关闭，必须显式设置 AGENT_AUTO_TRADE=true 才允许自动下单。
