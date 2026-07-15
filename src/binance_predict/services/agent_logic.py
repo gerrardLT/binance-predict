@@ -25,6 +25,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from ..models.schemas import ActualLabel, FinalPrediction, PatternStatus
+from .curve_features import cosine_sim
 
 __all__ = [
     "PatternStat",
@@ -584,6 +585,9 @@ def compress_windows_for_deep_learn(
 
 _FINGERPRINT_KEYS = ("trend_direction", "volatility", "start_level", "divergence")
 
+# P1-3：确定性特征向量去重的余弦相似度阈值（同方向且 >= 此值视为重复）
+_DEDUP_COSINE_THRESHOLD = 0.95
+
 
 def compute_pattern_fingerprint(
     curve_features: dict,
@@ -616,7 +620,11 @@ def detect_duplicate_pattern(
     existing_patterns: list[dict],
 ) -> int | None:
     """
-    若新模式与某现有模式方向相同且指纹完全一致，返回现有模式 id。
+    方向相同前提下判重，返回重复模式 id（无重复返回 None）。
+
+    P1-3：若新旧模式的 curve_features 均含确定性特征向量 `_feature_vector`，
+    用 cosine_sim >= 阈值判重（比对 LLM 自由 JSONB 更稳健）；否则回退到
+    结构化字符串指纹（向后兼容 LLM/存量无向量模式）。
 
     Args:
         new_features: 新模式的 curve_features
@@ -626,14 +634,30 @@ def detect_duplicate_pattern(
     Returns:
         重复模式的 id，无重复返回 None
     """
+    new_vec = new_features.get("_feature_vector") if isinstance(new_features, dict) else None
     new_fp = compute_pattern_fingerprint(new_features, new_direction)
-    if new_fp is None:
-        return None  # 特征不足，无法判定去重
+    # 既无向量又无有效指纹 → 无法判定
+    if new_vec is None and new_fp is None:
+        return None
     for pat in existing_patterns:
         if pat.get("predicted_direction", "").upper() != new_direction.upper():
             continue
+        pat_features = pat.get("curve_features", {}) or {}
+        pat_vec = (
+            pat_features.get("_feature_vector")
+            if isinstance(pat_features, dict)
+            else None
+        )
+        # 优先用确定性特征向量
+        if new_vec is not None and pat_vec is not None:
+            if cosine_sim(new_vec, pat_vec) >= _DEDUP_COSINE_THRESHOLD:
+                return pat.get("id")
+            continue
+        # 回退字符串指纹
+        if new_fp is None:
+            continue
         existing_fp = compute_pattern_fingerprint(
-            pat.get("curve_features", {}),
+            pat_features,
             pat.get("predicted_direction", ""),
         )
         if existing_fp is not None and new_fp == existing_fp:

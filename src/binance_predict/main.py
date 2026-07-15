@@ -600,6 +600,11 @@ async def lifespan(app: FastAPI):
             for col_sql in [
                 "ALTER TABLE prediction_market_samples ADD COLUMN IF NOT EXISTS participants INTEGER",
                 "ALTER TABLE prediction_market_samples ADD COLUMN IF NOT EXISTS trade_volume FLOAT",
+                # Deep Learn 双轨：pattern_memory 发现方法与 holdout 统计（与 alembic 迁移等价，存量 dev 库安全网）
+                "ALTER TABLE pattern_memory ADD COLUMN IF NOT EXISTS discovery_method VARCHAR(20) NOT NULL DEFAULT 'LEGACY'",
+                "ALTER TABLE pattern_memory ADD COLUMN IF NOT EXISTS holdout_win_rate FLOAT",
+                "ALTER TABLE pattern_memory ADD COLUMN IF NOT EXISTS holdout_sample_count INTEGER",
+                "ALTER TABLE pattern_memory ADD COLUMN IF NOT EXISTS holdout_ci_lower FLOAT",
             ]:
                 try:
                     await conn.execute(text(col_sql))
@@ -1040,6 +1045,10 @@ async def get_agent_patterns(
             correct_count=r.correct_count,
             confidence_score=r.confidence_score,
             status=r.status,
+            discovery_method=r.discovery_method,
+            holdout_win_rate=r.holdout_win_rate,
+            holdout_sample_count=r.holdout_sample_count,
+            holdout_ci_lower=r.holdout_ci_lower,
             created_at=r.created_at,
             updated_at=r.updated_at,
         ).model_dump()
@@ -1123,6 +1132,11 @@ async def get_agent_status(
         "active_pattern_count": active_pattern_count,
         "scheduler_running": scheduler_running,
         "queue_depth": agent_scheduler.queue_depth if agent_scheduler is not None else -1,
+        "evolve_trigger_mode": settings.agent_evolve_trigger_mode,
+        "new_validated_since_evolve": (
+            agent_scheduler.new_validated_since_evolve if agent_scheduler is not None else 0
+        ),
+        "evolve_min_new_samples": settings.agent_evolve_min_new_samples,
         "metrics_summary": {
             "llm_total_cost": metrics_collector.get_snapshot().get("llm", {}).get("total_cost", 0.0),
             "llm_call_count": metrics_collector.get_snapshot().get("llm", {}).get("call_count", 0),
@@ -1140,6 +1154,25 @@ async def get_agent_metrics(
     返回各阶段执行统计、LLM token 用量与估算成本、交易决策统计、队列深度。
     """
     return metrics_collector.get_snapshot()
+
+
+@app.get("/api/sentiment/agent/evolution")
+async def get_agent_evolution(
+    days: int = 30,
+    _: None = Depends(_require_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """进化有效性看板（Item 1）。
+
+    把「Agent 是否真的在进化」量化为可证伪的数字：总体决策胜率与是否
+    跑赢随机基线（Wilson 95% 下界>0.5）、按天的样本外胜率趋势、前半程 vs
+    近半程代际对比（change≠improvement 的判据）、以及按发现方法拆分的胜率
+    （LLM_DEEP / PY_CLUSTER / LEGACY / UNMATCHED）。days 夹在 [1, 90]。
+    """
+    from .services.evolution_metrics import build_evolution_report
+
+    days = max(1, min(days, 90))
+    return await build_evolution_report(db, days=days)
 
 
 def _collect_memory_state() -> tuple[dict, dict, int | None]:
@@ -1203,6 +1236,8 @@ async def trigger_deep_learn(
     if sentiment_agent is None:
         return {"status": "error", "message": "Agent 尚未初始化，请等待系统启动完成"}
 
+    # P1-2: 端点入参 clamp 上限，防止外部传入超大 max_windows 拖垮采样
+    max_windows = max(1, min(max_windows, settings.agent_deep_learn_max_windows_cap))
     try:
         result = await sentiment_agent.deep_learn(max_windows=max_windows)
         return {
@@ -1232,6 +1267,8 @@ async def stream_deep_learn(
     done 帧携带最终 reasoning 与 discoveries（供前端勾选后走 /commit 写入）。
     不写 DB；成功后会落一条 DEEP_LEARN 轨迹。
     """
+    # P1-2: 端点入参 clamp 上限
+    max_windows = max(1, min(max_windows, settings.agent_deep_learn_max_windows_cap))
 
     async def event_gen():
         if sentiment_agent is None:
@@ -1276,15 +1313,189 @@ async def commit_deep_learn(
     # 将 Pydantic 模型转换为 dict 列表
     discoveries_dicts = [d.model_dump() for d in request.discoveries]
 
+    # P2-2: 记录预览时的 snapshot_token 供审计；commit 侧不信任预览声明，
+    # 而是用每条 discovery 携带的当次 holdout 统计独立重跑准入闸门（兜底一致性）。
+    logger.info(
+        "Commit Deep Learn: snapshot_token={} | discoveries={}",
+        request.snapshot_token, len(discoveries_dicts),
+    )
     try:
-        count = await sentiment_agent.commit_deep_learn(discoveries_dicts)
-        return {"status": "ok", "written": count}
+        # commit_deep_learn 返回 {status, written, rejected, failed}（P0-3 准入 / P1-4 失败收集）
+        result = await sentiment_agent.commit_deep_learn(discoveries_dicts)
+        return {
+            "status": "ok",
+            "written": result.get("written", 0),
+            "rejected": result.get("rejected", []),
+            "failed": result.get("failed", []),
+        }
     except RuntimeError as e:
         # 并发冲突
         return {"status": "busy", "message": str(e)}
     except Exception as e:
         logger.error("深度分析写入失败: {}", e)
         return {"status": "error", "message": "写入失败，请查看服务端日志"}
+
+
+def _summarize_discovery_group(result: dict) -> dict:
+    """把一次 deep-learn 结果压成多维对比摘要（发现即时 holdout 维度）。
+
+    汇总发现数、平均 holdout 胜率 / Wilson 下界、holdout 样本量、平均 confidence、
+    通过 P0-3 准入闸门的比例、方向分布（UP/DOWN），供 /compare 面板对齐两套方案。
+    """
+    discoveries = result.get("discoveries", [])
+    n = len(discoveries)
+    win_rates = [d["holdout_win_rate"] for d in discoveries if d.get("holdout_win_rate") is not None]
+    ci_lowers = [d["holdout_ci_lower"] for d in discoveries if d.get("holdout_ci_lower") is not None]
+    confidences = [d["confidence_score"] for d in discoveries if d.get("confidence_score") is not None]
+    total_samples = sum(int(d.get("holdout_sample_count") or 0) for d in discoveries)
+    min_samples = settings.agent_deep_learn_min_holdout_samples
+    passed = [
+        d for d in discoveries
+        if (d.get("holdout_ci_lower") or 0.0) > 0.5
+        and (d.get("holdout_sample_count") or 0) >= min_samples
+    ]
+    up = sum(1 for d in discoveries if (d.get("predicted_direction") or "").upper() == "UP")
+    down = sum(1 for d in discoveries if (d.get("predicted_direction") or "").upper() == "DOWN")
+
+    def _avg(xs: list[float]) -> float:
+        return round(sum(xs) / len(xs), 4) if xs else 0.0
+
+    return {
+        "method": result.get("method"),
+        "discovery_count": n,
+        "avg_holdout_win_rate": _avg(win_rates),
+        "avg_holdout_ci_lower": _avg(ci_lowers),
+        "total_holdout_samples": total_samples,
+        "avg_confidence": _avg(confidences),
+        "passed_gate_count": len(passed),
+        "passed_gate_ratio": round(len(passed) / n, 4) if n else 0.0,
+        "direction_up": up,
+        "direction_down": down,
+        "snapshot_token": result.get("snapshot_token"),
+        "train_count": result.get("train_count", 0),
+        "holdout_count": result.get("holdout_count", 0),
+    }
+
+
+@app.post("/api/sentiment/agent/deep-learn/pycluster")
+async def trigger_deep_learn_pycluster(
+    max_windows: int = 100,
+    _: None = Depends(_require_auth),
+):
+    """触发 Python 聚类版深度发现（全程无 LLM，确定性对照组，预览不写库）。
+
+    与纯 LLM 版 /deep-learn 对称：返回 discoveries（每条含 discovery_method=PY_CLUSTER
+    与 holdout 统计）+ snapshot_token + train/holdout 计数，供前端预览后走 /commit 写入。
+    """
+    if sentiment_agent is None:
+        return {"status": "error", "message": "Agent 尚未初始化，请等待系统启动完成"}
+
+    # P1-2: 端点入参 clamp 上限
+    max_windows = max(1, min(max_windows, settings.agent_deep_learn_max_windows_cap))
+    try:
+        result = await sentiment_agent.deep_learn_pycluster(max_windows=max_windows)
+        return {
+            "status": "ok",
+            "reasoning": result.get("reasoning", ""),
+            "discoveries": result.get("discoveries", []),
+            "count": len(result.get("discoveries", [])),
+            "method": result.get("method", "PY_CLUSTER"),
+            "snapshot_token": result.get("snapshot_token"),
+            "train_count": result.get("train_count", 0),
+            "holdout_count": result.get("holdout_count", 0),
+            "message": "预览模式，数据尚未写入 DB。确认后请调用 POST /api/sentiment/agent/deep-learn/commit",
+        }
+    except RuntimeError as e:
+        return {"status": "busy", "message": str(e)}
+    except Exception as e:
+        logger.error("聚类深度分析失败: {}", e)
+        return {"status": "error", "message": "聚类深度分析失败，请查看服务端日志"}
+
+
+@app.post("/api/sentiment/agent/deep-learn/compare")
+async def compare_deep_learn(
+    max_windows: int = 100,
+    _: None = Depends(_require_auth),
+):
+    """同一采样窗口上依次跑 LLM 版与 Python 聚类版，返回对齐的多维对比（预览不写库）。
+
+    两版均调用同一确定性采样，snapshot_token 应一致；不一致时 snapshot_consistent=False，
+    前端需提示两次采样窗口不同（对比失真）。comparison 为 [LLM 摘要, PY 摘要]。
+    """
+    if sentiment_agent is None:
+        return {"status": "error", "message": "Agent 尚未初始化，请等待系统启动完成"}
+
+    # P1-2: 端点入参 clamp 上限
+    max_windows = max(1, min(max_windows, settings.agent_deep_learn_max_windows_cap))
+    try:
+        llm_result = await sentiment_agent.deep_learn(max_windows=max_windows)
+        py_result = await sentiment_agent.deep_learn_pycluster(max_windows=max_windows)
+    except RuntimeError as e:
+        return {"status": "busy", "message": str(e)}
+    except Exception as e:
+        logger.error("对比深度分析失败: {}", e)
+        return {"status": "error", "message": "对比深度分析失败，请查看服务端日志"}
+
+    return {
+        "status": "ok",
+        "snapshot_consistent": (
+            llm_result.get("snapshot_token") == py_result.get("snapshot_token")
+        ),
+        "comparison": [
+            _summarize_discovery_group(llm_result),
+            _summarize_discovery_group(py_result),
+        ],
+        "llm": {
+            "reasoning": llm_result.get("reasoning", ""),
+            "discoveries": llm_result.get("discoveries", []),
+        },
+        "pycluster": {
+            "reasoning": py_result.get("reasoning", ""),
+            "discoveries": py_result.get("discoveries", []),
+        },
+    }
+
+
+@app.get("/api/sentiment/agent/deep-learn/compare/live")
+async def compare_deep_learn_live(
+    _: None = Depends(_require_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """按 discovery_method 聚合 pattern_memory 的上线真实指标（LLM_DEEP vs PY_CLUSTER vs LEGACY）。
+
+    live 维度用 Harness 维护的 win_rate/sample_count/correct_count（与发现时 holdout 分开存），
+    反映模式上线后的真实表现。仅统计 ACTIVE 模式。
+    """
+    from sqlalchemy import func as sa_func, select as sa_select
+    from .db.models import PatternMemory
+
+    stmt = (
+        sa_select(
+            PatternMemory.discovery_method,
+            sa_func.count(PatternMemory.id),
+            sa_func.sum(PatternMemory.sample_count),
+            sa_func.sum(PatternMemory.correct_count),
+            sa_func.avg(PatternMemory.confidence_score),
+            sa_func.avg(PatternMemory.holdout_ci_lower),
+        )
+        .where(PatternMemory.status == "ACTIVE")
+        .group_by(PatternMemory.discovery_method)
+    )
+    rows = (await db.execute(stmt)).all()
+    groups = []
+    for method, cnt, samples, correct, avg_conf, avg_ci in rows:
+        samples = int(samples or 0)
+        correct = int(correct or 0)
+        groups.append({
+            "method": method,
+            "pattern_count": int(cnt or 0),
+            "live_sample_count": samples,
+            "live_correct_count": correct,
+            "live_win_rate": round(correct / samples, 4) if samples else 0.0,
+            "avg_confidence": round(float(avg_conf), 4) if avg_conf is not None else 0.0,
+            "avg_holdout_ci_lower": round(float(avg_ci), 4) if avg_ci is not None else 0.0,
+        })
+    return {"status": "ok", "groups": groups}
 
 
 # ============================================================

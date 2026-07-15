@@ -204,8 +204,21 @@ class Settings(BaseSettings):
     agent_learn_mode: str = "manual"
     # 手动模式：深度分析最大窗口数
     agent_deep_learn_max_windows: int = 100
-    # 手动模式：聚类压缩后目标窗口数
+    # 手动模式：max_windows 上限（端点入参 clamp，防止无上限透传 limit）
+    agent_deep_learn_max_windows_cap: int = 500
+    # 手动模式：KMeans 目标簇数（Python 聚类版；实际 n_clusters=min(该值, 窗口数)）
     agent_deep_learn_target_clusters: int = 25
+    # 采样时间跨度（天）：Deep Learn 先按 start_time >= now-days_back 圈定再分层抽样
+    agent_deep_learn_days_back: int = 7
+    # holdout 比例：按 start_time 排序切出最新该比例作样本外校验集
+    agent_deep_learn_holdout_ratio: float = 0.3
+    # 准入最小 holdout 样本数：低于此值的候选模式不予写库（样本外统计不可信）。
+    # 提高到 50：10 个样本要让 Wilson 下界>0.5 几乎需 9~10 全对，极易把「连续走运」
+    # 误当成模式；50+ 才能把 ~55% 的真实 edge 与噪声区分开。过严导致罕见模式难准入
+    # 属预期取舍，可经 .env（AGENT_DEEP_LEARN_MIN_HOLDOUT_SAMPLES）按实际数据量回调。
+    agent_deep_learn_min_holdout_samples: int = 50
+    # 非流式深度分析专用超时（秒）：替代旧的借用 LEARN 100s 硬超时
+    agent_deep_learn_timeout: float = 300.0
     # 手动模式：LLM max_tokens（深度分析输出上限，基于实测：全量窗口输入~30k tokens，reasoning+discoveries 输出~10k tokens）
     agent_deep_learn_max_tokens: int = 16384
     # 手动模式：流式深度分析「空闲超时」（秒）。仅当两次 token 之间的间隔超过该值才判定超时，
@@ -217,8 +230,16 @@ class Settings(BaseSettings):
     agent_auto_trade: bool = False
     # 交易置信度阈值：仅当总开关开启、direction∈{UP,DOWN} 且 confidence > 此值才执行交易。
     agent_trade_confidence_threshold: float = 0.6
-    # Evolve 触发间隔：每累计完成 N 次 Validate 触发一次 Evolve（Req 5.1 / 6.5）
+    # Evolve 触发间隔：每累计完成 N 次 Validate 触发一次 Evolve（Req 5.1 / 6.5）。
+    # 注：samples 触发模式下该值仅用于 windows 回退模式，及 Evolve 读取的近期预测条数。
     agent_evolve_interval: int = 12
+    # Evolve 触发模式（Item 5：进化时钟与证据量挂钩）：
+    # - "samples"（默认）：累计「新验证的预测样本数」达 agent_evolve_min_new_samples
+    #   才触发 Evolve，确保进化建立在足够新标注证据上，避免信号积累慢于窗口推进时空转。
+    # - "windows"：回退旧行为，每 agent_evolve_interval 次窗口归档触发一次。
+    agent_evolve_trigger_mode: str = "samples"
+    # samples 模式下触发 Evolve 所需的「自上次 Evolve 以来新验证预测样本数」阈值。
+    agent_evolve_min_new_samples: int = 24
     # Learn 窗口数：Learn 阶段选取最近 N 个 outcome 非空的情绪窗口（Req 2.2）
     agent_learn_window_count: int = 50
     # Predict 触发采样点：当前窗口累计有效采样点达到 N 个时触发 Predict（Req 3.1）

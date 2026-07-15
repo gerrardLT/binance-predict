@@ -16,6 +16,8 @@ PatternDirection = Literal["UP", "DOWN"]
 ChangeType = Literal["CREATE", "UPDATE", "RETIRE"]
 EvolveAction = Literal["RETAIN", "MODIFY", "RETIRE", "CREATE"]
 EntryTiming = Literal["NOW", "WAIT", "SKIP"]
+# 发现方法：纯 LLM 深度发现 / Python 确定性聚类 / 存量或 learn·evolve 产出
+DiscoveryMethod = Literal["LLM_DEEP", "PY_CLUSTER", "LEGACY"]
 
 
 # ============================================================
@@ -46,6 +48,23 @@ class LearnOutput(BaseModel):
     reasoning: str = Field(description="历史曲线分析推理过程")
     discoveries: list[PatternDiscovery] = Field(
         default_factory=list, description="本次发现或更新的模式"
+    )
+
+
+class DeepLearnDiscovery(PatternDiscovery):
+    """Deep Learn 预览/提交用发现项：在 LLM·聚类发现基础上附加发现方法与样本外统计。
+
+    holdout_* 由程序在留出集上计算后附加（非 LLM 填写）；commit 时据此做准入闸门
+    与写库。作为预览端点返回与 commit 请求的元素类型，不污染作为 LLM response_model 的 PatternDiscovery。
+    """
+
+    discovery_method: DiscoveryMethod = Field(
+        default="LLM_DEEP", description="发现方法 LLM_DEEP | PY_CLUSTER"
+    )
+    holdout_win_rate: float | None = Field(default=None, description="holdout 胜率 0~1")
+    holdout_sample_count: int | None = Field(default=None, description="holdout 命中判定样本数")
+    holdout_ci_lower: float | None = Field(
+        default=None, description="holdout 胜率 Wilson 95% 置信下界"
     )
 
 
@@ -96,6 +115,14 @@ class PatternMemoryRecord(BaseModel):
     correct_count: int = Field(default=0, description="命中数", ge=0)
     confidence_score: float = Field(default=0.5, description="模式置信度 0~1", ge=0, le=1)
     status: PatternStatus = Field(default="ACTIVE", description="ACTIVE | RETIRED | EVOLVING")
+    discovery_method: DiscoveryMethod = Field(
+        default="LEGACY", description="发现方法 LLM_DEEP | PY_CLUSTER | LEGACY"
+    )
+    holdout_win_rate: float | None = Field(default=None, description="发现时 holdout 胜率 0~1")
+    holdout_sample_count: int | None = Field(default=None, description="发现时 holdout 样本数")
+    holdout_ci_lower: float | None = Field(
+        default=None, description="发现时 holdout 胜率 Wilson 95% 置信下界"
+    )
     created_at: datetime | None = Field(default=None, description="创建时间 UTC")
     updated_at: datetime | None = Field(default=None, description="最后更新时间 UTC")
 
@@ -142,9 +169,12 @@ class PatternChangeLogRecord(BaseModel):
 class CommitDeepLearnRequest(BaseModel):
     """深度分析确认写入请求。"""
 
-    discoveries: list[PatternDiscovery] = Field(
+    discoveries: list[DeepLearnDiscovery] = Field(
         default_factory=list,
-        description="用户确认后的发现列表（来自 POST /api/sentiment/agent/deep-learn 的返回值）"
+        description="用户确认后的发现列表（来自 deep-learn / deep-learn/pycluster 预览返回，每条携带 discovery_method 与 holdout 统计）"
+    )
+    snapshot_token: str | None = Field(
+        default=None, description="预览时返回的窗口快照标记（hash of window_ids），commit 时回传校验一致性"
     )
 
 

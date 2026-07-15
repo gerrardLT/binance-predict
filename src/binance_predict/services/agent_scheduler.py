@@ -85,6 +85,8 @@ class AgentScheduler:
         self._seq_counter: int = 0
         self._running: bool = False
         self._validate_counter: int = 0
+        # Item 5：累计「自上次 Evolve 以来新验证的预测样本数」，用于样本量驱动的 Evolve 触发。
+        self._new_validated_since_evolve: int = 0
         self._alert_service = AlertService(metrics_collector)
         # Fix #19: 将告警服务注入 agent，使 predict 阶段交易门控能查询
         # trading_blocked 熔断标志（成本超限/阶段连续失败时阻断新交易）。
@@ -124,6 +126,11 @@ class AgentScheduler:
     def validate_counter(self) -> int:
         """当前累计完成的 Validate 次数（只读，供 API/监控查询）。"""
         return self._validate_counter
+
+    @property
+    def new_validated_since_evolve(self) -> int:
+        """自上次 Evolve 以来累计新验证的预测样本数（只读，供 API/监控查询）。"""
+        return self._new_validated_since_evolve
 
     @property
     def queue_depth(self) -> int:
@@ -574,25 +581,47 @@ class AgentScheduler:
             )
 
             self._validate_counter += 1
+            # Item 5：累计本轮 Evolve 以来新验证的预测样本数（validated_ids 长度）。
+            self._new_validated_since_evolve += len(validated_ids)
             logger.debug(
                 "AgentScheduler: Validate 完成 | window_id={} | "
-                "validated_ids={} | validate_counter={}",
+                "validated_ids={} | validate_counter={} | new_validated_since_evolve={}",
                 window_id,
                 validated_ids,
                 self._validate_counter,
+                self._new_validated_since_evolve,
             )
 
-            if (
-                self._validate_counter > 0
-                and self._validate_counter % settings.agent_evolve_interval == 0
-            ):
+            # Evolve 触发判定（Item 5）：默认按「新验证样本量」驱动，确保进化建立在
+            # 足够新证据上；windows 模式回退旧的「每 N 次窗口归档」行为。
+            if settings.agent_evolve_trigger_mode == "samples":
+                should_evolve = (
+                    self._new_validated_since_evolve
+                    >= settings.agent_evolve_min_new_samples
+                )
+                evolve_reason = (
+                    f"new_validated_since_evolve={self._new_validated_since_evolve} "
+                    f">= min_new_samples={settings.agent_evolve_min_new_samples}"
+                )
+            else:  # "windows" 回退
+                should_evolve = (
+                    self._validate_counter > 0
+                    and self._validate_counter % settings.agent_evolve_interval == 0
+                )
+                evolve_reason = (
+                    f"validate_counter={self._validate_counter} 达到 "
+                    f"evolve_interval={settings.agent_evolve_interval} 倍数"
+                )
+
+            if should_evolve:
                 logger.info(
-                    "AgentScheduler: validate_counter={} 达到 evolve_interval={} 的倍数 | "
-                    "触发 EVOLVE 事件（Req 5.1/6.5）",
-                    self._validate_counter,
-                    settings.agent_evolve_interval,
+                    "AgentScheduler: 触发 EVOLVE 事件（Req 5.1/6.5）| mode={} | {}",
+                    settings.agent_evolve_trigger_mode,
+                    evolve_reason,
                 )
                 self.publish("EVOLVE")
+                # 重置样本累计器（windows 模式下该字段不参与触发，重置无副作用）。
+                self._new_validated_since_evolve = 0
 
         except asyncio.TimeoutError:
             all_succeeded = False

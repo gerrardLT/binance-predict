@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef, Fragment } from 'react'
 import {
   XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, Area, AreaChart, ReferenceLine,
+  BarChart, Bar, Legend, LineChart, Line,
 } from 'recharts'
 
 // ============================================================
@@ -48,6 +49,46 @@ interface AgentStatus {
   validate_counter: number
   active_pattern_count: number
   scheduler_running: boolean
+  // Item 5：进化时钟与证据量挂钩（后端 status 端点新增字段，旧后端可能缺省）
+  evolve_trigger_mode?: string
+  new_validated_since_evolve?: number
+  evolve_min_new_samples?: number
+}
+
+// 进化有效性看板（Item 1）：与后端 evolution_metrics 输出严格对齐
+interface EvoBucket {
+  sample_count: number
+  correct: number
+  win_rate: number
+  ci_lower: number
+  excess_over_random: number
+  beats_random: boolean
+}
+interface EvoOverall extends EvoBucket {
+  verdict: 'INSUFFICIENT_SAMPLES' | 'BEATS_RANDOM' | 'INCONCLUSIVE'
+}
+interface EvoTrendPoint extends EvoBucket {
+  date: string
+}
+interface EvoGenerations {
+  comparable: boolean
+  older_half: EvoBucket
+  newer_half: EvoBucket
+  win_rate_delta: number
+  significant_improvement: boolean
+}
+interface EvolutionReport {
+  window_days: number
+  total_validated: number
+  decisive_count: number
+  no_trade_count: number
+  random_baseline: number
+  overall: EvoOverall
+  trend_daily: EvoTrendPoint[]
+  generations: EvoGenerations
+  by_discovery_method: Record<string, EvoBucket>
+  summary: string
+  generated_at: string
 }
 
 interface PatternMemory {
@@ -62,6 +103,10 @@ interface PatternMemory {
   correct_count: number
   confidence_score: number
   status: 'ACTIVE' | 'RETIRED' | 'EVOLVING'
+  discovery_method: 'LLM_DEEP' | 'PY_CLUSTER' | 'LEGACY'
+  holdout_win_rate: number | null
+  holdout_sample_count: number | null
+  holdout_ci_lower: number | null
   created_at: string | null
   updated_at: string | null
 }
@@ -126,6 +171,69 @@ interface DeepLearnDiscovery {
   predicted_direction: 'UP' | 'DOWN'
   confidence_score: number
   change_reason: string
+  discovery_method?: 'LLM_DEEP' | 'PY_CLUSTER'
+  holdout_win_rate?: number | null
+  holdout_sample_count?: number | null
+  holdout_ci_lower?: number | null
+}
+
+// 运行监控：与后端 HealthReport（schemas.HealthReport）严格对齐
+interface CalibrationBucket {
+  range: string
+  count: number
+  avg_confidence: number
+  hit_rate: number | null
+  gap: number | null
+}
+interface HealthAlert {
+  level: 'WARN' | 'CRITICAL'
+  code: string
+  message: string
+}
+interface HealthReport {
+  generated_at: string
+  overall_status: 'OK' | 'WARN' | 'CRITICAL'
+  alerts: HealthAlert[]
+  window_continuity: Record<string, number | null>
+  predict_stats: Record<string, unknown>
+  calibration: CalibrationBucket[]
+  scheduler: Record<string, unknown>
+  llm: Record<string, unknown>
+  summary: string
+}
+
+// 方案对比：与后端 /deep-learn/compare 的每方法摘要对齐
+interface CompareSummary {
+  method: string | null
+  discovery_count: number
+  avg_holdout_win_rate: number
+  avg_holdout_ci_lower: number
+  total_holdout_samples: number
+  avg_confidence: number
+  passed_gate_count: number
+  passed_gate_ratio: number
+  direction_up: number
+  direction_down: number
+  snapshot_token: string | null
+  train_count: number
+  holdout_count: number
+}
+interface CompareResult {
+  status: string
+  snapshot_consistent: boolean
+  comparison: CompareSummary[]
+  llm: { reasoning: string; discoveries: DeepLearnDiscovery[] }
+  pycluster: { reasoning: string; discoveries: DeepLearnDiscovery[] }
+  message?: string
+}
+interface CompareLiveGroup {
+  method: string
+  pattern_count: number
+  live_sample_count: number
+  live_correct_count: number
+  live_win_rate: number
+  avg_confidence: number
+  avg_holdout_ci_lower: number
 }
 
 // 深度学习流式（SSE）事件：与后端 deep_learn_stream 产出的 dict 严格对齐
@@ -135,6 +243,10 @@ interface DeepLearnStreamEvent {
   delta?: string
   discoveries?: number | DeepLearnDiscovery[]
   reasoning?: string
+  method?: string
+  snapshot_token?: string
+  train_count?: number
+  holdout_count?: number
 }
 
 // ============================================================
@@ -157,11 +269,20 @@ const api = {
     fetch(`/api/llm/traces/${id}`).then(r => r.json()),
   triggerDeepLearn: (maxWindows = 100) =>
     fetch(`/api/sentiment/agent/deep-learn?max_windows=${maxWindows}`, { method: 'POST' }).then(r => r.json()),
-  commitDeepLearn: (discoveries: DeepLearnDiscovery[]) =>
+  runPyClusterDeepLearn: (maxWindows = 100) =>
+    fetch(`/api/sentiment/agent/deep-learn/pycluster?max_windows=${maxWindows}`, { method: 'POST' }).then(r => r.json()),
+  runCompare: (maxWindows = 100) =>
+    fetch(`/api/sentiment/agent/deep-learn/compare?max_windows=${maxWindows}`, { method: 'POST' }).then(r => r.json()),
+  getCompareLive: () =>
+    fetch('/api/sentiment/agent/deep-learn/compare/live').then(r => r.json()),
+  getAgentHealth: () => fetch('/api/agent/health').then(r => r.json()),
+  getAgentEvolution: (days = 30) =>
+    fetch(`/api/sentiment/agent/evolution?days=${days}`).then(r => r.json()),
+  commitDeepLearn: (discoveries: DeepLearnDiscovery[], snapshotToken?: string | null) =>
     fetch('/api/sentiment/agent/deep-learn/commit', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ discoveries }),
+      body: JSON.stringify({ discoveries, snapshot_token: snapshotToken ?? null }),
     }).then(r => r.json()),
 }
 
@@ -205,6 +326,16 @@ function ChangeTypeBadge({ type }: { type: string }) {
   return <span className={`px-2 py-0.5 text-xs font-bold rounded ${colors[type] || 'bg-gray-100'}`}>{type}</span>
 }
 
+function DiscoveryMethodBadge({ method }: { method?: string }) {
+  const meta: Record<string, { label: string; cls: string }> = {
+    LLM_DEEP: { label: 'LLM', cls: 'bg-purple-100 text-purple-700' },
+    PY_CLUSTER: { label: 'PY聚类', cls: 'bg-teal-100 text-teal-700' },
+    LEGACY: { label: '存量', cls: 'bg-gray-100 text-gray-500' },
+  }
+  const m = meta[method || 'LEGACY'] || meta.LEGACY
+  return <span className={`px-1.5 py-0.5 text-[10px] font-bold rounded ${m.cls}`}>{m.label}</span>
+}
+
 function Card({ title, children, className = '' }: { title: string; children: React.ReactNode; className?: string }) {
   return (
     <div className={`bg-white rounded-xl border border-gray-200 shadow-sm flex flex-col ${className}`}>
@@ -222,7 +353,7 @@ function Card({ title, children, className = '' }: { title: string; children: Re
 
 export default function App() {
   const [health, setHealth] = useState<HealthData | null>(null)
-  const [tab, setTab] = useState<'market' | 'agent'>('market')
+  const [tab, setTab] = useState<'market' | 'agent' | 'monitor'>('market')
 
   // 市场情绪
   const [pmPoints, setPmPoints] = useState<PMPoint[]>([])
@@ -295,6 +426,16 @@ export default function App() {
               }`}
             >
               Agent 自进化
+            </button>
+            <button
+              onClick={() => setTab('monitor')}
+              className={`px-4 py-1.5 text-sm font-semibold rounded-md transition ${
+                tab === 'monitor'
+                  ? 'bg-white text-blue-600 shadow-sm'
+                  : 'text-gray-600 hover:text-gray-900 hover:bg-white/60'
+              }`}
+            >
+              运行监控
             </button>
           </div>
 
@@ -425,6 +566,8 @@ export default function App() {
         )}
 
         {tab === 'agent' && <AgentTab />}
+
+        {tab === 'monitor' && <MonitorTab />}
       </main>
 
       {/* 右侧悬浮：LLM 轨迹面板（全局可见，5 秒轮询） */}
@@ -447,6 +590,8 @@ function AgentTab() {
   const [historyFor, setHistoryFor] = useState<number | null>(null)
   const [loading, setLoading] = useState(false)
   const [dlOpen, setDlOpen] = useState(false)
+  const [cmpOpen, setCmpOpen] = useState(false)
+  const [evoOpen, setEvoOpen] = useState(false)
 
   const refreshStatus = useCallback(() => {
     api.getAgentStatus().then(setStatus).catch(() => {})
@@ -509,6 +654,15 @@ function AgentTab() {
               <span className="text-xs text-gray-500">累计验证</span>
               <span className="text-sm font-bold text-gray-900 font-mono">{status.validate_counter}</span>
             </div>
+            <div className="h-4 w-px bg-gray-200" />
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-gray-500">距下次进化</span>
+              <span className="text-sm font-bold text-gray-900 font-mono">
+                {status.evolve_trigger_mode === 'samples' && status.evolve_min_new_samples != null
+                  ? `${status.new_validated_since_evolve ?? 0}/${status.evolve_min_new_samples}`
+                  : '—'}
+              </span>
+            </div>
           </div>
         ) : <div className="text-gray-400 text-center text-sm flex-1">加载中...</div>}
         <button
@@ -517,6 +671,20 @@ function AgentTab() {
           title="全量历史深度分析：预览发现结果，审核后写入模式库"
         >
           🔬 深度学习
+        </button>
+        <button
+          onClick={() => setCmpOpen(true)}
+          className="shrink-0 px-3 py-1.5 text-xs font-semibold text-white bg-teal-600 rounded-lg hover:bg-teal-700 transition"
+          title="同一数据上对比纯 LLM 版与 Python 聚类版的多维准确率"
+        >
+          ⚖️ 方案对比
+        </button>
+        <button
+          onClick={() => setEvoOpen(true)}
+          className="shrink-0 px-3 py-1.5 text-xs font-semibold text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition"
+          title="用样本外胜率趋势/代际对比/分轨证明系统在变好而非只在变化"
+        >
+          📈 进化看板
         </button>
       </div>
 
@@ -536,9 +704,11 @@ function AgentTab() {
                 <thead>
                   <tr className="border-b border-gray-200 text-gray-500">
                     <th className="py-1.5 px-1.5 text-left">模式名称</th>
+                    <th className="py-1.5 px-1.5 text-left">方法</th>
                     <th className="py-1.5 px-1.5 text-left">方向</th>
                     <th className="py-1.5 px-1.5 text-left">状态</th>
-                    <th className="py-1.5 px-1.5 text-right">胜率</th>
+                    <th className="py-1.5 px-1.5 text-right">Live 胜率</th>
+                    <th className="py-1.5 px-1.5 text-right">Holdout</th>
                     <th className="py-1.5 px-1.5 text-right">样本</th>
                     <th className="py-1.5 px-1.5 text-right">置信度</th>
                   </tr>
@@ -548,15 +718,17 @@ function AgentTab() {
                     <Fragment key={p.id}>
                       <tr className="border-b border-gray-100 hover:bg-gray-50 cursor-pointer" onClick={() => setExpandedPattern(expandedPattern === p.id ? null : p.id)}>
                         <td className="py-1.5 px-1.5 font-medium text-gray-800">{p.pattern_name}</td>
+                        <td className="py-1.5 px-1.5"><DiscoveryMethodBadge method={p.discovery_method} /></td>
                         <td className="py-1.5 px-1.5"><DirectionBadge direction={p.predicted_direction} /></td>
                         <td className="py-1.5 px-1.5"><StatusBadge status={p.status} /></td>
                         <td className="py-1.5 px-1.5 text-right font-mono">{(p.win_rate * 100).toFixed(1)}%</td>
+                        <td className="py-1.5 px-1.5 text-right font-mono text-gray-500">{p.holdout_win_rate != null ? `${(p.holdout_win_rate * 100).toFixed(0)}%` : '—'}</td>
                         <td className="py-1.5 px-1.5 text-right font-mono">{p.sample_count}</td>
                         <td className="py-1.5 px-1.5 text-right font-mono">{(p.confidence_score * 100).toFixed(0)}%</td>
                       </tr>
                       {expandedPattern === p.id && (
                         <tr className="bg-gray-50">
-                          <td colSpan={6} className="py-2 px-3">
+                          <td colSpan={8} className="py-2 px-3">
                             <div className="text-xs text-gray-700 mb-2"><b>描述：</b>{p.description}</div>
                             <div className="grid grid-cols-2 gap-2 mb-2">
                               <div>
@@ -652,6 +824,346 @@ function AgentTab() {
 
       {/* 深度学习：预览 + 审核 + 提交（模态） */}
       {dlOpen && <DeepLearnModal onClose={() => setDlOpen(false)} onCommitted={refreshPatterns} />}
+
+      {/* 方案对比：LLM vs Python 聚类多维对比（模态） */}
+      {cmpOpen && <CompareModal onClose={() => setCmpOpen(false)} onCommitted={refreshPatterns} />}
+
+      {/* 进化有效性看板（Item 1，模态） */}
+      {evoOpen && <EvolutionModal onClose={() => setEvoOpen(false)} />}
+    </div>
+  )
+}
+
+// ============================================================
+// 进化有效性看板（Item 1）：GET /api/sentiment/agent/evolution
+// ============================================================
+
+const VERDICT_META: Record<string, { label: string; cls: string }> = {
+  BEATS_RANDOM: { label: '已显著跑赢随机', cls: 'bg-green-100 text-green-700 border-green-200' },
+  INCONCLUSIVE: { label: '尚未显著', cls: 'bg-amber-100 text-amber-700 border-amber-200' },
+  INSUFFICIENT_SAMPLES: { label: '样本不足', cls: 'bg-gray-100 text-gray-500 border-gray-200' },
+}
+
+function evoPct(v: number | null | undefined): string {
+  return typeof v === 'number' ? (v * 100).toFixed(1) + '%' : '--'
+}
+
+function EvoStat({ label, value, tone = 'text-gray-800' }: { label: string; value: React.ReactNode; tone?: string }) {
+  return (
+    <div className="bg-gray-50 rounded-lg px-3 py-2 border border-gray-100">
+      <div className="text-[10px] text-gray-400">{label}</div>
+      <div className={`text-sm font-mono font-bold ${tone}`}>{value}</div>
+    </div>
+  )
+}
+
+function EvolutionModal({ onClose }: { onClose: () => void }) {
+  const [days, setDays] = useState(30)
+  const [report, setReport] = useState<EvolutionReport | null>(null)
+  const [loading, setLoading] = useState(false)
+
+  const load = useCallback((d: number) => {
+    setLoading(true)
+    api.getAgentEvolution(d)
+      .then((r: EvolutionReport) => setReport(r))
+      .catch(() => setReport(null))
+      .finally(() => setLoading(false))
+  }, [])
+
+  useEffect(() => { load(days) }, [days, load])
+
+  const verdict = report?.overall.verdict ?? 'INSUFFICIENT_SAMPLES'
+  const vm = VERDICT_META[verdict] ?? VERDICT_META.INSUFFICIENT_SAMPLES
+
+  return (
+    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
+      <div className="bg-white rounded-xl shadow-2xl w-full max-w-4xl max-h-[88vh] flex flex-col" onClick={e => e.stopPropagation()}>
+        {/* 头部 */}
+        <div className="px-5 py-3 border-b border-gray-200 flex items-center justify-between shrink-0">
+          <div>
+            <h2 className="text-sm font-bold text-gray-800">📈 进化有效性看板</h2>
+            <p className="text-[11px] text-gray-400 mt-0.5">用样本外胜率证明「在变好」而非「只在变化」。仅统计已验证的决策预测（UP/DOWN），随机基线 50%。</p>
+          </div>
+          <div className="flex items-center gap-2">
+            <select value={days} onChange={e => setDays(Number(e.target.value))}
+              className="px-2 py-1 border border-gray-200 rounded-lg text-[11px] focus:outline-none focus:ring-2 focus:ring-blue-500">
+              <option value={7}>近 7 天</option>
+              <option value={30}>近 30 天</option>
+              <option value={90}>近 90 天</option>
+            </select>
+            <button onClick={onClose} className="text-gray-400 hover:text-gray-700 text-xl leading-none px-1">✕</button>
+          </div>
+        </div>
+
+        {/* 主体 */}
+        <div className="flex-1 min-h-0 overflow-auto p-5 space-y-4">
+          {loading && <div className="text-center text-gray-400 py-10 text-sm">加载中...</div>}
+          {!loading && !report && <div className="text-center text-gray-400 py-10 text-sm">暂无数据</div>}
+          {!loading && report && (
+            <>
+              {/* 结论横幅 */}
+              <div className={`rounded-lg border px-4 py-3 ${vm.cls}`}>
+                <div className="flex items-center gap-2 mb-1 flex-wrap">
+                  <span className="text-xs font-bold">{vm.label}</span>
+                  <span className="text-[10px] opacity-70">窗口 {report.window_days} 天 · 已验证 {report.total_validated} 条 · 决策 {report.decisive_count} · 弃权(NO_TRADE) {report.no_trade_count}</span>
+                </div>
+                <p className="text-xs leading-relaxed">{report.summary}</p>
+              </div>
+
+              {/* 总体指标 */}
+              <div>
+                <div className="text-[11px] font-semibold text-gray-500 mb-1.5">总体（决策样本 = UP/DOWN）</div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                  <EvoStat label="决策胜率" value={evoPct(report.overall.win_rate)} tone={report.overall.win_rate >= 0.5 ? 'text-green-600' : 'text-red-600'} />
+                  <EvoStat label="Wilson 95% 下界" value={evoPct(report.overall.ci_lower)} tone={report.overall.beats_random ? 'text-green-600' : 'text-gray-800'} />
+                  <EvoStat label="超额（vs 50%）" value={(report.overall.excess_over_random >= 0 ? '+' : '') + (report.overall.excess_over_random * 100).toFixed(1) + '%'} tone={report.overall.excess_over_random >= 0 ? 'text-green-600' : 'text-red-600'} />
+                  <EvoStat label="跑赢随机？" value={report.overall.beats_random ? '是 ✓' : '否'} tone={report.overall.beats_random ? 'text-green-600' : 'text-gray-500'} />
+                </div>
+              </div>
+
+              {/* 样本外胜率趋势 */}
+              <div>
+                <div className="text-[11px] font-semibold text-gray-500 mb-1.5">样本外胜率趋势（按天）</div>
+                {report.trend_daily.length === 0 ? (
+                  <div className="text-center text-gray-400 py-6 text-xs">暂无按天数据</div>
+                ) : (
+                  <ResponsiveContainer width="100%" height={220}>
+                    <LineChart data={report.trend_daily.map(d => ({
+                      date: d.date.slice(5),
+                      win: +(d.win_rate * 100).toFixed(1),
+                      ci: +(d.ci_lower * 100).toFixed(1),
+                    }))}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                      <XAxis dataKey="date" tick={{ fontSize: 10 }} stroke="#9ca3af" />
+                      <YAxis tick={{ fontSize: 10 }} stroke="#9ca3af" domain={[0, 100]} tickFormatter={(v: number) => v + '%'} />
+                      <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8, border: '1px solid #e5e7eb' }}
+                        formatter={(v, n) => [typeof v === 'number' ? v + '%' : '--', n === 'win' ? '胜率' : 'Wilson 下界']} />
+                      <Legend wrapperStyle={{ fontSize: 11 }} />
+                      <ReferenceLine y={50} stroke="#9ca3af" strokeDasharray="4 4" />
+                      <Line type="monotone" dataKey="win" stroke="#2563eb" strokeWidth={2} name="胜率" dot={{ r: 2 }} />
+                      <Line type="monotone" dataKey="ci" stroke="#a855f7" strokeWidth={1.5} strokeDasharray="4 3" name="Wilson 下界" dot={false} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                )}
+              </div>
+
+              {/* 代际对比 */}
+              <div>
+                <div className="text-[11px] font-semibold text-gray-500 mb-1.5">代际对比（前半程 vs 近半程）</div>
+                {!report.generations.comparable ? (
+                  <div className="text-xs text-gray-400 bg-gray-50 rounded-lg px-3 py-2 border border-gray-100">两半程样本不足（各需 ≥15 决策样本），暂不下改善结论。</div>
+                ) : (
+                  <>
+                    <div className="grid grid-cols-3 gap-2">
+                      <EvoStat label={`前半程（n=${report.generations.older_half.sample_count}）`} value={evoPct(report.generations.older_half.win_rate)} />
+                      <EvoStat label={`近半程（n=${report.generations.newer_half.sample_count}）`} value={evoPct(report.generations.newer_half.win_rate)} tone={report.generations.win_rate_delta >= 0 ? 'text-green-600' : 'text-red-600'} />
+                      <EvoStat label="Δ 胜率" value={(report.generations.win_rate_delta >= 0 ? '+' : '') + (report.generations.win_rate_delta * 100).toFixed(1) + '%'} tone={report.generations.significant_improvement ? 'text-green-600' : report.generations.win_rate_delta > 0 ? 'text-amber-600' : 'text-red-600'} />
+                    </div>
+                    <div className="text-[11px] text-gray-500 mt-1">
+                      {report.generations.significant_improvement
+                        ? '✓ 近半程保守下界已超前半程点估计，是可信的改善信号。'
+                        : report.generations.win_rate_delta > 0
+                          ? '有改善迹象但未达显著，可能仍是波动。'
+                          : '未见改善——警惕「只在变化、并未变好」。'}
+                    </div>
+                  </>
+                )}
+              </div>
+
+              {/* 分发现方法 */}
+              <div>
+                <div className="text-[11px] font-semibold text-gray-500 mb-1.5">按发现方法分轨（哪条轨道真的产出 alpha）</div>
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="border-b border-gray-200 text-gray-500">
+                      <th className="py-1 px-2 text-left">方法</th>
+                      <th className="py-1 px-2 text-right">样本</th>
+                      <th className="py-1 px-2 text-right">胜率</th>
+                      <th className="py-1 px-2 text-right">Wilson 下界</th>
+                      <th className="py-1 px-2 text-center">跑赢随机</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {Object.entries(report.by_discovery_method).map(([m, s]) => (
+                      <tr key={m} className="border-b border-gray-100 hover:bg-gray-50">
+                        <td className="py-1 px-2 font-medium text-gray-700">{m}</td>
+                        <td className="py-1 px-2 text-right font-mono">{s.sample_count}</td>
+                        <td className="py-1 px-2 text-right font-mono">{evoPct(s.win_rate)}</td>
+                        <td className="py-1 px-2 text-right font-mono">{evoPct(s.ci_lower)}</td>
+                        <td className="py-1 px-2 text-center">{s.beats_random ? <span className="text-green-600 font-bold">✓</span> : <span className="text-gray-300">—</span>}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="text-[10px] text-gray-400 text-right">生成于 {report.generated_at ? new Date(report.generated_at).toLocaleString('zh-CN') : '--'}</div>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ============================================================
+// 运行监控 Tab（GET /api/agent/health，30s 轮询）
+// ============================================================
+
+function healthTone(status: string): { dot: string; text: string; label: string } {
+  if (status === 'OK') return { dot: 'bg-green-500', text: 'text-green-600', label: '正常' }
+  if (status === 'WARN') return { dot: 'bg-yellow-500', text: 'text-yellow-600', label: '警告' }
+  return { dot: 'bg-red-500', text: 'text-red-600', label: '严重' }
+}
+
+function MetricKV({ label, value }: { label: string; value: React.ReactNode }) {
+  return (
+    <div className="flex items-center justify-between py-1 border-b border-gray-50 last:border-0">
+      <span className="text-[11px] text-gray-500">{label}</span>
+      <span className="text-xs font-mono font-medium text-gray-800">{value}</span>
+    </div>
+  )
+}
+
+function fmtNum(v: unknown, digits = 2): string {
+  if (v == null || typeof v !== 'number' || Number.isNaN(v)) return '--'
+  return v.toFixed(digits)
+}
+
+function MonitorTab() {
+  const [report, setReport] = useState<HealthReport | null>(null)
+  const [err, setErr] = useState('')
+
+  const refresh = useCallback(() => {
+    api.getAgentHealth()
+      .then(d => { if (d && d.overall_status) { setReport(d); setErr('') } else setErr('健康报告返回异常') })
+      .catch(() => setErr('健康报告获取失败'))
+  }, [])
+
+  useEffect(() => {
+    refresh()
+    const timer = setInterval(refresh, 30000)
+    return () => clearInterval(timer)
+  }, [refresh])
+
+  if (!report) {
+    return <div className="text-center text-gray-400 py-16 text-sm">{err || '加载健康报告中...'}</div>
+  }
+
+  const tone = healthTone(report.overall_status)
+  const wc = report.window_continuity || {}
+  const ps = report.predict_stats || {}
+  const matchRate = typeof ps.match_rate === 'number' ? ps.match_rate : null
+  const dirDist = (ps.direction_distribution as Record<string, number> | undefined) || {}
+
+  return (
+    <div className="space-y-3">
+      {/* 总体状态红黄绿灯 + 诊断文本 */}
+      <div className="bg-white rounded-xl border border-gray-200 shadow-sm px-5 py-3">
+        <div className="flex items-center justify-between gap-4 flex-wrap">
+          <div className="flex items-center gap-3">
+            <span className={`inline-block w-3.5 h-3.5 rounded-full ${tone.dot} animate-pulse`} />
+            <span className={`text-base font-bold ${tone.text}`}>总体状态：{tone.label}</span>
+            <span className="text-[11px] text-gray-400 font-mono">
+              {report.generated_at ? new Date(report.generated_at).toLocaleString('zh-CN') : ''}
+            </span>
+          </div>
+          <button onClick={refresh} className="px-2 py-0.5 text-[11px] rounded bg-gray-100 text-gray-600 hover:bg-gray-200 transition">立即刷新</button>
+        </div>
+        {report.summary && (
+          <div className="mt-2 text-xs text-gray-700 bg-gray-50 rounded-lg p-3 whitespace-pre-wrap break-words">{report.summary}</div>
+        )}
+      </div>
+
+      {/* 告警列表 */}
+      <Card title={`告警（${report.alerts.length}）`}>
+        {report.alerts.length === 0 ? (
+          <div className="text-center text-gray-400 py-4 text-sm">无告警</div>
+        ) : (
+          <ul className="space-y-1.5">
+            {report.alerts.map((a, i) => (
+              <li key={i} className="flex items-start gap-2 text-xs">
+                <span className={`px-1.5 py-0.5 rounded font-bold shrink-0 ${a.level === 'CRITICAL' ? 'bg-red-100 text-red-700' : 'bg-yellow-100 text-yellow-700'}`}>{a.level}</span>
+                <span className="font-mono text-gray-400 shrink-0">{a.code}</span>
+                <span className="text-gray-700">{a.message}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </Card>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+        {/* 窗口连续性 */}
+        <Card title="窗口连续性">
+          <MetricKV label="最新窗口龄期 (s)" value={fmtNum(wc.last_window_age_s, 0)} />
+          <MetricKV label="缺口数 gap_count" value={wc.gap_count ?? '--'} />
+          <MetricKV label="近期窗口数" value={wc.recent_count ?? '--'} />
+          <MetricKV label="预期间隔 (s)" value={wc.expected_interval_s ?? '--'} />
+        </Card>
+
+        {/* predict 统计 */}
+        <Card title="Predict 统计">
+          <MetricKV label="总预测数" value={String(ps.total ?? '--')} />
+          <MetricKV label="已匹配数" value={String(ps.matched ?? '--')} />
+          <MetricKV label="匹配率" value={matchRate != null ? `${(matchRate * 100).toFixed(1)}%` : '--'} />
+          <MetricKV label="ACTIVE 模式数" value={String(ps.active_pattern_count ?? '--')} />
+          <MetricKV label="方向分布" value={`UP ${dirDist.UP ?? 0} / DOWN ${dirDist.DOWN ?? 0} / NO_TRADE ${dirDist.NO_TRADE ?? 0}`} />
+        </Card>
+
+        {/* 调度器 */}
+        <Card title="调度器">
+          {Object.keys(report.scheduler || {}).length === 0 ? (
+            <div className="text-center text-gray-400 py-3 text-xs">无内存态数据</div>
+          ) : (
+            Object.entries(report.scheduler).map(([k, v]) => (
+              <MetricKV key={k} label={k} value={typeof v === 'object' ? JSON.stringify(v) : String(v)} />
+            ))
+          )}
+        </Card>
+
+        {/* LLM 指标 */}
+        <Card title="LLM 指标">
+          {Object.keys(report.llm || {}).length === 0 ? (
+            <div className="text-center text-gray-400 py-3 text-xs">无内存态数据</div>
+          ) : (
+            Object.entries(report.llm).map(([k, v]) => (
+              <MetricKV key={k} label={k} value={typeof v === 'object' ? JSON.stringify(v) : String(v)} />
+            ))
+          )}
+        </Card>
+      </div>
+
+      {/* 置信度校准分桶 */}
+      <Card title="置信度校准（分桶）">
+        {report.calibration.length === 0 ? (
+          <div className="text-center text-gray-400 py-4 text-sm">样本不足，暂无校准数据</div>
+        ) : (
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="border-b border-gray-200 text-gray-500">
+                <th className="py-1.5 px-1.5 text-left">区间</th>
+                <th className="py-1.5 px-1.5 text-right">样本数</th>
+                <th className="py-1.5 px-1.5 text-right">平均置信度</th>
+                <th className="py-1.5 px-1.5 text-right">实际命中率</th>
+                <th className="py-1.5 px-1.5 text-right">偏差 (gap)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {report.calibration.map((b, i) => (
+                <tr key={i} className="border-b border-gray-100 hover:bg-gray-50">
+                  <td className="py-1.5 px-1.5 font-mono text-gray-700">{b.range}</td>
+                  <td className="py-1.5 px-1.5 text-right font-mono">{b.count}</td>
+                  <td className="py-1.5 px-1.5 text-right font-mono">{(b.avg_confidence * 100).toFixed(0)}%</td>
+                  <td className="py-1.5 px-1.5 text-right font-mono">{b.hit_rate != null ? `${(b.hit_rate * 100).toFixed(0)}%` : '--'}</td>
+                  <td className={`py-1.5 px-1.5 text-right font-mono ${b.gap == null ? 'text-gray-400' : b.gap > 0.1 ? 'text-red-600' : b.gap < -0.1 ? 'text-blue-600' : 'text-gray-600'}`}>
+                    {b.gap != null ? `${b.gap > 0 ? '+' : ''}${(b.gap * 100).toFixed(0)}%` : '--'}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </Card>
     </div>
   )
 }
@@ -847,6 +1359,9 @@ function DeepLearnModal({ onClose, onCommitted }: { onClose: () => void; onCommi
   const [expanded, setExpanded] = useState<number | null>(null)
   const [liveLog, setLiveLog] = useState<string[]>([])
   const [progressCount, setProgressCount] = useState(0)
+  const [snapshotToken, setSnapshotToken] = useState<string | null>(null)
+  const [trainCount, setTrainCount] = useState(0)
+  const [holdoutCount, setHoldoutCount] = useState(0)
   const reasoningRef = useRef<HTMLPreElement>(null)
 
   // reasoning 增量到达时自动滚到底部（打字机跟随）
@@ -859,6 +1374,7 @@ function DeepLearnModal({ onClose, onCommitted }: { onClose: () => void; onCommi
     setPhase('analyzing'); setMsg('')
     setReasoning(''); setDiscoveries([]); setChecked(new Set())
     setLiveLog([]); setProgressCount(0)
+    setSnapshotToken(null); setTrainCount(0); setHoldoutCount(0)
     try {
       const resp = await fetch(
         `/api/sentiment/agent/deep-learn/stream?max_windows=${maxWindows}`,
@@ -900,6 +1416,9 @@ function DeepLearnModal({ onClose, onCommitted }: { onClose: () => void; onCommi
             setReasoning(ev.reasoning || reasoningAcc)
             setDiscoveries(ds)
             setChecked(new Set(ds.map((_, i) => i)))  // 默认全选
+            setSnapshotToken(ev.snapshot_token ?? null)
+            setTrainCount(ev.train_count ?? 0)
+            setHoldoutCount(ev.holdout_count ?? 0)
             setPhase('review')
             if (ds.length === 0) setMsg('LLM 未发现任何新模式（本次已产生一条 DEEP_LEARN 轨迹）')
           }
@@ -924,9 +1443,12 @@ function DeepLearnModal({ onClose, onCommitted }: { onClose: () => void; onCommi
     if (selected.length === 0) { setMsg('请至少勾选一条模式'); return }
     setPhase('committing'); setMsg('')
     try {
-      const res = await api.commitDeepLearn(selected)
+      const res = await api.commitDeepLearn(selected, snapshotToken)
       if (res.status === 'ok') {
-        setMsg(`✅ 已写入 ${res.written} 条模式到模式库`)
+        const rejected = Array.isArray(res.rejected) ? res.rejected.length : 0
+        const failed = Array.isArray(res.failed) ? res.failed.length : 0
+        const extra = [rejected ? `未过闸门 ${rejected}` : '', failed ? `失败 ${failed}` : ''].filter(Boolean).join(' · ')
+        setMsg(`✅ 已写入 ${res.written} 条模式到模式库${extra ? `（${extra}）` : ''}`)
         onCommitted()
         setDiscoveries([]); setChecked(new Set())
         setPhase('review')
@@ -1022,6 +1544,9 @@ function DeepLearnModal({ onClose, onCommitted }: { onClose: () => void; onCommi
               <div className="flex items-center justify-between mb-2">
                 <div className="text-[11px] font-bold text-gray-500">
                   发现 {discoveries.length} 条 · 已选 {selectedCount} 条
+                  {(trainCount > 0 || holdoutCount > 0) && (
+                    <span className="ml-2 font-normal text-gray-400">train {trainCount} / holdout {holdoutCount}</span>
+                  )}
                 </div>
                 <div className="flex gap-2">
                   <button onClick={() => setChecked(new Set(discoveries.map((_, i) => i)))} className="text-[10px] px-2 py-0.5 rounded bg-gray-100 text-gray-600 hover:bg-gray-200">全选</button>
@@ -1039,6 +1564,11 @@ function DeepLearnModal({ onClose, onCommitted }: { onClose: () => void; onCommi
                           <span className="font-semibold text-sm text-gray-800">{d.pattern_name}</span>
                           <DirectionBadge direction={d.predicted_direction} />
                           <span className="text-[10px] text-gray-500 font-mono">conf {(d.confidence_score * 100).toFixed(0)}%</span>
+                          {d.holdout_win_rate != null && (
+                            <span className="text-[10px] text-teal-600 font-mono" title={`holdout 胜率 · 样本 ${d.holdout_sample_count ?? 0} · Wilson下界 ${d.holdout_ci_lower != null ? (d.holdout_ci_lower * 100).toFixed(0) + '%' : '—'}`}>
+                              holdout {(d.holdout_win_rate * 100).toFixed(0)}%
+                            </span>
+                          )}
                           {d.operation === 'UPDATE' && d.target_pattern_id != null && (
                             <span className="text-[10px] text-amber-600 font-mono">→ 更新 #{d.target_pattern_id}</span>
                           )}
@@ -1088,6 +1618,286 @@ function DeepLearnModal({ onClose, onCommitted }: { onClose: () => void; onCommi
               </button>
             )}
           </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ============================================================
+// 方案对比模态：LLM vs Python 聚类 —— 同一 train/holdout 多维对比
+// ============================================================
+
+interface PyClusterResult {
+  status: string
+  reasoning: string
+  discoveries: DeepLearnDiscovery[]
+  count: number
+  method: string
+  snapshot_token: string | null
+  train_count: number
+  holdout_count: number
+  message?: string
+}
+
+function pct(v: number | null | undefined): string {
+  return v == null ? '—' : `${(v * 100).toFixed(0)}%`
+}
+
+function CompareModal({ onClose, onCommitted }: { onClose: () => void; onCommitted: () => void }) {
+  const [maxWindows, setMaxWindows] = useState(100)
+  const [busy, setBusy] = useState<'' | 'py' | 'cmp' | 'live' | 'commit'>('')
+  const [msg, setMsg] = useState('')
+  const [py, setPy] = useState<PyClusterResult | null>(null)
+  const [pyChecked, setPyChecked] = useState<Set<number>>(new Set())
+  const [cmp, setCmp] = useState<CompareResult | null>(null)
+  const [live, setLive] = useState<CompareLiveGroup[]>([])
+
+  useEffect(() => { loadLive() }, [])  // eslint-disable-line react-hooks/exhaustive-deps
+
+  const loadLive = async () => {
+    setBusy('live')
+    try {
+      const res = await api.getCompareLive()
+      setLive(Array.isArray(res.groups) ? res.groups : [])
+    } catch (e) { setMsg(`上线指标加载失败: ${(e as Error).message}`) }
+    finally { setBusy('') }
+  }
+
+  const runPy = async () => {
+    setBusy('py'); setMsg(''); setPy(null); setPyChecked(new Set())
+    try {
+      const res: PyClusterResult = await api.runPyClusterDeepLearn(maxWindows)
+      if (res.status === 'ok') {
+        setPy(res)
+        setPyChecked(new Set(res.discoveries.map((_, i) => i)))
+        if (res.discoveries.length === 0) setMsg('Python 聚类未产出任何模式（样本不足或全部未过闸门）')
+      } else {
+        setMsg(res.message || 'Python 聚类失败')
+      }
+    } catch (e) { setMsg(`请求失败: ${(e as Error).message}`) }
+    finally { setBusy('') }
+  }
+
+  const runCmp = async () => {
+    setBusy('cmp'); setMsg(''); setCmp(null)
+    try {
+      const res: CompareResult = await api.runCompare(maxWindows)
+      if (res.status === 'ok') { setCmp(res) }
+      else { setMsg(res.message || '对比失败') }
+    } catch (e) { setMsg(`请求失败: ${(e as Error).message}`) }
+    finally { setBusy('') }
+  }
+
+  const togglePy = (i: number) => {
+    setPyChecked(prev => { const n = new Set(prev); n.has(i) ? n.delete(i) : n.add(i); return n })
+  }
+
+  const commitPy = async () => {
+    if (!py) return
+    const selected = py.discoveries.filter((_, i) => pyChecked.has(i))
+    if (selected.length === 0) { setMsg('请至少勾选一条 PY 聚类模式'); return }
+    setBusy('commit'); setMsg('')
+    try {
+      const res = await api.commitDeepLearn(selected, py.snapshot_token)
+      if (res.status === 'ok') {
+        const rejected = Array.isArray(res.rejected) ? res.rejected.length : 0
+        const failed = Array.isArray(res.failed) ? res.failed.length : 0
+        const extra = [rejected ? `未过闸门 ${rejected}` : '', failed ? `失败 ${failed}` : ''].filter(Boolean).join(' · ')
+        setMsg(`✅ 已写入 ${res.written} 条 PY 聚类模式${extra ? `（${extra}）` : ''}`)
+        onCommitted(); loadLive()
+        setPy(null); setPyChecked(new Set())
+      } else { setMsg(res.message || '写入失败') }
+    } catch (e) { setMsg(`请求失败: ${(e as Error).message}`) }
+    finally { setBusy('') }
+  }
+
+  const byMethod = (m: string): CompareSummary | undefined =>
+    cmp?.comparison.find(c => c.method === m)
+  const llmSum = byMethod('LLM_DEEP')
+  const pySum = byMethod('PY_CLUSTER')
+
+  // 归一化到 0-1 的可比维度，画在同一张柱状图
+  const chartData = cmp ? [
+    { metric: 'Holdout胜率', LLM: llmSum?.avg_holdout_win_rate ?? 0, PY: pySum?.avg_holdout_win_rate ?? 0 },
+    { metric: 'Wilson下界', LLM: llmSum?.avg_holdout_ci_lower ?? 0, PY: pySum?.avg_holdout_ci_lower ?? 0 },
+    { metric: '平均置信', LLM: llmSum?.avg_confidence ?? 0, PY: pySum?.avg_confidence ?? 0 },
+    { metric: '过闸门比', LLM: llmSum?.passed_gate_ratio ?? 0, PY: pySum?.passed_gate_ratio ?? 0 },
+  ] : []
+
+  const rows: { label: string; get: (s?: CompareSummary) => string }[] = [
+    { label: '发现数', get: s => String(s?.discovery_count ?? 0) },
+    { label: '平均 holdout 胜率', get: s => pct(s?.avg_holdout_win_rate) },
+    { label: '平均 Wilson 下界', get: s => pct(s?.avg_holdout_ci_lower) },
+    { label: 'holdout 样本量', get: s => String(s?.total_holdout_samples ?? 0) },
+    { label: '平均 confidence', get: s => pct(s?.avg_confidence) },
+    { label: '通过准入', get: s => `${s?.passed_gate_count ?? 0} / ${s?.discovery_count ?? 0}（${pct(s?.passed_gate_ratio)}）` },
+    { label: '方向 UP / DOWN', get: s => `${s?.direction_up ?? 0} / ${s?.direction_down ?? 0}` },
+  ]
+
+  const pySelected = py ? py.discoveries.filter((_, i) => pyChecked.has(i)).length : 0
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-4xl max-h-[90vh] flex flex-col" onClick={e => e.stopPropagation()}>
+        {/* 头部 */}
+        <div className="px-5 py-3 border-b border-gray-200 flex items-center justify-between shrink-0">
+          <h2 className="text-base font-bold text-gray-800">⚖️ 方案对比 · LLM vs Python 聚类</h2>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-xl leading-none">×</button>
+        </div>
+
+        {/* 控制栏 */}
+        <div className="px-5 py-3 border-b border-gray-100 flex items-center gap-3 flex-wrap shrink-0">
+          <label className="text-xs text-gray-600 flex items-center gap-1.5">
+            窗口数
+            <input
+              type="number" min={1} max={500} value={maxWindows}
+              onChange={e => setMaxWindows(Math.max(1, Math.min(500, Number(e.target.value) || 1)))}
+              className="w-20 px-2 py-1 text-xs border border-gray-300 rounded"
+            />
+          </label>
+          <button onClick={runPy} disabled={busy !== ''} className="px-3 py-1.5 text-xs font-semibold text-white bg-teal-600 rounded-lg hover:bg-teal-700 disabled:opacity-50">
+            {busy === 'py' ? '聚类中...' : '运行 Python 聚类版'}
+          </button>
+          <button onClick={runCmp} disabled={busy !== ''} className="px-3 py-1.5 text-xs font-semibold text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 disabled:opacity-50">
+            {busy === 'cmp' ? '对比中（含 LLM）...' : '对比两套方案'}
+          </button>
+          <button onClick={loadLive} disabled={busy !== ''} className="px-3 py-1.5 text-xs font-medium text-gray-600 bg-gray-100 rounded-lg hover:bg-gray-200 disabled:opacity-50">
+            刷新上线指标
+          </button>
+          {msg && <span className={`text-xs ${msg.startsWith('✅') ? 'text-green-600' : 'text-gray-500'}`}>{msg}</span>}
+        </div>
+
+        <div className="p-5 overflow-auto space-y-5">
+          {/* 对比图表 + 表格 */}
+          {cmp && (
+            <div className="space-y-3">
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-semibold text-gray-700">发现即时对比（同一 train/holdout）</span>
+                {!cmp.snapshot_consistent && (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-700" title="两套方案的数据快照不一致">⚠ 快照不一致</span>
+                )}
+              </div>
+              <div className="h-56 bg-gray-50 rounded-lg border border-gray-200 p-2">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={chartData} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
+                    <XAxis dataKey="metric" tick={{ fontSize: 11 }} />
+                    <YAxis domain={[0, 1]} tickFormatter={v => `${(v * 100).toFixed(0)}%`} tick={{ fontSize: 11 }} />
+                    <Tooltip formatter={(v) => `${(Number(v) * 100).toFixed(1)}%`} />
+                    <Legend wrapperStyle={{ fontSize: 11 }} />
+                    <Bar dataKey="LLM" fill="#a855f7" radius={[3, 3, 0, 0]} />
+                    <Bar dataKey="PY" fill="#14b8a6" radius={[3, 3, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+              <div className="overflow-auto">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="border-b border-gray-200 text-gray-500">
+                      <th className="py-1.5 px-2 text-left">维度</th>
+                      <th className="py-1.5 px-2 text-right"><DiscoveryMethodBadge method="LLM_DEEP" /></th>
+                      <th className="py-1.5 px-2 text-right"><DiscoveryMethodBadge method="PY_CLUSTER" /></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rows.map(r => (
+                      <tr key={r.label} className="border-b border-gray-100">
+                        <td className="py-1.5 px-2 text-gray-600">{r.label}</td>
+                        <td className="py-1.5 px-2 text-right font-mono text-purple-700">{r.get(llmSum)}</td>
+                        <td className="py-1.5 px-2 text-right font-mono text-teal-700">{r.get(pySum)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* 上线真实指标（按 discovery_method 聚合） */}
+          <div className="space-y-2">
+            <span className="text-sm font-semibold text-gray-700">上线真实指标（模式库 ACTIVE，按来源聚合）</span>
+            {live.length === 0 ? (
+              <div className="text-xs text-gray-400">暂无上线数据</div>
+            ) : (
+              <div className="overflow-auto">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="border-b border-gray-200 text-gray-500">
+                      <th className="py-1.5 px-2 text-left">来源</th>
+                      <th className="py-1.5 px-2 text-right">模式数</th>
+                      <th className="py-1.5 px-2 text-right">样本量</th>
+                      <th className="py-1.5 px-2 text-right">正确数</th>
+                      <th className="py-1.5 px-2 text-right">Live 胜率</th>
+                      <th className="py-1.5 px-2 text-right">平均置信</th>
+                      <th className="py-1.5 px-2 text-right">平均Wilson下界</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {live.map(g => (
+                      <tr key={g.method} className="border-b border-gray-100">
+                        <td className="py-1.5 px-2"><DiscoveryMethodBadge method={g.method} /></td>
+                        <td className="py-1.5 px-2 text-right font-mono">{g.pattern_count}</td>
+                        <td className="py-1.5 px-2 text-right font-mono">{g.live_sample_count}</td>
+                        <td className="py-1.5 px-2 text-right font-mono">{g.live_correct_count}</td>
+                        <td className="py-1.5 px-2 text-right font-mono font-bold">{pct(g.live_win_rate)}</td>
+                        <td className="py-1.5 px-2 text-right font-mono">{pct(g.avg_confidence)}</td>
+                        <td className="py-1.5 px-2 text-right font-mono">{pct(g.avg_holdout_ci_lower)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
+          {/* PY 聚类发现列表 + 勾选提交 */}
+          {py && py.discoveries.length > 0 && (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-sm font-semibold text-gray-700">
+                  Python 聚类发现 {py.discoveries.length} 条 · 已选 {pySelected}
+                  <span className="ml-2 font-normal text-gray-400">train {py.train_count} / holdout {py.holdout_count}</span>
+                </span>
+                <div className="flex gap-2">
+                  <button onClick={() => setPyChecked(new Set(py.discoveries.map((_, i) => i)))} className="text-[10px] px-2 py-0.5 rounded bg-gray-100 text-gray-600 hover:bg-gray-200">全选</button>
+                  <button onClick={() => setPyChecked(new Set())} className="text-[10px] px-2 py-0.5 rounded bg-gray-100 text-gray-600 hover:bg-gray-200">清空</button>
+                </div>
+              </div>
+              <div className="space-y-2">
+                {py.discoveries.map((d, i) => (
+                  <label key={i} className="flex gap-2 items-start p-2.5 border border-gray-200 rounded-lg cursor-pointer hover:bg-gray-50">
+                    <input type="checkbox" checked={pyChecked.has(i)} onChange={() => togglePy(i)} className="mt-1 accent-teal-600" />
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 mb-1 flex-wrap">
+                        <ChangeTypeBadge type={d.operation} />
+                        <span className="font-semibold text-sm text-gray-800">{d.pattern_name}</span>
+                        <DirectionBadge direction={d.predicted_direction} />
+                        <span className="text-[10px] text-gray-500 font-mono">conf {(d.confidence_score * 100).toFixed(0)}%</span>
+                        {d.holdout_win_rate != null && (
+                          <span className="text-[10px] text-teal-600 font-mono" title={`holdout 样本 ${d.holdout_sample_count ?? 0} · Wilson下界 ${pct(d.holdout_ci_lower)}`}>
+                            holdout {pct(d.holdout_win_rate)}
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-xs text-gray-600 mb-1">{d.description}</div>
+                      <div className="text-[11px] text-gray-500"><b>理由：</b>{d.change_reason}</div>
+                    </div>
+                  </label>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* 底部 */}
+        <div className="px-5 py-3 border-t border-gray-200 flex items-center justify-end gap-2 shrink-0">
+          <button onClick={onClose} className="px-3 py-1.5 text-xs font-medium text-gray-600 bg-gray-100 rounded-lg hover:bg-gray-200">关闭</button>
+          {py && py.discoveries.length > 0 && (
+            <button onClick={commitPy} disabled={busy !== '' || pySelected === 0} className="px-3 py-1.5 text-xs font-semibold text-white bg-green-600 rounded-lg hover:bg-green-700 disabled:opacity-50">
+              {busy === 'commit' ? '写入中...' : `写入选中的 ${pySelected} 条 PY 模式`}
+            </button>
+          )}
         </div>
       </div>
     </div>

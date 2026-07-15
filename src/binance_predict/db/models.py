@@ -200,6 +200,7 @@ class PatternMemory(Base):
     __table_args__ = (
         Index("ix_pattern_memory_name", "pattern_name"),    # Req 1.2 名称检索
         Index("ix_pattern_memory_status", "status"),        # Req 1.2 状态筛选
+        Index("ix_pattern_memory_discovery_method", "discovery_method"),  # 按发现方法聚合 live 指标
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -236,6 +237,24 @@ class PatternMemory(Base):
     status: Mapped[str] = mapped_column(
         String(10), nullable=False, default="ACTIVE",
         comment="ACTIVE | RETIRED | EVOLVING"
+    )
+    # --- 发现方法与样本外（holdout）统计（Deep Learn 双轨 A/B 对比）---
+    # discovery_method: LLM_DEEP=纯 LLM 深度发现 / PY_CLUSTER=Python 确定性聚类 /
+    # LEGACY=存量或 learn/evolve 产出（迁移默认值，存量行不受影响）。
+    discovery_method: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="LEGACY", server_default="LEGACY",
+        comment="发现方法：LLM_DEEP | PY_CLUSTER | LEGACY"
+    )
+    # 发现时在留出集(holdout)上的样本外统计，与 live 的 win_rate/sample_count/
+    # correct_count 分开存、互不污染；仅 Deep Learn 双轨发现时回填。
+    holdout_win_rate: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="发现时 holdout 胜率 0~1"
+    )
+    holdout_sample_count: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment="发现时 holdout 命中判定样本数"
+    )
+    holdout_ci_lower: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="发现时 holdout 胜率 Wilson 95% 置信下界"
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

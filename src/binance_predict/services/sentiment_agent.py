@@ -18,10 +18,11 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
+import numpy as np
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -52,6 +53,16 @@ from .agent_logic import (
     should_trade,
 )
 from .alerting import AlertService
+from .backtest import (
+    evaluate_on_holdout,
+    snapshot_token,
+    time_split,
+)
+from .curve_features import (
+    FEATURE_DIM,
+    cluster_windows,
+    extract_features,
+)
 from .llm_service import LLMService
 from .llm_validator import (
     validate_evolve_output,
@@ -307,6 +318,10 @@ class SentimentAgent:
                 win_rate=0.0,
                 sample_count=0,
                 correct_count=0,
+                discovery_method=pattern_data.get("discovery_method", "LEGACY"),
+                holdout_win_rate=pattern_data.get("holdout_win_rate"),
+                holdout_sample_count=pattern_data.get("holdout_sample_count"),
+                holdout_ci_lower=pattern_data.get("holdout_ci_lower"),
             )
             session.add(new_pattern)
             # flush 以获取自增 id（同一事务内）
@@ -349,7 +364,7 @@ class SentimentAgent:
             # 记录变更前快照
             before_snapshot = self._pattern_to_snapshot(pattern)
 
-            # 更新指定字段（仅更新 LLM 可写的业务字段）
+            # 更新指定字段（仅更新 LLM 可写的业务字段 + Deep Learn 样本外统计）
             updatable_fields = (
                 "pattern_name",
                 "description",
@@ -357,6 +372,10 @@ class SentimentAgent:
                 "conditions",
                 "predicted_direction",
                 "confidence_score",
+                "discovery_method",
+                "holdout_win_rate",
+                "holdout_sample_count",
+                "holdout_ci_lower",
             )
             for field in updatable_fields:
                 if field in pattern_data:
@@ -688,6 +707,132 @@ class SentimentAgent:
     # 深度分析（手动触发，双模式架构）
     # ======================================================================
 
+    @staticmethod
+    def _uniform_sample(items: list, k: int) -> list:
+        """从有序 items 中按位置均匀抽取至多 k 个（保持原顺序，去重索引）。
+
+        k>=len 或 k<=0 时原样返回。用于分层后层内按时间均匀抽样，
+        保证抽样覆盖整个时间跨度而非仅集中在两端。
+        """
+        n = len(items)
+        if k <= 0 or k >= n:
+            return list(items)
+        if k == 1:
+            return [items[n // 2]]
+        seen: set[int] = set()
+        picked: list = []
+        for i in range(k):
+            idx = round(i * (n - 1) / (k - 1))
+            if idx not in seen:
+                seen.add(idx)
+                picked.append(items[idx])
+        return picked
+
+    async def _fetch_deep_learn_windows(
+        self,
+        days_back: int | None = None,
+        max_windows: int | None = None,
+    ) -> list[dict]:
+        """P0-1 时间分层采样：圈定近 days_back 天 outcome 非空窗口，按 outcome
+        分层、层内按时间均匀抽样至多 max_windows 个，返回 start_time 升序的序列化 dict。
+
+        取代原 `order_by(start_time.desc()).limit(max_windows)`——后者只取最近 N 个
+        却当作"全量历史"，既丢失早期样本又误导 LLM 的时间跨度认知。
+        """
+        if days_back is None:
+            days_back = settings.agent_deep_learn_days_back
+        if max_windows is None:
+            max_windows = settings.agent_deep_learn_max_windows
+
+        cutoff_ms = int(time.time() * 1000) - int(days_back) * 86_400_000
+        async with async_session_factory() as session:
+            stmt = (
+                select(SentimentWindow)
+                .where(
+                    SentimentWindow.outcome.isnot(None),
+                    SentimentWindow.start_time >= cutoff_ms,
+                )
+                .order_by(SentimentWindow.start_time.asc())
+            )
+            result = await session.execute(stmt)
+            raw_windows = result.scalars().all()
+            all_dicts = [
+                {
+                    "id": w.id,
+                    "start_time": w.start_time,
+                    "end_time": w.end_time,
+                    "curve_up_pct": w.curve_up_pct,
+                    "curve_down_pct": w.curve_down_pct,
+                    "outcome": w.outcome,
+                    "actual_return": w.actual_return,
+                    "sample_count": w.sample_count,
+                }
+                for w in raw_windows
+            ]
+
+        total = len(all_dicts)
+        if total <= max_windows:
+            return all_dicts
+
+        # 按 outcome 分层（各层已随全局按 start_time 升序）
+        layers: dict[str, list[dict]] = defaultdict(list)
+        for w in all_dicts:
+            layers[(w.get("outcome") or "NOISE").upper()].append(w)
+
+        # 按层大小比例分配配额，层内均匀抽样
+        sampled: list[dict] = []
+        for key, group in layers.items():
+            quota = max(1, round(max_windows * len(group) / total))
+            sampled.extend(self._uniform_sample(group, quota))
+
+        # 配额合计可能略超 max_windows，再做一次全局均匀收敛
+        sampled.sort(key=lambda w: w.get("start_time", 0))
+        if len(sampled) > max_windows:
+            sampled = self._uniform_sample(sampled, max_windows)
+        return sampled
+
+    @staticmethod
+    def _direction_centroid(windows: list[dict], direction: str) -> np.ndarray:
+        """取 windows 中 outcome==direction 的窗口特征质心作代表向量。
+
+        供 LLM_DEEP discovery 复用同一 holdout 匹配/去重路径（LLM 产出无数值向量，
+        以其方向对应的历史窗口质心代表其形态）。无匹配窗口返回零向量。
+        """
+        vecs = [
+            extract_features(w.get("curve_up_pct") or [], w.get("curve_down_pct") or [])
+            for w in windows
+            if (w.get("outcome") or "").upper() == (direction or "").upper()
+        ]
+        if not vecs:
+            return np.zeros(FEATURE_DIM, dtype=float)
+        return np.mean(np.vstack(vecs), axis=0)
+
+    def _finalize_llm_discoveries(
+        self,
+        discoveries: list[dict],
+        train_windows: list[dict],
+        holdout_windows: list[dict],
+    ) -> list[dict]:
+        """为 LLM discoveries 附加 holdout 统计与 discovery_method='LLM_DEEP'。
+
+        每条 discovery 以其方向在 train 内的特征质心为代表向量，存入
+        curve_features['_feature_vector']（供 holdout 匹配与 P1-3 去重复用），
+        再在 holdout 上回测胜率/样本/Wilson 下界。
+        """
+        for d in discoveries:
+            direction = d.get("predicted_direction") or ""
+            vec = self._direction_centroid(train_windows, direction)
+            cf = d.get("curve_features")
+            cf = dict(cf) if isinstance(cf, dict) else {}
+            cf["_feature_vector"] = vec.tolist()
+            d["curve_features"] = cf
+            stats = evaluate_on_holdout(vec, direction, holdout_windows)
+            d["discovery_method"] = "LLM_DEEP"
+            d["holdout_win_rate"] = stats["win_rate"]
+            d["holdout_sample_count"] = stats["sample_count"]
+            d["holdout_ci_lower"] = stats["ci_lower"]
+        return discoveries
+
     async def deep_learn(
         self,
         max_windows: int | None = None,
@@ -715,41 +860,21 @@ class SentimentAgent:
             raise RuntimeError("已有深度分析任务正在执行，请稍后重试")
 
         async with self._deep_learn_lock:
+            days_back = settings.agent_deep_learn_days_back
             if max_windows is None:
                 max_windows = settings.agent_deep_learn_max_windows
 
             logger.info(
-                "Deep Learn: 开始全量历史分析 | max_windows={}",
+                "Deep Learn: 开始历史分析 | days_back={} | max_windows={}",
+                days_back,
                 max_windows,
             )
 
-            # Step 1: 从 DB 读取全量窗口（全量原始数据，不压缩）
+            # Step 1: 时间分层采样取数（P0-1）
+            windows_dicts = await self._fetch_deep_learn_windows(days_back, max_windows)
+
+            # 查询 ACTIVE 模式
             async with async_session_factory() as session:
-                stmt = (
-                    select(SentimentWindow)
-                    .where(SentimentWindow.outcome.isnot(None))
-                    .order_by(SentimentWindow.start_time.desc())
-                    .limit(max_windows)
-                )
-                result = await session.execute(stmt)
-                raw_windows = result.scalars().all()
-
-                # 序列化为 dict（保留完整曲线数据）
-                windows_dicts = [
-                    {
-                        "id": w.id,
-                        "start_time": w.start_time,
-                        "end_time": w.end_time,
-                        "curve_up_pct": w.curve_up_pct,
-                        "curve_down_pct": w.curve_down_pct,
-                        "outcome": w.outcome,
-                        "actual_return": w.actual_return,
-                        "sample_count": w.sample_count,
-                    }
-                    for w in raw_windows
-                ]
-
-                # 查询 ACTIVE 模式
                 pattern_stmt = select(PatternMemory).where(PatternMemory.status == "ACTIVE")
                 pattern_result = await session.execute(pattern_stmt)
                 active_patterns = [
@@ -767,21 +892,35 @@ class SentimentAgent:
                     for p in pattern_result.scalars().all()
                 ]
 
+            if not windows_dicts:
+                logger.warning("Deep Learn: 无可用历史窗口，跳过分析")
+                return {
+                    "reasoning": "",
+                    "discoveries": [],
+                    "method": "LLM_DEEP",
+                    "snapshot_token": snapshot_token([]),
+                    "train_count": 0,
+                    "holdout_count": 0,
+                }
+
+            # 按时间切 train/holdout（P0-2：LLM 仅看 train，holdout 真正留出）
+            train_windows, holdout_windows = time_split(
+                windows_dicts, settings.agent_deep_learn_holdout_ratio
+            )
+
             logger.info(
-                "Deep Learn: 数据准备完成 | 窗口数={} | ACTIVE 模式={}",
+                "Deep Learn: 数据准备完成 | 采样窗口={} | train={} | holdout={} | ACTIVE 模式={}",
                 len(windows_dicts),
+                len(train_windows),
+                len(holdout_windows),
                 len(active_patterns),
             )
 
-            if not windows_dicts:
-                logger.warning("Deep Learn: 无可用历史窗口，跳过分析")
-                return {"reasoning": "", "discoveries": []}
-
-            # Step 2: LLM 深度分析（全量原始窗口直接输入，不压缩）
-            timeout = settings.agent_llm_timeouts.get("LEARN", 100.0)
+            # Step 2: LLM 深度分析（仅输入 train 窗口，避免 holdout 泄漏；P1-1 专用超时）
+            timeout = settings.agent_deep_learn_timeout
             try:
                 learn_output = await self._llm.agent_deep_learn(
-                    windows=windows_dicts,
+                    windows=train_windows,
                     active_patterns=active_patterns,
                     timeout=timeout,
                 )
@@ -799,7 +938,7 @@ class SentimentAgent:
                 learn_output.reasoning[:200] if learn_output.reasoning else "",
             )
 
-            # Step 3: 序列化返回（不写入 DB）
+            # Step 3: 序列化 + 附加 holdout 统计（P0-2 对比 / P0-3 准入依据）
             discoveries_serialized = []
             for d in learn_output.discoveries:
                 discoveries_serialized.append({
@@ -813,10 +952,17 @@ class SentimentAgent:
                     "confidence_score": d.confidence_score,
                     "change_reason": d.change_reason,
                 })
+            self._finalize_llm_discoveries(
+                discoveries_serialized, train_windows, holdout_windows
+            )
 
             return {
                 "reasoning": learn_output.reasoning or "",
                 "discoveries": discoveries_serialized,
+                "method": "LLM_DEEP",
+                "snapshot_token": snapshot_token([w["id"] for w in windows_dicts]),
+                "train_count": len(train_windows),
+                "holdout_count": len(holdout_windows),
             }
 
     async def deep_learn_stream(
@@ -842,36 +988,24 @@ class SentimentAgent:
             return
 
         async with self._deep_learn_lock:
+            days_back = settings.agent_deep_learn_days_back
             if max_windows is None:
                 max_windows = settings.agent_deep_learn_max_windows
 
-            logger.info("Deep Learn(stream): 开始全量历史分析 | max_windows={}", max_windows)
-            yield {"type": "step", "message": f"开始全量历史分析（max_windows={max_windows}）"}
+            logger.info(
+                "Deep Learn(stream): 开始历史分析 | days_back={} | max_windows={}",
+                days_back,
+                max_windows,
+            )
+            yield {
+                "type": "step",
+                "message": f"开始历史分析（days_back={days_back} · max_windows={max_windows}）",
+            }
 
-            # Step 1: 读取全量窗口 + ACTIVE 模式（与 deep_learn 相同）
+            # Step 1: 时间分层采样取数（P0-1）
+            windows_dicts = await self._fetch_deep_learn_windows(days_back, max_windows)
+
             async with async_session_factory() as session:
-                stmt = (
-                    select(SentimentWindow)
-                    .where(SentimentWindow.outcome.isnot(None))
-                    .order_by(SentimentWindow.start_time.desc())
-                    .limit(max_windows)
-                )
-                result = await session.execute(stmt)
-                raw_windows = result.scalars().all()
-                windows_dicts = [
-                    {
-                        "id": w.id,
-                        "start_time": w.start_time,
-                        "end_time": w.end_time,
-                        "curve_up_pct": w.curve_up_pct,
-                        "curve_down_pct": w.curve_down_pct,
-                        "outcome": w.outcome,
-                        "actual_return": w.actual_return,
-                        "sample_count": w.sample_count,
-                    }
-                    for w in raw_windows
-                ]
-
                 pattern_stmt = select(PatternMemory).where(PatternMemory.status == "ACTIVE")
                 pattern_result = await session.execute(pattern_stmt)
                 active_patterns = [
@@ -889,26 +1023,45 @@ class SentimentAgent:
                     for p in pattern_result.scalars().all()
                 ]
 
+            if not windows_dicts:
+                logger.warning("Deep Learn(stream): 无可用历史窗口，跳过分析")
+                yield {
+                    "type": "done",
+                    "reasoning": "",
+                    "discoveries": [],
+                    "method": "LLM_DEEP",
+                    "snapshot_token": snapshot_token([]),
+                    "train_count": 0,
+                    "holdout_count": 0,
+                }
+                return
+
+            # 按时间切 train/holdout（P0-2：LLM 仅看 train）
+            train_windows, holdout_windows = time_split(
+                windows_dicts, settings.agent_deep_learn_holdout_ratio
+            )
+
             logger.info(
-                "Deep Learn(stream): 数据准备完成 | 窗口数={} | ACTIVE 模式={}",
+                "Deep Learn(stream): 数据准备完成 | 采样窗口={} | train={} | holdout={} | ACTIVE 模式={}",
                 len(windows_dicts),
+                len(train_windows),
+                len(holdout_windows),
                 len(active_patterns),
             )
             yield {
                 "type": "step",
-                "message": f"数据准备完成：窗口 {len(windows_dicts)} 个 · ACTIVE 模式 {len(active_patterns)} 条",
+                "message": (
+                    f"数据准备完成：采样 {len(windows_dicts)} 个"
+                    f"（train {len(train_windows)} / holdout {len(holdout_windows)}）"
+                    f" · ACTIVE 模式 {len(active_patterns)} 条"
+                ),
             }
 
-            if not windows_dicts:
-                logger.warning("Deep Learn(stream): 无可用历史窗口，跳过分析")
-                yield {"type": "done", "reasoning": "", "discoveries": []}
-                return
-
-            # Step 2: 流式 LLM 深度分析（空闲超时，全程转发事件）
+            # Step 2: 流式 LLM 深度分析（仅输入 train，避免 holdout 泄漏）
             yield {"type": "step", "message": f"调用 LLM（model={settings.decision_model}）分析中…"}
             final = None
             async for ev in self._llm.agent_deep_learn_stream(
-                windows=windows_dicts,
+                windows=train_windows,
                 active_patterns=active_patterns,
                 idle_timeout=settings.agent_deep_learn_idle_timeout,
             ):
@@ -945,6 +1098,11 @@ class SentimentAgent:
                     "change_reason": getattr(d, "change_reason", "") or "",
                 })
 
+            # 附加 holdout 统计（P0-2 对比 / P0-3 准入依据）
+            self._finalize_llm_discoveries(
+                discoveries_serialized, train_windows, holdout_windows
+            )
+
             logger.info(
                 "Deep Learn(stream): 完成 | 有效发现={}",
                 len(discoveries_serialized),
@@ -953,51 +1111,199 @@ class SentimentAgent:
                 "type": "done",
                 "reasoning": getattr(final, "reasoning", None) or "",
                 "discoveries": discoveries_serialized,
+                "method": "LLM_DEEP",
+                "snapshot_token": snapshot_token([w["id"] for w in windows_dicts]),
+                "train_count": len(train_windows),
+                "holdout_count": len(holdout_windows),
+            }
+
+    async def deep_learn_pycluster(
+        self,
+        days_back: int | None = None,
+        max_windows: int | None = None,
+    ) -> dict:
+        """P0-2 Python 聚类版深度发现（全程无 LLM，作为纯 LLM 版的确定性对照组）。
+
+        流程：时间分层采样 → time_split → train 提特征 → KMeans 聚类 →
+        每簇 outcome 多数投票定方向（NOISE 主导簇丢弃）→ 质心存 curve_features →
+        evaluate_on_holdout 得样本外统计。同一份数据必得同一结果（random_state 固定）。
+
+        Returns:
+            {reasoning, discoveries, method='PY_CLUSTER', snapshot_token, train_count, holdout_count}
+            discoveries 每条含 discovery_method/holdout_* 字段，供 commit 准入闸门复用。
+        """
+        if self._deep_learn_lock.locked():
+            raise RuntimeError("已有深度分析任务正在执行，请稍后重试")
+
+        async with self._deep_learn_lock:
+            if days_back is None:
+                days_back = settings.agent_deep_learn_days_back
+            if max_windows is None:
+                max_windows = settings.agent_deep_learn_max_windows
+
+            logger.info(
+                "Deep Learn(pycluster): 开始确定性聚类 | days_back={} | max_windows={}",
+                days_back,
+                max_windows,
+            )
+
+            windows_dicts = await self._fetch_deep_learn_windows(days_back, max_windows)
+            if not windows_dicts:
+                logger.warning("Deep Learn(pycluster): 无可用历史窗口，跳过分析")
+                return {
+                    "reasoning": "无可用历史窗口",
+                    "discoveries": [],
+                    "method": "PY_CLUSTER",
+                    "snapshot_token": snapshot_token([]),
+                    "train_count": 0,
+                    "holdout_count": 0,
+                }
+
+            train_windows, holdout_windows = time_split(
+                windows_dicts, settings.agent_deep_learn_holdout_ratio
+            )
+
+            # train 窗口提特征 → KMeans 聚类
+            train_feats = [
+                extract_features(
+                    w.get("curve_up_pct") or [], w.get("curve_down_pct") or []
+                )
+                for w in train_windows
+            ]
+            if not train_feats:
+                return {
+                    "reasoning": "train 窗口为空",
+                    "discoveries": [],
+                    "method": "PY_CLUSTER",
+                    "snapshot_token": snapshot_token([w["id"] for w in windows_dicts]),
+                    "train_count": 0,
+                    "holdout_count": len(holdout_windows),
+                }
+            matrix = np.vstack(train_feats)
+            labels = cluster_windows(matrix, settings.agent_deep_learn_target_clusters)
+            label_list = [int(x) for x in labels.tolist()]
+
+            discoveries: list[dict] = []
+            for cid in sorted(set(label_list)):
+                member_idx = [i for i, lb in enumerate(label_list) if lb == cid]
+                if not member_idx:
+                    continue
+                votes = Counter(
+                    (train_windows[i].get("outcome") or "NOISE").upper()
+                    for i in member_idx
+                )
+                direction, _ = votes.most_common(1)[0]
+                if direction == "NOISE":
+                    # NOISE 主导簇丢弃（无可交易方向）
+                    continue
+                centroid = np.mean(
+                    np.vstack([train_feats[i] for i in member_idx]), axis=0
+                )
+                stats = evaluate_on_holdout(centroid, direction, holdout_windows)
+                up_c = int(votes.get("UP", 0))
+                down_c = int(votes.get("DOWN", 0))
+                noise_c = int(votes.get("NOISE", 0))
+                n_members = len(member_idx)
+                curve_features = {
+                    "_feature_vector": centroid.tolist(),
+                    "cluster_id": cid,
+                    "member_count": n_members,
+                    "up_count": up_c,
+                    "down_count": down_c,
+                    "noise_count": noise_c,
+                }
+                discoveries.append({
+                    "operation": "CREATE",
+                    "target_pattern_id": None,
+                    "pattern_name": f"PY-{direction}-C{cid}-n{n_members}",
+                    "description": (
+                        f"Python 聚类簇 {cid}：{n_members} 个 train 窗口，"
+                        f"outcome 分布 UP={up_c}/DOWN={down_c}/NOISE={noise_c}，"
+                        f"多数方向 {direction}（确定性特征 + KMeans，无 LLM）"
+                    ),
+                    "curve_features": curve_features,
+                    "conditions": {},
+                    "predicted_direction": direction,
+                    "confidence_score": stats["ci_lower"],
+                    "change_reason": (
+                        f"PY_CLUSTER 自动发现（train {len(train_windows)} / "
+                        f"holdout {len(holdout_windows)}）"
+                    ),
+                    "discovery_method": "PY_CLUSTER",
+                    "holdout_win_rate": stats["win_rate"],
+                    "holdout_sample_count": stats["sample_count"],
+                    "holdout_ci_lower": stats["ci_lower"],
+                })
+
+            logger.info(
+                "Deep Learn(pycluster): 完成 | train={} | holdout={} | 候选模式={}",
+                len(train_windows),
+                len(holdout_windows),
+                len(discoveries),
+            )
+            return {
+                "reasoning": (
+                    f"确定性聚类：采样 {len(windows_dicts)} 窗口"
+                    f"（train {len(train_windows)} / holdout {len(holdout_windows)}），"
+                    f"KMeans 产出 {len(discoveries)} 个非 NOISE 候选模式"
+                ),
+                "discoveries": discoveries,
+                "method": "PY_CLUSTER",
+                "snapshot_token": snapshot_token([w["id"] for w in windows_dicts]),
+                "train_count": len(train_windows),
+                "holdout_count": len(holdout_windows),
             }
 
     async def commit_deep_learn(
         self,
         discoveries: list[dict],
-    ) -> int:
-        """
-        将用户确认的 discoveries 写入 pattern_memory。
+    ) -> dict:
+        """将用户确认的 discoveries 写入 pattern_memory（含样本外准入闸门）。
 
-        复用 apply_pattern_change + savepoint 隔离逻辑，
-        与 learn() Step 4 相同的写入机制，并包含去重检查。
+        P2-1 字段校验：pattern_name/predicted_direction/curve_features 必填非空（拦截流式半成品）。
+        P0-3 准入闸门：仅当 holdout_ci_lower > 0.5 且 holdout_sample_count >=
+        settings.agent_deep_learn_min_holdout_samples 才写库；不达标计入 rejected。
+        写库时 confidence_score 用 holdout_ci_lower 覆盖 LLM 主观值，holdout_*/
+        discovery_method 落库；win_rate/sample_count/correct_count 仍初始 0（留给 live 跟踪）。
+        P1-4：UPDATE 目标必须存在且 ACTIVE；写库失败不再静默 continue，收集入 failed。
 
         Args:
-            discoveries: 用户确认后的发现列表（来自 deep_learn 返回值）
+            discoveries: 用户确认后的发现列表（每条携带 discovery_method 与 holdout 统计）
 
         Returns:
-            成功写入的模式数量
+            {"status": "ok", "written": int, "rejected": list[dict], "failed": list[dict]}
         """
         # 并发保护
         if self._deep_learn_lock.locked():
             raise RuntimeError("已有深度分析任务正在执行，请稍后重试")
 
         async with self._deep_learn_lock:
+            rejected: list[dict] = []
+            failed: list[dict] = []
             if not discoveries:
                 logger.info("Commit Deep Learn: 无 discoveries 待写入")
-                return 0
+                return {"status": "ok", "written": 0, "rejected": rejected, "failed": failed}
 
             logger.info(
                 "Commit Deep Learn: 开始写入 {} 条发现",
                 len(discoveries),
             )
 
-            # 读取现有 ACTIVE 模式用于去重检查
+            min_samples = settings.agent_deep_learn_min_holdout_samples
+
+            # 读取现有 ACTIVE 模式（去重 + UPDATE 目标校验）
             existing_patterns: list[dict] = []
+            active_ids: set[int] = set()
             async with async_session_factory() as read_session:
                 pattern_stmt = select(PatternMemory).where(PatternMemory.status == "ACTIVE")
                 pattern_result = await read_session.execute(pattern_stmt)
-                existing_patterns = [
-                    {
+                for p in pattern_result.scalars().all():
+                    existing_patterns.append({
                         "id": p.id,
                         "curve_features": p.curve_features,
                         "predicted_direction": p.predicted_direction,
-                    }
-                    for p in pattern_result.scalars().all()
-                ]
+                    })
+                    active_ids.add(p.id)
 
             # 记录本批次已创建的模式指纹，用于批内去重
             batch_created_patterns: list[dict] = []
@@ -1005,66 +1311,103 @@ class SentimentAgent:
 
             async with async_session_factory() as session:
                 for idx, d in enumerate(discoveries, 1):
-                    try:
-                        operation = d.get("operation", "CREATE")
+                    name = d.get("pattern_name")
+                    operation = d.get("operation", "CREATE")
+                    direction = d.get("predicted_direction")
+                    curve_features = d.get("curve_features")
 
-                        # CREATE 前去重检查（与 learn() 相同逻辑）
+                    # P2-1: 必填字段校验（拦截流式半成品）
+                    if not name or not direction or not curve_features:
+                        rejected.append({
+                            "name": name,
+                            "reason": "字段残缺（pattern_name/predicted_direction/curve_features 必填非空）",
+                        })
+                        logger.warning(
+                            "Commit Deep Learn: {}/{} 字段残缺被拒 | '{}'",
+                            idx, len(discoveries), name,
+                        )
+                        continue
+
+                    # P0-3: 样本外准入闸门
+                    ci_lower = d.get("holdout_ci_lower")
+                    sample_count = d.get("holdout_sample_count")
+                    if ci_lower is None or sample_count is None:
+                        rejected.append({
+                            "name": name,
+                            "reason": "缺少 holdout 统计，无法通过准入闸门",
+                        })
+                        continue
+                    if not (ci_lower > 0.5 and sample_count >= min_samples):
+                        rejected.append({
+                            "name": name,
+                            "reason": (
+                                f"未过准入闸门（holdout_ci_lower={ci_lower:.3f} 需>0.5，"
+                                f"holdout_sample_count={sample_count} 需>={min_samples}）"
+                            ),
+                        })
+                        logger.info(
+                            "Commit Deep Learn: {}/{} 未过准入闸门被拒 | '{}'",
+                            idx, len(discoveries), name,
+                        )
+                        continue
+
+                    try:
+                        # CREATE 前去重检查
                         if operation == "CREATE" and settings.agent_dedup_enabled:
                             all_patterns_for_dedup = existing_patterns + batch_created_patterns
                             existing_id = detect_duplicate_pattern(
-                                d.get("curve_features", {}),
-                                d.get("predicted_direction", ""),
-                                all_patterns_for_dedup,
+                                curve_features, direction, all_patterns_for_dedup,
                             )
                             if existing_id is not None:
                                 logger.warning(
                                     "Commit Deep Learn: 疑似重复模式 '{}'，与 id={} 指纹一致 | "
                                     "auto_downgrade={}",
-                                    d.get("pattern_name"),
-                                    existing_id,
-                                    settings.agent_dedup_auto_downgrade,
+                                    name, existing_id, settings.agent_dedup_auto_downgrade,
                                 )
                                 if settings.agent_dedup_auto_downgrade:
-                                    # 将 CREATE 降级为 UPDATE
                                     operation = "UPDATE"
-                                    d["operation"] = "UPDATE"
                                     d["target_pattern_id"] = existing_id
                                     d["change_reason"] = (
-                                        f"去重降级: 与 id={existing_id} 指纹一致，"
-                                        f"原 CREATE 转为 UPDATE"
+                                        f"去重降级: 与 id={existing_id} 指纹一致，原 CREATE 转为 UPDATE"
                                     )
                                 else:
-                                    # 未启用 auto_downgrade，跳过该条
-                                    logger.info(
-                                        "Commit Deep Learn: 跳过重复模式 '{}' ",
-                                        d.get("pattern_name"),
-                                    )
+                                    rejected.append({
+                                        "name": name,
+                                        "reason": f"疑似重复（与 id={existing_id} 指纹一致）",
+                                    })
                                     continue
 
+                        # P1-4: UPDATE 目标必须存在且 ACTIVE
+                        if operation == "UPDATE":
+                            target_id = d.get("target_pattern_id")
+                            if target_id is None or target_id not in active_ids:
+                                failed.append({
+                                    "name": name,
+                                    "reason": f"UPDATE 目标 id={target_id} 不存在或非 ACTIVE",
+                                })
+                                logger.error(
+                                    "Commit Deep Learn: {}/{} UPDATE 目标非法 | '{}' target={}",
+                                    idx, len(discoveries), name, target_id,
+                                )
+                                continue
+
                         async with session.begin_nested():
+                            pattern_data = {
+                                "pattern_name": name,
+                                "description": d.get("description"),
+                                "curve_features": curve_features,
+                                "conditions": d.get("conditions"),
+                                "predicted_direction": direction,
+                                # P0-3: confidence 用 holdout_ci_lower 覆盖 LLM 主观值
+                                "confidence_score": ci_lower,
+                                "change_reason": d.get("change_reason", ""),
+                                "discovery_method": d.get("discovery_method", "LEGACY"),
+                                "holdout_win_rate": d.get("holdout_win_rate"),
+                                "holdout_sample_count": sample_count,
+                                "holdout_ci_lower": ci_lower,
+                            }
                             if operation == "UPDATE":
-                                # UPDATE 操作：使用指定字段
-                                pattern_data = {
-                                    "pattern_name": d.get("pattern_name"),
-                                    "description": d.get("description"),
-                                    "curve_features": d.get("curve_features"),
-                                    "conditions": d.get("conditions"),
-                                    "predicted_direction": d.get("predicted_direction"),
-                                    "confidence_score": d.get("confidence_score", 0.5),
-                                    "change_reason": d.get("change_reason", ""),
-                                    "target_pattern_id": d.get("target_pattern_id"),
-                                }
-                            else:
-                                # CREATE 操作
-                                pattern_data = {
-                                    "pattern_name": d.get("pattern_name"),
-                                    "description": d.get("description"),
-                                    "curve_features": d.get("curve_features"),
-                                    "conditions": d.get("conditions"),
-                                    "predicted_direction": d.get("predicted_direction"),
-                                    "confidence_score": d.get("confidence_score", 0.5),
-                                    "change_reason": d.get("change_reason", ""),
-                                }
+                                pattern_data["target_pattern_id"] = d.get("target_pattern_id")
 
                             new_pattern = await self.apply_pattern_change(
                                 session=session,
@@ -1085,30 +1428,29 @@ class SentimentAgent:
                             written_count += 1
                             logger.info(
                                 "Commit Deep Learn: {}/{} 写入成功 | {} '{}'",
-                                idx,
-                                len(discoveries),
-                                operation,
-                                d.get("pattern_name"),
+                                idx, len(discoveries), operation, name,
                             )
                     except Exception as exc:
+                        # P1-4: 不再静默 continue，收集 failed
+                        failed.append({"name": name, "reason": str(exc)})
                         logger.error(
                             "Commit Deep Learn: {}/{} 写入失败 | {} '{}' | error={}",
-                            idx,
-                            len(discoveries),
-                            d.get("operation"),
-                            d.get("pattern_name"),
-                            str(exc),
+                            idx, len(discoveries), operation, name, str(exc),
                         )
                         continue
 
                 await session.commit()
 
             logger.info(
-                "Commit Deep Learn: 完成 | 成功写入 {}/{} 条",
-                written_count,
-                len(discoveries),
+                "Commit Deep Learn: 完成 | 写入 {} · 拒绝 {} · 失败 {}",
+                written_count, len(rejected), len(failed),
             )
-            return written_count
+            return {
+                "status": "ok",
+                "written": written_count,
+                "rejected": rejected,
+                "failed": failed,
+            }
 
     # ======================================================================
     # Predict 阶段（Req 3.2 / 3.3 / 3.4 / 3.5 / 3.6 / 10.1 / 10.2 / 10.3 / 11.1）

@@ -710,8 +710,24 @@ class LLMService:
         """
         from datetime import datetime, timezone
 
+        # P0-1: 用实际窗口的 min/max start_time 计算真实跨度，
+        # 避免"最近 N 个当全量历史"的误导。
+        starts = [w.get("start_time", 0) for w in windows if w.get("start_time")]
+        if starts:
+            t_min = datetime.fromtimestamp(min(starts) / 1000, tz=timezone.utc)
+            t_max = datetime.fromtimestamp(max(starts) / 1000, tz=timezone.utc)
+            span_days = (max(starts) - min(starts)) / 86_400_000
+            span_str = (
+                f"覆盖 {t_min.strftime('%Y-%m-%d %H:%M')} ~ "
+                f"{t_max.strftime('%Y-%m-%d %H:%M')} UTC（约 {span_days:.1f} 天）"
+            )
+        else:
+            span_str = "时间范围未知"
+
         lines: list[str] = [
-            f"## 全量历史窗口（共 {len(windows)} 个，按时间从新到旧，每 15 秒一个采样点）",
+            f"## 采样历史窗口（共 {len(windows)} 个，按时间从旧到新，每 15 秒一个采样点）",
+            f"时间范围：{span_str}",
+            "注：以下为按 outcome 分层、时间均匀抽样的代表性窗口，非连续全量。",
             "格式：窗口序号 [时间]: UP%[...] / DOWN%[...] → outcome (实际收益)",
             "",
         ]
