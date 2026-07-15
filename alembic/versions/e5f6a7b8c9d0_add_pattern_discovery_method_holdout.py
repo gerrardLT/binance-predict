@@ -1,8 +1,8 @@
 """add pattern_memory discovery_method + holdout stats (Deep Learn 双轨 A/B 对比)
 
-Revision ID: c3d4e5f6a7b8
-Revises: b2c3d4e5f6a7
-Create Date: 2026-07-13 10:00:00.000000
+Revision ID: e5f6a7b8c9d0
+Revises: d4e5f6a7b8c9
+Create Date: 2026-07-13 12:00:00.000000
 
 本迁移为「Deep Learn 整改」在 pattern_memory 表新增 4 列，用于区分模式的发现
 方法（纯 LLM 深度发现 / Python 确定性聚类 / 存量）并存储发现时的样本外(holdout)
@@ -22,8 +22,8 @@ from alembic import op
 import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
-revision = "c3d4e5f6a7b8"
-down_revision = "b2c3d4e5f6a7"
+revision = "e5f6a7b8c9d0"
+down_revision = "d4e5f6a7b8c9"
 branch_labels = None
 depends_on = None
 
