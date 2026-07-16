@@ -6,8 +6,9 @@
 
 设计约束：
 - 每次 refresh_daily_stats() 从 DB 重新加载当日数据，不依赖内存缓存
-- 连续亏损基于 AgentPrediction.is_correct（方向命中率），
-  统一语义，避免与交易 PnL 混淆（方向正确≠盈利，含手续费/滑点）
+- 连续亏损基于实际交易盈亏（TradeOrderModel.amount_out < amount_in），
+  而非方向命中（is_correct）——方向对也可能因手续费/滑点亏钱，
+  方向错但 NO_TRADE 则未实际交易不应计入 streak。
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from sqlalchemy import func, select
 
 from ..config.settings import settings
 from ..db.engine import async_session_factory
-from ..db.models import AgentPrediction, TradeOrderModel
+from ..db.models import TradeOrderModel
 
 
 class RiskController:
@@ -94,22 +95,33 @@ class RiskController:
                         pass
                 self._daily_pnl = pnl_sum
 
-                # 查询最近已验证的预测，计算连续亏损（基于 is_correct）
-                pred_stmt = (
-                    select(AgentPrediction.is_correct)
-                    .where(AgentPrediction.is_correct.isnot(None))
-                    .order_by(AgentPrediction.validated_at.desc())
+                # P2-5：连续亏损基于实际交易盈亏（amount_out < amount_in），
+                # 而非方向命中（is_correct）。方向对也可能因手续费/滑点亏钱；
+                # NO_TRADE 未实际交易不产生订单，天然不计入 streak。仅统计真实成交订单。
+                order_stmt = (
+                    select(
+                        TradeOrderModel.amount_in,
+                        TradeOrderModel.amount_out,
+                    )
+                    .order_by(TradeOrderModel.created_at.desc())
                     .limit(50)
                 )
-                pred_result = await session.execute(pred_stmt)
-                recent_flags = pred_result.scalars().all()
+                order_rows = (await session.execute(order_stmt)).all()
 
                 streak = 0
-                for is_correct in recent_flags:
-                    if is_correct is False:
-                        streak += 1
-                    else:
+                for amt_in_raw, amt_out_raw in order_rows:
+                    try:
+                        amt_in = float(amt_in_raw) if amt_in_raw else 0.0
+                        amt_out = float(amt_out_raw) if amt_out_raw else 0.0
+                    except (ValueError, TypeError):
                         break
+                    # 仅对已结算订单（首尾金额均有效）判定盈亏；
+                    # 未结算订单（amount_out 缺失）跳过，不中断也不计入。
+                    if amt_in > 0 and amt_out > 0:
+                        if amt_out < amt_in:
+                            streak += 1
+                        else:
+                            break
                 self._recent_loss_streak = streak
 
             self._last_refresh_ts = now_mono

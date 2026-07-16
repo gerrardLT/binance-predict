@@ -57,6 +57,7 @@ from .backtest import (
     evaluate_on_holdout,
     snapshot_token,
     time_split,
+    wilson_lower_bound,
 )
 from .curve_features import (
     FEATURE_DIM,
@@ -112,8 +113,13 @@ class SentimentAgent:
         self._trader = trader
         self._risk_controller = risk_controller or RiskController()
         self._alert_service = alert_service
-        # 深度分析并发锁：防止多个 deep_learn/commit 同时执行
+        # 深度分析并发锁：仅防止多个 deep_learn 发现任务（LLM 长调用）同时执行，
+        # 用于成本/资源控制，不覆盖 pattern_memory 写入。
         self._deep_learn_lock = asyncio.Lock()
+        # P0-2：pattern_memory 唯一写锁——Validate / Evolve / commit_deep_learn 的
+        # DB 写事务统一持此锁，取代原「调度器 _write_lock 与 _deep_learn_lock 两把锁
+        # 守护同一张表」的竞态设计。锁粒度仅覆盖 DB 写，不含 LLM 调用。
+        self._pattern_write_lock = asyncio.Lock()
 
     # ======================================================================
     # Validate 阶段（Req 4.1 / 4.2 / 4.3 / 4.4）
@@ -145,7 +151,9 @@ class SentimentAgent:
         """
         validated_ids: list[int] = []
 
-        async with async_session_factory() as session:
+        # P0-2：Validate 回填预测 + 更新模式统计属 pattern_memory 写操作，
+        # 持唯一写锁与 Evolve / commit_deep_learn 串行，避免并发写竞态。
+        async with self._pattern_write_lock, async_session_factory() as session:
             # 1. 查询该窗口时间范围内的未验证预测
             # Bug fix: Predict 时窗口可能尚未归档，sentiment_window_id 可能为 None，
             # 改为时间范围匹配以确保 Validate 能找到所有关联预测
@@ -314,7 +322,9 @@ class SentimentAgent:
                 conditions=pattern_data.get("conditions", {}),
                 predicted_direction=pattern_data["predicted_direction"],
                 confidence_score=pattern_data.get("confidence_score", 0.5),
-                status="ACTIVE",
+                # P0-1：允许调用方指定初始状态（Evolve CREATE 传 EVOLVING 观察态），
+                # 默认 ACTIVE（deep-learn 经准入闸门后写库沿用旧行为）。
+                status=pattern_data.get("status", "ACTIVE"),
                 win_rate=0.0,
                 sample_count=0,
                 correct_count=0,
@@ -1291,13 +1301,21 @@ class SentimentAgent:
 
             min_samples = settings.agent_deep_learn_min_holdout_samples
 
-            # 读取现有 ACTIVE 模式（去重 + UPDATE 目标校验）
-            existing_patterns: list[dict] = []
-            active_ids: set[int] = set()
-            async with async_session_factory() as read_session:
-                pattern_stmt = select(PatternMemory).where(PatternMemory.status == "ACTIVE")
-                pattern_result = await read_session.execute(pattern_stmt)
-                for p in pattern_result.scalars().all():
+            # 记录本批次已创建的模式指纹，用于批内去重
+            batch_created_patterns: list[dict] = []
+            written_count = 0
+
+            # P0-2：读取现有 ACTIVE + 写入 pattern_memory 全程持唯一写锁，
+            # 与 Validate / Evolve 串行，保证去重判定 / active_cap 计数 / 写入的原子性。
+            # LLM 调用已在本方法外完成，锁粒度不含 LLM。
+            async with self._pattern_write_lock, async_session_factory() as session:
+                # 读取现有 ACTIVE 模式（去重 + UPDATE 目标校验），与写入同一会话/同一锁
+                existing_patterns: list[dict] = []
+                active_ids: set[int] = set()
+                _existing_result = await session.execute(
+                    select(PatternMemory).where(PatternMemory.status == "ACTIVE")
+                )
+                for p in _existing_result.scalars().all():
                     existing_patterns.append({
                         "id": p.id,
                         "curve_features": p.curve_features,
@@ -1305,11 +1323,6 @@ class SentimentAgent:
                     })
                     active_ids.add(p.id)
 
-            # 记录本批次已创建的模式指纹，用于批内去重
-            batch_created_patterns: list[dict] = []
-            written_count = 0
-
-            async with async_session_factory() as session:
                 for idx, d in enumerate(discoveries, 1):
                     name = d.get("pattern_name")
                     operation = d.get("operation", "CREATE")
@@ -1506,7 +1519,12 @@ class SentimentAgent:
                 for p in raw_patterns
             ]
             active_rows = plan_active_patterns(pattern_rows)
-            active_ids = {pr.id for pr in active_rows}
+            # P0-1：候选集 = ACTIVE ∪ EVOLVING（观察态）。EVOLVING 模式参与 LLM 匹配
+            # 以积累 live 样本，但交易门控会二次确认 status==ACTIVE，故不会真正下单。
+            candidate_ids = {pr.id for pr in active_rows} | {
+                p.id for p in raw_patterns if p.status == "EVOLVING"
+            }
+            active_ids = candidate_ids
             for p in raw_patterns:
                 if p.id in active_ids:
                     patterns_dicts.append({
@@ -1775,7 +1793,7 @@ class SentimentAgent:
                         matched_pattern_id,
                         matched_pattern_status,
                     )
-                    pred.skip_trade_reason = f"模式已退役/暂停（status={matched_pattern_status}）"
+                    pred.skip_trade_reason = f"模式非 ACTIVE 不交易（status={matched_pattern_status}）"
                     final_skip_reason = pred.skip_trade_reason
                     do_trade = False
 
@@ -1894,14 +1912,25 @@ class SentimentAgent:
                     "status": p.status,
                 })
 
-            # 读最近 agent_evolve_interval 次 AgentPrediction（含验证结果）
+            # P1-3：反思查询对齐触发阈值 + 仅取已验证预测。
+            # limit 由 agent_evolve_interval 提升至 agent_evolve_min_new_samples
+            # （与 Evolve 触发阈值一致）；并过滤 is_correct IS NULL 的未验证预测，
+            # 避免未验证证据污染反思。
+            reflect_limit = settings.agent_evolve_min_new_samples
             pred_stmt = (
                 select(AgentPrediction)
+                .where(AgentPrediction.is_correct.isnot(None))
                 .order_by(AgentPrediction.prediction_time.desc())
-                .limit(settings.agent_evolve_interval)
+                .limit(reflect_limit)
             )
             pred_result = await session.execute(pred_stmt)
             recent_preds = pred_result.scalars().all()
+            if len(recent_preds) < reflect_limit:
+                logger.warning(
+                    "Evolve: 已验证预测仅 {} 条 < 反思目标 {} 条，"
+                    "证据不足但继续（不阻断）",
+                    len(recent_preds), reflect_limit,
+                )
 
             for pred in recent_preds:
                 recent_predictions_dicts.append({
@@ -1997,7 +2026,8 @@ class SentimentAgent:
         evolve_phase_id = f"{uuid.uuid4().hex[:8]}-{int(time.time())}"
 
         # ========== Step 4：应用进化操作（独立事务，含冷启动保护）==========
-        async with async_session_factory() as session:
+        # P0-2：Step 4 写 pattern_memory，持唯一写锁与 Validate / commit_deep_learn 串行。
+        async with self._pattern_write_lock, async_session_factory() as session:
             # 获取当前 ACTIVE 模式数用于冷启动保护判断
             current_active_stmt = select(PatternMemory).where(
                 PatternMemory.status == "ACTIVE"
@@ -2017,6 +2047,75 @@ class SentimentAgent:
             skipped_retain = 0
             skipped_cold_start = 0
             failed_count = 0
+
+            # ========== P0-1：EVOLVING 观察态晋升/淘汰 ==========
+            # 达到最小 holdout 样本量后，用 live 样本的 Wilson 置信下界裁决：
+            # 下界 > 0.5 → 晋升 ACTIVE（confidence 用下界覆盖）；否则 RETIRE。
+            # 未达样本量则保持 EVOLVING 继续观察。
+            promoted_count = 0
+            evolving_retired_count = 0
+            evolving_result = await session.execute(
+                select(PatternMemory).where(PatternMemory.status == "EVOLVING")
+            )
+            evolving_patterns = evolving_result.scalars().all()
+            for ep in evolving_patterns:
+                if ep.sample_count < settings.agent_deep_learn_min_holdout_samples:
+                    continue
+                lb = wilson_lower_bound(ep.correct_count, ep.sample_count)
+                try:
+                    async with session.begin_nested():  # savepoint：失败仅回滚此子事务
+                        if lb > 0.5:
+                            before_snapshot = self._pattern_to_snapshot(ep)
+                            ep.status = "ACTIVE"
+                            ep.confidence_score = lb
+                            after_snapshot = self._pattern_to_snapshot(ep)
+                            session.add(PatternChangeLog(
+                                pattern_id=ep.id,
+                                change_type="UPDATE",
+                                phase="EVOLVE",
+                                before_snapshot=before_snapshot,
+                                after_snapshot=after_snapshot,
+                                change_reason=(
+                                    f"EVOLVING 晋升 ACTIVE：live 样本 {ep.sample_count} "
+                                    f"（>= {settings.agent_deep_learn_min_holdout_samples}），"
+                                    f"Wilson 下界 {lb:.3f} > 0.5"
+                                ),
+                                evolve_phase_id=evolve_phase_id,
+                            ))
+                            promoted_count += 1
+                            logger.info(
+                                "Evolve: EVOLVING 模式 id={} '{}' 晋升 ACTIVE | "
+                                "sample={} wilson_lb={:.3f}",
+                                ep.id, ep.pattern_name, ep.sample_count, lb,
+                            )
+                        else:
+                            await self.apply_pattern_change(
+                                session=session,
+                                operation="RETIRE",
+                                pattern_data={
+                                    "target_pattern_id": ep.id,
+                                    "change_reason": (
+                                        f"EVOLVING 淘汰：live 样本 {ep.sample_count} "
+                                        f"（>= {settings.agent_deep_learn_min_holdout_samples}），"
+                                        f"Wilson 下界 {lb:.3f} 未过 0.5"
+                                    ),
+                                },
+                                phase="EVOLVE",
+                                evolve_phase_id=evolve_phase_id,
+                            )
+                            evolving_retired_count += 1
+                            logger.info(
+                                "Evolve: EVOLVING 模式 id={} '{}' 淘汰 | "
+                                "sample={} wilson_lb={:.3f}",
+                                ep.id, ep.pattern_name, ep.sample_count, lb,
+                            )
+                except Exception as exc:
+                    failed_count += 1
+                    logger.error(
+                        "Evolve: EVOLVING 晋升/淘汰 id={} 失败 | error={}",
+                        ep.id, exc,
+                    )
+                    continue
 
             for idx, op in enumerate(evolve_output.operations, 1):
                 # RETAIN：跳过（不做 DB 操作）
@@ -2095,6 +2194,9 @@ class SentimentAgent:
                                 "conditions": op.new_pattern.conditions,
                                 "predicted_direction": op.new_pattern.predicted_direction,
                                 "confidence_score": op.new_pattern.confidence_score,
+                                # P0-1：Evolve 新建模式先入 EVOLVING 观察态，不直接参与交易，
+                                # 积累 live 样本达标后由后续 Evolve 晋升 ACTIVE。
+                                "status": "EVOLVING",
                                 "change_reason": op.reason,
                             }
                             await self.apply_pattern_change(
@@ -2238,10 +2340,127 @@ class SentimentAgent:
 
         logger.info(
             "Evolve: 阶段完成 | evolve_phase_id={} | 已应用={} | RETAIN 跳过={} | "
-            "冷启动跳过={} | 失败={}",
+            "冷启动跳过={} | 失败={} | EVOLVING晋升={} | EVOLVING淘汰={}",
             evolve_phase_id,
             applied_count,
             skipped_retain,
             skipped_cold_start,
             failed_count,
+            promoted_count,
+            evolving_retired_count,
         )
+
+    # ======================================================================
+    # 降级 / 对账辅助（P2-3 / P1-1）
+    # ======================================================================
+
+    async def write_no_trade(
+        self, window_end_ms: int, reason: str
+    ) -> AgentPrediction | None:
+        """将降级场景落库为 NO_TRADE 预测（无静默降级，规则 3）。
+
+        P2-3：当 PREDICT 事件在队列中等待过久、current_curve 快照陈旧时，
+        不喂陈旧曲线给 LLM，而是直接落库一条 NO_TRADE 预测并标注原因。
+
+        Args:
+            window_end_ms: 当前窗口结束时间戳（毫秒）
+            reason: 降级原因（写入 reasoning 与 skip_trade_reason）
+
+        Returns:
+            写入的 AgentPrediction 实例；极端异常返回 None
+        """
+        sentiment_window_id: int | None = None
+        async with async_session_factory() as session:
+            sw_stmt = select(SentimentWindow.id).where(
+                SentimentWindow.end_time == window_end_ms
+            )
+            sentiment_window_id = (
+                await session.execute(sw_stmt)
+            ).scalar_one_or_none()
+
+        logger.warning(
+            "Predict: 降级为 NO_TRADE | window_end_ms={} | reason={}",
+            window_end_ms,
+            reason,
+        )
+        return await self._write_prediction_and_trade(
+            predicted_direction="NO_TRADE",
+            matched_pattern_id=None,
+            matched_pattern_name=None,
+            confidence=0.0,
+            entry_timing="SKIP",
+            reasoning=reason,
+            sentiment_window_id=sentiment_window_id,
+            skip_trade_reason=reason,
+        )
+
+    async def reconcile_pending_predictions(self) -> int:
+        """启动对账：回填进程重启后遗漏的未验证预测（P1-1）。
+
+        调度队列非持久，进程重启后待验证预测（is_correct IS NULL）无人回填；
+        archiver 又不会重发已归档窗口的 WINDOW_ARCHIVED，导致预测永久孤儿。
+        本方法在 lifespan 启动阶段一次性扫描：对每条超过一个窗口时长的
+        未验证预测，找到覆盖它的已归档（outcome 非空）SentimentWindow，调 validate 回填。
+        找不到已归档窗口的（窗口从未归档，见 P1-2）本轮不处理。
+
+        Returns:
+            本次回填的预测总数
+        """
+        # 仅处理已超过一个窗口时长的未验证预测，避免误碰仍在进行中的窗口
+        now = datetime.now(tz=timezone.utc)
+        cutoff = now - timedelta(minutes=5)
+        validated_total = 0
+
+        async with async_session_factory() as session:
+            pend_stmt = (
+                select(AgentPrediction.prediction_time)
+                .where(
+                    AgentPrediction.is_correct.is_(None),
+                    AgentPrediction.prediction_time <= cutoff,
+                )
+                .order_by(AgentPrediction.prediction_time.asc())
+            )
+            pend_times = (await session.execute(pend_stmt)).scalars().all()
+            if not pend_times:
+                logger.info("Reconcile: 无待回填的未验证预测")
+                return 0
+
+            # 为每条待验证预测找到覆盖它的已归档窗口（outcome 非空），去重
+            window_ids: set[int] = set()
+            windows_to_validate: list[SentimentWindow] = []
+            for pt in pend_times:
+                pt_ms = int(pt.timestamp() * 1000)
+                win_stmt = (
+                    select(SentimentWindow)
+                    .where(
+                        SentimentWindow.start_time <= pt_ms,
+                        SentimentWindow.end_time >= pt_ms,
+                        SentimentWindow.outcome.isnot(None),
+                    )
+                    .order_by(SentimentWindow.end_time.desc())
+                    .limit(1)
+                )
+                win = (await session.execute(win_stmt)).scalar_one_or_none()
+                if win is not None and win.id not in window_ids:
+                    window_ids.add(win.id)
+                    windows_to_validate.append(win)
+
+        logger.info(
+            "Reconcile: 发现 {} 条未验证预测，匹配到 {} 个已归档窗口待回填",
+            len(pend_times),
+            len(windows_to_validate),
+        )
+
+        for win in windows_to_validate:
+            try:
+                ids = await self.validate(win)
+                validated_total += len(ids)
+            except Exception as exc:
+                # 无静默降级：单窗口回填失败不阻断其余，但记录错误
+                logger.error(
+                    "Reconcile: 窗口 id={} 回填失败 | error={}", win.id, exc
+                )
+                continue
+
+        logger.info("Reconcile: 完成，共回填 {} 条预测", validated_total)
+        return validated_total

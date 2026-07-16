@@ -5,10 +5,11 @@
 - 优先级队列（asyncio.PriorityQueue）按优先级出队事件
 - 双 Worker 架构（Plan 步骤 11）：PREDICT 快速通道 + HEAVY 重型通道
   - PREDICT worker：只读 ACTIVE 模式，不持锁，独立队列
-  - HEAVY worker：串行执行 Validate → Learn → Evolve，写入时持 _write_lock
+  - HEAVY worker：串行执行 Validate → Learn → Evolve；pattern_memory 写锁已下沉
+    到 SentimentAgent 内部（_pattern_write_lock），调度器不再自持写锁。
 - 回退单 Worker：feature flag agent_dual_worker_enabled=False 时使用原单 worker
 - 分阶段超时：每个阶段独立超时
-- PREDICT 排队超时保护（Plan 步骤 12）：排队过久的 PREDICT 事件被跳过
+- PREDICT 排队超时保护（Plan 步骤 12 / P2-3）：排队过久曲线陈旧时降级为 NO_TRADE
 
 设计约束：
 - publish() 为非阻塞 put_nowait，队列满时记录告警而非静默丢弃
@@ -94,7 +95,8 @@ class AgentScheduler:
 
         # 双 Worker 架构（Plan 步骤 11）
         self._dual_worker = settings.agent_dual_worker_enabled
-        self._write_lock: asyncio.Lock = asyncio.Lock()
+        # P0-2：pattern_memory 写锁已下沉到 SentimentAgent（validate/evolve/
+        # commit_deep_learn 内部统一持 _pattern_write_lock），调度器不再自持写锁。
 
         if self._dual_worker:
             # 双队列：PREDICT 快速通道 + HEAVY 重型通道
@@ -377,20 +379,34 @@ class AgentScheduler:
             except asyncio.CancelledError:
                 break
 
-            # Plan 步骤 12：排队超时检查
+            # Plan 步骤 12 / P2-3：排队超时检查。
+            # current_curve 在入队时快照，排队过久则曲线陈旧。此时不喂陈旧曲线
+            # 给 LLM，而是落库一条 NO_TRADE 预测（无静默降级，规则 3），不再静默丢弃。
             enqueued_at = event.payload.pop("_enqueued_at", None)
             if enqueued_at is not None:
                 wait_time = time.monotonic() - enqueued_at
                 if wait_time > settings.agent_predict_max_queue_wait:
                     logger.warning(
                         "AgentScheduler: PREDICT 排队超时 | wait={:.1f}s > "
-                        "max={:.1f}s | 跳过本次预测",
+                        "max={:.1f}s | 降级为 NO_TRADE（曲线陈旧）",
                         wait_time,
                         settings.agent_predict_max_queue_wait,
                     )
                     metrics_collector.record_phase(
                         "PREDICT", wait_time, False, "QUEUE_TIMEOUT"
                     )
+                    try:
+                        await self._agent.write_no_trade(
+                            window_end_ms=event.payload.get("window_end_ms", 0),
+                            reason=(
+                                f"curve_stale: PREDICT 排队 {wait_time:.1f}s > "
+                                f"{settings.agent_predict_max_queue_wait:.1f}s，曲线陈旧"
+                            ),
+                        )
+                    except Exception as exc:
+                        logger.error(
+                            "AgentScheduler: 陈旧降级写 NO_TRADE 失败 | {}", exc
+                        )
                     self._predict_queue.task_done()
                     continue
 
@@ -437,9 +453,10 @@ class AgentScheduler:
                 metrics_collector.record_queue_depth(self._heavy_queue.qsize())
 
             try:
-                # HEAVY 事件写入时持 _write_lock（保护 pattern_memory）
-                async with self._write_lock:
-                    await self._dispatch(event)
+                # P0-2：pattern_memory 写锁已下沉到 SentimentAgent 内部（validate/evolve/
+                # commit_deep_learn 统一持 _pattern_write_lock），此处不再自持调度器级
+                # _write_lock，避免两把锁守护同一张表导致的计数/去重/win_rate 竞态。
+                await self._dispatch(event)
             except asyncio.CancelledError:
                 break
             except Exception as exc:

@@ -331,10 +331,17 @@ async def _sentiment_window_archiver() -> None:
                 result = await db.execute(stmt)
                 samples = result.scalars().all()
 
-                # Bug 1.6 修复：归档门槛从 3 提高到 8
+                # P1-2：采样点数仅作质量标注，不再作为归档闸门。
+                # 原 <8 跳过会导致低采样窗口永不归档 → 其内 AgentPrediction 的
+                # is_correct 永久为 None（孤儿预测）。改为：低采样仅告警，只要下方
+                # 能取到有效首尾价格即照常归档并发布 WINDOW_ARCHIVED 驱动 Validate。
                 if len(samples) < 8:
-                    logger.debug("情绪窗口跳过 | {}~{} | 采样点不足({}<8)", start_ms, end_ms, len(samples))
-                else:
+                    logger.warning(
+                        "情绪窗口低采样 | {}~{} | 采样点={}(<8)，曲线质量偏低但仍归档",
+                        start_ms, end_ms, len(samples),
+                    )
+                # 归档主体：对任意采样量执行（无有效首尾价格时下方会 continue 跳过）
+                if len(samples) >= 0:
                     # 构建曲线数据
                     curve_up = [{"t": s.timestamp, "v": s.up_pct} for s in samples if s.up_pct is not None]
                     curve_down = [{"t": s.timestamp, "v": s.down_pct} for s in samples if s.down_pct is not None]
@@ -625,6 +632,15 @@ async def lifespan(app: FastAPI):
     agent_scheduler = AgentScheduler(agent=_sentiment_agent, trader=prediction_trader)
     await agent_scheduler.start()  # 含冷启动检查（Req 11.2）
     logger.info("SentimentAgent + AgentScheduler 已就绪（冷启动检查完成）")
+
+    # P1-1：启动对账——回填进程重启后遗漏的未验证预测（孤儿预测）。
+    # 调度队列非持久，重启后 is_correct IS NULL 的预测无人回填；
+    # 在 scheduler 启动后、正常事件流开始前一次性扫描并回填。
+    try:
+        reconciled = await _sentiment_agent.reconcile_pending_predictions()
+        logger.info("启动对账完成 | 回填未验证预测 {} 条", reconciled)
+    except Exception as exc:
+        logger.error("启动对账失败（不阻断启动）| {}", exc)
 
     tasks = [
         asyncio.create_task(collector.connect_spot_ws(), name="spot_ws"),
