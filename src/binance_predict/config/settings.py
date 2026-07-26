@@ -49,6 +49,13 @@ class Settings(BaseSettings):
     # 噪声阈值：future_return 绝对值小于此值视为 NOISE
     noise_threshold: float = 0.0005
 
+    # --- 原始采样保留策略 ---
+    # prediction_market_samples（15s 级原始数据）的保留时长（小时）。
+    # <=0 表示永不删除（默认）：TimescaleDB 下约 5760 行/天、~300MB/年，成本可忽略；
+    # 而归档表只保存"当时想到要存的"字段——历史价格曲线因旧的 1 小时清理策略
+    # 永久丢失（3510/3522 窗口无价格数据）即为教训。需要旧行为可设为 1。
+    sample_retention_hours: float = 0.0
+
     # --- 置信度运营门槛 ---
     confidence_strong: float = 0.75
     confidence_normal: float = 0.60

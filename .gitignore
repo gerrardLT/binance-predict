@@ -9,9 +9,14 @@ wheels/
 
 # 测试缓存
 .pytest_cache/
+.pytest_tmp/
 .hypothesis/
 .coverage
 htmlcov/
+
+# 本地数据导出（离线分析用，非代码）
+sentiment_windows.json
+windows_with_price.json
 
 # 虚拟环境
 .venv

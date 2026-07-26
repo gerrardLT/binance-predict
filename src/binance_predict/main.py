@@ -345,6 +345,12 @@ async def _sentiment_window_archiver() -> None:
                     # 构建曲线数据
                     curve_up = [{"t": s.timestamp, "v": s.up_pct} for s in samples if s.up_pct is not None]
                     curve_down = [{"t": s.timestamp, "v": s.down_pct} for s in samples if s.down_pct is not None]
+                    # 价格曲线永久化：采样表仅保留 1 小时，归档时快照否则永久丢失（经济账依赖）
+                    curve_up_price = [{"t": s.timestamp, "v": s.up_price} for s in samples if s.up_price is not None]
+                    curve_down_price = [{"t": s.timestamp, "v": s.down_price} for s in samples if s.down_price is not None]
+                    # 参与者/交易量时序永久化：momentum 类假设的原始证据（此前仅存均值）
+                    curve_participants = [{"t": s.timestamp, "v": s.participants} for s in samples if s.participants is not None]
+                    curve_trade_volume = [{"t": s.timestamp, "v": s.trade_volume} for s in samples if s.trade_volume is not None]
 
                     # 修复：使用窗口切换时快照的价格。
                     # entry_price = 已关闭窗口起点快照；exit_price = 切换时刻价（窗口终点）。
@@ -390,6 +396,10 @@ async def _sentiment_window_archiver() -> None:
                         end_time=end_ms,
                         curve_up_pct=curve_up,
                         curve_down_pct=curve_down,
+                        curve_up_price=curve_up_price,
+                        curve_down_price=curve_down_price,
+                        curve_participants=curve_participants,
+                        curve_trade_volume=curve_trade_volume,
                         sample_count=len(samples),
                         entry_price=entry_price,
                         exit_price=exit_price,
@@ -423,15 +433,20 @@ async def _sentiment_window_archiver() -> None:
                         _last_archived_window_end = end_ms  # 已存在也标记，停止重复尝试
                         logger.debug("情绪窗口已存在（跳过重复归档）| {}~{}", start_ms, end_ms)
 
-                # 清理 1 小时前的旧采样记录（防止 DB 无限增长）
-                cleanup_threshold_ms = end_ms - 3600 * 1000
-                del_result = await db.execute(
-                    sa_delete(PredictionMarketSample)
-                    .where(PredictionMarketSample.timestamp < cleanup_threshold_ms)
-                )
-                if del_result.rowcount > 0:
-                    await db.commit()
-                    logger.debug("清理旧采样记录 | 删除 {} 条（早于 {}）", del_result.rowcount, cleanup_threshold_ms)
+                # 旧采样清理：仅当 sample_retention_hours > 0 时执行。
+                # 默认 <=0 永不删除——原始采样是唯一的"全字段事实源"，归档表只含
+                # 归档时想到要存的字段（历史价格曲线因旧 1 小时清理永久丢失即为教训）。
+                if settings.sample_retention_hours > 0:
+                    cleanup_threshold_ms = end_ms - int(
+                        settings.sample_retention_hours * 3600 * 1000
+                    )
+                    del_result = await db.execute(
+                        sa_delete(PredictionMarketSample)
+                        .where(PredictionMarketSample.timestamp < cleanup_threshold_ms)
+                    )
+                    if del_result.rowcount > 0:
+                        await db.commit()
+                        logger.debug("清理旧采样记录 | 删除 {} 条（早于 {}）", del_result.rowcount, cleanup_threshold_ms)
 
         except asyncio.CancelledError:
             break
@@ -612,6 +627,9 @@ async def lifespan(app: FastAPI):
                 "ALTER TABLE pattern_memory ADD COLUMN IF NOT EXISTS holdout_win_rate FLOAT",
                 "ALTER TABLE pattern_memory ADD COLUMN IF NOT EXISTS holdout_sample_count INTEGER",
                 "ALTER TABLE pattern_memory ADD COLUMN IF NOT EXISTS holdout_ci_lower FLOAT",
+                # 参与者/交易量时序曲线（与 alembic 迁移 a7b8c9d0e1f2 等价，存量 dev 库安全网）
+                "ALTER TABLE sentiment_windows ADD COLUMN IF NOT EXISTS curve_participants JSONB",
+                "ALTER TABLE sentiment_windows ADD COLUMN IF NOT EXISTS curve_trade_volume JSONB",
             ]:
                 try:
                     await conn.execute(text(col_sql))

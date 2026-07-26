@@ -156,6 +156,21 @@ class SentimentWindow(Base):
     curve_down_pct: Mapped[dict | None] = mapped_column(
         JSONB, nullable=True, comment="DOWN% 时间序列 [{t, v}, ...]"
     )
+    # 价格曲线：下注那一刻锁定赔率的关键数据（采样表仅保留 1 小时，归档时永久化）
+    curve_up_price: Mapped[dict | None] = mapped_column(
+        JSONB, nullable=True, comment="UP token 价格时间序列 [{t, v}, ...]，v 为 0~1"
+    )
+    curve_down_price: Mapped[dict | None] = mapped_column(
+        JSONB, nullable=True, comment="DOWN token 价格时间序列 [{t, v}, ...]，v 为 0~1"
+    )
+    # 参与者/交易量时序：momentum 类假设（资金流入速度、参与者增长率）的原始证据，
+    # 归档时快照永久化，避免重演价格曲线仅剩均值的教训
+    curve_participants: Mapped[dict | None] = mapped_column(
+        JSONB, nullable=True, comment="参与人数时间序列 [{t, v}, ...]"
+    )
+    curve_trade_volume: Mapped[dict | None] = mapped_column(
+        JSONB, nullable=True, comment="交易量时间序列 [{t, v}, ...]"
+    )
     sample_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, comment="窗口内采样点数"
     )
