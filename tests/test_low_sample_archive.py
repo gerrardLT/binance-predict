@@ -10,16 +10,17 @@
 - 采样量 < 8 但价格有效 → 归档（archived=True，outcome 由涨跌判定）；
 - entry_price 无效 → 跳过归档（skipped，对应源码的 continue）；
 - outcome 只取决于 entry/exit 价格，与采样量无关。
+
+结算口径对齐后：outcome 按 actual_return 正负号标注（预测市场只按方向赔付），
+仅恰好为 0 时标 NOISE。
 """
 
 from __future__ import annotations
 
-NOISE_THRESHOLD = 0.0005  # 与 settings.noise_threshold 同量级，仅用于本地判定
-
 
 def _archive_decision(sample_count: int, entry_price: float | None,
                       exit_price: float | None) -> dict:
-    """复刻 main.py 归档主体的决策（P1-2 后）。
+    """复刻 main.py 归档主体的决策（P1-2 后 + 结算口径标注）。
 
     返回 {"archived": bool, "outcome": str|None, "sample_count": int}。
     archived=False 表示源码走 continue 跳过归档。
@@ -35,9 +36,9 @@ def _archive_decision(sample_count: int, entry_price: float | None,
     outcome = None
     if entry_price and exit_price and entry_price > 0:
         actual_return = exit_price / entry_price - 1
-        if actual_return > NOISE_THRESHOLD:
+        if actual_return > 0:
             outcome = "UP"
-        elif actual_return < -NOISE_THRESHOLD:
+        elif actual_return < 0:
             outcome = "DOWN"
         else:
             outcome = "NOISE"
@@ -72,7 +73,14 @@ def test_outcome_independent_of_sample_count() -> None:
     # 相同价格下，低采样与高采样得到相同 outcome（判定只看价格）
     low = _archive_decision(sample_count=2, entry_price=100.0, exit_price=100.02)
     high = _archive_decision(sample_count=50, entry_price=100.0, exit_price=100.02)
-    assert low["outcome"] == high["outcome"] == "NOISE"
+    # 结算口径：只要收涨就是 UP，不再有幅度门槛
+    assert low["outcome"] == high["outcome"] == "UP"
+
+
+def test_flat_price_is_noise() -> None:
+    # 恰好分毫不动（无法结算方向）→ NOISE
+    res = _archive_decision(sample_count=20, entry_price=100.0, exit_price=100.0)
+    assert res["outcome"] == "NOISE"
 
 
 def test_high_sample_not_flagged_low_quality() -> None:

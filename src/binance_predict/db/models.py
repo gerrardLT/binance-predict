@@ -119,6 +119,11 @@ class PredictionMarketSample(Base):
     down_pct: Mapped[float | None] = mapped_column(Float, nullable=True, comment="DOWN 百分比")
     participants: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="参与人数")
     trade_volume: Mapped[float | None] = mapped_column(Float, nullable=True, comment="交易量")
+    # BTC 现货中间价快照：验证“情绪领先还是滞后价格”的关键原始证据，
+    # 与情绪采样同时刻记录，供局内领先/滞后与背离分析使用
+    btc_price: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="采样时刻 BTC 现货中间价（spot bookTicker mid）"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -170,6 +175,11 @@ class SentimentWindow(Base):
     )
     curve_trade_volume: Mapped[dict | None] = mapped_column(
         JSONB, nullable=True, comment="交易量时间序列 [{t, v}, ...]"
+    )
+    # BTC 局内价格曲线：与情绪曲线同步采样的现货中间价序列，
+    # 用于情绪 vs 价格的领先/滞后、背离、加速度关系分析（归档时永久化）
+    curve_btc_price: Mapped[dict | None] = mapped_column(
+        JSONB, nullable=True, comment="BTC 现货中间价时间序列 [{t, v}, ...]"
     )
     sample_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, comment="窗口内采样点数"

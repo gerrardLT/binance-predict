@@ -202,6 +202,7 @@ async def _prediction_market_tracker() -> None:
                                     "down_pct": row.down_pct,
                                     "participants": row.participants,
                                     "trade_volume": row.trade_volume,
+                                    "btc_price": row.btc_price,
                                 })
                             if rows:
                                 logger.info("从 DB 恢复当前窗口数据 | {} 条采样 | 窗口 {}~{}", len(rows), window_start_ms, window_end_ms)
@@ -214,6 +215,9 @@ async def _prediction_market_tracker() -> None:
             down_price = quote.down_price
 
             if up_chance is not None or down_chance is not None:
+                # BTC 现货中间价快照（与情绪采样同时刻）：验证情绪领先/滞后
+                # 价格的关键证据。内存快照无效时存 None，不阻塞、不伪造。
+                _btc_mid = collector.store.mid_price
                 point = {
                     "timestamp": aligned_ts,
                     "up_price": up_price,
@@ -222,6 +226,7 @@ async def _prediction_market_tracker() -> None:
                     "down_pct": round(down_chance * 100, 1) if down_chance is not None else None,
                     "participants": quote.participants,
                     "trade_volume": float(quote.trade_volume) if quote.trade_volume is not None else None,
+                    "btc_price": _btc_mid if _btc_mid and _btc_mid > 0 else None,
                 }
                 _pm_history.append(point)
 
@@ -236,6 +241,7 @@ async def _prediction_market_tracker() -> None:
                             down_pct=point["down_pct"],
                             participants=point["participants"],
                             trade_volume=point["trade_volume"],
+                            btc_price=point["btc_price"],
                         ))
                         await db.commit()
                 except Exception as e:
@@ -351,6 +357,9 @@ async def _sentiment_window_archiver() -> None:
                     # 参与者/交易量时序永久化：momentum 类假设的原始证据（此前仅存均值）
                     curve_participants = [{"t": s.timestamp, "v": s.participants} for s in samples if s.participants is not None]
                     curve_trade_volume = [{"t": s.timestamp, "v": s.trade_volume} for s in samples if s.trade_volume is not None]
+                    # BTC 局内价格曲线：与情绪曲线同步的现货中间价序列，
+                    # 情绪 vs 价格领先/滞后分析的原始证据（归档永久化）
+                    curve_btc_price = [{"t": s.timestamp, "v": s.btc_price} for s in samples if s.btc_price is not None]
 
                     # 修复：使用窗口切换时快照的价格。
                     # entry_price = 已关闭窗口起点快照；exit_price = 切换时刻价（窗口终点）。
@@ -371,15 +380,17 @@ async def _sentiment_window_archiver() -> None:
                             )
                             continue
 
-                    # 计算实际结果
+                    # 计算实际结果（结算口径对齐）：预测市场只按涨跌方向赔付，
+                    # 与幅度无关，故 outcome 按 actual_return 正负号标注；恰好为 0
+                    # （极罕见，历史数据 16/3522）无法结算方向，标 NOISE。
+                    # noise_threshold 不再参与结果标注，仅保留作策略层横盘过滤备用。
                     actual_return = None
                     outcome = None
                     if entry_price and exit_price and entry_price > 0:
                         actual_return = exit_price / entry_price - 1
-                        noise_threshold = settings.noise_threshold
-                        if actual_return > noise_threshold:
+                        if actual_return > 0:
                             outcome = "UP"
-                        elif actual_return < -noise_threshold:
+                        elif actual_return < 0:
                             outcome = "DOWN"
                         else:
                             outcome = "NOISE"
@@ -400,6 +411,7 @@ async def _sentiment_window_archiver() -> None:
                         curve_down_price=curve_down_price,
                         curve_participants=curve_participants,
                         curve_trade_volume=curve_trade_volume,
+                        curve_btc_price=curve_btc_price,
                         sample_count=len(samples),
                         entry_price=entry_price,
                         exit_price=exit_price,
@@ -890,6 +902,7 @@ async def get_sentiment_windows(
             "outcome": w.outcome,
             "curve_up_pct": w.curve_up_pct,
             "curve_down_pct": w.curve_down_pct,
+            "curve_btc_price": w.curve_btc_price,
         }
         for w in windows
     ]

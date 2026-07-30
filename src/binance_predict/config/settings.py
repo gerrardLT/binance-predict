@@ -46,7 +46,9 @@ class Settings(BaseSettings):
     symbol: str = "BTCUSDT"
     # 预测周期
     horizon: str = "5m"
-    # 噪声阈值：future_return 绝对值小于此值视为 NOISE
+    # 噪声阈值（已从结果标注中移除）：预测市场按方向结算，outcome 改按
+    # actual_return 正负号标注（见 main.py 归档器）。此值保留作策略层
+    # “预计横盘不下注”过滤器备用（后续计划改为波动率自适应）。
     noise_threshold: float = 0.0005
 
     # --- 原始采样保留策略 ---

@@ -110,8 +110,12 @@ def compute_is_correct(direction: FinalPrediction, outcome: ActualLabel | None) 
     判定规则：
     - direction ∈ {UP, DOWN}：is_correct = (direction == outcome)
       方向命中为真；方向相反或结果为 NOISE 均为假。
+      结算口径对齐后 outcome 按涨跌正负号标注（预测市场只按方向赔付），
+      本判定即与实际盈亏一致；NOISE 仅剩“恰好分毫不动”的极罕见情形。
     - direction == NO_TRADE：is_correct = (outcome == "NOISE")
-      正确规避非行情为真；实际有 UP/DOWN 行情却未预测方向为假（错失机会）。
+      新口径下 NOISE 几乎绝迹，故弃权几乎恒判为假；弃权无盈亏，
+      此字段对 NO_TRADE 仅作“错失行情”标记，不再参与模式胜率统计
+      （见 SentimentAgent.validate 仅对 UP/DOWN 更新模式统计）。
 
     参数
     ----

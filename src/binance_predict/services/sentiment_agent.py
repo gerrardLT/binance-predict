@@ -205,8 +205,14 @@ class SentimentAgent:
                 if pred.sentiment_window_id is None:
                     pred.sentiment_window_id = window.id
 
-                # 3. 若匹配了模式 → 更新模式统计
-                if pred.matched_pattern_id is not None:
+                # 3. 若匹配了模式且为方向性预测 → 更新模式统计。
+                # 结算口径对齐：NO_TRADE 是弃权（未下注、无盈亏），不应计入
+                # 模式胜率——outcome 改按涨跌正负号标注后 NOISE 几乎绝迹，
+                # 若仍计入会把弃权全部记为失败，无辜拖垮模式胜率。
+                if (
+                    pred.matched_pattern_id is not None
+                    and pred.predicted_direction in ("UP", "DOWN")
+                ):
                     pattern_stmt = select(PatternMemory).where(
                         PatternMemory.id == pred.matched_pattern_id
                     )
