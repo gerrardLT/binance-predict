@@ -145,7 +145,8 @@ class PredictionMarketDataService:
         中的周期标记分类（'5m'/'15m'），直接提取 outcome 中的 price/chance 及元数据。
 
         分页拉取：币安市场列表默认按推荐排序（含全币种+事件市场），BTC 15m
-        市场不在首页；按 END_DATE 升序排序 + hasMore 翻页确保短周期市场不遗漏。
+        市场可能不在首页；按 hasMore 翻页确保短周期市场不遗漏。
+        （实测：sortBy/orderBy 参数该 sapi 端点不接受，不可传）
         提前终止：两个周期都找到后不再翻页（控制采样频率下的 API 开销）。
 
         与交易模块不同，本方法：
@@ -164,8 +165,6 @@ class PredictionMarketDataService:
             params = self._sign_request({
                 "limit": limit,
                 "offset": offset,
-                "sortBy": "END_DATE",
-                "orderBy": "ASC",
             })
 
             try:

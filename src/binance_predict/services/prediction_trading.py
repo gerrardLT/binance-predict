@@ -218,8 +218,8 @@ class BinancePredictionTrader:
         直接提取 outcome 中的 price/chance，无需调用 get_quote。
 
         分页拉取（15m 市场不在首页）：币安市场列表默认按推荐排序，
-        含全币种+事件市场，BTC 15m 被挤到后面的页；按 END_DATE 升序
-        排序 + hasMore 翻页确保不遗漏短周期市场。
+        含全币种+事件市场，BTC 15m 可能被挤到后面的页；按 hasMore 翻页
+        确保不遗漏。（实测：sortBy/orderBy 参数该 sapi 端点不接受，不可传）
         """
         markets: list[dict] = []
         offset = 0
@@ -228,8 +228,6 @@ class BinancePredictionTrader:
             params = self._sign_request({
                 "limit": limit,
                 "offset": offset,
-                "sortBy": "END_DATE",
-                "orderBy": "ASC",
             })
 
             try:
@@ -241,6 +239,12 @@ class BinancePredictionTrader:
                 )
                 resp.raise_for_status()
                 data = resp.json()
+            except httpx.HTTPStatusError as e:
+                logger.error(
+                    "查询预测市场失败 (HTTP {}): {}",
+                    e.response.status_code, e.response.text,
+                )
+                break
             except Exception as e:
                 logger.error("查询预测市场失败: {}", e)
                 break
