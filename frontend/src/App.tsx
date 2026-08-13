@@ -23,6 +23,7 @@ interface PMPoint {
   down_price: number | null
   up_pct: number | null
   down_pct: number | null
+  btc_price?: number | null
 }
 
 interface MomentumSignal {
@@ -340,6 +341,7 @@ interface DeepLearnStreamEvent {
 const api = {
   health: () => fetch('/api/health').then(r => r.json()),
   getPredictionMarket: () => fetch('/api/chart/prediction-market').then(r => r.json()),
+  getPredictionMarket15m: () => fetch('/api/chart/prediction-market/15m').then(r => r.json()),
   runMomentumPredict: () => fetch('/api/sentiment/momentum-predict', { method: 'POST' }).then(r => r.json()),
   getAgentStatus: () => fetch('/api/sentiment/agent/status').then(r => r.json()),
   getAgentPatterns: () => fetch('/api/sentiment/agent/patterns').then(r => r.json()),
@@ -602,6 +604,8 @@ export default function App() {
             </Card>
 
             <FakeBreakoutPanel />
+
+            <Market15mPanel />
 
             <Card title="概率动量分析（纯算法 · 独立备选方案）">
               <div className="text-xs text-gray-400 mb-3">
@@ -2319,6 +2323,91 @@ function PatternPoolPanel() {
             </tbody>
           </table>
         </div>
+      )}
+    </Card>
+  )
+}
+
+// ============================================================
+// 15 分钟预测市场面板（market tab）：假突破策略的兑现载体报价
+// ============================================================
+
+function Market15mPanel() {
+  const [points, setPoints] = useState<PMPoint[]>([])
+  const [market, setMarket] = useState<Record<string, unknown> | null>(null)
+  const [, setTick] = useState(0)
+
+  const refresh = useCallback(() => {
+    api.getPredictionMarket15m().then(d => {
+      setPoints(d.points || [])
+      setMarket(d.market || null)
+    }).catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    refresh()
+    const timer = setInterval(refresh, 15000)
+    const tickTimer = setInterval(() => setTick(t => t + 1), 1000)  // 倒计时每秒刷新
+    return () => { clearInterval(timer); clearInterval(tickTimer) }
+  }, [refresh])
+
+  const endMs = (market?.end_date as number) || 0
+  const remaining = Math.max(0, Math.floor((endMs - Date.now()) / 1000))
+  const min = Math.floor(remaining / 60)
+  const sec = remaining % 60
+  const last = points[points.length - 1]
+
+  return (
+    <Card title="BTC 15 分钟涨跌市场（假突破策略兑现载体）">
+      <div className="text-xs text-gray-400 mb-3">
+        币安预测市场 15m 期的 UP/DOWN 报价。冲高破位瞬间 DOWN token 被砸出的低价，就是假突破策略的下注赔率。
+      </div>
+      <div className="flex flex-wrap gap-4 mb-3 text-xs">
+        <span className="px-2 py-1 bg-orange-50 text-orange-700 rounded font-medium">🟠 15m 期</span>
+        {endMs > 0 && (
+          <span className="text-orange-500 font-mono">⏱ 距到期 {min}:{String(sec).padStart(2, '0')}</span>
+        )}
+        {last && (
+          <>
+            <span className="text-gray-500">
+              DOWN 现价 <strong className="text-red-500 font-mono">{last.down_price !== null ? last.down_price.toFixed(3) : '--'}</strong>
+              <span className="text-gray-400">（越低赔率越肥）</span>
+            </span>
+            <span className="text-gray-500">
+              UP 现价 <strong className="text-green-600 font-mono">{last.up_price !== null ? last.up_price.toFixed(3) : '--'}</strong>
+            </span>
+            {last.btc_price && (
+              <span className="text-gray-500">BTC <strong className="font-mono text-gray-800">{last.btc_price.toFixed(0)}</strong></span>
+            )}
+          </>
+        )}
+      </div>
+      {points.length > 0 ? (
+        <>
+          <ResponsiveContainer width="100%" height={320}>
+            <AreaChart data={points.map(d => ({
+              time: new Date(d.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+              up_pct: d.up_pct,
+              down_pct: d.down_pct,
+            }))}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+              <XAxis dataKey="time" tick={{ fontSize: 10 }} stroke="#9ca3af" interval="preserveStartEnd" />
+              <YAxis tick={{ fontSize: 11 }} stroke="#9ca3af" domain={[0, 100]} tickFormatter={(v: number) => v + '%'} />
+              <Tooltip
+                contentStyle={{ fontSize: 12, borderRadius: 8, border: '1px solid #e5e7eb' }}
+                formatter={(v, n) => [typeof v === 'number' ? v.toFixed(1) + '%' : '--', n === 'up_pct' ? '看涨 (UP)' : '看跌 (DOWN)']}
+              />
+              <Area type="monotone" dataKey="up_pct" stroke="#22c55e" fill="#22c55e20" strokeWidth={2} name="看涨" connectNulls />
+              <Area type="monotone" dataKey="down_pct" stroke="#ef4444" fill="#ef444420" strokeWidth={2} name="看跌" connectNulls />
+              <ReferenceLine y={50} stroke="#9ca3af" strokeDasharray="4 4" />
+            </AreaChart>
+          </ResponsiveContainer>
+          <div className="flex justify-center gap-6 mt-2 text-xs text-gray-500">
+            <span>共 {points.length} 个采样点（约 {Math.round(points.length / 4)} 分钟）</span>
+          </div>
+        </>
+      ) : (
+        <div className="text-center text-gray-400 py-10 text-sm">正在采集 15m 市场数据...每 15 秒采样一次。</div>
       )}
     </Card>
   )

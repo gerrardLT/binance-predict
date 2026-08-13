@@ -1177,6 +1177,44 @@ async def get_prediction_market_chart():
     }
 
 
+@app.get("/api/chart/prediction-market/15m")
+async def get_prediction_market_chart_15m(
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    获取 15 分钟预测市场采样曲线（从 prediction_market_samples 查 market_period='15m'）
+
+    返回最近 400 个点（约 100 分钟，覆盖多个 15m 期次）的 UP/DOWN 报价与
+    BTC 快照价；market 字段为检测器缓存的最新 15m 市场快照（到期时刻等）。
+    """
+    from sqlalchemy import desc as sa_desc, select as sa_select
+
+    stmt = (
+        sa_select(PredictionMarketSample)
+        .where(PredictionMarketSample.market_period == "15m")
+        .order_by(sa_desc(PredictionMarketSample.timestamp))
+        .limit(400)
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+    points = [
+        {
+            "timestamp": s.timestamp,
+            "up_price": s.up_price,
+            "down_price": s.down_price,
+            "up_pct": s.up_pct,
+            "down_pct": s.down_pct,
+            "btc_price": s.btc_price,
+        }
+        for s in reversed(rows)
+    ]
+    return {
+        "symbol": settings.symbol,
+        "poll_interval_sec": 15,
+        "points": points,
+        "market": dict(_pm_15m_latest),
+    }
+
+
 # ============================================================
 # 情绪曲线分析 API
 # ============================================================
