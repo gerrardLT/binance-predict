@@ -283,18 +283,31 @@ class FakeBreakoutDetector:
             "（超日限，不发邮件）" if over_daily_limit else "",
         )
 
-        # 邮件推送（未超日限时）
+        # 邮件推送（未超日限时）：fire-and-forget，绝不阻塞检测循环。
+        # 实测教训：SMTP 连接被防火墙丢包时同步等待会卡死整个循环 16 分钟，
+        # 导致结算回读停摆（信号 #1 事故）。
         if settings.fake_breakout_email_enabled and not over_daily_limit:
+            asyncio.create_task(
+                self._send_signal_email_bg(signal.id),
+                name=f"fbs_email_{signal.id}",
+            )
+
+    async def _send_signal_email_bg(self, signal_id: int) -> None:
+        """后台邮件发送：重新查库拿完整信号，发送成功后回填 email_sent。"""
+        try:
+            async with async_session_factory() as session:
+                signal = await session.get(FakeBreakoutSignal, signal_id)
+            if signal is None:
+                return
             sent = await self._send_signal_email(signal)
             if sent:
-                try:
-                    async with async_session_factory() as session:
-                        row = await session.get(FakeBreakoutSignal, signal.id)
-                        if row is not None:
-                            row.email_sent = True
-                            await session.commit()
-                except Exception as exc:
-                    logger.warning("假突破信号 email_sent 回填失败 | {}", exc)
+                async with async_session_factory() as session:
+                    row = await session.get(FakeBreakoutSignal, signal_id)
+                    if row is not None:
+                        row.email_sent = True
+                        await session.commit()
+        except Exception as exc:
+            logger.warning("假突破信号邮件后台发送异常 #{} | {}", signal_id, exc)
 
     async def _send_signal_email(self, signal: FakeBreakoutSignal) -> bool:
         t_str = datetime.fromtimestamp(
