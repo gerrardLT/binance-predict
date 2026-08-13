@@ -144,6 +144,10 @@ class PredictionMarketDataService:
         筛选 chartType=CRYPTO_UP_DOWN 且 symbol=BTCUSDT 的市场，按 title/slug
         中的周期标记分类（'5m'/'15m'），直接提取 outcome 中的 price/chance 及元数据。
 
+        分页拉取：币安市场列表默认按推荐排序（含全币种+事件市场），BTC 15m
+        市场不在首页；按 END_DATE 升序排序 + hasMore 翻页确保短周期市场不遗漏。
+        提前终止：两个周期都找到后不再翻页（控制采样频率下的 API 开销）。
+
         与交易模块不同，本方法：
         - 不缓存 token_id
         - 不修改任何外部状态
@@ -152,34 +156,61 @@ class PredictionMarketDataService:
         Returns:
             dict[str, MarketQuoteData]: key 为 '5m'/'15m'；API 失败时返回空 dict。
         """
-        params = self._sign_request({
-            "limit": 50,
-            "offset": 0,
-        })
-
-        try:
-            client = self._get_client()
-            resp = await client.get(
-                f"{self.BASE_URL}/sapi/v1/w3w/wallet/prediction/market/list",
-                params=params,
-                headers={"X-MBX-APIKEY": self._api_key},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except httpx.HTTPStatusError as e:
-            logger.error(
-                "读取预测市场数据失败 (HTTP {}): {}",
-                e.response.status_code,
-                e.response.text,
-            )
-            return {}
-        except Exception as e:
-            logger.error("读取预测市场数据失败: {}", e)
-            return {}
-
-        markets = data.get("marketTopics", [])
         quotes: dict[str, MarketQuoteData] = {}
+        offset = 0
+        limit = 100  # 官方上限 100
 
+        for _page in range(5):  # 最多翻 5 页兑底
+            params = self._sign_request({
+                "limit": limit,
+                "offset": offset,
+                "sortBy": "END_DATE",
+                "orderBy": "ASC",
+            })
+
+            try:
+                client = self._get_client()
+                resp = await client.get(
+                    f"{self.BASE_URL}/sapi/v1/w3w/wallet/prediction/market/list",
+                    params=params,
+                    headers={"X-MBX-APIKEY": self._api_key},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            except httpx.HTTPStatusError as e:
+                logger.error(
+                    "读取预测市场数据失败 (HTTP {}): {}",
+                    e.response.status_code,
+                    e.response.text,
+                )
+                return quotes
+            except Exception as e:
+                logger.error("读取预测市场数据失败: {}", e)
+                return quotes
+
+            page = data.get("marketTopics", [])
+            self._extract_period_quotes(page, quotes)
+
+            # 提前终止：两周期均已找到，或无更多页
+            if ("5m" in quotes and "15m" in quotes) or not data.get("hasMore") or not page:
+                break
+            offset += limit
+
+        q5 = quotes.get("5m")
+        q15 = quotes.get("15m")
+        logger.debug(
+            "读取预测报价 | 5m DOWN={} end={} | 15m DOWN={} end={}",
+            q5.down_price if q5 else None,
+            q5.end_date if q5 else None,
+            q15.down_price if q15 else None,
+            q15.end_date if q15 else None,
+        )
+        return quotes
+
+    def _extract_period_quotes(
+        self, markets: list[dict], quotes: dict[str, MarketQuoteData]
+    ) -> None:
+        """从一页市场列表中提取 5m/15m 报价，写入 quotes（已有的周期不覆盖）。"""
         for market in markets:
             if (
                 market.get("chartType") != "CRYPTO_UP_DOWN"
@@ -221,14 +252,3 @@ class PredictionMarketDataService:
                 end_date=market.get("endDate"),
                 start_date=market.get("startDate"),
             )
-
-        q5 = quotes.get("5m")
-        q15 = quotes.get("15m")
-        logger.debug(
-            "读取预测报价 | 5m DOWN={} end={} | 15m DOWN={} end={}",
-            q5.down_price if q5 else None,
-            q5.end_date if q5 else None,
-            q15.down_price if q15 else None,
-            q15.end_date if q15 else None,
-        )
-        return quotes

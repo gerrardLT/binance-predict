@@ -216,26 +216,41 @@ class BinancePredictionTrader:
         筛选 chartType=CRYPTO_UP_DOWN 且 symbol=BTCUSDT 的市场，按周期分类
         （5m 用于交易执行缓存 tokenId；15m 缓存报价供假突破信号系统读取）。
         直接提取 outcome 中的 price/chance，无需调用 get_quote。
+
+        分页拉取（15m 市场不在首页）：币安市场列表默认按推荐排序，
+        含全币种+事件市场，BTC 15m 被挤到后面的页；按 END_DATE 升序
+        排序 + hasMore 翻页确保不遗漏短周期市场。
         """
-        params = self._sign_request({
-            "limit": 50,
-            "offset": 0,
-        })
+        markets: list[dict] = []
+        offset = 0
+        limit = 100  # 官方上限 100
+        for _page in range(5):  # 最多翻 5 页兑底
+            params = self._sign_request({
+                "limit": limit,
+                "offset": offset,
+                "sortBy": "END_DATE",
+                "orderBy": "ASC",
+            })
 
-        try:
-            client = self._get_client()
-            resp = await client.get(
-                f"{self.BASE_URL}/sapi/v1/w3w/wallet/prediction/market/list",
-                params=params,
-                headers={"X-MBX-APIKEY": self._api_key},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            logger.error("查询预测市场失败: {}", e)
-            return []
+            try:
+                client = self._get_client()
+                resp = await client.get(
+                    f"{self.BASE_URL}/sapi/v1/w3w/wallet/prediction/market/list",
+                    params=params,
+                    headers={"X-MBX-APIKEY": self._api_key},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as e:
+                logger.error("查询预测市场失败: {}", e)
+                break
 
-        markets = data.get("marketTopics", [])
+            page = data.get("marketTopics", [])
+            markets.extend(page)
+            if not data.get("hasMore") or len(page) == 0:
+                break
+            offset += limit
+
         btc_markets = []
 
         for market in markets:

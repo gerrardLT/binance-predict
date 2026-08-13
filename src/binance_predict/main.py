@@ -1085,6 +1085,38 @@ async def list_prediction_markets(
     }
 
 
+@app.get("/api/prediction-markets/all")
+async def list_prediction_markets_all(
+    _: None = Depends(_require_auth),
+):
+    """全量 BTC 预测市场（含分页拉取后的所有周期，诊断用）。
+
+    返回精简字段：title/slug/周期分类/起止时间/参与者/交易量，
+    用于确认 15m 等新周期市场是否在列表内。
+    """
+    markets = await prediction_trader.list_markets()
+    return {
+        "count": len(markets),
+        "periods": {
+            "5m": bool(prediction_trader._up_token_id),
+            "15m_down_price": prediction_trader._15m_down_price,
+            "15m_end_date": prediction_trader._15m_end_date,
+        },
+        "markets": [
+            {
+                "title": m.get("title"),
+                "slug": m.get("slug"),
+                "period": BinancePredictionTrader._classify_period(m),
+                "startDate": m.get("startDate"),
+                "endDate": m.get("endDate"),
+                "participantCount": m.get("participantCount"),
+                "tradeVolume": m.get("tradeVolume"),
+            }
+            for m in markets
+        ],
+    }
+
+
 @app.get("/api/prediction-wallet")
 async def get_prediction_wallet(
     _: None = Depends(_require_auth),
