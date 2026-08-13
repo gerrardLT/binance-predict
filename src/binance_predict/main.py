@@ -706,6 +706,9 @@ async def lifespan(app: FastAPI):
                 # 假突破信号系统 + 模式池分级（与 alembic 迁移 h8b9c0d1e2f3 等价，存量 dev 库安全网）
                 "ALTER TABLE prediction_market_samples ADD COLUMN IF NOT EXISTS market_period VARCHAR(5) NOT NULL DEFAULT '5m'",
                 "ALTER TABLE pattern_memory ADD COLUMN IF NOT EXISTS tier VARCHAR(2) NOT NULL DEFAULT 'C'",
+                # 假突破 5m 兑现口径（与 alembic 迁移 i9b0c1d2e3f4 等价，存量 dev 库安全网）
+                "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS settle_btc_price_5m FLOAT",
+                "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS settle_outcome_5m VARCHAR(10)",
             ]:
                 try:
                     await conn.execute(text(col_sql))
@@ -879,6 +882,8 @@ async def list_fake_breakout_signals(
                 "market_end_15m": s.market_end_15m,
                 "settle_btc_price": s.settle_btc_price,
                 "settle_outcome": s.settle_outcome,
+                "settle_btc_price_5m": s.settle_btc_price_5m,
+                "settle_outcome_5m": s.settle_outcome_5m,
                 "status": s.status,
                 "email_sent": s.email_sent,
                 "created_at": s.created_at.isoformat() if s.created_at else None,
@@ -917,12 +922,25 @@ async def get_fake_breakout_stats(db: AsyncSession = Depends(get_db)):
             FakeBreakoutSignal.down_price_5m.isnot(None)
         )
     )).scalar()
+    # 5m 兑现口径胜率（与 15m 口径并行验证）
+    settled_5m = (await db.execute(
+        sa_select(sa_func.count(FakeBreakoutSignal.id)).where(
+            FakeBreakoutSignal.settle_outcome_5m.isnot(None)
+        )
+    )).scalar() or 0
+    down_wins_5m = (await db.execute(
+        sa_select(sa_func.count(FakeBreakoutSignal.id)).where(
+            FakeBreakoutSignal.settle_outcome_5m == "DOWN"
+        )
+    )).scalar() or 0
     return {
         "total_signals": total,
         "settled": settled,
         "down_win_rate": (down_wins / settled) if settled else None,
         "avg_down_price_15m": float(avg_15m) if avg_15m is not None else None,
         "avg_down_price_5m": float(avg_5m) if avg_5m is not None else None,
+        "settled_5m": settled_5m,
+        "down_win_rate_5m": (down_wins_5m / settled_5m) if settled_5m else None,
     }
 
 

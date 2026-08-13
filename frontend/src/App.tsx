@@ -214,6 +214,8 @@ interface FakeBreakoutSignal {
   market_end_15m: number | null
   settle_btc_price: number | null
   settle_outcome: 'UP' | 'DOWN' | 'NOISE' | null
+  settle_btc_price_5m: number | null
+  settle_outcome_5m: 'UP' | 'DOWN' | 'NOISE' | null
   status: 'PENDING' | 'SETTLED' | 'EXPIRED'
   email_sent: boolean
   created_at: string | null
@@ -234,6 +236,8 @@ interface FakeBreakoutStats {
   down_win_rate: number | null
   avg_down_price_15m: number | null
   avg_down_price_5m: number | null
+  settled_5m: number
+  down_win_rate_5m: number | null
 }
 
 // 模式池分级与回测快照：与后端 /api/agent/patterns/compare + /backtest-runs 对齐
@@ -2076,10 +2080,16 @@ function FakeBreakoutPanel() {
           <span className="text-gray-600">累计信号 <strong>{stats.total_signals}</strong></span>
           <span className="text-gray-600">已结算 <strong>{stats.settled}</strong></span>
           <span className="text-gray-600">
-            DOWN 胜率 <strong className={stats.down_win_rate !== null && stats.down_win_rate >= 0.654 ? 'text-green-600' : 'text-gray-800'}>
+            DOWN 胜率（15m） <strong className={stats.down_win_rate !== null && stats.down_win_rate >= 0.654 ? 'text-green-600' : 'text-gray-800'}>
               {stats.down_win_rate !== null ? `${(stats.down_win_rate * 100).toFixed(1)}%` : '--'}
             </strong>
-            <span className="text-gray-400">（回测基线 65.4% / 信号口径 80%）</span>
+            <span className="text-gray-400">（回测 80%）</span>
+          </span>
+          <span className="text-gray-600">
+            DOWN 胜率（5m） <strong className={stats.down_win_rate_5m !== null && stats.down_win_rate_5m >= 0.654 ? 'text-green-600' : 'text-gray-800'}>
+              {stats.down_win_rate_5m !== null ? `${(stats.down_win_rate_5m * 100).toFixed(1)}%` : '--'}
+            </strong>
+            <span className="text-gray-400">（{stats.settled_5m} 注，回测 77.4%）</span>
           </span>
           <span className="text-gray-600">平均 15m DOWN 入场价 <strong className="font-mono">{stats.avg_down_price_15m?.toFixed(3) ?? '--'}</strong></span>
         </div>
@@ -2098,6 +2108,7 @@ function FakeBreakoutPanel() {
                 <th className="py-1.5 px-2 text-right">15m DOWN 价</th>
                 <th className="py-1.5 px-2 text-right">5m DOWN 价</th>
                 <th className="py-1.5 px-2 text-right">结算价</th>
+                <th className="py-1.5 px-2 text-center">5m 后方向</th>
                 <th className="py-1.5 px-2 text-center">15m 后方向</th>
                 <th className="py-1.5 px-2 text-center">状态</th>
               </tr>
@@ -2112,6 +2123,19 @@ function FakeBreakoutPanel() {
                   <td className="py-1.5 px-2 text-right font-mono text-red-500">{s.down_price_15m?.toFixed(3) ?? '--'}</td>
                   <td className="py-1.5 px-2 text-right font-mono text-gray-500">{s.down_price_5m?.toFixed(3) ?? '--'}</td>
                   <td className="py-1.5 px-2 text-right font-mono text-gray-600">{s.settle_btc_price?.toFixed(0) ?? '--'}</td>
+                  <td className="py-1.5 px-2 text-center">
+                    {s.settle_outcome_5m ? (
+                      <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                        s.settle_outcome_5m === 'DOWN'
+                          ? 'bg-green-100 text-green-700'
+                          : s.settle_outcome_5m === 'UP'
+                            ? 'bg-red-100 text-red-700'
+                            : 'bg-gray-100 text-gray-500'
+                      }`}>
+                        {s.settle_outcome_5m === 'DOWN' ? '✓ DOWN' : s.settle_outcome_5m === 'UP' ? '✗ UP' : '— NOISE'}
+                      </span>
+                    ) : <span className="text-gray-300">待结算</span>}
+                  </td>
                   <td className="py-1.5 px-2 text-center">
                     {s.settle_outcome ? (
                       <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${

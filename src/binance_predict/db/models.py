@@ -616,7 +616,14 @@ class FakeBreakoutSignal(Base):
         BigInteger, nullable=False, comment="结算回读死线（ms）= signal_time + 15min + 缓冲"
     )
     settle_btc_price: Mapped[float | None] = mapped_column(
-        Float, nullable=True, comment="结算时刻 BTC 现货中间价（到期回读回填）"
+        Float, nullable=True, comment="结算时刻 BTC 现货中间价（到期回读回填，15m 口径）"
+    )
+    settle_btc_price_5m: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="信号时刻 +5min 回读的 BTC 现货中间价（5m 兑现口径验证）"
+    )
+    settle_outcome_5m: Mapped[str | None] = mapped_column(
+        String(10), nullable=True,
+        comment="5m 兑现方向 UP | DOWN（只看符号：settle_btc_5m < btc_price → DOWN 赢）"
     )
     settle_outcome: Mapped[str | None] = mapped_column(
         String(10), nullable=True,

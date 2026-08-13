@@ -37,6 +37,8 @@ from .data_collector import BinanceDataCollector
 
 # 兑现窗口（15 分钟，与回测 HOLD_MS 对齐）
 HOLD_MS = 900_000
+# 5 分钟兑现口径（与 15m 并行验证：离线回测 5m 77.4% vs 15m 80.0%）
+HOLD_5M_MS = 300_000
 # 停机积压判定：到期后超过此宽限仍未结算的信号置 EXPIRED（现价已不能代表结算时刻）
 SETTLE_EXPIRE_GRACE_MS = 300_000
 
@@ -286,15 +288,70 @@ class FakeBreakoutDetector:
         return await send_plain_email(subject, body)
 
     # ==================================================================
-    # 到期结算回读
+    # 到期结算回读（5m + 15m 双口径并行验证）
     # ==================================================================
 
     async def _settle_due_signals(self, now_ms: int) -> None:
-        """回填到期信号的结算方向（settle_btc < btc_price → DOWN 赢，只看符号）。
+        """双时点回读：5m 口径（信号+5min）与 15m 口径（对齐市场到期）独立回填。
 
-        CodeReview Minor-3b：停机积压超过宽限的信号，现价已不能代表结算时刻，
-        置 EXPIRED 而非按现价结算（避免失真）。
+        CodeReview Minor-3b：停机积压超过宽限的 15m 信号置 EXPIRED 而非按现价结算；
+        5m 口径逾期不回填（保持 NULL，不影响 15m 状态机）。
         """
+        await self._settle_5m(now_ms)
+        await self._settle_15m(now_ms)
+
+    async def _settle_5m(self, now_ms: int) -> None:
+        """5m 兑现口径回读：信号时刻 +5min + 缓冲后回填 BTC 价与方向。"""
+        buffer_ms = settings.fake_breakout_settle_buffer_seconds * 1000
+        due_5m_before = now_ms - HOLD_5M_MS - buffer_ms
+        try:
+            async with async_session_factory() as session:
+                stmt = (
+                    select(FakeBreakoutSignal)
+                    .where(FakeBreakoutSignal.status == "PENDING")
+                    .where(FakeBreakoutSignal.settle_outcome_5m.is_(None))
+                    .where(FakeBreakoutSignal.signal_time <= due_5m_before)
+                    .limit(20)
+                )
+                due = (await session.execute(stmt)).scalars().all()
+        except Exception as exc:
+            logger.warning("假突破 5m 结算查询失败 | {}", exc)
+            return
+
+        if not due:
+            return
+
+        settle_price = await self._collector.fetch_mid_price()
+        if settle_price <= 0:
+            logger.warning("假突破 5m 结算：BTC 现价不可用，本轮 {} 条顺延", len(due))
+            return
+
+        try:
+            async with async_session_factory() as session:
+                for s in due:
+                    # 逾期超宽限（停机积压）：不回填，保持 NULL 避免失真
+                    if now_ms - (s.signal_time + HOLD_5M_MS + buffer_ms) > SETTLE_EXPIRE_GRACE_MS:
+                        continue
+                    row = await session.get(FakeBreakoutSignal, s.id)
+                    if row is None or row.settle_outcome_5m is not None:
+                        continue
+                    row.settle_btc_price_5m = settle_price
+                    if settle_price < row.btc_price:
+                        row.settle_outcome_5m = "DOWN"
+                    elif settle_price > row.btc_price:
+                        row.settle_outcome_5m = "UP"
+                    else:
+                        row.settle_outcome_5m = "NOISE"
+                    logger.info(
+                        "假突破信号 5m 结算 #{} | 入场 {:.0f} → +5min {:.0f} | {}",
+                        row.id, row.btc_price, settle_price, row.settle_outcome_5m,
+                    )
+                await session.commit()
+        except Exception as exc:
+            logger.error("假突破 5m 结算回填失败 | {}", exc)
+
+    async def _settle_15m(self, now_ms: int) -> None:
+        """15m 兑现口径回读：对齐所报价 15m 市场到期时刻回填（原 _settle_due_signals）。"""
         try:
             async with async_session_factory() as session:
                 stmt = (
