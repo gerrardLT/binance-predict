@@ -206,11 +206,15 @@ interface HealthReport {
 // 假突破信号：与后端 /api/fake-breakout/* 输出对齐
 interface FakeBreakoutSignal {
   id: number
+  level: '1h' | '4h' | 'daily'
+  side: 'high' | 'low'
   signal_time: number
   resistance: number
   btc_price: number
   down_price_5m: number | null
   down_price_15m: number | null
+  up_price_5m: number | null
+  up_price_15m: number | null
   market_end_15m: number | null
   settle_btc_price: number | null
   settle_outcome: 'UP' | 'DOWN' | 'NOISE' | null
@@ -223,12 +227,22 @@ interface FakeBreakoutSignal {
 interface FakeBreakoutStatus {
   running: boolean
   enabled: boolean
-  resistance: number | null
+  levels: Record<string, { resistance: number; support: number }>
   daily_count: number
   eps: number
   btc_mid: number
   pm_15m: { down_price: number | null; up_price: number | null; end_date: number | null; updated_ts: number | null }
   pm_5m_down_price: number | null
+}
+interface FakeBreakoutGroup {
+  level: string
+  side: string
+  settled_15m: number
+  wins_15m: number
+  settled_5m: number
+  wins_5m: number
+  win_rate_15m: number | null
+  win_rate_5m: number | null
 }
 interface FakeBreakoutStats {
   total_signals: number
@@ -238,6 +252,7 @@ interface FakeBreakoutStats {
   avg_down_price_5m: number | null
   settled_5m: number
   down_win_rate_5m: number | null
+  by_group: FakeBreakoutGroup[]
 }
 
 // 模式池分级与回测快照：与后端 /api/agent/patterns/compare + /backtest-runs 对齐
@@ -2038,15 +2053,19 @@ function FakeBreakoutPanel() {
     return () => clearInterval(timer)
   }, [refresh])
 
-  const dist = status?.resistance && status.btc_mid > 0
-    ? (status.btc_mid / status.resistance - 1) * 100
-    : null
+  const levels = status?.levels || {}
+  const levelOrder = ['1h', '4h', 'daily']
+  // 胜负判定：side=high 买 DOWN（结算 DOWN 赢）；side=low 买 UP（结算 UP 赢）
+  const isWin = (s: FakeBreakoutSignal, oc: string | null) =>
+    oc !== null && oc === (s.side === 'high' ? 'DOWN' : 'UP')
+  const winBadge = (oc: string | null) =>
+    oc === 'DOWN' ? '↓ DOWN' : oc === 'UP' ? '↑ UP' : '— NOISE'
 
   return (
-    <Card title="假突破信号（日线阻力破位 · 暂不下注）">
+    <Card title="假突破信号（1h/4h/日线 × 阻力/支撑 · 暂不下注）">
       <div className="text-xs text-gray-400 mb-3">
-        秒级检测 BTC 盘中冲过日线阻力（前 288 个 5m 窗口 closes 最大值）。
-        回测：冲高瞬间买 15m DOWN 持有到期，方向胜率 80%（80 注，基线 65.4%）。当前只记录信号 + 邮件提醒。
+        秒级检测 BTC 破位：冲过阻力→看跌（买 DOWN）/ 跌破支撑→看涨（买 UP）。
+        回测：日线破阻力 80%、4h 73.5%、1h 65.1%（支撑方向对称成立）。当前只记录信号 + 邮件提醒。
       </div>
 
       {/* 状态行 */}
@@ -2059,106 +2078,121 @@ function FakeBreakoutPanel() {
           </span>
         </span>
         <span className="text-gray-500">
-          日线阻力 <strong className="text-gray-800 font-mono">{status?.resistance ? status.resistance.toFixed(0) : '--'}</strong>
-        </span>
-        <span className="text-gray-500">
           当前价 <strong className="text-gray-800 font-mono">{status?.btc_mid ? status.btc_mid.toFixed(0) : '--'}</strong>
         </span>
-        <span className={dist !== null && dist > 0 ? 'text-red-600 font-bold' : 'text-gray-500'}>
-          距阻力 {dist !== null ? `${dist >= 0 ? '+' : ''}${dist.toFixed(3)}%` : '--'}
-          {dist !== null && dist > 0 && ' ⚠️ 已破位'}
-        </span>
         <span className="text-gray-500">今日信号 <strong className="font-mono text-gray-800">{status?.daily_count ?? 0}</strong> 条</span>
-        <span className="text-gray-500">
-          15m DOWN 现价 <strong className="font-mono text-red-500">{status?.pm_15m?.down_price?.toFixed(3) ?? '--'}</strong>
-        </span>
       </div>
 
-      {/* 汇总统计 */}
+      {/* 三级别位势 */}
+      {Object.keys(levels).length > 0 && (
+        <div className="grid grid-cols-3 gap-2 mb-3 text-xs">
+          {levelOrder.filter(l => levels[l]).map(l => {
+            const lv = levels[l]
+            const mid = status?.btc_mid || 0
+            const distRes = mid > 0 ? (mid / lv.resistance - 1) * 100 : null
+            const distSup = mid > 0 ? (mid / lv.support - 1) * 100 : null
+            const brokeRes = distRes !== null && distRes > 0
+            const brokeSup = distSup !== null && distSup < 0
+            return (
+              <div key={l} className="px-2.5 py-2 bg-gray-50 border border-gray-200 rounded-lg">
+                <div className="font-bold text-gray-700 mb-1">{l === 'daily' ? '日线' : l} <span className="text-gray-400 font-normal">（{l === 'daily' ? 288 : l === '4h' ? 48 : 12} 窗）</span></div>
+                <div className={`font-mono ${brokeRes ? 'text-red-600 font-bold' : 'text-gray-500'}`}>
+                  阻力 {lv.resistance.toFixed(0)}{distRes !== null && <span className="ml-1">({distRes >= 0 ? '+' : ''}{distRes.toFixed(2)}%){brokeRes && ' ⚠️'}</span>}
+                </div>
+                <div className={`font-mono ${brokeSup ? 'text-green-600 font-bold' : 'text-gray-500'}`}>
+                  支撑 {lv.support.toFixed(0)}{distSup !== null && <span className="ml-1">({distSup >= 0 ? '+' : ''}{distSup.toFixed(2)}%){brokeSup && ' ⚠️'}</span>}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      )}
+
+      {/* 分组统计（级别×方向） */}
       {stats && stats.total_signals > 0 && (
-        <div className="flex flex-wrap gap-x-5 gap-y-1 mb-3 px-3 py-2 bg-amber-50 border border-amber-200 rounded-lg text-xs">
-          <span className="text-gray-600">累计信号 <strong>{stats.total_signals}</strong></span>
-          <span className="text-gray-600">已结算 <strong>{stats.settled}</strong></span>
-          <span className="text-gray-600">
-            DOWN 胜率（15m） <strong className={stats.down_win_rate !== null && stats.down_win_rate >= 0.654 ? 'text-green-600' : 'text-gray-800'}>
-              {stats.down_win_rate !== null ? `${(stats.down_win_rate * 100).toFixed(1)}%` : '--'}
-            </strong>
-            <span className="text-gray-400">（回测 80%）</span>
-          </span>
-          <span className="text-gray-600">
-            DOWN 胜率（5m） <strong className={stats.down_win_rate_5m !== null && stats.down_win_rate_5m >= 0.654 ? 'text-green-600' : 'text-gray-800'}>
-              {stats.down_win_rate_5m !== null ? `${(stats.down_win_rate_5m * 100).toFixed(1)}%` : '--'}
-            </strong>
-            <span className="text-gray-400">（{stats.settled_5m} 注，回测 77.4%）</span>
-          </span>
-          <span className="text-gray-600">平均 15m DOWN 入场价 <strong className="font-mono">{stats.avg_down_price_15m?.toFixed(3) ?? '--'}</strong></span>
+        <div className="mb-3 px-3 py-2 bg-amber-50 border border-amber-200 rounded-lg text-xs">
+          <div className="flex flex-wrap gap-x-5 gap-y-1 mb-1.5">
+            <span className="text-gray-600">累计信号 <strong>{stats.total_signals}</strong></span>
+            <span className="text-gray-600">已结算（15m） <strong>{stats.settled}</strong></span>
+            <span className="text-gray-600">已结算（5m） <strong>{stats.settled_5m}</strong></span>
+          </div>
+          {stats.by_group.length > 0 && (
+            <div className="flex flex-wrap gap-2">
+              {stats.by_group.map(g => (
+                <span key={`${g.level}-${g.side}`} className="px-2 py-1 bg-white border border-amber-200 rounded font-mono text-[11px]">
+                  <strong>{g.level}</strong>{g.side === 'high' ? '↓' : '↑'}：
+                  15m {g.win_rate_15m !== null ? `${(g.win_rate_15m * 100).toFixed(0)}%` : '--'}({g.settled_15m})
+                  {' '}5m {g.win_rate_5m !== null ? `${(g.win_rate_5m * 100).toFixed(0)}%` : '--'}({g.settled_5m})
+                </span>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
       {/* 信号列表 */}
       {signals.length === 0 ? (
-        <div className="text-center text-gray-400 py-6 text-sm">暂无信号——BTC 盘中冲过日线阻力时自动记录并邮件提醒</div>
+        <div className="text-center text-gray-400 py-6 text-sm">暂无信号——BTC 盘中破位任一级别阻力/支撑时自动记录并邮件提醒</div>
       ) : (
         <div className="overflow-x-auto max-h-80 overflow-y-auto">
           <table className="w-full text-xs">
             <thead className="sticky top-0 bg-white">
               <tr className="border-b border-gray-200 text-gray-500">
                 <th className="py-1.5 px-2 text-left">信号时间</th>
-                <th className="py-1.5 px-2 text-right">破位价 / 阻力</th>
-                <th className="py-1.5 px-2 text-right">15m DOWN 价</th>
-                <th className="py-1.5 px-2 text-right">5m DOWN 价</th>
+                <th className="py-1.5 px-2 text-center">级别/方向</th>
+                <th className="py-1.5 px-2 text-right">破位价 / 位价</th>
+                <th className="py-1.5 px-2 text-right">15m 目标价</th>
+                <th className="py-1.5 px-2 text-right">5m 目标价</th>
                 <th className="py-1.5 px-2 text-right">结算价</th>
-                <th className="py-1.5 px-2 text-center">5m 后方向</th>
-                <th className="py-1.5 px-2 text-center">15m 后方向</th>
+                <th className="py-1.5 px-2 text-center">5m 后</th>
+                <th className="py-1.5 px-2 text-center">15m 后</th>
                 <th className="py-1.5 px-2 text-center">状态</th>
               </tr>
             </thead>
             <tbody>
-              {signals.map(s => (
-                <tr key={s.id} className="border-b border-gray-100 hover:bg-gray-50">
-                  <td className="py-1.5 px-2 text-gray-600 font-mono">{fmtMs(s.signal_time)}</td>
-                  <td className="py-1.5 px-2 text-right font-mono text-gray-800">
-                    {s.btc_price.toFixed(0)} <span className="text-gray-400">/ {s.resistance.toFixed(0)}</span>
-                  </td>
-                  <td className="py-1.5 px-2 text-right font-mono text-red-500">{s.down_price_15m?.toFixed(3) ?? '--'}</td>
-                  <td className="py-1.5 px-2 text-right font-mono text-gray-500">{s.down_price_5m?.toFixed(3) ?? '--'}</td>
-                  <td className="py-1.5 px-2 text-right font-mono text-gray-600">{s.settle_btc_price?.toFixed(0) ?? '--'}</td>
-                  <td className="py-1.5 px-2 text-center">
-                    {s.settle_outcome_5m ? (
+              {signals.map(s => {
+                const entry15 = s.side === 'high' ? s.down_price_15m : s.up_price_15m
+                const entry5 = s.side === 'high' ? s.down_price_5m : s.up_price_5m
+                return (
+                  <tr key={s.id} className="border-b border-gray-100 hover:bg-gray-50">
+                    <td className="py-1.5 px-2 text-gray-600 font-mono">{fmtMs(s.signal_time)}</td>
+                    <td className="py-1.5 px-2 text-center">
+                      <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-indigo-50 text-indigo-700 border border-indigo-200 mr-1">{s.level}</span>
                       <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
-                        s.settle_outcome_5m === 'DOWN'
-                          ? 'bg-green-100 text-green-700'
-                          : s.settle_outcome_5m === 'UP'
-                            ? 'bg-red-100 text-red-700'
-                            : 'bg-gray-100 text-gray-500'
+                        s.side === 'high' ? 'bg-red-50 text-red-600' : 'bg-green-50 text-green-600'
+                      }`}>{s.side === 'high' ? '看跌' : '看涨'}</span>
+                    </td>
+                    <td className="py-1.5 px-2 text-right font-mono text-gray-800">
+                      {s.btc_price.toFixed(0)} <span className="text-gray-400">/ {s.resistance.toFixed(0)}</span>
+                    </td>
+                    <td className="py-1.5 px-2 text-right font-mono text-red-500">{entry15?.toFixed(3) ?? '--'}</td>
+                    <td className="py-1.5 px-2 text-right font-mono text-gray-500">{entry5?.toFixed(3) ?? '--'}</td>
+                    <td className="py-1.5 px-2 text-right font-mono text-gray-600">{s.settle_btc_price?.toFixed(0) ?? '--'}</td>
+                    <td className="py-1.5 px-2 text-center">
+                      {s.settle_outcome_5m ? (
+                        <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                          isWin(s, s.settle_outcome_5m) ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'
+                        }`}>{isWin(s, s.settle_outcome_5m) ? `✓ ${winBadge(s.settle_outcome_5m)}` : `✗ ${winBadge(s.settle_outcome_5m)}`}</span>
+                      ) : <span className="text-gray-300">待结算</span>}
+                    </td>
+                    <td className="py-1.5 px-2 text-center">
+                      {s.settle_outcome ? (
+                        <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                          isWin(s, s.settle_outcome) ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'
+                        }`}>{isWin(s, s.settle_outcome) ? `✓ ${winBadge(s.settle_outcome)} 赢` : `✗ ${winBadge(s.settle_outcome)}`}</span>
+                      ) : <span className="text-gray-300">待结算</span>}
+                    </td>
+                    <td className="py-1.5 px-2 text-center">
+                      <span className={`text-[10px] ${
+                        s.status === 'SETTLED' ? 'text-gray-400' : s.status === 'PENDING' ? 'text-orange-500' : 'text-gray-400'
                       }`}>
-                        {s.settle_outcome_5m === 'DOWN' ? '✓ DOWN' : s.settle_outcome_5m === 'UP' ? '✗ UP' : '— NOISE'}
+                        {s.status === 'SETTLED' ? '已结算' : s.status === 'PENDING' ? '跟踪中' : s.status}
                       </span>
-                    ) : <span className="text-gray-300">待结算</span>}
-                  </td>
-                  <td className="py-1.5 px-2 text-center">
-                    {s.settle_outcome ? (
-                      <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
-                        s.settle_outcome === 'DOWN'
-                          ? 'bg-green-100 text-green-700'
-                          : s.settle_outcome === 'UP'
-                            ? 'bg-red-100 text-red-700'
-                            : 'bg-gray-100 text-gray-500'
-                      }`}>
-                        {s.settle_outcome === 'DOWN' ? '✓ DOWN 赢' : s.settle_outcome === 'UP' ? '✗ UP' : '— NOISE'}
-                      </span>
-                    ) : <span className="text-gray-300">待结算</span>}
-                  </td>
-                  <td className="py-1.5 px-2 text-center">
-                    <span className={`text-[10px] ${
-                      s.status === 'SETTLED' ? 'text-gray-400' : s.status === 'PENDING' ? 'text-orange-500' : 'text-gray-400'
-                    }`}>
-                      {s.status === 'SETTLED' ? '已结算' : s.status === 'PENDING' ? '跟踪中' : s.status}
-                    </span>
-                    {s.email_sent && <span className="text-[10px] text-blue-400 ml-1" title="邮件已推送">📧</span>}
-                  </td>
-                </tr>
-              ))}
+                      {s.email_sent && <span className="text-[10px] text-blue-400 ml-1" title="邮件已推送">📧</span>}
+                    </td>
+                  </tr>
+                )
+              })}
             </tbody>
           </table>
         </div>

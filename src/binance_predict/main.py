@@ -709,6 +709,11 @@ async def lifespan(app: FastAPI):
                 # 假突破 5m 兑现口径（与 alembic 迁移 i9b0c1d2e3f4 等价，存量 dev 库安全网）
                 "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS settle_btc_price_5m FLOAT",
                 "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS settle_outcome_5m VARCHAR(10)",
+                # 假突破三级别双向（与 alembic 迁移 j0c1d2e3f4g5 等价，存量 dev 库安全网）
+                "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS level VARCHAR(8) NOT NULL DEFAULT 'daily'",
+                "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS side VARCHAR(4) NOT NULL DEFAULT 'high'",
+                "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS up_price_5m FLOAT",
+                "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS up_price_15m FLOAT",
             ]:
                 try:
                     await conn.execute(text(col_sql))
@@ -874,11 +879,15 @@ async def list_fake_breakout_signals(
         "signals": [
             {
                 "id": s.id,
+                "level": s.level,
+                "side": s.side,
                 "signal_time": s.signal_time,
                 "resistance": s.resistance,
                 "btc_price": s.btc_price,
                 "down_price_5m": s.down_price_5m,
                 "down_price_15m": s.down_price_15m,
+                "up_price_5m": s.up_price_5m,
+                "up_price_15m": s.up_price_15m,
                 "market_end_15m": s.market_end_15m,
                 "settle_btc_price": s.settle_btc_price,
                 "settle_outcome": s.settle_outcome,
@@ -896,22 +905,58 @@ async def list_fake_breakout_signals(
 
 @app.get("/api/fake-breakout/stats")
 async def get_fake_breakout_stats(db: AsyncSession = Depends(get_db)):
-    """假突破信号汇总统计：已结算信号的方向胜率（对照回测口径）。"""
+    """假突破信号汇总统计：按 级别×方向 分组的胜率（5m/15m 双口径）。
+
+    胜负语义：side=high 买 DOWN（BTC 跌赢）；side=low 买 UP（BTC 涨赢）。
+    """
     from sqlalchemy import func as sa_func, select as sa_select
 
     total = (await db.execute(
         sa_select(sa_func.count(FakeBreakoutSignal.id))
     )).scalar() or 0
-    settled = (await db.execute(
-        sa_select(sa_func.count(FakeBreakoutSignal.id)).where(
-            FakeBreakoutSignal.status == "SETTLED"
-        )
-    )).scalar() or 0
-    down_wins = (await db.execute(
-        sa_select(sa_func.count(FakeBreakoutSignal.id)).where(
-            FakeBreakoutSignal.settle_outcome == "DOWN"
-        )
-    )).scalar() or 0
+
+    # 分组统计：(level, side) × {15m口径, 5m口径}
+    rows = (await db.execute(
+        sa_select(
+            FakeBreakoutSignal.level,
+            FakeBreakoutSignal.side,
+            FakeBreakoutSignal.settle_outcome,
+            FakeBreakoutSignal.settle_outcome_5m,
+        ).where(FakeBreakoutSignal.status == "SETTLED")
+    )).all()
+
+    groups: dict[str, dict] = {}
+    for level, side, oc15, oc5 in rows:
+        key = f"{level}|{side}"
+        g = groups.setdefault(key, {
+            "level": level, "side": side,
+            "settled_15m": 0, "wins_15m": 0,
+            "settled_5m": 0, "wins_5m": 0,
+        })
+        win_dir = "DOWN" if side == "high" else "UP"
+        if oc15 is not None:
+            g["settled_15m"] += 1
+            if oc15 == win_dir:
+                g["wins_15m"] += 1
+        if oc5 is not None:
+            g["settled_5m"] += 1
+            if oc5 == win_dir:
+                g["wins_5m"] += 1
+
+    by_group = []
+    for g in groups.values():
+        by_group.append({
+            **g,
+            "win_rate_15m": (g["wins_15m"] / g["settled_15m"]) if g["settled_15m"] else None,
+            "win_rate_5m": (g["wins_5m"] / g["settled_5m"]) if g["settled_5m"] else None,
+        })
+    by_group.sort(key=lambda x: (x["level"], x["side"]))
+
+    # 全量汇总（兼容前端旧字段）
+    settled = sum(g["settled_15m"] for g in groups.values())
+    wins = sum(g["wins_15m"] for g in groups.values())
+    settled_5m = sum(g["settled_5m"] for g in groups.values())
+    wins_5m = sum(g["wins_5m"] for g in groups.values())
     avg_15m = (await db.execute(
         sa_select(sa_func.avg(FakeBreakoutSignal.down_price_15m)).where(
             FakeBreakoutSignal.down_price_15m.isnot(None)
@@ -922,25 +967,15 @@ async def get_fake_breakout_stats(db: AsyncSession = Depends(get_db)):
             FakeBreakoutSignal.down_price_5m.isnot(None)
         )
     )).scalar()
-    # 5m 兑现口径胜率（与 15m 口径并行验证）
-    settled_5m = (await db.execute(
-        sa_select(sa_func.count(FakeBreakoutSignal.id)).where(
-            FakeBreakoutSignal.settle_outcome_5m.isnot(None)
-        )
-    )).scalar() or 0
-    down_wins_5m = (await db.execute(
-        sa_select(sa_func.count(FakeBreakoutSignal.id)).where(
-            FakeBreakoutSignal.settle_outcome_5m == "DOWN"
-        )
-    )).scalar() or 0
     return {
         "total_signals": total,
         "settled": settled,
-        "down_win_rate": (down_wins / settled) if settled else None,
+        "down_win_rate": (wins / settled) if settled else None,
         "avg_down_price_15m": float(avg_15m) if avg_15m is not None else None,
         "avg_down_price_5m": float(avg_5m) if avg_5m is not None else None,
         "settled_5m": settled_5m,
-        "down_win_rate_5m": (down_wins_5m / settled_5m) if settled_5m else None,
+        "down_win_rate_5m": (wins_5m / settled_5m) if settled_5m else None,
+        "by_group": by_group,
     }
 
 

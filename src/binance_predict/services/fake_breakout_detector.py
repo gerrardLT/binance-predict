@@ -42,6 +42,14 @@ HOLD_5M_MS = 300_000
 # 停机积压判定：到期后超过此宽限仍未结算的信号置 EXPIRED（现价已不能代表结算时刻）
 SETTLE_EXPIRE_GRACE_MS = 300_000
 
+# 级别定义（与回测 scripts/local_combo_level_matrix_check.py 对齐）：
+# 级别名 → 回看窗口数（5m 窗口 closes 极值）
+LEVEL_LOOKBACKS: dict[str, int] = {
+    "1h": 12,
+    "4h": 48,
+    "daily": 288,
+}
+
 
 class FakeBreakoutDetector:
     """
@@ -65,12 +73,12 @@ class FakeBreakoutDetector:
         self._running = False
         self._task: asyncio.Task | None = None
 
-        # 日线阻力缓存
-        self._resistance: float | None = None
-        self._resistance_refreshed_at: float = 0.0
+        # 三级别位势缓存：level → {"resistance": float, "support": float}
+        self._levels: dict[str, dict[str, float]] = {}
+        self._levels_refreshed_at: float = 0.0
 
-        # 风控状态
-        self._last_signal_at_ms: int = 0
+        # 风控状态：按 (side, level) 独立冷却（一波冲高/冲低每级别只报一次）
+        self._last_signal_at: dict[tuple[str, str], int] = {}
         self._daily_count: int = 0
         self._daily_date: str = ""  # UTC 日期串，跨天重置
 
@@ -82,13 +90,13 @@ class FakeBreakoutDetector:
         if self._running:
             return
         self._running = True
-        await self._refresh_resistance(force=True)
+        await self._refresh_levels(force=True)
         self._task = asyncio.create_task(self._loop(), name="fake_breakout_detector")
         logger.info(
-            "假突破检测器启动 | eps={} | 检测间隔={}s | 阻力回看={}窗 | 冷却={}s",
+            "假突破检测器启动 | 级别={} | eps={} | 检测间隔={}s | 冷却={}s",
+            "/".join(LEVEL_LOOKBACKS.keys()),
             settings.fake_breakout_eps,
             settings.fake_breakout_check_interval,
-            settings.fake_breakout_resistance_lookback,
             settings.fake_breakout_cooldown_seconds,
         )
 
@@ -104,44 +112,55 @@ class FakeBreakoutDetector:
         logger.info("假突破检测器已停止")
 
     # ==================================================================
-    # 日线阻力计算（前 288 个 5m 窗口 closes 的 max，定期刷新）
+    # 三级别位势计算（1h/4h/日线 closes 极值，定期刷新）
     # ==================================================================
 
-    async def _refresh_resistance(self, force: bool = False) -> None:
+    async def _refresh_levels(self, force: bool = False) -> None:
         now = time.monotonic()
-        if not force and (now - self._resistance_refreshed_at) < settings.fake_breakout_resistance_refresh_seconds:
+        if not force and (now - self._levels_refreshed_at) < settings.fake_breakout_resistance_refresh_seconds:
             return
-        self._resistance_refreshed_at = now
+        self._levels_refreshed_at = now
 
-        lookback = settings.fake_breakout_resistance_lookback
+        max_lookback = max(LEVEL_LOOKBACKS.values())  # 288
         try:
             async with async_session_factory() as session:
                 stmt = (
                     select(SentimentWindow.exit_price)
                     .where(SentimentWindow.exit_price.isnot(None))
                     .order_by(desc(SentimentWindow.end_time))
-                    .limit(lookback)
+                    .limit(max_lookback)
                 )
                 rows = (await session.execute(stmt)).scalars().all()
         except Exception as exc:
-            logger.warning("假突破检测器：阻力位刷新失败 | {}", exc)
+            logger.warning("假突破检测器：位势刷新失败 | {}", exc)
             return
 
-        if len(rows) < lookback // 2:
-            # 数据太少（冷启动初期）不更新，避免阻力位失真误触发
-            logger.debug(
-                "假突破检测器：历史窗口不足（{}/{}），阻力位暂不更新",
-                len(rows), lookback,
-            )
+        # closes 按时间倒序返回，反转为升序后切片算各级别
+        closes = [float(r) for r in reversed(rows)]
+        if len(closes) < LEVEL_LOOKBACKS["1h"]:
+            logger.debug("假突破检测器：历史窗口不足（{}），位势暂不更新", len(closes))
             return
 
-        new_resistance = max(float(r) for r in rows)
-        if new_resistance != self._resistance:
+        new_levels: dict[str, dict[str, float]] = {}
+        for level, lookback in LEVEL_LOOKBACKS.items():
+            window = closes[-lookback:] if len(closes) >= lookback else closes
+            # 冷启动保护：大级别数据不足一半时跳过该级别（防失真误触发）
+            if len(window) < lookback // 2:
+                continue
+            new_levels[level] = {
+                "resistance": max(window),
+                "support": min(window),
+            }
+
+        if new_levels != self._levels:
             logger.info(
-                "假突破检测器：日线阻力更新 {} → {}（基于 {} 个窗口 closes）",
-                self._resistance, new_resistance, len(rows),
+                "假突破检测器：位势更新 | {}",
+                " | ".join(
+                    f"{lv} 阻力 {v['resistance']:.0f} 支撑 {v['support']:.0f}"
+                    for lv, v in new_levels.items()
+                ),
             )
-            self._resistance = new_resistance
+            self._levels = new_levels
 
     # ==================================================================
     # 主循环：秒级检测 + 顺带处理到期结算
@@ -151,12 +170,12 @@ class FakeBreakoutDetector:
         logger.debug("假突破检测器：循环开始")
         while self._running:
             try:
-                await self._refresh_resistance()
+                await self._refresh_levels()
 
                 mid = self._collector.store.mid_price
                 now_ms = int(time.time() * 1000)
 
-                if mid > 0 and self._resistance is not None:
+                if mid > 0 and self._levels:
                     await self._check_breakout(now_ms, mid)
 
                 await self._settle_due_signals(now_ms)
@@ -187,13 +206,25 @@ class FakeBreakoutDetector:
             self._daily_count = 0
 
     async def _check_breakout(self, now_ms: int, mid: float) -> None:
-        assert self._resistance is not None
+        """遍历 三级别 × 双向 检查破位，每个 (side, level) 独立冷却。"""
         eps = settings.fake_breakout_eps
-        if mid <= self._resistance * (1.0 + eps):
-            return
+        for level, lv in self._levels.items():
+            # 冲过阻力 → 卖跌信号（买 DOWN）
+            if mid > lv["resistance"] * (1.0 + eps):
+                await self._fire_signal(now_ms, mid, level, "high", lv["resistance"])
+            # 跌破支撑 → 买涨信号（买 UP）
+            if mid < lv["support"] * (1.0 - eps):
+                await self._fire_signal(now_ms, mid, level, "low", lv["support"])
 
-        # 风控 1：冷却（一波冲高只报一次）
-        if now_ms - self._last_signal_at_ms < settings.fake_breakout_cooldown_seconds * 1000:
+    async def _fire_signal(
+        self, now_ms: int, mid: float, level: str, side: str, broken_level: float
+    ) -> None:
+        """单个 (level, side) 破位信号的冷却检查、落表与推送。"""
+        eps = settings.fake_breakout_eps
+        key = (side, level)
+
+        # 风控 1：冷却（同一级别同一方向，一波冲高/冲低只报一次）
+        if now_ms - self._last_signal_at.get(key, 0) < settings.fake_breakout_cooldown_seconds * 1000:
             return
 
         self._daily_rollover(now_ms)
@@ -201,10 +232,11 @@ class FakeBreakoutDetector:
         over_daily_limit = self._daily_count >= settings.fake_breakout_max_daily_signals
 
         down_5m = self._pm_5m.get("down_price")
+        up_5m = self._pm_5m.get("up_price")
         down_15m = self._pm_15m.get("down_price")
+        up_15m = self._pm_15m.get("up_price")
         end_15m = self._pm_15m.get("end_date")
         # 结算死线对齐所报价 15m 市场的真实到期时刻（CodeReview Minor-3a）：
-        # 信号若在该市场后段触发，按 signal+15min 回读不代表所记录 DOWN 报价的实际盈亏。
         # market_end_15m 缺失或已过期时退回 signal+15min 口径。
         buffer_ms = settings.fake_breakout_settle_buffer_seconds * 1000
         if end_15m and int(end_15m) > now_ms:
@@ -213,12 +245,16 @@ class FakeBreakoutDetector:
             settle_deadline = now_ms + HOLD_MS + buffer_ms
 
         signal = FakeBreakoutSignal(
+            level=level,
+            side=side,
             signal_time=now_ms,
-            resistance=self._resistance,
+            resistance=broken_level,
             btc_price=mid,
             eps=eps,
             down_price_5m=down_5m,
             down_price_15m=down_15m,
+            up_price_5m=up_5m,
+            up_price_15m=up_15m,
             market_end_15m=end_15m,
             settle_deadline=settle_deadline,
             status="PENDING",
@@ -233,14 +269,16 @@ class FakeBreakoutDetector:
             logger.error("假突破信号落表失败 | {}", exc)
             return
 
-        self._last_signal_at_ms = now_ms
+        self._last_signal_at[key] = now_ms
         self._daily_count += 1
 
+        direction = "DOWN" if side == "high" else "UP"
+        entry_15m = down_15m if side == "high" else up_15m
         logger.info(
-            "假突破信号触发 #{} | BTC {:.0f} > 阻力 {:.0f}×(1+{:.4f}) | "
-            "5m DOWN={} 15m DOWN={} | 15m到期={} | 日内第 {} 条{}",
-            signal.id, mid, self._resistance, eps,
-            down_5m, down_15m, end_15m,
+            "假突破信号触发 #{} [{} {}] | BTC {:.0f} 破 {} {:.0f} | "
+            "目标 {} | 15m {}价={} | 日内第 {} 条{}",
+            signal.id, level, side, mid, "阻力" if side == "high" else "支撑",
+            broken_level, direction, direction, entry_15m,
             self._daily_count,
             "（超日限，不发邮件）" if over_daily_limit else "",
         )
@@ -269,20 +307,28 @@ class FakeBreakoutDetector:
             if signal.market_end_15m
             else "未知"
         )
+        is_high = signal.side == "high"
+        direction = "DOWN" if is_high else "UP"
+        level_name = "阻力" if is_high else "支撑"
+        entry_15m = signal.down_price_15m if is_high else signal.up_price_15m
+        entry_5m = signal.down_price_5m if is_high else signal.up_price_5m
+        backtest_wr = {"1h": "65.1%", "4h": "73.5%", "daily": "80.0%"}.get(signal.level, "—")
         subject = (
-            f"[假突破信号] BTC {signal.btc_price:.0f} 冲过日线阻力 {signal.resistance:.0f}"
+            f"[假突破信号·{signal.level}] BTC {signal.btc_price:.0f} "
+            f"破{level_name} {signal.resistance:.0f} → 看{direction}"
         )
         body = (
             f"信号时间：{t_str}\n"
-            f"日线阻力：{signal.resistance:.2f}\n"
-            f"破位价格：{signal.btc_price:.2f}（+{(signal.btc_price / signal.resistance - 1) * 100:.3f}%）\n"
+            f"级别：{signal.level}（{'冲过阻力' if is_high else '跌破支撑'}，方向 {direction}）\n"
+            f"{level_name}位：{signal.resistance:.2f}\n"
+            f"破位价格：{signal.btc_price:.2f}（{'+' if is_high else ''}{(signal.btc_price / signal.resistance - 1) * 100:.3f}%）\n"
             f"触发阈值：{signal.eps:.4f}\n\n"
-            f"当时报价：\n"
-            f"  5m  DOWN token：{signal.down_price_5m}\n"
-            f"  15m DOWN token：{signal.down_price_15m}\n"
+            f"当时报价（{direction} token）：\n"
+            f"  5m：{entry_5m}\n"
+            f"  15m：{entry_15m}\n"
             f"  15m 市场到期：{end_str}\n\n"
-            f"玩法提示（回测口径）：冲高瞬间买 15m DOWN，持有到期按方向结算。\n"
-            f"历史回测：BTC 方向胜率 80.0%（80 注，对照基线 65.4%）。\n"
+            f"玩法提示（回测口径）：破位瞬间买 15m {direction}，持有到期按方向结算。\n"
+            f"历史回测（{signal.level} 级 {direction} 方向）：胜率 {backtest_wr}。\n"
             f"当前阶段：系统不下注，仅记录信号并到期回读结算方向。\n"
         )
         return await send_plain_email(subject, body)
@@ -424,7 +470,7 @@ class FakeBreakoutDetector:
     def status_snapshot(self) -> dict:
         return {
             "running": self._running,
-            "resistance": self._resistance,
+            "levels": self._levels,
             "daily_count": self._daily_count,
             "daily_date": self._daily_date,
             "eps": settings.fake_breakout_eps,

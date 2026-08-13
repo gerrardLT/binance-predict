@@ -275,14 +275,14 @@ class Settings(BaseSettings):
     fake_breakout_eps: float = 0.0005
     # 检测循环间隔（秒）：读 collector.store.mid_price（bookTicker 实时价）
     fake_breakout_check_interval: float = 1.0
-    # 日线阻力回看窗口数：前 N 个 5m 窗口 closes 的 max（288 = 24h）
+    # [已废弃] 级别回看窗口数已内置于 detector.LEVEL_LOOKBACKS（1h=12/4h=48/daily=288）
     fake_breakout_resistance_lookback: int = 288
     # 阻力位刷新间隔（秒）：从 sentiment_windows 重算
     fake_breakout_resistance_refresh_seconds: float = 60.0
-    # 风控：同一阻力位信号冷却（秒）——一波冲高只报一次
+    # 风控：同一 (方向,级别) 信号冷却（秒）——一波冲高/冲低每级别每方向只报一次
     fake_breakout_cooldown_seconds: int = 900
-    # 风控：日内信号上限（防邮件轰炸；不下注阶段的主要风控手段）
-    fake_breakout_max_daily_signals: int = 50
+    # 风控：日内信号上限（防邮件轰炸；三级别双向理论约 50/天，100 留足余量）
+    fake_breakout_max_daily_signals: int = 100
     # 结算回读死线缓冲（秒）：signal_time + 15min + 本缓冲后回读 BTC 价回填方向
     fake_breakout_settle_buffer_seconds: int = 90
     # 信号邮件推送开关（复用 agent_alert_* SMTP 配置）

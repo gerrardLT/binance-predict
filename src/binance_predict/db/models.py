@@ -588,9 +588,18 @@ class FakeBreakoutSignal(Base):
     __table_args__ = (
         Index("ix_fbs_signal_time", "signal_time"),
         Index("ix_fbs_status", "status"),
+        Index("ix_fbs_level_side", "level", "side"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    level: Mapped[str] = mapped_column(
+        String(8), nullable=False, default="daily", server_default="daily",
+        comment="破位级别：1h | 4h | daily（对应前 12/48/288 个 5m 窗口 closes 极值）"
+    )
+    side: Mapped[str] = mapped_column(
+        String(4), nullable=False, default="high", server_default="high",
+        comment="破位方向：high（冲过阻力→卖跌）| low（跌破支撑→买涨）"
+    )
     signal_time: Mapped[int] = mapped_column(
         BigInteger, nullable=False, comment="破位检测时刻（ms，秒级检测循环触发）"
     )
@@ -608,6 +617,12 @@ class FakeBreakoutSignal(Base):
     )
     down_price_15m: Mapped[float | None] = mapped_column(
         Float, nullable=True, comment="信号时刻 15m 市场 DOWN token 最近采样报价"
+    )
+    up_price_5m: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="信号时刻 5m 市场 UP token 最近采样报价（支撑方向目标 token）"
+    )
+    up_price_15m: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="信号时刻 15m 市场 UP token 最近采样报价"
     )
     market_end_15m: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True, comment="当时 15m 市场 end_date（ms，即到期结算时刻）"
