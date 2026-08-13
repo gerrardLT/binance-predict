@@ -16,7 +16,11 @@ htmlcov/
 
 # 本地数据导出（离线分析用，非代码）
 sentiment_windows.json
+sentiment_windows.bak.json
 windows_with_price.json
+prediction_market_samples.json
+prediction_market_samples.bak.json
+*.dump
 
 # 虚拟环境
 .venv

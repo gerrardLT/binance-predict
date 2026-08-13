@@ -149,6 +149,33 @@ def _send_email_sync(subject: str, body: str, recipients: list[str]) -> None:
         server.sendmail(sender, recipients, msg.as_string())
 
 
+async def send_plain_email(subject: str, body: str) -> bool:
+    """通用纯文本邮件推送（复用 agent_alert_* SMTP 配置）。
+
+    供假突破信号等非健康报告场景复用同一 SMTP 通道。
+    仅在 agent_alert_email_enabled=True、SMTP host 与收件人均已配置时发送；
+    阻塞 smtplib 调用放入线程池，发送失败仅告警、不抛出。
+
+    Returns:
+        True=已发送（或成功入线程池），False=未配置/未启用/发送失败
+    """
+    if not settings.agent_alert_email_enabled:
+        return False
+    recipients = [x.strip() for x in settings.agent_alert_email_to.split(",") if x.strip()]
+    if not settings.agent_alert_smtp_host or not recipients:
+        return False
+    try:
+        await asyncio.to_thread(_send_email_sync, subject, body, recipients)
+        logger.info("[EMAIL] 邮件已发送 | subject={} | 收件人={}", subject, len(recipients))
+        return True
+    except Exception as exc:
+        logger.warning(
+            "[EMAIL] 邮件发送失败 | subject={} | error_type={} | error={}",
+            subject, type(exc).__name__, str(exc),
+        )
+        return False
+
+
 async def send_email_alert(report: HealthReport, alerts: list[HealthAlert]) -> None:
     """将健康报告的告警以邮件推送（主渠道）。
 

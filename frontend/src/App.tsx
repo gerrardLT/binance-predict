@@ -202,6 +202,90 @@ interface HealthReport {
   summary: string
 }
 
+// 假突破信号：与后端 /api/fake-breakout/* 输出对齐
+interface FakeBreakoutSignal {
+  id: number
+  signal_time: number
+  resistance: number
+  btc_price: number
+  down_price_5m: number | null
+  down_price_15m: number | null
+  market_end_15m: number | null
+  settle_btc_price: number | null
+  settle_outcome: 'UP' | 'DOWN' | 'NOISE' | null
+  status: 'PENDING' | 'SETTLED' | 'EXPIRED'
+  email_sent: boolean
+  created_at: string | null
+}
+interface FakeBreakoutStatus {
+  running: boolean
+  enabled: boolean
+  resistance: number | null
+  daily_count: number
+  eps: number
+  btc_mid: number
+  pm_15m: { down_price: number | null; up_price: number | null; end_date: number | null; updated_ts: number | null }
+  pm_5m_down_price: number | null
+}
+interface FakeBreakoutStats {
+  total_signals: number
+  settled: number
+  down_win_rate: number | null
+  avg_down_price_15m: number | null
+  avg_down_price_5m: number | null
+}
+
+// 模式池分级与回测快照：与后端 /api/agent/patterns/compare + /backtest-runs 对齐
+interface PatternBacktestRun {
+  id: number
+  pattern_id: number
+  data_start: number
+  data_end: number
+  sample_count: number
+  correct_count: number
+  win_rate: number
+  wilson_lower: number | null
+  wilson_upper: number | null
+  ev_after_fee: number | null
+  segment_stats: Record<string, { n: number; k: number; win_rate: number }> | null
+  delta_vs_prev: {
+    tier_change?: { from: string; to: string } | null
+    decay_warning?: boolean
+    latest_seg_win_rate?: number | null
+    latest_seg_n?: number
+    prev_run_id?: number
+    prev_win_rate?: number
+    win_rate_drift?: number
+    new_samples?: number
+    new_samples_win_rate?: number | null
+    suggestions?: string[]
+    note?: string
+  } | null
+  trigger_reason: string
+  created_at: string | null
+}
+interface PatternCompareItem {
+  pattern_id: number
+  pattern_name: string
+  status: string
+  tier: 'S' | 'A' | 'B' | 'C'
+  predicted_direction: string
+  discovery_method: string
+  live_win_rate: number
+  live_sample_count: number
+  latest_run: {
+    id: number
+    data_end: number
+    sample_count: number
+    win_rate: number
+    wilson_lower: number | null
+    wilson_upper: number | null
+    ev_after_fee: number | null
+    delta_vs_prev: PatternBacktestRun['delta_vs_prev']
+    created_at: string | null
+  } | null
+}
+
 // 方案对比：与后端 /deep-learn/compare 的每方法摘要对齐
 interface CompareSummary {
   method: string | null
@@ -278,6 +362,15 @@ const api = {
   getAgentHealth: () => fetch('/api/agent/health').then(r => r.json()),
   getAgentEvolution: (days = 30) =>
     fetch(`/api/sentiment/agent/evolution?days=${days}`).then(r => r.json()),
+  getFakeBreakoutStatus: () => fetch('/api/fake-breakout/status').then(r => r.json()),
+  getFakeBreakoutSignals: (limit = 50) =>
+    fetch(`/api/fake-breakout/signals?limit=${limit}`).then(r => r.json()),
+  getFakeBreakoutStats: () => fetch('/api/fake-breakout/stats').then(r => r.json()),
+  getPatternCompare: () => fetch('/api/agent/patterns/compare').then(r => r.json()),
+  getPatternBacktestRuns: (patternId: number, limit = 30) =>
+    fetch(`/api/agent/patterns/backtest-runs?pattern_id=${patternId}&limit=${limit}`).then(r => r.json()),
+  triggerReevaluate: () =>
+    fetch('/api/agent/patterns/reevaluate', { method: 'POST' }).then(r => r.json()),
   commitDeepLearn: (discoveries: DeepLearnDiscovery[], snapshotToken?: string | null) =>
     fetch('/api/sentiment/agent/deep-learn/commit', {
       method: 'POST',
@@ -508,6 +601,8 @@ export default function App() {
               )}
             </Card>
 
+            <FakeBreakoutPanel />
+
             <Card title="概率动量分析（纯算法 · 独立备选方案）">
               <div className="text-xs text-gray-400 mb-3">
                 基于预测市场 UP% 时序的多维度动量信号，纯算法不依赖 LLM/K线。手动触发，不参与自动决策。
@@ -686,6 +781,11 @@ function AgentTab() {
         >
           📈 进化看板
         </button>
+      </div>
+
+      {/* (a2) 模式池对比面板（横向 + 纵向回测对比） */}
+      <div className="shrink-0 max-h-[45vh] overflow-auto">
+        <PatternPoolPanel />
       </div>
 
       {/* (b) 模式库 + 预测历史：左右并列 */}
@@ -1901,5 +2001,325 @@ function CompareModal({ onClose, onCommitted }: { onClose: () => void; onCommitt
         </div>
       </div>
     </div>
+  )
+}
+
+// ============================================================
+// 假突破信号面板（market tab）：日线阻力破位检测，暂不下注
+// ============================================================
+
+function fmtMs(ms: number | null): string {
+  if (!ms) return '--'
+  return new Date(ms).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })
+}
+
+function FakeBreakoutPanel() {
+  const [status, setStatus] = useState<FakeBreakoutStatus | null>(null)
+  const [signals, setSignals] = useState<FakeBreakoutSignal[]>([])
+  const [stats, setStats] = useState<FakeBreakoutStats | null>(null)
+
+  const refresh = useCallback(() => {
+    api.getFakeBreakoutStatus().then(setStatus).catch(() => {})
+    api.getFakeBreakoutSignals(50).then(d => setSignals(d.signals || [])).catch(() => {})
+    api.getFakeBreakoutStats().then(setStats).catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    refresh()
+    const timer = setInterval(refresh, 15000)
+    return () => clearInterval(timer)
+  }, [refresh])
+
+  const dist = status?.resistance && status.btc_mid > 0
+    ? (status.btc_mid / status.resistance - 1) * 100
+    : null
+
+  return (
+    <Card title="假突破信号（日线阻力破位 · 暂不下注）">
+      <div className="text-xs text-gray-400 mb-3">
+        秒级检测 BTC 盘中冲过日线阻力（前 288 个 5m 窗口 closes 最大值）。
+        回测：冲高瞬间买 15m DOWN 持有到期，方向胜率 80%（80 注，基线 65.4%）。当前只记录信号 + 邮件提醒。
+      </div>
+
+      {/* 状态行 */}
+      <div className="flex flex-wrap items-center gap-x-5 gap-y-2 mb-3 text-xs">
+        <span className="flex items-center gap-1.5">
+          <StatusDot ok={!!status?.running} />
+          <span className="text-gray-500">检测器</span>
+          <span className={`font-bold ${status?.running ? 'text-green-600' : 'text-red-500'}`}>
+            {status?.running ? '运行中' : '未运行'}
+          </span>
+        </span>
+        <span className="text-gray-500">
+          日线阻力 <strong className="text-gray-800 font-mono">{status?.resistance ? status.resistance.toFixed(0) : '--'}</strong>
+        </span>
+        <span className="text-gray-500">
+          当前价 <strong className="text-gray-800 font-mono">{status?.btc_mid ? status.btc_mid.toFixed(0) : '--'}</strong>
+        </span>
+        <span className={dist !== null && dist > 0 ? 'text-red-600 font-bold' : 'text-gray-500'}>
+          距阻力 {dist !== null ? `${dist >= 0 ? '+' : ''}${dist.toFixed(3)}%` : '--'}
+          {dist !== null && dist > 0 && ' ⚠️ 已破位'}
+        </span>
+        <span className="text-gray-500">今日信号 <strong className="font-mono text-gray-800">{status?.daily_count ?? 0}</strong> 条</span>
+        <span className="text-gray-500">
+          15m DOWN 现价 <strong className="font-mono text-red-500">{status?.pm_15m?.down_price?.toFixed(3) ?? '--'}</strong>
+        </span>
+      </div>
+
+      {/* 汇总统计 */}
+      {stats && stats.total_signals > 0 && (
+        <div className="flex flex-wrap gap-x-5 gap-y-1 mb-3 px-3 py-2 bg-amber-50 border border-amber-200 rounded-lg text-xs">
+          <span className="text-gray-600">累计信号 <strong>{stats.total_signals}</strong></span>
+          <span className="text-gray-600">已结算 <strong>{stats.settled}</strong></span>
+          <span className="text-gray-600">
+            DOWN 胜率 <strong className={stats.down_win_rate !== null && stats.down_win_rate >= 0.654 ? 'text-green-600' : 'text-gray-800'}>
+              {stats.down_win_rate !== null ? `${(stats.down_win_rate * 100).toFixed(1)}%` : '--'}
+            </strong>
+            <span className="text-gray-400">（回测基线 65.4% / 信号口径 80%）</span>
+          </span>
+          <span className="text-gray-600">平均 15m DOWN 入场价 <strong className="font-mono">{stats.avg_down_price_15m?.toFixed(3) ?? '--'}</strong></span>
+        </div>
+      )}
+
+      {/* 信号列表 */}
+      {signals.length === 0 ? (
+        <div className="text-center text-gray-400 py-6 text-sm">暂无信号——BTC 盘中冲过日线阻力时自动记录并邮件提醒</div>
+      ) : (
+        <div className="overflow-x-auto max-h-80 overflow-y-auto">
+          <table className="w-full text-xs">
+            <thead className="sticky top-0 bg-white">
+              <tr className="border-b border-gray-200 text-gray-500">
+                <th className="py-1.5 px-2 text-left">信号时间</th>
+                <th className="py-1.5 px-2 text-right">破位价 / 阻力</th>
+                <th className="py-1.5 px-2 text-right">15m DOWN 价</th>
+                <th className="py-1.5 px-2 text-right">5m DOWN 价</th>
+                <th className="py-1.5 px-2 text-right">结算价</th>
+                <th className="py-1.5 px-2 text-center">15m 后方向</th>
+                <th className="py-1.5 px-2 text-center">状态</th>
+              </tr>
+            </thead>
+            <tbody>
+              {signals.map(s => (
+                <tr key={s.id} className="border-b border-gray-100 hover:bg-gray-50">
+                  <td className="py-1.5 px-2 text-gray-600 font-mono">{fmtMs(s.signal_time)}</td>
+                  <td className="py-1.5 px-2 text-right font-mono text-gray-800">
+                    {s.btc_price.toFixed(0)} <span className="text-gray-400">/ {s.resistance.toFixed(0)}</span>
+                  </td>
+                  <td className="py-1.5 px-2 text-right font-mono text-red-500">{s.down_price_15m?.toFixed(3) ?? '--'}</td>
+                  <td className="py-1.5 px-2 text-right font-mono text-gray-500">{s.down_price_5m?.toFixed(3) ?? '--'}</td>
+                  <td className="py-1.5 px-2 text-right font-mono text-gray-600">{s.settle_btc_price?.toFixed(0) ?? '--'}</td>
+                  <td className="py-1.5 px-2 text-center">
+                    {s.settle_outcome ? (
+                      <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                        s.settle_outcome === 'DOWN'
+                          ? 'bg-green-100 text-green-700'
+                          : s.settle_outcome === 'UP'
+                            ? 'bg-red-100 text-red-700'
+                            : 'bg-gray-100 text-gray-500'
+                      }`}>
+                        {s.settle_outcome === 'DOWN' ? '✓ DOWN 赢' : s.settle_outcome === 'UP' ? '✗ UP' : '— NOISE'}
+                      </span>
+                    ) : <span className="text-gray-300">待结算</span>}
+                  </td>
+                  <td className="py-1.5 px-2 text-center">
+                    <span className={`text-[10px] ${
+                      s.status === 'SETTLED' ? 'text-gray-400' : s.status === 'PENDING' ? 'text-orange-500' : 'text-gray-400'
+                    }`}>
+                      {s.status === 'SETTLED' ? '已结算' : s.status === 'PENDING' ? '跟踪中' : s.status}
+                    </span>
+                    {s.email_sent && <span className="text-[10px] text-blue-400 ml-1" title="邮件已推送">📧</span>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </Card>
+  )
+}
+
+// ============================================================
+// 模式池对比面板（agent tab）：横向模式对比 + 纵向回测历史
+// ============================================================
+
+function TierBadge({ tier }: { tier: string }) {
+  const meta: Record<string, string> = {
+    S: 'bg-yellow-100 text-yellow-800 border-yellow-400',
+    A: 'bg-purple-100 text-purple-800 border-purple-300',
+    B: 'bg-blue-100 text-blue-800 border-blue-300',
+    C: 'bg-gray-100 text-gray-600 border-gray-300',
+  }
+  return (
+    <span className={`inline-block w-6 text-center px-1 py-0.5 rounded border text-[11px] font-black ${meta[tier] || meta.C}`}>
+      {tier}
+    </span>
+  )
+}
+
+function PatternPoolPanel() {
+  const [items, setItems] = useState<PatternCompareItem[]>([])
+  const [loading, setLoading] = useState(false)
+  const [reevalMsg, setReevalMsg] = useState('')
+  const [expanded, setExpanded] = useState<number | null>(null)
+  const [runs, setRuns] = useState<PatternBacktestRun[]>([])
+
+  const refresh = useCallback(() => {
+    api.getPatternCompare().then(d => setItems(d.patterns || [])).catch(() => {})
+  }, [])
+
+  useEffect(() => { refresh() }, [refresh])
+
+  const handleReevaluate = async () => {
+    setLoading(true)
+    setReevalMsg('')
+    try {
+      const res = await api.triggerReevaluate()
+      const s = res.summary || {}
+      setReevalMsg(`✅ 重回测完成：${s.patterns ?? 0} 模式 / ${s.windows ?? 0} 窗口 / 定级变更 ${(s.tier_changes || []).length} 起`)
+      refresh()
+    } catch (e) {
+      setReevalMsg(`❌ 失败: ${(e as Error).message}`)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const toggleRuns = async (pid: number) => {
+    if (expanded === pid) {
+      setExpanded(null)
+      setRuns([])
+      return
+    }
+    setExpanded(pid)
+    try {
+      const d = await api.getPatternBacktestRuns(pid)
+      setRuns(d.runs || [])
+    } catch {
+      setRuns([])
+    }
+  }
+
+  const pct = (v: number | null | undefined) => v === null || v === undefined ? '--' : `${(v * 100).toFixed(1)}%`
+
+  return (
+    <Card title="模式池对比（S/A/B/C 分级 · 定期重回测 · 只发现不下注）">
+      <div className="flex justify-between items-center mb-2">
+        <div className="text-[11px] text-gray-400">
+          新数据累积到阈值后自动全量重回测；点击行展开该模式的回测历史（纵向对比）
+        </div>
+        <div className="flex items-center gap-2">
+          {reevalMsg && <span className="text-[11px] text-gray-500">{reevalMsg}</span>}
+          <button
+            onClick={handleReevaluate}
+            disabled={loading}
+            className="px-2.5 py-1 text-[11px] font-semibold text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 disabled:opacity-50 transition"
+            title="立即对全部谓词模式执行一轮全量历史回测"
+          >
+            {loading ? '回测中...' : '🔄 立即重回测'}
+          </button>
+        </div>
+      </div>
+
+      {items.length === 0 ? (
+        <div className="text-center text-gray-400 py-6 text-sm">暂无极式（深度学习发现后自动入库并参与重回测）</div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="border-b border-gray-200 text-gray-500">
+                <th className="py-1.5 px-2 text-center">池</th>
+                <th className="py-1.5 px-2 text-left">模式</th>
+                <th className="py-1.5 px-2 text-center">方向</th>
+                <th className="py-1.5 px-2 text-right">最新回测胜率</th>
+                <th className="py-1.5 px-2 text-right">Wilson 下界</th>
+                <th className="py-1.5 px-2 text-right">费后 EV</th>
+                <th className="py-1.5 px-2 text-right">样本</th>
+                <th className="py-1.5 px-2 text-left">最近变化</th>
+              </tr>
+            </thead>
+            <tbody>
+              {items.map(p => (
+                <Fragment key={p.pattern_id}>
+                  <tr
+                    className="border-b border-gray-100 hover:bg-gray-50 cursor-pointer"
+                    onClick={() => toggleRuns(p.pattern_id)}
+                  >
+                    <td className="py-1.5 px-2 text-center"><TierBadge tier={p.tier} /></td>
+                    <td className="py-1.5 px-2 font-medium text-gray-700">
+                      {p.pattern_name}
+                      <span className="ml-1 text-[10px] text-gray-400">{p.status}</span>
+                    </td>
+                    <td className="py-1.5 px-2 text-center"><DirectionBadge direction={p.predicted_direction} /></td>
+                    <td className="py-1.5 px-2 text-right font-mono font-bold text-gray-800">
+                      {p.latest_run ? pct(p.latest_run.win_rate) : '--'}
+                    </td>
+                    <td className="py-1.5 px-2 text-right font-mono text-gray-600">
+                      {p.latest_run?.wilson_lower !== null && p.latest_run?.wilson_lower !== undefined
+                        ? p.latest_run.wilson_lower.toFixed(3) : '--'}
+                    </td>
+                    <td className={`py-1.5 px-2 text-right font-mono font-bold ${
+                      p.latest_run?.ev_after_fee !== null && p.latest_run?.ev_after_fee !== undefined && p.latest_run.ev_after_fee > 0
+                        ? 'text-green-600' : 'text-red-500'
+                    }`}>
+                      {p.latest_run?.ev_after_fee !== null && p.latest_run?.ev_after_fee !== undefined
+                        ? `${p.latest_run.ev_after_fee > 0 ? '+' : ''}${p.latest_run.ev_after_fee.toFixed(3)}` : '--'}
+                    </td>
+                    <td className="py-1.5 px-2 text-right font-mono text-gray-600">
+                      {p.latest_run?.sample_count ?? 0}
+                    </td>
+                    <td className="py-1.5 px-2 text-gray-500 text-[11px] max-w-56 truncate" title={(p.latest_run?.delta_vs_prev?.suggestions || []).join('\n')}>
+                      {p.latest_run?.delta_vs_prev?.suggestions?.[0] ?? '—'}
+                    </td>
+                  </tr>
+                  {expanded === p.pattern_id && (
+                    <tr>
+                      <td colSpan={8} className="bg-gray-50 px-4 py-3">
+                        <div className="text-[11px] font-bold text-gray-600 mb-2">回测历史（纵向对比：同一模式随数据累积的表现漂移）</div>
+                        {runs.length === 0 ? (
+                          <div className="text-gray-400 text-xs py-2">该模式尚无回测记录</div>
+                        ) : (
+                          <div className="space-y-2">
+                            {runs.map(r => (
+                              <div key={r.id} className="bg-white rounded-lg border border-gray-200 px-3 py-2">
+                                <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-gray-600">
+                                  <span className="font-mono">{r.created_at ? new Date(r.created_at).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '--'}</span>
+                                  <span>胜率 <strong className="font-mono">{pct(r.win_rate)}</strong>（{r.correct_count}/{r.sample_count}）</span>
+                                  <span>CI [{r.wilson_lower?.toFixed(3) ?? '--'}, {r.wilson_upper?.toFixed(3) ?? '--'}]</span>
+                                  <span>EV <strong className="font-mono">{r.ev_after_fee !== null ? `${(r.ev_after_fee ?? 0) > 0 ? '+' : ''}${r.ev_after_fee?.toFixed(3)}` : '--'}</strong></span>
+                                  <span className="text-gray-400">{r.trigger_reason}</span>
+                                  {r.delta_vs_prev?.tier_change && (
+                                    <span className="text-indigo-600 font-bold">
+                                      {r.delta_vs_prev.tier_change.from} → {r.delta_vs_prev.tier_change.to}
+                                    </span>
+                                  )}
+                                  {r.delta_vs_prev?.decay_warning && <span className="text-red-500 font-bold">⚠ 衰减降级</span>}
+                                </div>
+                                {(r.delta_vs_prev?.suggestions || []).length > 0 && (
+                                  <ul className="mt-1 text-[11px] text-gray-500 space-y-0.5">
+                                    {(r.delta_vs_prev?.suggestions || []).map((s, i) => <li key={i}>· {s}</li>)}
+                                  </ul>
+                                )}
+                                {r.segment_stats && Object.keys(r.segment_stats).length > 0 && (
+                                  <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-gray-400 font-mono">
+                                    {Object.entries(r.segment_stats).map(([month, seg]) => (
+                                      <span key={month}>{month}: {pct(seg.win_rate)}({seg.n})</span>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </td>
+                    </tr>
+                  )}
+                </Fragment>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </Card>
   )
 }

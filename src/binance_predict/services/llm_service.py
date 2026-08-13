@@ -4,7 +4,7 @@ BTC 5min LLM 预测系统 V2 - LLM 决策服务（核心模块）
 核心逻辑：每次决策前通过 prompt + LLM 多轮验证反馈沟通得到可靠决策。
 
 实现方式：
-1. 使用 Instructor 的 Tool Calling 模式（Mode.Tools）调用 deepseek-v4-pro / qwen3.7-max
+1. 使用 Instructor 的 Tool Calling 模式（Mode.Tools）调用 deepseek-v4-flash / qwen3.7-max
    - 两个模型均不支持原生 Structured Output，但支持 Function Calling
    - Instructor 通过 Tool Calling + Pydantic 验证实现等效的结构化输出
 2. 自动重试机制：Pydantic 验证失败时，Instructor 会将验证错误回传给 LLM 让其自修复
@@ -18,7 +18,7 @@ BTC 5min LLM 预测系统 V2 - LLM 决策服务（核心模块）
 
 百炼 DashScope API 通过 OpenAI 兼容接口统一调用：
 - base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-- 决策模型: deepseek-v4-pro（输入 12 元/百万Token，输出 24 元/百万Token）
+- 决策模型: deepseek-v4-flash（输入 1 元/百万Token，输出 2 元/百万Token）
 - 复盘模型: qwen3.7-max（输入 12 元/百万Token，输出 36 元/百万Token）
 """
 
@@ -34,15 +34,16 @@ from loguru import logger
 
 from ..config.settings import settings
 from ..models.schemas import (
+    ArbitrateOutput,
+    DiscoveryOutput,
     EvolveOutput,
     LearnOutput,
-    PredictOutput,
 )
 from ..prompts.agent_templates import (
-    DEEP_LEARN_SYSTEM_PROMPT,
+    ARBITRATE_SYSTEM_PROMPT,
+    DISCOVERY_SYSTEM_PROMPT,
     EVOLVE_SYSTEM_PROMPT,
     LEARN_SYSTEM_PROMPT,
-    PREDICT_SYSTEM_PROMPT,
 )
 from .metrics import metrics_collector
 
@@ -52,7 +53,7 @@ class LLMService:
     LLM 决策与复盘服务
 
     两个模型走不同的 API 通道：
-    - 决策模型 deepseek-v4-pro → DeepSeek 原生 API (api.deepseek.com)
+    - 决策模型 deepseek-v4-flash → DeepSeek 原生 API (api.deepseek.com)
     - 复盘模型 qwen3.7-max → 百炼 DashScope API (dashscope.aliyuncs.com)
 
     两个模型均不支持原生 Structured Output，
@@ -63,7 +64,7 @@ class LLMService:
     """
 
     def __init__(self) -> None:
-        # --- 决策 LLM 客户端（deepseek-v4-pro → DeepSeek 原生 API）---
+        # --- 决策 LLM 客户端（deepseek-v4-flash → DeepSeek 原生 API）---
         decision_openai_client = openai.AsyncOpenAI(
             api_key=settings.deepseek_api_key,
             base_url=settings.deepseek_base_url,
@@ -154,40 +155,45 @@ class LLMService:
 
     async def agent_deep_learn(
         self,
-        windows: list[dict],
-        active_patterns: list[dict],
+        symbolized_windows: list[dict],
         timeout: float,
-    ) -> LearnOutput:
+        feedback: dict | None = None,
+        hints: list[dict] | None = None,
+    ) -> DiscoveryOutput:
         """
-        深度模式发现（手动触发）：全量历史分析。
+        深度模式发现（科学发现轨，Phase 2）：LLM 作为假设生成器。
 
-        与 agent_learn() 的区别：
-        - 输入：全量原始窗口 dict（不压缩，保留完整曲线形态）
-        - max_tokens：16384（基于实测，允许充分推理输出）
-        - 专用 prompt：强调跨周期深度分析，NOISE 过滤由 prompt 引导
+        与旧轨的区别（宪法 Q1/Q5 与第〇条角色分离）：
+        - 输入：发现集窗口的符号串 + 几何摘要（三通道，每通道独立分箱），
+          不再是原始曲线全量点
+        - 输出：谓词 DSL 假设（DiscoveryOutput.hypotheses），不再是自由文本特征
+        - 统计审判由程序在验证集上完成（discovery.screen_hypotheses），LLM 不得自我验证
 
         Args:
-            windows: 全量 SentimentWindow 原始数据（dict 列表）
-            active_patterns: 当前 ACTIVE 模式库
+            symbolized_windows: 已符号化的发现集窗口 payload（每项含 start_time /
+                outcome / channels{channel: {symbols, geometry}}）
             timeout: LLM 超时秒数
+            feedback: Q7-2 反馈包（负样本全量 / 正样本摘要 / 存活期统计），
+                None 时按冷启动渲染（首轮发现无历史审判记录）
+            hints: 程序预筛线索榜单（hypothesis_miner.mine_hints 产出，
+                train 集穷举统计），None 时退化为纯直觉发现
 
         Returns:
-            LearnOutput: 结构化发现结果
+            DiscoveryOutput: reasoning + hypotheses[PredicateHypothesis]
         """
-        user_message = self._build_deep_learn_user_msg(windows, active_patterns)
+        user_message = self._build_discovery_user_msg(symbolized_windows, feedback, hints)
         logger.info(
-            "开始深度分析 LLM 调用 | model={} | windows={} | active_patterns={} | timeout={}s",
+            "开始科学发现 LLM 调用 | model={} | symbolized_windows={} | timeout={}s",
             settings.decision_model,
-            len(windows),
-            len(active_patterns),
+            len(symbolized_windows),
             timeout,
         )
         t0 = time.monotonic()
         result, completion = await asyncio.wait_for(
             self._decision_client.create_with_completion(
-                response_model=LearnOutput,
+                response_model=DiscoveryOutput,
                 messages=[
-                    {"role": "system", "content": DEEP_LEARN_SYSTEM_PROMPT},
+                    {"role": "system", "content": DISCOVERY_SYSTEM_PROMPT},
                     {"role": "user", "content": user_message},
                 ],
                 max_retries=2,
@@ -198,45 +204,45 @@ class LLMService:
             timeout=timeout,
         )
         self._record_llm_usage("DEEP_LEARN", user_message, t0, completion)
-        self._spawn_trace("DEEP_LEARN", DEEP_LEARN_SYSTEM_PROMPT, user_message, result, t0, completion)
+        self._spawn_trace("DEEP_LEARN", DISCOVERY_SYSTEM_PROMPT, user_message, result, t0, completion)
         return result
 
     async def agent_deep_learn_stream(
         self,
-        windows: list[dict],
-        active_patterns: list[dict],
+        symbolized_windows: list[dict],
         idle_timeout: float,
+        feedback: dict | None = None,
+        hints: list[dict] | None = None,
     ):
-        """深度模式发现（流式版）：逐 token 推送 LLM 输出，供前端实时打字机展示。
+        """深度模式发现（流式版，科学发现轨）：逐 token 推送 LLM 输出，供前端实时打字机展示。
 
         与 agent_deep_learn 的差异：
-        - 使用 Instructor create_partial 流式生成，逐步产出「部分完整」的 LearnOutput
+        - 使用 Instructor create_partial 流式生成，逐步产出「部分完整」的 DiscoveryOutput
         - 不施加一次性总超时，改为「空闲超时」：仅当相邻两次分片间隔超过 idle_timeout
           才判定超时（只要模型在持续吐字就不算超时），彻底规避旧的 100s 硬超时被掐问题
         - 迭代结束后用最终对象落一条 DEEP_LEARN 轨迹（token 用量为估算值）
 
         产出事件（dict）：
         - {"type": "reasoning", "delta": str}  reasoning 新增片段（打字机增量）
-        - {"type": "progress", "discoveries": int}  当前已解析出的发现条数
-        - {"type": "done", "result": LearnOutput}  最终完整结构化结果
+        - {"type": "progress", "hypotheses": int}   当前已解析出的假设条数
+        - {"type": "done", "result": DiscoveryOutput}  最终完整结构化结果
         - {"type": "error", "message": str}  空闲超时或流式异常
 
         Raises: 不向上抛异常，所有失败均以 {"type": "error"} 事件产出，交由上层转成 SSE。
         """
-        user_message = self._build_deep_learn_user_msg(windows, active_patterns)
+        user_message = self._build_discovery_user_msg(symbolized_windows, feedback, hints)
         logger.info(
-            "开始深度分析 LLM 流式调用 | model={} | windows={} | active_patterns={} | idle_timeout={}s",
+            "开始科学发现 LLM 流式调用 | model={} | symbolized_windows={} | idle_timeout={}s",
             settings.decision_model,
-            len(windows),
-            len(active_patterns),
+            len(symbolized_windows),
             idle_timeout,
         )
         t0 = time.monotonic()
         try:
             stream = self._decision_client.create_partial(
-                response_model=LearnOutput,
+                response_model=DiscoveryOutput,
                 messages=[
-                    {"role": "system", "content": DEEP_LEARN_SYSTEM_PROMPT},
+                    {"role": "system", "content": DISCOVERY_SYSTEM_PROMPT},
                     {"role": "user", "content": user_message},
                 ],
                 max_tokens=settings.agent_deep_learn_max_tokens,
@@ -287,10 +293,10 @@ class LLMService:
                 delta = reasoning[len(last_reasoning):]
                 last_reasoning = reasoning
                 yield {"type": "reasoning", "delta": delta}
-            cur_count = len(getattr(partial, "discoveries", None) or [])
+            cur_count = len(getattr(partial, "hypotheses", None) or [])
             if cur_count != last_count:
                 last_count = cur_count
-                yield {"type": "progress", "discoveries": cur_count}
+                yield {"type": "progress", "hypotheses": cur_count}
 
         if final is None:
             yield {"type": "error", "message": "LLM 未返回任何内容"}
@@ -298,54 +304,55 @@ class LLMService:
 
         # 迭代完成：记录用量 + 落轨迹（流式无 completion 对象，token 为估算值）
         self._record_llm_usage("DEEP_LEARN", user_message, t0, None)
-        self._spawn_trace("DEEP_LEARN", DEEP_LEARN_SYSTEM_PROMPT, user_message, final, t0, None)
+        self._spawn_trace("DEEP_LEARN", DISCOVERY_SYSTEM_PROMPT, user_message, final, t0, None)
         yield {"type": "done", "result": final}
 
-    async def agent_predict(
+    async def agent_arbitrate(
         self,
-        current_curve: list[dict],
-        active_patterns: list[dict],
+        window_payload: dict,
+        candidates: list[dict],
         remaining_seconds: int,
         timeout: float,
-    ) -> PredictOutput:
+    ) -> ArbitrateOutput:
         """
-        预测阶段（Predict Phase）结构化 LLM 调用（Req 3.4 / 7.1 / 7.2 / 7.3 / 7.4）。
+        预测阶段仲裁调用（科学发现宪法第八条，Phase 3）。
 
-        将当前窗口的实时情绪曲线与已有 ACTIVE 模式匹配，返回结构化预测结果
-        PredictOutput（reasoning-first + 方向 / 置信度 / 匹配模式 / 入场时机）。
+        程序已完成确定性谓词匹配，仅在「多模式命中且方向冲突」时调用本方法
+        请 LLM 消歧。LLM 只能从冲突候选中选定一个模式或放弃，direction 由
+        程序从选定模式的 predicted_direction 推导，LLM 无权发明方向。
 
         Args:
-            current_curve: 当前窗口已采集的实时曲线（[{t, v}, ...]，v 为 UP%）
-            active_patterns: 当前 Pattern_Memory 中所有 ACTIVE 模式（dict 列表，含 id 与特征）
+            window_payload: 当前窗口符号化视图 payload（_view_to_payload 形态：
+                start_time / channels{channel: {symbols, geometry}}）
+            candidates: 冲突候选模式（dict 列表，含 id / pattern_name /
+                predicted_direction / description / predicate / win_rate / sample_count）
             remaining_seconds: 距当前窗口结束的剩余秒数
             timeout: LLM 内层超时（秒），由上层按 settings.agent_llm_timeouts["PREDICT"] 传入
 
         Returns:
-            PredictOutput: 结构化预测结论。
+            ArbitrateOutput: 仲裁结论（selected_pattern_id 或放弃）。
 
         Raises:
             asyncio.TimeoutError: LLM 调用超过 timeout。
             Exception: 网络错误 / 重试 2 次后 Pydantic 校验仍失败等，均直接向上抛出。
         """
-        # Predict 时间敏感、当前曲线点数少（单窗口 ≤ 约 20 点），完整呈现不下采样
-        user_message = self._build_predict_user_msg(
-            current_curve, active_patterns, remaining_seconds
+        user_message = self._build_arbitrate_user_msg(
+            window_payload, candidates, remaining_seconds
         )
         logger.info(
-            "开始 Predict LLM 调用 | model={} | curve_points={} | active_patterns={} | remaining={}s | timeout={}s",
+            "开始仲裁 LLM 调用 | model={} | 冲突候选={} | remaining={}s | timeout={}s",
             settings.decision_model,
-            len(current_curve),
-            len(active_patterns),
+            len(candidates),
             remaining_seconds,
             timeout,
         )
-        # 照搬 decide() 已验证形态；max_tokens 取 2048（design.md 示例值）
+        # 仲裁输出字段少，max_tokens 取 2048 与既有阶段调用一致
         t0 = time.monotonic()
         result, completion = await asyncio.wait_for(
             self._decision_client.create_with_completion(
-                response_model=PredictOutput,
+                response_model=ArbitrateOutput,
                 messages=[
-                    {"role": "system", "content": PREDICT_SYSTEM_PROMPT},
+                    {"role": "system", "content": ARBITRATE_SYSTEM_PROMPT},
                     {"role": "user", "content": user_message},
                 ],
                 max_retries=2,
@@ -355,8 +362,9 @@ class LLMService:
             ),
             timeout=timeout,
         )
+        # 阶段标签保持 PREDICT：健康检查/成本核算按四阶段口径统计
         self._record_llm_usage("PREDICT", user_message, t0, completion)
-        self._spawn_trace("PREDICT", PREDICT_SYSTEM_PROMPT, user_message, result, t0, completion)
+        self._spawn_trace("PREDICT", ARBITRATE_SYSTEM_PROMPT, user_message, result, t0, completion)
         return result
 
     async def agent_evolve(
@@ -441,6 +449,17 @@ class LLMService:
             conf = getattr(result, "confidence", 0.0) or 0.0
             timing = getattr(result, "entry_timing", "")
             return f"direction={direction} conf={conf:.2f} timing={timing}"[:200]
+        # 仲裁输出（ArbitrateOutput）：无 direction 字段，按选定 id 摘要
+        if hasattr(result, "selected_pattern_id"):
+            conf = getattr(result, "confidence", 0.0) or 0.0
+            timing = getattr(result, "entry_timing", "")
+            return (
+                f"selected={result.selected_pattern_id} "
+                f"conf={conf:.2f} timing={timing}"
+            )[:200]
+        hypotheses = getattr(result, "hypotheses", None)
+        if hypotheses is not None:
+            return f"hypotheses={len(hypotheses)}"[:200]
         discoveries = getattr(result, "discoveries", None)
         if discoveries is not None:
             return f"discoveries={len(discoveries)}"[:200]
@@ -701,18 +720,31 @@ class LLMService:
         )
         return "\n".join(lines)
 
-    def _build_deep_learn_user_msg(
-        self, windows: list[dict], active_patterns: list[dict]
+    def _build_discovery_user_msg(
+        self,
+        symbolized_windows: list[dict],
+        feedback: dict | None = None,
+        hints: list[dict] | None = None,
     ) -> str:
-        """组装深度分析 user message：全量窗口原始曲线（不下采样）+ 统计摘要 + ACTIVE 模式库。
+        """组装科学发现 user message：反馈区块（Q7-2）+ 三通道符号串 + 几何摘要 + outcome。
 
-        不压缩、不筛选、不下采样，所有窗口全量原始点呈现给 LLM，让其自主判断。
+        输入为 symbolizer.build_window_view 的 dict 形态（宪法 Q1/Q2）：
+        每项含 start_time / outcome / channels{channel: {symbols, geometry}}。
+        LLM 只消费符号串与几何摘要，不再呈现原始曲线数值——原始数值的形态
+        解释权归程序（分箱快照），LLM 只做符号层面的假设生成。
+
+        feedback（Q7-2 反馈循环）置于窗口数据之前，让 LLM 带着排除约束读数据：
+        - negatives：SPURIOUS 死亡假设的全量细节（波普尔排除，禁止重提）
+        - positive_summary：存活模式统计摘要（不含谓词结构，防近亲繁殖）
+        - lifespan_stats：EXPIRED 死亡的存活期分布（规律预期寿命元信息）
         """
         from datetime import datetime, timezone
 
-        # P0-1: 用实际窗口的 min/max start_time 计算真实跨度，
+        # P0-1 沿用：用实际窗口的 min/max start_time 计算真实跨度，
         # 避免"最近 N 个当全量历史"的误导。
-        starts = [w.get("start_time", 0) for w in windows if w.get("start_time")]
+        starts = [
+            w.get("start_time", 0) for w in symbolized_windows if w.get("start_time")
+        ]
         if starts:
             t_min = datetime.fromtimestamp(min(starts) / 1000, tz=timezone.utc)
             t_max = datetime.fromtimestamp(max(starts) / 1000, tz=timezone.utc)
@@ -724,76 +756,188 @@ class LLMService:
         else:
             span_str = "时间范围未知"
 
-        lines: list[str] = [
-            f"## 采样历史窗口（共 {len(windows)} 个，按时间从旧到新，每 15 秒一个采样点）",
-            f"时间范围：{span_str}",
-            "注：以下为按 outcome 分层、时间均匀抽样的代表性窗口，非连续全量。",
-            "格式：窗口序号 [时间]: UP%[...] / DOWN%[...] → outcome (实际收益)",
-            "",
-        ]
-        for i, w in enumerate(windows, 1):
-            up_curve = w.get("curve_up_pct", []) or []
-            down_curve = w.get("curve_down_pct", []) or []
-            # 全量原始点，不下采样
-            up = [f"{p.get('v', 0):.1f}%" for p in up_curve]
-            down = [f"{p.get('v', 0):.1f}%" for p in down_curve]
-            outcome = w.get("outcome", "N/A")
-            actual_return = w.get("actual_return", 0) or 0
+        lines: list[str] = []
 
-            # 格式化时间
+        # --- Q7-2 反馈区块（先于数据呈现）---
+        lines.append("## 发现反馈（历史审判结果，务必遵守）")
+        if not feedback:
+            lines.append("暂无历史审判记录（首轮发现）。")
+        else:
+            negatives = feedback.get("negatives") or []
+            if negatives:
+                lines.append(
+                    f"\n### 已被证伪的假设（{len(negatives)} 条，禁止重提相同或高度相似结构）"
+                )
+                lines.append(
+                    "以下假设经程序统计审判确认为假规律（live 命中从未显著优于局部基准），"
+                    "已被处决。与它们相同或仅参数微调（如计数阈值 ±1）的重提会被同样证伪，"
+                    "不要浪费假设名额："
+                )
+                for i, neg in enumerate(negatives, 1):
+                    pred_json = json.dumps(
+                        neg.get("predicate"), ensure_ascii=False, separators=(",", ":")
+                    )
+                    lines.append(
+                        f"{i}. 「{neg.get('pattern_name', '?')}」"
+                        f"方向 {neg.get('predicted_direction', '?')}"
+                        f" | live {neg.get('sample_count', 0)} 次命中"
+                        f"胜率 {float(neg.get('win_rate') or 0.0):.2f}"
+                        f"\n   谓词 {pred_json}"
+                        f"\n   形态描述：{neg.get('description', '')}"
+                    )
+            else:
+                lines.append("\n### 已被证伪的假设\n暂无（尚无假规律被处决）。")
+
+            pos = feedback.get("positive_summary") or {}
+            pos_count = int(pos.get("count") or 0)
+            if pos_count:
+                lines.append(
+                    f"\n### 当前存活模式统计（结构对你不可见）\n"
+                    f"存活 ACTIVE 模式 {pos_count} 个"
+                    f"（UP {pos.get('up_count', 0)} / DOWN {pos.get('down_count', 0)}），"
+                    f"平均 live 胜率 {float(pos.get('avg_win_rate') or 0.0):.2f}。\n"
+                    "注意：为防全库同质化（近亲繁殖），存活模式的谓词结构不向你开放——"
+                    "不要猜测或模仿它们，你的价值在于探索它们未覆盖的形态空间。"
+                )
+            else:
+                lines.append("\n### 当前存活模式统计\n暂无存活模式（模式库为空）。")
+
+            life = feedback.get("lifespan_stats") or {}
+            life_count = int(life.get("count") or 0)
+            if life_count:
+                lines.append(
+                    f"\n### 规律存活期分布（元信息）\n"
+                    f"历史过期规律（曾显著后衰减）共 {life_count} 个，"
+                    f"存活期：平均 {life.get('mean')} 天 / 中位 {life.get('median')} 天 / "
+                    f"最长 {life.get('max')} 天。\n"
+                    "这是规律的预期寿命量级：优先提出稳健、跨 regime 的结构，而非短期噪声。"
+                )
+        lines.append("")
+
+        # --- 程序预筛线索榜单（假设矿机，置于窗口明细之前：先线索后下钻）---
+        if hints:
+            lines.extend([
+                f"## 程序预筛线索榜单（训练集统计，按偏向强度降序，共 {len(hints)} 条）",
+                "程序已在训练集上穷举全部单谓词组合（约 300 个）逐窗口执行，以下条目",
+                "命中数达标且 outcome 偏向最强。统计口径与最终审判一致（局部基准 lift），",
+                "但跑在训练集——榜单只是线索不是结论：你精选的每条假设仍会在留出集独立审判。",
+                "格式：#编号 方向 lift(CI下界) 命中数(UP/DOWN/NOISE) 谓词JSON",
+                "",
+            ])
+            for i, h in enumerate(hints, 1):
+                pred_json = json.dumps(
+                    h.get("predicate"), ensure_ascii=False, separators=(",", ":")
+                )
+                lines.append(
+                    f"#{i:02d} {h.get('direction')} "
+                    f"lift={h.get('lift')}({h.get('ci_lower')}) "
+                    f"命中{h.get('hits')}(UP:{h.get('up_hits')} "
+                    f"DOWN:{h.get('down_hits')} NOISE:{h.get('noise_hits')}) "
+                    f"{pred_json}"
+                )
+            lines.append("")
+
+        channel_names = ("sentiment", "price", "volume")
+        lines.extend([
+            f"## 发现集窗口（共 {len(symbolized_windows)} 个，按时间从旧到新）",
+            f"时间范围：{span_str}",
+            "格式：窗口序号 [时间] → outcome；随后三通道符号串与几何摘要",
+            "注：「缺」= 该窗口此通道无有效数据",
+            "",
+        ])
+        for i, w in enumerate(symbolized_windows, 1):
+            outcome = w.get("outcome", "N/A")
             start_time = w.get("start_time", 0)
             ts = datetime.fromtimestamp(start_time / 1000, tz=timezone.utc)
             time_str = ts.strftime("%m-%d %H:%M")
+            lines.append(f"窗口{i} [{time_str}] → {outcome}")
 
-            lines.append(
-                f"窗口{i} [{time_str}]: UP%[{','.join(up)}] / DOWN%[{','.join(down)}] "
-                f"→ {outcome} (收益: {actual_return:+.4%})"
-            )
-            # 附加统计摘要（减轻 LLM 数值计算负担）
-            summary = self._compute_curve_summary(up_curve, down_curve)
-            if summary:
-                lines.append(f"  摘要: {summary}")
+            channels = w.get("channels") or {}
+            for channel in channel_names:
+                view = channels.get(channel) or {}
+                symbols = view.get("symbols") or []
+                if not symbols:
+                    lines.append(f"  {channel}: 缺")
+                else:
+                    lines.append(f"  {channel}: {','.join(symbols)}")
+
+            geo_parts: list[str] = []
+            for channel in channel_names:
+                view = channels.get(channel) or {}
+                geo = view.get("geometry") or {}
+                if not geo:
+                    continue
+                geo_parts.append(
+                    f"{channel}(峰{geo.get('peak_count', 0)}"
+                    f"/面积比{geo.get('area_ratio', 0.5):.2f}"
+                    f"/卷曲{geo.get('curliness', 1.0):.1f}"
+                    f"/间距{geo.get('extremum_spacing', 'insufficient')})"
+                )
+            if geo_parts:
+                lines.append(f"  几何: {' '.join(geo_parts)}")
             lines.append("")
 
-        lines.append(f"## 当前模式库 ACTIVE 模式（共 {len(active_patterns)} 个）")
-        lines.append(self._format_patterns_json(active_patterns))
-        lines.append("")
-        lines.append(
-            "请分析全量历史窗口的完整曲线形态，自主判断哪些窗口值得重点关注、"
-            "哪些可以忽略，发现跨周期可复现的模式。"
-        )
+        if hints:
+            lines.append(
+                "请基于以上线索榜单与符号串明细提出可证伪的谓词假设（hypotheses 至多 20 条）："
+                "优先从榜单精选有形态学意义的条目（rationale 引用 #编号），"
+                "可对榜单谓词微调参数或做逻辑组合，也鼓励提出榜单外的新结构。"
+            )
+        else:
+            lines.append(
+                "请基于以上符号串与几何摘要提出可证伪的谓词假设（hypotheses 至多 20 条）。"
+            )
         return "\n".join(lines)
 
-    def _build_predict_user_msg(
+    def _build_arbitrate_user_msg(
         self,
-        current_curve: list[dict],
-        active_patterns: list[dict],
+        window_payload: dict,
+        candidates: list[dict],
         remaining_seconds: int,
     ) -> str:
-        """组装 Predict 阶段 user message：当前实时曲线 + 统计摘要 + ACTIVE 模式库 + 剩余时间。"""
-        up_values = [f"{p.get('up_pct', 0):.1f}%" for p in current_curve]
-        down_values = [f"{p.get('down_pct', 0):.1f}%" for p in current_curve]
+        """组装仲裁 user message（宪法第八条规则 6）。
 
-        # 构建统计摘要（Plan 步骤 6）
-        up_curve_raw = [{"v": p.get("up_pct", 0)} for p in current_curve]
-        down_curve_raw = [{"v": p.get("down_pct", 0)} for p in current_curve]
-        summary = self._compute_curve_summary(up_curve_raw, down_curve_raw)
+        当前窗口三通道符号串+几何摘要（与 Deep Learn 同口径，LLM 只消费符号
+        层面信息）+ 冲突候选详情（含谓词定义与 live 统计）。候选序列化为
+        JSON 呈现，谓词原样保留供 LLM 对照形态。
+        """
+        channel_names = ("sentiment", "price", "volume")
+        channels = window_payload.get("channels") or {}
 
         lines: list[str] = [
-            "## 当前窗口实时状态",
-            f"- 已采集采样点：{len(current_curve)} 个（约每 15 秒 1 点）",
+            "## 当前窗口（进行中）",
             f"- 距窗口结束剩余：{remaining_seconds} 秒",
-            f"- UP% 实时曲线（从早到晚）：[{','.join(up_values)}]",
-            f"- DOWN% 实时曲线（从早到晚）：[{','.join(down_values)}]",
         ]
-        if summary:
-            lines.append(f"- 统计摘要: {summary}")
+        for channel in channel_names:
+            view = channels.get(channel) or {}
+            symbols = view.get("symbols") or []
+            if not symbols:
+                lines.append(f"- {channel}: 缺")
+            else:
+                lines.append(f"- {channel}: {','.join(symbols)}")
+
+        geo_parts: list[str] = []
+        for channel in channel_names:
+            view = channels.get(channel) or {}
+            geo = view.get("geometry") or {}
+            if not geo:
+                continue
+            geo_parts.append(
+                f"{channel}(峰{geo.get('peak_count', 0)}"
+                f"/面积比{geo.get('area_ratio', 0.5):.2f}"
+                f"/卷曲{geo.get('curliness', 1.0):.1f}"
+                f"/间距{geo.get('extremum_spacing', 'insufficient')})"
+            )
+        if geo_parts:
+            lines.append(f"- 几何: {' '.join(geo_parts)}")
+
         lines.extend([
             "",
-            f"## 可参考的 ACTIVE 模式库（共 {len(active_patterns)} 个）",
-            self._format_patterns_json(active_patterns),
+            f"## 冲突候选（谓词均已命中，共 {len(candidates)} 个，方向相异）",
+            json.dumps(candidates, ensure_ascii=False, indent=2, default=str),
             "",
-            "请将当前曲线与上述模式匹配，给出方向预测、置信度与入场时机。",
+            "请仲裁：选定一个与当前窗口形态最契合的候选（selected_pattern_id），"
+            "或判定信号矛盾放弃（留空）。",
         ])
         return "\n".join(lines)
 

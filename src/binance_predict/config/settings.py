@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     )
 
     # --- LLM API 配置 ---
-    # DeepSeek 原生 API Key（用于决策模型 deepseek-v4-pro）
+    # DeepSeek 原生 API Key（用于决策模型 deepseek-v4-flash）
     deepseek_api_key: str = ""
     # DeepSeek 原生 API base_url
     deepseek_base_url: str = "https://api.deepseek.com/v1"
@@ -26,8 +26,10 @@ class Settings(BaseSettings):
     dashscope_api_key: str = ""
     # 百炼 OpenAI 兼容接口 base_url
     dashscope_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    # 决策 LLM 模型名（每 60s 调用一次，走 DeepSeek 原生 API）
-    decision_model: str = "deepseek-v4-pro"
+    # 决策 LLM 模型名（每 60s 调用一次，走 DeepSeek 原生 API）。
+    # 别名自动指向最新版 DeepSeek-V4-Flash-0731；官方 API 不暴露带版本后缀的固定名，
+    # 请勿写成 deepseek-v4-flash-0731（会因模型名不存在而调用失败）。
+    decision_model: str = "deepseek-v4-flash"
     # 复盘 LLM 模型名（T+5min 到期后调用，走百炼 DashScope）
     review_model: str = "qwen3.7-max"
 
@@ -114,9 +116,9 @@ class Settings(BaseSettings):
     # Evolve 阶段 LLM 调用超时（< agent_timeout_evolve）
     agent_llm_timeout_evolve: float = 100.0
 
-    # --- LLM 成本配置（元/百万 Token）---
-    llm_input_price_per_1m: float = 12.0   # DeepSeek 输入价格
-    llm_output_price_per_1m: float = 24.0  # DeepSeek 输出价格
+    # --- LLM 成本配置（元/百万 Token，按 deepseek-v4-flash 官方价：输入 1 / 输出 2）---
+    llm_input_price_per_1m: float = 1.0    # DeepSeek-V4-Flash 输入价格（缓存未命中）
+    llm_output_price_per_1m: float = 2.0   # DeepSeek-V4-Flash 输出价格
 
     # --- 告警配置 ---
     agent_alert_enabled: bool = True
@@ -234,6 +236,14 @@ class Settings(BaseSettings):
     # 不再对整体调用施加硬性总超时——只要模型在持续吐字就允许长时间运行（替代旧的 100s 一次性超时）。
     agent_deep_learn_idle_timeout: float = 60.0
 
+    # --- 科学发现 V1.1：决策点截断对齐 + 经济闸（宪法第八条规则 8 / Q6 第 5 步）---
+    # 决策点（开窗后秒数）：predict 在第 10 采样点（~150s）触发，发现/初筛/在线
+    # 统一使用该截断视图（消除全窗初筛的截断错位）
+    agent_decision_point_sec: float = 150.0
+    # 经济闸开关：双轨 ACTIVE 假设须按入场价口径（费 2%+溢价 0.01）EV bootstrap
+    # CI 下界>0 才允许直上线，否则降级 OBSERVE（经济功效不足，非模式无效）
+    agent_ev_gate_enabled: bool = True
+
     # --- Sentiment Agent 行为参数 ---
     # 自动交易总开关：默认关闭，必须显式设置 AGENT_AUTO_TRADE=true 才允许自动下单。
     agent_auto_trade: bool = False
@@ -257,6 +267,37 @@ class Settings(BaseSettings):
     agent_active_pattern_cap: int = 30
     # 淘汰保护最小样本数：sample_count <= 此值的模式不因上限被淘汰（Req 5.8）
     agent_min_sample: int = 5
+
+    # --- 假突破信号系统（日线阻力破位检测，暂不下注）---
+    # 总开关：为 True 时 lifespan 启动秒级检测循环
+    fake_breakout_enabled: bool = True
+    # 破位阈值：BTC mid > 日线阻力 × (1 + eps) 判定冲高破位
+    fake_breakout_eps: float = 0.0005
+    # 检测循环间隔（秒）：读 collector.store.mid_price（bookTicker 实时价）
+    fake_breakout_check_interval: float = 1.0
+    # 日线阻力回看窗口数：前 N 个 5m 窗口 closes 的 max（288 = 24h）
+    fake_breakout_resistance_lookback: int = 288
+    # 阻力位刷新间隔（秒）：从 sentiment_windows 重算
+    fake_breakout_resistance_refresh_seconds: float = 60.0
+    # 风控：同一阻力位信号冷却（秒）——一波冲高只报一次
+    fake_breakout_cooldown_seconds: int = 900
+    # 风控：日内信号上限（防邮件轰炸；不下注阶段的主要风控手段）
+    fake_breakout_max_daily_signals: int = 50
+    # 结算回读死线缓冲（秒）：signal_time + 15min + 本缓冲后回读 BTC 价回填方向
+    fake_breakout_settle_buffer_seconds: int = 90
+    # 信号邮件推送开关（复用 agent_alert_* SMTP 配置）
+    fake_breakout_email_enabled: bool = True
+
+    # --- 模式池分级与定期重回测（无限进化引擎，只发现不下注）---
+    # 总开关：为 True 时 lifespan 启动重回测调度循环
+    pattern_reeval_enabled: bool = True
+    # 检查间隔（秒）：每轮检查自上次回测以来新归档的已标注窗口数
+    pattern_reeval_check_interval: float = 1800.0
+    # 新窗口触发阈值：累积 >= 此数量的新已标注窗口才触发一轮全量重回测
+    # （288 ≈ 1 天数据，保证每次对比有统计意义的新增量）
+    pattern_reeval_min_new_windows: int = 288
+    # 单次重回测最大窗口数（防止全表随数据增长变慢）
+    pattern_reeval_max_windows: int = 20000
 
     @property
     def allowed_origins_list(self) -> list[str]:

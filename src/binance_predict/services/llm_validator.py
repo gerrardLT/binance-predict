@@ -13,7 +13,7 @@ LLM 输出语义验证器 —— 纯函数、分 HARD/SOFT 两级
 
 from __future__ import annotations
 
-from ..models.schemas import EvolveOutput, LearnOutput, PredictOutput
+from ..models.schemas import ArbitrateOutput, EvolveOutput, LearnOutput
 
 
 def validate_learn_output(
@@ -70,16 +70,16 @@ def validate_learn_output(
     return hard, soft
 
 
-def validate_predict_output(
-    output: PredictOutput,
-    active_pattern_ids: set[int],
+def validate_arbitrate_output(
+    output: ArbitrateOutput,
+    candidate_ids: set[int],
 ) -> tuple[list[str], list[str]]:
     """
-    校验 Predict 阶段 LLM 输出。
+    校验仲裁输出（科学发现宪法第八条规则 6）。
 
     Args:
-        output: LLM 返回的 PredictOutput
-        active_pattern_ids: 当前 ACTIVE 模式的 ID 集合
+        output: LLM 返回的 ArbitrateOutput
+        candidate_ids: 冲突候选模式的 ID 集合（LLM 只允许从中选择）
 
     Returns:
         (hard_failures, soft_warnings) 两个字符串列表
@@ -87,27 +87,29 @@ def validate_predict_output(
     hard: list[str] = []
     soft: list[str] = []
 
-    # HARD: matched_pattern_id 非空时必须存在于 ACTIVE 模式
-    if output.matched_pattern_id is not None:
-        if output.matched_pattern_id not in active_pattern_ids:
+    # HARD: selected_pattern_id 非空时必须属于冲突候选集合
+    # （LLM 不得发明候选外的模式；越界即仲裁无效，调用方降级 NO_TRADE）
+    if output.selected_pattern_id is not None:
+        if output.selected_pattern_id not in candidate_ids:
             hard.append(
-                f"matched_pattern_id={output.matched_pattern_id} "
-                f"不在 ACTIVE 模式集合中（可能已退役或不存在）"
+                f"selected_pattern_id={output.selected_pattern_id} "
+                f"不在冲突候选集合中"
             )
 
     # SOFT: reasoning 非空
     if not output.reasoning.strip():
         soft.append("reasoning 为空")
 
-    # SOFT: 非 NO_TRADE 时 confidence 不应过低
-    if output.direction != "NO_TRADE" and output.confidence < 0.3:
+    # SOFT: 选定了候选但 confidence 过低
+    if output.selected_pattern_id is not None and output.confidence < 0.3:
         soft.append(
-            f"direction={output.direction} 但 confidence={output.confidence:.4f} < 0.3"
+            f"已选定 id={output.selected_pattern_id} 但 "
+            f"confidence={output.confidence:.4f} < 0.3"
         )
 
-    # SOFT: NO_TRADE 时 matched_pattern 应为空
-    if output.direction == "NO_TRADE" and output.matched_pattern_id is not None:
-        soft.append("direction=NO_TRADE 但 matched_pattern_id 非空")
+    # SOFT: 放弃时 entry_timing 应为 SKIP
+    if output.selected_pattern_id is None and output.entry_timing != "SKIP":
+        soft.append("放弃（未选定候选）但 entry_timing 非 SKIP")
 
     return hard, soft
 

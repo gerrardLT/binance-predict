@@ -56,6 +56,9 @@ class DeepLearnDiscovery(PatternDiscovery):
 
     holdout_* 由程序在留出集上计算后附加（非 LLM 填写）；commit 时据此做准入闸门
     与写库。作为预览端点返回与 commit 请求的元素类型，不污染作为 LLM response_model 的 PatternDiscovery。
+
+    科学发现轨（Phase 2）：predicate 非空即谓词假设，准入闸门切换为 Q6 双轨裁决
+    （screen_verdict），holdout_* 三列不再由新轨填充（旧轨 pycluster 保留）。
     """
 
     discovery_method: DiscoveryMethod = Field(
@@ -66,16 +69,88 @@ class DeepLearnDiscovery(PatternDiscovery):
     holdout_ci_lower: float | None = Field(
         default=None, description="holdout 胜率 Wilson 95% 置信下界"
     )
+    # --- 科学发现轨（谓词假设，Q5/Q6；非空即走新轨闸门）---
+    predicate: dict | None = Field(
+        default=None, description="谓词 DSL JSON（Q5 白名单，程序确定性执行）"
+    )
+    binning_version: str | None = Field(
+        default=None, description="发现时的分箱快照版本（Q4）"
+    )
+    screen_verdict: str | None = Field(
+        default=None, description="初筛裁决 ACTIVE | OBSERVE | REJECT（Q6，程序计算）"
+    )
+    screen_lift: float | None = Field(default=None, description="初筛 lift 点估计")
+    screen_ci_lower: float | None = Field(default=None, description="初筛 log-lift CI 下界")
+    screen_ci_upper: float | None = Field(default=None, description="初筛 log-lift CI 上界")
+    screen_hit_count: int | None = Field(default=None, description="初筛验证集命中窗口数")
+    screen_reject_reason: str | None = Field(
+        default=None, description="REJECT 原因（非静默，反馈 LLM 用）"
+    )
+    # --- 经济闸证据（V1.1，Q6 第 5 步；仅双轨 ACTIVE 候选计算，其余为 None）---
+    screen_ev: float | None = Field(
+        default=None, description="费后 EV 点估计（入场价口径，含溢价）"
+    )
+    screen_ev_ci_lower: float | None = Field(
+        default=None, description="EV bootstrap 95% CI 下界"
+    )
+    screen_ev_ci_upper: float | None = Field(
+        default=None, description="EV bootstrap 95% CI 上界"
+    )
+    screen_ev_fires: int | None = Field(
+        default=None, description="决策点截断视图上的命中注数"
+    )
+    screen_ev_passed: bool | None = Field(
+        default=None, description="经济闸是否通过（未过则裁决降级 OBSERVE）"
+    )
 
 
-class PredictOutput(BaseModel):
-    """Predict 阶段 LLM 结构化输出。"""
+# ============================================================
+# 科学发现系统（scientific-discovery 宪法 Phase 2）——谓词假设 LLM 契约
+# ============================================================
 
-    reasoning: str = Field(description="当前曲线与模式匹配的推理过程")
-    direction: FinalPrediction = Field(description="预测方向 UP | DOWN | NO_TRADE")
-    matched_pattern_name: str | None = Field(default=None, description="匹配的模式名称")
-    matched_pattern_id: int | None = Field(default=None, description="匹配的模式 id")
-    confidence: float = Field(description="预测置信度 0~1", ge=0, le=1)
+class PredicateHypothesis(BaseModel):
+    """Deep Learn 新轨 LLM 输出的单条谓词假设（Q5 DSL）。
+
+    LLM 是假设生成器：只产出 predicate + target_outcome + 命名/描述，
+    统计审判由程序完成（discovery.screen_hypotheses），LLM 永远不得自我验证。
+    """
+
+    pattern_name: str = Field(description="LLM 自主命名的模式名称")
+    description: str = Field(description="假设的自然语言描述（形态直觉、预期结构）")
+    predicate: dict = Field(
+        description="谓词 DSL JSON（Q5 白名单：L1 五谓词 + L2 两谓词 + AND/OR/NOT ≤2 层）"
+    )
+    target_outcome: Literal["UP", "DOWN"] = Field(
+        description="假设预测的目标结果（谓词命中时期望 outcome 偏向它）"
+    )
+    confidence_score: float = Field(
+        description="主观置信度 0~1（仅先验参考，准入以程序初筛为准）", ge=0, le=1
+    )
+    rationale: str = Field(description="提出该假设的形态学理由")
+
+
+class DiscoveryOutput(BaseModel):
+    """Deep Learn 新轨 LLM 结构化输出（科学发现轨）。"""
+
+    reasoning: str = Field(description="符号串与几何摘要的分析推理过程（先于结论）")
+    hypotheses: list[PredicateHypothesis] = Field(
+        default_factory=list, description="谓词假设列表（≤20 条，Q7 发现预算）"
+    )
+
+
+class ArbitrateOutput(BaseModel):
+    """Predict 阶段 LLM 仲裁输出（科学发现宪法第八条，Phase 3）。
+
+    谓词命中冲突（多模式异向）时，LLM 仅作仲裁者消歧：从冲突候选中
+    选定一个模式或全部放弃。direction 不在输出中——由程序从选中模式的
+    predicted_direction 推导，LLM 无权发明方向（角色分离）。
+    """
+
+    reasoning: str = Field(description="冲突消歧的推理过程（先于结论）")
+    selected_pattern_id: int | None = Field(
+        default=None, description="选定的候选模式 id；None 表示冲突不可调和、放弃交易"
+    )
+    confidence: float = Field(description="对选定模式的把握 0~1", ge=0, le=1)
     entry_timing: EntryTiming = Field(default="SKIP", description="入场时机 NOW | WAIT | SKIP")
     entry_reason: str = Field(default="", description="入场或跳过时机的说明")
 

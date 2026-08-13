@@ -32,11 +32,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config.settings import settings
 from .db.engine import async_session_factory, get_db
-from .db.models import Base, PredictionMarketSample, SentimentWindow
+from .db.models import (
+    Base,
+    FakeBreakoutSignal,
+    PatternBacktestRun,
+    PredictionMarketSample,
+    SentimentWindow,
+)
 from .models.schemas import CommitDeepLearnRequest
 from .services.agent_scheduler import AgentScheduler
 from .services.data_collector import BinanceDataCollector
+from .services.fake_breakout_detector import FakeBreakoutDetector
 from .services.llm_service import LLMService
+from .services.pattern_reevaluator import pattern_reevaluator
 from .services.prediction_trading import BinancePredictionTrader
 from .services.prediction_market_data import PredictionMarketDataService, MarketQuoteData
 from .services.sentiment_agent import SentimentAgent
@@ -76,8 +84,20 @@ agent_scheduler: AgentScheduler | None = None
 # SentimentAgent 全局实例（lifespan 中初始化，供 deep-learn API 调用）
 sentiment_agent: SentimentAgent | None = None
 
+# 15m 市场最新报价缓存（tracker 每 15s 刷新，假突破检测器读取信号时刻的
+# 15m DOWN 报价与到期时刻；只读共享，无需加锁——单写者 + 读者可容忍毫秒级旧值）
+_pm_15m_latest: dict = {
+    "down_price": None,
+    "up_price": None,
+    "end_date": None,
+    "updated_ts": None,
+}
+
 # PREDICT 事件触发标志：同一窗口仅触发一次（Req 3.1），窗口切换时重置
 _predict_triggered_for_window: bool = False
+
+# 假突破检测器全局实例（lifespan 中初始化；秒级检测日线阻力破位，暂不下注）
+fake_breakout_detector: FakeBreakoutDetector | None = None
 
 
 # ============================================================
@@ -95,7 +115,7 @@ async def _prediction_market_tracker() -> None:
     读写分离设计：本函数不再调用 prediction_trader.list_markets()，
     避免修改交易模块状态（Bug 1.1 修复）。
     """
-    global _current_window_end, _window_entry_price, _pm_market_info, _predict_triggered_for_window
+    global _current_window_end, _window_entry_price, _predict_triggered_for_window
     global _last_closed_window_end, _last_closed_window_entry_price, _last_closed_window_exit_price
 
     POLL_INTERVAL = 15  # 秒
@@ -124,10 +144,14 @@ async def _prediction_market_tracker() -> None:
             aligned_epoch = now + sleep_sec
             aligned_ts = int(round(aligned_epoch)) * 1000
 
-            # 通过只读服务获取市场报价（不修改交易模块状态）
+            # 通过只读服务获取市场报价（5m + 15m 双周期，不修改交易模块状态）
             try:
-                quote = await market_data_service.fetch_market_data()
+                quotes = await market_data_service.fetch_market_data_multi()
             except Exception:
+                continue
+
+            quote = quotes.get("5m")
+            if quote is None:
                 continue
 
             # Bug 1.2 修复：end_date=None 防御
@@ -135,8 +159,36 @@ async def _prediction_market_tracker() -> None:
                 logger.warning("end_date 为 None，跳过本轮采样")
                 continue
 
-            # 更新市场元数据（供图表 API 只读访问）
-            _pm_market_info = {
+            # --- 15m 市场通道：只多写一条采样 + 刷新缓存，不参与窗口切换逻辑 ---
+            quote_15m = quotes.get("15m")
+            if quote_15m is not None and quote_15m.down_price is not None:
+                _pm_15m_latest["down_price"] = quote_15m.down_price
+                _pm_15m_latest["up_price"] = quote_15m.up_price
+                _pm_15m_latest["end_date"] = quote_15m.end_date
+                _pm_15m_latest["updated_ts"] = aligned_ts
+                try:
+                    async with async_session_factory() as db:
+                        db.add(PredictionMarketSample(
+                            timestamp=aligned_ts,
+                            market_period="15m",
+                            up_price=quote_15m.up_price,
+                            down_price=quote_15m.down_price,
+                            up_pct=round(quote_15m.up_chance * 100, 1) if quote_15m.up_chance is not None else None,
+                            down_pct=round(quote_15m.down_chance * 100, 1) if quote_15m.down_chance is not None else None,
+                            participants=quote_15m.participants,
+                            trade_volume=float(quote_15m.trade_volume) if quote_15m.trade_volume is not None else None,
+                            btc_price=collector.store.mid_price or None,
+                        ))
+                        await db.commit()
+                except Exception as e:
+                    logger.warning("15m 市场采样入库失败: {}", e)
+
+            # 更新市场元数据（供图表 API 只读访问 + 假突破检测器共享）。
+            # 原地更新（clear+update）保持 dict 身份不变：lifespan 把该 dict 引用
+            # 传给了 FakeBreakoutDetector，整体重新赋值会让检测器持有过期空引用，
+            # 导致 down_price_5m 永远读不到（CodeReview Major-1）。
+            _pm_market_info.clear()
+            _pm_market_info.update({
                 "participant_count": quote.participants,
                 "trade_volume": quote.trade_volume,
                 "start_date": quote.start_date,
@@ -145,7 +197,7 @@ async def _prediction_market_tracker() -> None:
                 "down_price": quote.down_price,
                 "up_chance": quote.up_chance,
                 "down_chance": quote.down_chance,
-            }
+            })
 
             # 检测 5 分钟窗口切换：end_date 变化说明进入了新市场
             new_window_end = quote.end_date
@@ -235,6 +287,7 @@ async def _prediction_market_tracker() -> None:
                     async with async_session_factory() as db:
                         db.add(PredictionMarketSample(
                             timestamp=point["timestamp"],
+                            market_period="5m",
                             up_price=point["up_price"],
                             down_price=point["down_price"],
                             up_pct=point["up_pct"],
@@ -258,9 +311,17 @@ async def _prediction_market_tracker() -> None:
                     and len(_pm_history) >= settings.agent_predict_trigger_samples
                 ):
                     _predict_triggered_for_window = True
-                    # 构建 current_curve：当前窗口的 UP/DOWN% 时序切片
+                    # 构建 current_curve：当前窗口三通道时序切片（宪法第八条规则 3：
+                    # sentiment/price/volume 实时采样齐备，L2 跨通道谓词在线可执行；
+                    # btc_price/trade_volume 为 None 的点被符号化层跳过，不阻塞）
                     current_curve = [
-                        {"t": p["timestamp"], "up_pct": p["up_pct"], "down_pct": p["down_pct"]}
+                        {
+                            "t": p["timestamp"],
+                            "up_pct": p["up_pct"],
+                            "down_pct": p["down_pct"],
+                            "btc_price": p.get("btc_price"),
+                            "trade_volume": p.get("trade_volume"),
+                        }
                         for p in _pm_history
                     ]
                     agent_scheduler.publish("PREDICT", {
@@ -642,6 +703,9 @@ async def lifespan(app: FastAPI):
                 # 参与者/交易量时序曲线（与 alembic 迁移 a7b8c9d0e1f2 等价，存量 dev 库安全网）
                 "ALTER TABLE sentiment_windows ADD COLUMN IF NOT EXISTS curve_participants JSONB",
                 "ALTER TABLE sentiment_windows ADD COLUMN IF NOT EXISTS curve_trade_volume JSONB",
+                # 假突破信号系统 + 模式池分级（与 alembic 迁移 h8b9c0d1e2f3 等价，存量 dev 库安全网）
+                "ALTER TABLE prediction_market_samples ADD COLUMN IF NOT EXISTS market_period VARCHAR(5) NOT NULL DEFAULT '5m'",
+                "ALTER TABLE pattern_memory ADD COLUMN IF NOT EXISTS tier VARCHAR(2) NOT NULL DEFAULT 'C'",
             ]:
                 try:
                     await conn.execute(text(col_sql))
@@ -680,10 +744,31 @@ async def lifespan(app: FastAPI):
     ]
     logger.info("现货 WS + 预测市场追踪 + 情绪窗口归档 + 健康监控已启动")
 
+    # 假突破信号系统：秒级检测日线阻力破位（暂不下注，只记录+邮件+到期回读）
+    global fake_breakout_detector
+    if settings.fake_breakout_enabled:
+        fake_breakout_detector = FakeBreakoutDetector(
+            collector=collector,
+            pm_15m_latest=_pm_15m_latest,
+            pm_market_info=_pm_market_info,
+        )
+        await fake_breakout_detector.start()
+        logger.info("假突破检测器已启动（信号模式，不下注）")
+
+    # 模式池分级与定期重回测（无限进化引擎：新数据累积阈值触发，只发现不下注）
+    if settings.pattern_reeval_enabled:
+        await pattern_reevaluator.start()
+        logger.info("模式重回测调度器已启动（模式池 S/A/B/C 分级）")
+
     yield  # 应用运行中
 
     # 4. 清理
     logger.info("系统关闭中...")
+    # 停止模式重回测调度器
+    await pattern_reevaluator.stop()
+    # 停止假突破检测器
+    if fake_breakout_detector is not None:
+        await fake_breakout_detector.stop()
     # 停止 AgentScheduler（优雅关闭，等待当前阶段执行完毕）
     if agent_scheduler is not None:
         await agent_scheduler.stop()
@@ -745,6 +830,200 @@ async def _require_auth(
 # ============================================================
 # API 路由（V2 PRD §17）
 # ============================================================
+
+# ============================================================
+# 假突破信号系统 API
+# ============================================================
+
+@app.get("/api/fake-breakout/status")
+async def get_fake_breakout_status():
+    """假突破检测器状态：当前阻力位、日内信号数、最新报价快照。"""
+    snapshot = (
+        fake_breakout_detector.status_snapshot
+        if fake_breakout_detector is not None
+        else {"running": False}
+    )
+    return {
+        **snapshot,
+        "enabled": settings.fake_breakout_enabled,
+        "btc_mid": collector.store.mid_price,
+        "pm_15m": _pm_15m_latest,
+        "pm_5m_down_price": _pm_market_info.get("down_price"),
+    }
+
+
+@app.get("/api/fake-breakout/signals")
+async def list_fake_breakout_signals(
+    limit: int = 50,
+    db: AsyncSession = Depends(get_db),
+):
+    """假突破信号列表（倒序）。含到期回填的结算方向。"""
+    from sqlalchemy import desc as sa_desc, select as sa_select
+
+    limit = max(1, min(limit, 200))
+    stmt = (
+        sa_select(FakeBreakoutSignal)
+        .order_by(sa_desc(FakeBreakoutSignal.signal_time))
+        .limit(limit)
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+    return {
+        "signals": [
+            {
+                "id": s.id,
+                "signal_time": s.signal_time,
+                "resistance": s.resistance,
+                "btc_price": s.btc_price,
+                "down_price_5m": s.down_price_5m,
+                "down_price_15m": s.down_price_15m,
+                "market_end_15m": s.market_end_15m,
+                "settle_btc_price": s.settle_btc_price,
+                "settle_outcome": s.settle_outcome,
+                "status": s.status,
+                "email_sent": s.email_sent,
+                "created_at": s.created_at.isoformat() if s.created_at else None,
+            }
+            for s in rows
+        ],
+        "total": len(rows),
+    }
+
+
+@app.get("/api/fake-breakout/stats")
+async def get_fake_breakout_stats(db: AsyncSession = Depends(get_db)):
+    """假突破信号汇总统计：已结算信号的方向胜率（对照回测口径）。"""
+    from sqlalchemy import func as sa_func, select as sa_select
+
+    total = (await db.execute(
+        sa_select(sa_func.count(FakeBreakoutSignal.id))
+    )).scalar() or 0
+    settled = (await db.execute(
+        sa_select(sa_func.count(FakeBreakoutSignal.id)).where(
+            FakeBreakoutSignal.status == "SETTLED"
+        )
+    )).scalar() or 0
+    down_wins = (await db.execute(
+        sa_select(sa_func.count(FakeBreakoutSignal.id)).where(
+            FakeBreakoutSignal.settle_outcome == "DOWN"
+        )
+    )).scalar() or 0
+    avg_15m = (await db.execute(
+        sa_select(sa_func.avg(FakeBreakoutSignal.down_price_15m)).where(
+            FakeBreakoutSignal.down_price_15m.isnot(None)
+        )
+    )).scalar()
+    avg_5m = (await db.execute(
+        sa_select(sa_func.avg(FakeBreakoutSignal.down_price_5m)).where(
+            FakeBreakoutSignal.down_price_5m.isnot(None)
+        )
+    )).scalar()
+    return {
+        "total_signals": total,
+        "settled": settled,
+        "down_win_rate": (down_wins / settled) if settled else None,
+        "avg_down_price_15m": float(avg_15m) if avg_15m is not None else None,
+        "avg_down_price_5m": float(avg_5m) if avg_5m is not None else None,
+    }
+
+
+# ============================================================
+# 模式池分级与回测快照 API（无限进化引擎，只发现不下注）
+# ============================================================
+
+@app.post("/api/agent/patterns/reevaluate")
+async def trigger_pattern_reevaluate(_: None = Depends(_require_auth)):
+    """手动触发一轮全量模式重回测（与后台调度同一入口）。"""
+    summary = await pattern_reevaluator.run_all(trigger="MANUAL")
+    return {"ok": True, "summary": summary}
+
+
+@app.get("/api/agent/patterns/backtest-runs")
+async def list_pattern_backtest_runs(
+    pattern_id: int | None = None,
+    limit: int = 50,
+    db: AsyncSession = Depends(get_db),
+):
+    """模式回测快照列表（纵向对比数据源：同一模式随时间的回测漂移）。"""
+    from sqlalchemy import desc as sa_desc, select as sa_select
+
+    limit = max(1, min(limit, 200))
+    stmt = sa_select(PatternBacktestRun).order_by(sa_desc(PatternBacktestRun.created_at))
+    if pattern_id is not None:
+        stmt = stmt.where(PatternBacktestRun.pattern_id == pattern_id)
+    stmt = stmt.limit(limit)
+    rows = (await db.execute(stmt)).scalars().all()
+    return {
+        "runs": [
+            {
+                "id": r.id,
+                "pattern_id": r.pattern_id,
+                "data_start": r.data_start,
+                "data_end": r.data_end,
+                "sample_count": r.sample_count,
+                "correct_count": r.correct_count,
+                "win_rate": r.win_rate,
+                "wilson_lower": r.wilson_lower,
+                "wilson_upper": r.wilson_upper,
+                "ev_after_fee": r.ev_after_fee,
+                "segment_stats": r.segment_stats,
+                "delta_vs_prev": r.delta_vs_prev,
+                "trigger_reason": r.trigger_reason,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ],
+        "total": len(rows),
+    }
+
+
+@app.get("/api/agent/patterns/compare")
+async def compare_patterns_latest(db: AsyncSession = Depends(get_db)):
+    """横向对比：每个模式最新一次回测快照 + 当前 tier（模式间对比）。"""
+    from sqlalchemy import desc as sa_desc, select as sa_select
+    from .db.models import PatternMemory
+
+    patterns = (await db.execute(
+        sa_select(PatternMemory).order_by(sa_desc(PatternMemory.updated_at))
+    )).scalars().all()
+
+    # 每个模式的最新一次回测
+    latest_runs: dict[int, PatternBacktestRun] = {}
+    run_rows = (await db.execute(
+        sa_select(PatternBacktestRun).order_by(sa_desc(PatternBacktestRun.created_at))
+    )).scalars().all()
+    for r in run_rows:
+        if r.pattern_id not in latest_runs:
+            latest_runs[r.pattern_id] = r
+
+    items = []
+    for p in patterns:
+        run = latest_runs.get(p.id)
+        items.append({
+            "pattern_id": p.id,
+            "pattern_name": p.pattern_name,
+            "status": p.status,
+            "tier": p.tier,
+            "predicted_direction": p.predicted_direction,
+            "discovery_method": p.discovery_method,
+            "live_win_rate": p.win_rate,
+            "live_sample_count": p.sample_count,
+            "latest_run": (
+                {
+                    "id": run.id,
+                    "data_end": run.data_end,
+                    "sample_count": run.sample_count,
+                    "win_rate": run.win_rate,
+                    "wilson_lower": run.wilson_lower,
+                    "wilson_upper": run.wilson_upper,
+                    "ev_after_fee": run.ev_after_fee,
+                    "delta_vs_prev": run.delta_vs_prev,
+                    "created_at": run.created_at.isoformat() if run.created_at else None,
+                }
+                if run else None
+            ),
+        })
+    return {"patterns": items, "total": len(items)}
+
 
 @app.get("/api/health")
 async def health_check():
@@ -1384,10 +1663,12 @@ async def commit_deep_learn(
 
 
 def _summarize_discovery_group(result: dict) -> dict:
-    """把一次 deep-learn 结果压成多维对比摘要（发现即时 holdout 维度）。
+    """把一次 deep-learn 结果压成多维对比摘要（双轨：holdout 维度 + Q6 初筛维度）。
 
-    汇总发现数、平均 holdout 胜率 / Wilson 下界、holdout 样本量、平均 confidence、
-    通过 P0-3 准入闸门的比例、方向分布（UP/DOWN），供 /compare 面板对齐两套方案。
+    旧轨（PY_CLUSTER/LEGACY）维度保持不变：发现数、平均 holdout 胜率 / Wilson
+    下界、holdout 样本量、平均 confidence、通过 P0-3 准入闸门的比例、方向分布。
+    谓词轨（LLM_DEEP 新轨，predicate 非空）追加：假设条数、screen 三档裁决计数、
+    过闸（ACTIVE+OBSERVE 可写库）比例、平均 screen lift、分箱版本。
     """
     discoveries = result.get("discoveries", [])
     n = len(discoveries)
@@ -1403,6 +1684,16 @@ def _summarize_discovery_group(result: dict) -> dict:
     ]
     up = sum(1 for d in discoveries if (d.get("predicted_direction") or "").upper() == "UP")
     down = sum(1 for d in discoveries if (d.get("predicted_direction") or "").upper() == "DOWN")
+
+    # --- 谓词轨（Q6 初筛）维度 ---
+    pred_track = [d for d in discoveries if d.get("predicate")]
+    pn = len(pred_track)
+    screen_lifts = [
+        d["screen_lift"] for d in pred_track if d.get("screen_lift") is not None
+    ]
+    active_n = sum(1 for d in pred_track if d.get("screen_verdict") == "ACTIVE")
+    observe_n = sum(1 for d in pred_track if d.get("screen_verdict") == "OBSERVE")
+    reject_n = sum(1 for d in pred_track if d.get("screen_verdict") == "REJECT")
 
     def _avg(xs: list[float]) -> float:
         return round(sum(xs) / len(xs), 4) if xs else 0.0
@@ -1421,6 +1712,15 @@ def _summarize_discovery_group(result: dict) -> dict:
         "snapshot_token": result.get("snapshot_token"),
         "train_count": result.get("train_count", 0),
         "holdout_count": result.get("holdout_count", 0),
+        # 谓词轨扩展（旧轨结果这些字段为 0/None，不影响旧面板）
+        "binning_version": result.get("binning_version"),
+        "predicate_count": pn,
+        "screen_active_count": active_n,
+        "screen_observe_count": observe_n,
+        "screen_reject_count": reject_n,
+        "screen_admitted_count": active_n + observe_n,
+        "screen_admitted_ratio": round((active_n + observe_n) / pn, 4) if pn else 0.0,
+        "avg_screen_lift": _avg(screen_lifts),
     }
 
 

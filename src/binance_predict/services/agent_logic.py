@@ -32,6 +32,7 @@ __all__ = [
     "PatternRow",
     "WindowRow",
     "TradeGateContext",
+    "PredicateHit",
     "compute_is_correct",
     "should_trade",
     "evaluate_trade_gate",
@@ -42,6 +43,12 @@ __all__ = [
     "is_prediction_stale",
     "compute_pattern_fingerprint",
     "detect_duplicate_pattern",
+    "resolve_predicate_hits",
+    "pattern_confidence",
+    "HIT_NONE",
+    "HIT_SINGLE",
+    "HIT_CONCORDANT",
+    "HIT_CONFLICT",
 ]
 
 
@@ -667,3 +674,73 @@ def detect_duplicate_pattern(
         if existing_fp is not None and new_fp == existing_fp:
             return pat.get("id")
     return None
+
+
+# ============================================================
+# 科学发现第八条：Predict 谓词命中解析（Phase 3，纯函数）
+# ============================================================
+
+# 命中解析分支标签（顺序不可换，见 design.md 第八条规则 4）
+HIT_NONE = "NONE"              # 零命中 → NO_TRADE，不调 LLM
+HIT_SINGLE = "SINGLE"          # 单命中 → 直接采用，不调 LLM
+HIT_CONCORDANT = "CONCORDANT"  # 多命中同向 → 取证据最强者，不调 LLM
+HIT_CONFLICT = "CONFLICT"      # 多命中异向 → 需 LLM 仲裁
+
+
+@dataclass(frozen=True, slots=True)
+class PredicateHit:
+    """谓词命中记录：某谓词模式在当前窗口符号化视图上命中（第八条）。
+
+    仅承载命中解析与置信的程序合成所需字段；direction 即模式的
+    predicted_direction（谓词命中时的预期偏向），仲裁/采用路径都不得篡改。
+    """
+
+    pattern_id: int
+    pattern_name: str
+    direction: str  # UP | DOWN
+    win_rate: float = 0.0
+    sample_count: int = 0
+    prior_confidence: float = 0.5  # 模式 confidence_score 列（LLM 先验）
+
+
+def resolve_predicate_hits(
+    hits: Sequence[PredicateHit],
+) -> tuple[str, PredicateHit | None]:
+    """谓词命中解析四分支（第八条规则 4）。
+
+    分支顺序不可换：
+    - 零命中 → (HIT_NONE, None)
+    - 单命中 → (HIT_SINGLE, 该命中)
+    - 多命中同向 → (HIT_CONCORDANT, 证据最强者)：win_rate 降序 →
+      sample_count 降序 → id 升序兜底（确定性排序，同输入恒同输出）
+    - 多命中异向 → (HIT_CONFLICT, None)：交由 LLM 仲裁消歧
+    """
+    if not hits:
+        return HIT_NONE, None
+    if len(hits) == 1:
+        return HIT_SINGLE, hits[0]
+    directions = {h.direction.upper() for h in hits}
+    if len(directions) == 1:
+        strongest = sorted(
+            hits, key=lambda h: (-h.win_rate, -h.sample_count, h.pattern_id)
+        )[0]
+        return HIT_CONCORDANT, strongest
+    return HIT_CONFLICT, None
+
+
+def pattern_confidence(
+    win_rate: float,
+    sample_count: int,
+    prior_confidence: float,
+    min_samples: int = 5,
+) -> float:
+    """程序命中路径的置信度合成（第八条规则 5）。
+
+    live 样本充足（>= min_samples）时用 live win_rate（最诚实的证据）；
+    样本不足时回退 LLM 先验 confidence_score。交易门控规则 4
+    （样本 < min_pattern_samples 拒交易）对新模式形成二次保护，
+    故此处的先验回退不会直接放行实盘下单。
+    """
+    if sample_count >= min_samples:
+        return round(win_rate, 4)
+    return round(prior_confidence, 4)

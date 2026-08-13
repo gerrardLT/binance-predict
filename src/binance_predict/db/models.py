@@ -103,15 +103,20 @@ class TradeOrderModel(Base):
 # ============================================================
 
 class PredictionMarketSample(Base):
-    """预测市场情绪采样：每 15s 记录 UP/DOWN token 价格"""
+    """预测市场情绪采样：每 15s 记录 UP/DOWN token 价格（5m/15m 双市场）"""
     __tablename__ = "prediction_market_samples"
     __table_args__ = (
         Index("ix_pm_samples_timestamp", "timestamp"),
+        Index("ix_pm_samples_period_ts", "market_period", "timestamp"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     timestamp: Mapped[int] = mapped_column(
         BigInteger, nullable=False, comment="毫秒时间戳"
+    )
+    market_period: Mapped[str] = mapped_column(
+        String(5), nullable=False, default="5m", server_default="5m",
+        comment="预测市场周期：5m | 15m（存量行回填 5m，语义不变）"
     )
     up_price: Mapped[float | None] = mapped_column(Float, nullable=True, comment="UP token 价格")
     down_price: Mapped[float | None] = mapped_column(Float, nullable=True, comment="DOWN token 价格")
@@ -226,6 +231,7 @@ class PatternMemory(Base):
         Index("ix_pattern_memory_name", "pattern_name"),    # Req 1.2 名称检索
         Index("ix_pattern_memory_status", "status"),        # Req 1.2 状态筛选
         Index("ix_pattern_memory_discovery_method", "discovery_method"),  # 按发现方法聚合 live 指标
+        Index("ix_pattern_memory_tier", "tier"),                            # 模式池分级筛选
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -281,11 +287,75 @@ class PatternMemory(Base):
     holdout_ci_lower: Mapped[float | None] = mapped_column(
         Float, nullable=True, comment="发现时 holdout 胜率 Wilson 95% 置信下界"
     )
+    # --- 模式池分级（S/A/B/C）：由定期重回测（pattern_backtest_runs）驱动
+    # 晋级/降级；存量行默认 'C'。最有潜力的模式晋级到 S 池。---
+    tier: Mapped[str] = mapped_column(
+        String(2), nullable=False, default="C", server_default="C",
+        comment="模式池分级 S | A | B | C"
+    )
+    # --- 科学发现系统（scientific-discovery 宪法）---
+    # predicate: LLM 假设的谓词 DSL JSON（经 predicates.validate_predicate 白名单校验，
+    # 程序可确定性执行）；旧自由文本模式此列为 NULL，与谓词轨并存。
+    predicate: Mapped[dict | None] = mapped_column(
+        JSONB, nullable=True, comment="谓词 DSL JSON（科学发现轨，Q5）"
+    )
+    # binning_version: 模式"出生"时的分箱快照版本（Q4：测量结果必须注明仪器精度）
+    binning_version: Mapped[str | None] = mapped_column(
+        String(40), nullable=True, comment="发现时的分箱快照版本（Q4）"
+    )
+    # 双轨死因（Q7-1）：SPURIOUS=假规律（从未显著）/ EXPIRED=过期规律（曾显著后衰减）；
+    # 存活为 NULL。RETIRE 时由 diagnose_death 回填。
+    death_cause: Mapped[str | None] = mapped_column(
+        String(10), nullable=True, comment="死因：SPURIOUS | EXPIRED（Q7-1）"
+    )
+    lifespan_days: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="存活天数（RETIRE 时回填，供存活期分布反馈）"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+# ============================================================
+# 科学发现系统 - 分箱冻结快照表（Q4：每通道独立分位边界）
+# ============================================================
+
+class BinningSnapshotModel(Base):
+    """
+    分位数分箱冻结快照：每 30 天按通道各冻结一版 20/40/60/80 分位边界。
+
+    与 services/symbolizer.BinningSnapshot 纯数据结构对齐（version/edges/
+    created_at_epoch/sample_count），DB 层额外加 channel 维度——三通道量纲不同，
+    共用边界会让小量纲通道全部落入"平"档（Q4 量纲漏洞修订）。
+    同一 version 覆盖 sentiment/price/volume 三行。
+    """
+    __tablename__ = "binning_snapshots"
+    __table_args__ = (
+        UniqueConstraint("version", "channel", name="uq_binning_version_channel"),
+        Index("ix_binning_snapshots_channel", "channel"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    version: Mapped[str] = mapped_column(
+        String(40), nullable=False, comment="快照版本号（同一版本覆盖三通道各一行）"
+    )
+    channel: Mapped[str] = mapped_column(
+        String(20), nullable=False, comment="sentiment | price | volume"
+    )
+    edges: Mapped[list] = mapped_column(
+        JSONB, nullable=False, comment="[q20, q40, q60, q80] 分位边界"
+    )
+    sample_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, comment="计算边界时的差值样本数"
+    )
+    created_at_epoch: Mapped[float] = mapped_column(
+        Float, nullable=False, comment="冻结时刻 epoch 秒（与 symbolizer 对齐）"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
     )
 
 
@@ -496,6 +566,128 @@ class HealthSnapshot(Base):
     )
     report: Mapped[dict] = mapped_column(
         JSONB, nullable=False, comment="HealthReport 完整 JSON"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+# ============================================================
+# 假突破信号表（日线阻力破位，暂不下注，只记录+提醒+到期结算回读）
+# ============================================================
+
+class FakeBreakoutSignal(Base):
+    """
+    日线阻力假突破信号：秒级检测 BTC 盘中冲高破位瞬间落表。
+
+    策略口径（回测验证）：5m 瞬间入场 + 15m 兑现，BTC 方向胜率 80%。
+    当前阶段不下注——只记录信号、邮件推送，到期后回读 BTC 价格回填结算方向，
+    用于积累 15m 市场真实赔率与可成交性数据。
+    """
+    __tablename__ = "fake_breakout_signals"
+    __table_args__ = (
+        Index("ix_fbs_signal_time", "signal_time"),
+        Index("ix_fbs_status", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    signal_time: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, comment="破位检测时刻（ms，秒级检测循环触发）"
+    )
+    resistance: Mapped[float] = mapped_column(
+        Float, nullable=False, comment="当时日线阻力位（前 288 个 5m 窗口 closes 的 max）"
+    )
+    btc_price: Mapped[float] = mapped_column(
+        Float, nullable=False, comment="破位时刻 BTC 现货中间价"
+    )
+    eps: Mapped[float] = mapped_column(
+        Float, nullable=False, comment="触发阈值快照（破位幅度，如 0.0005）"
+    )
+    down_price_5m: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="信号时刻 5m 市场 DOWN token 最近采样报价"
+    )
+    down_price_15m: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="信号时刻 15m 市场 DOWN token 最近采样报价"
+    )
+    market_end_15m: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, comment="当时 15m 市场 end_date（ms，即到期结算时刻）"
+    )
+    settle_deadline: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, comment="结算回读死线（ms）= signal_time + 15min + 缓冲"
+    )
+    settle_btc_price: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="结算时刻 BTC 现货中间价（到期回读回填）"
+    )
+    settle_outcome: Mapped[str | None] = mapped_column(
+        String(10), nullable=True,
+        comment="结算方向 UP | DOWN（只看符号：settle_btc < btc_price → DOWN 赢）"
+    )
+    status: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="PENDING", server_default="PENDING",
+        comment="PENDING | SETTLED | EXPIRED（数据缺失无法结算）"
+    )
+    email_sent: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=func.false(),
+        comment="信号触发邮件是否已推送"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+# ============================================================
+# 模式回测快照表（每个模式每次回测的完整记录，支撑无限进化与前后对比）
+# ============================================================
+
+class PatternBacktestRun(Base):
+    """
+    模式单次回测快照：定期重回测调度（新数据累积阈值触发）为每个模式落一条。
+
+    前端展示两个维度：
+    - 横向对比：同一时刻不同模式的回测指标对比
+    - 纵向对比：同一模式随时间的回测指标漂移（胜率/CI/EV 变化曲线）
+    """
+    __tablename__ = "pattern_backtest_runs"
+    __table_args__ = (
+        Index("ix_pbr_pattern_id", "pattern_id"),
+        Index("ix_pbr_created_at", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    pattern_id: Mapped[int] = mapped_column(
+        Integer, nullable=False,
+        comment="关联 pattern_memory.id（软关联，不加外键避免模式删除牵连历史）"
+    )
+    data_start: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, comment="本次回测数据范围起点（ms）"
+    )
+    data_end: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, comment="本次回测数据范围终点（ms）"
+    )
+    sample_count: Mapped[int] = mapped_column(Integer, nullable=False, comment="命中样本数")
+    correct_count: Mapped[int] = mapped_column(Integer, nullable=False, comment="命中且方向正确数")
+    win_rate: Mapped[float] = mapped_column(Float, nullable=False, comment="胜率 0~1")
+    wilson_lower: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="Wilson 95% 置信下界"
+    )
+    wilson_upper: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="Wilson 95% 置信上界"
+    )
+    ev_after_fee: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+        comment="费后 EV 估算（0.5 定价口径：(1-0.02)/0.51-1 ≈ +0.9216 / -1）"
+    )
+    segment_stats: Mapped[dict | None] = mapped_column(
+        JSONB, nullable=True,
+        comment="分段细节 JSON（按行情段/月段的胜率与样本数，供纵向对比）"
+    )
+    delta_vs_prev: Mapped[dict | None] = mapped_column(
+        JSONB, nullable=True,
+        comment="与上一次回测的细节对比差异（胜率漂移/新增样本分段表现等）"
+    )
+    trigger_reason: Mapped[str] = mapped_column(
+        String(20), nullable=False,
+        comment="触发原因：SCHEDULED | DATA_THRESHOLD | MANUAL"
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

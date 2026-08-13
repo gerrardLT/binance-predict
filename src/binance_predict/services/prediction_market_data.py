@@ -35,12 +35,13 @@ from . import clock_sync
 @dataclass(frozen=True)
 class MarketQuoteData:
     """
-    5 分钟 BTC 预测市场的只读报价快照
+    BTC 预测市场的只读报价快照（单周期）
 
     所有字段均为只读，不包含任何 token_id 或市场状态对象，
-    仅供情绪曲线采样使用。
+    仅供情绪曲线采样使用。period 标识市场周期（5m | 15m）。
     """
 
+    period: str
     up_price: float | None
     down_price: float | None
     up_chance: float | None
@@ -117,19 +118,39 @@ class PredictionMarketDataService:
         await clock_sync.sync_server_time()
 
     async def fetch_market_data(self) -> MarketQuoteData:
-        """
-        查询活跃的 5 分钟 BTC 预测市场，返回只读报价快照
+        """查询 5 分钟 BTC 预测市场报价（向后兼容包装，内部走 fetch_market_data_multi）。"""
+        quotes = await self.fetch_market_data_multi()
+        return quotes.get("5m") or MarketQuoteData(
+            "5m", None, None, None, None, None, None, None, None
+        )
 
-        筛选 chartType=CRYPTO_UP_DOWN 且 symbol=BTCUSDT 且 title/slug 含 '5m' 的市场，
-        直接提取 outcome 中的 price/chance 及市场元数据。
+    @staticmethod
+    def _classify_period(market: dict) -> str | None:
+        """按 title/slug 识别市场周期：'5m' | '15m' | None（其他周期暂不关注）。"""
+        title = (market.get("title") or "").lower()
+        slug = (market.get("slug") or "").lower()
+        text = f"{title} {slug}"
+        # 先判 15m 再判 5m（'15m' 包含 '5m' 子串）
+        if "15m" in text:
+            return "15m"
+        if "5m" in text:
+            return "5m"
+        return None
+
+    async def fetch_market_data_multi(self) -> dict[str, MarketQuoteData]:
+        """
+        查询活跃的 BTC 预测市场，返回 5m/15m 两个周期的只读报价快照
+
+        筛选 chartType=CRYPTO_UP_DOWN 且 symbol=BTCUSDT 的市场，按 title/slug
+        中的周期标记分类（'5m'/'15m'），直接提取 outcome 中的 price/chance 及元数据。
 
         与交易模块不同，本方法：
         - 不缓存 token_id
         - 不修改任何外部状态
-        - 无论成功与否都返回 MarketQuoteData（失败时字段全为 None）
+        - 无论成功与否都返回 dict（失败时对应周期缺席）
 
         Returns:
-            MarketQuoteData: 只读报价快照。若 API 失败或无 5m 市场，各字段为 None。
+            dict[str, MarketQuoteData]: key 为 '5m'/'15m'；API 失败时返回空 dict。
         """
         params = self._sign_request({
             "limit": 50,
@@ -151,21 +172,13 @@ class PredictionMarketDataService:
                 e.response.status_code,
                 e.response.text,
             )
-            return MarketQuoteData(None, None, None, None, None, None, None, None)
+            return {}
         except Exception as e:
             logger.error("读取预测市场数据失败: {}", e)
-            return MarketQuoteData(None, None, None, None, None, None, None, None)
+            return {}
 
         markets = data.get("marketTopics", [])
-
-        up_price: float | None = None
-        down_price: float | None = None
-        up_chance: float | None = None
-        down_chance: float | None = None
-        participants: int | None = None
-        trade_volume: float | None = None
-        end_date: int | None = None
-        start_date: int | None = None
+        quotes: dict[str, MarketQuoteData] = {}
 
         for market in markets:
             if (
@@ -174,19 +187,14 @@ class PredictionMarketDataService:
             ):
                 continue
 
-            # 仅关注 5 分钟市场（title 含 '5m' 或 slug 含 '5m'）
-            is_5m = (
-                "5m" in (market.get("title") or "").lower()
-                or "5m" in (market.get("slug") or "").lower()
-            )
-            if not is_5m:
+            period = self._classify_period(market)
+            if period is None or period in quotes:
                 continue
 
-            # 市场元数据
-            participants = market.get("participantCount")
-            trade_volume = market.get("tradeVolume")
-            start_date = market.get("startDate")
-            end_date = market.get("endDate")
+            up_price: float | None = None
+            down_price: float | None = None
+            up_chance: float | None = None
+            down_chance: float | None = None
 
             # 提取 UP/DOWN 的 price/chance（不缓存 tokenId）
             for sub_market in market.get("markets", []):
@@ -202,27 +210,25 @@ class PredictionMarketDataService:
                         down_price = float(price) if price is not None else None
                         down_chance = float(chance) if chance is not None else None
 
-            # 找到首个 5m 市场即可停止
-            break
+            quotes[period] = MarketQuoteData(
+                period=period,
+                up_price=up_price,
+                down_price=down_price,
+                up_chance=up_chance,
+                down_chance=down_chance,
+                participants=market.get("participantCount"),
+                trade_volume=market.get("tradeVolume"),
+                end_date=market.get("endDate"),
+                start_date=market.get("startDate"),
+            )
 
+        q5 = quotes.get("5m")
+        q15 = quotes.get("15m")
         logger.debug(
-            "读取 5m 预测报价 | UP={}({:.1%}) / DOWN={}({:.1%}) | 参与者={} | 交易量={} | end_date={}",
-            up_price,
-            up_chance or 0,
-            down_price,
-            down_chance or 0,
-            participants,
-            trade_volume,
-            end_date,
+            "读取预测报价 | 5m DOWN={} end={} | 15m DOWN={} end={}",
+            q5.down_price if q5 else None,
+            q5.end_date if q5 else None,
+            q15.down_price if q15 else None,
+            q15.end_date if q15 else None,
         )
-
-        return MarketQuoteData(
-            up_price=up_price,
-            down_price=down_price,
-            up_chance=up_chance,
-            down_chance=down_chance,
-            participants=participants,
-            trade_volume=trade_volume,
-            end_date=end_date,
-            start_date=start_date,
-        )
+        return quotes

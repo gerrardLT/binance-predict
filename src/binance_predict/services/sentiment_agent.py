@@ -31,24 +31,31 @@ from ..config.settings import settings
 from ..db.engine import async_session_factory
 from ..db.models import (
     AgentPrediction,
+    BinningSnapshotModel,
     PatternChangeLog,
     PatternMemory,
     SentimentWindow,
 )
 from .agent_logic import (
+    HIT_CONCORDANT,
+    HIT_CONFLICT,
+    HIT_NONE,
+    HIT_SINGLE,
     PatternRow,
     PatternStat,
+    PredicateHit,
     TradeGateContext,
     WindowRow,
-    compress_windows_for_deep_learn,
     compute_is_correct,
     compute_pattern_fingerprint,
     detect_duplicate_pattern,
     evaluate_trade_gate,
     is_prediction_stale,
+    pattern_confidence,
     plan_active_patterns,
     plan_learn_windows,
     recompute_win_rate,
+    resolve_predicate_hits,
     select_retire_candidates,
     should_trade,
 )
@@ -60,21 +67,50 @@ from .backtest import (
     wilson_lower_bound,
 )
 from .curve_features import (
-    FEATURE_DIM,
     cluster_windows,
     extract_features,
 )
+from .discovery import (
+    VERDICT_ACTIVE,
+    VERDICT_OBSERVE,
+    screen_hypotheses,
+)
+from .ev_gate import hypothesis_ev, truncate_to_decision_point
+from .hypothesis_miner import mine_hints
 from .llm_service import LLMService
 from .llm_validator import (
+    validate_arbitrate_output,
     validate_evolve_output,
     validate_learn_output,
-    validate_predict_output,
 )
+from .predicates import evaluate_predicate
 from .prediction_trading import BinancePredictionTrader
 from .risk_control import RiskController
+from .symbolizer import (
+    CHANNEL_FIELDS,
+    BinningSnapshot,
+    WindowView,
+    build_window_view,
+    compute_channel_snapshots,
+    should_freeze,
+)
+from .verification import (
+    DEATH_ALIVE,
+    DEATH_EXPIRED,
+    DEATH_SPURIOUS,
+    MIN_DEATH_HITS,
+    diagnose_death,
+    live_lift_summary,
+    pooled_local_baseline,
+)
 
 if TYPE_CHECKING:
     from ..models.schemas import ChangeType
+
+
+# Q7-2 反馈循环：注入 Deep Learn prompt 的负样本（SPURIOUS 死亡模式）条数上限，
+# 与发现预算（每轮 ≤20 条假设）协调，防 token 膨胀
+_FEEDBACK_NEGATIVE_LIMIT: int = 20
 
 
 class SentimentAgent:
@@ -284,6 +320,8 @@ class SentimentAgent:
             "correct_count": pattern.correct_count,
             "confidence_score": pattern.confidence_score,
             "status": pattern.status,
+            "predicate": pattern.predicate,
+            "binning_version": pattern.binning_version,
         }
 
     async def apply_pattern_change(
@@ -338,6 +376,9 @@ class SentimentAgent:
                 holdout_win_rate=pattern_data.get("holdout_win_rate"),
                 holdout_sample_count=pattern_data.get("holdout_sample_count"),
                 holdout_ci_lower=pattern_data.get("holdout_ci_lower"),
+                # 科学发现轨（Q4/Q5）：谓词 DSL 与发现时的分箱快照版本
+                predicate=pattern_data.get("predicate"),
+                binning_version=pattern_data.get("binning_version"),
             )
             session.add(new_pattern)
             # flush 以获取自增 id（同一事务内）
@@ -380,7 +421,7 @@ class SentimentAgent:
             # 记录变更前快照
             before_snapshot = self._pattern_to_snapshot(pattern)
 
-            # 更新指定字段（仅更新 LLM 可写的业务字段 + Deep Learn 样本外统计）
+            # 更新指定字段（仅更新 LLM 可写的业务字段 + Deep Learn 样本外统计 + 谓词轨字段）
             updatable_fields = (
                 "pattern_name",
                 "description",
@@ -392,6 +433,8 @@ class SentimentAgent:
                 "holdout_win_rate",
                 "holdout_sample_count",
                 "holdout_ci_lower",
+                "predicate",
+                "binning_version",
             )
             for field in updatable_fields:
                 if field in pattern_data:
@@ -435,8 +478,13 @@ class SentimentAgent:
             # 记录变更前快照
             before_snapshot = self._pattern_to_snapshot(pattern)
 
-            # 置为 RETIRED
+            # 置为 RETIRED；Q7-1：死因判定时回填 death_cause / lifespan_days
+            # （调用方未提供时保持 None——上限淘汰等非死因路径不写这两列）
             pattern.status = "RETIRED"
+            if pattern_data.get("death_cause") is not None:
+                pattern.death_cause = pattern_data["death_cause"]
+            if pattern_data.get("lifespan_days") is not None:
+                pattern.lifespan_days = pattern_data["lifespan_days"]
 
             # 记录变更后快照（status 已为 RETIRED）
             after_snapshot = self._pattern_to_snapshot(pattern)
@@ -779,6 +827,12 @@ class SentimentAgent:
                     "end_time": w.end_time,
                     "curve_up_pct": w.curve_up_pct,
                     "curve_down_pct": w.curve_down_pct,
+                    # 科学发现轨三通道（Q2）：价格与交易量曲线供 price/volume 通道符号化
+                    "curve_btc_price": w.curve_btc_price,
+                    "curve_trade_volume": w.curve_trade_volume,
+                    # 经济闸入场价来源（V1.1，Q6 第 5 步）：真实 token 价曲线
+                    "curve_up_price": w.curve_up_price,
+                    "curve_down_price": w.curve_down_price,
                     "outcome": w.outcome,
                     "actual_return": w.actual_return,
                     "sample_count": w.sample_count,
@@ -807,60 +861,346 @@ class SentimentAgent:
             sampled = self._uniform_sample(sampled, max_windows)
         return sampled
 
-    @staticmethod
-    def _direction_centroid(windows: list[dict], direction: str) -> np.ndarray:
-        """取 windows 中 outcome==direction 的窗口特征质心作代表向量。
+    async def _load_latest_binning_snapshots(self) -> dict[str, BinningSnapshot]:
+        """读取 binning_snapshots 表最新一版快照（created_at_epoch 降序首见即最新）。"""
+        async with async_session_factory() as session:
+            stmt = select(BinningSnapshotModel).order_by(
+                BinningSnapshotModel.created_at_epoch.desc(),
+                BinningSnapshotModel.id.desc(),
+            )
+            rows = (await session.execute(stmt)).scalars().all()
+        latest: dict[str, BinningSnapshot] = {}
+        for row in rows:
+            if row.channel in latest:
+                continue
+            latest[row.channel] = BinningSnapshot(
+                version=row.version,
+                edges=tuple(float(x) for x in row.edges),  # type: ignore[arg-type]
+                created_at_epoch=float(row.created_at_epoch),
+                sample_count=int(row.sample_count),
+            )
+        return latest
 
-        供 LLM_DEEP discovery 复用同一 holdout 匹配/去重路径（LLM 产出无数值向量，
-        以其方向对应的历史窗口质心代表其形态）。无匹配窗口返回零向量。
+    async def _load_binning_snapshots_by_versions(
+        self, versions: set[str]
+    ) -> dict[str, dict[str, BinningSnapshot]]:
+        """按版本集合加载分箱快照（Predict 谓词符号化用，宪法第八条规则 2）。
+
+        仪器精度对齐：模式须以其出生 binning_version 对应的边界符号化。
+        返回 {version: {channel: BinningSnapshot}}；表中不存在的版本缺席，
+        由调用方跳过对应模式并记 warning（不静默降级）。
         """
-        vecs = [
-            extract_features(w.get("curve_up_pct") or [], w.get("curve_down_pct") or [])
-            for w in windows
-            if (w.get("outcome") or "").upper() == (direction or "").upper()
+        if not versions:
+            return {}
+        async with async_session_factory() as session:
+            stmt = select(BinningSnapshotModel).where(
+                BinningSnapshotModel.version.in_(sorted(versions))
+            )
+            rows = (await session.execute(stmt)).scalars().all()
+        result: dict[str, dict[str, BinningSnapshot]] = {}
+        for row in rows:
+            result.setdefault(row.version, {})[row.channel] = BinningSnapshot(
+                version=row.version,
+                edges=tuple(float(x) for x in row.edges),  # type: ignore[arg-type]
+                created_at_epoch=float(row.created_at_epoch),
+                sample_count=int(row.sample_count),
+            )
+        return result
+
+    async def _ensure_binning_snapshots(
+        self, windows: list[dict]
+    ) -> dict[str, BinningSnapshot]:
+        """分箱快照管理（Q4）：返回当前生效的每通道独立分箱快照。
+
+        读 binning_snapshots 最新版 → should_freeze 判定（从未冻结或距上次 >=30 天，
+        或通道覆盖不全）→ 需冻结时用本次采样窗口计算每通道独立分位边界并以新
+        版本号落库（同一 version 三通道各一行）。冻结失败（全部通道样本不足）
+        时退回旧版快照并记 warning，不静默吞错。
+        """
+        latest = await self._load_latest_binning_snapshots()
+        probe = next(iter(latest.values()), None)
+        if (
+            len(latest) >= len(CHANNEL_FIELDS)
+            and not should_freeze(probe)
+        ):
+            return latest
+
+        now = time.time()
+        version = f"v{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+        snapshots = compute_channel_snapshots(windows, version, created_at_epoch=now)
+        if not snapshots:
+            logger.warning(
+                "Deep Learn: 分箱冻结失败（全部通道差值样本不足），退回旧版快照 | 旧版通道={}",
+                sorted(latest.keys()),
+            )
+            return latest
+
+        rows = [
+            BinningSnapshotModel(
+                version=snap.version,
+                channel=channel,
+                edges=list(snap.edges),
+                sample_count=snap.sample_count,
+                created_at_epoch=snap.created_at_epoch,
+            )
+            for channel, snap in snapshots.items()
         ]
-        if not vecs:
-            return np.zeros(FEATURE_DIM, dtype=float)
-        return np.mean(np.vstack(vecs), axis=0)
+        async with async_session_factory() as session:
+            session.add_all(rows)
+            await session.commit()
+        logger.info(
+            "Deep Learn: 分箱快照已冻结 | version={} | 通道={}",
+            version,
+            sorted(snapshots.keys()),
+        )
+        return snapshots
 
-    def _finalize_llm_discoveries(
-        self,
-        discoveries: list[dict],
-        train_windows: list[dict],
-        holdout_windows: list[dict],
-    ) -> list[dict]:
-        """为 LLM discoveries 附加 holdout 统计与 discovery_method='LLM_DEEP'。
+    @staticmethod
+    def _snapshots_version(snapshots: dict[str, BinningSnapshot]) -> str | None:
+        """从快照 dict 提取版本号（同一 version 覆盖三通道；空 dict 返回 None）。"""
+        probe = next(iter(snapshots.values()), None)
+        return probe.version if probe is not None else None
 
-        每条 discovery 以其方向在 train 内的特征质心为代表向量，存入
-        curve_features['_feature_vector']（供 holdout 匹配与 P1-3 去重复用），
-        再在 holdout 上回测胜率/样本/Wilson 下界。
+    @staticmethod
+    def _view_to_payload(view: WindowView) -> dict:
+        """WindowView → LLM 消费的序列化 payload（Q1：符号串为主，几何摘要为辅）。
+
+        geometry 剔除 extrema 明细（逐极值点列表 token 开销大且对 LLM 无增益，
+        其统计结论已含于 peak_count/extremum_spacing）。
         """
-        for d in discoveries:
-            direction = d.get("predicted_direction") or ""
-            vec = self._direction_centroid(train_windows, direction)
-            cf = d.get("curve_features")
-            cf = dict(cf) if isinstance(cf, dict) else {}
-            cf["_feature_vector"] = vec.tolist()
-            d["curve_features"] = cf
-            stats = evaluate_on_holdout(vec, direction, holdout_windows)
-            d["discovery_method"] = "LLM_DEEP"
-            d["holdout_win_rate"] = stats["win_rate"]
-            d["holdout_sample_count"] = stats["sample_count"]
-            d["holdout_ci_lower"] = stats["ci_lower"]
-        return discoveries
+        return {
+            "start_time": view.start_time,
+            "outcome": view.outcome,
+            "channels": {
+                channel: {
+                    "symbols": cv.symbols,
+                    "geometry": {
+                        k: v for k, v in cv.geometry.items() if k != "extrema"
+                    },
+                }
+                for channel, cv in view.channels.items()
+            },
+        }
+
+    @staticmethod
+    def _current_window_dict(window_end_ms: int, current_curve: list[dict]) -> dict:
+        """PREDICT 事件 current_curve → build_window_view 输入形态（宪法第八条规则 3）。
+
+        current_curve 每点形态 {t, up_pct, down_pct, btc_price, trade_volume}
+        （main.py 从 _pm_history 切片）；本方法拆为三通道 [{t, v}] 曲线。
+        v=None 的点被 symbolizer._series_values 防御跳过，对应通道有效点 <2
+        时不产生符号，谓词对缺失通道按防御求值 False。
+        """
+        def _points(key: str) -> list[dict]:
+            return [{"t": p.get("t"), "v": p.get(key)} for p in current_curve]
+
+        return {
+            # start_time 仅供 WindowView 记录（谓词执行不读），取首个采样时刻，
+            # 空曲线时回推 5min 窗口起点（Q3）
+            "start_time": (
+                int(current_curve[0].get("t") or 0)
+                if current_curve
+                else window_end_ms - 300_000
+            ),
+            "curve_up_pct": _points("up_pct"),
+            "curve_btc_price": _points("btc_price"),
+            "curve_trade_volume": _points("trade_volume"),
+        }
+
+    def _screen_and_serialize(
+        self,
+        hypotheses: list,
+        holdout_views: list[WindowView],
+        binning_version: str | None,
+        holdout_windows: list[dict] | None = None,
+    ) -> list[dict]:
+        """Q6 初筛流水线 + 序列化为 DeepLearnDiscovery 兼容 dict（预览与 commit 用）。
+
+        LLM 只产出假设（predicate + target_outcome + 命名/描述），统计审判全部
+        由 screen_hypotheses 在 holdout 符号化视图上完成（宪法第〇条角色分离）。
+        每条假设附加 screen_* 审判证据；holdout_* 三列不再由新轨填充（旧轨
+        pycluster 保留该路径）。REJECT 原因非静默落 screen_reject_reason。
+
+        V1.1（Q6 第 5 步经济闸）：双轨 ACTIVE 的假设另算入场价经济账
+        （ev_gate.hypothesis_ev，需 holdout_windows 提供价格曲线），
+        费后 EV CI 下界 ≤0 或注数不足 → 降级 OBSERVE（经济功效不足而非
+        模式无效，与 FDR 降级同语义）；screen_ev_* 证据随裁决一并返回。
+        """
+        # 防御式过滤半成品（流式 partial 可能字段残缺；非流式 Pydantic 已保证完整）
+        valid = [
+            h
+            for h in hypotheses
+            if getattr(h, "pattern_name", None)
+            and getattr(h, "predicate", None)
+            and getattr(h, "target_outcome", None) in ("UP", "DOWN")
+        ]
+        hypotheses_dicts = [
+            {"predicate": h.predicate, "target_outcome": h.target_outcome}
+            for h in valid
+        ]
+        screened = screen_hypotheses(hypotheses_dicts, holdout_views)
+
+        results: list[dict] = []
+        for h, s in zip(valid, screened):
+            lr = s.lift_result
+            verdict = s.verdict
+            ev_result = None
+            # Q6 第 5 步经济闸（V1.1）：仅双轨 ACTIVE 需要经济账；不通过降 OBSERVE
+            if (
+                settings.agent_ev_gate_enabled
+                and verdict == VERDICT_ACTIVE
+                and holdout_windows is not None
+            ):
+                ev_result = hypothesis_ev(
+                    h.predicate,
+                    h.target_outcome,
+                    holdout_views,
+                    holdout_windows,
+                    t_sec=settings.agent_decision_point_sec,
+                )
+                if not ev_result.passed:
+                    verdict = VERDICT_OBSERVE
+            results.append({
+                "operation": "CREATE",
+                "target_pattern_id": None,
+                "pattern_name": h.pattern_name,
+                "description": getattr(h, "description", "") or "",
+                "curve_features": {},
+                "conditions": {},
+                # 谓词命中时的预期偏向映射到旧方向字段（保持前端/Schema 兼容）
+                "predicted_direction": h.target_outcome,
+                "confidence_score": getattr(h, "confidence_score", None) or 0.0,
+                "change_reason": getattr(h, "rationale", "") or "",
+                "discovery_method": "LLM_DEEP",
+                "predicate": h.predicate,
+                "binning_version": binning_version,
+                "screen_verdict": verdict,
+                "screen_lift": lr.lift if lr else None,
+                "screen_ci_lower": lr.ci_lower if lr else None,
+                "screen_ci_upper": lr.ci_upper if lr else None,
+                "screen_hit_count": len(s.hit_start_times),
+                "screen_reject_reason": s.reject_reason,
+                # 经济闸证据（V1.1；非 ACTIVE 候选为 None）
+                "screen_ev": (
+                    round(ev_result.ev, 4)
+                    if ev_result is not None and ev_result.ev is not None
+                    else None
+                ),
+                "screen_ev_ci_lower": (
+                    round(ev_result.ev_ci_lower, 4)
+                    if ev_result is not None and ev_result.ev_ci_lower is not None
+                    else None
+                ),
+                "screen_ev_ci_upper": (
+                    round(ev_result.ev_ci_upper, 4)
+                    if ev_result is not None and ev_result.ev_ci_upper is not None
+                    else None
+                ),
+                "screen_ev_fires": ev_result.n_fires if ev_result is not None else None,
+                "screen_ev_passed": ev_result.passed if ev_result is not None else None,
+            })
+        return results
+
+    async def _load_discovery_feedback(self) -> dict:
+        """组装 Deep Learn 反馈包（宪法 Q7-2 反馈策略）。
+
+        - negatives（负样本）：SPURIOUS 死亡的谓词模式全量细节（名称/谓词/方向/
+          描述/live 统计），波普尔排除法——被证伪的结构禁止重提
+        - positive_summary（正样本）：存活 ACTIVE 谓词模式的统计摘要（数量/平均
+          胜率/方向分布），**不含谓词结构**——防近亲繁殖导致全库同质化
+        - lifespan_stats（元信息）：EXPIRED 死亡的 lifespan_days 分布——
+          规律的预期寿命量级，引导 LLM 提稳健、跨 regime 的结构
+        """
+        async with async_session_factory() as session:
+            # 负样本：最近处决的 SPURIOUS 谓词模式（上限防 token 膨胀）
+            neg_stmt = (
+                select(PatternMemory)
+                .where(
+                    PatternMemory.death_cause == DEATH_SPURIOUS,
+                    PatternMemory.predicate.isnot(None),
+                )
+                .order_by(PatternMemory.updated_at.desc())
+                .limit(_FEEDBACK_NEGATIVE_LIMIT)
+            )
+            negatives = (await session.execute(neg_stmt)).scalars().all()
+
+            # 正样本摘要：只取统计字段（不取谓词结构）
+            pos_stmt = select(
+                PatternMemory.predicted_direction,
+                PatternMemory.win_rate,
+            ).where(
+                PatternMemory.status == "ACTIVE",
+                PatternMemory.predicate.isnot(None),
+            )
+            pos_rows = (await session.execute(pos_stmt)).all()
+
+            # 存活期：EXPIRED 死亡的 lifespan_days
+            life_stmt = select(PatternMemory.lifespan_days).where(
+                PatternMemory.death_cause == DEATH_EXPIRED,
+                PatternMemory.lifespan_days.isnot(None),
+            )
+            lifespans = sorted(
+                float(x) for x in (await session.execute(life_stmt)).scalars().all()
+            )
+
+        positive_count = len(pos_rows)
+        direction_dist = Counter((r[0] or "UNKNOWN") for r in pos_rows)
+        n = len(lifespans)
+        lifespan_stats = {
+            "count": n,
+            "mean": round(sum(lifespans) / n, 2) if n else None,
+            "median": (
+                round(
+                    lifespans[n // 2]
+                    if n % 2
+                    else (lifespans[n // 2 - 1] + lifespans[n // 2]) / 2,
+                    2,
+                )
+                if n
+                else None
+            ),
+            "max": lifespans[-1] if n else None,
+        }
+
+        return {
+            "negatives": [
+                {
+                    "pattern_name": p.pattern_name,
+                    "predicate": p.predicate,
+                    "predicted_direction": p.predicted_direction,
+                    "description": p.description,
+                    "win_rate": p.win_rate,
+                    "sample_count": p.sample_count,
+                }
+                for p in negatives
+            ],
+            "positive_summary": {
+                "count": positive_count,
+                "avg_win_rate": (
+                    round(sum(float(r[1] or 0.0) for r in pos_rows) / positive_count, 4)
+                    if positive_count
+                    else 0.0
+                ),
+                "up_count": direction_dist.get("UP", 0),
+                "down_count": direction_dist.get("DOWN", 0),
+            },
+            "lifespan_stats": lifespan_stats,
+        }
 
     async def deep_learn(
         self,
         max_windows: int | None = None,
     ) -> dict:
         """
-        深度模式发现（手动触发）：分析全量历史窗口，返回发现结果供用户预览。
+        深度模式发现（科学发现轨，Phase 2）：LLM 作为假设生成器，程序做统计审判。
 
-        与 learn() 的区别：
-        - 读取全量窗口（不限于最近 50）
-        - 全量原始曲线直接输入 LLM（不压缩，保留完整曲线形态）
-        - LLM max_tokens 更大（16384）
-        - **不直接写入 DB**，返回 discoveries 列表
+        流程（宪法第〇条角色分离 + Q1/Q4/Q6）：
+        1. 时间分层采样取数（P0-1）
+        2. 分箱快照管理（Q4：读 binning_snapshots，到期/缺失则冻结新版）
+        3. time_split（P0-2：LLM 仅看 train 符号串，holdout 真正留出）
+        4. LLM 消费 train 符号化视图，产出谓词假设（不做任何自我验证）
+        5. 程序在 holdout 符号化视图上跑 Q6 初筛流水线（screen_hypotheses）
+        6. 返回假设 + screen_* 审判证据供预览；不直接写 DB（commit 走 Q6 闸门）
 
         Args:
             max_windows: 最大读取窗口数，默认使用 settings.agent_deep_learn_max_windows
@@ -868,7 +1208,8 @@ class SentimentAgent:
         Returns:
             dict 包含：
             - reasoning: LLM 分析推理过程
-            - discoveries: 序列化的发现列表
+            - discoveries: 序列化假设列表（每条含 predicate / screen_* 审判证据）
+            - method / snapshot_token / train_count / holdout_count / binning_version
             用户可通过 commit_deep_learn() 确认后写入 DB
         """
         # 并发保护：同一时刻只允许一个 deep_learn 执行
@@ -881,33 +1222,13 @@ class SentimentAgent:
                 max_windows = settings.agent_deep_learn_max_windows
 
             logger.info(
-                "Deep Learn: 开始历史分析 | days_back={} | max_windows={}",
+                "Deep Learn: 开始科学发现 | days_back={} | max_windows={}",
                 days_back,
                 max_windows,
             )
 
             # Step 1: 时间分层采样取数（P0-1）
             windows_dicts = await self._fetch_deep_learn_windows(days_back, max_windows)
-
-            # 查询 ACTIVE 模式
-            async with async_session_factory() as session:
-                pattern_stmt = select(PatternMemory).where(PatternMemory.status == "ACTIVE")
-                pattern_result = await session.execute(pattern_stmt)
-                active_patterns = [
-                    {
-                        "id": p.id,
-                        "pattern_name": p.pattern_name,
-                        "description": p.description,
-                        "curve_features": p.curve_features,
-                        "conditions": p.conditions,
-                        "predicted_direction": p.predicted_direction,
-                        "win_rate": p.win_rate,
-                        "sample_count": p.sample_count,
-                        "confidence_score": p.confidence_score,
-                    }
-                    for p in pattern_result.scalars().all()
-                ]
-
             if not windows_dicts:
                 logger.warning("Deep Learn: 无可用历史窗口，跳过分析")
                 return {
@@ -917,28 +1238,63 @@ class SentimentAgent:
                     "snapshot_token": snapshot_token([]),
                     "train_count": 0,
                     "holdout_count": 0,
+                    "binning_version": None,
                 }
 
-            # 按时间切 train/holdout（P0-2：LLM 仅看 train，holdout 真正留出）
+            # Step 1.5: 决策点截断对齐（V1.1 规则 8）：发现/初筛与在线 predict
+            # 统一用开窗后前 150s 视图，消除全窗初筛的截断错位；快照同从截断
+            # 视图差值冻结（同一测量仪器，Q4 延伸）
+            windows_dicts = truncate_to_decision_point(
+                windows_dicts, settings.agent_decision_point_sec
+            )
+
+            # Step 2: 分箱快照（Q4：到期/缺失则冻结新版）
+            snapshots = await self._ensure_binning_snapshots(windows_dicts)
+            binning_version = self._snapshots_version(snapshots)
+
+            # Step 3: 按时间切 train/holdout（P0-2：LLM 仅看 train，holdout 真正留出）
             train_windows, holdout_windows = time_split(
                 windows_dicts, settings.agent_deep_learn_holdout_ratio
             )
 
+            # Step 4: train 符号化 → LLM 假设生成；holdout 符号化供初筛
+            train_views = [build_window_view(w, snapshots) for w in train_windows]
+            train_payload = [self._view_to_payload(v) for v in train_views]
+            holdout_views = [
+                build_window_view(w, snapshots) for w in holdout_windows
+            ]
+
             logger.info(
-                "Deep Learn: 数据准备完成 | 采样窗口={} | train={} | holdout={} | ACTIVE 模式={}",
+                "Deep Learn: 数据准备完成 | 采样窗口={} | train={} | holdout={} | "
+                "分箱版本={} | 通道={}",
                 len(windows_dicts),
                 len(train_windows),
                 len(holdout_windows),
-                len(active_patterns),
+                binning_version,
+                sorted(snapshots.keys()),
             )
 
-            # Step 2: LLM 深度分析（仅输入 train 窗口，避免 holdout 泄漏；P1-1 专用超时）
+            # Step 4.5: 反馈包（Q7-2：负样本全量 + 正样本摘要 + 存活期统计）
+            feedback = await self._load_discovery_feedback()
+            logger.info(
+                "Deep Learn: 反馈包就绪 | 负样本={} | 存活 ACTIVE={} | EXPIRED 存活期样本={}",
+                len(feedback["negatives"]),
+                feedback["positive_summary"]["count"],
+                feedback["lifespan_stats"]["count"],
+            )
+
+            # Step 4.6: 假设矿机（程序预筛轨）：train 集穷举谓词 → 线索榜单。
+            # 纯 CPU 计算放入线程，避免阻塞事件循环；只跑 train，holdout 绝不泄漏。
+            hints = await asyncio.to_thread(mine_hints, train_views)
+            logger.info("Deep Learn: 预筛线索榜单就绪 | 线索={}", len(hints))
+
             timeout = settings.agent_deep_learn_timeout
             try:
-                learn_output = await self._llm.agent_deep_learn(
-                    windows=train_windows,
-                    active_patterns=active_patterns,
+                discovery_output = await self._llm.agent_deep_learn(
+                    symbolized_windows=train_payload,
+                    feedback=feedback,
                     timeout=timeout,
+                    hints=hints,
                 )
             except Exception as exc:
                 logger.error(
@@ -949,51 +1305,43 @@ class SentimentAgent:
                 raise
 
             logger.info(
-                "Deep Learn: LLM 返回 {} 条发现 | reasoning={}...",
-                len(learn_output.discoveries),
-                learn_output.reasoning[:200] if learn_output.reasoning else "",
+                "Deep Learn: LLM 返回 {} 条假设 | reasoning={}...",
+                len(discovery_output.hypotheses),
+                discovery_output.reasoning[:200] if discovery_output.reasoning else "",
             )
 
-            # Step 3: 序列化 + 附加 holdout 统计（P0-2 对比 / P0-3 准入依据）
-            discoveries_serialized = []
-            for d in learn_output.discoveries:
-                discoveries_serialized.append({
-                    "operation": d.operation,
-                    "target_pattern_id": d.target_pattern_id,
-                    "pattern_name": d.pattern_name,
-                    "description": d.description,
-                    "curve_features": d.curve_features,
-                    "conditions": d.conditions,
-                    "predicted_direction": d.predicted_direction,
-                    "confidence_score": d.confidence_score,
-                    "change_reason": d.change_reason,
-                })
-            self._finalize_llm_discoveries(
-                discoveries_serialized, train_windows, holdout_windows
+            # Step 5: holdout 初筛（Q6：谓词执行 + lift 检验 + BH-FDR + 裁决）
+            discoveries_serialized = self._screen_and_serialize(
+                list(discovery_output.hypotheses),
+                holdout_views,
+                binning_version,
+                holdout_windows=holdout_windows,
             )
 
             return {
-                "reasoning": learn_output.reasoning or "",
+                "reasoning": discovery_output.reasoning or "",
                 "discoveries": discoveries_serialized,
                 "method": "LLM_DEEP",
                 "snapshot_token": snapshot_token([w["id"] for w in windows_dicts]),
                 "train_count": len(train_windows),
                 "holdout_count": len(holdout_windows),
+                "binning_version": binning_version,
             }
 
     async def deep_learn_stream(
         self,
         max_windows: int | None = None,
     ):
-        """深度模式发现（流式版）：逐步产出事件供前端 SSE 实时展示（打字机效果）。
+        """深度模式发现（流式版，科学发现轨）：逐步产出事件供前端 SSE 实时展示。
 
-        流程与 deep_learn 一致（读全量窗口 → LLM 分析 → 序列化 discoveries，不写 DB），
-        区别在于全程以事件流形式产出，且 LLM 调用走 create_partial 流式 + 空闲超时。
+        流程与 deep_learn 一致（采样 → 分箱快照 → time_split → LLM 假设生成 →
+        Q6 初筛 → 预览，不写 DB），区别在于全程以事件流形式产出，且 LLM 调用
+        走 create_partial 流式 + 空闲超时。
 
         产出事件（dict，交由 main 转成 SSE data 帧）：
         - {"type": "step",      "message": str}        阶段性进度（读取窗口/开始调用等）
         - {"type": "reasoning", "delta": str}          reasoning 增量（打字机）
-        - {"type": "progress",  "discoveries": int}    已解析发现条数
+        - {"type": "progress",  "hypotheses": int}     已解析假设条数
         - {"type": "done",      "reasoning": str, "discoveries": list}  最终结果（供勾选提交）
         - {"type": "error",     "message": str}        并发冲突/空闲超时/流式异常
 
@@ -1009,7 +1357,7 @@ class SentimentAgent:
                 max_windows = settings.agent_deep_learn_max_windows
 
             logger.info(
-                "Deep Learn(stream): 开始历史分析 | days_back={} | max_windows={}",
+                "Deep Learn(stream): 开始科学发现 | days_back={} | max_windows={}",
                 days_back,
                 max_windows,
             )
@@ -1020,25 +1368,6 @@ class SentimentAgent:
 
             # Step 1: 时间分层采样取数（P0-1）
             windows_dicts = await self._fetch_deep_learn_windows(days_back, max_windows)
-
-            async with async_session_factory() as session:
-                pattern_stmt = select(PatternMemory).where(PatternMemory.status == "ACTIVE")
-                pattern_result = await session.execute(pattern_stmt)
-                active_patterns = [
-                    {
-                        "id": p.id,
-                        "pattern_name": p.pattern_name,
-                        "description": p.description,
-                        "curve_features": p.curve_features,
-                        "conditions": p.conditions,
-                        "predicted_direction": p.predicted_direction,
-                        "win_rate": p.win_rate,
-                        "sample_count": p.sample_count,
-                        "confidence_score": p.confidence_score,
-                    }
-                    for p in pattern_result.scalars().all()
-                ]
-
             if not windows_dicts:
                 logger.warning("Deep Learn(stream): 无可用历史窗口，跳过分析")
                 yield {
@@ -1049,37 +1378,57 @@ class SentimentAgent:
                     "snapshot_token": snapshot_token([]),
                     "train_count": 0,
                     "holdout_count": 0,
+                    "binning_version": None,
                 }
                 return
 
-            # 按时间切 train/holdout（P0-2：LLM 仅看 train）
+            # Step 1.5: 决策点截断对齐（V1.1 规则 8），与 deep_learn 同口径
+            windows_dicts = truncate_to_decision_point(
+                windows_dicts, settings.agent_decision_point_sec
+            )
+
+            # Step 2: 分箱快照（Q4）+ time_split（P0-2：LLM 仅看 train）
+            snapshots = await self._ensure_binning_snapshots(windows_dicts)
+            binning_version = self._snapshots_version(snapshots)
             train_windows, holdout_windows = time_split(
                 windows_dicts, settings.agent_deep_learn_holdout_ratio
             )
+            train_views = [build_window_view(w, snapshots) for w in train_windows]
+            train_payload = [self._view_to_payload(v) for v in train_views]
+            holdout_views = [
+                build_window_view(w, snapshots) for w in holdout_windows
+            ]
 
             logger.info(
-                "Deep Learn(stream): 数据准备完成 | 采样窗口={} | train={} | holdout={} | ACTIVE 模式={}",
+                "Deep Learn(stream): 数据准备完成 | 采样窗口={} | train={} | holdout={} | 分箱版本={}",
                 len(windows_dicts),
                 len(train_windows),
                 len(holdout_windows),
-                len(active_patterns),
+                binning_version,
             )
             yield {
                 "type": "step",
                 "message": (
                     f"数据准备完成：采样 {len(windows_dicts)} 个"
                     f"（train {len(train_windows)} / holdout {len(holdout_windows)}）"
-                    f" · ACTIVE 模式 {len(active_patterns)} 条"
+                    f" · 分箱版本 {binning_version or '无'}"
                 ),
             }
 
-            # Step 2: 流式 LLM 深度分析（仅输入 train，避免 holdout 泄漏）
-            yield {"type": "step", "message": f"调用 LLM（model={settings.decision_model}）分析中…"}
+            # Step 3: 反馈包（Q7-2）+ 假设矿机预筛（仅 train，holdout 绝不泄漏）
+            feedback = await self._load_discovery_feedback()
+            hints = await asyncio.to_thread(mine_hints, train_views)
+            yield {
+                "type": "step",
+                "message": f"程序预筛完成：穷举谓词命中线索 {len(hints)} 条",
+            }
+            yield {"type": "step", "message": f"调用 LLM（model={settings.decision_model}）生成谓词假设…"}
             final = None
             async for ev in self._llm.agent_deep_learn_stream(
-                windows=train_windows,
-                active_patterns=active_patterns,
+                symbolized_windows=train_payload,
+                feedback=feedback,
                 idle_timeout=settings.agent_deep_learn_idle_timeout,
+                hints=hints,
             ):
                 if ev.get("type") == "done":
                     final = ev.get("result")
@@ -1094,33 +1443,17 @@ class SentimentAgent:
                 yield {"type": "error", "message": "LLM 未返回任何内容"}
                 return
 
-            # Step 3: 序列化 discoveries（防御式：跳过分片未填满的项）
-            discoveries_serialized = []
-            for d in getattr(final, "discoveries", None) or []:
-                op = getattr(d, "operation", None)
-                name = getattr(d, "pattern_name", None)
-                direction = getattr(d, "predicted_direction", None)
-                if not op or not name or not direction:
-                    continue
-                discoveries_serialized.append({
-                    "operation": op,
-                    "target_pattern_id": getattr(d, "target_pattern_id", None),
-                    "pattern_name": name,
-                    "description": getattr(d, "description", "") or "",
-                    "curve_features": getattr(d, "curve_features", None) or {},
-                    "conditions": getattr(d, "conditions", None) or {},
-                    "predicted_direction": direction,
-                    "confidence_score": getattr(d, "confidence_score", None) or 0.0,
-                    "change_reason": getattr(d, "change_reason", "") or "",
-                })
-
-            # 附加 holdout 统计（P0-2 对比 / P0-3 准入依据）
-            self._finalize_llm_discoveries(
-                discoveries_serialized, train_windows, holdout_windows
+            # Step 4: Q6 初筛审判（谓词执行 + lift 检验 + FDR 控制）+ 序列化
+            yield {"type": "step", "message": "初筛审判中（谓词执行 + lift 检验 + FDR 控制）…"}
+            discoveries_serialized = self._screen_and_serialize(
+                list(getattr(final, "hypotheses", None) or []),
+                holdout_views,
+                binning_version,
+                holdout_windows=holdout_windows,
             )
 
             logger.info(
-                "Deep Learn(stream): 完成 | 有效发现={}",
+                "Deep Learn(stream): 完成 | 有效假设={}",
                 len(discoveries_serialized),
             )
             yield {
@@ -1131,6 +1464,7 @@ class SentimentAgent:
                 "snapshot_token": snapshot_token([w["id"] for w in windows_dicts]),
                 "train_count": len(train_windows),
                 "holdout_count": len(holdout_windows),
+                "binning_version": binning_version,
             }
 
     async def deep_learn_pycluster(
@@ -1274,13 +1608,18 @@ class SentimentAgent:
         self,
         discoveries: list[dict],
     ) -> dict:
-        """将用户确认的 discoveries 写入 pattern_memory（含样本外准入闸门）。
+        """将用户确认的 discoveries 写入 pattern_memory（双轨准入闸门）。
 
-        P2-1 字段校验：pattern_name/predicted_direction/curve_features 必填非空（拦截流式半成品）。
-        P0-3 准入闸门：仅当 holdout_ci_lower > 0.5 且 holdout_sample_count >=
-        settings.agent_deep_learn_min_holdout_samples 才写库；不达标计入 rejected。
-        写库时 confidence_score 用 holdout_ci_lower 覆盖 LLM 主观值，holdout_*/
-        discovery_method 落库；win_rate/sample_count/correct_count 仍初始 0（留给 live 跟踪）。
+        P2-1 字段校验：pattern_name/predicted_direction 必填非空（拦截流式半成品；
+        旧轨另需 curve_features）。
+        准入按轨分流（科学发现 Phase 2，宪法 Q6）：
+        - 谓词轨（predicate 非空）：screen_verdict ACTIVE → status=ACTIVE 直上线；
+          OBSERVE → status=EVOLVING 观察仓攒样本；其余拒绝。仅支持 CREATE。
+          confidence_score 保留 LLM 主观先验，holdout_* 三列不填充，
+          predicate/binning_version 落库（Q4/Q5）。
+        - 旧轨（pycluster/LEGACY）：P0-3 样本外闸门，holdout_ci_lower > 0.5 且
+          holdout_sample_count >= settings.agent_deep_learn_min_holdout_samples
+          才写库；confidence_score 用 holdout_ci_lower 覆盖 LLM 主观值。
         P1-4：UPDATE 目标必须存在且 ACTIVE；写库失败不再静默 continue，收集入 failed。
 
         Args:
@@ -1334,12 +1673,14 @@ class SentimentAgent:
                     operation = d.get("operation", "CREATE")
                     direction = d.get("predicted_direction")
                     curve_features = d.get("curve_features")
+                    predicate = d.get("predicate")
 
                     # P2-1: 必填字段校验（拦截流式半成品）
-                    if not name or not direction or not curve_features:
+                    # 谓词轨（科学发现 Phase 2）无特征向量，不要求 curve_features
+                    if not name or not direction or (not predicate and not curve_features):
                         rejected.append({
                             "name": name,
-                            "reason": "字段残缺（pattern_name/predicted_direction/curve_features 必填非空）",
+                            "reason": "字段残缺（pattern_name/predicted_direction 必填非空；旧轨另需 curve_features）",
                         })
                         logger.warning(
                             "Commit Deep Learn: {}/{} 字段残缺被拒 | '{}'",
@@ -1347,32 +1688,64 @@ class SentimentAgent:
                         )
                         continue
 
-                    # P0-3: 样本外准入闸门
+                    # 准入闸门按轨分流：谓词轨走 Q6 双轨裁决；旧轨走 P0-3 样本外闸门
+                    initial_status: str | None = None
                     ci_lower = d.get("holdout_ci_lower")
                     sample_count = d.get("holdout_sample_count")
-                    if ci_lower is None or sample_count is None:
-                        rejected.append({
-                            "name": name,
-                            "reason": "缺少 holdout 统计，无法通过准入闸门",
-                        })
-                        continue
-                    if not (ci_lower > 0.5 and sample_count >= min_samples):
-                        rejected.append({
-                            "name": name,
-                            "reason": (
-                                f"未过准入闸门（holdout_ci_lower={ci_lower:.3f} 需>0.5，"
-                                f"holdout_sample_count={sample_count} 需>={min_samples}）"
-                            ),
-                        })
-                        logger.info(
-                            "Commit Deep Learn: {}/{} 未过准入闸门被拒 | '{}'",
-                            idx, len(discoveries), name,
-                        )
-                        continue
+                    if predicate:
+                        # 谓词轨（Q6）：screen_verdict ACTIVE → ACTIVE 直上线；
+                        # OBSERVE → EVOLVING 观察仓攒样本；其余（REJECT/缺失）拒绝
+                        verdict = d.get("screen_verdict")
+                        if verdict == VERDICT_ACTIVE:
+                            initial_status = "ACTIVE"
+                        elif verdict == VERDICT_OBSERVE:
+                            initial_status = "EVOLVING"
+                        else:
+                            rejected.append({
+                                "name": name,
+                                "reason": (
+                                    f"初筛裁决 {verdict or '缺失'} 不予写库"
+                                    f"（原因：{d.get('screen_reject_reason') or '无'}）"
+                                ),
+                            })
+                            logger.info(
+                                "Commit Deep Learn: {}/{} 初筛裁决未过被拒 | '{}' verdict={}",
+                                idx, len(discoveries), name, verdict,
+                            )
+                            continue
+                        # 谓词假设无 UPDATE 语义（Phase 2 仅 CREATE）
+                        if operation != "CREATE":
+                            rejected.append({
+                                "name": name,
+                                "reason": "谓词轨仅支持 CREATE（假设无 UPDATE 语义）",
+                            })
+                            continue
+                    else:
+                        # 旧轨（P0-3 样本外准入闸门）：pycluster/LEGACY 保留
+                        if ci_lower is None or sample_count is None:
+                            rejected.append({
+                                "name": name,
+                                "reason": "缺少 holdout 统计，无法通过准入闸门",
+                            })
+                            continue
+                        if not (ci_lower > 0.5 and sample_count >= min_samples):
+                            rejected.append({
+                                "name": name,
+                                "reason": (
+                                    f"未过准入闸门（holdout_ci_lower={ci_lower:.3f} 需>0.5，"
+                                    f"holdout_sample_count={sample_count} 需>={min_samples}）"
+                                ),
+                            })
+                            logger.info(
+                                "Commit Deep Learn: {}/{} 未过准入闸门被拒 | '{}'",
+                                idx, len(discoveries), name,
+                            )
+                            continue
 
                     try:
-                        # CREATE 前去重检查
-                        if operation == "CREATE" and settings.agent_dedup_enabled:
+                        # CREATE 前去重检查（谓词轨跳过：指纹体系基于特征向量/结构化
+                        # key，对谓词模式不适用；谓词精确重复由用户勾选时把关）
+                        if operation == "CREATE" and not predicate and settings.agent_dedup_enabled:
                             all_patterns_for_dedup = existing_patterns + batch_created_patterns
                             existing_id = detect_duplicate_pattern(
                                 curve_features, direction, all_patterns_for_dedup,
@@ -1411,20 +1784,38 @@ class SentimentAgent:
                                 continue
 
                         async with session.begin_nested():
-                            pattern_data = {
-                                "pattern_name": name,
-                                "description": d.get("description"),
-                                "curve_features": curve_features,
-                                "conditions": d.get("conditions"),
-                                "predicted_direction": direction,
-                                # P0-3: confidence 用 holdout_ci_lower 覆盖 LLM 主观值
-                                "confidence_score": ci_lower,
-                                "change_reason": d.get("change_reason", ""),
-                                "discovery_method": d.get("discovery_method", "LEGACY"),
-                                "holdout_win_rate": d.get("holdout_win_rate"),
-                                "holdout_sample_count": sample_count,
-                                "holdout_ci_lower": ci_lower,
-                            }
+                            if predicate:
+                                # 谓词轨：confidence 保留 LLM 主观先验（程序审判证据在
+                                # predicate/screen_*），holdout_* 三列不填充；
+                                # status 由 Q6 闸门决定（ACTIVE 直上线 / EVOLVING 观察仓）
+                                pattern_data = {
+                                    "pattern_name": name,
+                                    "description": d.get("description"),
+                                    "curve_features": {},
+                                    "conditions": {},
+                                    "predicted_direction": direction,
+                                    "confidence_score": d.get("confidence_score") or 0.5,
+                                    "change_reason": d.get("change_reason", ""),
+                                    "discovery_method": d.get("discovery_method", "LLM_DEEP"),
+                                    "status": initial_status,
+                                    "predicate": predicate,
+                                    "binning_version": d.get("binning_version"),
+                                }
+                            else:
+                                pattern_data = {
+                                    "pattern_name": name,
+                                    "description": d.get("description"),
+                                    "curve_features": curve_features,
+                                    "conditions": d.get("conditions"),
+                                    "predicted_direction": direction,
+                                    # P0-3: confidence 用 holdout_ci_lower 覆盖 LLM 主观值
+                                    "confidence_score": ci_lower,
+                                    "change_reason": d.get("change_reason", ""),
+                                    "discovery_method": d.get("discovery_method", "LEGACY"),
+                                    "holdout_win_rate": d.get("holdout_win_rate"),
+                                    "holdout_sample_count": sample_count,
+                                    "holdout_ci_lower": ci_lower,
+                                }
                             if operation == "UPDATE":
                                 pattern_data["target_pattern_id"] = d.get("target_pattern_id")
 
@@ -1479,71 +1870,62 @@ class SentimentAgent:
         self, window_end_ms: int, current_curve: list[dict]
     ) -> AgentPrediction | None:
         """
-        预测阶段：基于当前窗口实时曲线与 ACTIVE 模式匹配，给出方向预测并执行交易门控。
+        预测阶段（科学发现宪法第八条，Phase 3）：程序执行谓词匹配（确定性），
+        LLM 降级为仲裁者——仅在多模式命中冲突时消歧，零命中输出 NO_TRADE。
 
-        流程（design.md §2 Predict 段）：
-        1. 读 ACTIVE 模式列表（plan_active_patterns）
-        2. 冷启动检查：若 ACTIVE 模式数为 0 → 直接构造 NO_TRADE 预测记录，不调用 LLM（Req 11.1）
-        3. 否则：计算 remaining_seconds，调用 llm.agent_predict → PredictOutput
-        4. 写 AgentPrediction 记录（prediction_time=now, 映射 PredictOutput 字段）
-        5. 交易门控：should_trade(direction, confidence, threshold)
-           - 通过：调 trader.execute_trade → 回填 trade_order_id
-           - 跳过：写 skip_trade_reason
-        6. LLM 失败/超时/重试耗尽 → 落库 direction=NO_TRADE, confidence=0,
-           reasoning=f"LLM 调用失败: {error}", skip_trade_reason="LLM 调用失败"（Req 3.6）
+        流程（design.md 第八条操作化规则 1~7）：
+        1. 候选集：仅 predicate 非空的 ACTIVE ∪ EVOLVING 模式（predicate 为空的
+           旧模式不删库、live 统计冻结，由 Evolve/手动逐步 RETIRE）；
+           候选为空 → NO_TRADE 冷启动（不调 LLM）
+        2. 仪器精度对齐：按 binning_version 分组候选，加载对应版本快照，每组
+           用其出生版本符号化当前窗口；版本缺失或快照查不到的组跳过并记 warning
+        3. 程序谓词执行：evaluate_predicate 逐模式判定 → 命中集 PredicateHit
+        4. 命中解析四分支（resolve_predicate_hits，顺序不可换）：
+           零命中 → NO_TRADE；单命中 → 直接采用；多命中同向 → 取证据最强者；
+           多命中异向 → 调 LLM 仲裁（agent_arbitrate）
+        5. confidence：程序路径由 pattern_confidence 合成（live win_rate 优先，
+           样本不足回退 LLM 先验）；仲裁路径取 LLM 对选定模式的把握
+        6. entry_timing：程序命中路径恒 NOW（谓词命中即形态已确认）；仲裁路径
+           由 LLM 评估；剩余时间保护（is_prediction_stale）不变
+        7. 写 AgentPrediction + 交易门控（_write_prediction_and_trade 不变；
+           EVOLVING 模式命中仅落库攒 live 样本，二次确认拦截实盘下单）
 
         Args:
             window_end_ms: 当前窗口结束时间戳（毫秒），用于计算剩余时间与匹配窗口 ID
-            current_curve: 当前窗口已采集的实时曲线数据（[{t, v}, ...]），
-                由 Scheduler dispatch 时从 _pm_history 切片传入
+            current_curve: 当前窗口实时采样点（[{t, up_pct, down_pct, btc_price,
+                trade_volume}, ...]），由 Scheduler dispatch 时从 _pm_history 切片传入；
+                btc_price/trade_volume 缺失的点被符号化层跳过，谓词按防御求值 False
 
         Returns:
             写入的 AgentPrediction 实例；极端异常下返回 None
 
         设计约束：
-        - LLM 调用在事务开启前完成（避免长事务占用连接池）
-        - 使用独立 async_session_factory() 会话
-        - commit 后才拿 pred.id 去调交易（保证 id 已分配）
+        - LLM 调用（仅冲突仲裁分支）在事务开启前完成（避免长事务占用连接池）
         - 无静默降级：所有失败路径明确记录原因（规则 3）
         """
-        # ========== Step 1：读取 ACTIVE 模式（只读会话）==========
-        patterns_dicts: list[dict] = []
+        # ========== Step 1：读取谓词模式候选（只读会话）==========
+        candidates: list[dict] = []
 
         async with async_session_factory() as session:
-            pattern_stmt = select(PatternMemory)
-            pattern_result = await session.execute(pattern_stmt)
+            pattern_result = await session.execute(select(PatternMemory))
             raw_patterns = pattern_result.scalars().all()
 
-            # 构建 PatternRow 列表 → 纯函数筛选 ACTIVE
-            pattern_rows = [
-                PatternRow(
-                    id=p.id,
-                    status=p.status,
-                    pattern_name=p.pattern_name,
-                    predicted_direction=p.predicted_direction,
-                )
-                for p in raw_patterns
-            ]
-            active_rows = plan_active_patterns(pattern_rows)
-            # P0-1：候选集 = ACTIVE ∪ EVOLVING（观察态）。EVOLVING 模式参与 LLM 匹配
-            # 以积累 live 样本，但交易门控会二次确认 status==ACTIVE，故不会真正下单。
-            candidate_ids = {pr.id for pr in active_rows} | {
-                p.id for p in raw_patterns if p.status == "EVOLVING"
-            }
-            active_ids = candidate_ids
             for p in raw_patterns:
-                if p.id in active_ids:
-                    patterns_dicts.append({
-                        "id": p.id,
-                        "pattern_name": p.pattern_name,
-                        "description": p.description,
-                        "curve_features": p.curve_features,
-                        "conditions": p.conditions,
-                        "predicted_direction": p.predicted_direction,
-                        "win_rate": p.win_rate,
-                        "sample_count": p.sample_count,
-                        "confidence_score": p.confidence_score,
-                    })
+                # 规则 1：仅谓词模式参与 Predict；EVOLVING 观察态参与匹配以积累
+                # live 样本，交易门控二次确认 status==ACTIVE 才会真正下单
+                if not p.predicate or p.status not in ("ACTIVE", "EVOLVING"):
+                    continue
+                candidates.append({
+                    "id": p.id,
+                    "pattern_name": p.pattern_name,
+                    "description": p.description,
+                    "predicted_direction": p.predicted_direction,
+                    "predicate": p.predicate,
+                    "binning_version": p.binning_version,
+                    "win_rate": p.win_rate,
+                    "sample_count": p.sample_count,
+                    "confidence_score": p.confidence_score,
+                })
 
             # 尝试匹配 sentiment_window_id（窗口可能尚未归档，允许为 None）
             sw_stmt = select(SentimentWindow.id).where(
@@ -1552,44 +1934,159 @@ class SentimentAgent:
             sw_result = await session.execute(sw_stmt)
             sentiment_window_id = sw_result.scalar_one_or_none()
 
-        active_count = len(patterns_dicts)
         logger.info(
-            "Predict: 数据准备完成 | ACTIVE 模式={} | 曲线点数={} | window_end_ms={}",
-            active_count,
+            "Predict: 数据准备完成 | 谓词候选={} | 曲线点数={} | window_end_ms={}",
+            len(candidates),
             len(current_curve),
             window_end_ms,
         )
 
-        # ========== Step 2：冷启动检查（Req 11.1）==========
-        if active_count == 0:
-            logger.info("Predict: 冷启动——ACTIVE 模式数为 0，直接输出 NO_TRADE（不调用 LLM）")
+        # ========== Step 2：冷启动检查（规则 1：候选为空 → NO_TRADE）==========
+        if not candidates:
+            logger.info("Predict: 冷启动——谓词模式候选为 0，直接输出 NO_TRADE（不调用 LLM）")
             return await self._write_prediction_and_trade(
                 predicted_direction="NO_TRADE",
                 matched_pattern_id=None,
                 matched_pattern_name=None,
                 confidence=0.0,
                 entry_timing="SKIP",
-                reasoning="模式库为空，等待学习积累",
+                reasoning="谓词模式库为空，等待发现积累",
                 sentiment_window_id=sentiment_window_id,
             )
 
-        # ========== Step 3：计算剩余时间 + LLM 调用（在事务外完成）==========
+        # ========== Step 3：仪器精度对齐 + 程序谓词执行（规则 2/3）==========
+        by_version: dict[str, list[dict]] = defaultdict(list)
+        for c in candidates:
+            if c["binning_version"]:
+                by_version[c["binning_version"]].append(c)
+            else:
+                logger.warning(
+                    "Predict: 模式 id={} name='{}' 缺 binning_version，跳过",
+                    c["id"],
+                    c["pattern_name"],
+                )
+
+        snapshots_by_version = await self._load_binning_snapshots_by_versions(
+            set(by_version)
+        )
+        window_dict = self._current_window_dict(window_end_ms, current_curve)
+
+        hits: list[PredicateHit] = []
+        views_by_version: dict[str, WindowView] = {}
+        for version, group in by_version.items():
+            snaps = snapshots_by_version.get(version)
+            if not snaps:
+                logger.warning(
+                    "Predict: binning_snapshots 查不到版本 {}，跳过 {} 个模式",
+                    version,
+                    len(group),
+                )
+                continue
+            view = build_window_view(window_dict, snaps)
+            views_by_version[version] = view
+            for c in group:
+                try:
+                    if evaluate_predicate(c["predicate"], view):
+                        hits.append(PredicateHit(
+                            pattern_id=c["id"],
+                            pattern_name=c["pattern_name"],
+                            direction=c["predicted_direction"],
+                            win_rate=c["win_rate"],
+                            sample_count=c["sample_count"],
+                            prior_confidence=c["confidence_score"],
+                        ))
+                except Exception as exc:
+                    # 库内谓词写入时已过 DSL 校验，此处异常属数据腐败/程序缺陷；
+                    # 单模式失败不阻塞整体判定，显式记录（无静默降级）
+                    logger.warning(
+                        "Predict: 谓词执行异常 | id={} name='{}' | error={}",
+                        c["id"],
+                        c["pattern_name"],
+                        exc,
+                    )
+
+        branch, chosen = resolve_predicate_hits(hits)
+        logger.info(
+            "Predict: 谓词匹配完成 | 候选={} | 命中={} | 分支={}",
+            len(candidates),
+            len(hits),
+            branch,
+        )
+
+        # ========== Step 4 分支一：零命中 → NO_TRADE（不调 LLM）==========
+        if branch == HIT_NONE:
+            return await self._write_prediction_and_trade(
+                predicted_direction="NO_TRADE",
+                matched_pattern_id=None,
+                matched_pattern_name=None,
+                confidence=0.0,
+                entry_timing="SKIP",
+                reasoning=f"谓词零命中（{len(candidates)} 个候选模式无一命中当前窗口）",
+                sentiment_window_id=sentiment_window_id,
+            )
+
+        # ========== Step 4 分支二/三：单命中 / 多命中同向 → 程序直采 ==========
+        if branch in (HIT_SINGLE, HIT_CONCORDANT) and chosen is not None:
+            confidence = pattern_confidence(
+                chosen.win_rate,
+                chosen.sample_count,
+                chosen.prior_confidence,
+                min_samples=settings.agent_min_pattern_samples,
+            )
+            branch_label = (
+                "单命中" if branch == HIT_SINGLE else f"多命中同向({len(hits)} 个取最强)"
+            )
+            reasoning = (
+                f"谓词{branch_label}：{chosen.pattern_name}(id={chosen.pattern_id}) "
+                f"方向 {chosen.direction} | live 样本 {chosen.sample_count} "
+                f"胜率 {chosen.win_rate:.4f} | confidence={confidence:.4f}"
+            )
+            return await self._write_prediction_and_trade(
+                predicted_direction=chosen.direction,
+                matched_pattern_id=chosen.pattern_id,
+                matched_pattern_name=chosen.pattern_name,
+                confidence=confidence,
+                # 规则 7：程序命中路径恒 NOW（谓词命中即形态已确认）
+                entry_timing="NOW",
+                reasoning=reasoning,
+                sentiment_window_id=sentiment_window_id,
+            )
+
+        # ========== Step 4 分支四：多命中异向 → LLM 仲裁（规则 6）==========
+        conflict_ids = {h.pattern_id for h in hits}
+        conflict_candidates = [c for c in candidates if c["id"] in conflict_ids]
+        # 仲裁展示视图：取已符号化版本中快照最新者（最新仪器精度）
+        latest_version = max(
+            views_by_version.keys(),
+            key=lambda v: next(iter(snapshots_by_version[v].values())).created_at_epoch,
+        )
+        window_payload = self._view_to_payload(views_by_version[latest_version])
+
         remaining_seconds = max(0, (window_end_ms - int(time.time() * 1000)) // 1000)
+        arbitrate_candidates = [
+            {
+                "id": c["id"],
+                "pattern_name": c["pattern_name"],
+                "description": c["description"],
+                "predicted_direction": c["predicted_direction"],
+                "predicate": c["predicate"],
+                "win_rate": c["win_rate"],
+                "sample_count": c["sample_count"],
+            }
+            for c in conflict_candidates
+        ]
 
         try:
-            predict_output = await self._llm.agent_predict(
-                current_curve=current_curve,
-                active_patterns=patterns_dicts,
+            arb_output = await self._llm.agent_arbitrate(
+                window_payload=window_payload,
+                candidates=arbitrate_candidates,
                 remaining_seconds=remaining_seconds,
                 timeout=settings.agent_llm_timeouts["PREDICT"],
             )
         except Exception as exc:
-            # Req 3.6 / 7.4：LLM 失败/超时/重试耗尽 → 落库 NO_TRADE + 错误原因
-            error_msg = f"LLM 调用失败: {type(exc).__name__}: {exc}"
-            logger.error(
-                "Predict: LLM 调用失败，落库 NO_TRADE（无静默降级）| error={}",
-                error_msg,
-            )
+            # 规则 6：LLM 失败/超时/重试耗尽 → NO_TRADE（无静默降级）
+            error_msg = f"LLM 仲裁调用失败: {type(exc).__name__}: {exc}"
+            logger.error("Predict: {}，落库 NO_TRADE", error_msg)
             return await self._write_prediction_and_trade(
                 predicted_direction="NO_TRADE",
                 matched_pattern_id=None,
@@ -1602,41 +2099,72 @@ class SentimentAgent:
             )
 
         logger.info(
-            "Predict: LLM 返回 | direction={} | confidence={:.4f} | matched_pattern={}",
-            predict_output.direction,
-            predict_output.confidence,
-            predict_output.matched_pattern_name,
+            "Predict: 仲裁返回 | selected_pattern_id={} | confidence={:.4f} | 冲突数={}",
+            arb_output.selected_pattern_id,
+            arb_output.confidence,
+            len(conflict_candidates),
         )
 
-        # ========== Step 3.5：LLM 输出语义验证（Plan 步骤 5）==========
-        if settings.agent_llm_validation_enabled:
-            active_ids = {p["id"] for p in patterns_dicts}
-            hard_failures, soft_warnings = validate_predict_output(
-                predict_output, active_ids
+        # 规则 6：程序 HARD 校验——选定 id 必须在冲突候选集合内（不受验证
+        # 开关影响，LLM 无权发明候选外模式；越界即仲裁无效降级 NO_TRADE）
+        selected = next(
+            (c for c in conflict_candidates if c["id"] == arb_output.selected_pattern_id),
+            None,
+        )
+        if arb_output.selected_pattern_id is not None and selected is None:
+            logger.error(
+                "Predict: 仲裁选定 id={} 不在冲突候选集合，降级 NO_TRADE",
+                arb_output.selected_pattern_id,
             )
-            if soft_warnings:
-                for w in soft_warnings:
-                    logger.warning("Predict 语义验证 SOFT: {}", w)
+            return await self._write_prediction_and_trade(
+                predicted_direction="NO_TRADE",
+                matched_pattern_id=None,
+                matched_pattern_name=None,
+                confidence=0.0,
+                entry_timing="SKIP",
+                reasoning=f"仲裁选定 id={arb_output.selected_pattern_id} 越界（非冲突候选）",
+                sentiment_window_id=sentiment_window_id,
+                skip_trade_reason="LLM 输出语义验证失败",
+            )
+
+        # 语义验证（soft 告警落日志；hard 与上方程序兜底冗余双保险）
+        if settings.agent_llm_validation_enabled:
+            hard_failures, soft_warnings = validate_arbitrate_output(
+                arb_output, conflict_ids
+            )
+            for w in soft_warnings:
+                logger.warning("Predict 仲裁验证 SOFT: {}", w)
             if hard_failures:
                 for f in hard_failures:
-                    logger.error("Predict 语义验证 HARD: {}", f)
-                # HARD_FAIL 时降级为 NO_TRADE
-                logger.warning(
-                    "Predict: 语义验证 HARD_FAIL，降级为 NO_TRADE | failures={}",
-                    hard_failures,
-                )
+                    logger.error("Predict 仲裁验证 HARD: {}", f)
                 return await self._write_prediction_and_trade(
                     predicted_direction="NO_TRADE",
                     matched_pattern_id=None,
                     matched_pattern_name=None,
                     confidence=0.0,
                     entry_timing="SKIP",
-                    reasoning=f"语义验证失败: {hard_failures}",
+                    reasoning=f"仲裁输出语义验证失败: {hard_failures}",
                     sentiment_window_id=sentiment_window_id,
                     skip_trade_reason="LLM 输出语义验证失败",
                 )
 
-        # ========== Step 3.6：时间窗口保护（Plan 步骤 10）==========
+        # 仲裁放弃：冲突不可调和 → NO_TRADE（放弃的决定无时效问题，不做 stale 检查）
+        if selected is None:
+            return await self._write_prediction_and_trade(
+                predicted_direction="NO_TRADE",
+                matched_pattern_id=None,
+                matched_pattern_name=None,
+                confidence=0.0,
+                entry_timing="SKIP",
+                reasoning=(
+                    f"仲裁放弃（冲突 {len(conflict_candidates)} 模式不可调和）："
+                    f"{arb_output.reasoning}"
+                ),
+                sentiment_window_id=sentiment_window_id,
+                skip_trade_reason="仲裁放弃交易",
+            )
+
+        # 规则 7：剩余时间保护（仲裁路径有 LLM 延迟，保持不变）
         remaining_after_llm = max(0, (window_end_ms - int(time.time() * 1000)) // 1000)
         if is_prediction_stale(
             remaining_after_llm,
@@ -1658,14 +2186,16 @@ class SentimentAgent:
                 skip_trade_reason=f"预测已过时(剩余 {remaining_after_llm}s)",
             )
 
-        # ========== Step 4 & 5 & 6：写入预测 + 交易门控 ==========
+        # 仲裁选定：direction 由程序从模式 predicted_direction 推导（规则 6）
         return await self._write_prediction_and_trade(
-            predicted_direction=predict_output.direction,
-            matched_pattern_id=predict_output.matched_pattern_id,
-            matched_pattern_name=predict_output.matched_pattern_name,
-            confidence=predict_output.confidence,
-            entry_timing=predict_output.entry_timing,
-            reasoning=predict_output.reasoning,
+            predicted_direction=selected["predicted_direction"],
+            matched_pattern_id=selected["id"],
+            matched_pattern_name=selected["pattern_name"],
+            confidence=arb_output.confidence,
+            entry_timing=arb_output.entry_timing,
+            reasoning=(
+                f"仲裁选定（冲突 {len(conflict_candidates)} 模式）：{arb_output.reasoning}"
+            ),
             sentiment_window_id=sentiment_window_id,
         )
 
@@ -1853,6 +2383,180 @@ class SentimentAgent:
     # ======================================================================
     # Evolve 阶段（Req 5.2 / 5.3 / 5.4 / 5.5 / 5.6 / 5.7 / 5.8 / 7.4 / 11.3）
     # ======================================================================
+
+    async def _diagnose_pattern_deaths(
+        self, session: AsyncSession, evolve_phase_id: str
+    ) -> dict:
+        """双轨死因巡检（宪法 Q7-1）：对谓词轨存活模式做 live lift 诊断，判死即 RETIRE。
+
+        在 evolve() 的 LLM 操作应用前执行（程序确定性死因优先于 LLM 创造性进化）。
+        候选：status ∈ {ACTIVE, EVOLVING} 且 predicate 非空的模式（谓词轨；
+        旧轨 predicate 为空的模式统计已冻结，由既有上限淘汰路径管理）。
+
+        每模式流水线：全部已结算命中（is_correct 非空，时间升序）→ 命中窗口
+        ±3 天局部基准池（pooled_local_baseline，Q6-b）→ live_lift_summary
+        （recent 20 次 lift/CI + 前缀峰值）→ diagnose_death 双轨裁决：
+        - SPURIOUS（假规律：从未显著）→ RETIRE + 全量细节进负样本反馈池
+        - EXPIRED（过期规律：曾显著后衰减）→ RETIRE + 记录存活期 + 建议再发现
+        - ALIVE（或命中 < MIN_DEATH_HITS 样本不足）→ 不动
+
+        单模式失败仅回滚该 savepoint，不中断其余巡检（无静默降级：记 error）。
+        """
+        stats: dict = {
+            "checked": 0,
+            "skipped": 0,
+            "spurious": [],
+            "expired": [],
+        }
+
+        # Step 1: 候选模式（谓词轨存活者）
+        stmt = select(PatternMemory).where(
+            PatternMemory.status.in_(["ACTIVE", "EVOLVING"]),
+            PatternMemory.predicate.isnot(None),
+        )
+        candidates = (await session.execute(stmt)).scalars().all()
+        if not candidates:
+            return stats
+        pattern_ids = [p.id for p in candidates]
+
+        # Step 2: 批量取全部已结算命中（join 窗口拿 start_time；孤儿预测自动排除）
+        hit_stmt = (
+            select(
+                AgentPrediction.matched_pattern_id,
+                AgentPrediction.is_correct,
+                AgentPrediction.prediction_time,
+                SentimentWindow.start_time,
+            )
+            .join(
+                SentimentWindow,
+                AgentPrediction.sentiment_window_id == SentimentWindow.id,
+            )
+            .where(
+                AgentPrediction.matched_pattern_id.in_(pattern_ids),
+                AgentPrediction.is_correct.isnot(None),
+            )
+            .order_by(
+                AgentPrediction.matched_pattern_id,
+                AgentPrediction.prediction_time.asc(),
+            )
+        )
+        hit_rows = (await session.execute(hit_stmt)).all()
+        hits_by_pattern: dict[int, list] = defaultdict(list)
+        for pid, is_correct, _pred_time, window_start in hit_rows:
+            hits_by_pattern[pid].append((bool(is_correct), int(window_start)))
+
+        # Step 3: 局部基准原料——覆盖全部命中窗口 ±3 天的 outcome 非空窗口
+        all_hit_times = [st for rows in hits_by_pattern.values() for _, st in rows]
+        all_windows: list[dict] = []
+        if all_hit_times:
+            span_ms = 3 * 86_400_000
+            win_stmt = select(
+                SentimentWindow.start_time, SentimentWindow.outcome
+            ).where(
+                SentimentWindow.outcome.isnot(None),
+                SentimentWindow.start_time >= min(all_hit_times) - span_ms,
+                SentimentWindow.start_time <= max(all_hit_times) + span_ms,
+            )
+            all_windows = [
+                {"start_time": st, "outcome": oc}
+                for st, oc in (await session.execute(win_stmt)).all()
+            ]
+
+        # Step 4: 逐模式诊断（命中 < MIN_DEATH_HITS 直接跳过，样本不足不判死）
+        now = datetime.now(tz=timezone.utc)
+        for pattern in candidates:
+            hits = hits_by_pattern.get(pattern.id, [])
+            if len(hits) < MIN_DEATH_HITS:
+                stats["skipped"] += 1
+                continue
+            stats["checked"] += 1
+
+            hits_chrono = [ok for ok, _ in hits]
+            hit_start_times = [st for _, st in hits]
+            base_events, base_total = pooled_local_baseline(
+                hit_start_times, all_windows, pattern.predicted_direction
+            )
+            summary = live_lift_summary(hits_chrono, base_events, base_total)
+            verdict = diagnose_death(
+                summary.recent.lift,
+                summary.recent.ci_lower,
+                summary.recent.ci_upper,
+                summary.peak_lift,
+                summary.hit_count,
+            )
+            if verdict == DEATH_ALIVE:
+                continue
+
+            created_at = pattern.created_at
+            if created_at is not None and created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            lifespan_days = (
+                round((now - created_at).total_seconds() / 86_400.0, 2)
+                if created_at is not None
+                else None
+            )
+            lr = summary.recent
+            if verdict == DEATH_SPURIOUS:
+                reason = (
+                    f"死因判定 SPURIOUS（假规律）：{summary.hit_count} 次 live 命中 "
+                    f"recent lift {lr.lift:.2f} CI[{lr.ci_lower:.2f},{lr.ci_upper:.2f}] "
+                    f"覆盖 1，历史峰值 {summary.peak_lift:.2f} 从未显著；"
+                    f"全量细节反馈发现器（波普尔排除）"
+                )
+            else:
+                reason = (
+                    f"死因判定 EXPIRED（过期规律）：历史峰值 lift "
+                    f"{summary.peak_lift:.2f} 曾显著，最近 {MIN_DEATH_HITS} 次命中 "
+                    f"lift {lr.lift:.2f} < 1.1（regime 变迁）；建议触发新一轮发现"
+                )
+
+            try:
+                async with session.begin_nested():  # savepoint：失败仅回滚此模式
+                    await self.apply_pattern_change(
+                        session=session,
+                        operation="RETIRE",
+                        pattern_data={
+                            "target_pattern_id": pattern.id,
+                            "change_reason": reason,
+                            "death_cause": verdict,
+                            "lifespan_days": lifespan_days,
+                        },
+                        phase="EVOLVE",
+                        evolve_phase_id=evolve_phase_id,
+                    )
+                stats["spurious" if verdict == DEATH_SPURIOUS else "expired"].append(
+                    {"id": pattern.id, "name": pattern.pattern_name}
+                )
+                logger.info(
+                    "Evolve: 死因巡检 RETIRE 模式 id={} '{}' | verdict={} | "
+                    "hits={} recent_lift={:.2f} peak_lift={:.2f} lifespan={}天",
+                    pattern.id,
+                    pattern.pattern_name,
+                    verdict,
+                    summary.hit_count,
+                    lr.lift,
+                    summary.peak_lift,
+                    lifespan_days,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Evolve: 死因巡检 RETIRE 失败 | id={} verdict={} | "
+                    "error_type={} | error={}",
+                    pattern.id,
+                    verdict,
+                    type(exc).__name__,
+                    str(exc),
+                )
+                continue
+
+        if stats["expired"]:
+            logger.warning(
+                "Evolve: {} 个模式死于 EXPIRED（regime 变迁），建议触发新一轮 Deep Learn "
+                "发现（遵守发现预算：轮次间隔 ≥1 天）| ids={}",
+                len(stats["expired"]),
+                [x["id"] for x in stats["expired"]],
+            )
+        return stats
 
     async def evolve(self) -> None:
         """
@@ -2054,6 +2758,18 @@ class SentimentAgent:
             skipped_cold_start = 0
             failed_count = 0
 
+            # ========== Q7-1：双轨死因巡检（程序确定性，先于一切 LLM 操作）==========
+            death_stats = await self._diagnose_pattern_deaths(session, evolve_phase_id)
+            if death_stats["checked"] or death_stats["skipped"]:
+                logger.info(
+                    "Evolve: 死因巡检完成 | 诊断={} 样本不足跳过={} | "
+                    "SPURIOUS={} EXPIRED={}",
+                    death_stats["checked"],
+                    death_stats["skipped"],
+                    len(death_stats["spurious"]),
+                    len(death_stats["expired"]),
+                )
+
             # ========== P0-1：EVOLVING 观察态晋升/淘汰 ==========
             # 达到最小 holdout 样本量后，用 live 样本的 Wilson 置信下界裁决：
             # 下界 > 0.5 → 晋升 ACTIVE（confidence 用下界覆盖）；否则 RETIRE。
@@ -2095,6 +2811,20 @@ class SentimentAgent:
                                 ep.id, ep.pattern_name, ep.sample_count, lb,
                             )
                         else:
+                            # Q7-1：攒够样本但 Wilson 下界未过 0.5 = 从未显著，
+                            # 按假规律（SPURIOUS）归档，全量细节进负样本反馈池
+                            ep_created = ep.created_at
+                            if ep_created is not None and ep_created.tzinfo is None:
+                                ep_created = ep_created.replace(tzinfo=timezone.utc)
+                            ep_lifespan = (
+                                round(
+                                    (datetime.now(tz=timezone.utc) - ep_created)
+                                    .total_seconds() / 86_400.0,
+                                    2,
+                                )
+                                if ep_created is not None
+                                else None
+                            )
                             await self.apply_pattern_change(
                                 session=session,
                                 operation="RETIRE",
@@ -2105,6 +2835,8 @@ class SentimentAgent:
                                         f"（>= {settings.agent_deep_learn_min_holdout_samples}），"
                                         f"Wilson 下界 {lb:.3f} 未过 0.5"
                                     ),
+                                    "death_cause": DEATH_SPURIOUS,
+                                    "lifespan_days": ep_lifespan,
                                 },
                                 phase="EVOLVE",
                                 evolve_phase_id=evolve_phase_id,

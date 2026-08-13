@@ -79,6 +79,14 @@ class BinancePredictionTrader:
         self._5m_start_date: int | None = None
         self._5m_end_date: int | None = None
 
+        # 15 分钟市场实时数据（假突破信号系统：到期结算周期，暂不下注）
+        self._15m_up_token_id: str | None = None
+        self._15m_down_token_id: str | None = None
+        self._15m_up_price: float | None = None
+        self._15m_down_price: float | None = None
+        self._15m_start_date: int | None = None
+        self._15m_end_date: int | None = None
+
         if not self._api_key or not self._api_secret:
             logger.warning("Binance API Key/Secret 未配置，预测交易功能不可用")
         else:
@@ -191,13 +199,23 @@ class BinancePredictionTrader:
         )
         return wallet
 
+    @staticmethod
+    def _classify_period(market: dict) -> str | None:
+        """按 title/slug 识别市场周期：'5m' | '15m' | None。先判 15m（含 '5m' 子串）。"""
+        text = f"{(market.get('title') or '').lower()} {(market.get('slug') or '').lower()}"
+        if "15m" in text:
+            return "15m"
+        if "5m" in text:
+            return "5m"
+        return None
+
     async def list_markets(self) -> list[dict]:
         """
         查询活跃的 BTC 预测市场
 
-        筛选 chartType=CRYPTO_UP_DOWN 且 symbol=BTCUSDT 且 title 含 '5m' 的市场。
+        筛选 chartType=CRYPTO_UP_DOWN 且 symbol=BTCUSDT 的市场，按周期分类
+        （5m 用于交易执行缓存 tokenId；15m 缓存报价供假突破信号系统读取）。
         直接提取 outcome 中的 price/chance，无需调用 get_quote。
-        缓存 tokenId 供后续交易使用。
         """
         params = self._sign_request({
             "limit": 50,
@@ -227,10 +245,10 @@ class BinancePredictionTrader:
             ):
                 btc_markets.append(market)
 
-                # 筛选 5 分钟市场（title 含 '5m' 或 slug 含 '5m'）
-                is_5m = "5m" in (market.get("title") or "").lower() or "5m" in (market.get("slug") or "").lower()
+                # 按周期分类（先判 15m 再判 5m）
+                period = self._classify_period(market)
 
-                if is_5m:
+                if period == "5m":
                     # 更新 5 分钟市场元数据
                     self._5m_participant_count = market.get("participantCount")
                     self._5m_trade_volume = market.get("tradeVolume")
@@ -258,8 +276,23 @@ class BinancePredictionTrader:
 
                     if not self._active_market and market.get("status") == "REGISTERED":
                         self._active_market = market
+                elif period == "15m":
+                    # 15 分钟市场：缓存 tokenId + 报价（假突破信号系统用，暂不下注）
+                    self._15m_start_date = market.get("startDate")
+                    self._15m_end_date = market.get("endDate")
+                    for sub_market in market.get("markets", []):
+                        for outcome in sub_market.get("outcomes", []):
+                            name = outcome.get("name", "").upper()
+                            token_id = outcome.get("tokenId")
+                            price = outcome.get("price")
+                            if name in ("UP", "YES"):
+                                self._15m_up_token_id = token_id
+                                self._15m_up_price = float(price) if price is not None else None
+                            elif name in ("DOWN", "NO"):
+                                self._15m_down_token_id = token_id
+                                self._15m_down_price = float(price) if price is not None else None
                 else:
-                    # 非 5 分钟市场：仍提取 tokenId 作为备用（交易用）
+                    # 非 5m/15m 市场：仍提取 tokenId 作为备用（交易用）
                     for sub_market in market.get("markets", []):
                         for outcome in sub_market.get("outcomes", []):
                             name = outcome.get("name", "").upper()
@@ -270,12 +303,13 @@ class BinancePredictionTrader:
                                 self._down_token_id = token_id
 
         logger.info(
-            "查询到 {} 个 BTC 预测市场 | 5m UP={}({:.1%}) / DOWN={}({:.1%}) | 参与者={} | 交易量={}",
+            "查询到 {} 个 BTC 预测市场 | 5m UP={}({:.1%}) / DOWN={}({:.1%}) | 15m DOWN={} | 参与者={} | 交易量={}",
             len(btc_markets),
             self._5m_up_price,
             self._5m_up_chance or 0,
             self._5m_down_price,
             self._5m_down_chance or 0,
+            self._15m_down_price,
             self._5m_participant_count,
             self._5m_trade_volume,
         )
