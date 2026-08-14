@@ -1,5 +1,10 @@
 """
-假突破信号系统：三级别阻力/支撑破位的秒级检测 + 信号落表 + 周期结算回读。
+假突破信号系统：4h 阻力/支撑破位秒级检测 + A+B 过滤 + 信号落表 + 周期结算回读。
+
+模式收窄（2026-08-15 拍板）：只跑回测统计显著的 4h 双向 × A+B 组合
+（scripts/local_combo_filter_lab.py：4h 破阻力→DOWN 胜率 41.7% 费后 EV +7.06 [+0.35,+15.7]；
+4h 破支撑→UP 53.3% EV +6.52 [+1.12,+13.9]，CI 均不含 0）。
+1h/日线级别与未过 A+B 过滤的信号一律不落表、不结算、不邮件（旧模式彻底移除）。
 
 结算口径【周期锚点，与币安预测市场真实结算规则一致】：
 - 信号落在哪个市场周期，就按那个周期的涨跌判定：
@@ -11,7 +16,7 @@
   历史时点必然可得，停机无损；仅周期坐标缺失或 klines 也失败才 EXPIRED
 
 当前阶段【不下注】：
-- 破位瞬间落表 fake_breakout_signals（含 5m/15m 目标 token 报价快照 + 周期坐标）
+- 破位且通过 A+B 过滤才落表 fake_breakout_signals（含 5m/15m 目标 token 报价快照 + 周期坐标）
 - 邮件推送提醒（复用 agent_alert_* SMTP 配置，fire-and-forget 不阻塞检测循环）
 - 到期回读回填周期涨跌方向（UP/DOWN 符号），stats 按 side 换算策略胜负
 
@@ -44,12 +49,10 @@ HOLD_MS = 900_000
 # （周期锚点口径下 P(S)/P(E) 均为历史时点，klines 必然可得，停机无损）
 SETTLE_EXPIRE_GRACE_MS = 300_000
 
-# 级别定义（与回测 scripts/local_combo_level_matrix_check.py 对齐）：
-# 级别名 → 回看窗口数（5m 窗口 closes 极值）
+# 级别定义（与回测 scripts/local_combo_filter_lab.py 对齐）：
+# 级别名 → 回看窗口数（5m 窗口 closes 极值）。仅保留统计显著的 4h（2026-08-15 收窄）
 LEVEL_LOOKBACKS: dict[str, int] = {
-    "1h": 12,
     "4h": 48,
-    "daily": 288,
 }
 
 # 行动过滤器阈值（scripts/local_combo_filter_lab.py 回测，4 个 级别×方向 场景方向一致）：
@@ -100,7 +103,7 @@ def evaluate_signal_filter(
 
 class FakeBreakoutDetector:
     """
-    日线阻力假突破秒级检测器。
+    4h 阻力/支撑假突破秒级检测器（A+B 过滤前置：未过过滤不落表）。
 
     报价快照通过两个 dict 引用注入（main.py 模块级变量，tracker 单写者）：
     - pm_15m_latest: 15m 市场最新报价 {"down_price", "up_price", "end_date", "updated_ts"}
@@ -159,7 +162,7 @@ class FakeBreakoutDetector:
         logger.info("假突破检测器已停止")
 
     # ==================================================================
-    # 三级别位势计算（1h/4h/日线 closes 极值，定期刷新）
+    # 4h 位势计算（48 个 5m 窗口 closes 极值，定期刷新）
     # ==================================================================
 
     async def _refresh_levels(self, force: bool = False) -> None:
@@ -168,7 +171,7 @@ class FakeBreakoutDetector:
             return
         self._levels_refreshed_at = now
 
-        max_lookback = max(LEVEL_LOOKBACKS.values())  # 288
+        max_lookback = max(LEVEL_LOOKBACKS.values())  # 48
         try:
             async with async_session_factory() as session:
                 stmt = (
@@ -184,7 +187,7 @@ class FakeBreakoutDetector:
 
         # closes 按时间倒序返回，反转为升序后切片算各级别
         closes = [float(r) for r in reversed(rows)]
-        if len(closes) < LEVEL_LOOKBACKS["1h"]:
+        if len(closes) < min(LEVEL_LOOKBACKS.values()):
             logger.debug("假突破检测器：历史窗口不足（{}），位势暂不更新", len(closes))
             return
 
@@ -254,7 +257,7 @@ class FakeBreakoutDetector:
             self._daily_count = 0
 
     async def _check_breakout(self, now_ms: int, mid: float) -> None:
-        """遍历 三级别 × 双向 检查破位，每个 (side, level) 独立冷却。"""
+        """遍历 4h 级别 × 双向 检查破位，每个 (side, level) 独立冷却。"""
         eps = settings.fake_breakout_eps
         for level, lv in self._levels.items():
             # 冲过阻力 → 卖跌信号（买 DOWN）
@@ -337,7 +340,12 @@ class FakeBreakoutDetector:
             m_break_pct: float | None = round(raw * 100.0 if side == "high" else -raw * 100.0, 4)
         else:
             m_break_pct = None
-        filter_pass, _ = evaluate_signal_filter(level, side, m_offset_sec, m_break_pct)
+        filter_pass, filter_reason = evaluate_signal_filter(level, side, m_offset_sec, m_break_pct)
+        # 模式收窄：未过 A+B 过滤的信号彻底丢弃（不落表/不结算/不邮件）。
+        # 不占冷却——若后续周期前段再次破位且满足过滤，仍会正常报出
+        if not filter_pass:
+            logger.debug("假突破被过滤丢弃 [{} {}] | {}", level, side, filter_reason)
+            return
 
         signal = FakeBreakoutSignal(
             level=level,
@@ -431,15 +439,11 @@ class FakeBreakoutDetector:
         filter_pass, filter_label = evaluate_signal_filter(
             signal.level, signal.side, signal.cycle_offset_sec_15m, signal.break_pct
         )
-        # 周期锚点口径回测（scripts/local_combo_level_matrix_check.py，8809 窗口）：
-        # 低胜率高赔率——信号触发时周期内已走一段，赢需回到周期开盘价另一侧
+        # A+B 过滤组合回测（scripts/local_combo_filter_lab.py，8809 窗口，CI 不含 0）：
+        # 低胜率高赔率——赢需周期末价回到周期开盘价另一侧；仅剩 4h 双向（其余已移除）
         backtest = {
-            ("1h", "high"): "15m 周期胜率 14.7%，费后 EV +1.70",
-            ("1h", "low"): "15m 周期胜率 17.4%，费后 EV +1.45",
-            ("4h", "high"): "15m 周期胜率 16.1%，费后 EV +1.94",
-            ("4h", "low"): "15m 周期胜率 13.8%，费后 EV +0.77",
-            ("daily", "high"): "15m 周期胜率 21.2%，费后 EV +3.20",
-            ("daily", "low"): "15m 周期胜率 11.2%，费后 EV -0.12（回测为负，回避）",
+            ("4h", "high"): "A+B 组合胜率 41.7%，费后 EV +7.06 [+0.35,+15.7]",
+            ("4h", "low"): "A+B 组合胜率 53.3%，费后 EV +6.52 [+1.12,+13.9]",
         }.get((signal.level, signal.side), "—")
         subject = (
             f"[假突破信号·{signal.level} {'✅可行动' if filter_pass else '❌被过滤'}] "

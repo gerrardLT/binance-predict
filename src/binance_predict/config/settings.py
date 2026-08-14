@@ -268,20 +268,20 @@ class Settings(BaseSettings):
     # 淘汰保护最小样本数：sample_count <= 此值的模式不因上限被淘汰（Req 5.8）
     agent_min_sample: int = 5
 
-    # --- 假突破信号系统（日线阻力破位检测，暂不下注）---
+    # --- 假突破信号系统（4h 阻力/支撑破位检测 + A+B 过滤，暂不下注）---
     # 总开关：为 True 时 lifespan 启动秒级检测循环
     fake_breakout_enabled: bool = True
-    # 破位阈值：BTC mid > 日线阻力 × (1 + eps) 判定冲高破位
+    # 破位阈值：BTC mid > 4h 阻力 × (1 + eps) 判定冲高破位
     fake_breakout_eps: float = 0.0005
     # 检测循环间隔（秒）：读 collector.store.mid_price（bookTicker 实时价）
     fake_breakout_check_interval: float = 1.0
-    # [已废弃] 级别回看窗口数已内置于 detector.LEVEL_LOOKBACKS（1h=12/4h=48/daily=288）
+    # [已废弃] 级别回看窗口数已内置于 detector.LEVEL_LOOKBACKS（仅 4h=48，2026-08-15 收窄）
     fake_breakout_resistance_lookback: int = 288
     # 阻力位刷新间隔（秒）：从 sentiment_windows 重算
     fake_breakout_resistance_refresh_seconds: float = 60.0
     # 风控：同一 (方向,级别) 信号冷却（秒）——一波冲高/冲低每级别每方向只报一次
     fake_breakout_cooldown_seconds: int = 900
-    # 风控：日内信号上限（防邮件轰炸；三级别双向理论约 50/天，100 留足余量）
+    # 风控：日内信号上限（防邮件轰炸；收窄为 4h+A+B 过滤后约 1 条/天，100 留足余量）
     fake_breakout_max_daily_signals: int = 100
     # 结算回读死线缓冲（秒）：signal_time + 15min + 本缓冲后回读 BTC 价回填方向
     fake_breakout_settle_buffer_seconds: int = 90
