@@ -216,6 +216,11 @@ interface FakeBreakoutSignal {
   up_price_5m: number | null
   up_price_15m: number | null
   market_end_15m: number | null
+  market_start_15m: number | null
+  cycle_open_price_15m: number | null
+  market_start_5m: number | null
+  market_end_5m: number | null
+  cycle_open_price_5m: number | null
   settle_btc_price: number | null
   settle_outcome: 'UP' | 'DOWN' | 'NOISE' | null
   settle_btc_price_5m: number | null
@@ -2143,9 +2148,9 @@ function FakeBreakoutPanel() {
                 <th className="py-1.5 px-2 text-right">破位价 / 位价</th>
                 <th className="py-1.5 px-2 text-right" title="信号瞬间 15m 市场目标方向 token 的买入价快照（越低赔率越肥）">15m 入场价</th>
                 <th className="py-1.5 px-2 text-right" title="信号瞬间 5m 市场目标方向 token 的买入价快照">5m 入场价</th>
-                <th className="py-1.5 px-2 text-right" title="15m 市场到期时刻回读的 BTC 现价">结算价</th>
-                <th className="py-1.5 px-2 text-center" title="信号+5min 后 BTC 实际方向（系统按币安现货价回读判定，非预测市场数据）">+5m 方向</th>
-                <th className="py-1.5 px-2 text-center" title="15m 市场到期时 BTC 实际方向（对齐所报价市场的真实到期时刻）">+15m 方向</th>
+                <th className="py-1.5 px-2 text-right" title="信号所在 15m 周期：开盘价 → 周期末价（市场按这两者定涨跌）">15m 开→末</th>
+                <th className="py-1.5 px-2 text-center" title="信号所在 5m 周期的涨跌方向：周期末价 vs 周期开盘价，与币安市场真实结算规则一致">5m 周期</th>
+                <th className="py-1.5 px-2 text-center" title="信号所在 15m 周期的涨跌方向：周期末价 vs 周期开盘价，即市场真实结算结果">15m 周期</th>
                 <th className="py-1.5 px-2 text-center">状态</th>
               </tr>
             </thead>
@@ -2167,7 +2172,9 @@ function FakeBreakoutPanel() {
                     </td>
                     <td className="py-1.5 px-2 text-right font-mono text-red-500">{entry15?.toFixed(3) ?? '--'}</td>
                     <td className="py-1.5 px-2 text-right font-mono text-gray-500">{entry5?.toFixed(3) ?? '--'}</td>
-                    <td className="py-1.5 px-2 text-right font-mono text-gray-600">{s.settle_btc_price?.toFixed(0) ?? '--'}</td>
+                    <td className="py-1.5 px-2 text-right font-mono text-gray-600">
+                      {s.cycle_open_price_15m ? `${s.cycle_open_price_15m.toFixed(0)}→` : ''}{s.settle_btc_price?.toFixed(0) ?? '--'}
+                    </td>
                     <td className="py-1.5 px-2 text-center">
                       {s.settle_outcome_5m ? (
                         <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${

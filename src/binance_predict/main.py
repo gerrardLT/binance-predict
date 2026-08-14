@@ -89,9 +89,19 @@ sentiment_agent: SentimentAgent | None = None
 _pm_15m_latest: dict = {
     "down_price": None,
     "up_price": None,
+    "start_date": None,
     "end_date": None,
     "updated_ts": None,
+    # 周期开盘价（假突破周期锚点结算的判定基准 P(S)）：周期切换时快照，
+    # 冷启动时从 klines 精确回读；cycle_open_end 记录其所属周期供配对校验
+    "cycle_open_price": None,
+    "cycle_open_end": None,
 }
+
+# 5m 周期开盘价快照（tracker 窗口切换时更新；_pm_market_info 每轮 clear+update，
+# 故用模块级变量暂存，供其复制；假突破检测器周期锚点结算的 5m 判定基准）
+_pm_5m_cycle_open_price: float | None = None
+_pm_5m_cycle_open_end: int | None = None
 
 # PREDICT 事件触发标志：同一窗口仅触发一次（Req 3.1），窗口切换时重置
 _predict_triggered_for_window: bool = False
@@ -117,6 +127,7 @@ async def _prediction_market_tracker() -> None:
     """
     global _current_window_end, _window_entry_price, _predict_triggered_for_window
     global _last_closed_window_end, _last_closed_window_entry_price, _last_closed_window_exit_price
+    global _pm_5m_cycle_open_price, _pm_5m_cycle_open_end
 
     POLL_INTERVAL = 15  # 秒
     _restored_current_window = False  # 标记是否已从 DB 恢复当前窗口数据
@@ -161,9 +172,28 @@ async def _prediction_market_tracker() -> None:
 
             # --- 15m 市场通道：只多写一条采样 + 刷新缓存，不参与窗口切换逻辑 ---
             quote_15m = quotes.get("15m")
-            if quote_15m is not None and quote_15m.down_price is not None:
+            if quote_15m is not None and quote_15m.down_price is not None and quote_15m.end_date is not None:
+                # 周期切换检测：记录新周期开盘价（周期锚点结算的判定基准 P(S)）
+                prev_end_15m = _pm_15m_latest.get("end_date")
+                if quote_15m.end_date != prev_end_15m:
+                    if prev_end_15m is None:
+                        # 冷启动：当前周期已开始，从 klines 精确回读周期开盘价
+                        start_15m = quote_15m.start_date or (int(quote_15m.end_date) - 900_000)
+                        open_15m = await collector.fetch_kline_open("15m", int(start_15m))
+                    else:
+                        # 正常切换：切换时刻现价即新周期开盘价（≤15s 轮询滞后）
+                        open_15m = collector.store.mid_price
+                        if not open_15m or open_15m <= 0:
+                            open_15m = await collector.fetch_mid_price()
+                    _pm_15m_latest["cycle_open_price"] = open_15m if open_15m and open_15m > 0 else None
+                    _pm_15m_latest["cycle_open_end"] = quote_15m.end_date
+                    logger.info(
+                        "15m 市场周期切换 | 开盘价 {} | {} → {}",
+                        _pm_15m_latest["cycle_open_price"], prev_end_15m, quote_15m.end_date,
+                    )
                 _pm_15m_latest["down_price"] = quote_15m.down_price
                 _pm_15m_latest["up_price"] = quote_15m.up_price
+                _pm_15m_latest["start_date"] = quote_15m.start_date
                 _pm_15m_latest["end_date"] = quote_15m.end_date
                 _pm_15m_latest["updated_ts"] = aligned_ts
                 try:
@@ -197,6 +227,9 @@ async def _prediction_market_tracker() -> None:
                 "down_price": quote.down_price,
                 "up_chance": quote.up_chance,
                 "down_chance": quote.down_chance,
+                # 周期开盘价（周期锚点结算 P(S5)）：窗口切换时更新的模块级快照
+                "cycle_open_price": _pm_5m_cycle_open_price,
+                "cycle_open_end": _pm_5m_cycle_open_end,
             })
 
             # 检测 5 分钟窗口切换：end_date 变化说明进入了新市场
@@ -204,6 +237,7 @@ async def _prediction_market_tracker() -> None:
             if new_window_end != _current_window_end:
                 # Fix #5: 使用锁保护全局状态写入，防止 archiver 读到半写状态
                 async with _state_lock:
+                    prev_window_end = _current_window_end
                     if _current_window_end is not None:
                         # 修复：记录刚关闭窗口的快照供 archiver 归档。
                         # 入场价 = 旧窗口起点快照；出场价 = 本次切换时刻的 mid_price（即旧窗口终点）。
@@ -226,6 +260,17 @@ async def _prediction_market_tracker() -> None:
                                 "窗口切换时 entry_price 异常({})，将在归档时重新获取",
                                 _window_entry_price,
                             )
+                    # 周期开盘价快照（假突破 5m 周期锚点结算判定基准）：
+                    # 正常切换 = 新窗口起点快照；冷启动时当前周期已开始，klines 精确回读
+                    if prev_window_end is None:
+                        start_5m = int(quote.start_date) if quote.start_date else int(new_window_end) - 300_000
+                        kline_open_5m = await collector.fetch_kline_open("5m", start_5m)
+                        _pm_5m_cycle_open_price = kline_open_5m if kline_open_5m > 0 else None
+                    else:
+                        _pm_5m_cycle_open_price = (
+                            _window_entry_price if _window_entry_price and _window_entry_price > 0 else None
+                        )
+                    _pm_5m_cycle_open_end = int(new_window_end)
                     # 窗口切换时重置 PREDICT 触发标志（Req 3.1，同一窗口仅触发一次）
                     _predict_triggered_for_window = False
 
@@ -714,6 +759,12 @@ async def lifespan(app: FastAPI):
                 "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS side VARCHAR(4) NOT NULL DEFAULT 'high'",
                 "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS up_price_5m FLOAT",
                 "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS up_price_15m FLOAT",
+                # 假突破周期锚点结算口径（与 alembic 迁移 k1d2e3f4g5h6 等价，存量 dev 库安全网）
+                "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS market_start_15m BIGINT",
+                "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS cycle_open_price_15m FLOAT",
+                "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS market_start_5m BIGINT",
+                "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS market_end_5m BIGINT",
+                "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS cycle_open_price_5m FLOAT",
             ]:
                 try:
                     await conn.execute(text(col_sql))
@@ -889,6 +940,11 @@ async def list_fake_breakout_signals(
                 "up_price_5m": s.up_price_5m,
                 "up_price_15m": s.up_price_15m,
                 "market_end_15m": s.market_end_15m,
+                "market_start_15m": s.market_start_15m,
+                "cycle_open_price_15m": s.cycle_open_price_15m,
+                "market_start_5m": s.market_start_5m,
+                "market_end_5m": s.market_end_5m,
+                "cycle_open_price_5m": s.cycle_open_price_5m,
                 "settle_btc_price": s.settle_btc_price,
                 "settle_outcome": s.settle_outcome,
                 "settle_btc_price_5m": s.settle_btc_price_5m,
@@ -907,7 +963,9 @@ async def list_fake_breakout_signals(
 async def get_fake_breakout_stats(db: AsyncSession = Depends(get_db)):
     """假突破信号汇总统计：按 级别×方向 分组的胜率（5m/15m 双口径）。
 
-    胜负语义：side=high 买 DOWN（BTC 跌赢）；side=low 买 UP（BTC 涨赢）。
+    周期锚点口径：settle_outcome = 信号所在市场周期的涨跌方向
+    （周期末价 vs 周期开盘价，与币安预测市场真实结算规则一致）。
+    胜负语义：side=high 买 DOWN（周期跌赢）；side=low 买 UP（周期涨赢）。
     """
     from sqlalchemy import func as sa_func, select as sa_select
 

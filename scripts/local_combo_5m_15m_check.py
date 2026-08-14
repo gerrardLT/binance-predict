@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""组合测试：5m 发现假突破瞬间入场 + 15 分钟兑现（修正版）。
+"""组合测试：5m 发现假突破瞬间入场 + 所在 15m 周期到期结算（周期锚点修正版）。
 
 审查修正：
 1. 事件集 = 所有盘中冲过日线阻力的 5m 窗口（不要求收盘收回，消除选择偏差）
    - 再分子组对比：收回组 vs 未收回组
-2. 兑现时刻 = 盘中高点 + 15 分钟（900s），跨窗口取价
+2. 结算【周期锚点，与币安市场真实结算规则一致】：
+   信号所在 15m 市场周期，DOWN 赢 ⟺ 周期末价 < 周期开盘价
+   （周期边界按自然时钟对齐：peak_t - peak_t % 900_000）
 3. 执行敏感性：peak_t 插值价 vs peak_t±60s 区间内 DOWN 最低价（最优执行上限）
 4. 结算两口径（用户原则：只关心周期内方向，与幅度无关）：
-   a. token 结算：兑现时刻 DOWN 价 vs 入场价
-   b. BTC 方向结算：兑现时刻 BTC 价 vs 高点时刻 BTC 价
+   a. token 结算：周期末时刻 DOWN 价 vs 入场价（到期 token 收敛 0/1，交叉验证）
+   b. BTC 方向结算：周期末 BTC 价 vs 周期开盘价（= 市场真实结算）
 
 用法：
     python scripts/local_combo_5m_15m_check.py
@@ -33,7 +35,6 @@ FEE = 0.02
 PREMIUM = 0.01
 LOOKBACK = 288  # 日线阻力 = 前 288 个 5m 窗口 closes 的 max
 EPS = 0.0005
-HOLD_MS = 900_000  # 15 分钟兑现
 MIN_BETS_FOR_CI = 8
 
 
@@ -138,7 +139,10 @@ async def main() -> int:
         if not broke:
             continue
         # 全部冲高破位事件（不要求收回）
-        if peak_t + HOLD_MS > t_max:
+        # 周期锚点：信号所在 15m 市场周期（自然时钟边界对齐）
+        cyc15_start = peak_t - (peak_t % 900_000)
+        cyc15_end = cyc15_start + 900_000
+        if cyc15_end > t_max:
             continue
         entry = _price_at(down, peak_t)
         # 执行敏感性：peak_t±60s 区间内 DOWN 最低价（最优执行上限）
@@ -146,9 +150,10 @@ async def main() -> int:
             (v for t, v in down if peak_t - 60_000 <= t <= peak_t + 60_000),
             default=None,
         )
-        exit_dn = _price_at(down_all, peak_t + HOLD_MS)
-        btc_exit = _price_at(btc_all, peak_t + HOLD_MS)
-        if entry is None or exit_dn is None or btc_exit is None or entry <= 0:
+        exit_dn = _price_at(down_all, cyc15_end)
+        p_s15 = _price_at(btc_all, cyc15_start)
+        p_e15 = _price_at(btc_all, cyc15_end)
+        if entry is None or exit_dn is None or p_s15 is None or p_e15 is None or entry <= 0:
             continue
         events.append({
             "peak_t": peak_t,
@@ -157,12 +162,12 @@ async def main() -> int:
             "o": o,
             "c": c,
             "reclaimed_5m": c <= resistance,
-            "reclaimed_15m": btc_exit <= resistance,
+            "reclaimed_15m": p_e15 <= resistance,
             "entry": entry,
             "entry_min": window_min if window_min is not None else entry,
             "exit_dn": exit_dn,
-            "btc_peak": peak_v,
-            "btc_exit": btc_exit,
+            "p_s15": p_s15,
+            "p_e15": p_e15,
         })
 
     print(f"\n全部冲高破位事件: {len(events)} 个")
@@ -173,11 +178,11 @@ async def main() -> int:
             return
         n = len(evts)
         entries = [e["entry"] for e in evts]
-        # token 结算（真实入场价）
+        # token 结算（真实入场价）：周期末 DOWN 价 vs 入场价
         tok_w = [e["exit_dn"] > e["entry"] for e in evts]
         tok_p = [_bet_pnl(w_, p) for w_, p in zip(tok_w, entries)]
-        # BTC 方向结算（真实入场价）
-        btc_w = [e["btc_exit"] < e["btc_peak"] for e in evts]
+        # BTC 方向结算（周期锚点）：周期末价 < 周期开盘价 → DOWN 赢
+        btc_w = [e["p_e15"] < e["p_s15"] for e in evts]
         btc_p = [_bet_pnl(w_, p) for w_, p in zip(btc_w, entries)]
         # BTC 方向结算（0.5 假设入场对照）
         fake_p = [_bet_pnl(w_, 0.5) for w_ in btc_w]
@@ -203,8 +208,8 @@ async def main() -> int:
         print(
             f"  {e['peak_t']}: 高点 {e['peak_v']:.0f} 阻力 {e['res']:.0f} "
             f"| 入场 {e['entry']:.3f}(±60s最低 {e['entry_min']:.3f}) "
-            f"→+15m {e['exit_dn']:.3f} | BTC 高点→+15m: "
-            f"{'+' if e['btc_exit']>e['btc_peak'] else ''}{(e['btc_exit']/e['btc_peak']-1)*100:.3f}% "
+            f"→周期末 {e['exit_dn']:.3f} | 15m周期 开→末: "
+            f"{'+' if e['p_e15'] > e['p_s15'] else ''}{(e['p_e15'] / e['p_s15'] - 1) * 100:.3f}% "
             f"| 5m收 {'是' if e['reclaimed_5m'] else '否'} 15m收 {'是' if e['reclaimed_15m'] else '否'}"
         )
     return 0

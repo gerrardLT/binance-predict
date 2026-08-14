@@ -142,6 +142,53 @@ class BinanceDataCollector:
             logger.warning("REST fetch_mid_price 失败: {} | 回退使用缓存 mid_price={:.2f}", exc, self.store.mid_price)
             return self._safe_cached_mid_price()
 
+    async def fetch_kline_open(self, interval: str, start_ms: int) -> float:
+        """获取指定周期起点时刻的 K 线开盘价（周期锚点结算的 P(S) 数据源）。
+
+        用途：假突破信号的周期开盘价回读——服务冷启动时当前周期已开始、
+        内存快照缺失的场景，以及停机积压后精确补结算（历史 kline 必然可得）。
+
+        Args:
+            interval: K 线周期（"5m" | "15m"，与预测市场周期对齐）
+            start_ms: 周期起点时刻（ms，即市场 start_date）
+
+        Returns:
+            该时刻所在 K 线的开盘价；失败返回 0.0，调用方应检查 > 0。
+            返回 0.0 时本轮顺延，下轮重试（历史 kline 数据终将可得）。
+        """
+        url = "https://api.binance.com/api/v3/klines"
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    url,
+                    params={
+                        "symbol": settings.symbol,
+                        "interval": interval,
+                        "startTime": start_ms,
+                        "limit": 1,
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                if not data:
+                    logger.warning("klines 返回空 | interval={} start={}", interval, start_ms)
+                    return 0.0
+                open_time = int(data[0][0])
+                open_price = float(data[0][1])
+                # 对齐校验：市场 start_date 与自然 kline 边界错位时可观测
+                if abs(open_time - start_ms) > 60_000:
+                    logger.warning(
+                        "kline 边界与市场周期起点错位 | interval={} start={} kline_open_time={} 差{}s",
+                        interval, start_ms, open_time, abs(open_time - start_ms) // 1000,
+                    )
+                if open_price <= 0:
+                    logger.warning("kline 开盘价无效 | interval={} start={} open={}", interval, start_ms, open_price)
+                    return 0.0
+                return open_price
+        except Exception as exc:
+            logger.warning("fetch_kline_open 失败 | interval={} start={} | {}", interval, start_ms, exc)
+            return 0.0
+
     def _safe_cached_mid_price(self) -> float:
         """返回缓存的 mid_price，若为 0.0 则记录严重警告。"""
         cached = self.store.mid_price

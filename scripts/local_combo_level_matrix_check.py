@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""级别矩阵 × 双向假突破瞬间下注（最优赔率玩法）。
+"""级别矩阵 × 双向假突破瞬间下注（最优赔率玩法，周期锚点口径）。
 
 基于 local_combo_control_check.py 的对照设计扩展：
 - 支撑/阻力级别：1h（12 个 5m 窗口 closes）/ 4h（48）/ 日线（288）
 - 双向：
   a. 冲高破阻力瞬间 → 买 DOWN（DOWN token 被砸到白菜价）
   b. 冲低破支撑瞬间 → 买 UP（UP token 被砸到白菜价）
-- 兑现：入场后 +15 分钟（900s），跨窗口取全局时间序列
-- 结算两口径：token 回升（兑现时刻 token 价 vs 入场价）+ BTC 方向（兑现时刻 BTC vs 入场时刻 BTC）
-- 对照基线：全部盘中高点买 DOWN / 全部盘中低点买 UP（均值回归基线）
+- 结算【周期锚点，与币安市场真实结算规则一致】：
+  信号所在 15m/5m 市场周期，UP 赢 ⟺ 周期末价 > 周期开盘价
+  （周期边界按自然时钟对齐：ext_t - ext_t % 900_000 / 300_000）
 
 用法：
     python scripts/local_combo_level_matrix_check.py
@@ -32,7 +32,6 @@ from binance_predict.db.models import SentimentWindow  # noqa: E402
 FEE = 0.02
 PREMIUM = 0.01
 EPS = 0.0005
-HOLD_MS = 900_000  # 15 分钟兑现
 MIN_BETS_FOR_CI = 8
 LEVELS = (("1h", 12), ("4h", 48), ("日线", 288))
 
@@ -88,15 +87,9 @@ async def main() -> int:
     print(f"5m 窗口总数 {len(wins)}")
 
     btc_all: list[tuple[int, float]] = []
-    down_all: list[tuple[int, float]] = []
-    up_all: list[tuple[int, float]] = []
     for w in wins:
         btc_all.extend(_sorted_pairs(w["btc"]))
-        down_all.extend(_sorted_pairs(w["down"]))
-        up_all.extend(_sorted_pairs(w["up"]))
     btc_all.sort()
-    down_all.sort()
-    up_all.sort()
     t_max = btc_all[-1][0]
 
     def stats(pnls: list[float], wins_list: list[bool]) -> str:
@@ -136,26 +129,36 @@ async def main() -> int:
                 level = max(hist_closes)
                 broke = ext_v > level * (1.0 + EPS)
                 token_curve = _sorted_pairs(w["down"])
-                token_all = down_all
             else:
                 ext_t, ext_v = min(btc, key=lambda p: p[1])
                 level = min(hist_closes)
                 broke = ext_v < level * (1.0 - EPS)
                 token_curve = _sorted_pairs(w["up"])
-                token_all = up_all
 
-            if not broke or ext_t + HOLD_MS > t_max:
+            if not broke:
+                continue
+            # 周期锚点：信号所在 15m / 5m 市场周期（自然时钟边界对齐）
+            cyc15_start = ext_t - (ext_t % 900_000)
+            cyc15_end = cyc15_start + 900_000
+            cyc5_start = ext_t - (ext_t % 300_000)
+            cyc5_end = cyc5_start + 300_000
+            if cyc15_end > t_max:
                 continue
             entry = _price_at(token_curve, ext_t)
-            exit_tok = _price_at(token_all, ext_t + HOLD_MS)
-            btc_exit = _price_at(btc_all, ext_t + HOLD_MS)
-            if entry is None or exit_tok is None or btc_exit is None or entry <= 0:
+            p_s15 = _price_at(btc_all, cyc15_start)
+            p_e15 = _price_at(btc_all, cyc15_end)
+            p_s5 = _price_at(btc_all, cyc5_start)
+            p_e5 = _price_at(btc_all, cyc5_end)
+            if (
+                entry is None or entry <= 0
+                or p_s15 is None or p_e15 is None
+                or p_s5 is None or p_e5 is None
+            ):
                 continue
             events.append({
                 "entry": entry,
-                "exit_tok": exit_tok,
-                "btc_ext": ext_v,
-                "btc_exit": btc_exit,
+                "p_s15": p_s15, "p_e15": p_e15,
+                "p_s5": p_s5, "p_e5": p_e5,
                 "side": side,
             })
         return events
@@ -166,18 +169,21 @@ async def main() -> int:
             return
         entries = [e["entry"] for e in evts]
         avg_entry = float(np.mean(entries))
-        # token 回升：高点买 DOWN 后 token 回升 / 低点买 UP 后 token 回升
-        tok_w = [e["exit_tok"] > e["entry"] for e in evts]
-        tok_p = [_bet_pnl(w_, p) for w_, p in zip(tok_w, entries)]
-        # BTC 方向：高点后回落 / 低点后反弹
-        if evts[0]["side"] == "high":
-            btc_w = [e["btc_exit"] < e["btc_ext"] for e in evts]
-        else:
-            btc_w = [e["btc_exit"] > e["btc_ext"] for e in evts]
-        btc_p = [_bet_pnl(w_, p) for w_, p in zip(btc_w, entries)]
+        high = evts[0]["side"] == "high"
+        # 周期锚点两口径：买 DOWN 赢 ⟺ 周期末价 < 周期开盘价；买 UP 反之
+        w15 = [
+            (e["p_e15"] < e["p_s15"]) if high else (e["p_e15"] > e["p_s15"])
+            for e in evts
+        ]
+        p15 = [_bet_pnl(w_, p) for w_, p in zip(w15, entries)]
+        w5 = [
+            (e["p_e5"] < e["p_s5"]) if high else (e["p_e5"] > e["p_s5"])
+            for e in evts
+        ]
+        p5 = [_bet_pnl(w_, p) for w_, p in zip(w5, entries)]
         print(f"  {label}（平均入场 {avg_entry:.3f}）")
-        print(f"    token 回升: {stats(tok_p, tok_w)}")
-        print(f"    BTC 方向  : {stats(btc_p, btc_w)}")
+        print(f"    15m 周期方向: {stats(p15, w15)}")
+        print(f"    5m 周期方向 : {stats(p5, w5)}")
 
     for label, lookback in LEVELS:
         print(f"\n===== 级别 {label}（LOOKBACK={lookback} 个 5m 窗口） =====")

@@ -607,7 +607,7 @@ class FakeBreakoutSignal(Base):
         Float, nullable=False, comment="当时日线阻力位（前 288 个 5m 窗口 closes 的 max）"
     )
     btc_price: Mapped[float] = mapped_column(
-        Float, nullable=False, comment="破位时刻 BTC 现货中间价"
+        Float, nullable=False, comment="破位时刻 BTC 现货中间价（仅破位审计，不参与结算判定）"
     )
     eps: Mapped[float] = mapped_column(
         Float, nullable=False, comment="触发阈值快照（破位幅度，如 0.0005）"
@@ -627,22 +627,37 @@ class FakeBreakoutSignal(Base):
     market_end_15m: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True, comment="当时 15m 市场 end_date（ms，即到期结算时刻）"
     )
+    market_start_15m: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, comment="信号所在 15m 市场周期起点 start_date（ms）"
+    )
+    cycle_open_price_15m: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="15m 周期开盘价 P(S)：周期锚点结算的判定基准"
+    )
+    market_start_5m: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, comment="信号所在 5m 市场周期起点 start_date（ms）"
+    )
+    market_end_5m: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, comment="信号所在 5m 市场周期末 end_date（ms，5m 结算死线基准）"
+    )
+    cycle_open_price_5m: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="5m 周期开盘价 P(S5)：5m 口径判定基准"
+    )
     settle_deadline: Mapped[int] = mapped_column(
         BigInteger, nullable=False, comment="结算回读死线（ms）= signal_time + 15min + 缓冲"
     )
     settle_btc_price: Mapped[float | None] = mapped_column(
-        Float, nullable=True, comment="结算时刻 BTC 现货中间价（到期回读回填，15m 口径）"
+        Float, nullable=True, comment="15m 周期末时刻 BTC 现货中间价 P(E)（到期回读回填）"
     )
     settle_btc_price_5m: Mapped[float | None] = mapped_column(
-        Float, nullable=True, comment="信号时刻 +5min 回读的 BTC 现货中间价（5m 兑现口径验证）"
+        Float, nullable=True, comment="5m 周期末时刻回读的 BTC 现货中间价 P(E5)"
     )
     settle_outcome_5m: Mapped[str | None] = mapped_column(
         String(10), nullable=True,
-        comment="5m 兑现方向 UP | DOWN（只看符号：settle_btc_5m < btc_price → DOWN 赢）"
+        comment="5m 周期涨跌方向 UP | DOWN（周期锚点口径：P(E5) < cycle_open_price_5m → DOWN）"
     )
     settle_outcome: Mapped[str | None] = mapped_column(
         String(10), nullable=True,
-        comment="结算方向 UP | DOWN（只看符号：settle_btc < btc_price → DOWN 赢）"
+        comment="15m 周期涨跌方向 UP | DOWN（周期锚点口径：P(E) < cycle_open_price_15m → DOWN，与币安市场真实结算一致）"
     )
     status: Mapped[str] = mapped_column(
         String(10), nullable=False, default="PENDING", server_default="PENDING",

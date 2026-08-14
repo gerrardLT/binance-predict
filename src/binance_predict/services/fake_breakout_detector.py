@@ -1,21 +1,23 @@
 """
-假突破信号系统：日线阻力破位的秒级检测 + 信号落表 + 到期结算回读。
+假突破信号系统：三级别阻力/支撑破位的秒级检测 + 信号落表 + 周期结算回读。
 
-策略口径（本地一个月数据回测验证，scripts/local_combo_5m_15m_check.py）：
-- 触发：BTC 盘中冲高，现价 > 日线阻力 × (1 + eps)
-- 日线阻力 = 前 288 个 5m 窗口 closes 的 max（与回测 LOOKBACK=288 对齐）
-- 兑现：15 分钟（币安 15m 预测市场到期按 BTC 方向结算，只看符号）
-- 回测成绩：BTC 方向胜率 80.0%（80 注），对照组均值回归基线 65.4%
+结算口径【周期锚点，与币安预测市场真实结算规则一致】：
+- 信号落在哪个市场周期，就按那个周期的涨跌判定：
+  UP 赢 ⟺ P(周期末) > P(周期开盘价)；DOWN 赢 ⟺ P(周期末) < P(周期开盘价)
+- 15m 口径：信号所在 15m 市场 [market_start_15m, market_end_15m]
+- 5m 口径：信号所在 5m 市场 [market_start_5m, market_end_5m]（兑现窗=剩余周期 0~5min）
+- 周期开盘价 P(S)：tracker 周期切换时快照（冷启动 klines 精确回读）
+- 周期末价 P(E)：到期+buffer 后现价；超宽限（停机积压）用 klines 精确补，
+  历史时点必然可得，停机无损；仅周期坐标缺失或 klines 也失败才 EXPIRED
 
 当前阶段【不下注】：
-- 破位瞬间落表 fake_breakout_signals（含 5m/15m DOWN 当时报价快照）
-- 邮件推送提醒（复用 agent_alert_* SMTP 配置）
-- 到期后回读 BTC 价格回填结算方向（UP/DOWN 符号）
-- 积累 15m 市场真实赔率数据，回答"冲高瞬间 15m DOWN 真实报价"这一回测遗留疑虑
+- 破位瞬间落表 fake_breakout_signals（含 5m/15m 目标 token 报价快照 + 周期坐标）
+- 邮件推送提醒（复用 agent_alert_* SMTP 配置，fire-and-forget 不阻塞检测循环）
+- 到期回读回填周期涨跌方向（UP/DOWN 符号），stats 按 side 换算策略胜负
 
 风控（不下注阶段）：
-- 同一阻力位信号冷却（默认 900s，覆盖一个兑现周期，一波冲高只报一次）
-- 日内信号上限（默认 50，超限后仍落表但不再发邮件，防轰炸）
+- 同一 (side, level) 信号冷却（默认 900s，一波冲高/冲低只报一次）
+- 日内信号上限（超限后仍落表但不再发邮件，防轰炸）
 
 生命周期由 main.py lifespan 管理：start() 启动循环，stop() 优雅停止。
 """
@@ -32,14 +34,14 @@ from sqlalchemy import desc, select
 from ..config.settings import settings
 from ..db.engine import async_session_factory
 from ..db.models import FakeBreakoutSignal, SentimentWindow
+from . import clock_sync
 from .alerting import send_plain_email
 from .data_collector import BinanceDataCollector
 
-# 兑现窗口（15 分钟，与回测 HOLD_MS 对齐）
+# 15m 死线兜底：15m 报价快照缺失时退回 signal+15min（对齐 HOLD_MS 语义）
 HOLD_MS = 900_000
-# 5 分钟兑现口径（与 15m 并行验证：离线回测 5m 77.4% vs 15m 80.0%）
-HOLD_5M_MS = 300_000
-# 停机积压判定：到期后超过此宽限仍未结算的信号置 EXPIRED（现价已不能代表结算时刻）
+# 超宽限阈值：到期后超过此宽限未结算的信号转 klines 精确补结算路径
+# （周期锚点口径下 P(S)/P(E) 均为历史时点，klines 必然可得，停机无损）
 SETTLE_EXPIRE_GRACE_MS = 300_000
 
 # 级别定义（与回测 scripts/local_combo_level_matrix_check.py 对齐）：
@@ -173,7 +175,8 @@ class FakeBreakoutDetector:
                 await self._refresh_levels()
 
                 mid = self._collector.store.mid_price
-                now_ms = int(time.time() * 1000)
+                # 统一用币安服务器时钟：与市场 end_date（币安时钟）比较无时钟偏差
+                now_ms = clock_sync.now_ms()
 
                 if mid > 0 and self._levels:
                     await self._check_breakout(now_ms, mid)
@@ -236,13 +239,49 @@ class FakeBreakoutDetector:
         down_15m = self._pm_15m.get("down_price")
         up_15m = self._pm_15m.get("up_price")
         end_15m = self._pm_15m.get("end_date")
+        start_15m = self._pm_15m.get("start_date")
+        open_15m = self._pm_15m.get("cycle_open_price")
+        open_15m_end = self._pm_15m.get("cycle_open_end")
+        start_5m = self._pm_5m.get("start_date")
+        end_5m = self._pm_5m.get("end_date")
+        open_5m = self._pm_5m.get("cycle_open_price")
+        open_5m_end = self._pm_5m.get("cycle_open_end")
+
         # 结算死线对齐所报价 15m 市场的真实到期时刻（CodeReview Minor-3a）：
-        # market_end_15m 缺失或已过期时退回 signal+15min 口径。
+        # market_end_15m 缺失或已过期时退回 signal+15min 口径（该条周期坐标落空，
+        # 到期后无锚点可判，将由 EXPIRED 路径收场）。
         buffer_ms = settings.fake_breakout_settle_buffer_seconds * 1000
         if end_15m and int(end_15m) > now_ms:
             settle_deadline = int(end_15m) + buffer_ms
+            # 周期坐标与开盘价配对守卫：cycle_open_end 必须与当前周期 end_date 一致，
+            # 否则是 tracker 写入跨轮错配，宁可落空也不错配
+            m_start_15m = int(start_15m) if start_15m else int(end_15m) - 900_000
+            m_open_15m = (
+                float(open_15m)
+                if open_15m and open_15m_end is not None and int(open_15m_end) == int(end_15m)
+                else None
+            )
+            m_end_15m: int | None = int(end_15m)
         else:
             settle_deadline = now_ms + HOLD_MS + buffer_ms
+            m_start_15m = None
+            m_open_15m = None
+            m_end_15m = None
+            logger.warning("15m 报价快照缺失/过期，信号周期坐标落空 | {} {}", level, side)
+
+        # 5m 周期坐标：快照缺失或已过期（staleness 防御）则该条 5m 口径不结算
+        if end_5m and int(end_5m) > now_ms:
+            m_start_5m = int(start_5m) if start_5m else int(end_5m) - 300_000
+            m_end_5m: int | None = int(end_5m)
+            m_open_5m = (
+                float(open_5m)
+                if open_5m and open_5m_end is not None and int(open_5m_end) == int(end_5m)
+                else None
+            )
+        else:
+            m_start_5m = None
+            m_end_5m = None
+            m_open_5m = None
 
         signal = FakeBreakoutSignal(
             level=level,
@@ -255,7 +294,12 @@ class FakeBreakoutDetector:
             down_price_15m=down_15m,
             up_price_5m=up_5m,
             up_price_15m=up_15m,
-            market_end_15m=end_15m,
+            market_end_15m=m_end_15m,
+            market_start_15m=m_start_15m,
+            cycle_open_price_15m=m_open_15m,
+            market_start_5m=m_start_5m,
+            market_end_5m=m_end_5m,
+            cycle_open_price_5m=m_open_5m,
             settle_deadline=settle_deadline,
             status="PENDING",
             email_sent=False,
@@ -325,7 +369,16 @@ class FakeBreakoutDetector:
         level_name = "阻力" if is_high else "支撑"
         entry_15m = signal.down_price_15m if is_high else signal.up_price_15m
         entry_5m = signal.down_price_5m if is_high else signal.up_price_5m
-        backtest_wr = {"1h": "65.1%", "4h": "73.5%", "daily": "80.0%"}.get(signal.level, "—")
+        # 周期锚点口径回测（scripts/local_combo_level_matrix_check.py，8809 窗口）：
+        # 低胜率高赔率——信号触发时周期内已走一段，赢需回到周期开盘价另一侧
+        backtest = {
+            ("1h", "high"): "15m 周期胜率 14.7%，费后 EV +1.70",
+            ("1h", "low"): "15m 周期胜率 17.4%，费后 EV +1.45",
+            ("4h", "high"): "15m 周期胜率 16.1%，费后 EV +1.94",
+            ("4h", "low"): "15m 周期胜率 13.8%，费后 EV +0.77",
+            ("daily", "high"): "15m 周期胜率 21.2%，费后 EV +3.20",
+            ("daily", "low"): "15m 周期胜率 11.2%，费后 EV -0.12（回测为负，回避）",
+        }.get((signal.level, signal.side), "—")
         subject = (
             f"[假突破信号·{signal.level}] BTC {signal.btc_price:.0f} "
             f"破{level_name} {signal.resistance:.0f} → 看{direction}"
@@ -340,8 +393,9 @@ class FakeBreakoutDetector:
             f"  5m：{entry_5m}\n"
             f"  15m：{entry_15m}\n"
             f"  15m 市场到期：{end_str}\n\n"
-            f"玩法提示（回测口径）：破位瞬间买 15m {direction}，持有到期按方向结算。\n"
-            f"历史回测（{signal.level} 级 {direction} 方向）：胜率 {backtest_wr}。\n"
+            f"玩法提示（回测口径）：破位瞬间买 15m {direction}，持有到周期到期，\n"
+            f"按周期末价 vs 周期开盘价结算（与市场真实规则一致）。\n"
+            f"历史回测（{signal.level} 级 {direction} 方向）：{backtest}。\n"
             f"当前阶段：系统不下注，仅记录信号并到期回读结算方向。\n"
         )
         return await send_plain_email(subject, body)
@@ -351,33 +405,42 @@ class FakeBreakoutDetector:
     # ==================================================================
 
     async def _settle_due_signals(self, now_ms: int) -> None:
-        """双时点回读：5m 口径（信号+5min）与 15m 口径（对齐市场到期）独立回填。
+        """双口径回读：5m 口径（所在 5m 周期到期）与 15m 口径（所在 15m 周期到期）。
 
-        CodeReview Minor-3b：停机积压超过宽限的 15m 信号置 EXPIRED 而非按现价结算；
-        5m 口径逾期不回填（保持 NULL，不影响 15m 状态机）。
+        周期锚点口径：方向 = 周期末价 P(E) vs 周期开盘价 P(S)，与币安市场真实
+        结算规则一致。锚点缺失时 klines 精确回读；超宽限（停机积压）同样走
+        klines 补 P(E)——历史时点必然可得，停机无损，永不按失真现价结算。
         """
         await self._settle_5m(now_ms)
         await self._settle_15m(now_ms)
 
-    async def _settle_5m(self, now_ms: int) -> None:
-        """5m 兑现口径回读：信号时刻 +5min + 缓冲后回填 BTC 价与方向。
+    async def _klines_open(self, interval: str, start_ms: int | None) -> float:
+        """klines 回读某周期边界的开盘价；start_ms 缺失或失败返回 0.0。"""
+        if not start_ms:
+            return 0.0
+        return await self._collector.fetch_kline_open(interval, int(start_ms))
 
-        不限定 status：信号在 15m 市场临到期前 5 分钟内触发时（约占 1/3），
-        15m 死线早于 5m 死线，15m 先把 status 推进 SETTLED；若限定 PENDING，
-        这些信号的 5m 口径将永远卡 NULL（前端"待结算"常驻）。
-        SQL 下界排除超宽限旧信号（防卡死信号累积反复占位 limit 20），
-        settle_outcome_5m IS NULL 已保证幂等。
+    async def _settle_5m(self, now_ms: int) -> None:
+        """5m 周期锚点回读：信号所在 5m 周期到期 + 缓冲后，按 P(E5) vs P(S5) 判定。
+
+        - 锚点 P(S5)：fire 时快照的 cycle_open_price_5m；缺失则 klines 回读并补列
+        - P(E5)：宽限内用现价；超宽限（停机积压）klines 补（下一根 5m kline 开盘价）
+        - 周期坐标缺失（fire 时 5m 报价快照落空）的条目不结算，保持 NULL
+        - 不限定 status：15m 死线可能更早先把 status 推进 SETTLED，两口径独立回填
         """
         buffer_ms = settings.fake_breakout_settle_buffer_seconds * 1000
-        due_5m_before = now_ms - HOLD_5M_MS - buffer_ms
-        earliest = due_5m_before - SETTLE_EXPIRE_GRACE_MS
         try:
             async with async_session_factory() as session:
                 stmt = (
                     select(FakeBreakoutSignal)
                     .where(FakeBreakoutSignal.settle_outcome_5m.is_(None))
-                    .where(FakeBreakoutSignal.signal_time <= due_5m_before)
-                    .where(FakeBreakoutSignal.signal_time > earliest)
+                    .where(FakeBreakoutSignal.market_end_5m.isnot(None))
+                    .where(FakeBreakoutSignal.market_end_5m + buffer_ms <= now_ms)
+                    # 锚点与周期起点都缺失的条目永远无法结算，SQL 层排除防占位
+                    .where(
+                        (FakeBreakoutSignal.cycle_open_price_5m.isnot(None))
+                        | (FakeBreakoutSignal.market_start_5m.isnot(None))
+                    )
                     .limit(20)
                 )
                 due = (await session.execute(stmt)).scalars().all()
@@ -388,37 +451,65 @@ class FakeBreakoutDetector:
         if not due:
             return
 
-        settle_price = await self._collector.fetch_mid_price()
-        if settle_price <= 0:
-            logger.warning("假突破 5m 结算：BTC 现价不可用，本轮 {} 条顺延", len(due))
-            return
+        # 宽限内的条目用现价统一结算；超宽限的逐条 klines 精确补
+        in_grace = [
+            s for s in due
+            if now_ms - (int(s.market_end_5m) + buffer_ms) <= SETTLE_EXPIRE_GRACE_MS
+        ]
+        live_price = 0.0
+        if in_grace:
+            live_price = await self._collector.fetch_mid_price()
+            if live_price <= 0:
+                logger.warning("假突破 5m 结算：BTC 现价不可用，本轮 {} 条顺延", len(in_grace))
 
         try:
             async with async_session_factory() as session:
                 for s in due:
-                    # 逾期超宽限（停机积压）：不回填，保持 NULL 避免失真
-                    if now_ms - (s.signal_time + HOLD_5M_MS + buffer_ms) > SETTLE_EXPIRE_GRACE_MS:
-                        continue
+                    end_5m = int(s.market_end_5m)
+                    # P(E5)：宽限内现价；超宽限 klines 补（周期末 = 下一周期 kline 开盘价）
+                    if now_ms - (end_5m + buffer_ms) <= SETTLE_EXPIRE_GRACE_MS:
+                        if live_price <= 0:
+                            continue
+                        close_price = live_price
+                    else:
+                        close_price = await self._klines_open("5m", end_5m)
+                        if close_price <= 0:
+                            continue  # klines 暂时失败，下轮重试（历史必然可得）
+
                     row = await session.get(FakeBreakoutSignal, s.id)
                     if row is None or row.settle_outcome_5m is not None:
                         continue
-                    row.settle_btc_price_5m = settle_price
-                    if settle_price < row.btc_price:
+                    # 锚点 P(S5)：快照缺失时 klines 回读并补列
+                    anchor = row.cycle_open_price_5m
+                    if not anchor or anchor <= 0:
+                        anchor = await self._klines_open("5m", row.market_start_5m)
+                        if anchor <= 0:
+                            continue  # 下轮重试
+                        row.cycle_open_price_5m = anchor
+
+                    row.settle_btc_price_5m = close_price
+                    if close_price < anchor:
                         row.settle_outcome_5m = "DOWN"
-                    elif settle_price > row.btc_price:
+                    elif close_price > anchor:
                         row.settle_outcome_5m = "UP"
                     else:
                         row.settle_outcome_5m = "NOISE"
                     logger.info(
-                        "假突破信号 5m 结算 #{} | 入场 {:.0f} → +5min {:.0f} | {}",
-                        row.id, row.btc_price, settle_price, row.settle_outcome_5m,
+                        "假突破信号 5m 周期结算 #{} | 周期开盘 {:.0f} → 周期末 {:.0f} | {}",
+                        row.id, anchor, close_price, row.settle_outcome_5m,
                     )
                 await session.commit()
         except Exception as exc:
             logger.error("假突破 5m 结算回填失败 | {}", exc)
 
     async def _settle_15m(self, now_ms: int) -> None:
-        """15m 兑现口径回读：对齐所报价 15m 市场到期时刻回填（原 _settle_due_signals）。"""
+        """15m 周期锚点回读：对齐信号所在 15m 市场到期，按 P(E) vs P(S15) 判定。
+
+        - 锚点 P(S15)：fire 时快照；缺失则 klines 回读并补列
+        - P(E)：宽限内用现价；超宽限（停机积压）klines 精确补，不再置 EXPIRED
+        - EXPIRED 仅用于周期坐标缺失（fire 时 15m 报价快照落空，无锚点可判）
+        """
+        buffer_ms = settings.fake_breakout_settle_buffer_seconds * 1000
         try:
             async with async_session_factory() as session:
                 stmt = (
@@ -435,8 +526,8 @@ class FakeBreakoutDetector:
         if not due:
             return
 
-        # 先分离停机积压信号（逾期超宽限 → EXPIRED，不按现价结算）
-        expired_ids = [s.id for s in due if now_ms - s.settle_deadline > SETTLE_EXPIRE_GRACE_MS]
+        # 周期坐标缺失的条目无锚点可判，直接 EXPIRED（fire 时 15m 快照落空）
+        expired_ids = [s.id for s in due if not s.market_start_15m or not s.market_end_15m]
         if expired_ids:
             try:
                 async with async_session_factory() as session:
@@ -445,8 +536,8 @@ class FakeBreakoutDetector:
                         if row is not None and row.status == "PENDING":
                             row.status = "EXPIRED"
                             logger.warning(
-                                "假突破信号 #{} 停机积压逾期 {}s，置 EXPIRED（不按现价结算）",
-                                row.id, (now_ms - row.settle_deadline) // 1000,
+                                "假突破信号 #{} 周期坐标缺失（15m 报价快照落空），置 EXPIRED",
+                                row.id,
                             )
                     await session.commit()
             except Exception as exc:
@@ -455,29 +546,52 @@ class FakeBreakoutDetector:
             if not due:
                 return
 
-        settle_price = await self._collector.fetch_mid_price()
-        if settle_price <= 0:
-            logger.warning("假突破结算：BTC 现价不可用，本轮 {} 条顺延", len(due))
-            return
+        # 宽限内的条目用现价统一结算；超宽限的逐条 klines 精确补（停机无损）
+        in_grace = [
+            s for s in due
+            if now_ms - s.settle_deadline <= SETTLE_EXPIRE_GRACE_MS
+        ]
+        live_price = 0.0
+        if in_grace:
+            live_price = await self._collector.fetch_mid_price()
+            if live_price <= 0:
+                logger.warning("假突破结算：BTC 现价不可用，本轮 {} 条顺延", len(in_grace))
 
         try:
             async with async_session_factory() as session:
                 for s in due:
+                    end_15m = int(s.market_end_15m)
+                    if now_ms - s.settle_deadline <= SETTLE_EXPIRE_GRACE_MS:
+                        if live_price <= 0:
+                            continue
+                        close_price = live_price
+                    else:
+                        close_price = await self._klines_open("15m", end_15m)
+                        if close_price <= 0:
+                            continue  # klines 暂时失败，下轮重试
+
                     row = await session.get(FakeBreakoutSignal, s.id)
                     if row is None or row.status != "PENDING":
                         continue
-                    row.settle_btc_price = settle_price
-                    if settle_price < row.btc_price:
+                    # 锚点 P(S15)：快照缺失时 klines 回读并补列
+                    anchor = row.cycle_open_price_15m
+                    if not anchor or anchor <= 0:
+                        anchor = await self._klines_open("15m", row.market_start_15m)
+                        if anchor <= 0:
+                            continue  # 下轮重试
+                        row.cycle_open_price_15m = anchor
+
+                    row.settle_btc_price = close_price
+                    if close_price < anchor:
                         row.settle_outcome = "DOWN"
-                    elif settle_price > row.btc_price:
+                    elif close_price > anchor:
                         row.settle_outcome = "UP"
                     else:
                         row.settle_outcome = "NOISE"
                     row.status = "SETTLED"
                     logger.info(
-                        "假突破信号结算 #{} | 入场 BTC {:.0f} → 结算 {:.0f} | 方向 {} | 15m DOWN 入场价 {}",
-                        row.id, row.btc_price, settle_price,
-                        row.settle_outcome, row.down_price_15m,
+                        "假突破信号 15m 周期结算 #{} | 周期开盘 {:.0f} → 周期末 {:.0f} | {} | 入场价 {}",
+                        row.id, anchor, close_price, row.settle_outcome, row.down_price_15m,
                     )
                 await session.commit()
         except Exception as exc:
