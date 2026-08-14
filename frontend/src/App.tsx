@@ -2141,11 +2141,11 @@ function FakeBreakoutPanel() {
                 <th className="py-1.5 px-2 text-left">信号时间</th>
                 <th className="py-1.5 px-2 text-center">级别/方向</th>
                 <th className="py-1.5 px-2 text-right">破位价 / 位价</th>
-                <th className="py-1.5 px-2 text-right">15m 目标价</th>
-                <th className="py-1.5 px-2 text-right">5m 目标价</th>
-                <th className="py-1.5 px-2 text-right">结算价</th>
-                <th className="py-1.5 px-2 text-center">5m 后</th>
-                <th className="py-1.5 px-2 text-center">15m 后</th>
+                <th className="py-1.5 px-2 text-right" title="信号瞬间 15m 市场目标方向 token 的买入价快照（越低赔率越肥）">15m 入场价</th>
+                <th className="py-1.5 px-2 text-right" title="信号瞬间 5m 市场目标方向 token 的买入价快照">5m 入场价</th>
+                <th className="py-1.5 px-2 text-right" title="15m 市场到期时刻回读的 BTC 现价">结算价</th>
+                <th className="py-1.5 px-2 text-center" title="信号+5min 后 BTC 实际方向（系统按币安现货价回读判定，非预测市场数据）">+5m 方向</th>
+                <th className="py-1.5 px-2 text-center" title="15m 市场到期时 BTC 实际方向（对齐所报价市场的真实到期时刻）">+15m 方向</th>
                 <th className="py-1.5 px-2 text-center">状态</th>
               </tr>
             </thead>
@@ -2173,14 +2173,14 @@ function FakeBreakoutPanel() {
                         <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
                           isWin(s, s.settle_outcome_5m) ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'
                         }`}>{isWin(s, s.settle_outcome_5m) ? `✓ ${winBadge(s.settle_outcome_5m)}` : `✗ ${winBadge(s.settle_outcome_5m)}`}</span>
-                      ) : <span className="text-gray-300">待结算</span>}
+                      ) : <span className="text-gray-300" title="未到 +5min 结算时点，或该时点因部署重启错过（超宽限不回填防失真）">待结算</span>}
                     </td>
                     <td className="py-1.5 px-2 text-center">
                       {s.settle_outcome ? (
                         <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
                           isWin(s, s.settle_outcome) ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'
                         }`}>{isWin(s, s.settle_outcome) ? `✓ ${winBadge(s.settle_outcome)} 赢` : `✗ ${winBadge(s.settle_outcome)}`}</span>
-                      ) : <span className="text-gray-300">待结算</span>}
+                      ) : <span className="text-gray-300" title="15m 市场尚未到期">待结算</span>}
                     </td>
                     <td className="py-1.5 px-2 text-center">
                       <span className={`text-[10px] ${

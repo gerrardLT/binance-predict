@@ -360,16 +360,24 @@ class FakeBreakoutDetector:
         await self._settle_15m(now_ms)
 
     async def _settle_5m(self, now_ms: int) -> None:
-        """5m 兑现口径回读：信号时刻 +5min + 缓冲后回填 BTC 价与方向。"""
+        """5m 兑现口径回读：信号时刻 +5min + 缓冲后回填 BTC 价与方向。
+
+        不限定 status：信号在 15m 市场临到期前 5 分钟内触发时（约占 1/3），
+        15m 死线早于 5m 死线，15m 先把 status 推进 SETTLED；若限定 PENDING，
+        这些信号的 5m 口径将永远卡 NULL（前端"待结算"常驻）。
+        SQL 下界排除超宽限旧信号（防卡死信号累积反复占位 limit 20），
+        settle_outcome_5m IS NULL 已保证幂等。
+        """
         buffer_ms = settings.fake_breakout_settle_buffer_seconds * 1000
         due_5m_before = now_ms - HOLD_5M_MS - buffer_ms
+        earliest = due_5m_before - SETTLE_EXPIRE_GRACE_MS
         try:
             async with async_session_factory() as session:
                 stmt = (
                     select(FakeBreakoutSignal)
-                    .where(FakeBreakoutSignal.status == "PENDING")
                     .where(FakeBreakoutSignal.settle_outcome_5m.is_(None))
                     .where(FakeBreakoutSignal.signal_time <= due_5m_before)
+                    .where(FakeBreakoutSignal.signal_time > earliest)
                     .limit(20)
                 )
                 due = (await session.execute(stmt)).scalars().all()
