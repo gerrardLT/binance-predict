@@ -52,6 +52,51 @@ LEVEL_LOOKBACKS: dict[str, int] = {
     "daily": 288,
 }
 
+# 行动过滤器阈值（scripts/local_combo_filter_lab.py 回测，4 个 级别×方向 场景方向一致）：
+# A 剩余时间：信号落在 15m 周期前 6 分钟才可行动（12~15min 尾段桶 140 注仅 2 胜）
+# B 破位幅度：信号价偏离周期开盘价 <0.2%（>0.3% 桶 144 注 0 胜——周期内回吐整段破位几乎不可能）
+FILTER_A_MAX_OFFSET_SEC = 360
+FILTER_B_MAX_BREAK_PCT = 0.20
+
+
+def evaluate_signal_filter(
+    level: str,
+    side: str,
+    offset_sec: int | float | None,
+    break_pct: float | None,
+) -> tuple[bool, str]:
+    """A(周期内偏移) + B(破位幅度) + 方向 三重过滤判定（邮件/API/前端共用的单一事实源）。
+
+    返回 (是否可行动, 逐项中文说明)。数据缺失的项按不通过处理（保守：宁可放弃也不错动）。
+    """
+    parts: list[str] = []
+    ok_all = True
+
+    # A：周期内偏移（剩余时间越多，价格越有机会回归周期开盘价另一侧）
+    if offset_sec is None:
+        ok_all = False
+        parts.append("A 周期偏移未知❌")
+    else:
+        a_ok = offset_sec < FILTER_A_MAX_OFFSET_SEC
+        ok_all = ok_all and a_ok
+        parts.append(f"A 周期第 {offset_sec / 60:.1f}min（<6min {'✅' if a_ok else '❌'}）")
+
+    # B：破位幅度（破位越深，周期内回吐全部幅度越不可能）
+    if break_pct is None:
+        ok_all = False
+        parts.append("B 破位幅度未知❌")
+    else:
+        b_ok = break_pct < FILTER_B_MAX_BREAK_PCT
+        ok_all = ok_all and b_ok
+        parts.append(f"B {break_pct:.3f}%（<0.2% {'✅' if b_ok else '❌'}）")
+
+    # 方向：daily 破支撑→UP 回测费后 EV 为负（-0.12），回避
+    dir_ok = not (level == "daily" and side == "low")
+    ok_all = ok_all and dir_ok
+    parts.append(f"方向 {level} {side}{'✅' if dir_ok else '❌回避'}")
+
+    return ok_all, "｜".join(parts)
+
 
 class FakeBreakoutDetector:
     """
@@ -283,6 +328,17 @@ class FakeBreakoutDetector:
             m_end_5m = None
             m_open_5m = None
 
+        # 过滤器输入（A/B 回测口径）：fire 时计算落表，邮件/API/前端据此标注可行动性
+        m_offset_sec: int | None = (
+            int(round((now_ms - m_start_15m) / 1000.0)) if m_start_15m else None
+        )
+        if m_open_15m and m_open_15m > 0:
+            raw = mid / m_open_15m - 1.0
+            m_break_pct: float | None = round(raw * 100.0 if side == "high" else -raw * 100.0, 4)
+        else:
+            m_break_pct = None
+        filter_pass, _ = evaluate_signal_filter(level, side, m_offset_sec, m_break_pct)
+
         signal = FakeBreakoutSignal(
             level=level,
             side=side,
@@ -300,6 +356,8 @@ class FakeBreakoutDetector:
             market_start_5m=m_start_5m,
             market_end_5m=m_end_5m,
             cycle_open_price_5m=m_open_5m,
+            cycle_offset_sec_15m=m_offset_sec,
+            break_pct=m_break_pct,
             settle_deadline=settle_deadline,
             status="PENDING",
             email_sent=False,
@@ -320,10 +378,11 @@ class FakeBreakoutDetector:
         entry_15m = down_15m if side == "high" else up_15m
         logger.info(
             "假突破信号触发 #{} [{} {}] | BTC {:.0f} 破 {} {:.0f} | "
-            "目标 {} | 15m {}价={} | 日内第 {} 条{}",
+            "目标 {} | 15m {}价={} | 日内第 {} 条 | 过滤 {}{}",
             signal.id, level, side, mid, "阻力" if side == "high" else "支撑",
             broken_level, direction, direction, entry_15m,
             self._daily_count,
+            "✅" if filter_pass else "❌",
             "（超日限，不发邮件）" if over_daily_limit else "",
         )
 
@@ -369,6 +428,9 @@ class FakeBreakoutDetector:
         level_name = "阻力" if is_high else "支撑"
         entry_15m = signal.down_price_15m if is_high else signal.up_price_15m
         entry_5m = signal.down_price_5m if is_high else signal.up_price_5m
+        filter_pass, filter_label = evaluate_signal_filter(
+            signal.level, signal.side, signal.cycle_offset_sec_15m, signal.break_pct
+        )
         # 周期锚点口径回测（scripts/local_combo_level_matrix_check.py，8809 窗口）：
         # 低胜率高赔率——信号触发时周期内已走一段，赢需回到周期开盘价另一侧
         backtest = {
@@ -380,8 +442,8 @@ class FakeBreakoutDetector:
             ("daily", "low"): "15m 周期胜率 11.2%，费后 EV -0.12（回测为负，回避）",
         }.get((signal.level, signal.side), "—")
         subject = (
-            f"[假突破信号·{signal.level}] BTC {signal.btc_price:.0f} "
-            f"破{level_name} {signal.resistance:.0f} → 看{direction}"
+            f"[假突破信号·{signal.level} {'✅可行动' if filter_pass else '❌被过滤'}] "
+            f"BTC {signal.btc_price:.0f} 破{level_name} {signal.resistance:.0f} → 看{direction}"
         )
         body = (
             f"信号时间：{t_str}\n"
@@ -393,9 +455,12 @@ class FakeBreakoutDetector:
             f"  5m：{entry_5m}\n"
             f"  15m：{entry_15m}\n"
             f"  15m 市场到期：{end_str}\n\n"
+            f"过滤判定（A 剩余时间 <6min ｜ B 破位幅度 <0.2% ｜ 方向）：\n"
+            f"  {filter_label}\n"
+            f"  结论：{'✅ 可行动（A+B 组合 4h 口径回测胜率 42~53%，费后 EV +6.5~+7.1）' if filter_pass else '❌ 被过滤，建议放弃本注（尾段/深破/回避方向回测 EV 为负或 0 胜）'}\n\n"
             f"玩法提示（回测口径）：破位瞬间买 15m {direction}，持有到周期到期，\n"
             f"按周期末价 vs 周期开盘价结算（与市场真实规则一致）。\n"
-            f"历史回测（{signal.level} 级 {direction} 方向）：{backtest}。\n"
+            f"历史回测（{signal.level} 级 {direction} 方向基线，未过滤）：{backtest}。\n"
             f"当前阶段：系统不下注，仅记录信号并到期回读结算方向。\n"
         )
         return await send_plain_email(subject, body)

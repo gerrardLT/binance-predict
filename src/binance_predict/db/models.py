@@ -642,6 +642,14 @@ class FakeBreakoutSignal(Base):
     cycle_open_price_5m: Mapped[float | None] = mapped_column(
         Float, nullable=True, comment="5m 周期开盘价 P(S5)：5m 口径判定基准"
     )
+    cycle_offset_sec_15m: Mapped[int | None] = mapped_column(
+        Integer, nullable=True,
+        comment="信号触发时在 15m 周期内的偏移（秒，0~900）；过滤器 A（剩余时间）输入"
+    )
+    break_pct: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+        comment="破位幅度 %：信号价 vs 15m 周期开盘价（破位方向）；过滤器 B 输入"
+    )
     settle_deadline: Mapped[int] = mapped_column(
         BigInteger, nullable=False, comment="结算回读死线（ms）= signal_time + 15min + 缓冲"
     )

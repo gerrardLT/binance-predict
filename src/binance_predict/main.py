@@ -42,7 +42,7 @@ from .db.models import (
 from .models.schemas import CommitDeepLearnRequest
 from .services.agent_scheduler import AgentScheduler
 from .services.data_collector import BinanceDataCollector
-from .services.fake_breakout_detector import FakeBreakoutDetector
+from .services.fake_breakout_detector import FakeBreakoutDetector, evaluate_signal_filter
 from .services.llm_service import LLMService
 from .services.pattern_reevaluator import pattern_reevaluator
 from .services.prediction_trading import BinancePredictionTrader
@@ -765,6 +765,9 @@ async def lifespan(app: FastAPI):
                 "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS market_start_5m BIGINT",
                 "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS market_end_5m BIGINT",
                 "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS cycle_open_price_5m FLOAT",
+                # 假突破行动过滤器指标（与 alembic 迁移 l2d3e4f5g6h7 等价，存量 dev 库安全网）
+                "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS cycle_offset_sec_15m INTEGER",
+                "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS break_pct FLOAT",
             ]:
                 try:
                     await conn.execute(text(col_sql))
@@ -926,37 +929,39 @@ async def list_fake_breakout_signals(
         .limit(limit)
     )
     rows = (await db.execute(stmt)).scalars().all()
-    return {
-        "signals": [
-            {
-                "id": s.id,
-                "level": s.level,
-                "side": s.side,
-                "signal_time": s.signal_time,
-                "resistance": s.resistance,
-                "btc_price": s.btc_price,
-                "down_price_5m": s.down_price_5m,
-                "down_price_15m": s.down_price_15m,
-                "up_price_5m": s.up_price_5m,
-                "up_price_15m": s.up_price_15m,
-                "market_end_15m": s.market_end_15m,
-                "market_start_15m": s.market_start_15m,
-                "cycle_open_price_15m": s.cycle_open_price_15m,
-                "market_start_5m": s.market_start_5m,
-                "market_end_5m": s.market_end_5m,
-                "cycle_open_price_5m": s.cycle_open_price_5m,
-                "settle_btc_price": s.settle_btc_price,
-                "settle_outcome": s.settle_outcome,
-                "settle_btc_price_5m": s.settle_btc_price_5m,
-                "settle_outcome_5m": s.settle_outcome_5m,
-                "status": s.status,
-                "email_sent": s.email_sent,
-                "created_at": s.created_at.isoformat() if s.created_at else None,
-            }
-            for s in rows
-        ],
-        "total": len(rows),
-    }
+    signals = []
+    for s in rows:
+        fp, fl = evaluate_signal_filter(s.level, s.side, s.cycle_offset_sec_15m, s.break_pct)
+        signals.append({
+            "id": s.id,
+            "level": s.level,
+            "side": s.side,
+            "signal_time": s.signal_time,
+            "resistance": s.resistance,
+            "btc_price": s.btc_price,
+            "down_price_5m": s.down_price_5m,
+            "down_price_15m": s.down_price_15m,
+            "up_price_5m": s.up_price_5m,
+            "up_price_15m": s.up_price_15m,
+            "market_end_15m": s.market_end_15m,
+            "market_start_15m": s.market_start_15m,
+            "cycle_open_price_15m": s.cycle_open_price_15m,
+            "market_start_5m": s.market_start_5m,
+            "market_end_5m": s.market_end_5m,
+            "cycle_open_price_5m": s.cycle_open_price_5m,
+            "cycle_offset_sec_15m": s.cycle_offset_sec_15m,
+            "break_pct": s.break_pct,
+            "filter_pass": fp,
+            "filter_label": fl,
+            "settle_btc_price": s.settle_btc_price,
+            "settle_outcome": s.settle_outcome,
+            "settle_btc_price_5m": s.settle_btc_price_5m,
+            "settle_outcome_5m": s.settle_outcome_5m,
+            "status": s.status,
+            "email_sent": s.email_sent,
+            "created_at": s.created_at.isoformat() if s.created_at else None,
+        })
+    return {"signals": signals, "total": len(signals)}
 
 
 @app.get("/api/fake-breakout/stats")

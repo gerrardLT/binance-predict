@@ -221,6 +221,10 @@ interface FakeBreakoutSignal {
   market_start_5m: number | null
   market_end_5m: number | null
   cycle_open_price_5m: number | null
+  cycle_offset_sec_15m: number | null
+  break_pct: number | null
+  filter_pass: boolean
+  filter_label: string
   settle_btc_price: number | null
   settle_outcome: 'UP' | 'DOWN' | 'NOISE' | null
   settle_btc_price_5m: number | null
@@ -2145,6 +2149,7 @@ function FakeBreakoutPanel() {
               <tr className="border-b border-gray-200 text-gray-500">
                 <th className="py-1.5 px-2 text-left">信号时间</th>
                 <th className="py-1.5 px-2 text-center">级别/方向</th>
+                <th className="py-1.5 px-2 text-center" title="行动过滤：A 周期内偏移<6min（尾段回测140注仅2胜）｜ B 破位幅度<0.2%（>0.3%回测144注0胜）｜ 方向（日线破支撑回避）。全部通过才可行动">过滤</th>
                 <th className="py-1.5 px-2 text-right">破位价 / 位价</th>
                 <th className="py-1.5 px-2 text-right" title="信号瞬间 15m 市场目标方向 token 的买入价快照（越低赔率越肥）">15m 入场价</th>
                 <th className="py-1.5 px-2 text-right" title="信号瞬间 5m 市场目标方向 token 的买入价快照">5m 入场价</th>
@@ -2166,6 +2171,16 @@ function FakeBreakoutPanel() {
                       <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
                         s.side === 'high' ? 'bg-red-50 text-red-600' : 'bg-green-50 text-green-600'
                       }`}>{s.side === 'high' ? '看跌' : '看涨'}</span>
+                    </td>
+                    <td className="py-1.5 px-2 text-center" title={s.filter_label}>
+                      <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                        s.filter_pass ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-400'
+                      }`}>{s.filter_pass ? '✅ 可行动' : '❌ 过滤'}</span>
+                      {s.cycle_offset_sec_15m !== null && (
+                        <div className="text-[9px] text-gray-400 font-mono mt-0.5">
+                          {(s.cycle_offset_sec_15m / 60).toFixed(1)}min {s.break_pct !== null ? `${s.break_pct.toFixed(2)}%` : ''}
+                        </div>
+                      )}
                     </td>
                     <td className="py-1.5 px-2 text-right font-mono text-gray-800">
                       {s.btc_price.toFixed(0)} <span className="text-gray-400">/ {s.resistance.toFixed(0)}</span>
