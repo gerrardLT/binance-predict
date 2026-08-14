@@ -424,7 +424,8 @@ class FakeBreakoutDetector:
         """5m 周期锚点回读：信号所在 5m 周期到期 + 缓冲后，按 P(E5) vs P(S5) 判定。
 
         - 锚点 P(S5)：fire 时快照的 cycle_open_price_5m；缺失则 klines 回读并补列
-        - P(E5)：宽限内用现价；超宽限（停机积压）klines 补（下一根 5m kline 开盘价）
+        - P(E5)：统一 klines 精确读（下一根 kline 开盘价 = 周期末时刻价格，时点零误差）；
+          klines 暂时失败时宽限内可现价兜底，超宽限必须 klines（下轮重试，历史必然可得）
         - 周期坐标缺失（fire 时 5m 报价快照落空）的条目不结算，保持 NULL
         - 不限定 status：15m 死线可能更早先把 status 推进 SETTLED，两口径独立回填
         """
@@ -451,30 +452,21 @@ class FakeBreakoutDetector:
         if not due:
             return
 
-        # 宽限内的条目用现价统一结算；超宽限的逐条 klines 精确补
-        in_grace = [
-            s for s in due
-            if now_ms - (int(s.market_end_5m) + buffer_ms) <= SETTLE_EXPIRE_GRACE_MS
-        ]
-        live_price = 0.0
-        if in_grace:
-            live_price = await self._collector.fetch_mid_price()
-            if live_price <= 0:
-                logger.warning("假突破 5m 结算：BTC 现价不可用，本轮 {} 条顺延", len(in_grace))
-
+        live_price: float | None = None  # 惰性 fallback：仅 klines 失败且宽限内才取现价
         try:
             async with async_session_factory() as session:
                 for s in due:
                     end_5m = int(s.market_end_5m)
-                    # P(E5)：宽限内现价；超宽限 klines 补（周期末 = 下一周期 kline 开盘价）
-                    if now_ms - (end_5m + buffer_ms) <= SETTLE_EXPIRE_GRACE_MS:
-                        if live_price <= 0:
+                    # P(E5)：klines 精确读周期末价；失败时宽限内现价兜底，超宽限下轮重试
+                    close_price = await self._klines_open("5m", end_5m)
+                    if close_price <= 0:
+                        if now_ms - (end_5m + buffer_ms) > SETTLE_EXPIRE_GRACE_MS:
                             continue
+                        if live_price is None:
+                            live_price = await self._collector.fetch_mid_price()
                         close_price = live_price
-                    else:
-                        close_price = await self._klines_open("5m", end_5m)
                         if close_price <= 0:
-                            continue  # klines 暂时失败，下轮重试（历史必然可得）
+                            continue
 
                     row = await session.get(FakeBreakoutSignal, s.id)
                     if row is None or row.settle_outcome_5m is not None:
@@ -504,9 +496,10 @@ class FakeBreakoutDetector:
 
     async def _settle_15m(self, now_ms: int) -> None:
         """15m 周期锚点回读：对齐信号所在 15m 市场到期，按 P(E) vs P(S15) 判定。
-
+    
         - 锚点 P(S15)：fire 时快照；缺失则 klines 回读并补列
-        - P(E)：宽限内用现价；超宽限（停机积压）klines 精确补，不再置 EXPIRED
+        - P(E)：统一 klines 精确读（时点零误差）；klines 暂时失败时宽限内现价兜底，
+          超宽限（停机积压）必须 klines——历史必然可得，停机无损，不再置 EXPIRED
         - EXPIRED 仅用于周期坐标缺失（fire 时 15m 报价快照落空，无锚点可判）
         """
         buffer_ms = settings.fake_breakout_settle_buffer_seconds * 1000
@@ -546,29 +539,21 @@ class FakeBreakoutDetector:
             if not due:
                 return
 
-        # 宽限内的条目用现价统一结算；超宽限的逐条 klines 精确补（停机无损）
-        in_grace = [
-            s for s in due
-            if now_ms - s.settle_deadline <= SETTLE_EXPIRE_GRACE_MS
-        ]
-        live_price = 0.0
-        if in_grace:
-            live_price = await self._collector.fetch_mid_price()
-            if live_price <= 0:
-                logger.warning("假突破结算：BTC 现价不可用，本轮 {} 条顺延", len(in_grace))
-
+        live_price: float | None = None  # 惰性 fallback：仅 klines 失败且宽限内才取现价
         try:
             async with async_session_factory() as session:
                 for s in due:
                     end_15m = int(s.market_end_15m)
-                    if now_ms - s.settle_deadline <= SETTLE_EXPIRE_GRACE_MS:
-                        if live_price <= 0:
+                    # P(E)：klines 精确读周期末价；失败时宽限内现价兜底，超宽限下轮重试
+                    close_price = await self._klines_open("15m", end_15m)
+                    if close_price <= 0:
+                        if now_ms - s.settle_deadline > SETTLE_EXPIRE_GRACE_MS:
                             continue
+                        if live_price is None:
+                            live_price = await self._collector.fetch_mid_price()
                         close_price = live_price
-                    else:
-                        close_price = await self._klines_open("15m", end_15m)
                         if close_price <= 0:
-                            continue  # klines 暂时失败，下轮重试
+                            continue
 
                     row = await session.get(FakeBreakoutSignal, s.id)
                     if row is None or row.status != "PENDING":
