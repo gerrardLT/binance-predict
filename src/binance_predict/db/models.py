@@ -650,6 +650,19 @@ class FakeBreakoutSignal(Base):
         Float, nullable=True,
         comment="破位幅度 %：信号价 vs 15m 周期开盘价（破位方向）；过滤器 B 输入"
     )
+    pattern: Mapped[str | None] = mapped_column(
+        String(16), nullable=True,
+        comment="收盘确认场景：bull_exhaust(破阻力+光头阳→次周期DOWN) | "
+                "bear_exhaust(破支撑+收阴+放量→次周期UP)；旧 A+B 时代信号为 NULL"
+    )
+    close_pos: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+        comment="信号周期收盘位置 (C-L)/(H-L)：场景①判定输入与审计（阈值 0.85）"
+    )
+    vol_ratio: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+        comment="信号周期量比 = 本 15m 成交量 / 前 20 根均量：场景②判定输入与审计（阈值 2.0）"
+    )
     settle_deadline: Mapped[int] = mapped_column(
         BigInteger, nullable=False, comment="结算回读死线（ms）= signal_time + 15min + 缓冲"
     )

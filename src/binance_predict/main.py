@@ -42,7 +42,7 @@ from .db.models import (
 from .models.schemas import CommitDeepLearnRequest
 from .services.agent_scheduler import AgentScheduler
 from .services.data_collector import BinanceDataCollector
-from .services.fake_breakout_detector import FakeBreakoutDetector, evaluate_signal_filter
+from .services.fake_breakout_detector import FakeBreakoutDetector
 from .services.llm_service import LLMService
 from .services.pattern_reevaluator import pattern_reevaluator
 from .services.prediction_trading import BinancePredictionTrader
@@ -213,10 +213,7 @@ async def _prediction_market_tracker() -> None:
                 except Exception as e:
                     logger.warning("15m 市场采样入库失败: {}", e)
 
-            # 更新市场元数据（供图表 API 只读访问 + 假突破检测器共享）。
-            # 原地更新（clear+update）保持 dict 身份不变：lifespan 把该 dict 引用
-            # 传给了 FakeBreakoutDetector，整体重新赋值会让检测器持有过期空引用，
-            # 导致 down_price_5m 永远读不到（CodeReview Major-1）。
+            # 更新市场元数据（供图表 API 只读访问；场景检测器已不共享此 dict）。
             _pm_market_info.clear()
             _pm_market_info.update({
                 "participant_count": quote.participants,
@@ -768,6 +765,10 @@ async def lifespan(app: FastAPI):
                 # 假突破行动过滤器指标（与 alembic 迁移 l2d3e4f5g6h7 等价，存量 dev 库安全网）
                 "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS cycle_offset_sec_15m INTEGER",
                 "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS break_pct FLOAT",
+                # 场景收盘确认（与 alembic 迁移 n4e5f6g7h8i9 等价，存量 dev 库安全网）
+                "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS pattern VARCHAR(16)",
+                "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS close_pos FLOAT",
+                "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS vol_ratio FLOAT",
             ]:
                 try:
                     await conn.execute(text(col_sql))
@@ -806,16 +807,15 @@ async def lifespan(app: FastAPI):
     ]
     logger.info("现货 WS + 预测市场追踪 + 情绪窗口归档 + 健康监控已启动")
 
-    # 假突破信号系统：秒级检测日线阻力破位（暂不下注，只记录+邮件+到期回读）
+    # 场景信号系统：4h 破位记 pending → 15m 周期收盘确认 → 次周期信号（不下注）
     global fake_breakout_detector
     if settings.fake_breakout_enabled:
         fake_breakout_detector = FakeBreakoutDetector(
             collector=collector,
             pm_15m_latest=_pm_15m_latest,
-            pm_market_info=_pm_market_info,
         )
         await fake_breakout_detector.start()
-        logger.info("假突破检测器已启动（信号模式，不下注）")
+        logger.info("场景检测器已启动（场景①多头耗尽/场景②空头耗尽，信号模式不下注）")
 
     # 模式池分级与定期重回测（无限进化引擎：新数据累积阈值触发，只发现不下注）
     if settings.pattern_reeval_enabled:
@@ -931,7 +931,6 @@ async def list_fake_breakout_signals(
     rows = (await db.execute(stmt)).scalars().all()
     signals = []
     for s in rows:
-        fp, fl = evaluate_signal_filter(s.level, s.side, s.cycle_offset_sec_15m, s.break_pct)
         signals.append({
             "id": s.id,
             "level": s.level,
@@ -951,8 +950,9 @@ async def list_fake_breakout_signals(
             "cycle_open_price_5m": s.cycle_open_price_5m,
             "cycle_offset_sec_15m": s.cycle_offset_sec_15m,
             "break_pct": s.break_pct,
-            "filter_pass": fp,
-            "filter_label": fl,
+            "pattern": s.pattern,
+            "close_pos": s.close_pos,
+            "vol_ratio": s.vol_ratio,
             "settle_btc_price": s.settle_btc_price,
             "settle_outcome": s.settle_outcome,
             "settle_btc_price_5m": s.settle_btc_price_5m,
@@ -978,21 +978,22 @@ async def get_fake_breakout_stats(db: AsyncSession = Depends(get_db)):
         sa_select(sa_func.count(FakeBreakoutSignal.id))
     )).scalar() or 0
 
-    # 分组统计：(level, side) × {15m口径, 5m口径}
+    # 分组统计：(level, side, pattern) × {15m口径, 5m口径}
     rows = (await db.execute(
         sa_select(
             FakeBreakoutSignal.level,
             FakeBreakoutSignal.side,
+            FakeBreakoutSignal.pattern,
             FakeBreakoutSignal.settle_outcome,
             FakeBreakoutSignal.settle_outcome_5m,
         ).where(FakeBreakoutSignal.status == "SETTLED")
     )).all()
 
     groups: dict[str, dict] = {}
-    for level, side, oc15, oc5 in rows:
-        key = f"{level}|{side}"
+    for level, side, pattern, oc15, oc5 in rows:
+        key = f"{level}|{side}|{pattern or 'legacy'}"
         g = groups.setdefault(key, {
-            "level": level, "side": side,
+            "level": level, "side": side, "pattern": pattern,
             "settled_15m": 0, "wins_15m": 0,
             "settled_5m": 0, "wins_5m": 0,
         })
@@ -1013,7 +1014,7 @@ async def get_fake_breakout_stats(db: AsyncSession = Depends(get_db)):
             "win_rate_15m": (g["wins_15m"] / g["settled_15m"]) if g["settled_15m"] else None,
             "win_rate_5m": (g["wins_5m"] / g["settled_5m"]) if g["settled_5m"] else None,
         })
-    by_group.sort(key=lambda x: (x["level"], x["side"]))
+    by_group.sort(key=lambda x: (x["level"], x["side"], x["pattern"] or ""))
 
     # 全量汇总（兼容前端旧字段）
     settled = sum(g["settled_15m"] for g in groups.values())

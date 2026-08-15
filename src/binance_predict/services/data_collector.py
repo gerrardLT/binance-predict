@@ -189,6 +189,57 @@ class BinanceDataCollector:
             logger.warning("fetch_kline_open 失败 | interval={} start={} | {}", interval, start_ms, exc)
             return 0.0
 
+    async def fetch_recent_klines(self, interval: str, limit: int) -> list[dict]:
+        """拉最近 limit 根已收盘 K 线（升序），供周期收盘质量判定使用。
+
+        多拉 1 根并丢弃最后一根（当前未收盘的 K），保证返回的全部是完整 K。
+
+        Args:
+            interval: K 线周期（"5m" | "15m"）
+            limit: 需要的已收盘 K 线数量
+
+        Returns:
+            [{"open_time", "open", "high", "low", "close", "volume"}, ...]（升序）；
+            失败返回空列表，调用方下轮重试。
+        """
+        interval_ms = {"5m": 300_000, "15m": 900_000}.get(interval)
+        if interval_ms is None:
+            logger.warning("fetch_recent_klines 不支持的周期 | interval={}", interval)
+            return []
+        url = "https://api.binance.com/api/v3/klines"
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    url,
+                    params={
+                        "symbol": settings.symbol,
+                        "interval": interval,
+                        "limit": limit + 1,
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            if not data:
+                logger.warning("fetch_recent_klines 返回空 | interval={}", interval)
+                return []
+            # 币安服务器时间口径判断收盘（与结算回读一致，避免本地时钟偏差误判）
+            closed = [k for k in data if int(k[0]) + interval_ms <= int(time.time() * 1000) + 500]
+            closed = closed[-limit:]
+            return [
+                {
+                    "open_time": int(k[0]),
+                    "open": float(k[1]),
+                    "high": float(k[2]),
+                    "low": float(k[3]),
+                    "close": float(k[4]),
+                    "volume": float(k[5]),
+                }
+                for k in closed
+            ]
+        except Exception as exc:
+            logger.warning("fetch_recent_klines 失败 | interval={} | {}", interval, exc)
+            return []
+
     def _safe_cached_mid_price(self) -> float:
         """返回缓存的 mid_price，若为 0.0 则记录严重警告。"""
         cached = self.store.mid_price

@@ -1,28 +1,36 @@
 """
-假突破信号系统：4h 阻力/支撑破位秒级检测 + A+B 过滤 + 信号落表 + 周期结算回读。
+场景信号系统：4h 位势破位检测 + 15m 周期收盘质量确认 + 次周期入场提醒。
 
-模式收窄（2026-08-15 拍板）：只跑回测统计显著的 4h 双向 × A+B 组合
-（scripts/local_combo_filter_lab.py：4h 破阻力→DOWN 胜率 41.7% 费后 EV +7.06 [+0.35,+15.7]；
-4h 破支撑→UP 53.3% EV +6.52 [+1.12,+13.9]，CI 均不含 0）。
-1h/日线级别与未过 A+B 过滤的信号一律不落表、不结算、不邮件（旧模式彻底移除）。
+模式升级（2026-08-15 拍板）：旧 A+B 过滤方案（破位瞬间当周期行动）整体替换为
+经 180 天官方数据样本外盲验的两个高确定性场景（scripts/local_continuation_discovery.py、
+local_lowside_validation.py：前 120 天发现集筛选 → 后 60 天验证集盲验）：
+
+场景① bull_exhaust（多头耗尽，验证集 63.6% [59.3,68.0] n=462，EV@0.50 +0.22/事件）：
+  15m 周期内刺破 4h 阻力位势 + 周期收盘收阳 + 光头收盘（收盘位置 (C-L)/(H-L) ≥ 0.85）
+  → 次周期开盘买 DOWN。入场方案：开盘半仓 @~0.50 + 次周期内反弹至 +0.10% 加仓半仓 @~0.27
+    （180 天回测：开盘全仓 EV/事件 +0.223，触价加仓 +0.270，深等 z≥1 为负 EV 陷阱）
+
+场景② bear_exhaust（镜像，验证集 57.8% [53.5,62.1] n=512，EV@0.50 +0.11/事件）：
+  15m 周期内跌破 4h 支撑位势 + 周期收盘收阴 + 放量（量 ≥ 2× 前 20 根 15m 均量）
+  → 次周期开盘买 UP。入场方案：只开盘买——跌态中 UP token 无折扣（0.79~0.90），等待无价值
+
+检测流程：
+  1. 秒级循环：mid 破位势 → 记 pending（仅内存，不报警不落表，每方向每周期记首次）
+  2. 15m 周期边界：拉上一根完整 15m K（OHLCV）+ 前 20 根均量，判定收盘质量
+  3. 场景命中 → 落表 fake_breakout_signals（pattern 列区分）+ 邮件 + 次周期锚点结算
 
 结算口径【周期锚点，与币安预测市场真实结算规则一致】：
-- 信号落在哪个市场周期，就按那个周期的涨跌判定：
-  UP 赢 ⟺ P(周期末) > P(周期开盘价)；DOWN 赢 ⟺ P(周期末) < P(周期开盘价)
-- 15m 口径：信号所在 15m 市场 [market_start_15m, market_end_15m]
-- 5m 口径：信号所在 5m 市场 [market_start_5m, market_end_5m]（兑现窗=剩余周期 0~5min）
-- 周期开盘价 P(S)：tracker 周期切换时快照（冷启动 klines 精确回读）
-- 周期末价 P(E)：到期+buffer 后现价；超宽限（停机积压）用 klines 精确补，
-  历史时点必然可得，停机无损；仅周期坐标缺失或 klines 也失败才 EXPIRED
+- 目标周期 = 破位确认后的下一个 15m 周期 [market_start_15m, market_end_15m]
+- UP 赢 ⟺ P(周期末) > P(周期开盘价)；DOWN 赢 ⟺ P(周期末) < P(周期开盘价)
+- 周期开盘价 P(S)：fire 时快照（cycle_open_end 配对守卫）；缺失则结算时 klines 精确回读
+- 周期末价 P(E)：到期+buffer 后 klines 精确读；超宽限（停机积压）下轮重试，停机无损
 
-当前阶段【不下注】：
-- 破位且通过 A+B 过滤才落表 fake_breakout_signals（含 5m/15m 目标 token 报价快照 + 周期坐标）
-- 邮件推送提醒（复用 agent_alert_* SMTP 配置，fire-and-forget 不阻塞检测循环）
-- 到期回读回填周期涨跌方向（UP/DOWN 符号），stats 按 side 换算策略胜负
+当前阶段【不下注】：落表 + 邮件提醒 + 到期回读结算方向，积累实盘口径胜率/EV。
 
 风控（不下注阶段）：
-- 同一 (side, level) 信号冷却（默认 900s，一波冲高/冲低只报一次）
+- pending 按 (side, 周期) 天然去重，一波冲高/冲低每周期最多一条信号
 - 日内信号上限（超限后仍落表但不再发邮件，防轰炸）
+- 确认重试：klines 拉取失败最多重试 5 次/60s，超时放弃（次周期已走远，入场价假设失效）
 
 生命周期由 main.py lifespan 管理：start() 启动循环，stop() 优雅停止。
 """
@@ -43,8 +51,6 @@ from . import clock_sync
 from .alerting import send_plain_email
 from .data_collector import BinanceDataCollector
 
-# 15m 死线兜底：15m 报价快照缺失时退回 signal+15min（对齐 HOLD_MS 语义）
-HOLD_MS = 900_000
 # 超宽限阈值：到期后超过此宽限未结算的信号转 klines 精确补结算路径
 # （周期锚点口径下 P(S)/P(E) 均为历史时点，klines 必然可得，停机无损）
 SETTLE_EXPIRE_GRACE_MS = 300_000
@@ -55,70 +61,67 @@ LEVEL_LOOKBACKS: dict[str, int] = {
     "4h": 48,
 }
 
-# 行动过滤器阈值（scripts/local_combo_filter_lab.py 回测，4 个 级别×方向 场景方向一致）：
-# A 剩余时间：信号落在 15m 周期前 6 分钟才可行动（12~15min 尾段桶 140 注仅 2 胜）
-# B 破位幅度：信号价偏离周期开盘价 <0.2%（>0.3% 桶 144 注 0 胜——周期内回吐整段破位几乎不可能）
-FILTER_A_MAX_OFFSET_SEC = 360
-FILTER_B_MAX_BREAK_PCT = 0.20
+# 场景定义（180 天官方数据，发现集筛选 → 验证集盲验，scripts/local_continuation_discovery.py）：
+# 场景① bull_exhaust：破 4h 阻力 + 周期收阳 + 光头收盘 → 次周期 DOWN（验证集 63.6%）
+# 场景② bear_exhaust：破 4h 支撑 + 周期收阴 + 放量 → 次周期 UP（验证集 57.8%）
+CLOSE_POS_MIN = 0.85   # 场景①：收盘位置 (C-L)/(H-L) 下限（上影 ≤ 15% 振幅）
+VOL_RATIO_MIN = 2.0    # 场景②：量比下限（本周期 15m 量 / 前 20 根均量）
+VOL_MA_WINDOW = 20     # 场景②：均量窗口（根，不含当前周期）
+# 确认重试上限：klines 拉取失败时每轮循环重试，超过此时限放弃（次周期走远，入场价假设失效）
+CONFIRM_RETRY_MAX = 5
+CONFIRM_RETRY_TIMEOUT_MS = 60_000
 
 
-def evaluate_signal_filter(
-    level: str,
+def classify_close_pattern(
     side: str,
-    offset_sec: int | float | None,
-    break_pct: float | None,
-) -> tuple[bool, str]:
-    """A(周期内偏移) + B(破位幅度) + 方向 三重过滤判定（邮件/API/前端共用的单一事实源）。
+    o: float,
+    h: float,
+    l: float,
+    c: float,
+    volume: float,
+    vol_ma: float | None,
+) -> tuple[bool, float | None, float | None]:
+    """信号周期收盘质量判定（纯函数，邮件/API/测试共用的单一事实源）。
 
-    返回 (是否可行动, 逐项中文说明)。数据缺失的项按不通过处理（保守：宁可放弃也不错动）。
+    Args:
+        side: 破位方向（high=破阻力→场景① | low=破支撑→场景②）
+        o/h/l/c: 信号周期 15m K 线 OHLC
+        volume: 信号周期 15m 成交量
+        vol_ma: 前 VOL_MA_WINDOW 根 15m 均量（不含当前根）；数据不足时传 None（场景②保守不通过）
+
+    Returns:
+        (是否命中场景, close_pos, vol_ratio)
     """
-    parts: list[str] = []
-    ok_all = True
-
-    # A：周期内偏移（剩余时间越多，价格越有机会回归周期开盘价另一侧）
-    if offset_sec is None:
-        ok_all = False
-        parts.append("A 周期偏移未知❌")
+    rng = h - l
+    if rng <= 0 or o <= 0:
+        return False, None, None
+    close_pos = (c - l) / rng
+    vol_ratio = volume / vol_ma if vol_ma and vol_ma > 0 else None
+    if side == "high":
+        # 场景①：收阳 + 光头（收盘贴自身最高，多头满仓无剩余买力）
+        ok = c > o and close_pos >= CLOSE_POS_MIN
     else:
-        a_ok = offset_sec < FILTER_A_MAX_OFFSET_SEC
-        ok_all = ok_all and a_ok
-        parts.append(f"A 周期第 {offset_sec / 60:.1f}min（<6min {'✅' if a_ok else '❌'}）")
-
-    # B：破位幅度（破位越深，周期内回吐全部幅度越不可能）
-    if break_pct is None:
-        ok_all = False
-        parts.append("B 破位幅度未知❌")
-    else:
-        b_ok = break_pct < FILTER_B_MAX_BREAK_PCT
-        ok_all = ok_all and b_ok
-        parts.append(f"B {break_pct:.3f}%（<0.2% {'✅' if b_ok else '❌'}）")
-
-    # 方向：daily 破支撑→UP 回测费后 EV 为负（-0.12），回避
-    dir_ok = not (level == "daily" and side == "low")
-    ok_all = ok_all and dir_ok
-    parts.append(f"方向 {level} {side}{'✅' if dir_ok else '❌回避'}")
-
-    return ok_all, "｜".join(parts)
+        # 场景②：收阴 + 放量（数据不足时保守不通过）
+        ok = c < o and vol_ratio is not None and vol_ratio >= VOL_RATIO_MIN
+    return ok, close_pos, vol_ratio
 
 
 class FakeBreakoutDetector:
     """
-    4h 阻力/支撑假突破秒级检测器（A+B 过滤前置：未过过滤不落表）。
+    场景信号检测器：4h 位势破位秒级记录 → 15m 周期收盘质量确认 → 次周期信号。
 
-    报价快照通过两个 dict 引用注入（main.py 模块级变量，tracker 单写者）：
-    - pm_15m_latest: 15m 市场最新报价 {"down_price", "up_price", "end_date", "updated_ts"}
-    - pm_market_info: 5m 市场最新元数据（含 down_price）
+    报价快照通过 dict 引用注入（main.py 模块级变量，tracker 单写者）：
+    - pm_15m_latest: 15m 市场最新报价 {"down_price", "up_price", "end_date",
+      "cycle_open_price", "cycle_open_end"}
     """
 
     def __init__(
         self,
         collector: BinanceDataCollector,
         pm_15m_latest: dict,
-        pm_market_info: dict,
     ) -> None:
         self._collector = collector
         self._pm_15m = pm_15m_latest
-        self._pm_5m = pm_market_info
 
         self._running = False
         self._task: asyncio.Task | None = None
@@ -127,10 +130,18 @@ class FakeBreakoutDetector:
         self._levels: dict[str, dict[str, float]] = {}
         self._levels_refreshed_at: float = 0.0
 
-        # 风控状态：按 (side, level) 独立冷却（一波冲高/冲低每级别只报一次）
+        # 风控状态：按 (side, level) 独立冷却（双保险；主去重靠 pending 周期覆盖）
         self._last_signal_at: dict[tuple[str, str], int] = {}
         self._daily_count: int = 0
         self._daily_date: str = ""  # UTC 日期串，跨天重置
+
+        # 场景确认状态：
+        # - _pending_breaks: side → 本周期首次破位记录（仅内存，周期收盘时判定）
+        # - _last_cycle_id: 上次循环所在的 15m 周期号（边界检测用；冷启动为 None）
+        # - _confirm_retries: klines 拉取失败的确认重试队列
+        self._pending_breaks: dict[str, dict] = {}
+        self._last_cycle_id: int | None = None
+        self._confirm_retries: list[dict] = []
 
     # ==================================================================
     # 生命周期
@@ -143,11 +154,12 @@ class FakeBreakoutDetector:
         await self._refresh_levels(force=True)
         self._task = asyncio.create_task(self._loop(), name="fake_breakout_detector")
         logger.info(
-            "假突破检测器启动 | 级别={} | eps={} | 检测间隔={}s | 冷却={}s",
+            "场景检测器启动 | 级别={} | eps={} | 检测间隔={}s | 冷却={}s | 场景①close_pos≥{} 场景②量比≥{}",
             "/".join(LEVEL_LOOKBACKS.keys()),
             settings.fake_breakout_eps,
             settings.fake_breakout_check_interval,
             settings.fake_breakout_cooldown_seconds,
+            CLOSE_POS_MIN, VOL_RATIO_MIN,
         )
 
     async def stop(self) -> None:
@@ -159,7 +171,7 @@ class FakeBreakoutDetector:
             except asyncio.CancelledError:
                 pass
         self._task = None
-        logger.info("假突破检测器已停止")
+        logger.info("场景检测器已停止")
 
     # ==================================================================
     # 4h 位势计算（48 个 5m 窗口 closes 极值，定期刷新）
@@ -182,13 +194,13 @@ class FakeBreakoutDetector:
                 )
                 rows = (await session.execute(stmt)).scalars().all()
         except Exception as exc:
-            logger.warning("假突破检测器：位势刷新失败 | {}", exc)
+            logger.warning("场景检测器：位势刷新失败 | {}", exc)
             return
 
         # closes 按时间倒序返回，反转为升序后切片算各级别
         closes = [float(r) for r in reversed(rows)]
         if len(closes) < min(LEVEL_LOOKBACKS.values()):
-            logger.debug("假突破检测器：历史窗口不足（{}），位势暂不更新", len(closes))
+            logger.debug("场景检测器：历史窗口不足（{}），位势暂不更新", len(closes))
             return
 
         new_levels: dict[str, dict[str, float]] = {}
@@ -204,7 +216,7 @@ class FakeBreakoutDetector:
 
         if new_levels != self._levels:
             logger.info(
-                "假突破检测器：位势更新 | {}",
+                "场景检测器：位势更新 | {}",
                 " | ".join(
                     f"{lv} 阻力 {v['resistance']:.0f} 支撑 {v['support']:.0f}"
                     for lv, v in new_levels.items()
@@ -217,7 +229,7 @@ class FakeBreakoutDetector:
     # ==================================================================
 
     async def _loop(self) -> None:
-        logger.debug("假突破检测器：循环开始")
+        logger.debug("场景检测器：循环开始")
         while self._running:
             try:
                 await self._refresh_levels()
@@ -226,8 +238,17 @@ class FakeBreakoutDetector:
                 # 统一用币安服务器时钟：与市场 end_date（币安时钟）比较无时钟偏差
                 now_ms = clock_sync.now_ms()
 
+                # 确认重试队列优先处理（klines 之前拉取失败的周期收盘确认）
+                await self._drain_confirm_retries(now_ms)
+
+                # 15m 周期边界检测：跨周期 → 对上一周期做收盘质量确认
+                cycle_id = now_ms // 900_000
+                if self._last_cycle_id is not None and cycle_id != self._last_cycle_id:
+                    await self._on_cycle_boundary(self._last_cycle_id, cycle_id, now_ms)
+                self._last_cycle_id = cycle_id
+
                 if mid > 0 and self._levels:
-                    await self._check_breakout(now_ms, mid)
+                    self._record_breakout(now_ms, mid)
 
                 await self._settle_due_signals(now_ms)
 
@@ -235,7 +256,7 @@ class FakeBreakoutDetector:
                 break
             except Exception as exc:
                 logger.warning(
-                    "假突破检测器：循环异常 | error_type={} | error={}",
+                    "场景检测器：循环异常 | error_type={} | error={}",
                     type(exc).__name__, exc,
                 )
 
@@ -243,7 +264,7 @@ class FakeBreakoutDetector:
                 await asyncio.sleep(settings.fake_breakout_check_interval)
             except asyncio.CancelledError:
                 break
-        logger.debug("假突破检测器：循环结束")
+        logger.debug("场景检测器：循环结束")
 
     # ==================================================================
     # 破位检测与信号落表
@@ -256,25 +277,129 @@ class FakeBreakoutDetector:
             self._daily_date = today
             self._daily_count = 0
 
-    async def _check_breakout(self, now_ms: int, mid: float) -> None:
-        """遍历 4h 级别 × 双向 检查破位，每个 (side, level) 独立冷却。"""
+    def _record_breakout(self, now_ms: int, mid: float) -> None:
+        """遍历 4h 级别 × 双向检测破位：只记 pending（每方向每周期首次），不报警不落表。"""
         eps = settings.fake_breakout_eps
+        cycle_id = now_ms // 900_000
         for level, lv in self._levels.items():
-            # 冲过阻力 → 卖跌信号（买 DOWN）
-            if mid > lv["resistance"] * (1.0 + eps):
-                await self._fire_signal(now_ms, mid, level, "high", lv["resistance"])
-            # 跌破支撑 → 买涨信号（买 UP）
-            if mid < lv["support"] * (1.0 - eps):
-                await self._fire_signal(now_ms, mid, level, "low", lv["support"])
+            for side, broken in (("high", mid > lv["resistance"] * (1.0 + eps)),
+                                 ("low", mid < lv["support"] * (1.0 - eps))):
+                if broken and side not in self._pending_breaks:
+                    self._pending_breaks[side] = {
+                        "cycle_id": cycle_id,
+                        "level": level,
+                        "broken_level": lv["resistance"] if side == "high" else lv["support"],
+                        "break_price": mid,
+                        "break_time": now_ms,
+                    }
+                    logger.debug(
+                        "破位记 pending [{} {}] | BTC {:.0f} 破 {:.0f} | 周期 {}",
+                        level, side, mid,
+                        lv["resistance"] if side == "high" else lv["support"], cycle_id,
+                    )
 
-    async def _fire_signal(
-        self, now_ms: int, mid: float, level: str, side: str, broken_level: float
+    async def _on_cycle_boundary(self, prev_cycle: int, cur_cycle: int, now_ms: int) -> None:
+        """15m 周期边界：取出上一周期的 pending 破位，做收盘质量确认。
+
+        冷启动边界（_last_cycle_id 跳变超过 1 个周期）不做确认——停机期间的
+        pending 无法区分真实时序，且次周期早已走远，入场价假设失效。
+        """
+        due = {
+            side: rec for side, rec in self._pending_breaks.items()
+            if rec["cycle_id"] == prev_cycle
+        }
+        # 清理过期 pending（只保留当前及未来周期的记录）
+        self._pending_breaks = {
+            side: rec for side, rec in self._pending_breaks.items()
+            if rec["cycle_id"] >= cur_cycle
+        }
+        if cur_cycle - prev_cycle > 1:
+            logger.info("跨周期边界跳变（{} → {}），停机期间 pending 不确认", prev_cycle, cur_cycle)
+            return
+        if not due:
+            return
+        await self._confirm_and_fire(due, prev_cycle, cur_cycle, now_ms, retry=0)
+
+    async def _drain_confirm_retries(self, now_ms: int) -> None:
+        """处理确认重试队列：klines 之前拉取失败的周期收盘确认。"""
+        if not self._confirm_retries:
+            return
+        retries, self._confirm_retries = self._confirm_retries, []
+        for item in retries:
+            if now_ms - item["at"] > CONFIRM_RETRY_TIMEOUT_MS:
+                logger.warning(
+                    "场景确认超时放弃 | 周期 {} 破位 {}（次周期已走远，入场价假设失效）",
+                    item["prev_cycle"], "/".join(item["due"].keys()),
+                )
+                continue
+            await self._confirm_and_fire(
+                item["due"], item["prev_cycle"], item["cur_cycle"], now_ms, item["retry"]
+            )
+
+    async def _confirm_and_fire(
+        self,
+        due: dict[str, dict],
+        prev_cycle: int,
+        cur_cycle: int,
+        now_ms: int,
+        retry: int,
     ) -> None:
-        """单个 (level, side) 破位信号的冷却检查、落表与推送。"""
+        """拉上一周期 15m K + 均量，判定收盘质量，命中场景则 fire 信号。"""
+        klines = await self._collector.fetch_recent_klines("15m", VOL_MA_WINDOW + 1)
+        sig_open_time = prev_cycle * 900_000
+        sig_k = next((k for k in klines if k["open_time"] == sig_open_time), None)
+        if sig_k is None:
+            # 周期刚收盘 klines 可能尚未就绪：进重试队列（上限 5 次 / 60s）
+            if retry < CONFIRM_RETRY_MAX:
+                self._confirm_retries.append({
+                    "due": due, "prev_cycle": prev_cycle, "cur_cycle": cur_cycle,
+                    "retry": retry + 1, "at": now_ms,
+                })
+            else:
+                logger.warning(
+                    "场景确认放弃：klines 拉不到上一周期 K | 周期 {}", prev_cycle,
+                )
+            return
+
+        hist = [k for k in klines if k["open_time"] < sig_open_time]
+        vol_ma: float | None = None
+        if len(hist) >= VOL_MA_WINDOW // 2:
+            vol_ma = sum(k["volume"] for k in hist[-VOL_MA_WINDOW:]) / len(hist[-VOL_MA_WINDOW:])
+
+        for side, rec in due.items():
+            ok, close_pos, vol_ratio = classify_close_pattern(
+                side, sig_k["open"], sig_k["high"], sig_k["low"], sig_k["close"],
+                sig_k["volume"], vol_ma,
+            )
+            if not ok:
+                logger.debug(
+                    "收盘质量未命中 [{} {}] | 收盘位置 {} 量比 {}",
+                    rec["level"], side,
+                    f"{close_pos:.3f}" if close_pos is not None else "N/A",
+                    f"{vol_ratio:.2f}" if vol_ratio is not None else "N/A",
+                )
+                continue
+            await self._fire_confirmed_signal(
+                side, rec, sig_k, close_pos, vol_ratio, cur_cycle, now_ms
+            )
+
+    async def _fire_confirmed_signal(
+        self,
+        side: str,
+        rec: dict,
+        sig_k: dict,
+        close_pos: float,
+        vol_ratio: float | None,
+        cur_cycle: int,
+        now_ms: int,
+    ) -> None:
+        """场景命中信号：冷却/日限检查、落表与推送（目标周期 = 次周期 cur_cycle）。"""
         eps = settings.fake_breakout_eps
+        level = rec["level"]
+        pattern = "bull_exhaust" if side == "high" else "bear_exhaust"
         key = (side, level)
 
-        # 风控 1：冷却（同一级别同一方向，一波冲高/冲低只报一次）
+        # 风控 1：冷却（双保险；pending 每周期覆盖已保证每方向每周期最多一条）
         if now_ms - self._last_signal_at.get(key, 0) < settings.fake_breakout_cooldown_seconds * 1000:
             return
 
@@ -282,90 +407,37 @@ class FakeBreakoutDetector:
         # 风控 2：日内上限（超限仍落表，但不发邮件）
         over_daily_limit = self._daily_count >= settings.fake_breakout_max_daily_signals
 
-        down_5m = self._pm_5m.get("down_price")
-        up_5m = self._pm_5m.get("up_price")
-        down_15m = self._pm_15m.get("down_price")
-        up_15m = self._pm_15m.get("up_price")
-        end_15m = self._pm_15m.get("end_date")
-        start_15m = self._pm_15m.get("start_date")
+        # 目标周期 = 次周期（时间网格推算，坐标必然可得，不走 EXPIRED 路径）
+        next_start = cur_cycle * 900_000
+        next_end = next_start + 900_000
+        buffer_ms = settings.fake_breakout_settle_buffer_seconds * 1000
+        settle_deadline = next_end + buffer_ms
+
+        # 次周期开盘价快照（cycle_open_end 配对守卫，防 tracker 跨轮错配；
+        # 缺失不阻塞——结算时 klines 精确回读兜底）
         open_15m = self._pm_15m.get("cycle_open_price")
         open_15m_end = self._pm_15m.get("cycle_open_end")
-        start_5m = self._pm_5m.get("start_date")
-        end_5m = self._pm_5m.get("end_date")
-        open_5m = self._pm_5m.get("cycle_open_price")
-        open_5m_end = self._pm_5m.get("cycle_open_end")
-
-        # 结算死线对齐所报价 15m 市场的真实到期时刻（CodeReview Minor-3a）：
-        # market_end_15m 缺失或已过期时退回 signal+15min 口径（该条周期坐标落空，
-        # 到期后无锚点可判，将由 EXPIRED 路径收场）。
-        buffer_ms = settings.fake_breakout_settle_buffer_seconds * 1000
-        if end_15m and int(end_15m) > now_ms:
-            settle_deadline = int(end_15m) + buffer_ms
-            # 周期坐标与开盘价配对守卫：cycle_open_end 必须与当前周期 end_date 一致，
-            # 否则是 tracker 写入跨轮错配，宁可落空也不错配
-            m_start_15m = int(start_15m) if start_15m else int(end_15m) - 900_000
-            m_open_15m = (
-                float(open_15m)
-                if open_15m and open_15m_end is not None and int(open_15m_end) == int(end_15m)
-                else None
-            )
-            m_end_15m: int | None = int(end_15m)
-        else:
-            settle_deadline = now_ms + HOLD_MS + buffer_ms
-            m_start_15m = None
-            m_open_15m = None
-            m_end_15m = None
-            logger.warning("15m 报价快照缺失/过期，信号周期坐标落空 | {} {}", level, side)
-
-        # 5m 周期坐标：快照缺失或已过期（staleness 防御）则该条 5m 口径不结算
-        if end_5m and int(end_5m) > now_ms:
-            m_start_5m = int(start_5m) if start_5m else int(end_5m) - 300_000
-            m_end_5m: int | None = int(end_5m)
-            m_open_5m = (
-                float(open_5m)
-                if open_5m and open_5m_end is not None and int(open_5m_end) == int(end_5m)
-                else None
-            )
-        else:
-            m_start_5m = None
-            m_end_5m = None
-            m_open_5m = None
-
-        # 过滤器输入（A/B 回测口径）：fire 时计算落表，邮件/API/前端据此标注可行动性
-        m_offset_sec: int | None = (
-            int(round((now_ms - m_start_15m) / 1000.0)) if m_start_15m else None
+        m_open_15m = (
+            float(open_15m)
+            if open_15m and open_15m_end is not None and int(open_15m_end) == next_end
+            else None
         )
-        if m_open_15m and m_open_15m > 0:
-            raw = mid / m_open_15m - 1.0
-            m_break_pct: float | None = round(raw * 100.0 if side == "high" else -raw * 100.0, 4)
-        else:
-            m_break_pct = None
-        filter_pass, filter_reason = evaluate_signal_filter(level, side, m_offset_sec, m_break_pct)
-        # 模式收窄：未过 A+B 过滤的信号彻底丢弃（不落表/不结算/不邮件）。
-        # 不占冷却——若后续周期前段再次破位且满足过滤，仍会正常报出
-        if not filter_pass:
-            logger.debug("假突破被过滤丢弃 [{} {}] | {}", level, side, filter_reason)
-            return
 
         signal = FakeBreakoutSignal(
             level=level,
             side=side,
             signal_time=now_ms,
-            resistance=broken_level,
-            btc_price=mid,
+            resistance=rec["broken_level"],
+            btc_price=self._collector.store.mid_price or sig_k["close"],
             eps=eps,
-            down_price_5m=down_5m,
-            down_price_15m=down_15m,
-            up_price_5m=up_5m,
-            up_price_15m=up_15m,
-            market_end_15m=m_end_15m,
-            market_start_15m=m_start_15m,
+            down_price_15m=self._pm_15m.get("down_price"),
+            up_price_15m=self._pm_15m.get("up_price"),
+            market_end_15m=next_end,
+            market_start_15m=next_start,
             cycle_open_price_15m=m_open_15m,
-            market_start_5m=m_start_5m,
-            market_end_5m=m_end_5m,
-            cycle_open_price_5m=m_open_5m,
-            cycle_offset_sec_15m=m_offset_sec,
-            break_pct=m_break_pct,
+            pattern=pattern,
+            close_pos=round(close_pos, 4),
+            vol_ratio=round(vol_ratio, 3) if vol_ratio is not None else None,
             settle_deadline=settle_deadline,
             status="PENDING",
             email_sent=False,
@@ -376,21 +448,21 @@ class FakeBreakoutDetector:
                 await session.commit()
                 await session.refresh(signal)
         except Exception as exc:
-            logger.error("假突破信号落表失败 | {}", exc)
+            logger.error("场景信号落表失败 | {}", exc)
             return
 
         self._last_signal_at[key] = now_ms
         self._daily_count += 1
 
         direction = "DOWN" if side == "high" else "UP"
-        entry_15m = down_15m if side == "high" else up_15m
         logger.info(
-            "假突破信号触发 #{} [{} {}] | BTC {:.0f} 破 {} {:.0f} | "
-            "目标 {} | 15m {}价={} | 日内第 {} 条 | 过滤 {}{}",
-            signal.id, level, side, mid, "阻力" if side == "high" else "支撑",
-            broken_level, direction, direction, entry_15m,
-            self._daily_count,
-            "✅" if filter_pass else "❌",
+            "场景信号触发 #{} [{} {}] | 周期 {} 破{} {:.0f} | 信号K收{} 收盘位置 {:.2f} 量比 {} | "
+            "次周期看 {} | 日内第 {} 条{}",
+            signal.id, level, pattern, rec["cycle_id"],
+            "阻力" if side == "high" else "支撑", rec["broken_level"],
+            "阳" if sig_k["close"] > sig_k["open"] else "阴", close_pos,
+            f"{vol_ratio:.2f}" if vol_ratio is not None else "N/A",
+            direction, self._daily_count,
             "（超日限，不发邮件）" if over_daily_limit else "",
         )
 
@@ -418,7 +490,7 @@ class FakeBreakoutDetector:
                         row.email_sent = True
                         await session.commit()
         except Exception as exc:
-            logger.warning("假突破信号邮件后台发送异常 #{} | {}", signal_id, exc)
+            logger.warning("场景信号邮件后台发送异常 #{} | {}", signal_id, exc)
 
     async def _send_signal_email(self, signal: FakeBreakoutSignal) -> bool:
         t_str = datetime.fromtimestamp(
@@ -435,36 +507,48 @@ class FakeBreakoutDetector:
         direction = "DOWN" if is_high else "UP"
         level_name = "阻力" if is_high else "支撑"
         entry_15m = signal.down_price_15m if is_high else signal.up_price_15m
-        entry_5m = signal.down_price_5m if is_high else signal.up_price_5m
-        filter_pass, filter_label = evaluate_signal_filter(
-            signal.level, signal.side, signal.cycle_offset_sec_15m, signal.break_pct
-        )
-        # A+B 过滤组合回测（scripts/local_combo_filter_lab.py，8809 窗口，CI 不含 0）：
-        # 低胜率高赔率——赢需周期末价回到周期开盘价另一侧；仅剩 4h 双向（其余已移除）
-        backtest = {
-            ("4h", "high"): "A+B 组合胜率 41.7%，费后 EV +7.06 [+0.35,+15.7]",
-            ("4h", "low"): "A+B 组合胜率 53.3%，费后 EV +6.52 [+1.12,+13.9]",
-        }.get((signal.level, signal.side), "—")
+        if signal.pattern == "bull_exhaust":
+            pattern_label = "场景①多头耗尽"
+            backtest = "180 天验证集胜率 63.6% [59.3,68.0] n=462，EV@0.50 +0.22/事件；按月最差 54%"
+            entry_plan = (
+                "次周期开盘即买 DOWN，半仓 @~0.50；\n"
+                "  若次周期内价格反弹至 +0.10%（相对次周期开盘），加仓半仓 @~0.27；\n"
+                "  不要深等（次周期前 10 分钟仍在涨 = 场景已被证伪，胜率崩至 4~14%）"
+            )
+        elif signal.pattern == "bear_exhaust":
+            pattern_label = "场景②空头耗尽"
+            backtest = "180 天验证集胜率 57.8% [53.5,62.1] n=512，EV@0.50 +0.11/事件"
+            entry_plan = (
+                "次周期开盘即买 UP，只开盘买；\n"
+                "  跌态中 UP token 无折扣（0.79~0.90），等待无价值"
+            )
+        else:
+            pattern_label = "旧信号"
+            backtest = "—"
+            entry_plan = "—"
         subject = (
-            f"[假突破信号·{signal.level} {'✅可行动' if filter_pass else '❌被过滤'}] "
-            f"BTC {signal.btc_price:.0f} 破{level_name} {signal.resistance:.0f} → 看{direction}"
+            f"[场景信号·{pattern_label}] BTC 破4h{level_name}后收盘确认 → 次周期看 {direction}"
+        )
+        close_pos_str = (
+            f"收盘质量：收盘位置 (C-L)/(H-L) = {signal.close_pos:.3f}"
+            if signal.close_pos is not None else "收盘质量：收盘位置 N/A"
+        )
+        vol_str = (
+            f"量比（本周期/前20根均量）= {signal.vol_ratio:.2f}"
+            if signal.vol_ratio is not None else "量比：N/A"
         )
         body = (
-            f"信号时间：{t_str}\n"
-            f"级别：{signal.level}（{'冲过阻力' if is_high else '跌破支撑'}，方向 {direction}）\n"
-            f"{level_name}位：{signal.resistance:.2f}\n"
-            f"破位价格：{signal.btc_price:.2f}（{'+' if is_high else ''}{(signal.btc_price / signal.resistance - 1) * 100:.3f}%）\n"
-            f"触发阈值：{signal.eps:.4f}\n\n"
-            f"当时报价（{direction} token）：\n"
-            f"  5m：{entry_5m}\n"
-            f"  15m：{entry_15m}\n"
-            f"  15m 市场到期：{end_str}\n\n"
-            f"过滤判定（A 剩余时间 <6min ｜ B 破位幅度 <0.2% ｜ 方向）：\n"
-            f"  {filter_label}\n"
-            f"  结论：{'✅ 可行动（A+B 组合 4h 口径回测胜率 42~53%，费后 EV +6.5~+7.1）' if filter_pass else '❌ 被过滤，建议放弃本注（尾段/深破/回避方向回测 EV 为负或 0 胜）'}\n\n"
-            f"玩法提示（回测口径）：破位瞬间买 15m {direction}，持有到周期到期，\n"
-            f"按周期末价 vs 周期开盘价结算（与市场真实规则一致）。\n"
-            f"历史回测（{signal.level} 级 {direction} 方向基线，未过滤）：{backtest}。\n"
+            f"确认时间：{t_str}\n"
+            f"场景：{pattern_label}（pattern={signal.pattern or 'N/A'}）\n"
+            f"破位：15m 周期内{'冲过' if is_high else '跌破'} 4h {level_name} {signal.resistance:.2f}\n"
+            f"{close_pos_str}\n"
+            f"{vol_str}\n\n"
+            f"目标周期：下一个 15m 市场（到期 {end_str}）\n"
+            f"当时 {direction} token 报价：{entry_15m}\n\n"
+            f"入场方案：\n  {entry_plan}\n\n"
+            f"回测依据（scripts/local_continuation_discovery.py，发现集→验证集盲验）：\n"
+            f"  {backtest}\n"
+            f"机制：破位动能收盘未回吐（买力/卖力耗尽），次周期兑现反转。\n"
             f"当前阶段：系统不下注，仅记录信号并到期回读结算方向。\n"
         )
         return await send_plain_email(subject, body)
@@ -515,7 +599,7 @@ class FakeBreakoutDetector:
                 )
                 due = (await session.execute(stmt)).scalars().all()
         except Exception as exc:
-            logger.warning("假突破 5m 结算查询失败 | {}", exc)
+            logger.warning("场景信号 5m 结算查询失败 | {}", exc)
             return
 
         if not due:
@@ -556,12 +640,12 @@ class FakeBreakoutDetector:
                     else:
                         row.settle_outcome_5m = "NOISE"
                     logger.info(
-                        "假突破信号 5m 周期结算 #{} | 周期开盘 {:.0f} → 周期末 {:.0f} | {}",
+                        "场景信号 5m 周期结算 #{} | 周期开盘 {:.0f} → 周期末 {:.0f} | {}",
                         row.id, anchor, close_price, row.settle_outcome_5m,
                     )
                 await session.commit()
         except Exception as exc:
-            logger.error("假突破 5m 结算回填失败 | {}", exc)
+            logger.error("场景信号 5m 结算回填失败 | {}", exc)
 
     async def _settle_15m(self, now_ms: int) -> None:
         """15m 周期锚点回读：对齐信号所在 15m 市场到期，按 P(E) vs P(S15) 判定。
@@ -582,7 +666,7 @@ class FakeBreakoutDetector:
                 )
                 due = (await session.execute(stmt)).scalars().all()
         except Exception as exc:
-            logger.warning("假突破结算查询失败 | {}", exc)
+            logger.warning("场景结算查询失败 | {}", exc)
             return
 
         if not due:
@@ -598,12 +682,12 @@ class FakeBreakoutDetector:
                         if row is not None and row.status == "PENDING":
                             row.status = "EXPIRED"
                             logger.warning(
-                                "假突破信号 #{} 周期坐标缺失（15m 报价快照落空），置 EXPIRED",
+                                "场景信号 #{} 周期坐标缺失（15m 报价快照落空），置 EXPIRED",
                                 row.id,
                             )
                     await session.commit()
             except Exception as exc:
-                logger.warning("假突破信号 EXPIRED 回填失败 | {}", exc)
+                logger.warning("场景信号 EXPIRED 回填失败 | {}", exc)
             due = [s for s in due if s.id not in set(expired_ids)]
             if not due:
                 return
@@ -644,12 +728,12 @@ class FakeBreakoutDetector:
                         row.settle_outcome = "NOISE"
                     row.status = "SETTLED"
                     logger.info(
-                        "假突破信号 15m 周期结算 #{} | 周期开盘 {:.0f} → 周期末 {:.0f} | {} | 入场价 {}",
+                        "场景信号 15m 周期结算 #{} | 周期开盘 {:.0f} → 周期末 {:.0f} | {} | 入场价 {}",
                         row.id, anchor, close_price, row.settle_outcome, row.down_price_15m,
                     )
                 await session.commit()
         except Exception as exc:
-            logger.error("假突破结算回填失败 | {}", exc)
+            logger.error("场景结算回填失败 | {}", exc)
 
     # ==================================================================
     # 只读状态（供 API 查询）
@@ -660,6 +744,12 @@ class FakeBreakoutDetector:
         return {
             "running": self._running,
             "levels": self._levels,
+            "pending_breaks": {
+                side: {"cycle_id": rec["cycle_id"], "broken_level": rec["broken_level"]}
+                for side, rec in self._pending_breaks.items()
+            },
+            "confirm_retries": len(self._confirm_retries),
+            "last_cycle_id": self._last_cycle_id,
             "daily_count": self._daily_count,
             "daily_date": self._daily_date,
             "eps": settings.fake_breakout_eps,
