@@ -247,8 +247,10 @@ async def send_webhook_alert(
 class AlertNotifier:
     """告警通知器：对告警按 code 去重抑制后，经配置渠道（邮件+webhook）主动推送。
 
-    抑制：同一 code 在 settings.agent_alert_suppress_seconds 窗口内只推一次，
-    避免 60s 轮询导致同一问题反复轰炸。overall_status=OK 或无新告警时不推送。
+    抑制（分级，2026-08-15）：同一 code 在抑制窗口内只推一次，避免 60s 轮询轰炸：
+    - CRITICAL 级：agent_alert_suppress_seconds（15 分钟，真故障要尽快知道）
+    - WARN 级：agent_alert_suppress_warn_seconds（4 小时，慢性问题重推无信息量）
+    overall_status=OK 或无新告警时不推送。
     进程内单例持有 code→最近推送时刻，进程重启后抑制状态清零（可接受）。
     """
 
@@ -258,10 +260,14 @@ class AlertNotifier:
     def filter_fresh(
         self, alerts: list[HealthAlert], now: float
     ) -> list[HealthAlert]:
-        """返回未被抑制（超出静默窗口或首次出现）的告警子集。纯查询，不改状态。"""
-        window = settings.agent_alert_suppress_seconds
+        """返回未被抑制（超出分级静默窗口或首次出现）的告警子集。纯查询，不改状态。"""
         fresh: list[HealthAlert] = []
         for a in alerts:
+            window = (
+                settings.agent_alert_suppress_warn_seconds
+                if a.level == "WARN"
+                else settings.agent_alert_suppress_seconds
+            )
             last = self._last_sent.get(a.code)
             if last is None or (now - last) >= window:
                 fresh.append(a)

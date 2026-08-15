@@ -138,7 +138,9 @@ class Settings(BaseSettings):
     # 健康快照落库间隔（秒）：>= monitor_interval，控制 health_snapshots 表增长
     agent_health_snapshot_interval: float = 300.0
     # 窗口停摆告警阈值（秒）：最近窗口距今超过此值判 CRITICAL WINDOW_STALE
-    agent_health_window_stale_seconds: float = 600.0
+    # 2026-08-15 600→900：600（仅 2 个归档周期）下归档慢一轮就边缘抖动误报
+    # （实测 613s 触发后下一轮即恢复）；900 = 3 个周期，真停摆仍及时报
+    agent_health_window_stale_seconds: float = 900.0
     # 匹配率/方向分布统计取最近 N 条 AgentPrediction
     agent_health_recent_predictions: int = 20
     # 窗口连续性 gap 检测取最近 N 条 SentimentWindow
@@ -154,10 +156,14 @@ class Settings(BaseSettings):
     # health_snapshots 保留天数：落库后清理早于此天数的旧快照，防止无限增长
     agent_health_snapshot_retention_days: int = 7
 
-    # --- 告警推送去重抑制 ---
-    # 同一告警 code 在此窗口（秒）内只推送一次，避免 60s 轮询反复轰炸。
+    # --- 告警推送去重抑制（分级）---
+    # 同一告警 code 在抑制窗口内只推送一次，避免 60s 轮询反复轰炸。
     # 仅作用于主动推送渠道（邮件/webhook），不影响日志与落库。
+    # CRITICAL 级：真停摆/真故障要尽快知道，保持 15 分钟重推节奏
     agent_alert_suppress_seconds: float = 900.0
+    # WARN 级：多为慢性问题（如 NO_MATCH 匹配率低），高频重推无信息量，
+    # 拉长到 4 小时（2026-08-15：修复邮件配置后慢性 WARN 曾一天轰炸 96 封）
+    agent_alert_suppress_warn_seconds: float = 14400.0
 
     # --- 告警邮件推送（SMTP，主渠道；非 OK 状态且有新告警时触发）---
     # 总开关；为 False 时不发邮件（即便配置了 SMTP）

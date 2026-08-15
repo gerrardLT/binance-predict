@@ -66,6 +66,32 @@ def test_filter_fresh_new_code_not_suppressed() -> None:
     assert codes == {"LLM_FAILURES"}
 
 
+def test_warn_suppressed_longer_than_critical() -> None:
+    """分级抑制（2026-08-15）：WARN 用 4h 窗口，CRITICAL 用 15min 窗口。
+
+    慢性 WARN（如 NO_MATCH）在 CRITICAL 窗口过后仍被抑制，
+    避免修复邮件配置后一天轰炸 96 封。
+    """
+    n = AlertNotifier()
+    now = 1000.0
+    n.mark_sent(n.filter_fresh([_alert("NO_MATCH", "WARN")], now), now)
+    # 15 分钟（CRITICAL 窗口）后：WARN 仍被抑制
+    after_critical_window = now + settings.agent_alert_suppress_seconds + 1
+    assert n.filter_fresh([_alert("NO_MATCH", "WARN")], after_critical_window) == []
+    # 4 小时（WARN 窗口）后：可重推
+    after_warn_window = now + settings.agent_alert_suppress_warn_seconds + 1
+    assert len(n.filter_fresh([_alert("NO_MATCH", "WARN")], after_warn_window)) == 1
+
+
+def test_critical_still_uses_short_window() -> None:
+    """CRITICAL 级不受 WARN 长窗口影响：15 分钟后可重推（真故障要及时知道）。"""
+    n = AlertNotifier()
+    now = 1000.0
+    n.mark_sent(n.filter_fresh([_alert("WINDOW_STALE")], now), now)
+    after = now + settings.agent_alert_suppress_seconds + 1
+    assert len(n.filter_fresh([_alert("WINDOW_STALE")], after)) == 1
+
+
 @pytest.mark.asyncio
 async def test_notify_skips_ok_status() -> None:
     n = AlertNotifier()

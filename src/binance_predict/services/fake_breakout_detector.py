@@ -142,6 +142,11 @@ class FakeBreakoutDetector:
         self._pending_breaks: dict[str, dict] = {}
         self._last_cycle_id: int | None = None
         self._confirm_retries: list[dict] = []
+        # 累计观测计数（进程生命周期内，供 status API 确认系统在干活）：
+        # - _pending_count: 记过的破位 pending 总数（含未命中形态的）
+        # - _confirm_miss_count: 周期收盘确认时形态未命中的次数
+        self._pending_count: int = 0
+        self._confirm_miss_count: int = 0
 
     # ==================================================================
     # 生命周期
@@ -292,7 +297,8 @@ class FakeBreakoutDetector:
                         "break_price": mid,
                         "break_time": now_ms,
                     }
-                    logger.debug(
+                    self._pending_count += 1
+                    logger.info(
                         "破位记 pending [{} {}] | BTC {:.0f} 破 {:.0f} | 周期 {}",
                         level, side, mid,
                         lv["resistance"] if side == "high" else lv["support"], cycle_id,
@@ -372,7 +378,8 @@ class FakeBreakoutDetector:
                 sig_k["volume"], vol_ma,
             )
             if not ok:
-                logger.debug(
+                self._confirm_miss_count += 1
+                logger.info(
                     "收盘质量未命中 [{} {}] | 收盘位置 {} 量比 {}",
                     rec["level"], side,
                     f"{close_pos:.3f}" if close_pos is not None else "N/A",
@@ -750,6 +757,8 @@ class FakeBreakoutDetector:
             },
             "confirm_retries": len(self._confirm_retries),
             "last_cycle_id": self._last_cycle_id,
+            "pending_count": self._pending_count,
+            "confirm_miss_count": self._confirm_miss_count,
             "daily_count": self._daily_count,
             "daily_date": self._daily_date,
             "eps": settings.fake_breakout_eps,
