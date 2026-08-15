@@ -90,3 +90,5 @@ uv run pytest -q
 Set-Location frontend
 npm run build
 ```
+
+<!-- 2026-08-15 deploy note: VPS .env 补 AGENT_ALERT_* 邮件段，触发镜像变更以重建容器加载新 env -->
