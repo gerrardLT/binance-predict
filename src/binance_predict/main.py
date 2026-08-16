@@ -37,6 +37,7 @@ from .db.models import (
     FakeBreakoutSignal,
     PatternBacktestRun,
     PredictionMarketSample,
+    SceneParamVersion,
     SentimentWindow,
 )
 from .models.schemas import CommitDeepLearnRequest
@@ -984,6 +985,95 @@ async def list_fake_breakout_signals(
             "created_at": s.created_at.isoformat() if s.created_at else None,
         })
     return {"signals": signals, "total": len(signals)}
+
+
+@app.get("/api/scene/versions")
+async def list_scene_versions(
+    limit: int = 50,
+    _: None = Depends(_require_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """场景参数版本列表（M3）：状态机 PENDING_REVIEW→SHADOW/REJECTED→ACTIVE→RETIRED。"""
+    from sqlalchemy import desc as sa_desc, select as sa_select
+
+    limit = max(1, min(limit, 200))
+    stmt = (
+        sa_select(SceneParamVersion)
+        .order_by(sa_desc(SceneParamVersion.created_at))
+        .limit(limit)
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+    return {
+        "versions": [{
+            "id": r.id, "version": r.version, "params": r.params, "status": r.status,
+            "proposed_by": r.proposed_by, "review_note": r.review_note,
+            "has_backtest_report": r.backtest_report is not None,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "activated_at": r.activated_at.isoformat() if r.activated_at else None,
+        } for r in rows],
+        "total": len(rows),
+    }
+
+
+@app.post("/api/scene/versions/{version_id}/adjudicate")
+async def adjudicate_scene_version(
+    version_id: int,
+    _: None = Depends(_require_auth),
+):
+    """手动触发科学裁决（M3）：同窗 A/B 回测 + 四层硬门禁 → SHADOW/REJECTED。
+
+    耗时约 2~4 分钟（拉 180 天官方 K）；正常链路由 research_scheduler 自动调，
+    本端点供人工补跑。
+    """
+    from .services.hypothesis_arbiter import HypothesisArbiter
+
+    verdict = await HypothesisArbiter().adjudicate(version_id)
+    if verdict is None:
+        return {"status": "error", "message": f"版本 #{version_id} 不存在或非 PENDING_REVIEW"}
+    return {
+        "status": "ok",
+        "passed": verdict.passed,
+        "reasons": verdict.reasons,
+        "gates": verdict.gates,
+        "report": verdict.report,
+    }
+
+
+@app.post("/api/scene/versions/{version_id}/promote")
+async def promote_scene_version(
+    version_id: int,
+    _: None = Depends(_require_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """人工放行（终审，M3/M4）：SHADOW → ACTIVE，原 ACTIVE 转 RETIRED。
+
+    建议条件：影子实盘已结算 ≥ 30 条且不劣于现行 ACTIVE（research_scheduler 会
+    邮件提示）；放行后 detector 在下一 15m 周期边界加载新参数。
+    """
+    from datetime import datetime, timezone as tz
+    from sqlalchemy import select as sa_select
+
+    row = await db.get(SceneParamVersion, version_id)
+    if row is None:
+        return {"status": "error", "message": "版本不存在"}
+    if row.status != "SHADOW":
+        return {"status": "error", "message": f"仅 SHADOW 可放行（当前 {row.status}）；先经裁决"}
+
+    # 原 ACTIVE 退役
+    stmt = (
+        sa_select(SceneParamVersion)
+        .where(SceneParamVersion.status == "ACTIVE")
+    )
+    for old in (await db.execute(stmt)).scalars().all():
+        old.status = "RETIRED"
+        old.retired_at = datetime.now(tz=tz.utc)
+
+    row.status = "ACTIVE"
+    row.activated_at = datetime.now(tz=tz.utc)
+    row.reviewed_by = "manual-api"
+    await db.commit()
+    logger.info("场景参数版本放行 #{} {} → ACTIVE", version_id, row.version)
+    return {"status": "ok", "version": row.version, "params": row.params}
 
 
 @app.get("/api/fake-breakout/stats")

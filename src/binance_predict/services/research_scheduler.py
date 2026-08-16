@@ -239,20 +239,23 @@ class ResearchScheduler:
             logger.error("场景研究评估失败（本轮放弃，等待下次触发）| {}", exc)
             return
 
-        # 假设落库（PENDING_REVIEW；M3 裁决后转 SHADOW/REJECTED）
-        saved = 0
+        # 假设落库（PENDING_REVIEW）→ 逐个交 M3 科学裁决（同窗 A/B + 硬门禁 →
+        # SHADOW/REJECTED + 邮件）；裁决是纯代码，与 LLM 无关
+        saved_ids: list[int] = []
         try:
             async with async_session_factory() as session:
                 for h in assessment.hypotheses[:3]:
-                    version = f"h{int(time.time())}-{saved}"
-                    session.add(SceneParamVersion(
+                    version = f"h{int(time.time())}-{len(saved_ids)}"
+                    row = SceneParamVersion(
                         version=version,
                         params=(active_params or {}) | dict(h.param_overrides),
                         status="PENDING_REVIEW",
                         proposed_by="llm-researcher",
                         review_note=f"[{trigger}] {h.change_suggestion} | 机制: {h.mechanism_reason[:200]} | 声称改善: {h.expected_impact_pp}pp",
-                    ))
-                    saved += 1
+                    )
+                    session.add(row)
+                    await session.flush()  # 拿 id
+                    saved_ids.append(row.id)
                 await session.commit()
         except Exception as exc:
             logger.error("假设落库失败（评估结果已在 llm_traces 留档）| {}", exc)
@@ -268,7 +271,19 @@ class ResearchScheduler:
                 self._last_settled_count = (await session.execute(stmt)).scalar() or 0
         except Exception:
             pass
+
+        # M3 自动裁决链（每个假设同窗 A/B 回测 ~2-3 分钟，串行执行）
+        if saved_ids:
+            from .hypothesis_arbiter import HypothesisArbiter
+            arbiter = HypothesisArbiter()
+            for vid in saved_ids:
+                try:
+                    verdict = await arbiter.adjudicate(vid)
+                    logger.info("假设 #{} 裁决: {}", vid,
+                                "SHADOW（待人工审核）" if verdict and verdict.passed else "REJECTED")
+                except Exception as exc:
+                    logger.error("假设 #{} 裁决异常（可手动补跑 /adjudicate）| {}", vid, exc)
         logger.info(
-            "场景研究评估完成 | maintain_status_quo={} | 假设落库 {} 条（PENDING_REVIEW）",
-            assessment.maintain_status_quo, saved,
+            "场景研究评估完成 | maintain_status_quo={} | 假设落库 {} 条（已裁决）",
+            assessment.maintain_status_quo, len(saved_ids),
         )
