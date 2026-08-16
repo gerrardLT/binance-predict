@@ -46,10 +46,11 @@ from sqlalchemy import desc, select
 
 from ..config.settings import settings
 from ..db.engine import async_session_factory
-from ..db.models import FakeBreakoutSignal, SentimentWindow
+from ..db.models import FakeBreakoutSignal, SceneParamVersion, SentimentWindow
 from . import clock_sync
 from .alerting import send_plain_email
 from .data_collector import BinanceDataCollector
+from .scene_params import DEFAULT_SCENE_PARAMS, SceneParams
 
 # 超宽限阈值：到期后超过此宽限未结算的信号转 klines 精确补结算路径
 # （周期锚点口径下 P(S)/P(E) 均为历史时点，klines 必然可得，停机无损）
@@ -57,16 +58,15 @@ SETTLE_EXPIRE_GRACE_MS = 300_000
 
 # 级别定义（与回测 scripts/local_combo_filter_lab.py 对齐）：
 # 级别名 → 回看窗口数（5m 窗口 closes 极值）。仅保留统计显著的 4h（2026-08-15 收窄）
-LEVEL_LOOKBACKS: dict[str, int] = {
-    "4h": 48,
-}
+# （M4 起：常量由 DEFAULT_SCENE_PARAMS 派生，版本化参数见 scene_param_versions）
+LEVEL_LOOKBACKS: dict[str, int] = dict(DEFAULT_SCENE_PARAMS.level_lookbacks)
 
 # 场景定义（180 天官方数据，发现集筛选 → 验证集盲验，scripts/local_continuation_discovery.py）：
 # 场景① bull_exhaust：破 4h 阻力 + 周期收阳 + 光头收盘 → 次周期 DOWN（验证集 63.6%）
 # 场景② bear_exhaust：破 4h 支撑 + 周期收阴 + 放量 → 次周期 UP（验证集 57.8%）
-CLOSE_POS_MIN = 0.85   # 场景①：收盘位置 (C-L)/(H-L) 下限（上影 ≤ 15% 振幅）
-VOL_RATIO_MIN = 2.0    # 场景②：量比下限（本周期 15m 量 / 前 20 根均量）
-VOL_MA_WINDOW = 20     # 场景②：均量窗口（根，不含当前周期）
+CLOSE_POS_MIN = DEFAULT_SCENE_PARAMS.close_pos_min   # 场景①：收盘位置 (C-L)/(H-L) 下限
+VOL_RATIO_MIN = DEFAULT_SCENE_PARAMS.vol_ratio_min   # 场景②：量比下限
+VOL_MA_WINDOW = DEFAULT_SCENE_PARAMS.vol_ma_window   # 场景②：均量窗口（根，不含当前周期）
 # 确认重试上限：klines 拉取失败时每轮循环重试，超过此时限放弃（次周期走远，入场价假设失效）
 CONFIRM_RETRY_MAX = 5
 CONFIRM_RETRY_TIMEOUT_MS = 60_000
@@ -80,18 +80,21 @@ def classify_close_pattern(
     c: float,
     volume: float,
     vol_ma: float | None,
+    params: SceneParams | None = None,
 ) -> tuple[bool, float | None, float | None]:
-    """信号周期收盘质量判定（纯函数，邮件/API/测试共用的单一事实源）。
+    """信号周期收盘质量判定（纯函数，邮件/API/测试/影子并行共用的单一事实源）。
 
     Args:
         side: 破位方向（high=破阻力→场景① | low=破支撑→场景②）
         o/h/l/c: 信号周期 15m K 线 OHLC
         volume: 信号周期 15m 成交量
         vol_ma: 前 VOL_MA_WINDOW 根 15m 均量（不含当前根）；数据不足时传 None（场景②保守不通过）
+        params: 场景参数集（M4 影子并行注入；None = DEFAULT_SCENE_PARAMS）
 
     Returns:
         (是否命中场景, close_pos, vol_ratio)
     """
+    p = params or DEFAULT_SCENE_PARAMS
     rng = h - l
     if rng <= 0 or o <= 0:
         return False, None, None
@@ -99,10 +102,10 @@ def classify_close_pattern(
     vol_ratio = volume / vol_ma if vol_ma and vol_ma > 0 else None
     if side == "high":
         # 场景①：收阳 + 光头（收盘贴自身最高，多头满仓无剩余买力）
-        ok = c > o and close_pos >= CLOSE_POS_MIN
+        ok = c > o and close_pos >= p.close_pos_min
     else:
         # 场景②：收阴 + 放量（数据不足时保守不通过）
-        ok = c < o and vol_ratio is not None and vol_ratio >= VOL_RATIO_MIN
+        ok = c < o and vol_ratio is not None and vol_ratio >= p.vol_ratio_min
     return ok, close_pos, vol_ratio
 
 
@@ -147,6 +150,10 @@ class FakeBreakoutDetector:
         # - _confirm_miss_count: 周期收盘确认时形态未命中的次数
         self._pending_count: int = 0
         self._confirm_miss_count: int = 0
+        # M4 影子并行：ACTIVE 版本名 + 可影子判定的 SHADOW 版本列表
+        # （[{"version", "params": SceneParams}]；仅 classify 层参数差异的版本）
+        self._active_version: str = "v1"
+        self._shadow_versions: list[dict] = []
 
     # ==================================================================
     # 生命周期
@@ -157,6 +164,7 @@ class FakeBreakoutDetector:
             return
         self._running = True
         await self._refresh_levels(force=True)
+        await self._load_scene_versions()
         self._task = asyncio.create_task(self._loop(), name="fake_breakout_detector")
         logger.info(
             "场景检测器启动 | 级别={} | eps={} | 检测间隔={}s | 冷却={}s | 场景①close_pos≥{} 场景②量比≥{}",
@@ -250,6 +258,7 @@ class FakeBreakoutDetector:
                 cycle_id = now_ms // 900_000
                 if self._last_cycle_id is not None and cycle_id != self._last_cycle_id:
                     await self._on_cycle_boundary(self._last_cycle_id, cycle_id, now_ms)
+                    await self._load_scene_versions()  # 每周期边界重查版本（轻量）
                 self._last_cycle_id = cycle_id
 
                 if mid > 0 and self._levels:
@@ -342,6 +351,49 @@ class FakeBreakoutDetector:
                 item["due"], item["prev_cycle"], item["cur_cycle"], now_ms, item["retry"]
             )
 
+    async def _load_scene_versions(self) -> None:
+        """加载 ACTIVE + 可影子判定的 SHADOW 版本（M4）。
+
+        无 ACTIVE 行（create_all 环境/迁移未跑）→ 回退 v1 默认参数，
+        服务层必须容忍无种子行（M0 测试已声明）。
+        """
+        from .scene_params import is_shadow_supported
+        try:
+            async with async_session_factory() as session:
+                from sqlalchemy import select as sa_select
+                stmt = sa_select(SceneParamVersion).where(
+                    SceneParamVersion.status.in_(["ACTIVE", "SHADOW"])
+                )
+                rows = (await session.execute(stmt)).scalars().all()
+        except Exception as exc:
+            logger.debug("场景版本加载失败（回退 v1 默认）| {}", exc)
+            return
+        active = [r for r in rows if r.status == "ACTIVE"]
+        if active:
+            row = max(active, key=lambda r: r.activated_at or r.created_at)
+            self._active_version = row.version
+            base_json = dict(row.params)
+        else:
+            self._active_version = "v1"
+            base_json = DEFAULT_SCENE_PARAMS.to_params_json()
+        shadows = []
+        for r in rows:
+            if r.status != "SHADOW":
+                continue
+            if is_shadow_supported(dict(r.params), base_json):
+                shadows.append({"version": r.version, "params": SceneParams.from_params_json(r.params)})
+            else:
+                logger.warning(
+                    "SHADOW 版本 {} 含破位层参数差异（eps/lookback），影子层跳过"
+                    "（实盘判定与回测口径一致性保护）", r.version,
+                )
+        if shadows != self._shadow_versions:
+            self._shadow_versions = shadows
+            logger.info(
+                "场景版本加载 | ACTIVE={} | SHADOW={}",
+                self._active_version, [s["version"] for s in shadows],
+            )
+
     async def _confirm_and_fire(
         self,
         due: dict[str, dict],
@@ -377,7 +429,12 @@ class FakeBreakoutDetector:
                 side, sig_k["open"], sig_k["high"], sig_k["low"], sig_k["close"],
                 sig_k["volume"], vol_ma,
             )
-            if not ok:
+            if ok:
+                await self._fire_confirmed_signal(
+                    side, rec, sig_k, close_pos, vol_ratio, cur_cycle, now_ms,
+                    version=self._active_version, shadow=False,
+                )
+            else:
                 self._confirm_miss_count += 1
                 logger.info(
                     "收盘质量未命中 [{} {}] | 收盘位置 {} 量比 {}",
@@ -385,10 +442,18 @@ class FakeBreakoutDetector:
                     f"{close_pos:.3f}" if close_pos is not None else "N/A",
                     f"{vol_ratio:.2f}" if vol_ratio is not None else "N/A",
                 )
-                continue
-            await self._fire_confirmed_signal(
-                side, rec, sig_k, close_pos, vol_ratio, cur_cycle, now_ms
-            )
+            # M4 影子并行：SHADOW 版本用自身参数独立判定（只落表不发邮件）——
+            # 独立于 ACTIVE 是否命中（ACTIVE 未命中时影子仍可能命中）
+            for sv in self._shadow_versions:
+                s_ok, s_cp, s_vr = classify_close_pattern(
+                    side, sig_k["open"], sig_k["high"], sig_k["low"], sig_k["close"],
+                    sig_k["volume"], vol_ma, params=sv["params"],
+                )
+                if s_ok:
+                    await self._fire_confirmed_signal(
+                        side, rec, sig_k, s_cp, s_vr, cur_cycle, now_ms,
+                        version=sv["version"], shadow=True,
+                    )
 
     async def _fire_confirmed_signal(
         self,
@@ -399,20 +464,26 @@ class FakeBreakoutDetector:
         vol_ratio: float | None,
         cur_cycle: int,
         now_ms: int,
+        version: str = "v1",
+        shadow: bool = False,
     ) -> None:
-        """场景命中信号：冷却/日限检查、落表与推送（目标周期 = 次周期 cur_cycle）。"""
+        """场景命中信号：冷却/日限检查、落表与推送（目标周期 = 次周期 cur_cycle）。
+
+        M4：version 标记参数版本；shadow=True 时只落表不发邮件、不计日限、
+        独立冷却键——影子信号仅用于实盘对照，不影响正式信号流。
+        """
         eps = settings.fake_breakout_eps
         level = rec["level"]
         pattern = "bull_exhaust" if side == "high" else "bear_exhaust"
-        key = (side, level)
+        key = (side, level, version)
 
         # 风控 1：冷却（双保险；pending 每周期覆盖已保证每方向每周期最多一条）
         if now_ms - self._last_signal_at.get(key, 0) < settings.fake_breakout_cooldown_seconds * 1000:
             return
 
         self._daily_rollover(now_ms)
-        # 风控 2：日内上限（超限仍落表，但不发邮件）
-        over_daily_limit = self._daily_count >= settings.fake_breakout_max_daily_signals
+        # 风控 2：日内上限（超限仍落表，但不发邮件）；影子信号不占日限
+        over_daily_limit = (not shadow) and self._daily_count >= settings.fake_breakout_max_daily_signals
 
         # 目标周期 = 次周期（时间网格推算，坐标必然可得，不走 EXPIRED 路径）
         next_start = cur_cycle * 900_000
@@ -445,6 +516,7 @@ class FakeBreakoutDetector:
             pattern=pattern,
             close_pos=round(close_pos, 4),
             vol_ratio=round(vol_ratio, 3) if vol_ratio is not None else None,
+            version=version,
             settle_deadline=settle_deadline,
             status="PENDING",
             email_sent=False,
@@ -459,24 +531,25 @@ class FakeBreakoutDetector:
             return
 
         self._last_signal_at[key] = now_ms
-        self._daily_count += 1
+        if not shadow:
+            self._daily_count += 1
 
         direction = "DOWN" if side == "high" else "UP"
         logger.info(
-            "场景信号触发 #{} [{} {}] | 周期 {} 破{} {:.0f} | 信号K收{} 收盘位置 {:.2f} 量比 {} | "
+            "场景信号触发 #{} [{} {}{}] | 周期 {} 破{} {:.0f} | 信号K收{} 收盘位置 {:.2f} 量比 {} | "
             "次周期看 {} | 日内第 {} 条{}",
-            signal.id, level, pattern, rec["cycle_id"],
+            signal.id, level, pattern, f"·{version}" if version != "v1" else "", rec["cycle_id"],
             "阻力" if side == "high" else "支撑", rec["broken_level"],
             "阳" if sig_k["close"] > sig_k["open"] else "阴", close_pos,
             f"{vol_ratio:.2f}" if vol_ratio is not None else "N/A",
             direction, self._daily_count,
-            "（超日限，不发邮件）" if over_daily_limit else "",
+            "（影子，不发邮件）" if shadow else ("（超日限，不发邮件）" if over_daily_limit else ""),
         )
 
-        # 邮件推送（未超日限时）：fire-and-forget，绝不阻塞检测循环。
+        # 邮件推送（未超日限且非影子）：fire-and-forget，绝不阻塞检测循环。
         # 实测教训：SMTP 连接被防火墙丢包时同步等待会卡死整个循环 16 分钟，
         # 导致结算回读停摆（信号 #1 事故）。
-        if settings.fake_breakout_email_enabled and not over_daily_limit:
+        if not shadow and settings.fake_breakout_email_enabled and not over_daily_limit:
             asyncio.create_task(
                 self._send_signal_email_bg(signal.id),
                 name=f"fbs_email_{signal.id}",
@@ -759,6 +832,8 @@ class FakeBreakoutDetector:
             "last_cycle_id": self._last_cycle_id,
             "pending_count": self._pending_count,
             "confirm_miss_count": self._confirm_miss_count,
+            "active_version": self._active_version,
+            "shadow_versions": [s["version"] for s in self._shadow_versions],
             "daily_count": self._daily_count,
             "daily_date": self._daily_date,
             "eps": settings.fake_breakout_eps,

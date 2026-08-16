@@ -61,3 +61,15 @@ class SceneParams:
 
 # 现行线上口径（v1-20260816 种子的字段来源；180 天验证集：场景① 63.6% / ② 57.8%）
 DEFAULT_SCENE_PARAMS = SceneParams()
+
+# 影子并行（M4）支持的参数层：仅 classify 层参数可在影子版独立判定。
+# 破位层参数（eps/level_lookbacks）差异的版本，影子层无法复现其破位集，
+# 标记 UNSUPPORTED 跳过——保证实盘影子判定与回测口径一致性。
+CLASSIFY_LAYER_KEYS = frozenset({"close_pos_min", "vol_ratio_min", "vol_ma_window"})
+ALL_PARAM_KEYS = frozenset({"close_pos_min", "vol_ratio_min", "vol_ma_window", "eps", "level_lookbacks"})
+
+
+def is_shadow_supported(params_json: dict, base_json: dict) -> bool:
+    """参数差异仅限 classify 层（且确有差异）→ 可影子并行。"""
+    diff = {k for k in ALL_PARAM_KEYS if params_json.get(k) != base_json.get(k)}
+    return bool(diff) and diff <= CLASSIFY_LAYER_KEYS

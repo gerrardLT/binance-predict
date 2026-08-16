@@ -98,6 +98,58 @@ class ResearchScheduler:
     # 触发判定
     # ------------------------------------------------------------------
 
+    async def _shadow_promotion_hint(self) -> None:
+        """M4：SHADOW 版本实盘对照提示。已结算 ≥30 且胜率 ≥ ACTIVE 实盘胜率 →
+        邮件提示人工调用 promote API（终审权在人，不自动切换）。每 24h 最多提示一次。"""
+        now = time.time()
+        if now - getattr(self, "_last_hint_at", 0) < 24 * 3600:
+            return
+        try:
+            async with async_session_factory() as session:
+                rows = (
+                    select(FakeBreakoutSignal.version, FakeBreakoutSignal.side,
+                           FakeBreakoutSignal.settle_outcome)
+                    .where(FakeBreakoutSignal.status == "SETTLED")
+                    .where(FakeBreakoutSignal.pattern.isnot(None))
+                )
+                detail = (await session.execute(rows)).all()
+                shadows = (
+                    select(SceneParamVersion.version).where(SceneParamVersion.status == "SHADOW")
+                )
+                shadow_names = {r[0] for r in (await session.execute(shadows)).all()}
+        except Exception:
+            return
+        if not shadow_names:
+            return
+        stats: dict[str, dict] = {}
+        for version, side, outcome in detail:
+            v = version or "v1"
+            s = stats.setdefault(v, {"n": 0, "wins": 0})
+            win = (side == "high" and outcome == "DOWN") or (side == "low" and outcome == "UP")
+            s["n"] += 1
+            s["wins"] += int(bool(win))
+        active = stats.get("v1", {"n": 0, "wins": 0})
+        active_wr = active["wins"] / active["n"] if active["n"] else None
+        for name in shadow_names:
+            s = stats.get(name)
+            if s and s["n"] >= 30:
+                wr = s["wins"] / s["n"]
+                if active_wr is None or wr >= active_wr:
+                    self._last_hint_at = now
+                    from .alerting import send_plain_email
+                    active_str = f"{active_wr:.1%}" if active_wr is not None else "N/A"
+                    try:
+                        await send_plain_email(
+                            f"[影子对照·可放行] {name} 实盘不劣于现行版本",
+                            f"SHADOW {name}: n={s['n']} 胜率 {wr:.1%}\n"
+                            f"ACTIVE v1: n={active['n']} 胜率 {active_str}\n\n"
+                            f"人工放行请调用 POST /api/scene/versions/{{id}}/promote\n"
+                            f"（终审权在人；放行后 detector 下一周期边界加载新参数）",
+                        )
+                    except Exception:
+                        pass
+                    return
+
     async def _load_last_run_from_traces(self) -> float | None:
         try:
             async with async_session_factory() as session:
@@ -115,6 +167,9 @@ class ResearchScheduler:
 
     async def _check_triggers(self) -> str | None:
         """Returns: 'T1' | 'T2' | 'T3' | None。"""
+        # M4 影子切换提示（轻量，每轮检查）：SHADOW 已结算 ≥30 且不劣于
+        # ACTIVE 实盘表现 → 邮件提示人工 promote（不自动切换）
+        await self._shadow_promotion_hint()
         if self._last_run is not None:
             if time.time() - self._last_run < settings.scene_research_cooldown_hours * 3600:
                 return None  # 冷却期内

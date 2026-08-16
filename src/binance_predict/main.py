@@ -773,6 +773,8 @@ async def lifespan(app: FastAPI):
                 "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS pattern VARCHAR(16)",
                 "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS close_pos FLOAT",
                 "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS vol_ratio FLOAT",
+                # M4 影子并行（与 alembic 迁移 p4g7h8i9j0k1 等价，存量 dev 库安全网）
+                "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS version VARCHAR(40)",
             ]:
                 try:
                     await conn.execute(text(col_sql))

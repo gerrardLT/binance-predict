@@ -661,6 +661,10 @@ class FakeBreakoutSignal(Base):
         comment="收盘确认场景：bull_exhaust(破阻力+光头阳→次周期DOWN) | "
                 "bear_exhaust(破支撑+收阴+放量→次周期UP)；旧 A+B 时代信号为 NULL"
     )
+    version: Mapped[str | None] = mapped_column(
+        String(40), nullable=True,
+        comment="场景参数版本（M4 影子并行）：NULL/v1=现行 ACTIVE；其余为影子版本名"
+    )
     close_pos: Mapped[float | None] = mapped_column(
         Float, nullable=True,
         comment="信号周期收盘位置 (C-L)/(H-L)：场景①判定输入与审计（阈值 0.85）"
