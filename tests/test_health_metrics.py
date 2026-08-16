@@ -152,7 +152,11 @@ def test_derive_alerts_window_stale_critical() -> None:
     assert derive_overall_status(alerts) == "CRITICAL"
 
 
-def test_derive_alerts_no_match_after_bootstrap() -> None:
+def test_derive_alerts_no_match_after_bootstrap(monkeypatch) -> None:
+    # 系统B退役后 NO_MATCH 告警仅在意为启用（agent_loop_enabled）时才评估；
+    # 用 monkeypatch 显式回到启用态验证告警逻辑本身
+    from binance_predict.config.settings import settings
+    monkeypatch.setattr(settings, "agent_loop_enabled", True)
     alerts = derive_alerts(
         window_continuity=_clean_continuity(),
         predict_stats={"active_pattern_count": 4, "total": 20, "matched": 0},
@@ -165,6 +169,23 @@ def test_derive_alerts_no_match_after_bootstrap() -> None:
     codes = {a.code for a in alerts}
     assert "NO_MATCH" in codes
     assert derive_overall_status(alerts) == "WARN"
+
+
+def test_derive_alerts_no_match_skipped_when_system_b_retired(monkeypatch) -> None:
+    """系统B退役（默认态）：历史 matched=0 属存档事实，不再告警（防永久 WARN 轰炸）。"""
+    from binance_predict.config.settings import settings
+    monkeypatch.setattr(settings, "agent_loop_enabled", False)
+    alerts = derive_alerts(
+        window_continuity=_clean_continuity(),
+        predict_stats={"active_pattern_count": 4, "total": 20, "matched": 0},
+        phase_ages={},
+        queue_depth=None,
+        llm=None,
+        consecutive_failures=None,
+        has_memory=False,
+    )
+    assert alerts == []
+    assert derive_overall_status(alerts) == "OK"
 
 
 def test_derive_alerts_db_only_skips_memory_alerts() -> None:

@@ -220,6 +220,7 @@ class SentimentWindow(Base):
 
 class PatternMemory(Base):
     """
+    [DEPRECATED 2026-08: 系统B已退役，只读存档]
     情绪曲线模式记忆：由 LLM 在 Learn/Evolve 阶段自主发现与命名（Req 1.1）
 
     curve_features / conditions 为 LLM 自由结构 JSON，程序不做语义校验（Req 1.3）。
@@ -325,6 +326,7 @@ class PatternMemory(Base):
 
 class BinningSnapshotModel(Base):
     """
+    [DEPRECATED 2026-08: 系统B已退役，只读存档]
     分位数分箱冻结快照：每 30 天按通道各冻结一版 20/40/60/80 分位边界。
 
     与 services/symbolizer.BinningSnapshot 纯数据结构对齐（version/edges/
@@ -365,6 +367,7 @@ class BinningSnapshotModel(Base):
 
 class AgentPrediction(Base):
     """
+    [DEPRECATED 2026-08: 系统B已退役，只读存档]
     Sentiment_Agent 单次方向预测记录
 
     Predict 阶段写入方向/置信度/匹配模式/推理；Validate 阶段回填验证结果
@@ -436,6 +439,7 @@ class AgentPrediction(Base):
 
 class PatternChangeLog(Base):
     """
+    [DEPRECATED 2026-08: 系统B已退役，只读存档]
     模式变更日志：记录 CREATE/UPDATE/RETIRE 的完整前后快照与变更原因
 
     每次模式变更恰生成一条日志（与变更在同一事务提交，保证"有变更必有日志"）。
@@ -482,6 +486,7 @@ class PatternChangeLog(Base):
 
 class LLMTrace(Base):
     """
+    [历史部分为系统B存档；表本体继续服务新模块的 LLM 调用审计（如 SCENE_RESEARCH）]
     LLM 单次调用的完整轨迹审计记录。
 
     覆盖 Sentiment_Agent 四个 LLM 阶段（LEARN / DEEP_LEARN / PREDICT / EVOLVE）
@@ -544,6 +549,7 @@ class LLMTrace(Base):
 
 class HealthSnapshot(Base):
     """
+    [DEPRECATED 2026-08: 系统B已退役，只读存档；健康监控仍实时运行但不依赖本表]
     Agent 运行健康报告的持久化快照。
 
     后台监控循环按 settings.agent_health_snapshot_interval 周期，将
@@ -699,6 +705,7 @@ class FakeBreakoutSignal(Base):
 
 class PatternBacktestRun(Base):
     """
+    [DEPRECATED 2026-08: 系统B已退役，只读存档]
     模式单次回测快照：定期重回测调度（新数据累积阈值触发）为每个模式落一条。
 
     前端展示两个维度：
@@ -749,4 +756,66 @@ class PatternBacktestRun(Base):
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
+    )
+
+
+# ============================================================
+# 场景参数版本表（场景信号系统 LLM 自进化体系，2026-08-16）
+# ============================================================
+
+class SceneParamVersion(Base):
+    """
+    场景参数版本：场景①②判定参数的版本化载体（LLM 自进化体系）。
+
+    生命周期：LLM 研究员提出假设（PENDING_REVIEW）→ 科学回测裁决（硬门禁）→
+    人工放行 promote（SHADOW 影子并行，只落表不发邮件）→ 实盘积累且不劣于
+    ACTIVE 后人工切换（原 ACTIVE 转 RETIRED）。任意时刻最多一个 ACTIVE，
+    由服务层（hypothesis_arbiter / promote API）保证。
+    多重检验预算基数 = 本表累计行数（持久化，不随重启清零）。
+    """
+    __tablename__ = "scene_param_versions"
+    __table_args__ = (
+        Index("ix_spv_status", "status"),
+        UniqueConstraint("version", name="uq_spv_version"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    version: Mapped[str] = mapped_column(
+        String(40), nullable=False,
+        comment="版本号，如 v1-20260816（人工可读，全局唯一）"
+    )
+    params: Mapped[dict] = mapped_column(
+        JSONB, nullable=False,
+        comment="场景参数集：{close_pos_min, vol_ratio_min, vol_ma_window, eps, level_lookbacks}"
+    )
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="PENDING_REVIEW", server_default="PENDING_REVIEW",
+        comment="PENDING_REVIEW | REJECTED | SHADOW | ACTIVE | RETIRED"
+    )
+    backtest_report: Mapped[dict | None] = mapped_column(
+        JSONB, nullable=True,
+        comment="过闸时科学回测引擎的完整输出快照（四层检验结果）"
+    )
+    proposed_by: Mapped[str] = mapped_column(
+        String(60), nullable=False, default="human", server_default="human",
+        comment="提议者：llm-researcher | human"
+    )
+    reviewed_by: Mapped[str | None] = mapped_column(
+        String(60), nullable=True,
+        comment="放行人（promote API 调用时回填）"
+    )
+    review_note: Mapped[str | None] = mapped_column(
+        Text, nullable=True,
+        comment="审批备注（驳回理由 / 放行理由）"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    activated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        comment="升为 ACTIVE 的时刻（人工 promote）"
+    )
+    retired_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        comment="退为 RETIRED 的时刻（被新版本接替或人工回退）"
     )

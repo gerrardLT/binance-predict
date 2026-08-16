@@ -294,9 +294,16 @@ class Settings(BaseSettings):
     # 信号邮件推送开关（复用 agent_alert_* SMTP 配置）
     fake_breakout_email_enabled: bool = True
 
+    # --- 系统B（情绪 Agent Loop）退役开关（2026-08-16 拍板）---
+    # False = lifespan 不实例化 SentimentAgent/AgentScheduler，预测循环停用；
+    # 类与表保留（只读存档），可随时翻回 True 恢复。
+    # 情绪窗口归档器（sw_archiver）独立于本开关继续运行——它是场景信号系统的 4h 位势数据源。
+    agent_loop_enabled: bool = False
+
     # --- 模式池分级与定期重回测（无限进化引擎，只发现不下注）---
     # 总开关：为 True 时 lifespan 启动重回测调度循环
-    pattern_reeval_enabled: bool = True
+    # 2026-08-16 随系统B退役默认关闭（模式池为系统B组件）
+    pattern_reeval_enabled: bool = False
     # 检查间隔（秒）：每轮检查自上次回测以来新归档的已标注窗口数
     pattern_reeval_check_interval: float = 1800.0
     # 新窗口触发阈值：累积 >= 此数量的新已标注窗口才触发一轮全量重回测

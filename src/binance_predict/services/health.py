@@ -196,9 +196,11 @@ def derive_alerts(
             level="WARN", code="WINDOW_GAP",
             message=f"最近窗口序列存在 {gap} 个缺口，采样/归档可能间歇性中断",
         ))
-    # 3. 脱离冷启动后匹配率为 0（DB 层）
+    # 3. 脱离冷启动后匹配率为 0（DB 层）；系统B退役后不再产新预测，
+    # 历史 matched=0 属存档事实而非异常，跳过告警（否则永久 WARN 轰炸）
     if (
-        predict_stats.get("active_pattern_count", 0) > 0
+        settings.agent_loop_enabled
+        and predict_stats.get("active_pattern_count", 0) > 0
         and predict_stats.get("total", 0) > 0
         and predict_stats.get("matched", 0) == 0
     ):
@@ -429,6 +431,8 @@ class HealthService:
             alerts=alerts,
             has_memory=has_memory,
         )
+        if not settings.agent_loop_enabled:
+            summary = "（系统B预测循环已退役，预测/校准统计为历史存档）" + summary
 
         return HealthReport(
             generated_at=now,

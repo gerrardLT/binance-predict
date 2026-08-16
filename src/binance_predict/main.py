@@ -782,22 +782,27 @@ async def lifespan(app: FastAPI):
     await collector.start()
 
     # 4. 实例化并启动 AgentScheduler（Req 2.1/6.1/11.2）
-    # 在 tracker/archiver 的 while 循环开始前完成，保证时序安全
+    # 2026-08-16 系统B退役：agent_loop_enabled=False 时不实例化（预测循环停用），
+    # 全局 agent_scheduler/sentiment_agent 保持 None——tracker/archiver 的
+    # publish 调用已有 None 守卫，事件静默跳过；情绪窗口归档器不受影响。
     global agent_scheduler, sentiment_agent
-    _sentiment_agent = SentimentAgent(llm=llm_service, trader=prediction_trader)
-    sentiment_agent = _sentiment_agent
-    agent_scheduler = AgentScheduler(agent=_sentiment_agent, trader=prediction_trader)
-    await agent_scheduler.start()  # 含冷启动检查（Req 11.2）
-    logger.info("SentimentAgent + AgentScheduler 已就绪（冷启动检查完成）")
+    if settings.agent_loop_enabled:
+        _sentiment_agent = SentimentAgent(llm=llm_service, trader=prediction_trader)
+        sentiment_agent = _sentiment_agent
+        agent_scheduler = AgentScheduler(agent=_sentiment_agent, trader=prediction_trader)
+        await agent_scheduler.start()  # 含冷启动检查（Req 11.2）
+        logger.info("SentimentAgent + AgentScheduler 已就绪（冷启动检查完成）")
 
-    # P1-1：启动对账——回填进程重启后遗漏的未验证预测（孤儿预测）。
-    # 调度队列非持久，重启后 is_correct IS NULL 的预测无人回填；
-    # 在 scheduler 启动后、正常事件流开始前一次性扫描并回填。
-    try:
-        reconciled = await _sentiment_agent.reconcile_pending_predictions()
-        logger.info("启动对账完成 | 回填未验证预测 {} 条", reconciled)
-    except Exception as exc:
-        logger.error("启动对账失败（不阻断启动）| {}", exc)
+        # P1-1：启动对账——回填进程重启后遗漏的未验证预测（孤儿预测）。
+        # 调度队列非持久，重启后 is_correct IS NULL 的预测无人回填；
+        # 在 scheduler 启动后、正常事件流开始前一次性扫描并回填。
+        try:
+            reconciled = await _sentiment_agent.reconcile_pending_predictions()
+            logger.info("启动对账完成 | 回填未验证预测 {} 条", reconciled)
+        except Exception as exc:
+            logger.error("启动对账失败（不阻断启动）| {}", exc)
+    else:
+        logger.info("系统B预测循环已退役（agent_loop_enabled=False）| 情绪窗口归档继续运行（场景信号位势源）")
 
     tasks = [
         asyncio.create_task(collector.connect_spot_ws(), name="spot_ws"),
@@ -1747,7 +1752,7 @@ async def trigger_deep_learn(
     不写入 DB，需通过 /commit 端点确认写入。
     """
     if sentiment_agent is None:
-        return {"status": "error", "message": "Agent 尚未初始化，请等待系统启动完成"}
+        return {"status": "deprecated", "message": "系统B预测循环已退役（2026-08-16 拍板），deep-learn 系列端点随之退役"}
 
     # P1-2: 端点入参 clamp 上限，防止外部传入超大 max_windows 拖垮采样
     max_windows = max(1, min(max_windows, settings.agent_deep_learn_max_windows_cap))
@@ -1785,7 +1790,7 @@ async def stream_deep_learn(
 
     async def event_gen():
         if sentiment_agent is None:
-            yield f"data: {json.dumps({'type': 'error', 'message': 'Agent 尚未初始化，请等待系统启动完成'}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': 'error', 'message': '系统B预测循环已退役（2026-08-16 拍板），deep-learn 系列端点随之退役'}, ensure_ascii=False)}\n\n"
             return
         try:
             async for ev in sentiment_agent.deep_learn_stream(max_windows=max_windows):
@@ -1818,7 +1823,7 @@ async def commit_deep_learn(
     请求体使用 Pydantic Schema 校验，确保数据完整性。
     """
     if sentiment_agent is None:
-        return {"status": "error", "message": "Agent 尚未初始化，请等待系统启动完成"}
+        return {"status": "deprecated", "message": "系统B预测循环已退役（2026-08-16 拍板），deep-learn 系列端点随之退役"}
 
     if not request.discoveries:
         return {"status": "error", "message": "discoveries 为空，无内容可写入"}
@@ -1922,7 +1927,7 @@ async def trigger_deep_learn_pycluster(
     与 holdout 统计）+ snapshot_token + train/holdout 计数，供前端预览后走 /commit 写入。
     """
     if sentiment_agent is None:
-        return {"status": "error", "message": "Agent 尚未初始化，请等待系统启动完成"}
+        return {"status": "deprecated", "message": "系统B预测循环已退役（2026-08-16 拍板），deep-learn 系列端点随之退役"}
 
     # P1-2: 端点入参 clamp 上限
     max_windows = max(1, min(max_windows, settings.agent_deep_learn_max_windows_cap))
@@ -1957,7 +1962,7 @@ async def compare_deep_learn(
     前端需提示两次采样窗口不同（对比失真）。comparison 为 [LLM 摘要, PY 摘要]。
     """
     if sentiment_agent is None:
-        return {"status": "error", "message": "Agent 尚未初始化，请等待系统启动完成"}
+        return {"status": "deprecated", "message": "系统B预测循环已退役（2026-08-16 拍板），deep-learn 系列端点随之退役"}
 
     # P1-2: 端点入参 clamp 上限
     max_windows = max(1, min(max_windows, settings.agent_deep_learn_max_windows_cap))
