@@ -109,6 +109,9 @@ _predict_triggered_for_window: bool = False
 # 假突破检测器全局实例（lifespan 中初始化；秒级检测日线阻力破位，暂不下注）
 fake_breakout_detector: FakeBreakoutDetector | None = None
 
+# 场景研究调度器全局实例（M2：LLM 研究员触发与编排，lifespan 中初始化）
+research_scheduler: "ResearchScheduler | None" = None
+
 
 # ============================================================
 # 定时任务
@@ -822,6 +825,17 @@ async def lifespan(app: FastAPI):
         await fake_breakout_detector.start()
         logger.info("场景检测器已启动（场景①多头耗尽/场景②空头耗尽，信号模式不下注）")
 
+    # 场景研究（M2）：LLM 研究员定期/累积/异常触发评估，假设只落库不生效
+    # （M3 裁决 + 人工 promote 后才以 SHADOW 影子身份参与判定）
+    global research_scheduler
+    if settings.scene_research_enabled:
+        from .services.research_scheduler import ResearchScheduler
+        from .services.scene_researcher import SceneResearcher
+        research_scheduler = ResearchScheduler(
+            researcher=SceneResearcher(llm_service._decision_client),
+        )
+        await research_scheduler.start()
+
     # 模式池分级与定期重回测（无限进化引擎：新数据累积阈值触发，只发现不下注）
     if settings.pattern_reeval_enabled:
         await pattern_reevaluator.start()
@@ -833,6 +847,9 @@ async def lifespan(app: FastAPI):
     logger.info("系统关闭中...")
     # 停止模式重回测调度器
     await pattern_reevaluator.stop()
+    # 停止场景研究调度器
+    if research_scheduler is not None:
+        await research_scheduler.stop()
     # 停止假突破检测器
     if fake_breakout_detector is not None:
         await fake_breakout_detector.stop()

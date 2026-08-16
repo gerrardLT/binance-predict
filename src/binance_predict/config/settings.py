@@ -294,6 +294,18 @@ class Settings(BaseSettings):
     # 信号邮件推送开关（复用 agent_alert_* SMTP 配置）
     fake_breakout_email_enabled: bool = True
 
+    # --- 场景研究（LLM 研究员，M2 2026-08-16）---
+    # 总开关：False 时不启动研究调度循环
+    scene_research_enabled: bool = True
+    # T1 定期触发：距上次评估天数
+    scene_research_interval_days: int = 7
+    # T2 累积触发：自上次评估新增已结算信号数
+    scene_research_new_signals: int = 30
+    # T3 异常触发判定所需最小实盘样本（某场景已结算数）
+    scene_research_min_live_sample: int = 20
+    # 任意触发后的冷却时长（小时，防抖动重复评估）
+    scene_research_cooldown_hours: int = 24
+
     # --- 系统B（情绪 Agent Loop）退役开关（2026-08-16 拍板）---
     # False = lifespan 不实例化 SentimentAgent/AgentScheduler，预测循环停用；
     # 类与表保留（只读存档），可随时翻回 True 恢复。
