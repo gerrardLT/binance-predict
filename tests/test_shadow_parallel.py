@@ -26,20 +26,22 @@ from binance_predict.services.scene_params import (
 # ============================================================
 
 def test_classify_params_override() -> None:
-    """同一根 K：默认参数不命中（cp=0.60<0.85），放宽后命中。"""
+    """同一根 K：默认参数不命中（cp=0.60<0.85），放宽后命中（pos4h 达标 1.0）。"""
     o, h, l, c, v = 100.0, 110.0, 100.0, 106.0, 50.0  # close_pos=0.60
-    ok_default, cp, _ = classify_close_pattern("high", o, h, l, c, v, 40.0)
-    assert ok_default is False
-    ok_loose, cp2, _ = classify_close_pattern(
-        "high", o, h, l, c, v, 40.0, params=SceneParams(close_pos_min=0.5),
+    ok_default, _, cp, _ = classify_close_pattern("high", o, h, l, c, v, 40.0, pos4h=1.0)
+    assert ok_default is False and cp is None  # 未命中不回传指标
+    ok_loose, _, cp2, _ = classify_close_pattern(
+        "high", o, h, l, c, v, 40.0, pos4h=1.0, params=SceneParams(close_pos_min=0.5),
     )
-    assert ok_loose is True and cp == cp2
+    assert ok_loose is True and cp2 == pytest.approx(0.60)
 
 
 def test_classify_default_params_equivalence() -> None:
     """params=None 与 DEFAULT_SCENE_PARAMS 等价（向后兼容）。"""
     args = ("high", 100.0, 110.0, 99.0, 109.0, 50.0, 40.0)
-    assert classify_close_pattern(*args) == classify_close_pattern(*args, params=DEFAULT_SCENE_PARAMS)
+    kw = {"pos4h": 1.0}
+    assert (classify_close_pattern(*args, **kw)
+            == classify_close_pattern(*args, **kw, params=DEFAULT_SCENE_PARAMS))
 
 
 def test_is_shadow_supported_mapping() -> None:
@@ -64,11 +66,18 @@ class _FakeCollector:
     store = _FakeStore()
 
     async def fetch_recent_klines(self, interval: str, limit: int) -> list[dict]:
-        # 上一周期 K：收阳、close_pos=0.60（默认不命中，放宽后命中）
-        return [{
+        # 升序 21 根：前 20 根历史（周期 80~99，收阳、量 40、收盘 100）
+        # + 信号 K（周期 100，收阳 close_pos=0.60：默认不命中、放宽后命中）。
+        # 历史 20 根满足 vol_ma（=40）；末 15 根收盘全 100 → pos4h=(106-100)/6=1.0 ≥ 0.9
+        hist = [{
+            "open_time": (80 + i) * 900_000, "open": 99.5, "high": 100.5,
+            "low": 99.0, "close": 100.0, "volume": 40.0,
+        } for i in range(20)]
+        sig = [{
             "open_time": 100 * 900_000, "open": 100.0, "high": 110.0,
             "low": 100.0, "close": 106.0, "volume": 50.0,
         }]
+        return hist + sig
 
 
 @pytest.mark.asyncio
@@ -80,7 +89,7 @@ async def test_shadow_fires_when_active_misses(monkeypatch) -> None:
     fired: list[dict] = []
 
     async def fake_fire(side, rec, sig_k, close_pos, vol_ratio, cur_cycle, now_ms,
-                        version="v1", shadow=False):
+                        version="v1", shadow=False, pattern_type=None):
         fired.append({"side": side, "version": version, "shadow": shadow})
 
     monkeypatch.setattr(d, "_fire_confirmed_signal", fake_fire)

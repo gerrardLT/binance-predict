@@ -2,17 +2,24 @@
 场景信号系统：4h 位势破位检测 + 15m 周期收盘质量确认 + 次周期入场提醒。
 
 模式升级（2026-08-15 拍板）：旧 A+B 过滤方案（破位瞬间当周期行动）整体替换为
-经 180 天官方数据样本外盲验的两个高确定性场景（scripts/local_continuation_discovery.py、
-local_lowside_validation.py：前 120 天发现集筛选 → 后 60 天验证集盲验）：
+场景信号系统；2026-08-17 升级为 360 天真 OOS 修正版（scripts/local_full_history_discovery.py，
+前 240 天发现集 → 后 120 天验证集盲验，evaluate 切片 bug 修正后的口径）：
 
-场景① bull_exhaust（多头耗尽，验证集 63.6% [59.3,68.0] n=462，EV@0.50 +0.22/事件）：
-  15m 周期内刺破 4h 阻力位势 + 周期收盘收阳 + 光头收盘（收盘位置 (C-L)/(H-L) ≥ 0.85）
+场景① bull_exhaust = F22×F18×F25（多头耗尽，真 OOS 64.4% [58.8,69.5] n=303，EV@0.51 +0.237）：
+  15m 周期内刺破 4h 阻力位势 + 周期收盘收阳 + 光头收盘（(C-L)/(H-L) ≥ 0.85）
+  + 4h 区间上沿（收盘在最近 16 根 15m 收盘区间位置 pos4h ≥ 0.9，F25）
   → 次周期开盘买 DOWN。入场方案：开盘半仓 @~0.50 + 次周期内反弹至 +0.10% 加仓半仓 @~0.27
     （180 天回测：开盘全仓 EV/事件 +0.223，触价加仓 +0.270，深等 z≥1 为负 EV 陷阱）
 
-场景② bear_exhaust（镜像，验证集 57.8% [53.5,62.1] n=512，EV@0.50 +0.11/事件）：
+场景② bear_exhaust = F20×放量（空头耗尽，真 OOS 53.6% n=1097，EV@0.51 +0.066）：
   15m 周期内跌破 4h 支撑位势 + 周期收盘收阴 + 放量（量 ≥ 2× 前 20 根 15m 均量）
   → 次周期开盘买 UP。入场方案：只开盘买——跌态中 UP token 无折扣（0.79~0.90），等待无价值
+
+场景④ momentum_fade = F40×F06（动量衰竭，真 OOS 55.4% [50.7,60.0] n=433，EV@0.51 +0.065）：
+  连阳 ≥ 3 根（含信号 K 本身）+ 信号 K 光头阳（(C-L)/(H-L) ≥ 0.85），无破位要求
+  → 次周期开盘买 DOWN。仅开盘入场，无加仓方案（EV 薄，边缘场景）
+  （F40×F04 大实体组合 OOS 50.5% FAILED——不带大实体条件；
+   S3/F23「S1+24h新高」强化标记 2026-08-17 拍板不上线，与 S1 重叠度高 n=118⊂303）
 
 检测流程：
   1. 秒级循环：mid 破位势 → 记 pending（仅内存，不报警不落表，每方向每周期记首次）
@@ -39,7 +46,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from loguru import logger
 from sqlalchemy import desc, select
@@ -61,26 +68,48 @@ SETTLE_EXPIRE_GRACE_MS = 300_000
 # （M4 起：常量由 DEFAULT_SCENE_PARAMS 派生，版本化参数见 scene_param_versions）
 LEVEL_LOOKBACKS: dict[str, int] = dict(DEFAULT_SCENE_PARAMS.level_lookbacks)
 
-# 场景定义（180 天官方数据，发现集筛选 → 验证集盲验，scripts/local_continuation_discovery.py）：
-# 场景① bull_exhaust：破 4h 阻力 + 周期收阳 + 光头收盘 → 次周期 DOWN（验证集 63.6%）
-# 场景② bear_exhaust：破 4h 支撑 + 周期收阴 + 放量 → 次周期 UP（验证集 57.8%）
-CLOSE_POS_MIN = DEFAULT_SCENE_PARAMS.close_pos_min   # 场景①：收盘位置 (C-L)/(H-L) 下限
-VOL_RATIO_MIN = DEFAULT_SCENE_PARAMS.vol_ratio_min   # 场景②：量比下限
-VOL_MA_WINDOW = DEFAULT_SCENE_PARAMS.vol_ma_window   # 场景②：均量窗口（根，不含当前周期）
-# 确认重试上限：klines 拉取失败时每轮循环重试，超过此时限放弃（次周期走远，入场价假设失效）
+# 场景定义（360 天真 OOS 修正版，scripts/local_full_history_discovery.py 终验）：
+# S1 bull_exhaust = F22×F18×F25：破4h阻力 + 收阳 + 光头(close_pos≥0.85) + 4h区间上沿(pos4h≥0.9)
+#     → DOWN（真 OOS 64.4% [58.8,69.5] n=303 EV+0.237 Kelly 0.257）
+# S2 bear_exhaust：破4h支撑 + 收阴 + 放量(vol_ratio≥2.0)
+#     → UP（真 OOS 53.6% n=1097 EV+0.066）
+# S4 momentum_fade = F40×F06：连阳≥3(含信号K) + 光头(close_pos≥0.85)，无破位要求
+#     → DOWN（真 OOS 55.4% [50.7,60.0] n=433 EV+0.065 Kelly 0.071）
+#     （F40×F04 大实体版 OOS 50.5% FAILED 不采用；S3/F23 强化版不上线，见文件头）
+CLOSE_POS_MIN = DEFAULT_SCENE_PARAMS.close_pos_min   # S1/S4: 收盘位置下限 (>=0.85 光头)
+VOL_RATIO_MIN = DEFAULT_SCENE_PARAMS.vol_ratio_min   # S2: 量比下限 (>=2.0 放量)
+VOL_MA_WINDOW = DEFAULT_SCENE_PARAMS.vol_ma_window   # S2: 均量窗口 (前 20 根不含当前)
+STREAK_BULL_MIN = 3                                  # S4: 连阳最小根数（含信号K本身，回测 streak 口径）
+POS4H_WINDOW = 16                                    # S1: 4h 区间窗口（16 根 15m 收盘，含当前根）
+POS4H_MIN = 0.9                                      # S1: F25 4h 区间上沿阈值
 CONFIRM_RETRY_MAX = 5
 CONFIRM_RETRY_TIMEOUT_MS = 60_000
 
-# 入场报价快照（2026-08-17）：次周期开盘后延迟抓真实 15m 市场报价。
-# fire 时刻 _pm_15m 里还是旧市场临终价（0.01~0.99 残值），必须等缓存切到次周期
-# 市场后再取——边界加速协程（main.py）在 15m 边界后 40s 内 2s 粒度刷新缓存，
-# 开盘后 ~8s 首试通常已切换；未切换每 5s 重试，最迟 +90s 放弃（NULL 兜底）
+# 入场报价快照 (次周期开盘后延迟抓取真实 15m 市场报价，替代理论 @0.50 假设)
 ENTRY_SNAPSHOT_DELAY_MS = 8_000
 ENTRY_SNAPSHOT_RETRY_INTERVAL_S = 5
 ENTRY_SNAPSHOT_MAX_WAIT_MS = 90_000
-# 场景①加仓触发监测：次周期内 mid ≥ 开盘价×(1+0.10%) 即记录当时报价（@0.27 假设的实盘对照）
-ADD_TRIGGER_PCT = 0.001
+ADD_TRIGGER_PCT = 0.001                              # S1/S3加仓触发 (mid ≥ open×(1+0.1%))
 ADD_MONITOR_INTERVAL_S = 10
+
+# 交易定价常数 (与 EV 计算一致：费 2%+0.01 溢价，赔率 b≈0.922，打平胜率≈52.0%)
+FEE = 0.02
+PREMIUM = 0.01
+ODDS = (1 - FEE) / (0.50 + PREMIUM) - 1.0            # 赔率 b
+BREAKEVEN = 1.0 / (1.0 + ODDS)                        # 打平胜率 (EV=0 临界点)
+
+# 各场景真 OOS 胜率点估计（ev_at_entry = p×(1-FEE)/entry − 1 的 p；结算统计/邮件引用）
+RESEARCH_WIN_RATES: dict[str, float] = {
+    "bull_exhaust": 0.644,
+    "bear_exhaust": 0.536,
+    "momentum_fade": 0.554,
+}
+# pattern_type → pattern 旧列粗类映射（String(16) 上限；旧列保留兼容历史查询）
+PATTERN_GROUP: dict[str, str] = {
+    "bull_exhaust": "bull_exhaust",
+    "bear_exhaust": "bear_exhaust",
+    "momentum_fade": "momentum_fade",
+}
 
 
 def classify_close_pattern(
@@ -91,33 +120,130 @@ def classify_close_pattern(
     c: float,
     volume: float,
     vol_ma: float | None,
+    pos4h: float | None = None,
     params: SceneParams | None = None,
-) -> tuple[bool, float | None, float | None]:
-    """信号周期收盘质量判定（纯函数，邮件/API/测试/影子并行共用的单一事实源）。
+) -> tuple[bool, str | None, float | None, float | None]:
+    """信号周期收盘质量判定——破位侧场景 S1/S2（纯函数，邮件/API/测试/影子并行共用的单一事实源）。
 
     Args:
-        side: 破位方向（high=破阻力→场景① | low=破支撑→场景②）
+        side: 破位方向（high=破阻力→S1 | low=破支撑→S2）
         o/h/l/c: 信号周期 15m K 线 OHLC
         volume: 信号周期 15m 成交量
-        vol_ma: 前 VOL_MA_WINDOW 根 15m 均量（不含当前根）；数据不足时传 None（场景②保守不通过）
+        vol_ma: 前 20 根 15m 均量（不含当前；None/0 = 数据不足）
+        pos4h: 收盘价在最近 16 根（含当前根）15m 收盘区间中的位置 (c-min)/(max-min)
+               —— S1 的 F25「4h 区间上沿」条件；None = 历史不足（保守判 False）
         params: 场景参数集（M4 影子并行注入；None = DEFAULT_SCENE_PARAMS）
 
     Returns:
-        (是否命中场景, close_pos, vol_ratio)
+        (命中, pattern_type, close_pos, vol_ratio)
+        - pattern_type: "bull_exhaust" | "bear_exhaust" | None
     """
     p = params or DEFAULT_SCENE_PARAMS
     rng = h - l
     if rng <= 0 or o <= 0:
-        return False, None, None
+        return False, None, None, None
+
     close_pos = (c - l) / rng
     vol_ratio = volume / vol_ma if vol_ma and vol_ma > 0 else None
+
     if side == "high":
-        # 场景①：收阳 + 光头（收盘贴自身最高，多头满仓无剩余买力）
-        ok = c > o and close_pos >= p.close_pos_min
+        # S1 bull_exhaust = F22×F18×F25：收阳 + 光头 + 4h 区间上沿
+        is_s1 = (
+            (c > o)
+            and (close_pos >= p.close_pos_min)
+            and (pos4h is not None)
+            and (pos4h >= POS4H_MIN)
+        )
+        if is_s1:
+            return True, "bull_exhaust", close_pos, vol_ratio
     else:
-        # 场景②：收阴 + 放量（数据不足时保守不通过）
-        ok = c < o and vol_ratio is not None and vol_ratio >= p.vol_ratio_min
-    return ok, close_pos, vol_ratio
+        # S2 bear_exhaust：收阴 + 放量
+        is_s2 = (c < o) and (vol_ratio is not None) and (vol_ratio >= p.vol_ratio_min)
+        if is_s2:
+            return True, "bear_exhaust", close_pos, vol_ratio
+
+    return False, None, None, None
+
+
+def is_momentum_fade(
+    o: float,
+    h: float,
+    l: float,
+    c: float,
+    prev_dir: list[int] | None,
+    params: SceneParams | None = None,
+) -> tuple[bool, float | None]:
+    """S4 momentum_fade 独立判定（F40 连阳≥3 × F06 光头阳，无破位要求）。
+
+    连阳≥3 含信号 K 本身（回测 streak 口径）：信号 K 收阳 + 前 STREAK_BULL_MIN-1 根均收阳。
+    大实体条件不采用（F40×F04 组合 OOS 50.5% FAILED）。
+    调用方须仅在无 high 侧破位 pending 的周期检查（破位周期命中 S1 时优先 S1，
+    避免同一周期重复计数；S4 事件与 S1 重叠部分在实盘中被 S1 覆盖，属预期取舍）。
+
+    Returns:
+        (命中, close_pos)
+    """
+    p = params or DEFAULT_SCENE_PARAMS
+    rng = h - l
+    if rng <= 0 or o <= 0:
+        return False, None
+    need = STREAK_BULL_MIN - 1  # 信号 K 之前需要的连阳根数
+    streak_ok = (
+        prev_dir is not None
+        and len(prev_dir) >= need
+        and all(d == 1 for d in prev_dir[-need:])
+    )
+    close_pos = (c - l) / rng
+    hit = (c > o) and (close_pos >= p.close_pos_min) and streak_ok
+    return hit, close_pos if hit else None
+
+
+def compute_pattern_stats(rows: list) -> dict:
+    """按 pattern_type 已结算正式信号计算实盘统计（结算回填与 stats API 共用的纯函数）。
+
+    口径：每笔 1 USDT 本金；entry 价取入场报价快照（按方向选 DOWN/UP），
+    缺失回退 0.51（含溢价理论价）；单笔实现收益 = 赢 (1-FEE)/entry-1 / 输 -1。
+
+    Returns:
+        {n, wins, winrate, cumulative_ev, avg_ev_at_entry,
+         equity_curve, peak_equity, max_drawdown}
+    """
+    wins = 0
+    rets: list[float] = []
+    ev_entries: list[float] = []
+    for row in rows:
+        entry = row.entry_down_price_15m if row.side == "high" else row.entry_up_price_15m
+        entry = float(entry) if entry and entry > 0 else 0.50 + PREMIUM
+        ret = (1.0 - FEE) / entry - 1.0
+        won = row.settle_outcome == ("DOWN" if row.side == "high" else "UP")
+        if won:
+            wins += 1
+            rets.append(ret)
+        else:
+            rets.append(-1.0)
+        p = RESEARCH_WIN_RATES.get(row.pattern_type or "")
+        if p is not None:
+            ev_entries.append(p * (1.0 + ret) - 1.0)
+    n = len(rows)
+    cum = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    curve: list[float] = []
+    for r in rets:
+        cum += r
+        curve.append(round(cum, 6))
+        peak = max(peak, cum)
+        max_dd = max(max_dd, peak - cum)
+    return {
+        "n": n,
+        "wins": wins,
+        "winrate": wins / n if n else None,
+        "cumulative_ev": cum / n if n else None,
+        "avg_ev_at_entry": sum(ev_entries) / len(ev_entries) if ev_entries else None,
+        "equity_curve": curve,
+        "peak_equity": peak,
+        "max_drawdown": max_dd,
+    }
 
 
 class FakeBreakoutDetector:
@@ -342,8 +468,8 @@ class FakeBreakoutDetector:
         if cur_cycle - prev_cycle > 1:
             logger.info("跨周期边界跳变（{} → {}），停机期间 pending 不确认", prev_cycle, cur_cycle)
             return
-        if not due:
-            return
+        # due 为空也要跑收盘检查：S4 momentum_fade 无破位要求，每周期独立判定
+        # （_confirm_and_fire 内部对空 due 只走 S4 路径，不误判 S1/S2）
         await self._confirm_and_fire(due, prev_cycle, cur_cycle, now_ms, retry=0)
 
     async def _drain_confirm_retries(self, now_ms: int) -> None:
@@ -413,7 +539,12 @@ class FakeBreakoutDetector:
         now_ms: int,
         retry: int,
     ) -> None:
-        """拉上一周期 15m K + 均量，判定收盘质量，命中场景则 fire 信号。"""
+        """拉上一周期 15m K + 均量，判定收盘质量，命中场景则 fire 信号。
+
+        除 due 中的破位侧场景（S1/S2）外，还独立检查 S4 momentum_fade
+        （连阳≥3×光头，无破位要求；仅在无 high 侧 pending 时——破位周期
+        S1 优先，避免同一周期重复计数）。
+        """
         klines = await self._collector.fetch_recent_klines("15m", VOL_MA_WINDOW + 1)
         sig_open_time = prev_cycle * 900_000
         sig_k = next((k for k in klines if k["open_time"] == sig_open_time), None)
@@ -430,41 +561,81 @@ class FakeBreakoutDetector:
                 )
             return
 
+        # 信号 K 之前的历史（升序）：均量 / 4h 区间位置 / 连阳序列
         hist = [k for k in klines if k["open_time"] < sig_open_time]
-        vol_ma: float | None = None
-        if len(hist) >= VOL_MA_WINDOW // 2:
-            vol_ma = sum(k["volume"] for k in hist[-VOL_MA_WINDOW:]) / len(hist[-VOL_MA_WINDOW:])
+        vol_ma = (
+            sum(k["volume"] for k in hist[-VOL_MA_WINDOW:]) / VOL_MA_WINDOW
+            if len(hist) >= VOL_MA_WINDOW else None
+        )
+        # pos4h：收盘在最近 16 根（含当前根）15m 收盘区间中的位置
+        # （回测 F25 口径 roll_max/roll_min(c15,16) 含当前根）
+        pos4h = None
+        win = [k["close"] for k in hist[-(POS4H_WINDOW - 1):]] + [sig_k["close"]]
+        if len(win) >= POS4H_WINDOW:
+            hi_, lo_ = max(win), min(win)
+            if hi_ > lo_:
+                pos4h = (sig_k["close"] - lo_) / (hi_ - lo_)
+        # 连阳序列（信号 K 之前各根方向，升序；S4 取最后 STREAK_BULL_MIN-1 根）
+        prev_dir = [
+            1 if k["close"] > k["open"] else (-1 if k["close"] < k["open"] else 0)
+            for k in hist
+        ]
 
         for side, rec in due.items():
-            ok, close_pos, vol_ratio = classify_close_pattern(
+            # 主场景判定（ACTIVE 版本）
+            ok, pattern_type, close_pos, vol_ratio = classify_close_pattern(
                 side, sig_k["open"], sig_k["high"], sig_k["low"], sig_k["close"],
-                sig_k["volume"], vol_ma,
+                sig_k["volume"], vol_ma, pos4h=pos4h,
             )
             if ok:
                 await self._fire_confirmed_signal(
                     side, rec, sig_k, close_pos, vol_ratio, cur_cycle, now_ms,
                     version=self._active_version, shadow=False,
+                    pattern_type=pattern_type or "bull_exhaust",
                 )
             else:
                 self._confirm_miss_count += 1
                 logger.info(
-                    "收盘质量未命中 [{} {}] | 收盘位置 {} 量比 {}",
+                    "收盘质量未命中 [{} {}] | 收盘位置 {} 量比 {} pos4h {}",
                     rec["level"], side,
                     f"{close_pos:.3f}" if close_pos is not None else "N/A",
                     f"{vol_ratio:.2f}" if vol_ratio is not None else "N/A",
+                    f"{pos4h:.2f}" if pos4h is not None else "N/A",
                 )
-            # M4 影子并行：SHADOW 版本用自身参数独立判定（只落表不发邮件）——
-            # 独立于 ACTIVE 是否命中（ACTIVE 未命中时影子仍可能命中）
+            # M4 影子并行
             for sv in self._shadow_versions:
-                s_ok, s_cp, s_vr = classify_close_pattern(
+                s_ok, s_pt, s_cp, s_vr = classify_close_pattern(
                     side, sig_k["open"], sig_k["high"], sig_k["low"], sig_k["close"],
-                    sig_k["volume"], vol_ma, params=sv["params"],
+                    sig_k["volume"], vol_ma, pos4h=pos4h, params=sv["params"],
                 )
                 if s_ok:
                     await self._fire_confirmed_signal(
                         side, rec, sig_k, s_cp, s_vr, cur_cycle, now_ms,
                         version=sv["version"], shadow=True,
+                        pattern_type=s_pt or "bull_exhaust",
                     )
+
+        # S4 momentum_fade 独立检查：仅无 high 侧破位 pending 的周期执行
+        # （破位周期若 K 同时满足 S4 定义必为 S1 子集，已被上面优先处理）
+        if "high" not in due:
+            m_hit, m_close_pos = is_momentum_fade(
+                sig_k["open"], sig_k["high"], sig_k["low"], sig_k["close"], prev_dir,
+            )
+            if m_hit:
+                # 合成 rec：S4 无位势破位，level 固定 momentum（8 字符）区分索引统计；
+                # broken_level 记信号 K 高点仅作审计参考
+                synthetic_rec = {
+                    "cycle_id": prev_cycle,
+                    "level": "momentum",
+                    "broken_level": sig_k["high"],
+                    "break_price": sig_k["close"],
+                    "break_time": sig_open_time,
+                }
+                await self._fire_confirmed_signal(
+                    "high", synthetic_rec, sig_k, m_close_pos, None, cur_cycle, now_ms,
+                    version=self._active_version, shadow=False,
+                    pattern_type="momentum_fade",
+                )
 
     async def _fire_confirmed_signal(
         self,
@@ -477,15 +648,17 @@ class FakeBreakoutDetector:
         now_ms: int,
         version: str = "v1",
         shadow: bool = False,
+        pattern_type: str = "bull_exhaust",  # bull_exhaust | bear_exhaust | momentum_fade
     ) -> None:
         """场景命中信号：冷却/日限检查、落表与推送（目标周期 = 次周期 cur_cycle）。
 
         M4：version 标记参数版本；shadow=True 时只落表不发邮件、不计日限、
         独立冷却键——影子信号仅用于实盘对照，不影响正式信号流。
+        
+        pattern_type：具体模式类型（由 classify_close_pattern 返回）
         """
         eps = settings.fake_breakout_eps
         level = rec["level"]
-        pattern = "bull_exhaust" if side == "high" else "bear_exhaust"
         key = (side, level, version)
 
         # 风控 1：冷却（双保险；pending 每周期覆盖已保证每方向每周期最多一条）
@@ -524,7 +697,8 @@ class FakeBreakoutDetector:
             market_end_15m=next_end,
             market_start_15m=next_start,
             cycle_open_price_15m=m_open_15m,
-            pattern=pattern,
+            pattern=PATTERN_GROUP.get(pattern_type, "bull_exhaust"),
+            pattern_type=pattern_type,
             close_pos=round(close_pos, 4),
             vol_ratio=round(vol_ratio, 3) if vol_ratio is not None else None,
             version=version,
@@ -549,7 +723,7 @@ class FakeBreakoutDetector:
         # 次周期开盘后抓真实 15m 市场报价 + 场景①加仓触发监测。
         # 影子信号同样抓——影子对照必须与正式信号同口径才有可比性。
         asyncio.create_task(
-            self._capture_entry_quote(signal.id, next_start, next_end, pattern, m_open_15m),
+            self._capture_entry_quote(signal.id, next_start, next_end, pattern_type, m_open_15m),
             name=f"fbs_entry_{signal.id}",
         )
 
@@ -557,7 +731,7 @@ class FakeBreakoutDetector:
         logger.info(
             "场景信号触发 #{} [{} {}{}] | 周期 {} 破{} {:.0f} | 信号K收{} 收盘位置 {:.2f} 量比 {} | "
             "次周期看 {} | 日内第 {} 条{}",
-            signal.id, level, pattern, f"·{version}" if version != "v1" else "", rec["cycle_id"],
+            signal.id, level, pattern_type, f"·{version}" if version != "v1" else "", rec["cycle_id"],
             "阻力" if side == "high" else "支撑", rec["broken_level"],
             "阳" if sig_k["close"] > sig_k["open"] else "阴", close_pos,
             f"{vol_ratio:.2f}" if vol_ratio is not None else "N/A",
@@ -623,7 +797,7 @@ class FakeBreakoutDetector:
         signal_id: int,
         next_start: int,
         next_end: int,
-        pattern: str | None,
+        pattern_type: str | None,
         open_price: float | None,
     ) -> None:
         """入场报价快照 + 场景①加仓触发监测（次周期生命周期内的后台任务）。
@@ -635,7 +809,7 @@ class FakeBreakoutDetector:
            周期结束未触发保持 NULL（= 未触发，本身是有效信息：@0.27 假设未兑现）
         """
         try:
-            is_s1 = pattern == "bull_exhaust"
+            is_s1 = pattern_type == "bull_exhaust"
             entry_done = False
             entry_abandoned = False
             entry_deadline = next_start + ENTRY_SNAPSHOT_MAX_WAIT_MS
@@ -723,28 +897,39 @@ class FakeBreakoutDetector:
         direction = "DOWN" if is_high else "UP"
         level_name = "阻力" if is_high else "支撑"
         entry_15m = signal.down_price_15m if is_high else signal.up_price_15m
-        if signal.pattern == "bull_exhaust":
+        pt = signal.pattern_type or signal.pattern
+        if pt == "bull_exhaust":
             pattern_label = "场景①多头耗尽"
-            backtest = "180 天验证集胜率 63.6% [59.3,68.0] n=462，EV@0.50 +0.22/事件；按月最差 54%"
+            backtest = "360 天真 OOS 胜率 64.4% [58.8,69.5] n=303，EV@0.51 +0.237/事件（F22×F18×F25）；按月最差 57%"
             entry_plan = (
                 "次周期开盘即买 DOWN，半仓 @~0.50；\n"
                 "  若次周期内价格反弹至 +0.10%（相对次周期开盘），加仓半仓 @~0.27；\n"
                 "  不要深等（次周期前 10 分钟仍在涨 = 场景已被证伪，胜率崩至 4~14%）"
             )
-        elif signal.pattern == "bear_exhaust":
+        elif pt == "bear_exhaust":
             pattern_label = "场景②空头耗尽"
-            backtest = "180 天验证集胜率 57.8% [53.5,62.1] n=512，EV@0.50 +0.11/事件"
+            backtest = "360 天真 OOS 胜率 53.6% n=1097，EV@0.51 +0.066/事件"
             entry_plan = (
                 "次周期开盘即买 UP，只开盘买；\n"
                 "  跌态中 UP token 无折扣（0.79~0.90），等待无价值"
+            )
+        elif pt == "momentum_fade":
+            pattern_label = "场景④动量衰竭"
+            backtest = "360 天真 OOS 胜率 55.4% [50.7,60.0] n=433，EV@0.51 +0.065/事件（F40连阳≥3×F06光头阳，无破位要求）"
+            entry_plan = (
+                "次周期开盘即买 DOWN，仅开盘入场；\n"
+                "  EV 较薄（+0.065），观察为主，不加仓不深等"
             )
         else:
             pattern_label = "旧信号"
             backtest = "—"
             entry_plan = "—"
-        subject = (
-            f"[场景信号·{pattern_label}] BTC 破4h{level_name}后收盘确认 → 次周期看 {direction}"
-        )
+        if pt == "momentum_fade":
+            subject = f"[场景信号·{pattern_label}] BTC 连阳≥3+光头阳收盘确认 → 次周期看 {direction}"
+        else:
+            subject = (
+                f"[场景信号·{pattern_label}] BTC 破4h{level_name}后收盘确认 → 次周期看 {direction}"
+            )
         close_pos_str = (
             f"收盘质量：收盘位置 (C-L)/(H-L) = {signal.close_pos:.3f}"
             if signal.close_pos is not None else "收盘质量：收盘位置 N/A"
@@ -753,10 +938,15 @@ class FakeBreakoutDetector:
             f"量比（本周期/前20根均量）= {signal.vol_ratio:.2f}"
             if signal.vol_ratio is not None else "量比：N/A"
         )
+        break_line = (
+            f"破位：15m 周期内{'冲过' if is_high else '跌破'} 4h {level_name} {signal.resistance:.2f}"
+            if pt != "momentum_fade"
+            else f"动量背景：连阳 ≥3 根 + 光头阳，信号 K 高点 {signal.resistance:.2f}（无破位要求）"
+        )
         body = (
             f"确认时间：{t_str}\n"
-            f"场景：{pattern_label}（pattern={signal.pattern or 'N/A'}）\n"
-            f"破位：15m 周期内{'冲过' if is_high else '跌破'} 4h {level_name} {signal.resistance:.2f}\n"
+            f"场景：{pattern_label}（pattern_type={pt or 'N/A'}）\n"
+            f"{break_line}\n"
             f"{close_pos_str}\n"
             f"{vol_str}\n\n"
             f"目标周期：下一个 15m 市场（到期 {end_str}）\n"
@@ -909,6 +1099,7 @@ class FakeBreakoutDetector:
                 return
 
         live_price: float | None = None  # 惰性 fallback：仅 klines 失败且宽限内才取现价
+        settled_pts: set[str] = set()  # 本次结算涉及的场景类型（结算后统一回填统计）
         try:
             async with async_session_factory() as session:
                 for s in due:
@@ -943,6 +1134,7 @@ class FakeBreakoutDetector:
                     else:
                         row.settle_outcome = "NOISE"
                     row.status = "SETTLED"
+                    settled_pts.add(row.pattern_type or row.pattern or "")
                     logger.info(
                         "场景信号 15m 周期结算 #{} | 周期开盘 {:.0f} → 周期末 {:.0f} | {} | 入场价 {}",
                         row.id, anchor, close_price, row.settle_outcome, row.down_price_15m,
@@ -950,6 +1142,80 @@ class FakeBreakoutDetector:
                 await session.commit()
         except Exception as exc:
             logger.error("场景结算回填失败 | {}", exc)
+            return
+        # 统计维度回填（2026-08-17）：按本次结算涉及的场景类型更新累计指标
+        for pt in sorted(settled_pts):
+            if pt:
+                await self._update_pattern_stats(pt)
+
+    async def _update_pattern_stats(self, pattern_type: str) -> None:
+        """结算后按 pattern_type 回填统计列（ev_at_entry 补齐 + 最新行累计指标）。
+
+        仅正式信号（version NULL/v1，排除影子）；统计口径见 compute_pattern_stats。
+        ev_at_entry 按入场报价与真 OOS 胜率点估计补算（快照缺失回退 0.51 理论价）。
+        """
+        try:
+            async with async_session_factory() as session:
+                stmt = (
+                    select(FakeBreakoutSignal)
+                    .where(FakeBreakoutSignal.pattern_type == pattern_type)
+                    .where(FakeBreakoutSignal.status == "SETTLED")
+                    .where(
+                        (FakeBreakoutSignal.version.is_(None))
+                        | (FakeBreakoutSignal.version == "v1")
+                    )
+                    .order_by(FakeBreakoutSignal.signal_time)
+                )
+                rows = (await session.execute(stmt)).scalars().all()
+                if not rows:
+                    return
+                # ev_at_entry 补齐（入场时刻预期 EV = p×(1-FEE)/entry − 1）
+                p_research = RESEARCH_WIN_RATES.get(pattern_type)
+                for row in rows:
+                    if row.ev_at_entry is not None or p_research is None:
+                        continue
+                    entry = (
+                        row.entry_down_price_15m if row.side == "high"
+                        else row.entry_up_price_15m
+                    )
+                    entry = float(entry) if entry and entry > 0 else 0.50 + PREMIUM
+                    row.ev_at_entry = round(p_research * (1.0 - FEE) / entry - 1.0, 6)
+                stats = compute_pattern_stats(rows)
+                latest = rows[-1]
+                latest.cumulative_winrate = (
+                    round(stats["winrate"], 4) if stats["winrate"] is not None else None
+                )
+                latest.cumulative_ev = (
+                    round(stats["cumulative_ev"], 6)
+                    if stats["cumulative_ev"] is not None else None
+                )
+                now_ms = clock_sync.now_ms()
+                stmt7 = (
+                    select(FakeBreakoutSignal.id)
+                    .where(FakeBreakoutSignal.pattern_type == pattern_type)
+                    .where(FakeBreakoutSignal.signal_time >= now_ms - 7 * 86_400_000)
+                )
+                latest.n_events_last_7d = len((await session.execute(stmt7)).all())
+                # 回撤曲线快照：按周六归档 key 覆盖式更新（曲线截尾防 JSONB 膨胀）
+                d = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc)
+                week_key = (d + timedelta(days=(5 - d.weekday()) % 7)).strftime("%y%m%d")
+                snaps = dict(latest.max_drawdown_curves or {})
+                snaps[week_key] = {
+                    "equity_curve": stats["equity_curve"][-200:],
+                    "peak_equity": round(stats["peak_equity"], 6),
+                    "dd": round(stats["max_drawdown"], 6),
+                }
+                latest.max_drawdown_curves = snaps
+                await session.commit()
+                logger.info(
+                    "场景统计回填 [{}] | n={} 胜率 {} 累计EV/事件 {} 近7日 {} | 峰值 {} 回撤 {}",
+                    pattern_type, stats["n"],
+                    f"{stats['winrate']:.1%}" if stats["winrate"] is not None else "N/A",
+                    f"{stats['cumulative_ev']:+.3f}" if stats["cumulative_ev"] is not None else "N/A",
+                    latest.n_events_last_7d, stats["peak_equity"], stats["max_drawdown"],
+                )
+        except Exception as exc:
+            logger.warning("场景统计回填失败 [{}] | {}", pattern_type, exc)
 
     # ==================================================================
     # 只读状态（供 API 查询）

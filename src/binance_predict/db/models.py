@@ -673,6 +673,31 @@ class FakeBreakoutSignal(Base):
         Float, nullable=True,
         comment="信号周期量比 = 本 15m 成交量 / 前 20 根均量：场景②判定输入与审计（阈值 2.0）"
     )
+    pattern_type: Mapped[str | None] = mapped_column(
+        String(32), nullable=True,
+        comment="场景类型：bull_exhaust(破4h高·光头阳·4h上沿) | bear_exhaust(破4h低·收阴·放量) | "
+                "momentum_fade(连阳≥3·光头阳，无破位要求)；旧行/旧 A+B 时代信号为 NULL"
+    )
+    ev_at_entry: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+        comment="@entry 价计算的 EV=p*(1+b)-1（费 2%+0.01 溢价），p=真实胜率点估计，b=赔率"
+    )
+    cumulative_winrate: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+        comment="累计胜率（该场景全部已结算正式信号；回填到最新一条 SETTLED 行）"
+    )
+    cumulative_ev: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+        comment="累计实现 EV/事件（1 USDT 本金口径：赢 0.98/entry−1，输 −1；判断长期正期望是否稳定）"
+    )
+    n_events_last_7d: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, default=0, server_default="0",
+        comment="近 7 日事件计数（频率监控，确保样本量充足）"
+    )
+    max_drawdown_curves: Mapped[dict | None] = mapped_column(
+        JSONB, nullable=True,
+        comment="最大回撤曲线快照：{period_end_yymmdd: {equity_curve, peak_equity, dd}}——每周六自动归档"
+    )
     settle_deadline: Mapped[int] = mapped_column(
         BigInteger, nullable=False, comment="结算回读死线（ms）= signal_time + 15min + 缓冲"
     )

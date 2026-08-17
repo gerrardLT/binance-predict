@@ -819,6 +819,13 @@ async def lifespan(app: FastAPI):
                 "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS vol_ratio FLOAT",
                 # M4 影子并行（与 alembic 迁移 p4g7h8i9j0k1 等价，存量 dev 库安全网）
                 "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS version VARCHAR(40)",
+                # 场景统计维度（与 alembic 迁移 r8i9j0k1l2m3 等价，存量 dev 库安全网）
+                "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS pattern_type VARCHAR(32)",
+                "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS ev_at_entry FLOAT",
+                "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS cumulative_winrate FLOAT",
+                "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS cumulative_ev FLOAT",
+                "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS n_events_last_7d INTEGER",
+                "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS max_drawdown_curves JSONB",
             ]:
                 try:
                     await conn.execute(text(col_sql))
@@ -871,7 +878,7 @@ async def lifespan(app: FastAPI):
             pm_15m_latest=_pm_15m_latest,
         )
         await fake_breakout_detector.start()
-        logger.info("场景检测器已启动（场景①多头耗尽/场景②空头耗尽，信号模式不下注）")
+        logger.info("场景检测器已启动（S1多头耗尽/S2空头耗尽/S4动量衰竭，真 OOS 修正版，信号模式不下注）")
 
     # 场景研究（M2）：LLM 研究员定期/累积/异常触发评估，假设只落库不生效
     # （M3 裁决 + 人工 promote 后才以 SHADOW 影子身份参与判定）
@@ -1021,8 +1028,13 @@ async def list_fake_breakout_signals(
             "cycle_offset_sec_15m": s.cycle_offset_sec_15m,
             "break_pct": s.break_pct,
             "pattern": s.pattern,
+            "pattern_type": s.pattern_type,
             "close_pos": s.close_pos,
             "vol_ratio": s.vol_ratio,
+            "ev_at_entry": s.ev_at_entry,
+            "cumulative_winrate": s.cumulative_winrate,
+            "cumulative_ev": s.cumulative_ev,
+            "n_events_last_7d": s.n_events_last_7d,
             "entry_down_price_15m": s.entry_down_price_15m,
             "entry_up_price_15m": s.entry_up_price_15m,
             "entry_quote_ts_15m": s.entry_quote_ts_15m,
@@ -1131,13 +1143,17 @@ async def promote_scene_version(
 
 @app.get("/api/fake-breakout/stats")
 async def get_fake_breakout_stats(db: AsyncSession = Depends(get_db)):
-    """假突破信号汇总统计：按 级别×方向 分组的胜率（5m/15m 双口径）。
+    """假突破信号汇总统计：按 级别×方向 分组的胜率（5m/15m 双口径）+ 按场景类型的 EV 统计。
 
     周期锚点口径：settle_outcome = 信号所在市场周期的涨跌方向
     （周期末价 vs 周期开盘价，与币安预测市场真实结算规则一致）。
     胜负语义：side=high 买 DOWN（周期跌赢）；side=low 买 UP（周期涨赢）。
     """
     from sqlalchemy import func as sa_func, select as sa_select
+
+    from .services.fake_breakout_detector import (
+        BREAKEVEN, FEE, ODDS, PREMIUM, RESEARCH_WIN_RATES, compute_pattern_stats,
+    )
 
     total = (await db.execute(
         sa_select(sa_func.count(FakeBreakoutSignal.id))
@@ -1181,6 +1197,30 @@ async def get_fake_breakout_stats(db: AsyncSession = Depends(get_db)):
         })
     by_group.sort(key=lambda x: (x["level"], x["side"], x["pattern"] or ""))
 
+    # 按场景类型（pattern_type）的实盘统计：胜率 / 累计EV / 入场EV / 收益曲线 / 回撤
+    # （仅正式信号：version NULL/v1，排除影子；口径与 detector._update_pattern_stats 一致）
+    pt_rows = (await db.execute(
+        sa_select(FakeBreakoutSignal)
+        .where(FakeBreakoutSignal.status == "SETTLED")
+        .where(
+            (FakeBreakoutSignal.version.is_(None))
+            | (FakeBreakoutSignal.version == "v1")
+        )
+        .order_by(FakeBreakoutSignal.signal_time)
+    )).scalars().all()
+    by_pt: dict[str, list] = {}
+    for row in pt_rows:
+        by_pt.setdefault(row.pattern_type or row.pattern or "legacy", []).append(row)
+    now_ms = int(time.time() * 1000)
+    by_pattern_type = []
+    for pt, rows_pt in sorted(by_pt.items()):
+        stats = compute_pattern_stats(rows_pt)
+        stats["pattern_type"] = pt
+        stats["n_last_7d"] = sum(
+            1 for r in rows_pt if r.signal_time >= now_ms - 7 * 86_400_000
+        )
+        by_pattern_type.append(stats)
+
     # 全量汇总（兼容前端旧字段）
     settled = sum(g["settled_15m"] for g in groups.values())
     wins = sum(g["wins_15m"] for g in groups.values())
@@ -1205,6 +1245,9 @@ async def get_fake_breakout_stats(db: AsyncSession = Depends(get_db)):
         "settled_5m": settled_5m,
         "down_win_rate_5m": (wins_5m / settled_5m) if settled_5m else None,
         "by_group": by_group,
+        "by_pattern_type": by_pattern_type,
+        "research_win_rates": dict(RESEARCH_WIN_RATES),
+        "pricing": {"fee": FEE, "premium": PREMIUM, "odds": round(ODDS, 4), "breakeven": round(BREAKEVEN, 4)},
     }
 
 

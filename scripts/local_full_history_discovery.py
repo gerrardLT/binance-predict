@@ -424,16 +424,16 @@ def main() -> int:
     base_s = float(nxt_same[:split][same_valid[:split]].mean())
     print(f"\n发现集基准：次根↓ {base_d:.1%} | 次根↑ {1 - base_d:.1%} | 延续率 {base_s:.1%} | 打平 {BREAKEVEN:.1%} | 赔率 {ODDS:.3f}")
 
-    def evaluate(mask, expect, end):
-        m = mask[:end] & has_next[:end]
+    def evaluate(mask, expect, end, start=0):
+        m = mask[start:end] & has_next[start:end]
         n = int(m.sum())
         if n < 5:
             return None
-        k_d = int(nxt_down[:end][m].sum())
+        k_d = int(nxt_down[start:end][m].sum())
         pd = k_d / n
-        base = base_d if end == split else float(nxt_down[:end][has_next[:end]].mean())
-        ms = mask[:end] & same_valid[:end]
-        ps = float(nxt_same[:end][ms].mean()) if ms.sum() >= 30 else np.nan
+        base = float(nxt_down[start:end][has_next[start:end]].mean())
+        ms = mask[start:end] & same_valid[start:end]
+        ps = float(nxt_same[start:end][ms].mean()) if ms.sum() >= 30 else np.nan
         # 假设命中率（expect 方向）
         if expect == "down":
             p_hat, k_hat, alt = pd, k_d, "greater"
@@ -579,7 +579,7 @@ def main() -> int:
             flipped = True
             expect = "up" if expect0 == "down" else "down"
             rd = evaluate(m, expect, split)
-        rv = evaluate(m, expect, N)
+        rv = evaluate(m, expect, N, start=split)  # 严格验证集（不含发现集）
         if not rv:
             continue
         # 验证集命中明细（月度 / regime / run 块自助）
