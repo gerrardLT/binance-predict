@@ -71,6 +71,16 @@ VOL_MA_WINDOW = DEFAULT_SCENE_PARAMS.vol_ma_window   # 场景②：均量窗口�
 CONFIRM_RETRY_MAX = 5
 CONFIRM_RETRY_TIMEOUT_MS = 60_000
 
+# 入场报价快照（2026-08-17）：次周期开盘后延迟抓真实 15m 市场报价。
+# fire 时刻 _pm_15m 里还是旧市场临终价（0.01~0.99 残值），必须等 tracker（15s 轮询）
+# 切到次周期市场后再取——开盘后 ~20s 首试，未切换每 10s 重试，最迟 +90s 放弃（NULL 兜底）
+ENTRY_SNAPSHOT_DELAY_MS = 20_000
+ENTRY_SNAPSHOT_RETRY_INTERVAL_S = 10
+ENTRY_SNAPSHOT_MAX_WAIT_MS = 90_000
+# 场景①加仓触发监测：次周期内 mid ≥ 开盘价×(1+0.10%) 即记录当时报价（@0.27 假设的实盘对照）
+ADD_TRIGGER_PCT = 0.001
+ADD_MONITOR_INTERVAL_S = 10
+
 
 def classify_close_pattern(
     side: str,
@@ -534,6 +544,14 @@ class FakeBreakoutDetector:
         if not shadow:
             self._daily_count += 1
 
+        # 入场报价快照（fire-and-forget，与邮件后台任务同模式）：
+        # 次周期开盘后抓真实 15m 市场报价 + 场景①加仓触发监测。
+        # 影子信号同样抓——影子对照必须与正式信号同口径才有可比性。
+        asyncio.create_task(
+            self._capture_entry_quote(signal.id, next_start, next_end, pattern, m_open_15m),
+            name=f"fbs_entry_{signal.id}",
+        )
+
         direction = "DOWN" if side == "high" else "UP"
         logger.info(
             "场景信号触发 #{} [{} {}{}] | 周期 {} 破{} {:.0f} | 信号K收{} 收盘位置 {:.2f} 量比 {} | "
@@ -571,6 +589,123 @@ class FakeBreakoutDetector:
                         await session.commit()
         except Exception as exc:
             logger.warning("场景信号邮件后台发送异常 #{} | {}", signal_id, exc)
+
+    # ==================================================================
+    # 入场报价快照（次周期开盘后延迟抓取，替代理论 @0.50 假设）
+    # ==================================================================
+
+    async def _sleep_until(self, target_ms: int) -> None:
+        """睡到目标时刻（币安服务器时钟；分段睡防长阻塞 stop()）。"""
+        while self._running:
+            wait_s = (target_ms - clock_sync.now_ms()) / 1000
+            if wait_s <= 0:
+                return
+            await asyncio.sleep(min(wait_s, 30))
+
+    async def _update_signal(self, signal_id: int, **cols) -> bool:
+        """回填信号列（与 email_sent 回填同模式）；失败不抛，返回 False。"""
+        try:
+            async with async_session_factory() as session:
+                row = await session.get(FakeBreakoutSignal, signal_id)
+                if row is None:
+                    return False
+                for k, v in cols.items():
+                    setattr(row, k, v)
+                await session.commit()
+            return True
+        except Exception as exc:
+            logger.warning("信号列回填失败 #{} {} | {}", signal_id, list(cols), exc)
+            return False
+
+    async def _capture_entry_quote(
+        self,
+        signal_id: int,
+        next_start: int,
+        next_end: int,
+        pattern: str | None,
+        open_price: float | None,
+    ) -> None:
+        """入场报价快照 + 场景①加仓触发监测（次周期生命周期内的后台任务）。
+
+        单循环同时处理两件事（时序可能重叠：开盘后 20s 内即可反弹触发加仓）：
+        1. 入场快照：等 tracker 切到次周期市场（start_date 守卫，防旧市场残值），
+           开盘后 ~20s 首试，+90s 截止，失败置 NULL（不阻塞结算）
+        2. 加仓监测（仅 bull_exhaust）：mid ≥ 开盘价×(1+0.10%) 时抓报价落 add 列；
+           周期结束未触发保持 NULL（= 未触发，本身是有效信息：@0.27 假设未兑现）
+        """
+        try:
+            is_s1 = pattern == "bull_exhaust"
+            entry_done = False
+            entry_abandoned = False
+            entry_deadline = next_start + ENTRY_SNAPSHOT_MAX_WAIT_MS
+
+            # 加仓触发价：开盘价缺失时 klines 回读一次；仍缺失则放弃监测
+            trigger_price: float | None = None
+            if is_s1:
+                op = float(open_price) if open_price and open_price > 0 else 0.0
+                if op <= 0:
+                    op = await self._klines_open("15m", next_start)
+                if op > 0:
+                    trigger_price = op * (1 + ADD_TRIGGER_PCT)
+                else:
+                    logger.warning("加仓监测放弃 #{}：次周期开盘价不可得", signal_id)
+            add_done = not is_s1 or trigger_price is None
+
+            await self._sleep_until(next_start + ENTRY_SNAPSHOT_DELAY_MS)
+            while self._running and clock_sync.now_ms() < next_end:
+                now = clock_sync.now_ms()
+                q = dict(self._pm_15m)
+                matched = q.get("start_date") == next_start
+
+                if not entry_done and not entry_abandoned:
+                    if now > entry_deadline:
+                        entry_abandoned = True
+                        logger.warning(
+                            "入场报价快照放弃 #{}（+{}s 内市场切换未确认）",
+                            signal_id, ENTRY_SNAPSHOT_MAX_WAIT_MS // 1000,
+                        )
+                    elif matched:
+                        ok = await self._update_signal(
+                            signal_id,
+                            entry_down_price_15m=q.get("down_price"),
+                            entry_up_price_15m=q.get("up_price"),
+                            entry_quote_ts_15m=int(q.get("updated_ts") or now),
+                        )
+                        if ok:
+                            entry_done = True
+                            logger.info(
+                                "入场报价快照 #{} | DOWN {} UP {} | 开盘后 {}s",
+                                signal_id, q.get("down_price"), q.get("up_price"),
+                                (int(q.get("updated_ts") or now) - next_start) // 1000,
+                            )
+
+                if not add_done and matched:
+                    mid = self._collector.store.mid_price
+                    if mid and mid >= trigger_price:
+                        ok = await self._update_signal(
+                            signal_id,
+                            add_down_price_15m=q.get("down_price"),
+                            add_up_price_15m=q.get("up_price"),
+                            add_trigger_ts_15m=now,
+                        )
+                        if ok:
+                            add_done = True
+                            logger.info(
+                                "加仓触发快照 #{} | mid {:.0f} ≥ 触发价 {:.0f} | DOWN {} UP {}",
+                                signal_id, mid, trigger_price,
+                                q.get("down_price"), q.get("up_price"),
+                            )
+
+                if (entry_done or entry_abandoned) and add_done:
+                    return
+                await asyncio.sleep(
+                    ENTRY_SNAPSHOT_RETRY_INTERVAL_S if not entry_done else ADD_MONITOR_INTERVAL_S
+                )
+            # 周期自然结束：未触发即未触发（add 保持 NULL），无额外日志
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.warning("入场报价快照任务异常 #{} | {}", signal_id, exc)
 
     async def _send_signal_email(self, signal: FakeBreakoutSignal) -> bool:
         t_str = datetime.fromtimestamp(

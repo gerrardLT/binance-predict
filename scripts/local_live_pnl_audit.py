@@ -6,9 +6,14 @@
   ≥+0.10%（high ≥ open×1.001）加仓半仓 @0.27
 - 场景② bear_exhaust：次周期开盘买 UP 全仓 @0.50（只开盘买）
 
+报价口径（2026-08-17 起）：
+- 新信号优先用落库的真实入场快照 entry_*（次周期开盘后 ~20s 实测），
+  加仓用 add_*（反弹触发时刻实测）；标注 [实测]
+- 旧信号（无快照列）回退理论假设 @0.50/@0.27；标注 [假设]
+
 成本口径（与回测 ev() 一致）：入场价 e 的实际成本 = e+0.01（溢价），
 赢赎回 0.98（2% 手续费）。每 1 单位本金的盈亏：
-  @0.50 赢 +0.9216 / 输 -1.0；@0.27 赢 +2.5 / 输 -1.0
+  赢 +0.98/(e+0.01)-1 / 输 -1.0（@0.50 → +0.9216；@0.27 → +2.5）
 
 用法：python scripts/local_live_pnl_audit.py [--api URL]
 """
@@ -22,8 +27,10 @@ from datetime import datetime, timezone
 API = "http://165.154.147.155:8082"
 KLINE = "https://data-api.binance.vision/api/v3/klines"
 
-WIN_050 = (0.98 - 0.51) / 0.51   # +0.9216
-WIN_027 = (0.98 - 0.28) / 0.28   # +2.5
+
+def win_ret(e: float) -> float:
+    """入场价 e 的赔回报率（每 1 单位本金）。"""
+    return 0.98 / (e + 0.01) - 1.0
 
 
 def fetch_json(url: str):
@@ -53,6 +60,7 @@ def main() -> int:
         return 0
 
     total_pnl = 0.0
+    real_cnt = 0
     wins = 0
     print(f"===== 场景信号纸面盈亏审计 | {len(sigs)} 条 =====\n")
     for s in sigs:
@@ -63,17 +71,26 @@ def main() -> int:
         won = (s["settle_outcome"] == "DOWN") if is_s1 else (s["settle_outcome"] == "UP")
         wins += int(won)
 
+        # 报价口径：真实快照优先，旧信号回退理论假设
         if is_s1:
-            # 半仓 @0.50；反弹 +0.10% 触发加仓半仓 @0.27
+            e_open = s.get("entry_down_price_15m") or 0.50
+            tag_open = "实测" if s.get("entry_down_price_15m") is not None else "假设"
             added = path["high"] >= op * 1.001
-            pnl = 0.5 * (WIN_050 if won else -1.0)
+            e_add = s.get("add_down_price_15m") or 0.27
+            tag_add = "实测" if s.get("add_down_price_15m") is not None else ("假设" if added else "")
+            pnl = 0.5 * (win_ret(e_open) if won else -1.0)
             if added:
-                pnl += 0.5 * (WIN_027 if won else -1.0)
-            detail = f"半仓@0.50{' + 加仓@0.27' if added else ''}"
+                pnl += 0.5 * (win_ret(e_add) if won else -1.0)
+            detail = (f"半仓@{e_open:.2f}[{tag_open}]"
+                      + (f" + 加仓@{e_add:.2f}[{tag_add}]" if added else ""))
         else:
-            pnl = WIN_050 if won else -1.0
-            detail = "全仓@0.50"
+            e_open = s.get("entry_up_price_15m") or 0.50
+            tag_open = "实测" if s.get("entry_up_price_15m") is not None else "假设"
+            pnl = win_ret(e_open) if won else -1.0
+            detail = f"全仓@{e_open:.2f}[{tag_open}]"
 
+        if "实测" in detail:
+            real_cnt += 1
         total_pnl += pnl
         t = datetime.fromtimestamp(s["signal_time"] / 1000, tz=timezone.utc)
         print(f"#{s['id']} {s['pattern']:>13} {t:%m-%d %H:%M} | 买{direction} {detail} | "
@@ -81,10 +98,10 @@ def main() -> int:
 
     n = len(sigs)
     wr = wins / n
-    print(f"\n合计：{n} 条 | {wins} 胜 {n - wins} 负 | 胜率 {wr:.1%}")
+    print(f"\n合计：{n} 条 | {wins} 胜 {n - wins} 负 | 胜率 {wr:.1%} | 真实报价口径 {real_cnt} 条")
     print(f"纸面总盈亏（每信号 1 单位本金）：{total_pnl:+.3f} | 平均 {total_pnl / n:+.3f}/信号")
-    print(f"\n基准对照：场景①验证集 62.0% / 场景② 56.4%（样本外）；"
-          f"EV@0.50 全仓 ≈ +0.19/+0.08 每事件")
+    print(f"\n基准对照：360 天分段（上行/下行/震荡）：场景① 63.2%/63.7%/57.7% | "
+          f"场景② 52.2%/55.1%/58.7%；盈亏平衡胜率 p*=(e+0.01)/0.98")
     return 0
 
 

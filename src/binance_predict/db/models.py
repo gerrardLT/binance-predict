@@ -676,6 +676,29 @@ class FakeBreakoutSignal(Base):
     settle_deadline: Mapped[int] = mapped_column(
         BigInteger, nullable=False, comment="结算回读死线（ms）= signal_time + 15min + 缓冲"
     )
+    # 入场报价快照（2026-08-17）：次周期开盘后延迟抓取的真实 15m 市场报价，
+    # 替代理论 @0.50 假设——盈亏平衡胜率 p* = (entry+0.01)/0.98 随报价漂移，
+    # 无真实报价则胜率优势无法折算 EV（实测记录期开盘价中位 DOWN=0.615 而非 0.5）
+    entry_down_price_15m: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+        comment="入场报价快照：次周期开盘后~20s 的 15m 市场 DOWN token 价（市场切换确认后落）"
+    )
+    entry_up_price_15m: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="入场报价快照：次周期开盘后~20s 的 15m 市场 UP token 价"
+    )
+    entry_quote_ts_15m: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, comment="入场报价快照时刻（ms，距开盘 offset 可由此计算）"
+    )
+    add_down_price_15m: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+        comment="场景①加仓触发时（mid≥开盘×1.001）的 15m 市场 DOWN token 报价；NULL=未触发/未监测"
+    )
+    add_up_price_15m: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="场景①加仓触发时的 15m 市场 UP token 报价"
+    )
+    add_trigger_ts_15m: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, comment="场景①反弹加仓触发时刻（ms）；NULL=周期内未触发"
+    )
     settle_btc_price: Mapped[float | None] = mapped_column(
         Float, nullable=True, comment="15m 周期末时刻 BTC 现货中间价 P(E)（到期回读回填）"
     )
