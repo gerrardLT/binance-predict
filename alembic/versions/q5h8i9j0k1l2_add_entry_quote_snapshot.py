@@ -6,7 +6,7 @@
 随报价漂移（@0.615 需 63.8% vs @0.50 需 52%），胜率优势可能被报价吃掉。
 
 新增 6 列：
-- entry_down/up_price_15m + entry_quote_ts_15m：开盘后 ~20s 快照（市场切换确认守卫）
+- entry_down/up_price_15m + entry_quote_ts_15m：开盘后 ~8s 快照（15m 边界加速采样 2s 粒度，市场切换确认守卫）
 - add_down/up_price_15m + add_trigger_ts_15m：场景①反弹加仓（mid≥开盘×1.001）触发快照
 
 Revision ID: q5h8i9j0k1l2
@@ -26,10 +26,10 @@ def upgrade() -> None:
     with op.batch_alter_table("fake_breakout_signals") as batch:
         batch.add_column(sa.Column(
             "entry_down_price_15m", sa.Float(), nullable=True,
-            comment="入场报价快照：次周期开盘后~20s 的 15m 市场 DOWN token 价（市场切换确认后落）"))
+            comment="入场报价快照：次周期开盘后~8s 的 15m 市场 DOWN token 价（市场切换确认后落）"))
         batch.add_column(sa.Column(
             "entry_up_price_15m", sa.Float(), nullable=True,
-            comment="入场报价快照：次周期开盘后~20s 的 15m 市场 UP token 价"))
+            comment="入场报价快照：次周期开盘后~8s 的 15m 市场 UP token 价"))
         batch.add_column(sa.Column(
             "entry_quote_ts_15m", sa.BigInteger(), nullable=True,
             comment="入场报价快照时刻（ms，距开盘 offset 可由此计算）"))

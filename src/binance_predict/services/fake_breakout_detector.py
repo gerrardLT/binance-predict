@@ -72,10 +72,11 @@ CONFIRM_RETRY_MAX = 5
 CONFIRM_RETRY_TIMEOUT_MS = 60_000
 
 # 入场报价快照（2026-08-17）：次周期开盘后延迟抓真实 15m 市场报价。
-# fire 时刻 _pm_15m 里还是旧市场临终价（0.01~0.99 残值），必须等 tracker（15s 轮询）
-# 切到次周期市场后再取——开盘后 ~20s 首试，未切换每 10s 重试，最迟 +90s 放弃（NULL 兜底）
-ENTRY_SNAPSHOT_DELAY_MS = 20_000
-ENTRY_SNAPSHOT_RETRY_INTERVAL_S = 10
+# fire 时刻 _pm_15m 里还是旧市场临终价（0.01~0.99 残值），必须等缓存切到次周期
+# 市场后再取——边界加速协程（main.py）在 15m 边界后 40s 内 2s 粒度刷新缓存，
+# 开盘后 ~8s 首试通常已切换；未切换每 5s 重试，最迟 +90s 放弃（NULL 兜底）
+ENTRY_SNAPSHOT_DELAY_MS = 8_000
+ENTRY_SNAPSHOT_RETRY_INTERVAL_S = 5
 ENTRY_SNAPSHOT_MAX_WAIT_MS = 90_000
 # 场景①加仓触发监测：次周期内 mid ≥ 开盘价×(1+0.10%) 即记录当时报价（@0.27 假设的实盘对照）
 ADD_TRIGGER_PCT = 0.001

@@ -681,10 +681,10 @@ class FakeBreakoutSignal(Base):
     # 无真实报价则胜率优势无法折算 EV（实测记录期开盘价中位 DOWN=0.615 而非 0.5）
     entry_down_price_15m: Mapped[float | None] = mapped_column(
         Float, nullable=True,
-        comment="入场报价快照：次周期开盘后~20s 的 15m 市场 DOWN token 价（市场切换确认后落）"
+        comment="入场报价快照：次周期开盘后~8s 的 15m 市场 DOWN token 价（市场切换确认后落）"
     )
     entry_up_price_15m: Mapped[float | None] = mapped_column(
-        Float, nullable=True, comment="入场报价快照：次周期开盘后~20s 的 15m 市场 UP token 价"
+        Float, nullable=True, comment="入场报价快照：次周期开盘后~8s 的 15m 市场 UP token 价"
     )
     entry_quote_ts_15m: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True, comment="入场报价快照时刻（ms，距开盘 offset 可由此计算）"

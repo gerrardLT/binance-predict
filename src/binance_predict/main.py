@@ -85,8 +85,9 @@ agent_scheduler: AgentScheduler | None = None
 # SentimentAgent 全局实例（lifespan 中初始化，供 deep-learn API 调用）
 sentiment_agent: SentimentAgent | None = None
 
-# 15m 市场最新报价缓存（tracker 每 15s 刷新，假突破检测器读取信号时刻的
-# 15m DOWN 报价与到期时刻；只读共享，无需加锁——单写者 + 读者可容忍毫秒级旧值）
+# 15m 市场最新报价缓存（tracker 15s 对齐采样 + 边界加速协程（边界后 40s 内 2s 粒度）
+# 刷新，假突破检测器读取信号时刻的 15m DOWN 报价与到期时刻；只读共享，无需加锁——
+# 单写者事件循环 + 读者可容忍毫秒级旧值，逐 key 赋值段无 await 不交错）
 _pm_15m_latest: dict = {
     "down_price": None,
     "up_price": None,
@@ -117,6 +118,89 @@ research_scheduler: "ResearchScheduler | None" = None
 # ============================================================
 # 定时任务
 # ============================================================
+
+# 边界加速采样参数：15m 周期边界后短窗口内加密刷新（只刷内存缓存，不落库）。
+# 目的：入场报价快照观测点从开盘后 ~20s 推到 ~8s 内；cycle_open_price（周期
+# 锚点 P(S)）滞后从 ≤15s 压到 ≤2s。DB 采样粒度不变（15s 对齐，归档/曲面口径不变）。
+EDGE_ACCEL_INTERVAL_S = 2      # 加密刷新间隔
+EDGE_ACCEL_WINDOW_MS = 40_000  # 15m 边界后的加速窗口
+
+
+async def _handle_15m_quote(quote_15m, ts_ms: int, *, persist: bool) -> None:
+    """15m 市场通道：切换检测（cycle_open 快照）+ 缓存刷新 + 可选落库。
+
+    两条路径共用：tracker 15s 对齐采样（persist=True）与边界加速协程
+    （persist=False）。切换检测基于 end_date 变化，天然幂等——两路径
+    并发调用安全（单线程事件循环，逐 key 赋值段无 await 不交错）。
+    """
+    if quote_15m is None or quote_15m.down_price is None or quote_15m.end_date is None:
+        return
+    # 周期切换检测：记录新周期开盘价（周期锚点结算的判定基准 P(S)）
+    prev_end_15m = _pm_15m_latest.get("end_date")
+    if quote_15m.end_date != prev_end_15m:
+        if prev_end_15m is None:
+            # 冷启动：当前周期已开始，从 klines 精确回读周期开盘价
+            start_15m = quote_15m.start_date or (int(quote_15m.end_date) - 900_000)
+            open_15m = await collector.fetch_kline_open("15m", int(start_15m))
+        else:
+            # 正常切换：切换时刻现价即新周期开盘价（加速路径 ≤2s / 常规 ≤15s 滞后）
+            open_15m = collector.store.mid_price
+            if not open_15m or open_15m <= 0:
+                open_15m = await collector.fetch_mid_price()
+        _pm_15m_latest["cycle_open_price"] = open_15m if open_15m and open_15m > 0 else None
+        _pm_15m_latest["cycle_open_end"] = quote_15m.end_date
+        logger.info(
+            "15m 市场周期切换 | 开盘价 {} | {} → {}",
+            _pm_15m_latest["cycle_open_price"], prev_end_15m, quote_15m.end_date,
+        )
+    _pm_15m_latest["down_price"] = quote_15m.down_price
+    _pm_15m_latest["up_price"] = quote_15m.up_price
+    _pm_15m_latest["start_date"] = quote_15m.start_date
+    _pm_15m_latest["end_date"] = quote_15m.end_date
+    _pm_15m_latest["updated_ts"] = ts_ms
+    if not persist:
+        return
+    try:
+        async with async_session_factory() as db:
+            db.add(PredictionMarketSample(
+                timestamp=ts_ms,
+                market_period="15m",
+                up_price=quote_15m.up_price,
+                down_price=quote_15m.down_price,
+                up_pct=round(quote_15m.up_chance * 100, 1) if quote_15m.up_chance is not None else None,
+                down_pct=round(quote_15m.down_chance * 100, 1) if quote_15m.down_chance is not None else None,
+                participants=quote_15m.participants,
+                trade_volume=float(quote_15m.trade_volume) if quote_15m.trade_volume is not None else None,
+                btc_price=collector.store.mid_price or None,
+            ))
+            await db.commit()
+    except Exception as e:
+        logger.warning("15m 市场采样入库失败: {}", e)
+
+
+async def _pm_15m_edge_accelerator() -> None:
+    """15m 周期边界加速采样：边界后 40s 内每 2s 刷新缓存（不落库）。
+
+    入场报价快照与 cycle_open_price 精度的关键路径——其余时间不产生
+    任何额外 API 请求。API 增量：每边界 ~20 次（每 15 分钟），全天 ~1900 次。
+    """
+    last_poll = 0.0
+    while True:
+        try:
+            await asyncio.sleep(EDGE_ACCEL_INTERVAL_S)
+            now_ms = int(time.time() * 1000)
+            if now_ms % 900_000 >= EDGE_ACCEL_WINDOW_MS:
+                continue
+            if time.time() - last_poll < EDGE_ACCEL_INTERVAL_S:
+                continue
+            last_poll = time.time()
+            quotes = await market_data_service.fetch_market_data_multi()
+            await _handle_15m_quote(quotes.get("15m"), int(time.time() * 1000), persist=False)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.debug("边界加速采样异常（下一 tick 重试）: {}", e)
+
 
 async def _prediction_market_tracker() -> None:
     """
@@ -165,6 +249,9 @@ async def _prediction_market_tracker() -> None:
             except Exception:
                 continue
 
+            # --- 15m 市场通道：共用处理（切换检测 + 缓存 + 落库；边界加速协程共用同一函数） ---
+            await _handle_15m_quote(quotes.get("15m"), aligned_ts, persist=True)
+
             quote = quotes.get("5m")
             if quote is None:
                 continue
@@ -173,49 +260,6 @@ async def _prediction_market_tracker() -> None:
             if quote.end_date is None:
                 logger.warning("end_date 为 None，跳过本轮采样")
                 continue
-
-            # --- 15m 市场通道：只多写一条采样 + 刷新缓存，不参与窗口切换逻辑 ---
-            quote_15m = quotes.get("15m")
-            if quote_15m is not None and quote_15m.down_price is not None and quote_15m.end_date is not None:
-                # 周期切换检测：记录新周期开盘价（周期锚点结算的判定基准 P(S)）
-                prev_end_15m = _pm_15m_latest.get("end_date")
-                if quote_15m.end_date != prev_end_15m:
-                    if prev_end_15m is None:
-                        # 冷启动：当前周期已开始，从 klines 精确回读周期开盘价
-                        start_15m = quote_15m.start_date or (int(quote_15m.end_date) - 900_000)
-                        open_15m = await collector.fetch_kline_open("15m", int(start_15m))
-                    else:
-                        # 正常切换：切换时刻现价即新周期开盘价（≤15s 轮询滞后）
-                        open_15m = collector.store.mid_price
-                        if not open_15m or open_15m <= 0:
-                            open_15m = await collector.fetch_mid_price()
-                    _pm_15m_latest["cycle_open_price"] = open_15m if open_15m and open_15m > 0 else None
-                    _pm_15m_latest["cycle_open_end"] = quote_15m.end_date
-                    logger.info(
-                        "15m 市场周期切换 | 开盘价 {} | {} → {}",
-                        _pm_15m_latest["cycle_open_price"], prev_end_15m, quote_15m.end_date,
-                    )
-                _pm_15m_latest["down_price"] = quote_15m.down_price
-                _pm_15m_latest["up_price"] = quote_15m.up_price
-                _pm_15m_latest["start_date"] = quote_15m.start_date
-                _pm_15m_latest["end_date"] = quote_15m.end_date
-                _pm_15m_latest["updated_ts"] = aligned_ts
-                try:
-                    async with async_session_factory() as db:
-                        db.add(PredictionMarketSample(
-                            timestamp=aligned_ts,
-                            market_period="15m",
-                            up_price=quote_15m.up_price,
-                            down_price=quote_15m.down_price,
-                            up_pct=round(quote_15m.up_chance * 100, 1) if quote_15m.up_chance is not None else None,
-                            down_pct=round(quote_15m.down_chance * 100, 1) if quote_15m.down_chance is not None else None,
-                            participants=quote_15m.participants,
-                            trade_volume=float(quote_15m.trade_volume) if quote_15m.trade_volume is not None else None,
-                            btc_price=collector.store.mid_price or None,
-                        ))
-                        await db.commit()
-                except Exception as e:
-                    logger.warning("15m 市场采样入库失败: {}", e)
 
             # 更新市场元数据（供图表 API 只读访问；场景检测器已不共享此 dict）。
             _pm_market_info.clear()
@@ -813,10 +857,11 @@ async def lifespan(app: FastAPI):
     tasks = [
         asyncio.create_task(collector.connect_spot_ws(), name="spot_ws"),
         asyncio.create_task(_prediction_market_tracker(), name="pm_tracker"),
+        asyncio.create_task(_pm_15m_edge_accelerator(), name="pm_15m_edge_accel"),
         asyncio.create_task(_sentiment_window_archiver(), name="sw_archiver"),
         asyncio.create_task(_health_monitor_loop(), name="health_monitor"),
     ]
-    logger.info("现货 WS + 预测市场追踪 + 情绪窗口归档 + 健康监控已启动")
+    logger.info("现货 WS + 预测市场追踪 + 15m边界加速 + 情绪窗口归档 + 健康监控已启动")
 
     # 场景信号系统：4h 破位记 pending → 15m 周期收盘确认 → 次周期信号（不下注）
     global fake_breakout_detector

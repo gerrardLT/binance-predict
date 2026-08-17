@@ -6,12 +6,14 @@
 - 未切换重试 → 切换后落；超时放弃 → 保持 NULL 不阻塞
 - 场景①加仓触发（mid ≥ 开盘×1.001）落 add 列；未触发保持 NULL
 - fire 成功后调度快照后台任务
+- 15m 通道共用处理（main._handle_15m_quote）：切换检测 / 幂等 / persist 分支 / 防御
 """
 
 from __future__ import annotations
 
 import asyncio
 import itertools
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -180,3 +182,91 @@ async def test_fire_schedules_capture_task(monkeypatch) -> None:
     )
 
     assert any(name and name.startswith("fbs_entry_") for name, _ in created)
+
+
+# ============================================================
+# 15m 通道共用处理（main._handle_15m_quote）：tracker 与边界加速协程共用
+# ============================================================
+
+
+def _quote(end: int, down: float = 0.6, up: float = 0.38) -> SimpleNamespace:
+    return SimpleNamespace(
+        down_price=down, up_price=up, start_date=end - 900_000, end_date=end,
+        up_chance=0.4, down_chance=0.6, participants=10, trade_volume=99.0,
+    )
+
+
+async def _run_handle(monkeypatch, quote, ts_ms: int, persist: bool) -> tuple:
+    """注入替身后跑 _handle_15m_quote，返回 (main模块, session)。"""
+    import binance_predict.main as m
+
+    session = AsyncMock()
+    session.add = MagicMock()
+    session.commit = AsyncMock()
+    factory = MagicMock()
+    factory.return_value.__aenter__ = AsyncMock(return_value=session)
+    factory.return_value.__aexit__ = AsyncMock(return_value=False)
+    monkeypatch.setattr(m, "async_session_factory", factory)
+
+    col = MagicMock()
+    col.store.mid_price = 64_000.0
+    col.fetch_mid_price = AsyncMock(return_value=64_001.0)
+    col.fetch_kline_open = AsyncMock(return_value=63_999.0)
+    monkeypatch.setattr(m, "collector", col)
+
+    m._pm_15m_latest.clear()
+    m._pm_15m_latest.update({"down_price": None, "up_price": None, "start_date": None,
+                             "end_date": None, "updated_ts": None,
+                             "cycle_open_price": None, "cycle_open_end": None})
+    await m._handle_15m_quote(quote, ts_ms, persist=persist)
+    return m, session
+
+
+@pytest.mark.asyncio
+async def test_handle_15m_first_quote_cold_start(monkeypatch) -> None:
+    """冷启动（缓存空 end_date）：klines 回读开盘价 + 全量刷缓存 + 落库一次。"""
+    end = NEXT_START + 900_000
+    m, session = await _run_handle(monkeypatch, _quote(end), ts_ms=NEXT_START + 20_000, persist=True)
+
+    assert m._pm_15m_latest["cycle_open_price"] == 63_999.0  # klines 回读分支
+    assert m._pm_15m_latest["end_date"] == end
+    assert m._pm_15m_latest["down_price"] == 0.6
+    assert m._pm_15m_latest["updated_ts"] == NEXT_START + 20_000
+    session.add.assert_called_once()  # persist=True 落库
+
+
+@pytest.mark.asyncio
+async def test_handle_15m_switch_then_idempotent(monkeypatch) -> None:
+    """首次冷启动 klines 回读；同 end_date 再调不重复快照（幂等）；
+    切换到新 end_date 走现价快照分支；persist=False 不落库。"""
+    end1, end2 = NEXT_START + 900_000, NEXT_START + 1_800_000
+    m, session = await _run_handle(monkeypatch, _quote(end1), ts_ms=1, persist=True)
+    assert m._pm_15m_latest["cycle_open_price"] == 63_999.0  # 冷启动：klines 回读分支
+
+    col = m.collector
+    await m._handle_15m_quote(_quote(end1, down=0.7), ts_ms=2, persist=True)
+    assert col.fetch_mid_price.await_count == 0  # 同 end_date 不再触发切换检测
+    assert m._pm_15m_latest["down_price"] == 0.7  # 报价照常刷新
+    assert m._pm_15m_latest["cycle_open_price"] == 63_999.0  # 开盘价未被覆盖
+
+    await m._handle_15m_quote(_quote(end2), ts_ms=3, persist=False)
+    assert m._pm_15m_latest["end_date"] == end2
+    assert m._pm_15m_latest["cycle_open_end"] == end2
+    assert m._pm_15m_latest["cycle_open_price"] == 64_000.0  # 正常切换：现价快照分支
+    assert session.add.call_count == 2  # persist=False 不落库（前两次 True 各一条）
+
+
+@pytest.mark.asyncio
+async def test_handle_15m_defensive(monkeypatch) -> None:
+    """None 报价 / 缺 end_date / 缺 down_price → 直接返回，缓存与 DB 均不动。"""
+    m, session = await _run_handle(monkeypatch, None, ts_ms=1, persist=True)
+    assert m._pm_15m_latest["end_date"] is None
+    session.add.assert_not_called()
+
+    bad = _quote(NEXT_START)
+    bad.end_date = None
+    await m._handle_15m_quote(bad, ts_ms=1, persist=True)
+    bad2 = _quote(NEXT_START)
+    bad2.down_price = None
+    await m._handle_15m_quote(bad2, ts_ms=1, persist=True)
+    session.add.assert_not_called()
