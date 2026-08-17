@@ -826,6 +826,10 @@ async def lifespan(app: FastAPI):
                 "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS cumulative_ev FLOAT",
                 "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS n_events_last_7d INTEGER",
                 "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS max_drawdown_curves JSONB",
+                # +5min 报价快照 / S5 确认入场（与 alembic 迁移 t9j0k1l2m3n4 等价，存量 dev 库安全网）
+                "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS quote5m_down_15m FLOAT",
+                "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS quote5m_up_15m FLOAT",
+                "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS quote5m_ts_15m BIGINT",
             ]:
                 try:
                     await conn.execute(text(col_sql))
@@ -1041,6 +1045,9 @@ async def list_fake_breakout_signals(
             "add_down_price_15m": s.add_down_price_15m,
             "add_up_price_15m": s.add_up_price_15m,
             "add_trigger_ts_15m": s.add_trigger_ts_15m,
+            "quote5m_down_15m": s.quote5m_down_15m,
+            "quote5m_up_15m": s.quote5m_up_15m,
+            "quote5m_ts_15m": s.quote5m_ts_15m,
             "settle_btc_price": s.settle_btc_price,
             "settle_outcome": s.settle_outcome,
             "settle_btc_price_5m": s.settle_btc_price_5m,

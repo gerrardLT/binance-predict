@@ -206,7 +206,7 @@ interface HealthReport {
 // 假突破信号：与后端 /api/fake-breakout/* 输出对齐
 interface FakeBreakoutSignal {
   id: number
-  level: '1h' | '4h' | 'daily'
+  level: '1h' | '4h' | 'daily' | 'momentum'
   side: 'high' | 'low'
   signal_time: number
   resistance: number
@@ -223,8 +223,23 @@ interface FakeBreakoutSignal {
   cycle_open_price_5m: number | null
   cycle_offset_sec_15m: number | null
   break_pct: number | null
-  filter_pass: boolean
-  filter_label: string
+  pattern: string | null
+  pattern_type: string | null
+  close_pos: number | null
+  vol_ratio: number | null
+  ev_at_entry: number | null
+  cumulative_winrate: number | null
+  cumulative_ev: number | null
+  n_events_last_7d: number | null
+  entry_down_price_15m: number | null
+  entry_up_price_15m: number | null
+  entry_quote_ts_15m: number | null
+  add_down_price_15m: number | null
+  add_up_price_15m: number | null
+  add_trigger_ts_15m: number | null
+  quote5m_down_15m: number | null
+  quote5m_up_15m: number | null
+  quote5m_ts_15m: number | null
   settle_btc_price: number | null
   settle_outcome: 'UP' | 'DOWN' | 'NOISE' | null
   settle_btc_price_5m: number | null
@@ -262,6 +277,21 @@ interface FakeBreakoutStats {
   settled_5m: number
   down_win_rate_5m: number | null
   by_group: FakeBreakoutGroup[]
+  by_pattern_type: FakeBreakoutPatternStats[]
+  research_win_rates: Record<string, number>
+}
+// 按场景类型（pattern_type）的实盘统计：后端 compute_pattern_stats 输出
+interface FakeBreakoutPatternStats {
+  pattern_type: string
+  n: number
+  wins: number
+  winrate: number | null
+  cumulative_ev: number | null
+  avg_ev_at_entry: number | null
+  equity_curve: number[]
+  peak_equity: number
+  max_drawdown: number
+  n_last_7d: number
 }
 
 // 模式池分级与回测快照：与后端 /api/agent/patterns/compare + /backtest-runs 对齐
@@ -2070,6 +2100,27 @@ function FakeBreakoutPanel() {
   const winBadge = (oc: string | null) =>
     oc === 'DOWN' ? '↓ DOWN' : oc === 'UP' ? '↑ UP' : '— NOISE'
 
+  // 场景类型 → 徽章样式与中文名（S1/S2/S4/S5，2026-08-18 新增 S5 确认入场）
+  const sceneMeta: Record<string, { label: string; cls: string; desc: string }> = {
+    bull_exhaust: {
+      label: 'S1 多头耗尽', cls: 'bg-red-50 text-red-700 border-red-200',
+      desc: '破4h高·光头阳·4h上沿 → 次周期 DOWN',
+    },
+    bear_exhaust: {
+      label: 'S2 空头耗尽', cls: 'bg-green-50 text-green-700 border-green-200',
+      desc: '破4h低·收阴·放量≥2.0 → 次周期 UP',
+    },
+    momentum_fade: {
+      label: 'S4 动量衰竭', cls: 'bg-blue-50 text-blue-700 border-blue-200',
+      desc: '连阳≥3·光头阳，无破位要求 → 次周期 DOWN',
+    },
+    bull_exhaust_confirm: {
+      label: 'S5 确认入场', cls: 'bg-purple-50 text-purple-700 border-purple-200',
+      desc: 'S1 信号后 +5min 回落确认（5m 收盘 < 周期开盘）→ 买 DOWN 持有到期；盈亏平衡入场价 0.77',
+    },
+  }
+  const sceneOf = (s: FakeBreakoutSignal) => sceneMeta[s.pattern_type || ''] || null
+
   return (
     <Card title="假突破信号（1h/4h/日线 × 阻力/支撑 · 暂不下注）">
       <div className="text-xs text-gray-400 mb-3">
@@ -2139,6 +2190,47 @@ function FakeBreakoutPanel() {
         </div>
       )}
 
+      {/* 按场景类型统计（6 统计维度：胜率/累计EV/入场EV/回撤/近7日频率/收益曲线） */}
+      {stats && stats.by_pattern_type && stats.by_pattern_type.length > 0 && (
+        <div className="mb-3 grid grid-cols-2 lg:grid-cols-4 gap-2 text-xs">
+          {stats.by_pattern_type.map(ps => {
+            const meta = sceneMeta[ps.pattern_type]
+            const research = stats.research_win_rates?.[ps.pattern_type]
+            return (
+              <div key={ps.pattern_type} className="px-2.5 py-2 bg-white border border-gray-200 rounded-lg">
+                <div className="flex items-center gap-1 mb-1.5">
+                  <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold border ${meta?.cls || 'bg-gray-100 text-gray-500 border-gray-200'}`}>
+                    {meta?.label || ps.pattern_type}
+                  </span>
+                  {research !== undefined && (
+                    <span className="text-[10px] text-gray-400" title="回测胜率点估计（入场 EV 用的 p）">回测 {(research * 100).toFixed(1)}%</span>
+                  )}
+                </div>
+                <div className="flex flex-wrap gap-x-3 gap-y-0.5 font-mono text-[11px] text-gray-600">
+                  <span title={`已结算正式信号 ${ps.n} 条（胜 ${ps.wins}）`}>
+                    实盘 <strong className={ps.winrate !== null && research !== undefined && ps.winrate >= research ? 'text-green-600' : 'text-gray-800'}>
+                      {ps.winrate !== null ? `${(ps.winrate * 100).toFixed(0)}%` : '--'}
+                    </strong>({ps.n})
+                  </span>
+                  <span title="累计实现 EV/事件（1 USDT 本金：赢 0.98/entry−1，输 −1）">
+                    EV <strong className={(ps.cumulative_ev ?? 0) >= 0 ? 'text-green-600' : 'text-red-500'}>
+                      {ps.cumulative_ev !== null ? `${ps.cumulative_ev >= 0 ? '+' : ''}${ps.cumulative_ev.toFixed(3)}` : '--'}
+                    </strong>
+                  </span>
+                  <span title="入场时刻预期 EV 均值 = p×(1−费)/entry−1（p=回测胜率）">
+                    入场EV {ps.avg_ev_at_entry !== null ? `${ps.avg_ev_at_entry >= 0 ? '+' : ''}${ps.avg_ev_at_entry.toFixed(3)}` : '--'}
+                  </span>
+                </div>
+                <div className="flex flex-wrap gap-x-3 gap-y-0.5 font-mono text-[10px] text-gray-400 mt-0.5">
+                  <span title="累计收益曲线峰值→最大回撤">峰值 {ps.peak_equity.toFixed(2)} / 回撤 {ps.max_drawdown.toFixed(2)}</span>
+                  <span title="近 7 日事件数（频率监控）">近7日 {ps.n_last_7d}</span>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      )}
+
       {/* 信号列表 */}
       {signals.length === 0 ? (
         <div className="text-center text-gray-400 py-6 text-sm">暂无信号——BTC 盘中破位任一级别阻力/支撑时自动记录并邮件提醒</div>
@@ -2148,11 +2240,11 @@ function FakeBreakoutPanel() {
             <thead className="sticky top-0 bg-white">
               <tr className="border-b border-gray-200 text-gray-500">
                 <th className="py-1.5 px-2 text-left">信号时间</th>
+                <th className="py-1.5 px-2 text-center">场景</th>
                 <th className="py-1.5 px-2 text-center">级别/方向</th>
-                <th className="py-1.5 px-2 text-center" title="行动过滤：A 周期内偏移<6min（尾段回测140注仅2胜）｜ B 破位幅度<0.2%（>0.3%回测144注0胜）｜ 方向（日线破支撑回避）。全部通过才可行动">过滤</th>
                 <th className="py-1.5 px-2 text-right">破位价 / 位价</th>
-                <th className="py-1.5 px-2 text-right" title="信号瞬间 15m 市场目标方向 token 的买入价快照（越低赔率越肥）">15m 入场价</th>
-                <th className="py-1.5 px-2 text-right" title="信号瞬间 5m 市场目标方向 token 的买入价快照">5m 入场价</th>
+                <th className="py-1.5 px-2 text-right" title="入场报价快照：信号后次周期开盘 ~8s 的 15m 市场目标方向 token 价（S5 为 +5min 确认时刻价）；缺快照时回退信号瞬间报价">开盘入场价</th>
+                <th className="py-1.5 px-2 text-right" title="信号后 5 分钟（次周期 1/3 处）15m 市场目标方向 token 报价：S5 确认入场真实可得价 / 提前离场定价对照">+5m 报价</th>
                 <th className="py-1.5 px-2 text-right" title="信号所在 15m 周期：开盘价 → 周期末价（市场按这两者定涨跌）">15m 开→末</th>
                 <th className="py-1.5 px-2 text-center" title="信号所在 5m 周期的涨跌方向：周期末价 vs 周期开盘价，与币安市场真实结算规则一致">5m 周期</th>
                 <th className="py-1.5 px-2 text-center" title="信号所在 15m 周期的涨跌方向：周期末价 vs 周期开盘价，即市场真实结算结果">15m 周期</th>
@@ -2161,32 +2253,44 @@ function FakeBreakoutPanel() {
             </thead>
             <tbody>
               {signals.map(s => {
-                const entry15 = s.side === 'high' ? s.down_price_15m : s.up_price_15m
-                const entry5 = s.side === 'high' ? s.down_price_5m : s.up_price_5m
+                const entrySnap = s.side === 'high' ? s.entry_down_price_15m : s.entry_up_price_15m
+                const entryFire = s.side === 'high' ? s.down_price_15m : s.up_price_15m
+                const entry15 = entrySnap ?? entryFire
+                const q5 = s.side === 'high' ? s.quote5m_down_15m : s.quote5m_up_15m
+                const scene = sceneOf(s)
+                const sceneTip = [
+                  scene?.desc,
+                  s.close_pos !== null ? `收盘位置 ${(s.close_pos ?? 0).toFixed(3)}` : null,
+                  s.vol_ratio !== null ? `量比 ${(s.vol_ratio ?? 0).toFixed(2)}` : null,
+                  s.ev_at_entry !== null ? `入场EV ${s.ev_at_entry >= 0 ? '+' : ''}${s.ev_at_entry.toFixed(3)}` : null,
+                  s.cumulative_winrate !== null ? `累计胜率 ${(s.cumulative_winrate * 100).toFixed(1)}%` : null,
+                  s.cumulative_ev !== null ? `累计EV ${s.cumulative_ev >= 0 ? '+' : ''}${s.cumulative_ev.toFixed(3)}` : null,
+                ].filter(Boolean).join('\n')
                 return (
                   <tr key={s.id} className="border-b border-gray-100 hover:bg-gray-50">
                     <td className="py-1.5 px-2 text-gray-600 font-mono">{fmtMs(s.signal_time)}</td>
+                    <td className="py-1.5 px-2 text-center" title={sceneTip}>
+                      {scene ? (
+                        <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold border ${scene.cls}`}>
+                          {scene.label}
+                        </span>
+                      ) : (
+                        <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-gray-100 text-gray-400">旧信号</span>
+                      )}
+                    </td>
                     <td className="py-1.5 px-2 text-center">
                       <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-indigo-50 text-indigo-700 border border-indigo-200 mr-1">{s.level}</span>
                       <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
                         s.side === 'high' ? 'bg-red-50 text-red-600' : 'bg-green-50 text-green-600'
                       }`}>{s.side === 'high' ? '看跌' : '看涨'}</span>
                     </td>
-                    <td className="py-1.5 px-2 text-center" title={s.filter_label}>
-                      <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
-                        s.filter_pass ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-400'
-                      }`}>{s.filter_pass ? '✅ 可行动' : '❌ 过滤'}</span>
-                      {s.cycle_offset_sec_15m !== null && (
-                        <div className="text-[9px] text-gray-400 font-mono mt-0.5">
-                          {(s.cycle_offset_sec_15m / 60).toFixed(1)}min {s.break_pct !== null ? `${s.break_pct.toFixed(2)}%` : ''}
-                        </div>
-                      )}
-                    </td>
                     <td className="py-1.5 px-2 text-right font-mono text-gray-800">
                       {s.btc_price.toFixed(0)} <span className="text-gray-400">/ {s.resistance.toFixed(0)}</span>
                     </td>
-                    <td className="py-1.5 px-2 text-right font-mono text-red-500">{entry15?.toFixed(3) ?? '--'}</td>
-                    <td className="py-1.5 px-2 text-right font-mono text-gray-500">{entry5?.toFixed(3) ?? '--'}</td>
+                    <td className="py-1.5 px-2 text-right font-mono text-red-500" title={entrySnap !== null ? '开盘后 ~8s 入场快照' : '信号瞬间报价（无入场快照）'}>
+                      {entry15?.toFixed(3) ?? '--'}
+                    </td>
+                    <td className="py-1.5 px-2 text-right font-mono text-gray-500">{q5?.toFixed(3) ?? '--'}</td>
                     <td className="py-1.5 px-2 text-right font-mono text-gray-600">
                       {s.cycle_open_price_15m ? `${s.cycle_open_price_15m.toFixed(0)}→` : ''}{s.settle_btc_price?.toFixed(0) ?? '--'}
                     </td>

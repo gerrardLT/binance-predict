@@ -724,6 +724,18 @@ class FakeBreakoutSignal(Base):
     add_trigger_ts_15m: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True, comment="场景①反弹加仓触发时刻（ms）；NULL=周期内未触发"
     )
+    # +5min 报价快照（2026-08-18）：信号后 5 分钟（次周期第 1 根 5m 收盘时刻）
+    # 的 15m 市场报价——S5 确认入场的真实可得价，兼作提前离场/加仓的定价对照
+    quote5m_down_15m: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+        comment="信号后 5min（次周期 1/3 处）15m 市场 DOWN 报价：S5 确认入场真实价；NULL=未抓到"
+    )
+    quote5m_up_15m: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="信号后 5min 时刻 15m 市场 UP 报价（对称快照）"
+    )
+    quote5m_ts_15m: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, comment="+5min 报价快照时刻（ms）"
+    )
     settle_btc_price: Mapped[float | None] = mapped_column(
         Float, nullable=True, comment="15m 周期末时刻 BTC 现货中间价 P(E)（到期回读回填）"
     )

@@ -22,12 +22,14 @@ import pytest
 from binance_predict.services.fake_breakout_detector import (
     CLOSE_POS_MIN,
     FEE,
+    PATTERN_GROUP,
     POS4H_MIN,
     RESEARCH_WIN_RATES,
     VOL_RATIO_MIN,
     FakeBreakoutDetector,
     classify_close_pattern,
     compute_pattern_stats,
+    confirm_bull_exhaust_5m,
     is_momentum_fade,
 )
 
@@ -367,3 +369,47 @@ async def test_status_snapshot_exposes_scene_state() -> None:
     assert snap["pending_breaks"]["low"]["broken_level"] == 90.0
     assert snap["confirm_retries"] == 1
     assert snap["last_cycle_id"] == 2071
+
+# ============================================================
+# S5 bull_exhaust_confirm（S1 +5min 回落确认，2026-08-18）
+# ============================================================
+
+def test_s5_confirm_falling_pass() -> None:
+    """次周期第 1 根 5m 收盘 < 周期开盘（z5<0）：确认买 DOWN。"""
+    confirmed, reason = confirm_bull_exhaust_5m(c5_close=99.8, anchor=100.0)
+    assert confirmed is True
+    assert reason == "CONFIRM"
+
+
+def test_s5_skip_rising() -> None:
+    """5m 收盘 > 周期开盘（反向上涨，对照组胜率仅 34%）：放弃。"""
+    confirmed, reason = confirm_bull_exhaust_5m(c5_close=100.3, anchor=100.0)
+    assert confirmed is False
+    assert reason == "RISING"
+
+
+def test_s5_skip_flat_and_invalid() -> None:
+    """平价（NOISE）与异常输入：均放弃不落 S5 行。"""
+    assert confirm_bull_exhaust_5m(c5_close=100.0, anchor=100.0) == (False, "FLAT")
+    assert confirm_bull_exhaust_5m(c5_close=0.0, anchor=100.0) == (False, "INVALID")
+    assert confirm_bull_exhaust_5m(c5_close=100.0, anchor=0.0) == (False, "INVALID")
+
+
+def test_s5_registered_in_constants() -> None:
+    """S5 胜率点估计 0.785 入表；pattern 旧列映射 bull_exhaust（String(16) 上限）。"""
+    assert RESEARCH_WIN_RATES["bull_exhaust_confirm"] == 0.785
+    assert PATTERN_GROUP["bull_exhaust_confirm"] == "bull_exhaust"
+    assert len(PATTERN_GROUP["bull_exhaust_confirm"]) <= 16
+
+
+def test_s5_pattern_stats_ev_uses_785_entry() -> None:
+    """S5 统计：入场 EV 用 p=0.785 与 +5min 真实入场价（entry=0.65 例）。"""
+    rows = [_settled_row("high", "DOWN", 0.65, pattern_type="bull_exhaust_confirm")]
+    s = compute_pattern_stats(rows)
+    p = RESEARCH_WIN_RATES["bull_exhaust_confirm"]
+    ret = (1.0 - FEE) / 0.65 - 1.0
+    assert s["winrate"] == 1.0
+    assert s["cumulative_ev"] == pytest.approx(ret, abs=1e-6)
+    assert s["avg_ev_at_entry"] == pytest.approx(p * (1.0 + ret) - 1.0, abs=1e-6)
+    # 盈亏平衡入场价 ≈ 0.769：0.65 入场为正 EV，与回测敏感性表一致
+    assert s["avg_ev_at_entry"] > 0

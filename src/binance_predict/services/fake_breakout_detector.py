@@ -21,6 +21,14 @@
   （F40×F04 大实体组合 OOS 50.5% FAILED——不带大实体条件；
    S3/F23「S1+24h新高」强化标记 2026-08-17 拍板不上线，与 S1 重叠度高 n=118⊂303）
 
+场景⑤ bull_exhaust_confirm = S1+5m 确认（2026-08-18 上线，360 天双周期结合回测）：
+  S1 信号后不立即行动；等次周期第 1 根 5m K 收盘，若收盘价 < 次周期开盘价
+  （z5 < 0，回测 build_events 口径 nop = 次周期第 1 根 5m 开盘价）
+  → 确认买 DOWN，持有至同一次周期 15m 到期结算；反向上涨则放弃
+  回测（360 天）：确认组 n=591 胜率 78.5% [75.0,81.6]（对照组 60.9%，
+  反向上涨组 34.0%）；盈亏平衡入场价 0.77——真实 +5min 市场报价
+  （quote5m_down_15m 快照）预计 0.6~0.7，EV 约 +0.1~+0.28，不劣于开盘入基准 +0.171
+
 检测流程：
   1. 秒级循环：mid 破位势 → 记 pending（仅内存，不报警不落表，每方向每周期记首次）
   2. 15m 周期边界：拉上一根完整 15m K（OHLCV）+ 前 20 根均量，判定收盘质量
@@ -92,6 +100,12 @@ ENTRY_SNAPSHOT_MAX_WAIT_MS = 90_000
 ADD_TRIGGER_PCT = 0.001                              # S1/S3加仓触发 (mid ≥ open×(1+0.1%))
 ADD_MONITOR_INTERVAL_S = 10
 
+# S5 确认入场（2026-08-18）：S1 信号后 +5min 回落确认才买 DOWN
+S5_CONFIRM_DELAY_MS = 300_000                        # 次周期第 1 根 5m 收盘时刻
+S5_CONFIRM_GRACE_MS = 8_000                          # 收盘后缓冲（等 klines 落库）
+S5_CONFIRM_MAX_WAIT_MS = 90_000                      # 5m K 拉不到的放弃上限
+QUOTE_5M_DELAY_MS = 300_000                          # +5min 报价快照时点（与 S5 确认同时刻）
+
 # 交易定价常数 (与 EV 计算一致：费 2%+0.01 溢价，赔率 b≈0.922，打平胜率≈52.0%)
 FEE = 0.02
 PREMIUM = 0.01
@@ -103,12 +117,15 @@ RESEARCH_WIN_RATES: dict[str, float] = {
     "bull_exhaust": 0.644,
     "bear_exhaust": 0.536,
     "momentum_fade": 0.554,
+    # S5 = S1 子集“+5min 已回落”组（360 天双周期结合回测 2026-08-18）
+    "bull_exhaust_confirm": 0.785,
 }
 # pattern_type → pattern 旧列粗类映射（String(16) 上限；旧列保留兼容历史查询）
 PATTERN_GROUP: dict[str, str] = {
     "bull_exhaust": "bull_exhaust",
     "bear_exhaust": "bear_exhaust",
     "momentum_fade": "momentum_fade",
+    "bull_exhaust_confirm": "bull_exhaust",
 }
 
 
@@ -196,6 +213,30 @@ def is_momentum_fade(
     close_pos = (c - l) / rng
     hit = (c > o) and (close_pos >= p.close_pos_min) and streak_ok
     return hit, close_pos if hit else None
+
+
+def confirm_bull_exhaust_5m(c5_close: float, anchor: float) -> tuple[bool, str]:
+    """S5 确认判定（纯函数）：次周期第 1 根 5m 收盘价 vs 次周期开盘价。
+
+    回测口径（backtest/events.py 的 z5）：d1 = c5[nidx[0]][4] / nop − 1，
+    nop = 次周期第 1 根 5m 开盘价（= 次周期开盘价 P(S)）；确认 ⟺ z5 < 0。
+    锚点与 15m 结算同源（P(S)），确认组胜率 78.5%、反向上涨组 34.0%。
+
+    Args:
+        c5_close: 次周期第 1 根 5m K 的收盘价
+        anchor: 次周期开盘价（父信号 cycle_open_price_15m，或该 5m K 的 open）
+
+    Returns:
+        (confirmed, reason)：reason ∈ CONFIRM | RISING（反向上涨，放弃）|
+        FLAT（平价 NOISE，放弃）| INVALID（数据异常，放弃）
+    """
+    if not anchor or anchor <= 0 or not c5_close or c5_close <= 0:
+        return False, "INVALID"
+    if c5_close < anchor:
+        return True, "CONFIRM"
+    if c5_close > anchor:
+        return False, "RISING"
+    return False, "FLAT"
 
 
 def compute_pattern_stats(rows: list) -> dict:
@@ -727,6 +768,14 @@ class FakeBreakoutDetector:
             name=f"fbs_entry_{signal.id}",
         )
 
+        # S5 确认入场（2026-08-18）：仅正式 S1 信号派生——+5min 回落确认才买 DOWN；
+        # 影子不派生（影子对照仅覆盖收盘判定层，S5 属入场时机层）
+        if not shadow and pattern_type == "bull_exhaust":
+            asyncio.create_task(
+                self._confirm_s5_entry(signal.id, next_start, next_end),
+                name=f"fbs_s5_{signal.id}",
+            )
+
         direction = "DOWN" if side == "high" else "UP"
         logger.info(
             "场景信号触发 #{} [{} {}{}] | 周期 {} 破{} {:.0f} | 信号K收{} 收盘位置 {:.2f} 量比 {} | "
@@ -802,17 +851,20 @@ class FakeBreakoutDetector:
     ) -> None:
         """入场报价快照 + 场景①加仓触发监测（次周期生命周期内的后台任务）。
 
-        单循环同时处理两件事（时序可能重叠：开盘后 20s 内即可反弹触发加仓）：
+        单循环同时处理三件事（时序可能重叠：开盘后 20s 内即可反弹触发加仓）：
         1. 入场快照：等 tracker 切到次周期市场（start_date 守卫，防旧市场残值），
            开盘后 ~20s 首试，+90s 截止，失败置 NULL（不阻塞结算）
         2. 加仓监测（仅 bull_exhaust）：mid ≥ 开盘价×(1+0.10%) 时抓报价落 add 列；
            周期结束未触发保持 NULL（= 未触发，本身是有效信息：@0.27 假设未兑现）
+        3. +5min 报价快照（2026-08-18）：次周期 1/3 处的 15m 市场报价落 quote5m_* 列，
+           S5 确认入场的真实可得价与提前离场定价对照；周期结束未抓到保持 NULL
         """
         try:
             is_s1 = pattern_type == "bull_exhaust"
             entry_done = False
             entry_abandoned = False
             entry_deadline = next_start + ENTRY_SNAPSHOT_MAX_WAIT_MS
+            quote_done = False
 
             # 加仓触发价：开盘价缺失时 klines 回读一次；仍缺失则放弃监测
             trigger_price: float | None = None
@@ -871,7 +923,23 @@ class FakeBreakoutDetector:
                                 q.get("down_price"), q.get("up_price"),
                             )
 
-                if (entry_done or entry_abandoned) and add_done:
+                # +5min 报价快照：S5 确认入场真实价 + 提前离场定价对照
+                if not quote_done and now >= next_start + QUOTE_5M_DELAY_MS and matched:
+                    if q.get("down_price") is not None:
+                        ok = await self._update_signal(
+                            signal_id,
+                            quote5m_down_15m=q.get("down_price"),
+                            quote5m_up_15m=q.get("up_price"),
+                            quote5m_ts_15m=int(q.get("updated_ts") or now),
+                        )
+                        if ok:
+                            quote_done = True
+                            logger.info(
+                                "+5min 报价快照 #{} | DOWN {} UP {}",
+                                signal_id, q.get("down_price"), q.get("up_price"),
+                            )
+
+                if (entry_done or entry_abandoned) and add_done and quote_done:
                     return
                 await asyncio.sleep(
                     ENTRY_SNAPSHOT_RETRY_INTERVAL_S if not entry_done else ADD_MONITOR_INTERVAL_S
@@ -881,6 +949,134 @@ class FakeBreakoutDetector:
             pass
         except Exception as exc:
             logger.warning("入场报价快照任务异常 #{} | {}", signal_id, exc)
+
+    # ==================================================================
+    # S5 确认入场（2026-08-18）：S1 信号 +5min 回落确认才买 DOWN
+    # ==================================================================
+
+    async def _confirm_s5_entry(self, parent_id: int, next_start: int, next_end: int) -> None:
+        """S5 确认判定：+5min 拉次周期第 1 根 5m K，回落确认则落 S5 信号。
+
+        时序：睡到 next_start + 5min + 缓冲 → 重试循环（上限 90s）拉
+        open_time == next_start 的 5m K（此时必已收盘）→ 按 confirm_bull_exhaust_5m
+        判定（锚点 = 该 5m K 的 open，即次周期开盘价 P(S)，与回测 z5 的 nop 同源）。
+        确认 → _fire_s5_signal 落行+邮件；反向上涨/平价 → 放弃（无 S5 行）；
+        5m K 拉不到（停机/klines 异常）→ 放弃，不影响父 S1 行。
+        """
+        try:
+            await self._sleep_until(next_start + S5_CONFIRM_DELAY_MS + S5_CONFIRM_GRACE_MS)
+            deadline = next_start + S5_CONFIRM_DELAY_MS + S5_CONFIRM_MAX_WAIT_MS
+            while self._running and clock_sync.now_ms() < min(deadline, next_end):
+                try:
+                    klines = await self._collector.fetch_recent_klines("5m", 3)
+                except Exception:
+                    klines = []
+                k5 = next((k for k in klines if k["open_time"] == next_start), None)
+                if k5 is None or clock_sync.now_ms() < next_start + S5_CONFIRM_DELAY_MS:
+                    await asyncio.sleep(ENTRY_SNAPSHOT_RETRY_INTERVAL_S)
+                    continue
+                confirmed, reason = confirm_bull_exhaust_5m(
+                    float(k5["close"]), float(k5["open"]),
+                )
+                if not confirmed:
+                    logger.info(
+                        "S5 确认放弃 #{}（{}）| 5m 收盘 {:.2f} vs 周期开盘 {:.2f} | 对照：反向上涨组胜率 34%",
+                        parent_id, reason, k5["close"], k5["open"],
+                    )
+                    return
+                await self._fire_s5_signal(
+                    parent_id, next_start, next_end, float(k5["close"]), float(k5["open"]),
+                )
+                return
+            if self._running:
+                logger.warning(
+                    "S5 确认放弃 #{}（+{}s 内次周期第 1 根 5m K 不可得）",
+                    parent_id, S5_CONFIRM_MAX_WAIT_MS // 1000,
+                )
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.warning("S5 确认任务异常 #{} | {}", parent_id, exc)
+
+    async def _fire_s5_signal(
+        self,
+        parent_id: int,
+        next_start: int,
+        next_end: int,
+        c5_close: float,
+        anchor: float,
+    ) -> None:
+        """S5 确认命中：复制父 S1 行坐标落 pattern_type=bull_exhaust_confirm 新行。
+
+        入场价 = 确认时刻 15m 市场 DOWN 报价（start_date 守卫，防旧市场残值；
+        报价缺失置 NULL，统计回退 0.51 理论价）。结算与父行同周期同锚点
+        （cycle_open_price_15m 缺失时用第 1 根 5m open 兜底，即 P(S)）。每父信号
+        至多一条，天然去重；计入日限，邮件受日限控制（同正式信号风控）。
+        """
+        async with async_session_factory() as session:
+            parent = await session.get(FakeBreakoutSignal, parent_id)
+        if parent is None:
+            return
+
+        q = dict(self._pm_15m)
+        matched = q.get("start_date") == next_start
+        now_ms = clock_sync.now_ms()
+        self._daily_rollover(now_ms)
+        over_daily_limit = self._daily_count >= settings.fake_breakout_max_daily_signals
+
+        signal = FakeBreakoutSignal(
+            level=parent.level,
+            side=parent.side,
+            signal_time=now_ms,
+            resistance=parent.resistance,
+            btc_price=self._collector.store.mid_price or c5_close,
+            eps=parent.eps,
+            down_price_15m=q.get("down_price") if matched else None,
+            up_price_15m=q.get("up_price") if matched else None,
+            market_end_15m=parent.market_end_15m,
+            market_start_15m=parent.market_start_15m,
+            cycle_open_price_15m=(
+                parent.cycle_open_price_15m
+                if parent.cycle_open_price_15m and parent.cycle_open_price_15m > 0
+                else anchor
+            ),
+            pattern=PATTERN_GROUP["bull_exhaust_confirm"],
+            pattern_type="bull_exhaust_confirm",
+            close_pos=parent.close_pos,
+            vol_ratio=parent.vol_ratio,
+            version=parent.version,
+            # S5 入场即 +5min 确认时刻，entry 列语义对齐“入场时报价”
+            entry_down_price_15m=q.get("down_price") if matched else None,
+            entry_up_price_15m=q.get("up_price") if matched else None,
+            entry_quote_ts_15m=int(q.get("updated_ts") or now_ms) if matched else None,
+            settle_deadline=parent.settle_deadline,
+            status="PENDING",
+            email_sent=False,
+        )
+        try:
+            async with async_session_factory() as session:
+                session.add(signal)
+                await session.commit()
+                await session.refresh(signal)
+        except Exception as exc:
+            logger.error("S5 信号落表失败 #{} | {}", parent_id, exc)
+            return
+
+        self._daily_count += 1
+        logger.info(
+            "S5 确认信号触发 #{}（父 #{}）| 5m 收盘 {:.2f} < 周期开盘 {:.2f} | "
+            "DOWN 入场 {} | 360 天回测：确认组 78.5% [75.0,81.6] 盈亏平衡 0.77 | 日内第 {} 条{}",
+            signal.id, parent_id, c5_close, anchor,
+            q.get("down_price") if matched else "N/A",
+            self._daily_count,
+            "（超日限，不发邮件）" if over_daily_limit else "",
+        )
+
+        if settings.fake_breakout_email_enabled and not over_daily_limit:
+            asyncio.create_task(
+                self._send_signal_email_bg(signal.id),
+                name=f"fbs_email_{signal.id}",
+            )
 
     async def _send_signal_email(self, signal: FakeBreakoutSignal) -> bool:
         t_str = datetime.fromtimestamp(
@@ -920,12 +1116,31 @@ class FakeBreakoutDetector:
                 "次周期开盘即买 DOWN，仅开盘入场；\n"
                 "  EV 较薄（+0.065），观察为主，不加仓不深等"
             )
+        elif pt == "bull_exhaust_confirm":
+            pattern_label = "场景⑤确认入场（S1+5m 确认）"
+            entry_d = signal.entry_down_price_15m
+            ev_hint = (
+                f"当前入场价 {entry_d:.3f} → 预期 EV {RESEARCH_WIN_RATES['bull_exhaust_confirm'] * (1 - FEE) / (entry_d + PREMIUM) - 1:+.3f}"
+                if entry_d and entry_d > 0 else "入场价快照缺失（统计时回退 0.51 理论价）"
+            )
+            backtest = (
+                "360 天双周期结合回测：S1 信号 +5min 回落确认组胜率 78.5% [75.0,81.6] n=591"
+                "（全样本 60.9%；+5min 反向上涨组仅 34.0%）；\n"
+                f"  盈亏平衡入场价 0.77，{ev_hint}"
+            )
+            entry_plan = (
+                "已过 +5min 确认时点（次周期第 1 根 5m 收盘 < 周期开盘），现价买 DOWN 持有至本期到期；\n"
+                "  若实际报价 > 0.77 放弃（负 EV）；\n"
+                "  对照：父 S1 开盘入基准 EV@0.51 +0.171"
+            )
         else:
             pattern_label = "旧信号"
             backtest = "—"
             entry_plan = "—"
         if pt == "momentum_fade":
             subject = f"[场景信号·{pattern_label}] BTC 连阳≥3+光头阳收盘确认 → 次周期看 {direction}"
+        elif pt == "bull_exhaust_confirm":
+            subject = f"[场景信号·{pattern_label}] BTC S1 信号后 5 分钟已回落 → 买 {direction}（胜率 78.5%）"
         else:
             subject = (
                 f"[场景信号·{pattern_label}] BTC 破4h{level_name}后收盘确认 → 次周期看 {direction}"
@@ -940,8 +1155,13 @@ class FakeBreakoutDetector:
         )
         break_line = (
             f"破位：15m 周期内{'冲过' if is_high else '跌破'} 4h {level_name} {signal.resistance:.2f}"
-            if pt != "momentum_fade"
-            else f"动量背景：连阳 ≥3 根 + 光头阳，信号 K 高点 {signal.resistance:.2f}（无破位要求）"
+            if pt not in ("momentum_fade", "bull_exhaust_confirm")
+            else (
+                f"确认依据：父 S1 信号破 4h 阻力 {signal.resistance:.2f} 收盘确认后，"
+                f"次周期第 1 根 5m 收盘低于周期开盘价（回落确认）"
+                if pt == "bull_exhaust_confirm"
+                else f"动量背景：连阳 ≥3 根 + 光头阳，信号 K 高点 {signal.resistance:.2f}（无破位要求）"
+            )
         )
         body = (
             f"确认时间：{t_str}\n"
