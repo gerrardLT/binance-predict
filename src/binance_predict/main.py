@@ -1511,39 +1511,67 @@ async def get_prediction_market_chart():
 
 @app.get("/api/chart/prediction-market/15m")
 async def get_prediction_market_chart_15m(
+    limit: int = 400,
+    since: int = 0,
     db: AsyncSession = Depends(get_db),
 ):
     """
     获取 15 分钟预测市场采样曲线（从 prediction_market_samples 查 market_period='15m'）
 
-    返回最近 400 个点（约 100 分钟，覆盖多个 15m 期次）的 UP/DOWN 报价与
+    默认返回最近 400 个点（约 100 分钟，覆盖多个 15m 期次）的 UP/DOWN 报价与
     BTC 快照价；market 字段为检测器缓存的最新 15m 市场快照（到期时刻等）。
-    """
-    from sqlalchemy import desc as sa_desc, select as sa_select
 
-    stmt = (
-        sa_select(PredictionMarketSample)
-        .where(PredictionMarketSample.market_period == "15m")
-        .order_by(sa_desc(PredictionMarketSample.timestamp))
-        .limit(400)
-    )
-    rows = (await db.execute(stmt)).scalars().all()
-    points = [
-        {
-            "timestamp": s.timestamp,
-            "up_price": s.up_price,
-            "down_price": s.down_price,
-            "up_pct": s.up_pct,
-            "down_pct": s.down_pct,
-            "btc_price": s.btc_price,
-        }
-        for s in reversed(rows)
-    ]
+    历史导出（S6 定价分析用）：since>0 时按时间正序返回 timestamp>=since 的
+    前 limit 条（上限 50000，约 12.5 天），配合响应中的 oldest_ts 可翻页遍历。
+    """
+    from sqlalchemy import asc as sa_asc, desc as sa_desc, select as sa_select
+
+    limit = max(1, min(limit, 50_000))
+    if since > 0:
+        stmt = (
+            sa_select(PredictionMarketSample)
+            .where(PredictionMarketSample.market_period == "15m")
+            .where(PredictionMarketSample.timestamp >= since)
+            .order_by(sa_asc(PredictionMarketSample.timestamp))
+            .limit(limit)
+        )
+        rows = (await db.execute(stmt)).scalars().all()
+        points = [
+            {
+                "timestamp": s.timestamp,
+                "up_price": s.up_price,
+                "down_price": s.down_price,
+                "up_pct": s.up_pct,
+                "down_pct": s.down_pct,
+                "btc_price": s.btc_price,
+            }
+            for s in rows
+        ]
+    else:
+        stmt = (
+            sa_select(PredictionMarketSample)
+            .where(PredictionMarketSample.market_period == "15m")
+            .order_by(sa_desc(PredictionMarketSample.timestamp))
+            .limit(limit)
+        )
+        rows = (await db.execute(stmt)).scalars().all()
+        points = [
+            {
+                "timestamp": s.timestamp,
+                "up_price": s.up_price,
+                "down_price": s.down_price,
+                "up_pct": s.up_pct,
+                "down_pct": s.down_pct,
+                "btc_price": s.btc_price,
+            }
+            for s in reversed(rows)
+        ]
     return {
         "symbol": settings.symbol,
         "poll_interval_sec": 15,
         "points": points,
         "market": dict(_pm_15m_latest),
+        "oldest_ts": points[0]["timestamp"] if points else None,
     }
 
 
