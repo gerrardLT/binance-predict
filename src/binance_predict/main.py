@@ -1148,6 +1148,63 @@ async def promote_scene_version(
     return {"status": "ok", "version": row.version, "params": row.params}
 
 
+@app.get("/api/fake-breakout/signals/{signal_id}/path")
+async def get_fake_breakout_signal_path(
+    signal_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """信号次周期路径：15s 采样还原的 BTC 价格 + 15m 市场 DOWN/UP 报价双轨。
+
+    数据源 prediction_market_samples（market_period='15m'，2026-08-13 起积累），
+    区间 = 信号周期锚点 [market_start_15m, market_end_15m)。用于 S5/S6/S7
+    入场时点研究：早期窗口（t≤4）涨/跌态报价、+5m 确认点、真实结算对照。
+    更早的信号无采样，has_data=false。
+    """
+    from sqlalchemy import asc as sa_asc, select as sa_select
+
+    s = await db.get(FakeBreakoutSignal, signal_id)
+    if s is None or not s.market_start_15m or not s.market_end_15m:
+        return {"signal_id": signal_id, "has_data": False, "points": []}
+
+    start, end = int(s.market_start_15m), int(s.market_end_15m)
+    stmt = (
+        sa_select(PredictionMarketSample)
+        .where(
+            PredictionMarketSample.market_period == "15m",
+            PredictionMarketSample.timestamp >= start,
+            PredictionMarketSample.timestamp < end,
+        )
+        .order_by(sa_asc(PredictionMarketSample.timestamp))
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+    points = [
+        {
+            "off": round((r.timestamp - start) / 1000.0, 1),
+            "btc": r.btc_price,
+            "down": r.down_price,
+            "up": r.up_price,
+        }
+        for r in rows
+        if r.btc_price is not None and r.down_price is not None
+    ]
+    return {
+        "signal_id": signal_id,
+        "cycle_start": start,
+        "cycle_end": end,
+        "open": s.cycle_open_price_15m,
+        "side": s.side,
+        "settle": s.settle_outcome,
+        "quote5m_off": (
+            round((s.quote5m_ts_15m - start) / 1000.0, 1)
+            if s.quote5m_ts_15m and start <= s.quote5m_ts_15m < end
+            else None
+        ),
+        "quote5m_down": s.quote5m_down_15m if s.side == "high" else s.quote5m_up_15m,
+        "has_data": len(points) > 0,
+        "points": points,
+    }
+
+
 @app.get("/api/fake-breakout/stats")
 async def get_fake_breakout_stats(db: AsyncSession = Depends(get_db)):
     """假突破信号汇总统计：按 级别×方向 分组的胜率（5m/15m 双口径）+ 按场景类型的 EV 统计。

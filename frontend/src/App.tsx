@@ -3,6 +3,7 @@ import {
   XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, Area, AreaChart, ReferenceLine,
   BarChart, Bar, Legend, LineChart, Line,
+  ReferenceArea, ReferenceDot,
 } from 'recharts'
 
 // ============================================================
@@ -425,6 +426,8 @@ const api = {
   getFakeBreakoutStatus: () => fetch('/api/fake-breakout/status').then(r => r.json()),
   getFakeBreakoutSignals: (limit = 50) =>
     fetch(`/api/fake-breakout/signals?limit=${limit}`).then(r => r.json()),
+  getFakeBreakoutSignalPath: (signalId: number) =>
+    fetch(`/api/fake-breakout/signals/${signalId}/path`).then(r => r.json()),
   getFakeBreakoutStats: () => fetch('/api/fake-breakout/stats').then(r => r.json()),
   getPatternCompare: () => fetch('/api/agent/patterns/compare').then(r => r.json()),
   getPatternBacktestRuns: (patternId: number, limit = 30) =>
@@ -2079,6 +2082,12 @@ function FakeBreakoutPanel() {
   const [status, setStatus] = useState<FakeBreakoutStatus | null>(null)
   const [signals, setSignals] = useState<FakeBreakoutSignal[]>([])
   const [stats, setStats] = useState<FakeBreakoutStats | null>(null)
+  const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set())
+  const togglePath = (id: number) => setExpandedIds(prev => {
+    const next = new Set(prev)
+    if (next.has(id)) next.delete(id); else next.add(id)
+    return next
+  })
 
   const refresh = useCallback(() => {
     api.getFakeBreakoutStatus().then(setStatus).catch(() => {})
@@ -2239,6 +2248,7 @@ function FakeBreakoutPanel() {
           <table className="w-full text-xs">
             <thead className="sticky top-0 bg-white">
               <tr className="border-b border-gray-200 text-gray-500">
+                <th className="w-6" title="展开次周期价格+报价路径"></th>
                 <th className="py-1.5 px-2 text-left">信号时间</th>
                 <th className="py-1.5 px-2 text-center">场景</th>
                 <th className="py-1.5 px-2 text-center">级别/方向</th>
@@ -2267,7 +2277,15 @@ function FakeBreakoutPanel() {
                   s.cumulative_ev !== null ? `累计EV ${s.cumulative_ev >= 0 ? '+' : ''}${s.cumulative_ev.toFixed(3)}` : null,
                 ].filter(Boolean).join('\n')
                 return (
-                  <tr key={s.id} className="border-b border-gray-100 hover:bg-gray-50">
+                  <Fragment key={s.id}>
+                  <tr className="border-b border-gray-100 hover:bg-gray-50">
+                    <td className="py-1.5 px-1 text-center">
+                      <button onClick={() => togglePath(s.id)}
+                        className="text-gray-400 hover:text-indigo-600 leading-none text-xs"
+                        title="展开次周期价格+报价路径（15s 采样，8/13 起有数据）">
+                        {expandedIds.has(s.id) ? '▾' : '▸'}
+                      </button>
+                    </td>
                     <td className="py-1.5 px-2 text-gray-600 font-mono">{fmtMs(s.signal_time)}</td>
                     <td className="py-1.5 px-2 text-center" title={sceneTip}>
                       {scene ? (
@@ -2317,6 +2335,14 @@ function FakeBreakoutPanel() {
                       {s.email_sent && <span className="text-[10px] text-blue-400 ml-1" title="邮件已推送">📧</span>}
                     </td>
                   </tr>
+                  {expandedIds.has(s.id) && (
+                    <tr className="border-b border-gray-100">
+                      <td colSpan={11} className="p-0">
+                        <SignalPathPanel sig={s} />
+                      </td>
+                    </tr>
+                  )}
+                  </Fragment>
                 )
               })}
             </tbody>
@@ -2324,6 +2350,117 @@ function FakeBreakoutPanel() {
         </div>
       )}
     </Card>
+  )
+}
+
+// ============================================================
+// 信号次周期路径面板（行内展开）：价格 ±bp 上板 / DOWN 报价下板
+// 数据源 prediction_market_samples 15s 采样（8/13 起积累），懒加载
+// ============================================================
+
+interface SignalPathPoint { off: number; btc: number; down: number; up: number }
+interface SignalPathData {
+  signal_id: number
+  cycle_start: number
+  cycle_end: number
+  open: number | null
+  side: 'high' | 'low'
+  settle: string | null
+  quote5m_off: number | null
+  quote5m_down: number | null
+  has_data: boolean
+  points: SignalPathPoint[]
+}
+
+function SignalPathPanel({ sig }: { sig: FakeBreakoutSignal }) {
+  const [data, setData] = useState<SignalPathData | null>(null)
+  const [failed, setFailed] = useState(false)
+  useEffect(() => {
+    let alive = true
+    api.getFakeBreakoutSignalPath(sig.id)
+      .then(d => { if (alive) setData(d) })
+      .catch(() => { if (alive) setFailed(true) })
+    return () => { alive = false }
+  }, [sig.id])
+
+  if (failed) return <div className="py-4 text-center text-xs text-gray-400">路径加载失败</div>
+  if (!data) return <div className="py-4 text-center text-xs text-gray-400">路径加载中…</div>
+  if (!data.has_data || !data.open) {
+    return (
+      <div className="py-4 text-center text-xs text-gray-400" title="15m 市场采样自 2026-08-13 开始积累，更早的信号无路径数据">
+        暂无采样数据（8/13 前的信号或采样缺失）
+      </div>
+    )
+  }
+
+  const open = data.open
+  const pts = data.points.map(p => ({ off: p.off, dev: (p.btc / open - 1) * 10000, down: p.down }))
+  const maxDev = Math.max(5, Math.ceil(Math.max(...pts.map(p => Math.abs(p.dev))) / 5) * 5)
+  const x5 = data.quote5m_off ?? 300
+  const mmss = (s: number) => `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, '0')}`
+  const last = pts[pts.length - 1]
+  const minDev = Math.min(...pts.map(p => p.dev))
+  const maxUp = Math.max(...pts.map(p => p.dev))
+  const won = data.settle === (sig.side === 'high' ? 'DOWN' : 'UP')
+  const xTicks = [0, 180, 300, 600, 900]
+  const tipFmt = (v: unknown, n: unknown) =>
+    n === 'dev' ? [`${(v as number).toFixed(1)}bp`, '价格'] : [(v as number).toFixed(3), 'DOWN报价']
+
+  return (
+    <div className="px-2 py-2.5 bg-gray-50/70">
+      <div className="flex justify-between items-center mb-1 text-[11px] text-gray-500">
+        <span>
+          次周期路径 · 开盘 {open.toLocaleString()} ·
+          <span className="text-blue-600"> ■ 价格 ±bp</span> ·
+          <span className="text-red-500"> ■ DOWN 报价</span>
+          <span className="ml-2 px-1 bg-amber-50 text-amber-600 border border-amber-200 rounded"
+            title="S7 研究结论：早期窗口（t≤4 分钟）是涨态/跌态双分支最优入场区">
+            黄带 = t≤4 早期入场研究窗
+          </span>
+        </span>
+        {data.settle && (
+          <span className={won ? 'text-green-600 font-bold' : 'text-red-500 font-bold'}>
+            结算 {data.settle} · {won ? '信号赢' : '信号输'}
+          </span>
+        )}
+      </div>
+      <ResponsiveContainer width="100%" height={128}>
+        <LineChart data={pts} margin={{ top: 6, right: 44, left: 0, bottom: 0 }}>
+          <ReferenceArea x1={0} x2={240} fill="#fef3c7" fillOpacity={0.55} />
+          <ReferenceLine y={0} stroke="#9ca3af" strokeDasharray="3 3" />
+          <ReferenceLine x={x5} stroke="#a855f7" strokeDasharray="4 3"
+            label={{ value: '+5m', position: 'insideTopRight', fill: '#a855f7', fontSize: 10 }} />
+          <XAxis dataKey="off" type="number" domain={[0, 900]} ticks={xTicks} hide />
+          <YAxis domain={[-maxDev, maxDev]} width={46}
+            ticks={[-maxDev, 0, maxDev]} tickFormatter={v => `${v}bp`}
+            tick={{ fontSize: 10, fill: '#9ca3af' }} />
+          <Tooltip formatter={tipFmt} labelFormatter={o => `+${mmss(o as number)}`} />
+          <Line dataKey="dev" stroke="#2563eb" dot={false} strokeWidth={1.5} isAnimationActive={false} />
+        </LineChart>
+      </ResponsiveContainer>
+      <ResponsiveContainer width="100%" height={74}>
+        <LineChart data={pts} margin={{ top: 2, right: 44, left: 0, bottom: 0 }}>
+          <ReferenceArea x1={0} x2={240} fill="#fef3c7" fillOpacity={0.55} />
+          <ReferenceLine x={x5} stroke="#a855f7" strokeDasharray="4 3" />
+          {data.quote5m_down != null && data.quote5m_off != null && (
+            <ReferenceDot x={data.quote5m_off} y={data.quote5m_down} r={3.5} fill="#a855f7" stroke="white" />
+          )}
+          <XAxis dataKey="off" type="number" domain={[0, 900]} ticks={xTicks}
+            tickFormatter={v => `${Math.round(v / 60)}分`} tick={{ fontSize: 10, fill: '#9ca3af' }} />
+          <YAxis domain={[0, 1]} width={46} ticks={[0, 0.5, 1]}
+            tickFormatter={v => v.toFixed(1)} tick={{ fontSize: 10, fill: '#9ca3af' }} />
+          <Tooltip formatter={tipFmt} labelFormatter={o => `+${mmss(o as number)}`} />
+          <Line dataKey="down" stroke="#dc2626" dot={false} strokeWidth={1.5} isAnimationActive={false} />
+        </LineChart>
+      </ResponsiveContainer>
+      <div className="mt-1 flex flex-wrap gap-x-4 gap-y-0.5 text-[10px] text-gray-500 font-mono">
+        <span>极值 {minDev.toFixed(1)} ~ +{maxUp.toFixed(1)}bp</span>
+        <span>末点 {last.dev.toFixed(1)}bp / q(DOWN) {last.down.toFixed(3)}</span>
+        {data.quote5m_down != null && (
+          <span className="text-purple-600">+5m 确认价 q={data.quote5m_down.toFixed(3)}</span>
+        )}
+      </div>
+    </div>
   )
 }
 
