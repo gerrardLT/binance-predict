@@ -252,3 +252,69 @@ async def test_settle_pending_noise_expires() -> None:
     with patch.object(md, "async_session_factory", factory):
         await det._process_window(next_win)
     assert sig.status == "EXPIRED" and sig.win is None and sig.ev_at_entry is None
+
+
+# ============================================================
+# API 端点回归：GET /api/misalignment/signals
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_api_signals_endpoint_builds_sql_and_stats() -> None:
+    """回归：统计聚合语句必须可构建（曾因 func.case 误用致生产 500）。
+
+    直接调用端点函数：agg 语句在 db.execute 前构建，构建即验证，
+    mock 只拦截执行结果。附验 stats 四件套计算。
+    """
+    from binance_predict.db.models import MisalignmentSignal
+    import binance_predict.main as m
+
+    def _row(start: int, *, status: str, win, ev, kind) -> MisalignmentSignal:
+        return MisalignmentSignal(
+            version="x4_v1", window_start=start, window_end=start + 5 * MIN,
+            end_pct=37.0, outcome_base="UP", direction="DOWN",
+            target_window_start=start + 5 * MIN,
+            entry_down_price=0.53 if kind else None,
+            entry_up_price=None, entry_quote_ts=None, entry_quote_kind=kind,
+            settle_outcome=("DOWN" if status == "SETTLED" else None),
+            win=win, ev_at_entry=ev, status=status,
+        )
+
+    rows = [
+        _row(100 * MIN, status="SETTLED", win=True, ev=0.6, kind="real"),
+        _row(101 * MIN, status="SETTLED", win=False, ev=-1.0, kind="proxy"),
+        _row(102 * MIN, status="PENDING", win=None, ev=None, kind=None),
+    ]
+    db = MagicMock()
+    r1 = MagicMock()
+    r1.scalars.return_value.all.return_value = rows
+    r2 = MagicMock()
+    # (count, win_valid, wins, n_ev, avg_ev, n_real)：SETTLED 2 注，1 赢，实价 1
+    r2.one.return_value = (2, 2, 1, 2, -0.2, 1)
+    db.execute = AsyncMock(side_effect=[r1, r2])
+
+    out = await m.list_misalignment_signals(limit=50, db=db)
+
+    assert out["total"] == 3 and out["signals"][0]["end_pct"] == 37.0
+    assert out["stats"] == {
+        "settled": 2, "win_rate": 0.5, "avg_ev": -0.2, "real_quote_coverage": 0.5,
+    }
+
+
+@pytest.mark.asyncio
+async def test_api_signals_endpoint_empty_table() -> None:
+    """空表：sum 全 None，stats 不炸（除零/None 保护）。"""
+    import binance_predict.main as m
+
+    db = MagicMock()
+    r1 = MagicMock()
+    r1.scalars.return_value.all.return_value = []
+    r2 = MagicMock()
+    r2.one.return_value = (0, None, None, None, None, None)
+    db.execute = AsyncMock(side_effect=[r1, r2])
+
+    out = await m.list_misalignment_signals(limit=50, db=db)
+
+    assert out["signals"] == [] and out["total"] == 0
+    assert out["stats"] == {
+        "settled": 0, "win_rate": None, "avg_ev": None, "real_quote_coverage": None,
+    }

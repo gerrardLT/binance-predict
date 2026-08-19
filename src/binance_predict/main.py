@@ -1080,7 +1080,7 @@ async def list_misalignment_signals(
     db: AsyncSession = Depends(get_db),
 ):
     """X4 情绪错位影子信号列表 + 累计统计（promote 判据：WR/EV/实价覆盖率）。"""
-    from sqlalchemy import desc as sa_desc, func as sa_func, select as sa_select
+    from sqlalchemy import case as sa_case, desc as sa_desc, func as sa_func, select as sa_select
     from .db.models import MisalignmentSignal
 
     limit = max(1, min(limit, 200))
@@ -1111,14 +1111,16 @@ async def list_misalignment_signals(
     } for s in rows]
 
     # 累计统计（全量，不随 limit 截断）：promote 判据四件套
+    # 注意：case 必须从 sqlalchemy 顶层导入；func.case 是通用函数生成器，
+    # 不接受 else_，会在语句构建时抛 TypeError（曾致生产 500）
     agg = (
         sa_select(
             sa_func.count(MisalignmentSignal.id),
-            sa_func.sum(sa_func.case((MisalignmentSignal.win.isnot(None), 1), else_=0)),
-            sa_func.sum(sa_func.case((MisalignmentSignal.win.is_(True), 1), else_=0)),
-            sa_func.sum(sa_func.case((MisalignmentSignal.ev_at_entry.isnot(None), 1), else_=0)),
+            sa_func.sum(sa_case((MisalignmentSignal.win.isnot(None), 1), else_=0)),
+            sa_func.sum(sa_case((MisalignmentSignal.win.is_(True), 1), else_=0)),
+            sa_func.sum(sa_case((MisalignmentSignal.ev_at_entry.isnot(None), 1), else_=0)),
             sa_func.avg(MisalignmentSignal.ev_at_entry),
-            sa_func.sum(sa_func.case((MisalignmentSignal.entry_quote_kind == "real", 1), else_=0)),
+            sa_func.sum(sa_case((MisalignmentSignal.entry_quote_kind == "real", 1), else_=0)),
         ).where(MisalignmentSignal.status == "SETTLED")
     )
     n, n_win_valid, n_wins, n_ev, avg_ev, n_real = (
