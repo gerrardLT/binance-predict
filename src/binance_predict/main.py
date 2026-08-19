@@ -44,6 +44,7 @@ from .models.schemas import CommitDeepLearnRequest
 from .services.agent_scheduler import AgentScheduler
 from .services.data_collector import BinanceDataCollector
 from .services.fake_breakout_detector import FakeBreakoutDetector
+from .services.misalignment_detector import MisalignmentDetector
 from .services.llm_service import LLMService
 from .services.pattern_reevaluator import pattern_reevaluator
 from .services.prediction_trading import BinancePredictionTrader
@@ -110,6 +111,9 @@ _predict_triggered_for_window: bool = False
 
 # 假突破检测器全局实例（lifespan 中初始化；秒级检测日线阻力破位，暂不下注）
 fake_breakout_detector: FakeBreakoutDetector | None = None
+
+# X4 情绪错位影子检测器全局实例（M4 影子并行：收阳&end≤40→次窗DOWN，只记录不下注）
+misalignment_detector: MisalignmentDetector | None = None
 
 # 场景研究调度器全局实例（M2：LLM 研究员触发与编排，lifespan 中初始化）
 research_scheduler: "ResearchScheduler | None" = None
@@ -884,6 +888,14 @@ async def lifespan(app: FastAPI):
         await fake_breakout_detector.start()
         logger.info("场景检测器已启动（S1多头耗尽/S2空头耗尽/S4动量衰竭，真 OOS 修正版，信号模式不下注）")
 
+    # X4 情绪错位影子信号（M4）：收阳&end≤40→押次窗DOWN，只记录不下注，
+    # 次窗归档后回读真实报价与结算，攒 2~3 周定案经济账后人工 promote
+    global misalignment_detector
+    if settings.misalignment_enabled:
+        misalignment_detector = MisalignmentDetector()
+        await misalignment_detector.start()
+        logger.info("X4 影子检测器已启动（错位假设工厂产物，回测 63.5%/EV+0.254，影子模式不下注）")
+
     # 场景研究（M2）：LLM 研究员定期/累积/异常触发评估，假设只落库不生效
     # （M3 裁决 + 人工 promote 后才以 SHADOW 影子身份参与判定）
     global research_scheduler
@@ -912,6 +924,9 @@ async def lifespan(app: FastAPI):
     # 停止假突破检测器
     if fake_breakout_detector is not None:
         await fake_breakout_detector.stop()
+    # 停止 X4 影子检测器
+    if misalignment_detector is not None:
+        await misalignment_detector.stop()
     # 停止 AgentScheduler（优雅关闭，等待当前阶段执行完毕）
     if agent_scheduler is not None:
         await agent_scheduler.stop()
@@ -1057,6 +1072,68 @@ async def list_fake_breakout_signals(
             "created_at": s.created_at.isoformat() if s.created_at else None,
         })
     return {"signals": signals, "total": len(signals)}
+
+
+@app.get("/api/misalignment/signals")
+async def list_misalignment_signals(
+    limit: int = 50,
+    db: AsyncSession = Depends(get_db),
+):
+    """X4 情绪错位影子信号列表 + 累计统计（promote 判据：WR/EV/实价覆盖率）。"""
+    from sqlalchemy import desc as sa_desc, func as sa_func, select as sa_select
+    from .db.models import MisalignmentSignal
+
+    limit = max(1, min(limit, 200))
+    stmt = (
+        sa_select(MisalignmentSignal)
+        .order_by(sa_desc(MisalignmentSignal.window_start))
+        .limit(limit)
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+    signals = [{
+        "id": s.id,
+        "version": s.version,
+        "window_start": s.window_start,
+        "window_end": s.window_end,
+        "end_pct": s.end_pct,
+        "outcome_base": s.outcome_base,
+        "direction": s.direction,
+        "target_window_start": s.target_window_start,
+        "entry_down_price": s.entry_down_price,
+        "entry_up_price": s.entry_up_price,
+        "entry_quote_ts": s.entry_quote_ts,
+        "entry_quote_kind": s.entry_quote_kind,
+        "settle_outcome": s.settle_outcome,
+        "win": s.win,
+        "ev_at_entry": s.ev_at_entry,
+        "status": s.status,
+        "created_at": s.created_at.isoformat() if s.created_at else None,
+    } for s in rows]
+
+    # 累计统计（全量，不随 limit 截断）：promote 判据四件套
+    agg = (
+        sa_select(
+            sa_func.count(MisalignmentSignal.id),
+            sa_func.sum(sa_func.case((MisalignmentSignal.win.isnot(None), 1), else_=0)),
+            sa_func.sum(sa_func.case((MisalignmentSignal.win.is_(True), 1), else_=0)),
+            sa_func.sum(sa_func.case((MisalignmentSignal.ev_at_entry.isnot(None), 1), else_=0)),
+            sa_func.avg(MisalignmentSignal.ev_at_entry),
+            sa_func.sum(sa_func.case((MisalignmentSignal.entry_quote_kind == "real", 1), else_=0)),
+        ).where(MisalignmentSignal.status == "SETTLED")
+    )
+    n, n_win_valid, n_wins, n_ev, avg_ev, n_real = (
+        await db.execute(agg)
+    ).one()
+    n_ev = int(n_ev or 0)
+    stats = {
+        "settled": int(n or 0),
+        "win_rate": (float(n_wins) / float(n_win_valid)) if n_win_valid else None,
+        "avg_ev": float(avg_ev) if n_ev else None,
+        "real_quote_coverage": (n_real / n_ev) if n_ev else None,
+    }
+    detector_status = misalignment_detector.status() if misalignment_detector else None
+    return {"signals": signals, "total": len(signals), "stats": stats,
+            "detector": detector_status}
 
 
 @app.get("/api/scene/versions")

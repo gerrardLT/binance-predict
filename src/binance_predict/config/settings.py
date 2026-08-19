@@ -294,6 +294,10 @@ class Settings(BaseSettings):
     # 信号邮件推送开关（复用 agent_alert_* SMTP 配置）
     fake_breakout_email_enabled: bool = True
 
+    # --- X4 情绪错位影子信号（M4 影子并行，2026-08-19）---
+    # 影子模式：只记录不下注不发邮件；次窗归档后回读真实报价与结算定案经济账
+    misalignment_enabled: bool = True
+
     # --- 场景研究（LLM 研究员，M2 2026-08-16）---
     # 总开关：False 时不启动研究调度循环
     scene_research_enabled: bool = True

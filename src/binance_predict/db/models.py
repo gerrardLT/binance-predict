@@ -763,6 +763,78 @@ class FakeBreakoutSignal(Base):
     )
 
 
+class MisalignmentSignal(Base):
+    """
+    情绪错位影子信号（X4）：本窗收阳但 15m 市场收尾情绪 ≤40 → 押次窗 DOWN。
+
+    来源：错位假设工厂（local_misalignment_scan.py 58 条假设）唯一全闸门存活信号——
+    IS 65.6%/OOS 57.8%/合并 63.5%，EV+0.254 CI(0.038,0.493)（瑕疵：实价覆盖 19%）。
+    本表为 M4 影子并行：只记录不下注，次窗归档后回读真实报价与结算方向，
+    攒 2~3 周真实数据定案经济账，人工 promote 后才可上线交易。
+    判定/结算/报价口径与回测逐字段对齐（DECISION_T=150s，费 2%+溢 0.01）。
+    """
+    __tablename__ = "misalignment_signals"
+    __table_args__ = (
+        UniqueConstraint("version", "window_start", name="uq_mis_version_window"),
+        Index("ix_mis_status", "status"),
+        Index("ix_mis_target_window", "target_window_start"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    version: Mapped[str] = mapped_column(
+        String(40), nullable=False, default="x4_v1", server_default="x4_v1",
+        comment="信号口径版本：x4_v1 = 收阳 & end≤40 → 次窗 DOWN（端点口径）",
+    )
+    window_start: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, comment="触发窗（5m 情绪窗）start_time（ms）"
+    )
+    window_end: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, comment="触发窗 end_time（ms）= 信号判定时刻"
+    )
+    end_pct: Mapped[float] = mapped_column(
+        Float, nullable=False, comment="触发窗末 UP% 采样值（curve_up_pct 排序后末点）"
+    )
+    outcome_base: Mapped[str] = mapped_column(
+        String(10), nullable=False, comment="触发窗结算方向（X4 定义恒为 UP，审计冗余）"
+    )
+    direction: Mapped[str] = mapped_column(
+        String(4), nullable=False, default="DOWN", server_default="DOWN",
+        comment="押注方向（X4 定义恒为 DOWN）",
+    )
+    target_window_start: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, comment="目标窗（次 5m 窗）start_time（ms）= window_end"
+    )
+    # 入场报价（次窗 +150s 决策点，回读次窗归档曲线；影子模式不真实下单）
+    entry_down_price: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="次窗 150s 决策点 DOWN token 真实价（curve_down_price ≤150s 末点）"
+    )
+    entry_up_price: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="同时刻 UP token 价（对称快照，定价对照用）"
+    )
+    entry_quote_ts: Mapped[BigInteger | None] = mapped_column(
+        BigInteger, nullable=True, comment="入场报价采样点时刻（ms，距决策点最近且 ≤150s）"
+    )
+    entry_quote_kind: Mapped[str | None] = mapped_column(
+        String(8), nullable=True, comment="报价来源：real（token 价）/ proxy（chance/100）/ NULL（缺失）"
+    )
+    settle_outcome: Mapped[str | None] = mapped_column(
+        String(10), nullable=True, comment="次窗结算方向 UP | DOWN（NOISE 无法判向）"
+    )
+    win: Mapped[bool | None] = mapped_column(
+        Boolean, nullable=True, comment="押 DOWN 命中 = 次窗 DOWN；NOISE/缺结算为 NULL"
+    )
+    ev_at_entry: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="单注 EV：赢 0.98/(entry+0.01)−1 / 输 −1（entry 截断 [0.01,0.99]）；无报价 NULL"
+    )
+    status: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="PENDING", server_default="PENDING",
+        comment="PENDING（等次窗归档）| SETTLED（已结算）| EXPIRED（次窗缺数据/超时未结算）",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 # ============================================================
 # 模式回测快照表（每个模式每次回测的完整记录，支撑无限进化与前后对比）
 # ============================================================
