@@ -142,13 +142,13 @@ def _make_detector(monkeypatch, dup_first=None) -> tuple[QuoteEdgeDetector, _Fak
 
 @pytest.mark.asyncio
 async def test_process_window_momentum_hit(monkeypatch) -> None:
-    """A 格命中：t=120s q=0.71，窗口收 DOWN → SETTLED win=True。"""
+    """A 格命中：t=100s q=0.71（[90,120) 内），窗口收 DOWN → SETTLED win=True。"""
     d, session = _make_detector(monkeypatch)
     w = SentimentWindow(
         start_time=1_000_000_000, end_time=1_000_300_000,
         actual_return=-0.001, outcome="DOWN",
         curve_down_price=[{"t": 1_000_030_000, "v": 0.30},
-                          {"t": 1_000_120_000, "v": 0.71},
+                          {"t": 1_000_100_000, "v": 0.71},
                           {"t": 1_000_150_000, "v": 0.80}],
         curve_up_price=[{"t": 1_000_100_000, "v": 0.32},
                         {"t": 1_000_125_000, "v": 0.28}],
@@ -161,7 +161,7 @@ async def test_process_window_momentum_hit(monkeypatch) -> None:
     assert sig.target_window_start == 1_000_000_000  # 本窗即目标窗
     assert sig.end_pct == 0.71                        # 语义扩展：触发时刻报价
     assert sig.entry_down_price == 0.71
-    assert sig.entry_quote_ts == 1_000_120_000
+    assert sig.entry_quote_ts == 1_000_100_000
     assert sig.entry_quote_kind == "real"
     assert sig.entry_up_price == 0.32                 # ≤触发点的 UP 对照价
     assert sig.settle_outcome == "DOWN"
@@ -173,12 +173,12 @@ async def test_process_window_momentum_hit(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_process_window_contra_both_rules_one_window(monkeypatch) -> None:
-    """同窗双命中：B 格（t=50s q=0.20）+ A 格（t=120s q=0.70），各落一条。"""
+    """同窗双命中：B 格（t=50s q=0.20）+ A 格（t=100s q=0.70），各落一条。"""
     d, session = _make_detector(monkeypatch)
     w = SentimentWindow(
         start_time=0, end_time=300_000, actual_return=0.001, outcome="UP",
         curve_down_price=[{"t": 50_000, "v": 0.20},
-                          {"t": 120_000, "v": 0.70}],
+                          {"t": 100_000, "v": 0.70}],
     )
     await d._process_window(w)
     versions = sorted(s.version for s in session.added)
@@ -194,7 +194,7 @@ async def test_process_window_dup_skipped(monkeypatch) -> None:
     d, session = _make_detector(monkeypatch, dup_first=123)
     w = SentimentWindow(
         start_time=0, end_time=300_000, actual_return=-0.001, outcome="DOWN",
-        curve_down_price=[{"t": 120_000, "v": 0.71}],
+        curve_down_price=[{"t": 100_000, "v": 0.71}],
     )
     await d._process_window(w)
     assert session.added == []
@@ -207,7 +207,7 @@ async def test_process_window_noise_no_signal(monkeypatch) -> None:
     d, session = _make_detector(monkeypatch)
     w = SentimentWindow(
         start_time=0, end_time=300_000, actual_return=0.0, outcome="NOISE",
-        curve_down_price=[{"t": 120_000, "v": 0.71}],
+        curve_down_price=[{"t": 100_000, "v": 0.71}],
     )
     await d._process_window(w)
     assert session.added == []
@@ -219,7 +219,7 @@ async def test_process_window_no_hit_no_signal(monkeypatch) -> None:
     d, session = _make_detector(monkeypatch)
     w = SentimentWindow(
         start_time=0, end_time=300_000, actual_return=-0.001, outcome="DOWN",
-        curve_down_price=[{"t": 120_000, "v": 0.50}],
+        curve_down_price=[{"t": 100_000, "v": 0.50}],
     )
     await d._process_window(w)
     assert session.added == []

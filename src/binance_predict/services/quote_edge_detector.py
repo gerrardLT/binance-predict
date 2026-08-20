@@ -3,9 +3,10 @@
 信号定义（与 scripts/local_quote_bin_winrate.py + local_edge_cell_constraints.py
 回测口径逐字段对齐，规则冻结勿动）：
     quote_momentum_v1（A 格顺势）：
-        5m 窗内 t∈[90,210)s，DOWN token 报价首次进入 [0.69, 0.75) → 押 DOWN。
-        回测：胜率 79.9%（Holdout 79%），EV +0.097，日频 13.5；
+        5m 窗内 t∈[90,120)s，DOWN token 报价首次进入 [0.69, 0.75) → 押 DOWN。
+        回测：胜率 79.9%（Holdout 79%），EV +0.097，日频 13.5（均为 t∈[90,120) 口径）；
         约束来源：0.55-0.75 黄金区 + 唯一 OOS 存活约束 qdepth≥19（q≥0.69）。
+        注：曾误写 [90,210)，致事件量 2.7 倍、胜率/EV 虚高（CodeReview High#1），已收敛。
     quote_contrarian_v1（B 格逆势）：
         5m 窗内 t∈[45,60)s，DOWN token 报价首次进入 [0.15, 0.25) → 押 DOWN。
         回测：胜率 24.0%，EV +0.155，日频 13.7；
@@ -43,7 +44,9 @@ logger = logging.getLogger(__name__)
 # ---- 冻结口径（回测同源，勿动）----
 # rule -> (t_lo_s, t_hi_s, q_lo, q_hi)
 QUOTE_EDGE_RULES: dict[str, tuple[float, float, float, float]] = {
-    "quote_momentum_v1": (90.0, 210.0, 0.69, 0.75),
+    # t∈[90,120)：与回测脚本 Cell A 同口径（用户圈定），79.9%/EV+0.097 即该窗；
+    # 曾误写 [90,210) 导致口径漂移（CodeReview High#1），已收敛回 120。
+    "quote_momentum_v1": (90.0, 120.0, 0.69, 0.75),
     "quote_contrarian_v1": (45.0, 60.0, 0.15, 0.25),
 }
 FEE_RET = 0.98            # EV = 赢 0.98/q−1 / 输 −1（费 2%，无溢价，回测口径）
@@ -189,49 +192,56 @@ class QuoteEdgeDetector:
         if outcome is None:
             return  # NOISE/缺结算：胜负不可判，不产生信号
 
+        # per-rule 独立 commit（CodeReview Low#4）：单规则落表失败不回滚、
+        # 不影响另一规则；trigger_count 仅在 commit 成功后自增。
         async with async_session_factory() as session:
             for version, (t_lo, t_hi, q_lo, q_hi) in QUOTE_EDGE_RULES.items():
-                hit = _find_first_hit(w.curve_down_price, start_ms, t_lo, t_hi, q_lo, q_hi)
-                if hit is None:
-                    continue
-                price, quote_ts = hit
-                dup = await session.execute(
-                    sa_select(MisalignmentSignal.id).where(
-                        MisalignmentSignal.version == version,
-                        MisalignmentSignal.window_start == start_ms,
+                try:
+                    hit = _find_first_hit(w.curve_down_price, start_ms, t_lo, t_hi, q_lo, q_hi)
+                    if hit is None:
+                        continue
+                    price, quote_ts = hit
+                    dup = await session.execute(
+                        sa_select(MisalignmentSignal.id).where(
+                            MisalignmentSignal.version == version,
+                            MisalignmentSignal.window_start == start_ms,
+                        )
                     )
-                )
-                if dup.first() is not None:
-                    continue
-                win = outcome == "DOWN"
-                session.add(MisalignmentSignal(
-                    version=version,
-                    window_start=start_ms,
-                    window_end=end_ms,
-                    end_pct=price,               # 语义扩展：触发时刻 DOWN 报价
-                    outcome_base=outcome,          # 触发窗结算方向（审计冗余）
-                    direction="DOWN",
-                    target_window_start=start_ms,  # 本窗即目标窗
-                    entry_down_price=price,
-                    entry_up_price=_up_price_at_or_before(w.curve_up_price, quote_ts),
-                    entry_quote_ts=quote_ts,
-                    entry_quote_kind="real",
-                    settle_outcome=outcome,
-                    win=win,
-                    ev_at_entry=_ev_at_entry(win, price),
-                    status="SETTLED",
-                ))
-                self._trigger_count += 1
-                logger.info(
-                    "报价 edge 影子触发+结算 | {} | 窗口 {} | t=+{:.0f}s q={:.3f}"
-                    " → {} | win={} ev={:+.3f}",
-                    version,
-                    datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)
-                    .strftime("%m-%d %H:%M"),
-                    (quote_ts - start_ms) / 1000.0, price, outcome, win,
-                    _ev_at_entry(win, price),
-                )
-            await session.commit()
+                    if dup.first() is not None:
+                        continue
+                    win = outcome == "DOWN"
+                    session.add(MisalignmentSignal(
+                        version=version,
+                        window_start=start_ms,
+                        window_end=end_ms,
+                        end_pct=price,               # 语义扩展：触发时刻 DOWN 报价
+                        outcome_base=outcome,          # 触发窗结算方向（审计冗余）
+                        direction="DOWN",
+                        target_window_start=start_ms,  # 本窗即目标窗
+                        entry_down_price=price,
+                        entry_up_price=_up_price_at_or_before(w.curve_up_price, quote_ts),
+                        entry_quote_ts=quote_ts,
+                        entry_quote_kind="real",
+                        settle_outcome=outcome,
+                        win=win,
+                        ev_at_entry=_ev_at_entry(win, price),
+                        status="SETTLED",
+                    ))
+                    await session.commit()
+                    self._trigger_count += 1
+                    logger.info(
+                        "报价 edge 影子触发+结算 | {} | 窗口 {} | t=+{:.0f}s q={:.3f}"
+                        " → {} | win={} ev={:+.3f}",
+                        version,
+                        datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)
+                        .strftime("%m-%d %H:%M"),
+                        (quote_ts - start_ms) / 1000.0, price, outcome, win,
+                        _ev_at_entry(win, price),
+                    )
+                except Exception as exc:
+                    await session.rollback()
+                    logger.warning("报价 edge 影子：rule {} 落表失败 | window {} | {}",
+                                   version, start_ms, exc)
 
     # ------------------------------------------------------------------
     # 冷启动回补
@@ -245,8 +255,14 @@ class QuoteEdgeDetector:
         )
         async with async_session_factory() as session:
             wins = list(reversed((await session.execute(stmt)).scalars().all()))
+        # 单窗失败不中断整体；无论成败都推进水位——宁可跳过回补，
+        # 绝不让水位停在 None 触发后续从最老窗口全量回灌历史（CodeReview Medium#2）。
         for w in wins:
-            await self._process_window(w)
+            try:
+                await self._process_window(w)
+            except Exception as exc:
+                logger.warning("报价 edge 影子：回补单窗失败（跳过） | window {} | {}",
+                               getattr(w, "start_time", None), exc)
         self._last_window_end = max((int(w.end_time) for w in wins), default=None)
         if wins:
             logger.info(

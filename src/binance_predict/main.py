@@ -1097,9 +1097,10 @@ async def list_misalignment_signals(
 ):
     """影子信号列表 + 累计统计（promote 判据：WR/EV/实价覆盖率）。
 
-    version 过滤：x4_v1 / quote_momentum_v1 / quote_contrarian_v1；
-    缺省全部（历史兼容）。end_pct 字段：x4_v1 = 触发窗末 UP%，
-    quote_* = 触发时刻 DOWN 报价。
+    version 过滤：x4_v1 / quote_momentum_v1 / quote_contrarian_v1。
+    列表缺省全部（向后兼容）；但累计统计缺省限定 x4_v1，保持 X4 promote
+    判据语义——避免 quote_* 高频样本稀释 X4 的 WR/EV 数字（CodeReview Medium#3）。
+    end_pct 字段：x4_v1 = 触发窗末 UP%，quote_* = 触发时刻 DOWN 报价。
     """
     from sqlalchemy import case as sa_case, desc as sa_desc, func as sa_func, select as sa_select
     from .db.models import MisalignmentSignal
@@ -1114,9 +1115,11 @@ async def list_misalignment_signals(
         sa_func.avg(MisalignmentSignal.ev_at_entry),
         sa_func.sum(sa_case((MisalignmentSignal.entry_quote_kind == "real", 1), else_=0)),
     ).where(MisalignmentSignal.status == "SETTLED")
+    # 列表缺省全部；stats 缺省限定 x4_v1（保持 X4 promote 判据语义）。
+    stats_version = version or "x4_v1"
     if version:
         stmt = stmt.where(MisalignmentSignal.version == version)
-        agg_stmt = agg_stmt.where(MisalignmentSignal.version == version)
+    agg_stmt = agg_stmt.where(MisalignmentSignal.version == stats_version)
     stmt = stmt.order_by(sa_desc(MisalignmentSignal.window_start)).limit(limit)
     rows = (await db.execute(stmt)).scalars().all()
     signals = [{
