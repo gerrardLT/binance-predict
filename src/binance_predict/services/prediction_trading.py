@@ -446,6 +446,9 @@ class BinancePredictionTrader:
         confidence: float,
         prediction_id: int | None = None,
         agent_prediction_id: int | None = None,
+        amount_usdt: float | None = None,
+        signal_version: str | None = None,
+        window_start: int | None = None,
     ) -> TradeOrderModel | None:
         """
         执行完整的交易流程
@@ -459,6 +462,9 @@ class BinancePredictionTrader:
             agent_prediction_id: 关联的 Agent 预测记录 ID（新增，与 prediction_id 并存、
                 互不干扰）；由 SentimentAgent.predict 传入，用于写入
                 trade_orders.agent_prediction_id 并回填 AgentPrediction.trade_order_id
+            amount_usdt: 自定义单笔金额（None 用配置值）；报价 edge 实盘灰度用
+            signal_version: 触发信号版本（quote_momentum_v1 等），写入订单供实盘对账
+            window_start: 目标 5m 窗口起始 ms（与 signal_version 联合唯一防重复开火）
 
         Returns:
             TradeOrderModel 记录；NO_TRADE 或失败时返回 None
@@ -508,7 +514,7 @@ class BinancePredictionTrader:
                 )
 
             # 1. 获取报价
-            quote = await self.get_quote(token_id, "BUY")
+            quote = await self.get_quote(token_id, "BUY", amount_usdt=amount_usdt)
             if not quote:
                 return await self._save_failed_order(
                     prediction_id, "获取报价失败",
@@ -534,6 +540,98 @@ class BinancePredictionTrader:
                 order_id=order_result.get("orderId"),
                 status="FILLED",
                 quote_json=quote,
+                signal_version=signal_version,
+                window_start=window_start,
+            )
+
+    async def execute_signal_trade(
+        self,
+        prediction: str,
+        amount_usdt: float,
+        signal_version: str,
+        window_start: int,
+        max_exec_price: float | None = None,
+    ) -> TradeOrderModel | None:
+        """
+        信号驱动实盘专用通道（报价 edge LIVE）：报价 → 执行价护栏 → 下单 → 落表。
+
+        与 execute_trade 的差异：
+        1. 金额/信号版本/窗口由调用方显式传入（非配置默认）；
+        2. 报价后、下单前检查 averagePrice ≤ max_exec_price，超限弃单落 FAILED
+           （回测 EV 对入场溢价敏感，不追贵）；
+        3. signal_version+window_start 写入订单，DB 联合唯一约束保证每窗至多一单。
+        失败（含护栏弃单）均落 FAILED 行，可追溯、不静默降级。
+        """
+        if not self._api_key or not self._api_secret:
+            return await self._save_failed_order(
+                None, "API Key/Secret 未配置",
+                signal_version=signal_version, window_start=window_start,
+            )
+
+        if not self._wallet_address or not self._wallet_id:
+            wallet = await self.fetch_wallet_info()
+            if not wallet:
+                return await self._save_failed_order(
+                    None, "钱包信息获取失败，请先在 Binance App 开通预测市场",
+                    signal_version=signal_version, window_start=window_start,
+                )
+
+        async with self._trade_lock:
+            await self.list_markets()
+
+            if prediction == "UP":
+                token_id = self._up_token_id
+            elif prediction == "DOWN":
+                token_id = self._down_token_id
+            else:
+                logger.warning("未知预测方向: {}", prediction)
+                return None
+
+            if not token_id:
+                return await self._save_failed_order(
+                    None, f"未找到 {prediction} 方向的 token",
+                    signal_version=signal_version, window_start=window_start,
+                )
+
+            quote = await self.get_quote(token_id, "BUY", amount_usdt=amount_usdt)
+            if not quote:
+                return await self._save_failed_order(
+                    None, "获取报价失败",
+                    signal_version=signal_version, window_start=window_start,
+                )
+
+            # 执行价护栏：报价均价超阈弃单（不追贵，保护回测 EV 口径）
+            if max_exec_price is not None:
+                try:
+                    avg_price = float(quote.get("averagePrice") or 0.0)
+                except (TypeError, ValueError):
+                    avg_price = 0.0
+                if avg_price <= 0 or avg_price > max_exec_price:
+                    return await self._save_failed_order(
+                        None,
+                        f"执行价护栏弃单 | averagePrice={avg_price} > {max_exec_price}",
+                        quote=quote,
+                        signal_version=signal_version, window_start=window_start,
+                    )
+
+            order_result = await self.place_order(quote)
+            if not order_result:
+                return await self._save_failed_order(
+                    None, "下单失败", quote=quote,
+                    signal_version=signal_version, window_start=window_start,
+                )
+
+            return await self._save_order(
+                prediction_id=None,
+                token_id=token_id,
+                side="BUY",
+                amount_in=str(quote.get("amountIn", "")),
+                amount_out=str(quote.get("amountOut", "")),
+                order_id=order_result.get("orderId"),
+                status="FILLED",
+                quote_json=quote,
+                signal_version=signal_version,
+                window_start=window_start,
             )
 
     async def _save_order(
@@ -548,6 +646,8 @@ class BinancePredictionTrader:
         quote_json: dict | None = None,
         agent_prediction_id: int | None = None,
         error_message: str | None = None,
+        signal_version: str | None = None,
+        window_start: int | None = None,
     ) -> TradeOrderModel | None:
         """
         保存订单到数据库
@@ -555,6 +655,7 @@ class BinancePredictionTrader:
         agent_prediction_id 写入 trade_orders.agent_prediction_id，用于与 Agent 预测
         双向关联（旧 prediction_id 路径不传该值，行为保持不变）；
         error_message 仅在失败落库（status=FAILED）时写入，保证失败可追溯（规则 3，无静默降级）。
+        signal_version/window_start 为报价 edge 实盘关联字段，旧路径不传保持 NULL。
         """
         try:
             async with async_session_factory() as db:
@@ -570,6 +671,8 @@ class BinancePredictionTrader:
                     status=status,
                     quote_json=quote_json,
                     error_message=error_message,
+                    signal_version=signal_version,
+                    window_start=window_start,
                 )
                 db.add(order)
                 await db.commit()
@@ -588,16 +691,19 @@ class BinancePredictionTrader:
         error_msg: str,
         quote: dict | None = None,
         agent_prediction_id: int | None = None,
+        signal_version: str | None = None,
+        window_start: int | None = None,
     ) -> TradeOrderModel | None:
         """
         保存失败订单到数据库
 
         落库 status=FAILED + error_message，不伪造成交（规则 3，无静默降级）；
         同样透传 agent_prediction_id，使失败订单亦可与 Agent 预测双向关联。
+        signal_version/window_start 供报价 edge 实盘失败（含护栏弃单）追溯。
         """
         logger.warning(
-            "交易失败 | prediction_id={} | agent_prediction_id={} | error={}",
-            prediction_id, agent_prediction_id, error_msg,
+            "交易失败 | prediction_id={} | agent_prediction_id={} | signal={} | error={}",
+            prediction_id, agent_prediction_id, signal_version, error_msg,
         )
         return await self._save_order(
             prediction_id=prediction_id,
@@ -610,4 +716,6 @@ class BinancePredictionTrader:
             status="FAILED",
             quote_json=quote,
             error_message=error_msg,
+            signal_version=signal_version,
+            window_start=window_start,
         )

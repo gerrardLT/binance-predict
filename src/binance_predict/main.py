@@ -46,6 +46,7 @@ from .services.data_collector import BinanceDataCollector
 from .services.fake_breakout_detector import FakeBreakoutDetector
 from .services.misalignment_detector import MisalignmentDetector
 from .services.quote_edge_detector import QuoteEdgeDetector
+from .services.quote_edge_live_trader import QuoteEdgeLiveTrader
 from .services.llm_service import LLMService
 from .services.pattern_reevaluator import pattern_reevaluator
 from .services.prediction_trading import BinancePredictionTrader
@@ -118,6 +119,9 @@ misalignment_detector: MisalignmentDetector | None = None
 
 # 报价 edge 影子检测器全局实例（A 顺势 q∈[0.69,0.75) / B 逆势 q∈[0.15,0.25)，只记录不下注）
 quote_edge_detector: QuoteEdgeDetector | None = None
+
+# 报价 edge 实盘执行器全局实例（quote_momentum_v1 LIVE，仅开关开启时装配，默认 None）
+quote_edge_live_trader: QuoteEdgeLiveTrader | None = None
 
 # 场景研究调度器全局实例（M2：LLM 研究员触发与编排，lifespan 中初始化）
 research_scheduler: "ResearchScheduler | None" = None
@@ -431,6 +435,16 @@ async def _prediction_market_tracker() -> None:
                         _current_window_end,
                         len(_pm_history),
                         settings.agent_predict_trigger_samples,
+                    )
+
+                # 报价 edge 实盘（quote_momentum_v1 LIVE）：DOWN 报价首次进规则区间 → 真单。
+                # None 守卫：开关关闭时不装配；check 内纯内存比较，不阻塞采样循环。
+                if quote_edge_live_trader is not None and _current_window_end is not None:
+                    quote_edge_live_trader.check(
+                        int(_current_window_end) - 300_000,
+                        int(_current_window_end),
+                        aligned_ts,
+                        down_price,
                     )
 
         except asyncio.CancelledError:
@@ -908,6 +922,21 @@ async def lifespan(app: FastAPI):
         await quote_edge_detector.start()
         logger.info("报价 edge 影子检测器已启动（A 79.9%/EV+0.097，B 24%/EV+0.155，影子模式不下注）")
 
+    # 报价 edge 实盘（quote_momentum_v1 LIVE）：真单通道，默认 OFF；
+    # 开启前提：钱包配置就绪 + 用户人工设 quote_momentum_live_enabled=True。
+    global quote_edge_live_trader
+    if settings.quote_momentum_live_enabled:
+        quote_edge_live_trader = QuoteEdgeLiveTrader(prediction_trader)
+        logger.info(
+            "报价 edge 实盘执行器已启动（真单！）| {} | {} USDT/单 | 执行价上限 {} | 日上限 {} 单",
+            quote_edge_live_trader.status()["version"],
+            settings.quote_momentum_live_amount_usdt,
+            settings.quote_momentum_live_max_exec_price,
+            settings.quote_momentum_live_max_daily_orders,
+        )
+    else:
+        logger.info("报价 edge 实盘未开启（quote_momentum_live_enabled=False），维持影子记录")
+
     # 场景研究（M2）：LLM 研究员定期/累积/异常触发评估，假设只落库不生效
     # （M3 裁决 + 人工 promote 后才以 SHADOW 影子身份参与判定）
     global research_scheduler
@@ -942,6 +971,9 @@ async def lifespan(app: FastAPI):
     # 停止报价 edge 影子检测器
     if quote_edge_detector is not None:
         await quote_edge_detector.stop()
+    # 停止报价 edge 实盘执行器（取消在途下单/回填任务）
+    if quote_edge_live_trader is not None:
+        await quote_edge_live_trader.stop()
     # 停止 AgentScheduler（优雅关闭，等待当前阶段执行完毕）
     if agent_scheduler is not None:
         await agent_scheduler.stop()
@@ -1157,8 +1189,10 @@ async def list_misalignment_signals(
     }
     detector_status = misalignment_detector.status() if misalignment_detector else None
     quote_edge_status = quote_edge_detector.status() if quote_edge_detector else None
+    live_status = quote_edge_live_trader.status() if quote_edge_live_trader else None
     return {"signals": signals, "total": len(signals), "stats": stats,
-            "detector": detector_status, "quote_edge_detector": quote_edge_status}
+            "detector": detector_status, "quote_edge_detector": quote_edge_status,
+            "quote_edge_live": live_status}
 
 
 @app.get("/api/scene/versions")

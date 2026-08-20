@@ -46,6 +46,12 @@ class TradeOrderModel(Base):
     __tablename__ = "trade_orders"
     __table_args__ = (
         Index("ix_trade_orders_prediction_id", "prediction_id"),
+        # 报价 edge 实盘：每窗每版本唯一，防重启/并发重复开火（DB 层兜底）
+        UniqueConstraint(
+            "signal_version", "window_start",
+            name="uq_trade_orders_version_window",
+        ),
+        Index("ix_trade_orders_signal_version", "signal_version"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -92,6 +98,17 @@ class TradeOrderModel(Base):
     )
     error_message: Mapped[str | None] = mapped_column(
         Text, nullable=True, comment="错误信息（仅 FAILED 时）"
+    )
+    # --- 报价 edge 实盘关联（quote_momentum_v1 LIVE，2026-08-20）---
+    signal_version: Mapped[str | None] = mapped_column(
+        String(40), nullable=True,
+        comment="触发信号版本（quote_momentum_v1 等）；NULL=非信号驱动订单（旧路径）",
+    )
+    window_start: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, comment="目标 5m 窗口起始 ms（与 signal_version 联合唯一）"
+    )
+    signal_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment="窗口结算后回填的 misalignment_signals.id（实盘对账影子）"
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

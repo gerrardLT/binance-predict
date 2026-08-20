@@ -300,8 +300,20 @@ class Settings(BaseSettings):
 
     # --- 报价 edge 影子信号（A 顺势 / B 逆势，2026-08-20）---
     # 影子模式：只记录不下注；归档后处理首个命中报价，落表即结算
-    # 规则冻结：A t∈[90,210)s×q∈[0.69,0.75) / B t∈[45,60)s×q∈[0.15,0.25)
+    # 规则冻结：A t∈[90,120)s×q∈[0.69,0.75) / B t∈[45,60)s×q∈[0.15,0.25)
     quote_edge_enabled: bool = True
+
+    # --- 报价 edge 实盘下单（quote_momentum_v1 LIVE，2026-08-20）---
+    # 实时触发：窗口内 DOWN 报价首次进 [0.69,0.75) 且 t∈[90,120)s → 真单押 DOWN。
+    # 每窗至多一单（内存 + DB 唯一约束双保险）；默认 OFF，配置就绪后人工开启。
+    quote_momentum_live_enabled: bool = False
+    # 实盘单笔金额（USDT，灰度 5）
+    quote_momentum_live_amount_usdt: float = 5.0
+    # 执行价护栏：成交价超过此值弃单（影子回测 EV+0.097 对溢价敏感，
+    # 0.70 附近入场 EV≈0.40，0.75 处 EV≈0.307，0.78 起空间明显变薄）
+    quote_momentum_live_max_exec_price: float = 0.78
+    # 日单量护栏：当日 FILLED 达上限后停火（防行情极端密度暴涨散口）
+    quote_momentum_live_max_daily_orders: int = 30
 
     # --- 场景研究（LLM 研究员，M2 2026-08-16）---
     # 总开关：False 时不启动研究调度循环

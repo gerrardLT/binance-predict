@@ -13,7 +13,8 @@ from binance_predict.db.models import MisalignmentSignal, SentimentWindow
 from binance_predict.services import quote_edge_detector as qed
 from binance_predict.services.quote_edge_detector import QuoteEdgeDetector
 
-A_RULE = (90.0, 210.0, 0.69, 0.75)   # quote_momentum_v1
+# 纯函数测试专用传参（非生产口径；生产表为 QUOTE_EDGE_RULES，A 格 t∈[90,120)）
+A_RULE = (90.0, 210.0, 0.69, 0.75)
 B_RULE = (45.0, 60.0, 0.15, 0.25)    # quote_contrarian_v1
 
 
