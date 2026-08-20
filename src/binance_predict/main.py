@@ -47,6 +47,7 @@ from .services.fake_breakout_detector import FakeBreakoutDetector
 from .services.misalignment_detector import MisalignmentDetector
 from .services.quote_edge_detector import QuoteEdgeDetector
 from .services.quote_edge_live_trader import QuoteEdgeLiveTrader
+from .services import quote_edge_live_trader as qelt_module
 from .services.llm_service import LLMService
 from .services.pattern_reevaluator import pattern_reevaluator
 from .services.prediction_trading import BinancePredictionTrader
@@ -926,14 +927,23 @@ async def lifespan(app: FastAPI):
     # 开启前提：钱包配置就绪 + 用户人工设 quote_momentum_live_enabled=True。
     global quote_edge_live_trader
     if settings.quote_momentum_live_enabled:
-        quote_edge_live_trader = QuoteEdgeLiveTrader(prediction_trader)
-        logger.info(
-            "报价 edge 实盘执行器已启动（真单！）| {} | {} USDT/单 | 执行价上限 {} | 日上限 {} 单",
-            quote_edge_live_trader.status()["version"],
-            settings.quote_momentum_live_amount_usdt,
-            settings.quote_momentum_live_max_exec_price,
-            settings.quote_momentum_live_max_daily_orders,
-        )
+        if settings.quote_momentum_live_amount_usdt > qelt_module.MAX_ORDER_AMOUNT_USDT:
+            # Low#5：金额配置无 sanity 上限会让日敞口 = amount×30 失控（误写 500 即 1.5 万/日）
+            logger.error(
+                "报价 edge 实盘拒绝启动：单笔金额 {} 超硬上限 {} USDT（防配置误写）",
+                settings.quote_momentum_live_amount_usdt,
+                qelt_module.MAX_ORDER_AMOUNT_USDT,
+            )
+        else:
+            quote_edge_live_trader = QuoteEdgeLiveTrader(prediction_trader)
+            await quote_edge_live_trader.start()
+            logger.info(
+                "报价 edge 实盘执行器已启动（真单！）| {} | {} USDT/单 | 执行价上限 {} | 日上限 {} 单",
+                quote_edge_live_trader.status()["version"],
+                settings.quote_momentum_live_amount_usdt,
+                settings.quote_momentum_live_max_exec_price,
+                settings.quote_momentum_live_max_daily_orders,
+            )
     else:
         logger.info("报价 edge 实盘未开启（quote_momentum_live_enabled=False），维持影子记录")
 

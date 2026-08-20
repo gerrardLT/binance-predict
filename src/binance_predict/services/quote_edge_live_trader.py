@@ -5,23 +5,24 @@
 影子轨继续归档记录（对照），实盘轨实时开火，二者互不干扰。
 
 安全护栏：
-1. 每窗至多一单：内存 fired 集合 + DB (signal_version, window_start) 唯一约束双保险；
-   失败尝试（含护栏弃单）亦落 FAILED 行占住唯一键——同一窗口不重试，
-   与回测"首个命中点入场"语义一致。
-2. 执行价护栏：报价 averagePrice > max_exec_price → 弃单（不追贵，保护回测 EV 口径）。
+1. 每窗至多一单：内存 fired 集合 + **先占位后下单**（CodeReview High#1：
+   place_order 前先插 PENDING 行占住 (signal_version, window_start) 唯一键，
+   重复窗口在花钱前被拒）；失败尝试（含护栏弃单）更新为 FAILED 仍占键，
+   同一窗口不重试，与回测"首个命中点入场"语义一致。
+2. 执行价护栏：报价 averagePrice > max_exec_price → 弃单；且下单滑点按护栏价
+   动态收紧，成交价无法突破护栏（不追贵，保护回测 EV 口径）。
 3. 日单量护栏：当日 FILLED 达上限停火（防极端行情密度暴涨散口）。
 4. 不回灌：只盯活跃窗口，重启不补已过去的窗口（区别于影子 backscan）。
-5. 下单任务 create_task 脱离采样循环，不阻塞 15s 采样。
-
-signal_id 回填：窗口结算后（end + 180s）把订单关联回 misalignment_signals，
-实盘订单与影子信号一一对账。
+5. 下单任务 create_task 脱离采样循环，不阻塞 15s 采样；stop() 只取消辅助任务，
+   在途下单任务等待完成（钱已出去的临界区绝不打断）。
+6. signal_id 回填双通道：窗口结算后即时回填 + 周期自愈扫描（重启/影子延迟不丢对账）。
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func as sa_func
 from sqlalchemy import select as sa_select
@@ -37,6 +38,8 @@ logger = logging.getLogger(__name__)
 
 LIVE_VERSION = "quote_momentum_v1"   # 首个上实盘的信号（用户圈定，2026-08-20）
 SIGNAL_BACKFILL_DELAY_MS = 180_000  # 窗口结束后 180s 回读影子信号（归档+结算已就绪）
+HEAL_INTERVAL_S = 300.0             # signal_id 自愈扫描间隔（Low#4：重启/延迟不丢对账）
+MAX_ORDER_AMOUNT_USDT = 50.0        # 单笔金额硬上限（Low#5：配置误写拒绝启动，不靠自律）
 
 
 class QuoteEdgeLiveTrader:
@@ -50,16 +53,26 @@ class QuoteEdgeLiveTrader:
         self._max_exec = settings.quote_momentum_live_max_exec_price
         self._max_daily = settings.quote_momentum_live_max_daily_orders
         self._fired: set[int] = set()          # 本进程已开火/尝试过的 window_start
-        self._tasks: set[asyncio.Task] = set()  # 在途下单/回填任务（stop 时取消）
+        self._tasks: set[asyncio.Task] = set()  # 在途任务（下单/回填/自愈）
         self._fire_total = 0
+        self._healed_total = 0
+        self._stopped = False                   # stop 后拒绝派生新下单任务（High#1）
+        self._running = False
 
-    # ------------------------------------------------------------------
-    # 采样循环入口（非阻塞：守卫全为内存比较，命中才派生下单任务）
-    # ------------------------------------------------------------------
+    async def start(self) -> None:
+        """启动 signal_id 自愈扫描（下单触发由 tracker 喂价，无需自循环）。"""
+        if self._running:
+            return
+        self._running = True
+        task = asyncio.create_task(self._heal_loop(), name="quote_edge_live_heal")
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
     def check(self, window_start_ms: int, window_end_ms: int,
               ts_ms: int, down_price: float | None) -> bool:
         """每次 5m 采样调用一次；命中规则区间则派生下单任务，返回是否开火。"""
+        if self._stopped:
+            return False
         if not settings.quote_momentum_live_enabled:
             return False
         if down_price is None:
@@ -116,7 +129,8 @@ class QuoteEdgeLiveTrader:
                 max_exec_price=self._max_exec,
             )
             if order is None:
-                logger.warning("报价 edge 实盘：下单无落库记录返回 | 窗口 {}", win_label)
+                # 同窗已有占位（重启/并发重复）或前置配置缺失，未花钱，正常路径
+                logger.info("报价 edge 实盘：未产生订单（重复窗口或前置失败）| 窗口 {}", win_label)
                 return
 
             self._fire_total += 1
@@ -176,6 +190,8 @@ class QuoteEdgeLiveTrader:
     # ------------------------------------------------------------------
 
     async def _count_filled_today(self) -> int:
+        # Low#3：date_trunc 取 PG 会话时区（容器内为 UTC），即"日"按 UTC 自然日计，
+        # 北京时间 08:00 翻日；护栏语义自洽，对账时注明口径即可。
         async with async_session_factory() as session:
             row = (await session.execute(
                 sa_select(sa_func.count(TradeOrderModel.id)).where(
@@ -197,6 +213,39 @@ class QuoteEdgeLiveTrader:
         return row is not None
 
     # ------------------------------------------------------------------
+    # signal_id 自愈扫描（Low#4：即时回填只一次机会，重启/影子延迟会永久丢对账）
+    # ------------------------------------------------------------------
+
+    async def _heal_loop(self) -> None:
+        while self._running:
+            try:
+                await asyncio.sleep(HEAL_INTERVAL_S)
+                await self._heal_once()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning("报价 edge 实盘：自愈扫描异常 | {}", exc)
+
+    async def _heal_once(self) -> None:
+        """为超过 10 分钟仍缺 signal_id 的订单重试回填（幂等，可重复执行）。"""
+        try:
+            cutoff = datetime.now(timezone.utc) - timedelta(minutes=10)
+            async with async_session_factory() as session:
+                orders = (await session.execute(
+                    sa_select(TradeOrderModel.window_start).where(
+                        TradeOrderModel.signal_version == LIVE_VERSION,
+                        TradeOrderModel.signal_id.is_(None),
+                        TradeOrderModel.created_at < cutoff,
+                    ).order_by(TradeOrderModel.window_start.asc()).limit(20)
+                )).scalars().all()
+            for ws in orders:
+                await self._backfill_signal_link(int(ws))
+            if orders:
+                self._healed_total += len(orders)
+        except Exception as exc:
+            logger.warning("报价 edge 实盘：自愈扫描查询失败 | {}", exc)
+
+    # ------------------------------------------------------------------
     # 状态 / 生命周期
     # ------------------------------------------------------------------
 
@@ -209,16 +258,22 @@ class QuoteEdgeLiveTrader:
             "max_daily_orders": self._max_daily,
             "fired_windows": sorted(self._fired)[-10:],
             "fire_total": self._fire_total,
+            "healed_total": self._healed_total,
             "pending_tasks": len(self._tasks),
         }
 
     async def stop(self) -> None:
+        """停止：先拒新单，只取消辅助任务（回填/自愈）；在途下单任务不 cancel、
+        等待完成——钱已出去的临界区被打断会造成"交易所成交、DB 无终态"（High#1）。"""
+        self._stopped = True
+        self._running = False
         for task in list(self._tasks):
-            task.cancel()
+            if task.get_name() in ("quote_edge_live_heal", "quote_edge_live_backfill"):
+                task.cancel()
         for task in list(self._tasks):
             try:
-                await task
-            except (asyncio.CancelledError, Exception):
+                await asyncio.wait_for(asyncio.shield(task), timeout=45)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                 pass
         self._tasks.clear()
         logger.info("报价 edge 实盘执行器已停止 | 开火次数 {}", self._fire_total)

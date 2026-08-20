@@ -399,12 +399,14 @@ class BinancePredictionTrader:
             logger.error("获取报价异常: {}", e)
             return None
 
-    async def place_order(self, quote: dict) -> dict | None:
+    async def place_order(self, quote: dict, slippage_bps: int = 1200) -> dict | None:
         """
         执行下单
 
         Args:
             quote: get_quote 返回的报价响应
+            slippage_bps: 滑点容忍（基点，默认 1200=12%）；信号实盘通道按
+                执行价护栏动态收紧，防成交价突破护栏价（CodeReview Medium#2）
 
         Returns:
             下单响应 dict，包含 orderId；失败返回 None
@@ -419,7 +421,7 @@ class BinancePredictionTrader:
                 "timeInForce": "FOK",
                 "accountType": "SPOT",
                 "orderType": "MARKET",
-                "slippageBps": 1200,
+                "slippageBps": slippage_bps,
             },
         )
 
@@ -557,26 +559,31 @@ class BinancePredictionTrader:
 
         与 execute_trade 的差异：
         1. 金额/信号版本/窗口由调用方显式传入（非配置默认）；
-        2. 报价后、下单前检查 averagePrice ≤ max_exec_price，超限弃单落 FAILED
-           （回测 EV 对入场溢价敏感，不追贵）；
-        3. signal_version+window_start 写入订单，DB 联合唯一约束保证每窗至多一单。
-        失败（含护栏弃单）均落 FAILED 行，可追溯、不静默降级。
+        2. **先占位后下单**（CodeReview High#1）：place_order 前先插 PENDING 行占住
+           (signal_version, window_start) 唯一键，重复窗口在下单前即拒绝；
+           成功/失败 UPDATE 该行——重启防重不再依赖"钱出去后"的事后提交；
+        3. 报价后、下单前检查 averagePrice ≤ max_exec_price，超限弃单（不追贵）；
+           且按护栏价动态收紧 slippageBps，成交价无法突破 max_exec_price。
+        钱已出去而落库/更新失败时记 CRITICAL 日志，可追溯、不静默降级。
         """
         if not self._api_key or not self._api_secret:
-            return await self._save_failed_order(
-                None, "API Key/Secret 未配置",
-                signal_version=signal_version, window_start=window_start,
-            )
+            logger.warning("信号实盘：API Key/Secret 未配置 | signal={}", signal_version)
+            return None
 
         if not self._wallet_address or not self._wallet_id:
             wallet = await self.fetch_wallet_info()
             if not wallet:
-                return await self._save_failed_order(
-                    None, "钱包信息获取失败，请先在 Binance App 开通预测市场",
-                    signal_version=signal_version, window_start=window_start,
-                )
+                logger.warning("信号实盘：钱包信息获取失败（未开通预测市场？）| signal={}",
+                               signal_version)
+                return None
 
         async with self._trade_lock:
+            # 先占位后下单：PENDING 行占住唯一键；重复窗口（含重启/并发）在花钱前拒绝。
+            pending = await self._reserve_order_slot(signal_version, window_start)
+            if pending is None:
+                logger.info("信号实盘：窗口 {} 已有订单占位，跳过（每窗一单）", window_start)
+                return None
+
             await self.list_markets()
 
             if prediction == "UP":
@@ -585,54 +592,126 @@ class BinancePredictionTrader:
                 token_id = self._down_token_id
             else:
                 logger.warning("未知预测方向: {}", prediction)
-                return None
+                await self._update_signal_order(pending, "FAILED",
+                                                error_message=f"未知预测方向: {prediction}")
+                return pending
 
             if not token_id:
-                return await self._save_failed_order(
-                    None, f"未找到 {prediction} 方向的 token",
-                    signal_version=signal_version, window_start=window_start,
-                )
+                await self._update_signal_order(
+                    pending, "FAILED", error_message=f"未找到 {prediction} 方向的 token")
+                return pending
 
             quote = await self.get_quote(token_id, "BUY", amount_usdt=amount_usdt)
             if not quote:
-                return await self._save_failed_order(
-                    None, "获取报价失败",
-                    signal_version=signal_version, window_start=window_start,
-                )
+                await self._update_signal_order(pending, "FAILED", error_message="获取报价失败")
+                return pending
 
             # 执行价护栏：报价均价超阈弃单（不追贵，保护回测 EV 口径）
-            if max_exec_price is not None:
-                try:
-                    avg_price = float(quote.get("averagePrice") or 0.0)
-                except (TypeError, ValueError):
-                    avg_price = 0.0
-                if avg_price <= 0 or avg_price > max_exec_price:
-                    return await self._save_failed_order(
-                        None,
-                        f"执行价护栏弃单 | averagePrice={avg_price} > {max_exec_price}",
-                        quote=quote,
-                        signal_version=signal_version, window_start=window_start,
-                    )
+            try:
+                avg_price = float(quote.get("averagePrice") or 0.0)
+            except (TypeError, ValueError):
+                avg_price = 0.0
+            if max_exec_price is not None and (avg_price <= 0 or avg_price > max_exec_price):
+                await self._update_signal_order(
+                    pending, "FAILED",
+                    error_message=f"执行价护栏弃单 | averagePrice={avg_price} > {max_exec_price}",
+                    quote_json=quote)
+                return pending
 
-            order_result = await self.place_order(quote)
+            # 动态滑点收紧（CodeReview Medium#2）：FOK 成交价不得突破护栏价，
+            # 否则 slippageBps=1200 会让 0.78 的护栏形同虚设（最高可成交 ~0.87）。
+            slippage_bps = 1200
+            if max_exec_price is not None and avg_price > 0:
+                cap = int((max_exec_price / avg_price - 1.0) * 10000)
+                slippage_bps = max(0, min(1200, cap))
+
+            order_result = await self.place_order(quote, slippage_bps=slippage_bps)
             if not order_result:
-                return await self._save_failed_order(
-                    None, "下单失败", quote=quote,
-                    signal_version=signal_version, window_start=window_start,
-                )
+                await self._update_signal_order(pending, "FAILED",
+                                                error_message="下单失败", quote_json=quote)
+                return pending
 
-            return await self._save_order(
-                prediction_id=None,
+            await self._update_signal_order(
+                pending, "FILLED",
                 token_id=token_id,
-                side="BUY",
                 amount_in=str(quote.get("amountIn", "")),
                 amount_out=str(quote.get("amountOut", "")),
                 order_id=order_result.get("orderId"),
-                status="FILLED",
                 quote_json=quote,
-                signal_version=signal_version,
-                window_start=window_start,
             )
+            logger.info("信号实盘成交 | signal={} | window={} | orderId={} | slippageBps={}",
+                        signal_version, window_start, order_result.get("orderId"), slippage_bps)
+            return pending
+
+    async def _reserve_order_slot(
+        self, signal_version: str, window_start: int,
+    ) -> TradeOrderModel | None:
+        """先占位后下单（CodeReview High#1）：place_order 前先插 PENDING 行。
+
+        占住 (signal_version, window_start) 唯一键，令每窗一单在花钱前生效：
+        重复窗口（重启/并发）捕获 IntegrityError 返回 None，调用方放弃下单。
+        """
+        from sqlalchemy.exc import IntegrityError
+        try:
+            async with async_session_factory() as db:
+                order = TradeOrderModel(
+                    prediction_id=None,
+                    market_id=self._active_market.get("marketTopicId") if self._active_market else None,
+                    token_id="",
+                    side="BUY",
+                    amount_in="0",
+                    status="PENDING",
+                    signal_version=signal_version,
+                    window_start=window_start,
+                )
+                db.add(order)
+                await db.commit()
+                return order
+        except IntegrityError:
+            return None
+        except Exception as e:
+            logger.error("信号实盘：订单占位失败（保守放弃本窗）| window {} | {}",
+                         window_start, e)
+            return None
+
+    async def _update_signal_order(
+        self,
+        order: TradeOrderModel,
+        status: str,
+        *,
+        token_id: str | None = None,
+        amount_in: str | None = None,
+        amount_out: str | None = None,
+        order_id: str | None = None,
+        quote_json: dict | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        """把占位订单更新为终态（FILLED/FAILED）。
+
+        交易所已成交而此处更新失败是最坏路径（行卡在 PENDING）：记 CRITICAL
+        供日志健康检查报警，禁止静默（CodeReview High#1 修复配套）。
+        """
+        try:
+            async with async_session_factory() as db:
+                order.status = status
+                if token_id is not None:
+                    order.token_id = token_id
+                if amount_in is not None:
+                    order.amount_in = amount_in
+                if amount_out is not None:
+                    order.amount_out = amount_out
+                if order_id is not None:
+                    order.order_id = order_id
+                if quote_json is not None:
+                    order.quote_json = quote_json
+                if error_message is not None:
+                    order.error_message = error_message
+                db.add(order)
+                await db.commit()
+        except Exception as e:
+            logger.critical(
+                "信号实盘：订单终态落库失败 | window={} | status={} | order_id={} | {}",
+                order.window_start, status, order_id, e)
 
     async def _save_order(
         self,

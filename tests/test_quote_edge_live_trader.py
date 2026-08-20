@@ -197,7 +197,7 @@ def test_status_shape(monkeypatch) -> None:
 
 
 # ============================================================
-# execute_signal_trade：执行价护栏（真 trader，方法级 monkeypatch）
+# execute_signal_trade：先占位后下单 + 执行价护栏 + 动态滑点（方法级 monkeypatch）
 # ============================================================
 
 def _make_real_trader(monkeypatch) -> BinancePredictionTrader:
@@ -215,64 +215,156 @@ def _make_real_trader(monkeypatch) -> BinancePredictionTrader:
     return trader
 
 
+def _pending_order():
+    p = _FakeOrder(status="PENDING")
+    p.window_start = WINDOW_START
+    return p
+
+
 @pytest.mark.asyncio
 async def test_signal_trade_price_guard_rejects(monkeypatch) -> None:
-    """报价均价 0.82 > 上限 0.78 → 弃单落 FAILED，不 place_order。"""
+    """报价均价 0.82 > 上限 0.78 → 弃单，占位更新 FAILED，不 place_order。"""
     trader = _make_real_trader(monkeypatch)
+    pending = _pending_order()
+    updates: list[tuple] = []
+
+    async def _reserve(_v, _ws):
+        return pending
+
+    async def _update(order, status, **kwargs):
+        updates.append((status, kwargs))
+        order.status = status
 
     async def _quote(_token, _side, amount_usdt=None):
         return {"averagePrice": 0.82, "amountIn": "1", "quoteId": "Q1"}
 
-    async def _place(_q):
+    async def _place(_q, slippage_bps=1200):
         raise AssertionError("护栏弃单不应走到 place_order")
 
-    saved: list[dict] = []
-
-    async def _save_failed(prediction_id, error_msg, quote=None,
-                           agent_prediction_id=None, signal_version=None,
-                           window_start=None):
-        saved.append({"error": error_msg, "signal_version": signal_version,
-                      "window_start": window_start})
-        return _FakeOrder(status="FAILED", error_message=error_msg)
-
+    monkeypatch.setattr(trader, "_reserve_order_slot", _reserve)
+    monkeypatch.setattr(trader, "_update_signal_order", _update)
     monkeypatch.setattr(trader, "get_quote", _quote)
     monkeypatch.setattr(trader, "place_order", _place)
-    monkeypatch.setattr(trader, "_save_failed_order", _save_failed)
 
     order = await trader.execute_signal_trade(
         "DOWN", 5.0, "quote_momentum_v1", WINDOW_START, max_exec_price=0.78)
-    assert order is not None and order.status == "FAILED"
-    assert "执行价护栏" in saved[0]["error"]
-    assert saved[0]["signal_version"] == "quote_momentum_v1"
-    assert saved[0]["window_start"] == WINDOW_START
+    assert order is pending
+    assert updates[0][0] == "FAILED"
+    assert "执行价护栏" in updates[0][1]["error_message"]
 
 
 @pytest.mark.asyncio
-async def test_signal_trade_success_writes_signal_fields(monkeypatch) -> None:
-    """报价 0.71 ≤ 上限 → 下单成功，FILLED 订单带 signal_version/window_start。"""
+async def test_signal_trade_success_dynamic_slippage(monkeypatch) -> None:
+    """报价 0.71 ≤ 上限 → 成交；滑点按护栏价收紧至 985bps（0.78/0.71−1），
+    成交价无法突破护栏（Medium#2）；占位更新 FILLED 带 orderId。"""
     trader = _make_real_trader(monkeypatch)
+    pending = _pending_order()
+    updates: list[tuple] = []
+    slippage_seen: list[int] = []
+
+    async def _reserve(_v, _ws):
+        return pending
+
+    async def _update(order, status, **kwargs):
+        updates.append((status, kwargs))
+        order.status = status
 
     async def _quote(_token, _side, amount_usdt=None):
         assert amount_usdt == 5.0  # 自定义金额透传到报价
         return {"averagePrice": 0.71, "amountIn": "5", "amountOut": "7", "quoteId": "Q1"}
 
-    async def _place(_q):
+    async def _place(_q, slippage_bps=1200):
+        slippage_seen.append(slippage_bps)
         return {"orderId": "ORD-9"}
 
-    saved: list[dict] = []
-
-    async def _save(**kwargs):
-        saved.append(kwargs)
-        return _FakeOrder(status="FILLED")
-
+    monkeypatch.setattr(trader, "_reserve_order_slot", _reserve)
+    monkeypatch.setattr(trader, "_update_signal_order", _update)
     monkeypatch.setattr(trader, "get_quote", _quote)
     monkeypatch.setattr(trader, "place_order", _place)
-    monkeypatch.setattr(trader, "_save_order", _save)
 
     order = await trader.execute_signal_trade(
         "DOWN", 5.0, "quote_momentum_v1", WINDOW_START, max_exec_price=0.78)
-    assert order is not None and order.status == "FILLED"
-    assert saved[0]["status"] == "FILLED"
-    assert saved[0]["signal_version"] == "quote_momentum_v1"
-    assert saved[0]["window_start"] == WINDOW_START
-    assert saved[0]["order_id"] == "ORD-9"
+    assert order is pending and order.status == "FILLED"
+    assert slippage_seen == [985]
+    assert updates[0][0] == "FILLED"
+    assert updates[0][1]["order_id"] == "ORD-9"
+
+
+@pytest.mark.asyncio
+async def test_signal_trade_duplicate_window_skips(monkeypatch) -> None:
+    """占位失败（同窗已有 PENDING/终态行）→ 花钱前拒绝，不取报价不下单（High#1）。"""
+    trader = _make_real_trader(monkeypatch)
+
+    async def _reserve(_v, _ws):
+        return None
+
+    async def _quote(*a, **k):
+        raise AssertionError("重复窗口不应走到取报价")
+
+    monkeypatch.setattr(trader, "_reserve_order_slot", _reserve)
+    monkeypatch.setattr(trader, "get_quote", _quote)
+
+    order = await trader.execute_signal_trade(
+        "DOWN", 5.0, "quote_momentum_v1", WINDOW_START, max_exec_price=0.78)
+    assert order is None
+
+
+# ============================================================
+# 生命周期与自愈（High#1 stop 拒新单 / Low#4 回填自愈）
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_stop_rejects_new_fires(monkeypatch) -> None:
+    """stop 后 check 拒绝派生新下单任务（shutdown 窗口期保护，High#1）。"""
+    t = _make_trader(monkeypatch, _FakeTrader())
+    await t.stop()
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 100_000, 0.71) is False
+
+
+class _HealResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def scalars(self):
+        return self
+
+    def all(self):
+        return self._rows
+
+
+class _HealSession:
+    def __init__(self, rows):
+        self._rows = rows
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def execute(self, stmt):
+        return _HealResult(self._rows)
+
+
+@pytest.mark.asyncio
+async def test_heal_once_backfills_stale_orders(monkeypatch) -> None:
+    """自愈扫描：缺 signal_id 的陈旧订单逐窗回填（Low#4）。"""
+    t = _make_trader(monkeypatch, _FakeTrader())
+    monkeypatch.setattr(qelt, "async_session_factory", lambda: _HealSession([WINDOW_START]))
+    calls: list[int] = []
+
+    async def _bf(ws):
+        calls.append(ws)
+
+    t._backfill_signal_link = _bf
+    await t._heal_once()
+    assert calls == [WINDOW_START]
+    assert t._healed_total == 1
+
+
+@pytest.mark.asyncio
+async def test_heal_once_no_stale_orders(monkeypatch) -> None:
+    t = _make_trader(monkeypatch, _FakeTrader())
+    monkeypatch.setattr(qelt, "async_session_factory", lambda: _HealSession([]))
+    await t._heal_once()
+    assert t._healed_total == 0
