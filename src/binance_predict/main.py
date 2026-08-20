@@ -45,6 +45,7 @@ from .services.agent_scheduler import AgentScheduler
 from .services.data_collector import BinanceDataCollector
 from .services.fake_breakout_detector import FakeBreakoutDetector
 from .services.misalignment_detector import MisalignmentDetector
+from .services.quote_edge_detector import QuoteEdgeDetector
 from .services.llm_service import LLMService
 from .services.pattern_reevaluator import pattern_reevaluator
 from .services.prediction_trading import BinancePredictionTrader
@@ -114,6 +115,9 @@ fake_breakout_detector: FakeBreakoutDetector | None = None
 
 # X4 情绪错位影子检测器全局实例（M4 影子并行：收阳&end≤40→次窗DOWN，只记录不下注）
 misalignment_detector: MisalignmentDetector | None = None
+
+# 报价 edge 影子检测器全局实例（A 顺势 q∈[0.69,0.75) / B 逆势 q∈[0.15,0.25)，只记录不下注）
+quote_edge_detector: QuoteEdgeDetector | None = None
 
 # 场景研究调度器全局实例（M2：LLM 研究员触发与编排，lifespan 中初始化）
 research_scheduler: "ResearchScheduler | None" = None
@@ -896,6 +900,14 @@ async def lifespan(app: FastAPI):
         await misalignment_detector.start()
         logger.info("X4 影子检测器已启动（错位假设工厂产物，回测 63.5%/EV+0.254，影子模式不下注）")
 
+    # 报价 edge 影子信号（A 顺势/B 逆势）：报价分箱校准发现的两格错价，
+    # 归档后处理首个命中报价直接落 SETTLED，攒 2 周线上样本复核回测
+    global quote_edge_detector
+    if settings.quote_edge_enabled:
+        quote_edge_detector = QuoteEdgeDetector()
+        await quote_edge_detector.start()
+        logger.info("报价 edge 影子检测器已启动（A 79.9%/EV+0.097，B 24%/EV+0.155，影子模式不下注）")
+
     # 场景研究（M2）：LLM 研究员定期/累积/异常触发评估，假设只落库不生效
     # （M3 裁决 + 人工 promote 后才以 SHADOW 影子身份参与判定）
     global research_scheduler
@@ -927,6 +939,9 @@ async def lifespan(app: FastAPI):
     # 停止 X4 影子检测器
     if misalignment_detector is not None:
         await misalignment_detector.stop()
+    # 停止报价 edge 影子检测器
+    if quote_edge_detector is not None:
+        await quote_edge_detector.stop()
     # 停止 AgentScheduler（优雅关闭，等待当前阶段执行完毕）
     if agent_scheduler is not None:
         await agent_scheduler.stop()
@@ -1077,18 +1092,32 @@ async def list_fake_breakout_signals(
 @app.get("/api/misalignment/signals")
 async def list_misalignment_signals(
     limit: int = 50,
+    version: str | None = None,
     db: AsyncSession = Depends(get_db),
 ):
-    """X4 情绪错位影子信号列表 + 累计统计（promote 判据：WR/EV/实价覆盖率）。"""
+    """影子信号列表 + 累计统计（promote 判据：WR/EV/实价覆盖率）。
+
+    version 过滤：x4_v1 / quote_momentum_v1 / quote_contrarian_v1；
+    缺省全部（历史兼容）。end_pct 字段：x4_v1 = 触发窗末 UP%，
+    quote_* = 触发时刻 DOWN 报价。
+    """
     from sqlalchemy import case as sa_case, desc as sa_desc, func as sa_func, select as sa_select
     from .db.models import MisalignmentSignal
 
     limit = max(1, min(limit, 200))
-    stmt = (
-        sa_select(MisalignmentSignal)
-        .order_by(sa_desc(MisalignmentSignal.window_start))
-        .limit(limit)
-    )
+    stmt = sa_select(MisalignmentSignal)
+    agg_stmt = sa_select(
+        sa_func.count(MisalignmentSignal.id),
+        sa_func.sum(sa_case((MisalignmentSignal.win.isnot(None), 1), else_=0)),
+        sa_func.sum(sa_case((MisalignmentSignal.win.is_(True), 1), else_=0)),
+        sa_func.sum(sa_case((MisalignmentSignal.ev_at_entry.isnot(None), 1), else_=0)),
+        sa_func.avg(MisalignmentSignal.ev_at_entry),
+        sa_func.sum(sa_case((MisalignmentSignal.entry_quote_kind == "real", 1), else_=0)),
+    ).where(MisalignmentSignal.status == "SETTLED")
+    if version:
+        stmt = stmt.where(MisalignmentSignal.version == version)
+        agg_stmt = agg_stmt.where(MisalignmentSignal.version == version)
+    stmt = stmt.order_by(sa_desc(MisalignmentSignal.window_start)).limit(limit)
     rows = (await db.execute(stmt)).scalars().all()
     signals = [{
         "id": s.id,
@@ -1113,18 +1142,8 @@ async def list_misalignment_signals(
     # 累计统计（全量，不随 limit 截断）：promote 判据四件套
     # 注意：case 必须从 sqlalchemy 顶层导入；func.case 是通用函数生成器，
     # 不接受 else_，会在语句构建时抛 TypeError（曾致生产 500）
-    agg = (
-        sa_select(
-            sa_func.count(MisalignmentSignal.id),
-            sa_func.sum(sa_case((MisalignmentSignal.win.isnot(None), 1), else_=0)),
-            sa_func.sum(sa_case((MisalignmentSignal.win.is_(True), 1), else_=0)),
-            sa_func.sum(sa_case((MisalignmentSignal.ev_at_entry.isnot(None), 1), else_=0)),
-            sa_func.avg(MisalignmentSignal.ev_at_entry),
-            sa_func.sum(sa_case((MisalignmentSignal.entry_quote_kind == "real", 1), else_=0)),
-        ).where(MisalignmentSignal.status == "SETTLED")
-    )
     n, n_win_valid, n_wins, n_ev, avg_ev, n_real = (
-        await db.execute(agg)
+        await db.execute(agg_stmt)
     ).one()
     n_ev = int(n_ev or 0)
     stats = {
@@ -1134,8 +1153,9 @@ async def list_misalignment_signals(
         "real_quote_coverage": (n_real / n_ev) if n_ev else None,
     }
     detector_status = misalignment_detector.status() if misalignment_detector else None
+    quote_edge_status = quote_edge_detector.status() if quote_edge_detector else None
     return {"signals": signals, "total": len(signals), "stats": stats,
-            "detector": detector_status}
+            "detector": detector_status, "quote_edge_detector": quote_edge_status}
 
 
 @app.get("/api/scene/versions")
