@@ -295,6 +295,37 @@ interface FakeBreakoutPatternStats {
   n_last_7d: number
 }
 
+// 信号分析面板：与后端 /api/signals/analytics + /api/chart/btc-klines 对齐
+interface BtcKline {
+  open_time: number; open: number; high: number; low: number; close: number; volume: number
+}
+interface AnalyticsCurvePoint { i: number; ts: number; cum_wr: number; cum_ev: number }
+interface ShadowVersionBlock {
+  summary: {
+    n: number; win_rate: number | null; avg_ev: number | null; cum_ev: number | null
+    avg_breakeven: number | null; bench_winrate: number | null; bench_ev: number | null
+    desc: string
+  }
+  curve: AnalyticsCurvePoint[]
+}
+interface SceneTypeBlock {
+  summary: {
+    n: number; winrate: number | null; avg_ev: number | null; cum_ev: number | null
+    bench_winrate: number | null
+  }
+  curve: AnalyticsCurvePoint[]
+}
+interface SignalsAnalytics {
+  pump_ts: number
+  shadow: Record<string, ShadowVersionBlock>
+  scene: Record<string, SceneTypeBlock>
+  regime: {
+    phases: Record<string, { n: number; wins: number; winrate: number | null }>
+    by_version: Record<string, Record<string, { n: number; wins: number; winrate: number | null }>>
+    daily: { date: string; n: number; wins: number; winrate: number | null }[]
+  }
+}
+
 // 模式池分级与回测快照：与后端 /api/agent/patterns/compare + /backtest-runs 对齐
 interface PatternBacktestRun {
   id: number
@@ -429,6 +460,9 @@ const api = {
   getFakeBreakoutSignalPath: (signalId: number) =>
     fetch(`/api/fake-breakout/signals/${signalId}/path`).then(r => r.json()),
   getFakeBreakoutStats: () => fetch('/api/fake-breakout/stats').then(r => r.json()),
+  getBtcKlines: (interval: string, limit: number) =>
+    fetch(`/api/chart/btc-klines?interval=${interval}&limit=${limit}`).then(r => r.json()),
+  getSignalsAnalytics: () => fetch('/api/signals/analytics').then(r => r.json()),
   getPatternCompare: () => fetch('/api/agent/patterns/compare').then(r => r.json()),
   getPatternBacktestRuns: (patternId: number, limit = 30) =>
     fetch(`/api/agent/patterns/backtest-runs?pattern_id=${patternId}&limit=${limit}`).then(r => r.json()),
@@ -509,7 +543,7 @@ function Card({ title, children, className = '' }: { title: string; children: Re
 
 export default function App() {
   const [health, setHealth] = useState<HealthData | null>(null)
-  const [tab, setTab] = useState<'market' | 'agent' | 'monitor'>('market')
+  const [tab, setTab] = useState<'market' | 'agent' | 'monitor' | 'analysis'>('market')
 
   // 市场情绪
   const [pmPoints, setPmPoints] = useState<PMPoint[]>([])
@@ -592,6 +626,16 @@ export default function App() {
               }`}
             >
               运行监控
+            </button>
+            <button
+              onClick={() => setTab('analysis')}
+              className={`px-4 py-1.5 text-sm font-semibold rounded-md transition ${
+                tab === 'analysis'
+                  ? 'bg-white text-blue-600 shadow-sm'
+                  : 'text-gray-600 hover:text-gray-900 hover:bg-white/60'
+              }`}
+            >
+              信号分析
             </button>
           </div>
 
@@ -728,6 +772,8 @@ export default function App() {
         {tab === 'agent' && <AgentTab />}
 
         {tab === 'monitor' && <MonitorTab />}
+
+        {tab === 'analysis' && <SignalAnalyticsTab />}
       </main>
 
       {/* 右侧悬浮：LLM 轨迹面板（全局可见，5 秒轮询） */}
@@ -2731,5 +2777,427 @@ function Market15mPanel() {
         <div className="text-center text-gray-400 py-10 text-sm">正在采集 15m 市场数据...每 15 秒采样一次。</div>
       )}
     </Card>
+  )
+}
+
+// ============================================================
+// 信号分析 Tab：胜率曲线 × BTC K线 × 周期归因（60s 轮询自动刷新）
+// 口径全部来自后端 /api/signals/analytics（单一事实源），前端只做渲染
+// ============================================================
+
+const SHADOW_META: Record<string, { label: string; color: string }> = {
+  x4_v1: { label: 'X4 misalign→DOWN', color: '#1f77b4' },
+  quote_momentum_v1: { label: 'A momentum', color: '#d62728' },
+  quote_contrarian_v1: { label: 'B contrarian', color: '#2ca02c' },
+}
+const SCENE_META: Record<string, { label: string; color: string }> = {
+  bull_exhaust: { label: 'S1 bull_exhaust→DOWN', color: '#1f77b4' },
+  bear_exhaust: { label: 'S2 bear_exhaust→UP', color: '#d62728' },
+  momentum_fade: { label: 'S4 momentum_fade→DOWN', color: '#2ca02c' },
+  bull_exhaust_confirm: { label: 'S5 confirm→DOWN', color: '#9467bd' },
+  // legacy = pattern_type 为空的历史信号，胜负按 side 映射（与 /api/fake-breakout/stats
+  // 同语义，审计脚本对其「一律 DOWN」的简化口径在 side=low 时不同）
+  legacy: { label: 'legacy 历史', color: '#7f7f7f' },
+}
+// 后端动态发现的新版本/新场景的备用色（超出已知名单时按序取用）
+const EXTRA_COLORS = ['#8c564b', '#e377c2', '#17becf', '#bcbd22', '#7f7f7f']
+
+const pct1 = (v: number | null | undefined, digits = 1) =>
+  v == null ? '—' : `${(v * 100).toFixed(digits)}%`
+const evFmt = (v: number | null | undefined) =>
+  v == null ? '—' : `${v >= 0 ? '+' : ''}${v.toFixed(3)}`
+const utcMD = (ts: number) =>
+  new Date(ts).toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit', timeZone: 'UTC' })
+
+// 把各版本曲线按时间戳合并成宽表（recharts 单 data 多 Line 需要）
+function mergeCurves(
+  blocks: Record<string, { curve: AnalyticsCurvePoint[] }>,
+  meta: Record<string, { label: string; color: string }>,
+): Record<string, number>[] {
+  const rowMap = new Map<number, Record<string, number>>()
+  for (const [key, blk] of Object.entries(blocks)) {
+    const label = meta[key]?.label ?? key
+    for (const p of blk.curve) {
+      const row = rowMap.get(p.ts) ?? { ts: p.ts }
+      row[label] = +(p.cum_wr * 100).toFixed(1)
+      rowMap.set(p.ts, row)
+    }
+  }
+  return Array.from(rowMap.values()).sort((a, b) => (a.ts as number) - (b.ts as number))
+}
+
+function SignalAnalyticsTab() {
+  const [analytics, setAnalytics] = useState<SignalsAnalytics | null>(null)
+  const [klines, setKlines] = useState<BtcKline[]>([])
+  const [kinterval, setKinterval] = useState<'1d' | '1h'>('1d')
+  const [autoRefresh, setAutoRefresh] = useState(true)
+  const [lastUpdate, setLastUpdate] = useState<Date | null>(null)
+  const [err, setErr] = useState('')
+  // 请求序号守卫：切换周期时丢弃旧请求的慢返回，防止过期数据覆盖新数据
+  const reqIdRef = useRef(0)
+
+  const load = useCallback(() => {
+    const id = ++reqIdRef.current
+    Promise.all([
+      api.getSignalsAnalytics(),
+      api.getBtcKlines(kinterval, kinterval === '1d' ? 30 : 168),
+    ]).then(([a, k]) => {
+      if (id !== reqIdRef.current) return
+      if (a && a.shadow) { setAnalytics(a as SignalsAnalytics); setErr('') } else setErr('分析数据返回异常')
+      if (k && Array.isArray(k.klines)) setKlines(k.klines as BtcKline[])
+      setLastUpdate(new Date())
+    }).catch(e => {
+      if (id === reqIdRef.current) setErr(`请求失败: ${(e as Error).message}`)
+    })
+  }, [kinterval])
+
+  useEffect(() => { load() }, [load])
+  useEffect(() => {
+    if (!autoRefresh) return
+    const t = setInterval(load, 60_000)
+    return () => clearInterval(t)
+  }, [autoRefresh, load])
+
+  const pumpTs = analytics?.pump_ts ?? null
+
+  // ---- BTC K线图上信号落点（按 bar 聚合：场景=橙 / 影子=蓝）----
+  const barW = klines.length > 1 ? klines[1].open_time - klines[0].open_time : 86_400_000
+  const barIdxOf = (ts: number) => {
+    let lo = 0, hi = klines.length - 1, ans = -1
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1
+      if (klines[mid].open_time <= ts) { ans = mid; lo = mid + 1 } else hi = mid - 1
+    }
+    return ans >= 0 && ts - klines[ans].open_time < barW ? ans : -1
+  }
+  const dotAgg = (curves: AnalyticsCurvePoint[][]) => {
+    const m = new Map<number, number>()
+    for (const c of curves) for (const p of c) {
+      const i = barIdxOf(p.ts)
+      if (i >= 0) m.set(i, (m.get(i) ?? 0) + 1)
+    }
+    return m
+  }
+  const sceneDots = analytics ? dotAgg(Object.values(analytics.scene).map(b => b.curve)) : new Map<number, number>()
+  const shadowDots = analytics ? dotAgg(Object.values(analytics.shadow).map(b => b.curve)) : new Map<number, number>()
+
+  const sceneRows = analytics ? mergeCurves(analytics.scene, SCENE_META) : []
+  const shadowRows = analytics ? mergeCurves(analytics.shadow, SHADOW_META) : []
+  // 遍历后端返回的键（而非固定 META 名单）：后端动态发现的新版本/新场景也能展示
+  const metaFor =
+    (meta: Record<string, { label: string; color: string }>) =>
+    (key: string, idx: number): { label: string; color: string } =>
+      meta[key] ?? { label: key, color: EXTRA_COLORS[idx % EXTRA_COLORS.length] }
+  const sceneEntries: [string, { label: string; color: string }][] = analytics
+    ? Object.keys(analytics.scene).map((k, i) => [k, metaFor(SCENE_META)(k, i)])
+    : []
+  const shadowEntries: [string, { label: string; color: string }][] = analytics
+    ? Object.keys(analytics.shadow).map((k, i) => [k, metaFor(SHADOW_META)(k, i)])
+    : []
+
+  return (
+    <div className="space-y-6">
+      {/* 控制栏 */}
+      <div className="flex items-center gap-4 flex-wrap text-xs">
+        <label className="flex items-center gap-1.5 cursor-pointer text-gray-600">
+          <input type="checkbox" checked={autoRefresh} onChange={e => setAutoRefresh(e.target.checked)} />
+          自动刷新（60s）
+        </label>
+        <button
+          onClick={load}
+          className="px-3 py-1 text-xs font-medium text-white bg-blue-600 rounded-md hover:bg-blue-700 transition"
+        >
+          手动刷新
+        </button>
+        {lastUpdate && <span className="text-gray-400">最后更新 {lastUpdate.toLocaleTimeString('zh-CN')}</span>}
+        {err && <span className="text-red-500">{err}</span>}
+      </div>
+
+      {/* BTC K线背景 */}
+      <Card title={`BTC K线背景（${kinterval === '1d' ? '日线 × 30' : '1小时 × 168'}，UTC 已收盘）`}>
+        <div className="flex items-center gap-3 mb-2 text-xs">
+          {(['1d', '1h'] as const).map(iv => (
+            <button
+              key={iv}
+              onClick={() => setKinterval(iv)}
+              className={`px-2.5 py-0.5 rounded-md border transition ${
+                kinterval === iv
+                  ? 'bg-blue-600 text-white border-blue-600'
+                  : 'bg-white text-gray-600 border-gray-300 hover:border-blue-400'
+              }`}
+            >
+              {iv === '1d' ? '日线' : '1小时'}
+            </button>
+          ))}
+          <span className="text-gray-400">
+            <span className="text-orange-500">● 场景信号</span> · <span className="text-blue-500">● 影子信号</span>（点大小=当根信号数）
+            {pumpTs != null && <span className="ml-2 text-orange-400">| 竖线 = {utcMD(pumpTs)} 大涨分界</span>}
+          </span>
+        </div>
+        {klines.length > 0 ? (
+          <ResponsiveContainer width="100%" height={260}>
+            <LineChart data={klines.map(k => ({ t: k.open_time, close: k.close }))}
+              margin={{ top: 6, right: 12, left: 0, bottom: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+              <XAxis dataKey="t" type="number" domain={['dataMin', 'dataMax']} scale="time"
+                tickFormatter={utcMD} tick={{ fontSize: 10 }} stroke="#9ca3af" />
+              <YAxis domain={['auto', 'auto']} tick={{ fontSize: 10 }} stroke="#9ca3af" width={64}
+                tickFormatter={(v: number) => v.toLocaleString()} />
+              <Tooltip
+                contentStyle={{ fontSize: 12, borderRadius: 8, border: '1px solid #e5e7eb' }}
+                labelFormatter={t => new Date(t as number).toUTCString().slice(0, 16)}
+                formatter={v => [typeof v === 'number' ? v.toLocaleString() : '--', '收盘价']}
+              />
+              {pumpTs != null && (
+                <ReferenceLine x={pumpTs} stroke="#f97316" strokeDasharray="4 3" strokeWidth={1.5}
+                  label={{ value: `${utcMD(pumpTs)} 大涨分界`, position: 'insideTopRight', fill: '#f97316', fontSize: 10 }} />
+              )}
+              <Line dataKey="close" stroke="#374151" dot={false} strokeWidth={1.8} isAnimationActive={false} />
+              {Array.from(sceneDots.entries()).map(([i, n]) => (
+                <ReferenceDot key={`sc${i}`} x={klines[i].open_time} y={klines[i].close}
+                  r={Math.min(3 + n, 6)} fill="#f97316" fillOpacity={0.75} stroke="white" />
+              ))}
+              {Array.from(shadowDots.entries()).map(([i, n]) => (
+                <ReferenceDot key={`sh${i}`} x={klines[i].open_time} y={klines[i].close}
+                  r={Math.min(3 + n, 6)} fill="#3b82f6" fillOpacity={0.75} stroke="white" />
+              ))}
+            </LineChart>
+          </ResponsiveContainer>
+        ) : (
+          <div className="text-center text-gray-400 py-10 text-sm">K 线加载中...</div>
+        )}
+      </Card>
+
+      {/* 场景信号 */}
+      <Card title="场景信号（FakeBreakout 正式信号）：累计胜率 vs 回测冻结基准">
+        {analytics && (
+          <>
+            <div className="overflow-x-auto mb-3">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="border-b border-gray-200 text-gray-500">
+                    <th className="py-1 px-2 text-left">场景</th>
+                    <th className="py-1 px-2 text-right">n</th>
+                    <th className="py-1 px-2 text-right">线上胜率</th>
+                    <th className="py-1 px-2 text-right">回测</th>
+                    <th className="py-1 px-2 text-right">偏离</th>
+                    <th className="py-1 px-2 text-right">平均EV</th>
+                    <th className="py-1 px-2 text-right">累计EV</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {sceneEntries.map(([k, m]) => {
+                    const s = analytics.scene[k].summary
+                    const dev = s.winrate != null && s.bench_winrate != null ? s.winrate - s.bench_winrate : null
+                    return (
+                      <tr key={k} className="border-b border-gray-100 hover:bg-gray-50">
+                        <td className="py-1 px-2 font-medium" style={{ color: m.color }}>{m.label}</td>
+                        <td className="py-1 px-2 text-right font-mono">{s.n}</td>
+                        <td className="py-1 px-2 text-right font-mono font-bold">{pct1(s.winrate)}</td>
+                        <td className="py-1 px-2 text-right font-mono text-gray-500">{pct1(s.bench_winrate)}</td>
+                        <td className={`py-1 px-2 text-right font-mono ${dev == null ? 'text-gray-400' : dev >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                          {dev == null ? '—' : `${dev >= 0 ? '+' : ''}${(dev * 100).toFixed(1)}pp`}
+                        </td>
+                        <td className={`py-1 px-2 text-right font-mono ${s.avg_ev == null ? 'text-gray-400' : s.avg_ev >= 0 ? 'text-green-600' : 'text-red-600'}`}>{evFmt(s.avg_ev)}</td>
+                        <td className={`py-1 px-2 text-right font-mono ${s.cum_ev == null ? 'text-gray-400' : s.cum_ev >= 0 ? 'text-green-600' : 'text-red-600'}`}>{evFmt(s.cum_ev)}</td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <ResponsiveContainer width="100%" height={240}>
+              <LineChart data={sceneRows} margin={{ top: 6, right: 12, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                <XAxis dataKey="ts" type="number" domain={['dataMin', 'dataMax']} scale="time"
+                  tickFormatter={utcMD} tick={{ fontSize: 10 }} stroke="#9ca3af" />
+                <YAxis domain={[0, 100]} tick={{ fontSize: 10 }} stroke="#9ca3af" width={40}
+                  tickFormatter={(v: number) => v + '%'} />
+                <Tooltip
+                  contentStyle={{ fontSize: 12, borderRadius: 8, border: '1px solid #e5e7eb' }}
+                  labelFormatter={t => new Date(t as number).toUTCString().slice(0, 16)}
+                  formatter={(v, n) => [typeof v === 'number' ? v.toFixed(1) + '%' : '--', n]}
+                />
+                {pumpTs != null && <ReferenceLine x={pumpTs} stroke="#f97316" strokeDasharray="4 3" />}
+                {sceneEntries.map(([k, m]) => (
+                  <Fragment key={k}>
+                    <Line dataKey={m.label} stroke={m.color} strokeWidth={2} dot={false} connectNulls isAnimationActive={false} />
+                    {analytics.scene[k].summary.bench_winrate != null && (
+                      <ReferenceLine y={analytics.scene[k].summary.bench_winrate! * 100}
+                        stroke={m.color} strokeDasharray="5 4" strokeOpacity={0.5} />
+                    )}
+                  </Fragment>
+                ))}
+              </LineChart>
+            </ResponsiveContainer>
+            <div className="text-[10px] text-gray-400 mt-1">实线=线上累计胜率，同色虚线=回测冻结基准；x 轴为信号时间（UTC）。</div>
+          </>
+        )}
+      </Card>
+
+      {/* 影子三版本 */}
+      <Card title="影子信号（x4 / momentum / contrarian）：累计胜率 vs 回测基准 vs 盈亏平衡">
+        {analytics && (
+          <>
+            <div className="overflow-x-auto mb-3">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="border-b border-gray-200 text-gray-500">
+                    <th className="py-1 px-2 text-left">版本</th>
+                    <th className="py-1 px-2 text-right">n</th>
+                    <th className="py-1 px-2 text-right">胜率</th>
+                    <th className="py-1 px-2 text-right">盈亏平衡</th>
+                    <th className="py-1 px-2 text-right">回测</th>
+                    <th className="py-1 px-2 text-right">偏离</th>
+                    <th className="py-1 px-2 text-right">平均EV</th>
+                    <th className="py-1 px-2 text-right">累计EV</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {shadowEntries.map(([k, m]) => {
+                    const s = analytics.shadow[k].summary
+                    // bench 可空（后端动态发现的新版本无冻结基准），双非空才计算偏离
+                    const dev = s.win_rate != null && s.bench_winrate != null ? s.win_rate - s.bench_winrate : null
+                    return (
+                      <tr key={k} className="border-b border-gray-100 hover:bg-gray-50">
+                        <td className="py-1 px-2 font-medium" style={{ color: m.color }} title={s.desc}>{m.label}</td>
+                        <td className="py-1 px-2 text-right font-mono">{s.n}</td>
+                        <td className="py-1 px-2 text-right font-mono font-bold">{pct1(s.win_rate)}</td>
+                        <td className="py-1 px-2 text-right font-mono text-gray-500">{pct1(s.avg_breakeven)}</td>
+                        <td className="py-1 px-2 text-right font-mono text-gray-500">{pct1(s.bench_winrate)}</td>
+                        <td className={`py-1 px-2 text-right font-mono ${dev == null ? 'text-gray-400' : dev >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                          {dev == null ? '—' : `${dev >= 0 ? '+' : ''}${(dev * 100).toFixed(1)}pp`}
+                        </td>
+                        <td className={`py-1 px-2 text-right font-mono ${s.avg_ev == null ? 'text-gray-400' : s.avg_ev >= 0 ? 'text-green-600' : 'text-red-600'}`}>{evFmt(s.avg_ev)}</td>
+                        <td className={`py-1 px-2 text-right font-mono ${s.cum_ev == null ? 'text-gray-400' : s.cum_ev >= 0 ? 'text-green-600' : 'text-red-600'}`}>{evFmt(s.cum_ev)}</td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <ResponsiveContainer width="100%" height={240}>
+              <LineChart data={shadowRows} margin={{ top: 6, right: 12, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                <XAxis dataKey="ts" type="number" domain={['dataMin', 'dataMax']} scale="time"
+                  tickFormatter={utcMD} tick={{ fontSize: 10 }} stroke="#9ca3af" />
+                <YAxis domain={[0, 100]} tick={{ fontSize: 10 }} stroke="#9ca3af" width={40}
+                  tickFormatter={(v: number) => v + '%'} />
+                <Tooltip
+                  contentStyle={{ fontSize: 12, borderRadius: 8, border: '1px solid #e5e7eb' }}
+                  labelFormatter={t => new Date(t as number).toUTCString().slice(0, 16)}
+                  formatter={(v, n) => [typeof v === 'number' ? v.toFixed(1) + '%' : '--', n]}
+                />
+                {pumpTs != null && <ReferenceLine x={pumpTs} stroke="#f97316" strokeDasharray="4 3" />}
+                {shadowEntries.map(([k, m]) => {
+                  const s = analytics.shadow[k].summary
+                  return (
+                    <Fragment key={k}>
+                      <Line dataKey={m.label} stroke={m.color} strokeWidth={2} dot={false} connectNulls isAnimationActive={false} />
+                      {s.bench_winrate != null && (
+                        <ReferenceLine y={s.bench_winrate * 100} stroke={m.color} strokeDasharray="5 4" strokeOpacity={0.5} />
+                      )}
+                      {s.avg_breakeven != null && (
+                        <ReferenceLine y={s.avg_breakeven! * 100} stroke={m.color} strokeDasharray="1 3" strokeOpacity={0.6} />
+                      )}
+                    </Fragment>
+                  )
+                })}
+              </LineChart>
+            </ResponsiveContainer>
+            <div className="text-[10px] text-gray-400 mt-1">
+              实线=线上累计胜率；同色虚线=回测冻结基准；同色点线=逐版本平均盈亏平衡（x4 含溢价 0.01 口径，其余无溢价）。
+            </div>
+          </>
+        )}
+      </Card>
+
+      {/* 周期归因 */}
+      <Card title={`周期归因：大涨前 vs 大涨期（${pumpTs != null ? `${utcMD(pumpTs)} 00:00` : '—'} UTC 分界，场景+影子全部信号）`}>
+        {analytics && (
+          <>
+            <div className="flex flex-wrap gap-4 mb-4">
+              {[['pre', '大涨前（震荡期）'], ['pump', '大涨期（三根大阳）']].map(([ph, name]) => {
+                const g = analytics.regime.phases[ph]
+                return (
+                  <div key={ph} className="flex-1 min-w-[180px] rounded-lg border border-gray-200 bg-gray-50/60 p-3">
+                    <div className="text-xs text-gray-500 mb-1">{name}</div>
+                    {g ? (
+                      <div className="flex items-baseline gap-3">
+                        <span className="text-xl font-bold font-mono text-gray-800">{pct1(g.winrate)}</span>
+                        <span className="text-xs text-gray-400">n={g.n} · 赢{g.wins}</span>
+                      </div>
+                    ) : (
+                      <div className="text-sm text-gray-400">无样本</div>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+            {/* 逐影子版本 × 阶段（对齐审计报告表二归因维度） */}
+            {Object.keys(analytics.regime.by_version).length > 0 && (
+              <div className="overflow-x-auto mb-4">
+                <div className="text-xs text-gray-500 mb-1">逐影子版本拆分</div>
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="border-b border-gray-200 text-gray-500">
+                      <th className="py-1 px-2 text-left">版本 × 阶段</th>
+                      <th className="py-1 px-2 text-right">n</th>
+                      <th className="py-1 px-2 text-right">胜率</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {shadowEntries.map(([k, m]) => {
+                      const phases = analytics.regime.by_version[k]
+                      if (!phases) return null
+                      return (
+                        <Fragment key={k}>
+                          {(['pre', 'pump'] as const).map(ph => {
+                            const g = phases[ph]
+                            return (
+                              <tr key={ph} className="border-b border-gray-100 hover:bg-gray-50">
+                                <td className="py-1 px-2" style={{ color: m.color }}>
+                                  {m.label}
+                                  <span className="text-gray-400 ml-1.5">{ph === 'pre' ? '大涨前' : '大涨期'}</span>
+                                </td>
+                                <td className="py-1 px-2 text-right font-mono">{g ? g.n : 0}</td>
+                                <td className="py-1 px-2 text-right font-mono font-bold">{g ? pct1(g.winrate) : '—'}</td>
+                              </tr>
+                            )
+                          })}
+                        </Fragment>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            {analytics.regime.daily.length > 0 && (
+              <>
+                <div className="text-xs text-gray-500 mb-1">按天胜率（UTC 日）</div>
+                <ResponsiveContainer width="100%" height={180}>
+                  <BarChart data={analytics.regime.daily.map(d => ({
+                    date: d.date.slice(5), wr: d.winrate != null ? +(d.winrate * 100).toFixed(1) : 0, n: d.n,
+                  }))} margin={{ top: 16, right: 12, left: 0, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                    <XAxis dataKey="date" tick={{ fontSize: 10 }} stroke="#9ca3af" />
+                    <YAxis domain={[0, 100]} tick={{ fontSize: 10 }} stroke="#9ca3af" width={40}
+                      tickFormatter={(v: number) => v + '%'} />
+                    <Tooltip
+                      contentStyle={{ fontSize: 12, borderRadius: 8, border: '1px solid #e5e7eb' }}
+                      formatter={(v, n, item) => n === 'wr'
+                        ? [`${v}%（n=${(item?.payload as { n?: number })?.n ?? '-'}）`, '胜率']
+                        : [String(v), String(n)]}
+                    />
+                    <ReferenceLine y={50} stroke="#9ca3af" strokeDasharray="4 4" />
+                    <Bar dataKey="wr" fill="#3b82f6" fillOpacity={0.75} radius={[3, 3, 0, 0]} isAnimationActive={false} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </>
+            )}
+          </>
+        )}
+      </Card>
+    </div>
   )
 }

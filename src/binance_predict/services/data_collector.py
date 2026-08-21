@@ -190,19 +190,22 @@ class BinanceDataCollector:
             return 0.0
 
     async def fetch_recent_klines(self, interval: str, limit: int) -> list[dict]:
-        """拉最近 limit 根已收盘 K 线（升序），供周期收盘质量判定使用。
+        """拉最近 limit 根已收盘 K 线（升序），供周期收盘质量判定与图表 API 使用。
 
         多拉 1 根并丢弃最后一根（当前未收盘的 K），保证返回的全部是完整 K。
 
         Args:
-            interval: K 线周期（"5m" | "15m"）
+            interval: K 线周期（"5m" | "15m" | "1h" | "4h" | "1d"）
             limit: 需要的已收盘 K 线数量
 
         Returns:
             [{"open_time", "open", "high", "low", "close", "volume"}, ...]（升序）；
             失败返回空列表，调用方下轮重试。
         """
-        interval_ms = {"5m": 300_000, "15m": 900_000}.get(interval)
+        interval_ms = {
+            "5m": 300_000, "15m": 900_000,
+            "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000,
+        }.get(interval)
         if interval_ms is None:
             logger.warning("fetch_recent_klines 不支持的周期 | interval={}", interval)
             return []

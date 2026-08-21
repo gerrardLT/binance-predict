@@ -20,6 +20,11 @@ sentiment_windows.bak.json
 windows_with_price.json
 prediction_market_samples.json
 prediction_market_samples.bak.json
+# 线上拉取的带日期数据快照（如 *_online_20260819.json，体积大）
+sentiment_windows_online_*.json
+prediction_market_samples_online_*.json
+online_signals_now*.json
+online_shadow_now*.json
 *.dump
 
 # 虚拟环境
@@ -40,6 +45,9 @@ semantic-review/
 # Kiro IDE 自动生成的 specs
 .kiro/
 
+# Qoder IDE 本地配置
+.qoder/
+
 # 操作系统文件
 .DS_Store
 Thumbs.db
@@ -47,16 +55,3 @@ Thumbs.db
 
 # 日志
 *.log
-# Python-generated files
-__pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-
-# Virtual environments
-.venv
-
-# 本地密钥与运行配置
-.env

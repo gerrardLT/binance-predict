@@ -1779,6 +1779,222 @@ async def get_prediction_market_chart_15m(
 
 
 # ============================================================
+# 信号分析面板 API（胜率曲线 × BTC K线 × 周期归因）
+# 口径与 scripts/local_shadow_full_analysis.py、local_scene_signal_full_analysis.py
+# 审计后版本一致：三套 EV 口径、逐版本盈亏平衡、PUMP_TS 周期切分。
+# ============================================================
+
+# 影子三版本回测冻结基准（胜率, EV, 说明）
+SHADOW_BENCH: dict[str, tuple[float, float, str]] = {
+    "x4_v1": (0.635, 0.254, "错位: 本窗收阳&end≤40 → 次窗 DOWN"),
+    "quote_momentum_v1": (0.799, 0.097, "顺势: 深折价方向同窗押注"),
+    "quote_contrarian_v1": (0.240, 0.155, "逆势: 赔率型，胜率低赔率高"),
+}
+# 周期切分点：08-19 00:00 UTC（三根大阳起点）；< 为震荡期（大涨前），≥ 为大涨期
+PUMP_TS_MS = int(datetime(2026, 8, 19, tzinfo=timezone.utc).timestamp() * 1000)
+
+# BTC K 线图表缓存：interval:档位 -> (缓存时刻, klines)，避免前端轮询打爆 Binance。
+# limit 就近向上归档到固定档位，防止任意 limit 枚举缓存键绕过保护。
+_BTC_KLINE_LIMIT_TIERS = (30, 60, 120, 168, 200)
+_btc_kline_cache: dict[str, tuple[float, list[dict]]] = {}
+_BTC_KLINE_CACHE_TTL = 60.0
+# 短负缓存：interval -> 上次上游失败时刻（10s 内直接返回空，避免轮询连环打上游）
+_btc_kline_fail: dict[str, float] = {}
+_BTC_KLINE_FAIL_TTL = 10.0
+
+
+@app.get("/api/chart/btc-klines")
+async def get_btc_klines(interval: str = "1d", limit: int = 30):
+    """BTC K 线代理（信号分析面板背景图）：仅返回已收盘 K，升序。"""
+    if interval not in ("1h", "4h", "1d"):
+        raise HTTPException(status_code=422, detail=f"interval 仅支持 1h/4h/1d: {interval}")
+    limit = max(10, min(limit, 200))
+    tier = next((t for t in _BTC_KLINE_LIMIT_TIERS if t >= limit), _BTC_KLINE_LIMIT_TIERS[-1])
+    now = time.time()
+    if now - _btc_kline_fail.get(interval, 0.0) < _BTC_KLINE_FAIL_TTL:
+        return {"interval": interval, "klines": []}
+    key = f"{interval}:{tier}"
+    cached = _btc_kline_cache.get(key)
+    if cached and now - cached[0] < _BTC_KLINE_CACHE_TTL:
+        return {"interval": interval, "klines": cached[1][-limit:]}
+    klines = await collector.fetch_recent_klines(interval, tier)
+    if klines:
+        _btc_kline_cache[key] = (now, klines)
+    else:
+        _btc_kline_fail[interval] = now
+    return {"interval": interval, "klines": klines[-limit:] if klines else []}
+
+
+def _shadow_breakeven(version: str, q: float) -> float:
+    """逐笔盈亏平衡胜率（与各版本 EV 口径一致）：x4 含溢 0.01，其余无溢价。"""
+    return (q + 0.01) / 0.98 if version == "x4_v1" else q / 0.98
+
+
+_CURVE_MAX_POINTS = 500  # 单版本曲线点数上限（防响应体随信号量无界膨胀）
+
+
+@app.get("/api/signals/analytics")
+async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
+    """信号分析面板聚合端点：口径常量固化在后端（单一事实源）。
+
+    - shadow: 影子各版本累计胜率/EV 曲线 + 汇总（含逐笔平均盈亏平衡、回测基准）
+      —— EV 直读落库 ev_at_entry（与审计「逐笔交叉验证零误差」口径同源）
+    - scene: 各场景（pattern_type）累计胜率曲线 + 汇总（基准=research_win_rates）；
+      EV 按审计口径现算（费2%+溢0.01 逐笔实现 EV：赢 0.98/(q+0.01)−1 截断 / 输 −1，
+      q 按 side 取 entry_up/down_15m，缺失不计入）——落库 ev_at_entry 是期望 EV 口径，
+      与审计实现口径不可混用
+    - regime: 大涨前(<08-19 UTC) vs 大涨期胜率对比（合并 + 逐影子版本）+ 按 UTC 日胜率
+    胜负判定（场景/legacy）按 side 映射：side=high 押 DOWN、side=low 押 UP，
+    与 /api/fake-breakout/stats 的 compute_pattern_stats 同语义。
+    """
+    from sqlalchemy import or_ as sa_or, select as sa_select
+
+    from .db.models import MisalignmentSignal
+    from .services.fake_breakout_detector import RESEARCH_WIN_RATES
+
+    # ---- 影子信号：全量 SETTLED 升序（仅取所需列，避免整行 ORM 实体化）----
+    sh_rows = (await db.execute(
+        sa_select(
+            MisalignmentSignal.version, MisalignmentSignal.window_start,
+            MisalignmentSignal.win, MisalignmentSignal.ev_at_entry,
+            MisalignmentSignal.entry_down_price, MisalignmentSignal.entry_up_price,
+            MisalignmentSignal.direction,
+        )
+        .where(MisalignmentSignal.status == "SETTLED")
+        .order_by(MisalignmentSignal.window_start)
+    )).all()
+    # 版本 = 冻结基准已知版本 ∪ 数据中出现的版本（新版本缺基准不崩，bench 为 None）
+    versions = ["x4_v1", "quote_momentum_v1", "quote_contrarian_v1"]
+    versions += sorted({s.version for s in sh_rows} - set(versions))
+    shadow = {}
+    for v in versions:
+        g = [s for s in sh_rows if s.version == v and s.win is not None]
+        curve, wins, evs, bes = [], 0, [], []
+        cum_ev = 0.0
+        for i, s in enumerate(g, 1):
+            wins += int(bool(s.win))
+            if s.ev_at_entry is not None:
+                evs.append(float(s.ev_at_entry))
+                cum_ev += float(s.ev_at_entry)
+            q = s.entry_down_price if s.direction == "DOWN" else s.entry_up_price
+            if q:
+                bes.append(_shadow_breakeven(v, float(q)))
+            curve.append({
+                "i": i, "ts": s.window_start,
+                "cum_wr": round(wins / i, 4), "cum_ev": round(cum_ev, 4),
+            })
+        n = len(g)
+        bwr, bev, desc = SHADOW_BENCH.get(v, (None, None, ""))
+        shadow[v] = {
+            "summary": {
+                "n": n,
+                "win_rate": wins / n if n else None,
+                "avg_ev": sum(evs) / len(evs) if evs else None,
+                "cum_ev": round(cum_ev, 4) if evs else None,
+                "avg_breakeven": sum(bes) / len(bes) if bes else None,
+                "bench_winrate": bwr, "bench_ev": bev, "desc": desc,
+            },
+            "curve": curve[-_CURVE_MAX_POINTS:],
+        }
+
+    # ---- 场景信号：正式信号（version NULL/v1）按 pattern_type 分组 ----
+    sc_rows = (await db.execute(
+        sa_select(
+            FakeBreakoutSignal.signal_time, FakeBreakoutSignal.side,
+            FakeBreakoutSignal.settle_outcome, FakeBreakoutSignal.pattern_type,
+            FakeBreakoutSignal.pattern, FakeBreakoutSignal.cumulative_winrate,
+            FakeBreakoutSignal.entry_down_price_15m, FakeBreakoutSignal.entry_up_price_15m,
+        )
+        .where(FakeBreakoutSignal.status == "SETTLED")
+        .where(sa_or(FakeBreakoutSignal.version.is_(None), FakeBreakoutSignal.version == "v1"))
+        .order_by(FakeBreakoutSignal.signal_time)
+    )).all()
+    by_pt: dict[str, list] = {}
+    for r in sc_rows:
+        by_pt.setdefault(r.pattern_type or r.pattern or "legacy", []).append(r)
+    scene = {}
+    for pt, rows_pt in sorted(by_pt.items()):
+        curve, wins, evs = [], 0, []
+        cum_ev = 0.0
+        for i, r in enumerate(rows_pt, 1):
+            won = r.settle_outcome == ("DOWN" if r.side == "high" else "UP")
+            wins += int(won)
+            # 审计口径逐笔实现 EV：赢 0.98/(q+0.01)−1（截断[0.01,0.99]）/ 输 −1；
+            # q 按 side 取入场报价，缺失不计入（与 local_scene_signal_full_analysis.py 一致）
+            q = r.entry_up_price_15m if r.side == "low" else r.entry_down_price_15m
+            ev = None
+            if q and float(q) > 0:
+                ev = (0.98 / min(max(float(q) + 0.01, 0.01), 0.99) - 1.0) if won else -1.0
+                evs.append(ev)
+                cum_ev += ev
+            # 累计胜率优先 DB 落库字段（detector 同口径），缺失回退自算
+            cw = r.cumulative_winrate if r.cumulative_winrate is not None else wins / i
+            curve.append({
+                "i": i, "ts": r.signal_time,
+                "cum_wr": round(float(cw), 4), "cum_ev": round(cum_ev, 4),
+            })
+        n = len(rows_pt)
+        scene[pt] = {
+            "summary": {
+                "n": n,
+                "winrate": wins / n if n else None,
+                "avg_ev": sum(evs) / len(evs) if evs else None,
+                "cum_ev": round(cum_ev, 4) if evs else None,
+                "bench_winrate": RESEARCH_WIN_RATES.get(pt),
+            },
+            "curve": curve[-_CURVE_MAX_POINTS:],
+        }
+
+    # ---- 周期归因：场景 + 影子合并的 pre/pump 切分、逐影子版本拆分与按天胜率 ----
+    pairs: list[tuple[int, bool]] = [
+        (s.window_start, bool(s.win))
+        for s in sh_rows if s.win is not None
+    ]
+    pairs += [
+        (r.signal_time, r.settle_outcome == ("DOWN" if r.side == "high" else "UP"))
+        for rows_pt in by_pt.values() for r in rows_pt
+    ]
+    phases: dict[str, list[int]] = {}
+    daily: dict[str, list[int]] = {}
+    # 逐影子版本 × 阶段（对齐审计报告「表二」的归因维度）
+    by_version: dict[str, dict[str, dict]] = {}
+    for s in sh_rows:
+        if s.win is None:
+            continue
+        ph = "pump" if s.window_start >= PUMP_TS_MS else "pre"
+        g = by_version.setdefault(s.version, {}).setdefault(ph, {"n": 0, "wins": 0})
+        g["n"] += 1
+        g["wins"] += int(bool(s.win))
+    for v in by_version:
+        for ph, g in by_version[v].items():
+            g["winrate"] = g["wins"] / g["n"] if g["n"] else None
+    for ts, won in pairs:
+        ph = phases.setdefault("pump" if ts >= PUMP_TS_MS else "pre", [0, 0])
+        ph[0] += 1
+        ph[1] += int(won)
+        day = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+        d = daily.setdefault(day, [0, 0])
+        d[0] += 1
+        d[1] += int(won)
+    return {
+        "pump_ts": PUMP_TS_MS,
+        "shadow": shadow,
+        "scene": scene,
+        "regime": {
+            "phases": {
+                ph: {"n": g[0], "wins": g[1], "winrate": g[1] / g[0] if g[0] else None}
+                for ph, g in phases.items()
+            },
+            "by_version": by_version,
+            "daily": [
+                {"date": day, "n": g[0], "wins": g[1], "winrate": g[1] / g[0] if g[0] else None}
+                for day, g in sorted(daily.items())
+            ],
+        },
+    }
+
+
+# ============================================================
 # 情绪曲线分析 API
 # ============================================================
 
