@@ -12,6 +12,8 @@ collector.fetch_recent_klines 用 AsyncMock patch。
 - 周期切分：window_start/signal_time >= PUMP_TS_MS → pump，否则 pre
 - 影子累计曲线按 window_start 升序，win 非空才计入
 - 影子版本 = 冻结基准 ∪ 数据中出现版本（新版本 bench=None 容错）
+- 场景信号过滤 = 排除 SceneParamVersion 中 SHADOW 版本名（ACTIVE 演进名视为正式）；
+  端点共 3 次 db.execute（影子行 → SHADOW 版本名 → 场景行）
 - K 线缓存键 = interval:档位（limit 归档到固定档），上游失败 10s 负缓存
 """
 
@@ -49,11 +51,13 @@ def _scene_row(**over) -> SimpleNamespace:
 
 def _make_db(shadow_rows, scene_rows) -> AsyncMock:
     db = AsyncMock()
-    r1, r2 = MagicMock(), MagicMock()
-    # 端点用指定列 SELECT，结果直接 .all()（不再 .scalars()）
+    r1, r2, r3 = MagicMock(), MagicMock(), MagicMock()
+    # 端点用指定列 SELECT，结果直接 .all()（不再 .scalars()）；
+    # 3 次查询顺序：影子行 → SceneParamVersion SHADOW 版本名（默认空）→ 场景行
     r1.all.return_value = shadow_rows
-    r2.all.return_value = scene_rows
-    db.execute = AsyncMock(side_effect=[r1, r2])
+    r2.all.return_value = []
+    r3.all.return_value = scene_rows
+    db.execute = AsyncMock(side_effect=[r1, r2, r3])
     return db
 
 
@@ -252,6 +256,39 @@ async def test_analytics_unknown_version_no_bench() -> None:
     assert [p["cum_wr"] for p in blk["curve"]] == [1.0]
     # 已知三版本仍在（含空 contrarian）
     assert "x4_v1" in out["shadow"] and "quote_contrarian_v1" in out["shadow"]
+
+
+def _make_filter_db(shadow_versions=()) -> AsyncMock:
+    """_official_scene_version_filter 专用替身：单次查询返回 SHADOW 版本名行。"""
+    db = AsyncMock()
+    r = MagicMock()
+    r.all.return_value = [(v,) for v in shadow_versions]
+    db.execute = AsyncMock(return_value=r)
+    return db
+
+
+@pytest.mark.asyncio
+async def test_official_version_filter_no_shadow() -> None:
+    """无 SHADOW 版本 → 恒真条件（全部信号视为正式，含 ACTIVE 演进名）。"""
+    import binance_predict.main as m
+    from sqlalchemy import true as sa_true
+
+    clause = await m._official_scene_version_filter(_make_filter_db())
+    assert isinstance(clause, type(sa_true()))
+
+
+@pytest.mark.asyncio
+async def test_official_version_filter_excludes_shadow_keeps_null() -> None:
+    """有 SHADOW 版本 → 排除其版本名；NULL 显式保留（NOT IN 对 NULL 不为 TRUE）。"""
+    import binance_predict.main as m
+
+    clause = await m._official_scene_version_filter(
+        _make_filter_db(["v2-shadow-20260821"]))
+    sql = str(clause.compile(compile_kwargs={"literal_binds": True}))
+    # 排除 SHADOW 名 + NULL OR 保留；ACTIVE 演进名（如 v1-20260816）不落入排除集
+    assert "v2-shadow-20260821" in sql
+    assert "IS NULL" in sql.upper()
+    assert "NOT" in sql.upper()
 
 
 @pytest.mark.asyncio

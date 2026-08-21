@@ -57,7 +57,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from loguru import logger
-from sqlalchemy import desc, select
+from sqlalchemy import desc, or_, select
 
 from ..config.settings import settings
 from ..db.engine import async_session_factory
@@ -1371,21 +1371,25 @@ class FakeBreakoutDetector:
     async def _update_pattern_stats(self, pattern_type: str) -> None:
         """结算后按 pattern_type 回填统计列（ev_at_entry 补齐 + 最新行累计指标）。
 
-        仅正式信号（version NULL/v1，排除影子）；统计口径见 compute_pattern_stats。
+        仅正式信号（排除 SHADOW 版本名，ACTIVE 版本演进兼容）；
+        统计口径见 compute_pattern_stats。
         ev_at_entry 按入场报价与真 OOS 胜率点估计补算（快照缺失回退 0.51 理论价）。
         """
+        shadow_names = [s["version"] for s in self._shadow_versions]
         try:
             async with async_session_factory() as session:
                 stmt = (
                     select(FakeBreakoutSignal)
                     .where(FakeBreakoutSignal.pattern_type == pattern_type)
                     .where(FakeBreakoutSignal.status == "SETTLED")
-                    .where(
-                        (FakeBreakoutSignal.version.is_(None))
-                        | (FakeBreakoutSignal.version == "v1")
-                    )
                     .order_by(FakeBreakoutSignal.signal_time)
                 )
+                if shadow_names:
+                    # NULL 须显式保留（SQL 中 NOT (NULL IN ...) 不为 TRUE）
+                    stmt = stmt.where(
+                        or_(FakeBreakoutSignal.version.is_(None),
+                            ~FakeBreakoutSignal.version.in_(shadow_names))
+                    )
                 rows = (await session.execute(stmt)).scalars().all()
                 if not rows:
                     return

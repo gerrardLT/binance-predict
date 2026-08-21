@@ -1408,14 +1408,12 @@ async def get_fake_breakout_stats(db: AsyncSession = Depends(get_db)):
     by_group.sort(key=lambda x: (x["level"], x["side"], x["pattern"] or ""))
 
     # 按场景类型（pattern_type）的实盘统计：胜率 / 累计EV / 入场EV / 收益曲线 / 回撤
-    # （仅正式信号：version NULL/v1，排除影子；口径与 detector._update_pattern_stats 一致）
+    # （仅正式信号：排除 SHADOW 版本名，ACTIVE 版本演进兼容；
+    #   口径与 detector._update_pattern_stats 一致）
     pt_rows = (await db.execute(
         sa_select(FakeBreakoutSignal)
         .where(FakeBreakoutSignal.status == "SETTLED")
-        .where(
-            (FakeBreakoutSignal.version.is_(None))
-            | (FakeBreakoutSignal.version == "v1")
-        )
+        .where(await _official_scene_version_filter(db))
         .order_by(FakeBreakoutSignal.signal_time)
     )).scalars().all()
     by_pt: dict[str, list] = {}
@@ -1830,6 +1828,30 @@ def _shadow_breakeven(version: str, q: float) -> float:
     return (q + 0.01) / 0.98 if version == "x4_v1" else q / 0.98
 
 
+async def _official_scene_version_filter(db: AsyncSession):
+    """正式场景信号的 version 过滤条件：排除 SHADOW 版本名，其余均为正式信号。
+
+    FakeBreakoutSignal.version 语义：NULL/v1/历史 ACTIVE 名（如 v1-20260816）均为
+    正式信号；仅 SceneParamVersion 中 status=SHADOW 的版本名是影子对照行。
+    旧口径「version NULL/v1」在 ACTIVE 版本演进后会把正式信号误排除
+    （2026-08-16 起 ACTIVE=v1-20260816，导致 stats/面板只剩少量历史样本）。
+    NULL 行须显式 OR 保留（SQL 中 NOT (NULL IN ...) 不为 TRUE）。
+    """
+    from sqlalchemy import not_ as sa_not, or_ as sa_or, select as sa_select, true as sa_true
+
+    from .db.models import SceneParamVersion
+
+    shadow_names = [r[0] for r in (await db.execute(
+        sa_select(SceneParamVersion.version).where(SceneParamVersion.status == "SHADOW")
+    )).all()]
+    if not shadow_names:
+        return sa_true()
+    return sa_or(
+        FakeBreakoutSignal.version.is_(None),
+        sa_not(FakeBreakoutSignal.version.in_(shadow_names)),
+    )
+
+
 _CURVE_MAX_POINTS = 500  # 单版本曲线点数上限（防响应体随信号量无界膨胀）
 
 
@@ -1847,7 +1869,7 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
     胜负判定（场景/legacy）按 side 映射：side=high 押 DOWN、side=low 押 UP，
     与 /api/fake-breakout/stats 的 compute_pattern_stats 同语义。
     """
-    from sqlalchemy import or_ as sa_or, select as sa_select
+    from sqlalchemy import select as sa_select
 
     from .db.models import MisalignmentSignal
     from .services.fake_breakout_detector import RESEARCH_WIN_RATES
@@ -1897,7 +1919,8 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
             "curve": curve[-_CURVE_MAX_POINTS:],
         }
 
-    # ---- 场景信号：正式信号（version NULL/v1）按 pattern_type 分组 ----
+    # ---- 场景信号：正式信号（排除 SHADOW 版本名；ACTIVE 版本演进兼容）按 pattern_type 分组 ----
+    official_ver = await _official_scene_version_filter(db)
     sc_rows = (await db.execute(
         sa_select(
             FakeBreakoutSignal.signal_time, FakeBreakoutSignal.side,
@@ -1906,7 +1929,7 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
             FakeBreakoutSignal.entry_down_price_15m, FakeBreakoutSignal.entry_up_price_15m,
         )
         .where(FakeBreakoutSignal.status == "SETTLED")
-        .where(sa_or(FakeBreakoutSignal.version.is_(None), FakeBreakoutSignal.version == "v1"))
+        .where(official_ver)
         .order_by(FakeBreakoutSignal.signal_time)
     )).all()
     by_pt: dict[str, list] = {}
