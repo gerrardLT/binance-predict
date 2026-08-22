@@ -243,21 +243,28 @@ class BinancePredictionTrader:
         失败返回 None，详情写入 last_api_error。
         """
         amount_wei = str(int(round(amount_usdt * 10**18)))
-        signed_url = self._build_signed_url(
-            "/sapi/v1/w3w/wallet/prediction/transfer/inbound",
-            {
-                "walletId": self._wallet_id,
-                "walletAddress": self._wallet_address,
-                "fromTokenAmount": amount_wei,
-                "accountType": "SPOT",
-                "sourceBiz": "USER_TRANSFER",
-            },
-        )
+        params = {
+            "walletId": self._wallet_id,
+            "walletAddress": self._wallet_address,
+            "fromTokenAmount": amount_wei,
+            "accountType": "SPOT",
+            "sourceBiz": "USER_TRANSFER",
+        }
+        # 官方示例参数走 --data 请求体：签名覆盖全部参数（含 timestamp/
+        # recvWindow），业务参数以 JSON body 发送；全放 query 会报 -9000。
+        signed = self._sign_request(dict(params))
+        timestamp = signed["timestamp"]
+        recv_window = signed["recvWindow"]
+        signature = signed["signature"]
 
         try:
             client = self._get_client()
             resp = await client.post(
-                signed_url,
+                (
+                    f"{self.BASE_URL}/sapi/v1/w3w/wallet/prediction/transfer/inbound"
+                    f"?timestamp={timestamp}&recvWindow={recv_window}&signature={signature}"
+                ),
+                json=params,
                 headers={"X-MBX-APIKEY": self._api_key},
             )
             resp.raise_for_status()
