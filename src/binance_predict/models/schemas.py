@@ -253,6 +253,17 @@ class CommitDeepLearnRequest(BaseModel):
     )
 
 
+class ManualTradeTestRequest(BaseModel):
+    """实盘链路人工测试单请求（POST /api/trade/test，小额验证全链路）。"""
+
+    amount_usdt: float = Field(
+        default=1.0, description="测试单金额（USDT），端点硬限 0.1~5"
+    )
+    prediction: str = Field(
+        default="DOWN", description="方向 UP/DOWN（测试单随意，验证链路为目的）"
+    )
+
+
 # ============================================================
 # LLM 调用轨迹（前端「LLM 轨迹」面板）
 # ============================================================

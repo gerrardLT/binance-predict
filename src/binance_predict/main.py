@@ -40,7 +40,7 @@ from .db.models import (
     SceneParamVersion,
     SentimentWindow,
 )
-from .models.schemas import CommitDeepLearnRequest
+from .models.schemas import CommitDeepLearnRequest, ManualTradeTestRequest
 from .services.agent_scheduler import AgentScheduler
 from .services.data_collector import BinanceDataCollector
 from .services.fake_breakout_detector import FakeBreakoutDetector
@@ -1678,6 +1678,46 @@ async def get_prediction_wallet(
         "wallet_address": _mask_addr(wallet.get("walletAddress")),
         "wallet_id": wallet.get("walletId"),
         "registered_time": wallet.get("registeredTime"),
+    }
+
+
+@app.post("/api/trade/test")
+async def manual_trade_test(
+    req: ManualTradeTestRequest,
+    _: None = Depends(_require_auth),
+):
+    """实盘链路人工测试单：钱包→市场→报价→下单→落库全链路验证。
+
+    与信号实盘共用 execute_signal_trade（先占位后下单），signal_version="manual_test"：
+    同一 5m 窗口至多一单（唯一键防重），订单落 trade_orders 表可追溯。
+    金额硬限 0.1~5 USDT（链路验证用途，非交易通道）；不设执行价护栏。"""
+    if not (0.1 <= req.amount_usdt <= 5.0):
+        return {"error": "amount_usdt 仅允许 0.1~5（小额链路测试）"}
+    if req.prediction not in ("UP", "DOWN"):
+        return {"error": "prediction 仅允许 UP/DOWN"}
+
+    window_start = int(time.time() * 1000) // 300_000 * 300_000  # 当前 5m 窗口起点
+    order = await prediction_trader.execute_signal_trade(
+        prediction=req.prediction,
+        amount_usdt=req.amount_usdt,
+        signal_version="manual_test",
+        window_start=window_start,
+    )
+    if order is None:
+        return {
+            "error": "下单未执行（API Key 未配置 / 钱包获取失败 / 本窗口已有测试单）",
+            "window_start": window_start,
+        }
+    quote = order.quote_json or {}
+    return {
+        "status": order.status,
+        "order_id": order.order_id,
+        "signal_version": order.signal_version,
+        "window_start": order.window_start,
+        "token_id": order.token_id or None,
+        "average_price": quote.get("averagePrice"),
+        "amount_in": quote.get("amountIn"),
+        "error_message": order.error_message,
     }
 
 
