@@ -1911,16 +1911,29 @@ async def tail_logs(
 
     maxlen = max(1, min(int(lines), 1000))
     buf: deque = deque(maxlen=maxlen)
+    out: list[str] = []
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
-            for ln in f:
-                buf.append(ln.rstrip("\n"))
+            if grep:
+                # grep 模式：全文件流式过滤后取尾部（tail 窗口太浅会错过早期目标行）
+                for ln in f:
+                    ln = ln.rstrip("\n")
+                    if grep in ln:
+                        out.append(ln)
+                out = out[-maxlen:]
+                tail_lines = -1  # 全文件扫描
+            else:
+                for ln in f:
+                    buf.append(ln.rstrip("\n"))
     except Exception as e:
         return {"error": f"读取失败: {e}"}
 
-    out = [ln for ln in buf if (not grep or grep in ln)]
+    if not grep:
+        out = list(buf)
     return {
-        "path": path, "tail_lines": len(buf), "matched": len(out),
+        "path": path,
+        "tail_lines": len(buf) if not grep else tail_lines,
+        "matched": len(out),
         "lines": out, "cwd": os.getcwd(), "entries": entries,
     }
 
