@@ -1809,7 +1809,8 @@ async def get_binance_order_history(
     limit = max(1, min(int(limit), 100))
     orders = await prediction_trader.query_order_history(limit=limit)
     if orders is None:
-        return {"error": "查询失败（详见后端日志）", "orders": []}
+        # 回显币安侧具体错误，便于定位参数/权限问题
+        return {"error": prediction_trader.last_api_error or "查询失败（详见后端日志）", "orders": []}
     return {"orders": orders}
 
 

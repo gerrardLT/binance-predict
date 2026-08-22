@@ -281,11 +281,13 @@ class BinancePredictionTrader:
         """查询预测钱包订单历史（GET order/history）。
 
         用途：本地落库卡 PENDING 时对账，确认币安侧是否真实成交（钱是否
-        已花出）。失败返回 None。
+        已花出）。失败返回 None，详情写入 last_api_error（参数口径待与
+        官方文档核对，错误回显便于定位）。
         """
+        self.last_api_error = None
+        # 文档示例仅 walletAddress（不传 walletId，避免多余参数报错）
         params = self._sign_request({
             "walletAddress": self._wallet_address,
-            "walletId": self._wallet_id,
             "limit": limit,
         })
         try:
@@ -298,15 +300,21 @@ class BinancePredictionTrader:
             resp.raise_for_status()
             data = resp.json()
         except httpx.HTTPStatusError as e:
+            self.last_api_error = f"HTTP {e.response.status_code}: {e.response.text[:300]}"
             logger.error("查询订单历史失败 (HTTP {}): {}", e.response.status_code, e.response.text[:300])
             return None
         except Exception as e:
+            self.last_api_error = f"{type(e).__name__}: {e}"
             logger.error("查询订单历史失败: {}", e)
             return None
 
         if isinstance(data, list):
             return data
-        return data.get("orders", data.get("items", []))
+        if isinstance(data, dict):
+            orders = data.get("orders") or data.get("items")
+            if isinstance(orders, list):
+                return orders
+        return [data]
 
     @staticmethod
     def _classify_period(market: dict) -> str | None:
