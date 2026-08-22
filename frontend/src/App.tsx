@@ -586,22 +586,22 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen bg-gray-50 flex flex-col">
+    <div className="min-h-screen bg-[var(--bg)] flex flex-col">
       <header className="bg-white/95 backdrop-blur border-b border-gray-200 sticky top-0 z-10 shadow-sm">
         <div className="max-w-6xl mx-auto px-4 py-2 flex items-center justify-between gap-4 flex-wrap">
           {/* 左上角：紧凑标题 */}
           <div className="flex items-center gap-2 shrink-0">
-            <span className="inline-block w-1.5 h-4 bg-blue-500 rounded-full" />
+            <span className="inline-block w-1.5 h-4 bg-brand rounded-full" />
             <h1 className="text-sm font-bold text-gray-800 whitespace-nowrap">BTC 情绪 Agent V3</h1>
           </div>
 
           {/* 中部：标签切换（高对比度） */}
-          <div className="flex items-center gap-1 bg-gray-100 rounded-lg p-1">
+          <div className="flex items-center gap-1 bg-gray-100 rounded-full p-1">
             <button
               onClick={() => setTab('market')}
-              className={`px-4 py-1.5 text-sm font-semibold rounded-md transition ${
+              className={`px-4 py-1.5 text-sm font-semibold rounded-full transition ${
                 tab === 'market'
-                  ? 'bg-white text-blue-600 shadow-sm'
+                  ? 'bg-white text-brand shadow-sm'
                   : 'text-gray-600 hover:text-gray-900 hover:bg-white/60'
               }`}
             >
@@ -609,9 +609,9 @@ export default function App() {
             </button>
             <button
               onClick={() => setTab('agent')}
-              className={`px-4 py-1.5 text-sm font-semibold rounded-md transition ${
+              className={`px-4 py-1.5 text-sm font-semibold rounded-full transition ${
                 tab === 'agent'
-                  ? 'bg-white text-blue-600 shadow-sm'
+                  ? 'bg-white text-brand shadow-sm'
                   : 'text-gray-600 hover:text-gray-900 hover:bg-white/60'
               }`}
             >
@@ -619,9 +619,9 @@ export default function App() {
             </button>
             <button
               onClick={() => setTab('monitor')}
-              className={`px-4 py-1.5 text-sm font-semibold rounded-md transition ${
+              className={`px-4 py-1.5 text-sm font-semibold rounded-full transition ${
                 tab === 'monitor'
-                  ? 'bg-white text-blue-600 shadow-sm'
+                  ? 'bg-white text-brand shadow-sm'
                   : 'text-gray-600 hover:text-gray-900 hover:bg-white/60'
               }`}
             >
@@ -629,9 +629,9 @@ export default function App() {
             </button>
             <button
               onClick={() => setTab('analysis')}
-              className={`px-4 py-1.5 text-sm font-semibold rounded-md transition ${
+              className={`px-4 py-1.5 text-sm font-semibold rounded-full transition ${
                 tab === 'analysis'
-                  ? 'bg-white text-blue-600 shadow-sm'
+                  ? 'bg-white text-brand shadow-sm'
                   : 'text-gray-600 hover:text-gray-900 hover:bg-white/60'
               }`}
             >
@@ -719,7 +719,7 @@ export default function App() {
               <button
                 onClick={handleMomentum}
                 disabled={momentumLoading}
-                className="px-4 py-2 text-sm font-medium text-white bg-cyan-600 rounded-lg hover:bg-cyan-700 disabled:opacity-50 transition mb-4"
+                className="px-4 py-2 text-sm font-medium text-white bg-cyan-600 rounded-full hover:bg-cyan-700 disabled:opacity-50 transition mb-4"
               >
                 {momentumLoading ? '📊 计算中...' : '📊 运行概率动量分析'}
               </button>
@@ -873,21 +873,21 @@ function AgentTab() {
         ) : <div className="text-gray-400 text-center text-sm flex-1">加载中...</div>}
         <button
           onClick={() => setDlOpen(true)}
-          className="shrink-0 px-3 py-1.5 text-xs font-semibold text-white bg-purple-600 rounded-lg hover:bg-purple-700 transition"
+          className="shrink-0 px-3 py-1.5 text-xs font-semibold text-white bg-purple-600 rounded-full hover:bg-purple-700 transition"
           title="全量历史深度分析：预览发现结果，审核后写入模式库"
         >
           🔬 深度学习
         </button>
         <button
           onClick={() => setCmpOpen(true)}
-          className="shrink-0 px-3 py-1.5 text-xs font-semibold text-white bg-teal-600 rounded-lg hover:bg-teal-700 transition"
+          className="shrink-0 px-3 py-1.5 text-xs font-semibold text-white bg-teal-600 rounded-full hover:bg-teal-700 transition"
           title="同一数据上对比纯 LLM 版与 Python 聚类版的多维准确率"
         >
           ⚖️ 方案对比
         </button>
         <button
           onClick={() => setEvoOpen(true)}
-          className="shrink-0 px-3 py-1.5 text-xs font-semibold text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition"
+          className="shrink-0 px-3 py-1.5 text-xs font-semibold text-white bg-brand rounded-full hover:bg-brand-hover transition"
           title="用样本外胜率趋势/代际对比/分轨证明系统在变好而非只在变化"
         >
           📈 进化看板
@@ -989,7 +989,7 @@ function AgentTab() {
             <select
               value={dirFilter}
               onChange={e => { setDirFilter(e.target.value); refreshPredictions(e.target.value || undefined) }}
-              className="px-2 py-0.5 border border-gray-200 rounded-lg text-[11px] focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className="px-2 py-0.5 border border-gray-200 rounded-lg text-[11px] focus:outline-none focus:ring-2 focus:ring-brand"
             >
               <option value="">全部方向</option>
               <option value="UP">UP</option>
@@ -1088,7 +1088,7 @@ function EvolutionModal({ onClose }: { onClose: () => void }) {
 
   return (
     <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
-      <div className="bg-white rounded-xl shadow-2xl w-full max-w-4xl max-h-[88vh] flex flex-col" onClick={e => e.stopPropagation()}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-4xl max-h-[88vh] flex flex-col" onClick={e => e.stopPropagation()}>
         {/* 头部 */}
         <div className="px-5 py-3 border-b border-gray-200 flex items-center justify-between shrink-0">
           <div>
@@ -1097,7 +1097,7 @@ function EvolutionModal({ onClose }: { onClose: () => void }) {
           </div>
           <div className="flex items-center gap-2">
             <select value={days} onChange={e => setDays(Number(e.target.value))}
-              className="px-2 py-1 border border-gray-200 rounded-lg text-[11px] focus:outline-none focus:ring-2 focus:ring-blue-500">
+              className="px-2 py-1 border border-gray-200 rounded-lg text-[11px] focus:outline-none focus:ring-2 focus:ring-brand">
               <option value={7}>近 7 天</option>
               <option value={30}>近 30 天</option>
               <option value={90}>近 90 天</option>
@@ -1678,7 +1678,7 @@ function DeepLearnModal({ onClose, onCommitted }: { onClose: () => void; onCommi
   return (
     <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
       <div
-        className="bg-white rounded-xl shadow-2xl w-full max-w-3xl max-h-[85vh] flex flex-col"
+        className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[85vh] flex flex-col"
         onClick={e => e.stopPropagation()}
       >
         {/* 头部 */}
@@ -1706,7 +1706,7 @@ function DeepLearnModal({ onClose, onCommitted }: { onClose: () => void; onCommi
             <button
               onClick={runAnalyze}
               disabled={phase === 'analyzing' || phase === 'committing'}
-              className="px-3 py-1.5 text-xs font-semibold text-white bg-purple-600 rounded-lg hover:bg-purple-700 disabled:opacity-50 transition"
+              className="px-3 py-1.5 text-xs font-semibold text-white bg-purple-600 rounded-full hover:bg-purple-700 disabled:opacity-50 transition"
             >
               {phase === 'analyzing' ? '🔄 LLM 分析中...' : '开始分析'}
             </button>
@@ -1789,7 +1789,7 @@ function DeepLearnModal({ onClose, onCommitted }: { onClose: () => void; onCommi
                         <button
                           type="button"
                           onClick={e => { e.preventDefault(); setExpanded(expanded === i ? null : i) }}
-                          className="mt-1 text-[10px] text-blue-600 hover:underline"
+                          className="mt-1 text-[10px] text-brand hover:underline"
                         >
                           {expanded === i ? '收起特征/条件' : '查看特征/条件'}
                         </button>

@@ -1,20 +1,46 @@
 @import "tailwindcss";
+
+/* ============ atoms.dev design tokens ============
+   来源：docs/research/atoms-dev-c15a3ca0/zh-d83abd2e/DESIGN_TOKENS.md
+   通过 @theme 重映射，现有 Tailwind 工具类自动获得 atoms 风格：
+   - font-sans/mono → IBM Plex 家族
+   - rounded-xl → 16px（atoms radius-card）
+   - rounded-2xl → 24px（atoms radius-panel）
+   - brand → #4267FF（atoms --brand） */
+@theme {
+  --font-sans:
+    "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", Roboto, "Noto Sans", "PingFang SC", "Microsoft YaHei",
+    sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+
+  --color-brand: #4267ff;
+  --color-brand-hover: #2f54eb;
+  --color-brand-soft: #e4e9ff;
+
+  --radius-xl: 1rem;
+  --radius-2xl: 1.5rem;
+}
+
 :root {
-  --text: #6b6375;
-  --text-h: #08060d;
-  --bg: #fff;
-  --border: #e5e4e7;
-  --code-bg: #f4f3ec;
-  --accent: #aa3bff;
-  --accent-bg: rgba(170, 59, 255, 0.1);
-  --accent-border: rgba(170, 59, 255, 0.5);
-  --social-bg: rgba(244, 243, 236, 0.5);
+  --text: rgba(12, 12, 12, 0.55);
+  --text-h: rgba(12, 12, 12, 0.95);
+  --bg: #f6f6f6;
+  --border: #e5e7eb;
+  --code-bg: #f0f0f1;
+  --accent: #4267ff;
+  --accent-bg: rgba(66, 103, 255, 0.08);
+  --accent-border: rgba(66, 103, 255, 0.4);
+  --social-bg: rgba(240, 240, 241, 0.5);
   --shadow:
     rgba(0, 0, 0, 0.1) 0 10px 15px -3px, rgba(0, 0, 0, 0.05) 0 4px 6px -2px;
 
-  --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
-  --heading: system-ui, 'Segoe UI', Roboto, sans-serif;
-  --mono: ui-monospace, Consolas, monospace;
+  --sans:
+    "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", Roboto, "Noto Sans", "PingFang SC", "Microsoft YaHei",
+    sans-serif;
+  --heading: var(--sans);
+  --mono: "IBM Plex Mono", ui-monospace, Consolas, monospace;
 
   font: 18px/145% var(--sans);
   letter-spacing: 0.18px;
@@ -31,6 +57,7 @@
   }
 }
 
+/* 暗色模式：atoms.dev 源站无暗色，沿用宿主原值（字体/圆角仍随 @theme） */
 @media (prefers-color-scheme: dark) {
   :root {
     --text: #9ca3af;
@@ -38,9 +65,9 @@
     --bg: #16171d;
     --border: #2e303a;
     --code-bg: #1f2028;
-    --accent: #c084fc;
-    --accent-bg: rgba(192, 132, 252, 0.15);
-    --accent-border: rgba(192, 132, 252, 0.5);
+    --accent: #7c96ff;
+    --accent-bg: rgba(124, 150, 255, 0.15);
+    --accent-border: rgba(124, 150, 255, 0.5);
     --social-bg: rgba(47, 48, 58, 0.5);
     --shadow:
       rgba(0, 0, 0, 0.4) 0 10px 15px -3px, rgba(0, 0, 0, 0.25) 0 4px 6px -2px;
@@ -70,7 +97,7 @@ body {
 h1,
 h2 {
   font-family: var(--heading);
-  font-weight: 500;
+  font-weight: 600;
   color: var(--text-h);
 }
 
