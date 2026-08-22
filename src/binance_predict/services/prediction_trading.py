@@ -463,6 +463,12 @@ class BinancePredictionTrader:
             resp.raise_for_status()
             quote = resp.json()
             self.last_api_error = None
+            # 防御：成功响应缺 quoteId 时后续 place_order 会 KeyError 报 500，
+            # 提前拦下并透传响应内容供诊断（响应结构变更可及时发现）。
+            if not quote.get("quoteId"):
+                self.last_api_error = f"报价响应缺少 quoteId | resp={str(quote)[:300]}"
+                logger.error("获取报价异常：响应缺少 quoteId | resp={}", quote)
+                return None
             logger.info(
                 "获取报价成功 | token={} | side={} | avgPrice={} | quoteId={}",
                 token_id,
