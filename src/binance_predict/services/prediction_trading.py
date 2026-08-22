@@ -250,8 +250,9 @@ class BinancePredictionTrader:
             "accountType": "SPOT",
             "sourceBiz": "USER_TRANSFER",
         }
-        # 官方示例参数走 --data 请求体：签名覆盖全部参数（含 timestamp/
-        # recvWindow），业务参数以 JSON body 发送；全放 query 会报 -9000。
+        # 官方示例参数走 --data 请求体（表单编码）：签名覆盖全部参数
+        # （含 timestamp/recvWindow），业务参数以 form data 发送；
+        # 全放 query 报 -9000，JSON body 报 -1022。
         signed = self._sign_request(dict(params))
         timestamp = signed["timestamp"]
         recv_window = signed["recvWindow"]
@@ -264,7 +265,7 @@ class BinancePredictionTrader:
                     f"{self.BASE_URL}/sapi/v1/w3w/wallet/prediction/transfer/inbound"
                     f"?timestamp={timestamp}&recvWindow={recv_window}&signature={signature}"
                 ),
-                json=params,
+                data=params,
                 headers={"X-MBX-APIKEY": self._api_key},
             )
             resp.raise_for_status()
