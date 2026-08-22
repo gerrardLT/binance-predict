@@ -1814,6 +1814,67 @@ async def get_binance_order_history(
     return {"orders": orders}
 
 
+@app.post("/api/trades/sync-binance")
+async def sync_binance_orders(_: None = Depends(_require_auth)):
+    """对账回填：用币安侧订单历史把本地卡 PENDING 的行订正为终态。
+
+    场景：端点曾返回 500 但币安侧实际已成交（钱已花出），本地行停留
+    在 PENDING。按 window_start 匹配（slug btc-updown-5m-<秒> 编码窗口
+    起始秒）；币安侧无对应订单的行保持 PENDING 不动。
+    """
+    import re
+    from decimal import Decimal
+    from sqlalchemy import select
+    from .db.models import TradeOrderModel
+
+    if not prediction_trader._api_key:
+        return {"error": "Binance API Key 未配置"}
+    if not prediction_trader._wallet_address:
+        wallet = await prediction_trader.fetch_wallet_info()
+        if not wallet:
+            return {"error": "未找到预测钱包"}
+    history = await prediction_trader.query_order_history(limit=50)
+    if history is None:
+        return {"error": prediction_trader.last_api_error or "查询失败", "synced": 0}
+
+    # slug 末尾即窗口起始秒（如 btc-updown-5m-1787418600）
+    by_window: dict[int, dict] = {}
+    for o in history:
+        if not isinstance(o, dict):
+            continue
+        m = re.search(r"-(\d{10})$", o.get("slug") or "")
+        if m:
+            by_window[int(m.group(1)) * 1000] = o
+
+    synced: list[dict] = []
+    async with async_session_factory() as db:
+        stmt = select(TradeOrderModel).where(
+            TradeOrderModel.status == "PENDING",
+            TradeOrderModel.window_start.isnot(None),
+        )
+        rows = (await db.execute(stmt)).scalars().all()
+        for row in rows:
+            bo = by_window.get(row.window_start)
+            if not bo:
+                continue
+            filled = Decimal(str(bo.get("filledUsdtAmount") or "0"))
+            row.status = "FILLED" if bo.get("status") == "FILLED" else "FAILED"
+            row.order_id = bo.get("orderId")
+            row.amount_in = str(int(filled * (10 ** 18)))
+            row.quote_json = {
+                "averagePrice": float(bo.get("price") or 0),
+                "filledShareQty": bo.get("filledShareQty"),
+                "source": "binance_history_sync",
+            }
+            row.error_message = None
+            synced.append({
+                "id": row.id, "window_start": row.window_start,
+                "status": row.status, "order_id": row.order_id,
+            })
+        await db.commit()
+    return {"synced": len(synced), "details": synced, "binance_orders": len(history)}
+
+
 # ============================================================
 # [DEPRECATED] 情绪曲线回测自动触发（已退役，由 SentimentAgent.learn() 取代）
 # ============================================================

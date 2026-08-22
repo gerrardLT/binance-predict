@@ -264,3 +264,55 @@ async def test_transfer_in_success_and_failure(monkeypatch) -> None:
     out2 = await m.prediction_transfer_in(TransferInboundRequest(amount_usdt=5.0), _=None)
     assert out2["status"] == "FAILED"
     assert "-9000" in out2["error"]
+
+
+# ============================================================
+# POST /api/trades/sync-binance（对账回填卡 PENDING 行）
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_sync_binance_backfills_pending_rows(monkeypatch) -> None:
+    """币安侧 FILLED 订单按 slug 窗口秒匹配 → PENDING 行回填 FILLED；
+    币安侧无对应的行保持 PENDING 不动。"""
+    import binance_predict.main as m
+
+    monkeypatch.setattr(m.prediction_trader, "_api_key", "k")
+    monkeypatch.setattr(m.prediction_trader, "_wallet_address", "0xW")
+
+    async def _history(limit=50):
+        return [{"orderId": "B-1", "slug": "btc-updown-5m-1787418600",
+                 "status": "FILLED", "filledUsdtAmount": "1",
+                 "price": "0.55", "filledShareQty": "1.79"}]
+
+    monkeypatch.setattr(m.prediction_trader, "query_order_history", _history)
+
+    matched = SimpleNamespace(
+        id=7, window_start=1_787_418_600_000, status="PENDING",
+        order_id=None, amount_in="0", quote_json=None, error_message=None)
+    unmatched = SimpleNamespace(
+        id=9, window_start=1_787_419_200_000, status="PENDING",
+        order_id=None, amount_in="0", quote_json=None, error_message=None)
+
+    db = AsyncMock()
+    result = MagicMock()
+    result.scalars.return_value.all.return_value = [matched, unmatched]
+    db.execute = AsyncMock(return_value=result)
+
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def _factory():
+        yield db
+
+    monkeypatch.setattr(m, "async_session_factory", _factory)
+
+    out = await m.sync_binance_orders(_=None)
+    assert out["synced"] == 1
+    assert out["details"][0]["id"] == 7
+    assert matched.status == "FILLED"
+    assert matched.order_id == "B-1"
+    assert matched.amount_in == str(10 ** 18)
+    assert matched.quote_json["averagePrice"] == 0.55
+    assert matched.quote_json["source"] == "binance_history_sync"
+    assert unmatched.status == "PENDING"  # 无对应币安订单 → 不动
+    db.commit.assert_awaited_once()
