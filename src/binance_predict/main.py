@@ -1782,11 +1782,15 @@ async def get_prediction_market_chart_15m(
 # 审计后版本一致：三套 EV 口径、逐版本盈亏平衡、PUMP_TS 周期切分。
 # ============================================================
 
-# 影子三版本回测冻结基准（胜率, EV, 说明）
-SHADOW_BENCH: dict[str, tuple[float, float, str]] = {
+# 影子版本回测冻结基准（胜率, EV, 说明）；v2 为 2026-08-22 5m 归因落地的门禁版，
+# 无独立回测基准（bench=None → 面板不显示基准对比，只看影子实测）
+SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     "x4_v1": (0.635, 0.254, "错位: 本窗收阳&end≤40 → 次窗 DOWN"),
     "quote_momentum_v1": (0.799, 0.097, "顺势: 深折价方向同窗押注"),
     "quote_contrarian_v1": (0.240, 0.155, "逆势: 赔率型，胜率低赔率高"),
+    "x4_v2": (None, None, "错位v2: v1+|past1h|<0.5%平静市（归因: 57.6%/+9.70 vs 23%/−13.8）"),
+    "quote_momentum_v2": (None, None, "顺势v2: v1+触发时已跌≥0.10%（归因: 剔假恐慌 dip<0.15% 段 −0.43）"),
+    "quote_contrarian_v2": (None, None, "逆势v2: v1+触发时未涨≥0.10%（归因: 平盘窗贡献 86% 利润）"),
 }
 # 周期切分点：08-19 00:00 UTC（三根大阳起点）；< 为震荡期（大涨前），≥ 为大涨期
 PUMP_TS_MS = int(datetime(2026, 8, 19, tzinfo=timezone.utc).timestamp() * 1000)
@@ -1824,8 +1828,8 @@ async def get_btc_klines(interval: str = "1d", limit: int = 30):
 
 
 def _shadow_breakeven(version: str, q: float) -> float:
-    """逐笔盈亏平衡胜率（与各版本 EV 口径一致）：x4 含溢 0.01，其余无溢价。"""
-    return (q + 0.01) / 0.98 if version == "x4_v1" else q / 0.98
+    """逐笔盈亏平衡胜率（与各版本 EV 口径一致）：x4 系含溢 0.01，其余无溢价。"""
+    return (q + 0.01) / 0.98 if version.startswith("x4") else q / 0.98
 
 
 async def _official_scene_version_filter(db: AsyncSession):
@@ -1886,7 +1890,10 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
         .order_by(MisalignmentSignal.window_start)
     )).all()
     # 版本 = 冻结基准已知版本 ∪ 数据中出现的版本（新版本缺基准不崩，bench 为 None）
-    versions = ["x4_v1", "quote_momentum_v1", "quote_contrarian_v1"]
+    versions = [
+        "x4_v1", "quote_momentum_v1", "quote_contrarian_v1",
+        "x4_v2", "quote_momentum_v2", "quote_contrarian_v2",  # v2 门禁版（部署即入面板）
+    ]
     versions += sorted({s.version for s in sh_rows} - set(versions))
     shadow = {}
     for v in versions:

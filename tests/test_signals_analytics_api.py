@@ -220,22 +220,36 @@ async def test_analytics_regime_split_and_daily() -> None:
 
 @pytest.mark.asyncio
 async def test_analytics_empty_db() -> None:
-    """空数据：结构完整不崩溃。"""
+    """空数据：结构完整不崩溃（v2 门禁版部署即入面板，bench=None）。"""
     import binance_predict.main as m
 
     db = _make_db([], [])
     out = await m.get_signals_analytics(db)
 
     assert set(out["shadow"].keys()) == {
-        "x4_v1", "quote_momentum_v1", "quote_contrarian_v1"}
+        "x4_v1", "quote_momentum_v1", "quote_contrarian_v1",
+        "x4_v2", "quote_momentum_v2", "quote_contrarian_v2"}
     for v, blk in out["shadow"].items():
         assert blk["summary"]["n"] == 0
         assert blk["summary"]["win_rate"] is None
         assert blk["curve"] == []
+    # v2 无回测基准（None 透传，面板只看影子实测）
+    assert out["shadow"]["x4_v2"]["summary"]["bench_winrate"] is None
+    assert out["shadow"]["quote_momentum_v2"]["summary"]["desc"].startswith("顺势v2")
     assert out["scene"] == {}
     assert out["regime"]["phases"] == {}
     assert out["regime"]["by_version"] == {}
     assert out["regime"]["daily"] == []
+
+
+def test_shadow_breakeven_x4_family_includes_premium() -> None:
+    """盈亏平衡口径：x4 系（v1/v2）含溢 0.01，quote 系无溢价。"""
+    import binance_predict.main as m
+
+    assert m._shadow_breakeven("x4_v1", 0.5) == pytest.approx(0.51 / 0.98, abs=1e-9)
+    assert m._shadow_breakeven("x4_v2", 0.5) == pytest.approx(0.51 / 0.98, abs=1e-9)
+    assert m._shadow_breakeven("quote_momentum_v2", 0.5) == pytest.approx(0.5 / 0.98, abs=1e-9)
+    assert m._shadow_breakeven("quote_contrarian_v2", 0.5) == pytest.approx(0.5 / 0.98, abs=1e-9)
 
 
 @pytest.mark.asyncio

@@ -12,6 +12,12 @@
     3. 已有 PENDING 且 target_window_start == W_n.start_time → 回读 W_n 归档曲线
        结算：150s 决策点真实 DOWN/UP token 价 + 次窗 outcome → SETTLED/EXPIRED。
 冷启动回补：启动时重扫最近 12 个已归档窗口（幂等，唯一约束防重）。
+
+x4_v2 平静市门禁版（2026-08-22 5m 粒度归因落地，只加不改；v1 冻结口径原样）：
+    触发条件 = v1 全部条件 + |触发前 1h BTC 累计涨跌幅| < 0.5%（±10min 容差查
+    entry_price，严格 ex-ante）。归因依据（51 笔已结算 x4_v1）：平静市段
+    wr 57.6%/EV+9.70 vs 单边段 wr 23%/EV−13.8；门禁数据缺失 → v2 不触发。
+    结算通道与 v1 完全共用（PENDING → 次窗归档结算，版本无关）。
 """
 from __future__ import annotations
 
@@ -34,6 +40,52 @@ FEE, PREM = 0.02, 0.01   # 单注成本口径（费 2% + 溢价 0.01）
 POLL_INTERVAL = 60.0     # 轮询间隔（秒）
 BACKSCAN_WINDOWS = 12    # 冷启动回补窗口数（1 小时）
 PENDING_TIMEOUT_MS = 20 * 60 * 1000  # PENDING 超时（次窗归档最迟 ~6min）
+
+# ---- x4_v2 平静市门禁（2026-08-22 5m 归因落地，只加不改；v1 冻结口径原样）----
+# 触发前 1h（±10min 容差）BTC 累计涨跌幅 |chg|<0.5% 才触发：
+# 51 笔已结算 x4_v1 归因——平静市段 wr 57.6%/EV+9.70 vs 单边段 wr 23%/EV−13.8。
+X4_V2_VERSION = "x4_v2"
+X4_V2_PAST1H_MAX_ABS_PCT = 0.5   # |过去 1h 涨幅| 上限（%）
+X4_V2_LOOKBACK_MS = 3_600_000    # 回看 1h
+X4_V2_TOL_MS = 600_000           # 历史窗 start_time 容差 ±10min（兜数据缺口）
+
+
+def _window_open_price(w: SentimentWindow) -> float | None:
+    """窗口开盘 BTC 价：entry_price 优先，回退 curve_btc_price 首个有效采样点。"""
+    p = getattr(w, "entry_price", None)
+    if p is not None and float(p) > 0:
+        return float(p)
+    for pt in sorted((getattr(w, "curve_btc_price", None) or []), key=lambda x: x.get("t") or 0):
+        v = pt.get("v")
+        if v is not None and float(v) > 0:
+            return float(v)
+    return None
+
+
+async def _past_1h_chg_pct(session, w: SentimentWindow) -> float | None:
+    """触发前 1h 的 BTC 累计涨跌幅（%）。
+
+    基准 = start−1h（±10min 容差）内最晚已归档窗口的 entry_price；
+    当前 = 本窗开盘价（entry_price 优先回退 curve 首点）。
+    任一缺失 → None（门禁数据不足，v2 不触发）。
+    """
+    target = int(w.start_time) - X4_V2_LOOKBACK_MS
+    base = (await session.execute(
+        sa_select(SentimentWindow.entry_price)
+        .where(
+            SentimentWindow.start_time >= target - X4_V2_TOL_MS,
+            SentimentWindow.start_time <= target + X4_V2_TOL_MS,
+            SentimentWindow.entry_price.isnot(None),
+        )
+        .order_by(SentimentWindow.start_time.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+    if base is None:
+        return None
+    cur = _window_open_price(w)
+    if cur is None:
+        return None
+    return (cur - float(base)) / float(base) * 100.0
 
 
 def _curve_end_pct(curve: list | None) -> float | None:
@@ -106,8 +158,9 @@ class MisalignmentDetector:
         self._task = asyncio.create_task(self._loop(), name="misalignment_detector")
         logger.info(
             "X4 影子检测器启动 | 口径 end≤{} 收阳→次窗DOWN | 决策点 +{}s | 费{}+溢{}"
+            " | x4_v2 并行：|past1h|<{}%（平静市门禁，缺数据不触发）"
             "（影子模式：只记录不下注）",
-            X4_END_MAX, DECISION_T_SEC, FEE, PREM,
+            X4_END_MAX, DECISION_T_SEC, FEE, PREM, X4_V2_PAST1H_MAX_ABS_PCT,
         )
 
     async def stop(self) -> None:
@@ -181,10 +234,40 @@ class MisalignmentDetector:
                     MisalignmentSignal.window_start == start_ms,
                 )
             )
-            if dup.first() is not None:
+            if dup.first() is None:
+                session.add(MisalignmentSignal(
+                    version="x4_v1",
+                    window_start=start_ms,
+                    window_end=end_ms,
+                    end_pct=end_pct,
+                    outcome_base="UP",
+                    direction="DOWN",
+                    target_window_start=end_ms,
+                    status="PENDING",
+                ))
+                await session.commit()
+                self._trigger_count += 1
+                logger.info(
+                    "X4 影子触发 | 窗口 {}~{} | end_pct={:.1f} → 押次窗 DOWN（目标 {}）",
+                    datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).strftime("%m-%d %H:%M"),
+                    datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc).strftime("%H:%M"),
+                    end_pct, end_ms,
+                )
+
+            # --- x4_v2：v1 条件全同 + 平静市门禁（独立幂等/独立 commit，只加不改）---
+            dup2 = await session.execute(
+                sa_select(MisalignmentSignal.id).where(
+                    MisalignmentSignal.version == X4_V2_VERSION,
+                    MisalignmentSignal.window_start == start_ms,
+                )
+            )
+            if dup2.first() is not None:
                 return
+            past1h = await _past_1h_chg_pct(session, w)
+            if past1h is None or abs(past1h) >= X4_V2_PAST1H_MAX_ABS_PCT:
+                return  # 单边市/门禁数据缺失 → v2 不触发（v1 不受影响）
             session.add(MisalignmentSignal(
-                version="x4_v1",
+                version=X4_V2_VERSION,
                 window_start=start_ms,
                 window_end=end_ms,
                 end_pct=end_pct,
@@ -196,10 +279,9 @@ class MisalignmentDetector:
             await session.commit()
         self._trigger_count += 1
         logger.info(
-            "X4 影子触发 | 窗口 {}~{} | end_pct={:.1f} → 押次窗 DOWN（目标 {}）",
+            "X4v2 影子触发 | 窗口 {} | end_pct={:.1f} past1h={:+.2f}%（平静市）→ 押次窗 DOWN（目标 {}）",
             datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).strftime("%m-%d %H:%M"),
-            datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc).strftime("%H:%M"),
-            end_pct, end_ms,
+            end_pct, past1h, end_ms,
         )
 
     async def _settle_pending_for(self, w: SentimentWindow) -> None:

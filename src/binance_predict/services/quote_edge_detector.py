@@ -22,6 +22,11 @@
     4. 幂等：(version, window_start) 唯一约束防重。
 冷启动回补：启动时重扫最近 12 个已归档窗口。
 
+v2 价格门禁版（2026-08-22 5m 粒度归因落地，只加不改；v1 冻结口径原样）：
+    quote_momentum_v2   = v1 区间 + 触发时点 BTC 已低于窗口开盘 ≥0.10%（剔假恐慌）；
+    quote_contrarian_v2 = v1 区间 + 触发时点 BTC 未高于窗口开盘 ≥0.10%（只接假冲高）。
+    门禁数据源 curve_btc_price（与报价曲线同步采样），只用 ≤触发时点采样点（严格 ex-ante）。
+
 字段语义映射（复用 misalignment_signals 表）：
     end_pct → 触发时刻 DOWN 报价（X4 语义"触发窗末 UP%"的扩展，注释在案）；
     target_window_start → window_start（本窗即目标窗，无次窗）；
@@ -52,6 +57,19 @@ QUOTE_EDGE_RULES: dict[str, tuple[float, float, float, float]] = {
 FEE_RET = 0.98            # EV = 赢 0.98/q−1 / 输 −1（费 2%，无溢价，回测口径）
 POLL_INTERVAL = 60.0      # 轮询间隔（秒）
 BACKSCAN_WINDOWS = 12     # 冷启动回补窗口数（1 小时）
+
+# ---- v2 价格门禁（2026-08-22 5m 粒度归因落地，只加不改；触发区间与 v1 完全相同）----
+# chg% = (触发时点 BTC − 窗口开盘 BTC) / 窗口开盘 × 100，只用 ≤触发时点采样点（严格 ex-ante）：
+#   quote_momentum_v2   min_drop −0.10：触发时点已真跌 ≥0.10%（剔"假恐慌"：
+#       归因 dip<0.15% 段 wr 40%/EV−0.43 vs dip≥0.15% 段 wr 85%/EV+0.17，双 regime 成立）；
+#   quote_contrarian_v2 max_rise +0.10：触发时点未真涨 ≥0.10%（只接"假冲高"：
+#       归因 |chg|<0.05% 平盘窗贡献 86% 利润，melt≥0.3% 段 wr 0~7%）。
+# 门禁数据缺失（curve_btc_price/entry_price 无）→ 不落 v2（保守跳过，v1 不受影响）。
+V2_PRICE_GUARDS: dict[str, tuple[str, str, float]] = {
+    # v2 -> (base 规则, 门禁模式, 阈值%)；min_drop=chg≤阈值 / max_rise=chg<阈值
+    "quote_momentum_v2": ("quote_momentum_v1", "min_drop", -0.10),
+    "quote_contrarian_v2": ("quote_contrarian_v1", "max_rise", 0.10),
+}
 
 
 def _outcome_of(w: SentimentWindow) -> str | None:
@@ -102,6 +120,35 @@ def _up_price_at_or_before(curve: list | None, ts_ms: int) -> float | None:
     return best
 
 
+def _window_open_btc_price(w: SentimentWindow) -> float | None:
+    """窗口开盘 BTC 基准价：entry_price 优先，回退 curve_btc_price 首个有效点。"""
+    p = getattr(w, "entry_price", None)
+    if p is not None and float(p) > 0:
+        return float(p)
+    for pt in sorted((getattr(w, "curve_btc_price", None) or []), key=lambda x: x.get("t") or 0):
+        v = pt.get("v")
+        if v is not None and float(v) > 0:
+            return float(v)
+    return None
+
+
+def _pass_v2_price_guard(version: str, w: SentimentWindow, quote_ts: int) -> bool | None:
+    """v2 价格门禁：触发时点 BTC vs 窗口开盘的涨跌幅。
+
+    momentum_v2 要求 chg ≤ −0.10%（已真跌）；contrarian_v2 要求 chg < +0.10%（未真涨）。
+    门禁数据缺失 → None（保守不落表）。取价复用 ≤ts 最晚采样点逻辑（不含未来）。
+    """
+    mode, threshold = V2_PRICE_GUARDS[version][1], V2_PRICE_GUARDS[version][2]
+    base = _window_open_btc_price(w)
+    if base is None:
+        return None
+    cur = _up_price_at_or_before(getattr(w, "curve_btc_price", None), quote_ts)
+    if cur is None:
+        return None
+    chg_pct = (cur - base) / base * 100.0
+    return chg_pct <= threshold if mode == "min_drop" else chg_pct < threshold
+
+
 def _ev_at_entry(win: bool, price: float) -> float:
     """单注 EV（回测口径，无溢价）：赢 0.98/q−1 / 输 −1。"""
     return (FEE_RET / price - 1.0) if win else -1.0
@@ -133,9 +180,10 @@ class QuoteEdgeDetector:
             logger.warning("报价 edge 影子：冷启动回补失败（忽略，循环内自愈）| {}", exc)
         self._task = asyncio.create_task(self._loop(), name="quote_edge_detector")
         logger.info(
-            "报价 edge 影子检测器启动 | 规则 {} | EV=0.98/q−1（费 2%，影子模式只记录不下注）",
+            "报价 edge 影子检测器启动 | v1 规则 {} + v2 价格门禁版 {} | EV=0.98/q−1（费 2%，影子模式只记录不下注）",
             {k: f"t∈[{v[0]:.0f},{v[1]:.0f})s q∈[{v[2]:.2f},{v[3]:.2f})"
              for k, v in QUOTE_EDGE_RULES.items()},
+            {k: f"{m}{p:+.2f}%" for k, (_b, m, p) in V2_PRICE_GUARDS.items()},
         )
 
     async def stop(self) -> None:
@@ -192,15 +240,22 @@ class QuoteEdgeDetector:
         if outcome is None:
             return  # NOISE/缺结算：胜负不可判，不产生信号
 
+        # v1 冻结规则 + v2 门禁版（同区间，命中后过价格门禁才落表）
+        rules: dict[str, tuple[float, float, float, float]] = dict(QUOTE_EDGE_RULES)
+        for v2, (base, _mode, _pct) in V2_PRICE_GUARDS.items():
+            rules[v2] = QUOTE_EDGE_RULES[base]
+
         # per-rule 独立 commit（CodeReview Low#4）：单规则落表失败不回滚、
         # 不影响另一规则；trigger_count 仅在 commit 成功后自增。
         async with async_session_factory() as session:
-            for version, (t_lo, t_hi, q_lo, q_hi) in QUOTE_EDGE_RULES.items():
+            for version, (t_lo, t_hi, q_lo, q_hi) in rules.items():
                 try:
                     hit = _find_first_hit(w.curve_down_price, start_ms, t_lo, t_hi, q_lo, q_hi)
                     if hit is None:
                         continue
                     price, quote_ts = hit
+                    if version in V2_PRICE_GUARDS and _pass_v2_price_guard(version, w, quote_ts) is not True:
+                        continue  # 门禁未过/门禁数据缺失 → v2 不落（v1 不受影响）
                     dup = await session.execute(
                         sa_select(MisalignmentSignal.id).where(
                             MisalignmentSignal.version == version,

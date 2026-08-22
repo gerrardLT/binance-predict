@@ -6,7 +6,9 @@
 - 结算：PENDING 目标匹配次窗 → SETTLED（win/报价/EV 回填）；NOISE → EXPIRED
 - 报价：≤150s 最晚点；real 优先 / chance proxy 回退 / 缺失 NULL
 - EV：赢 0.98/(p+0.01)−1（截断 [0.01,0.99]）/ 输 −1
-- 幂等：同窗口重复触发被唯一约束查询拦下
+- 幂等：同窗口重复触发被唯一约束查询拦下（v1/v2 独立）
+- x4_v2 平静市门禁：|past1h|<0.5% 双落；单边市/缺基准只落 v1；
+  v1 幂等命中不再阻断 v2 判定（幂等键 per-version）
 """
 
 from __future__ import annotations
@@ -118,8 +120,9 @@ class _FakeSessionCtx:
         return False
 
 
-def _win(start: int, outcome: str, curve=None, ret=None, prices=None, pcts=None) -> SimpleNamespace:
-    """伪 SentimentWindow。"""
+def _win(start: int, outcome: str, curve=None, ret=None, prices=None, pcts=None,
+          entry_price=None) -> SimpleNamespace:
+    """伪 SentimentWindow（entry_price/curve_btc_price 供 x4_v2 门禁用）。"""
     return SimpleNamespace(
         start_time=start,
         end_time=start + 5 * MIN,
@@ -129,6 +132,8 @@ def _win(start: int, outcome: str, curve=None, ret=None, prices=None, pcts=None)
         curve_down_price=prices,
         curve_up_price=None,
         curve_down_pct=pcts,
+        curve_btc_price=None,
+        entry_price=entry_price,
     )
 
 
@@ -143,8 +148,10 @@ def _sig(window_start: int, status: str = "PENDING") -> SimpleNamespace:
     )
 
 
-async def _run_process(det_win, pending_sigs=(), dup_rows=None) -> tuple[MagicMock, list]:
-    """跑 _process_window：session.execute 按调用序返回（结算查询→幂等查询）。"""
+async def _run_process(det_win, pending_sigs=(), dup_rows=None, dup2_rows=None,
+                      past1h_price=None) -> tuple[MagicMock, list]:
+    """跑 _process_window：session.execute 按调用序返回
+    （结算查询→v1幂等→v2幂等→past1h 基准查询）。"""
     det = MisalignmentDetector()
     added: list = []
     session = MagicMock()
@@ -152,7 +159,12 @@ async def _run_process(det_win, pending_sigs=(), dup_rows=None) -> tuple[MagicMo
     settle_result.scalars.return_value.all.return_value = list(pending_sigs)
     dup_result = MagicMock()
     dup_result.first.return_value = (dup_rows or [None])[0]
-    session.execute = AsyncMock(side_effect=[settle_result, dup_result])
+    dup2_result = MagicMock()
+    dup2_result.first.return_value = (dup2_rows or [None])[0]
+    past1h_result = MagicMock()
+    past1h_result.scalar_one_or_none.return_value = past1h_price  # None=无基准窗 / 1h 前价格
+    session.execute = AsyncMock(
+        side_effect=[settle_result, dup_result, dup2_result, past1h_result])
     session.add = MagicMock(side_effect=added.append)
     session.commit = AsyncMock()
     factory = MagicMock(return_value=_FakeSessionCtx(session))
@@ -187,6 +199,59 @@ async def test_no_duplicate_on_same_window() -> None:
     """幂等：唯一约束预查询命中 → 不再 add。"""
     session, added = await _run_process(_win(100 * MIN, "UP"), dup_rows=[123])
     assert added == []
+
+
+# ============================================================
+# x4_v2 平静市门禁（|past1h| < 0.5%，±10min 容差）
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_v2_triggers_in_calm_market() -> None:
+    """平静市（past1h ≈ −0.2%）：v1 + v2 双落 PENDING，target 同次窗。"""
+    start = 100 * MIN
+    session, added = await _run_process(
+        _win(start, "UP", entry_price=100.0), past1h_price=100.2,
+    )
+    assert [s.version for s in added] == ["x4_v1", "x4_v2"]
+    v2 = added[1]
+    assert v2.end_pct == 38.0 and v2.status == "PENDING"
+    assert v2.target_window_start == start + 5 * MIN  # 与 v1 同目标次窗
+
+
+@pytest.mark.asyncio
+async def test_v2_skipped_in_trendy_market() -> None:
+    """单边市（past1h 涨 1.0% ≥ 0.5%）→ 只落 v1。"""
+    session, added = await _run_process(
+        _win(100 * MIN, "UP", entry_price=101.0), past1h_price=100.0,
+    )
+    assert [s.version for s in added] == ["x4_v1"]
+
+
+@pytest.mark.asyncio
+async def test_v2_skipped_when_past1h_missing() -> None:
+    """门禁数据缺失（无 1h 前基准窗）→ 保守只落 v1。"""
+    session, added = await _run_process(_win(100 * MIN, "UP", entry_price=100.0))
+    assert [s.version for s in added] == ["x4_v1"]
+
+
+@pytest.mark.asyncio
+async def test_v2_dup_skipped_independently() -> None:
+    """v2 幂等独立：v2 已存在 → 不重复落（v1 照常）。"""
+    session, added = await _run_process(
+        _win(100 * MIN, "UP", entry_price=100.0),
+        dup2_rows=[456], past1h_price=100.2,
+    )
+    assert [s.version for s in added] == ["x4_v1"]
+
+
+@pytest.mark.asyncio
+async def test_v2_triggers_even_when_v1_dup_exists() -> None:
+    """v1 已存在（重复处理）→ v2 仍独立判定落表（幂等键 per-version）。"""
+    session, added = await _run_process(
+        _win(100 * MIN, "UP", entry_price=100.0),
+        dup_rows=[123], past1h_price=100.2,
+    )
+    assert [s.version for s in added] == ["x4_v2"]
 
 
 @pytest.mark.asyncio
