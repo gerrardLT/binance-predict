@@ -1714,6 +1714,7 @@ async def get_prediction_wallet(
         "wallet_address": _mask_addr(wallet.get("walletAddress")),
         "wallet_id": wallet.get("walletId"),
         "registered_time": wallet.get("registeredTime"),
+        "spot_usdt_free": await prediction_trader.fetch_spot_usdt_balance(),
     }
 
 

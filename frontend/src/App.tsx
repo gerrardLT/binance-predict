@@ -615,6 +615,12 @@ function LiveTradeTab() {
             <span className="text-gray-500 shrink-0">钱包注册时间</span>
             <span className="text-gray-700">{regTs ? new Date(regTs).toLocaleString() : '--'}</span>
           </div>
+          <div className="flex justify-between gap-2">
+            <span className="text-gray-500 shrink-0">现货 USDT 可用</span>
+            {typeof wallet?.spot_usdt_free === 'number'
+              ? <span className={`font-mono font-bold ${(wallet.spot_usdt_free as number) >= 1 ? 'text-green-700' : 'text-red-600'}`}>{(wallet.spot_usdt_free as number).toFixed(4)}</span>
+              : <span className="text-gray-400">查询失败</span>}
+          </div>
           <div className="border-t border-gray-100 my-2" />
           <div className="flex justify-between gap-2">
             <span className="text-gray-500 shrink-0">信号实盘</span>

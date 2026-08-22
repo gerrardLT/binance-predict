@@ -203,6 +203,38 @@ class BinancePredictionTrader:
         )
         return wallet
 
+    async def fetch_spot_usdt_balance(self) -> float | None:
+        """查询现货账户 USDT 可用余额（下单扣款来源）。
+
+        调用 GET /api/v3/account（签名），从 balances 里取 USDT 的 free。
+        资金从 Web3 钱包转回交易所时可能落在资金账户，此查询用于确认
+        现货账户是否真正有可用 USDT。失败返回 None。
+        """
+        params = self._sign_request({})
+        try:
+            client = self._get_client()
+            resp = await client.get(
+                f"{self.BASE_URL}/api/v3/account",
+                params=params,
+                headers={"X-MBX-APIKEY": self._api_key},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("查询现货余额失败 (HTTP {}): {}", e.response.status_code, e.response.text[:300])
+            return None
+        except Exception as e:
+            logger.error("查询现货余额失败: {}", e)
+            return None
+
+        for b in data.get("balances", []):
+            if b.get("asset") == "USDT":
+                try:
+                    return float(b.get("free", 0))
+                except (TypeError, ValueError):
+                    return None
+        return 0.0
+
     @staticmethod
     def _classify_period(market: dict) -> str | None:
         """按 title/slug 识别市场周期：'5m' | '15m' | None。先判 15m（含 '5m' 子串）。"""

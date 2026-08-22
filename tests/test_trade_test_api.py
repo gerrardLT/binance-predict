@@ -163,3 +163,49 @@ async def test_recent_trades_empty() -> None:
 
     out = await m.get_recent_trades(limit=20, _=None, db=db)
     assert out["orders"] == []
+
+
+# ============================================================
+# GET /api/prediction-wallet 附现货 USDT 余额
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_prediction_wallet_includes_spot_balance(monkeypatch) -> None:
+    """prediction-wallet 返回体携带 spot_usdt_free（余额查询失败时为 None）。"""
+    import binance_predict.main as m
+
+    async def _wallet():
+        return {"walletAddress": "0xddfe00000000000000000000000000000000d1a2",
+                "walletId": "WID", "registeredTime": 1_787_410_421_564}
+
+    async def _bal():
+        return 12.34
+
+    monkeypatch.setattr(m.prediction_trader, "_api_key", "k")
+    monkeypatch.setattr(m.prediction_trader, "fetch_wallet_info", _wallet)
+    monkeypatch.setattr(m.prediction_trader, "fetch_spot_usdt_balance", _bal)
+    out = await m.get_prediction_wallet(_=None)
+    assert out["wallet_id"] == "WID"
+    assert out["spot_usdt_free"] == 12.34
+
+
+@pytest.mark.asyncio
+async def test_fetch_spot_usdt_balance_parses_free(monkeypatch) -> None:
+    """服务层：从 /api/v3/account balances 取 USDT 的 free。"""
+    from binance_predict.services.prediction_trading import BinancePredictionTrader
+
+    trader = BinancePredictionTrader()
+    trader._api_key = "k"
+    trader._api_secret = "s"
+
+    resp = SimpleNamespace(status_code=200)
+    resp.raise_for_status = lambda: None
+    resp.json = lambda: {"balances": [
+        {"asset": "BTC", "free": "0.1", "locked": "0"},
+        {"asset": "USDT", "free": "12.34", "locked": "1"},
+    ]}
+    client = MagicMock()
+    client.get = AsyncMock(return_value=resp)
+    monkeypatch.setattr(trader, "_get_client", lambda: client)
+
+    assert await trader.fetch_spot_usdt_balance() == 12.34
