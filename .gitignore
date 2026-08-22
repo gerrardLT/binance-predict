@@ -48,6 +48,13 @@ semantic-review/
 # Qoder IDE 本地配置
 .qoder/
 
+# 网站逆向产物（website-reverser 生成）
+# public/：原始资产下载缓存（与 clone/*/assets 重复，大体积二进制）
+/public/
+# docs/design-references/：原站 QA 截图（可随时重截，大体积二进制）
+docs/design-references/
+# 注意：clone/（克隆交付物）与 docs/research/（spec 文档）需版本跟踪，勿忽略
+
 # 操作系统文件
 .DS_Store
 Thumbs.db
