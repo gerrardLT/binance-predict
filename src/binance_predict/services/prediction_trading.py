@@ -62,6 +62,10 @@ class BinancePredictionTrader:
         # 本锁保证 list_markets + token 选择 + 下单 整体串行。
         self._trade_lock = asyncio.Lock()
 
+        # 最近一次 API 调用的错误详情（诊断透传：人工测试单/日志排查用；
+        # get_quote/place_order 失败时写入，成功时清空）
+        self.last_api_error: str | None = None
+
         # 缓存当前活跃的 BTC 预测市场信息
         self._active_market: dict | None = None
         self._up_token_id: str | None = None
@@ -384,6 +388,7 @@ class BinancePredictionTrader:
             )
             resp.raise_for_status()
             quote = resp.json()
+            self.last_api_error = None
             logger.info(
                 "获取报价成功 | token={} | side={} | avgPrice={} | quoteId={}",
                 token_id,
@@ -393,9 +398,11 @@ class BinancePredictionTrader:
             )
             return quote
         except httpx.HTTPStatusError as e:
+            self.last_api_error = f"HTTP {e.response.status_code}: {e.response.text[:300]}"
             logger.error("获取报价失败 (HTTP {}): {}", e.response.status_code, e.response.text)
             return None
         except Exception as e:
+            self.last_api_error = f"{type(e).__name__}: {e}"
             logger.error("获取报价异常: {}", e)
             return None
 
@@ -603,7 +610,11 @@ class BinancePredictionTrader:
 
             quote = await self.get_quote(token_id, "BUY", amount_usdt=amount_usdt)
             if not quote:
-                await self._update_signal_order(pending, "FAILED", error_message="获取报价失败")
+                detail = self.last_api_error or "无详情（网络异常？）"
+                await self._update_signal_order(
+                    pending, "FAILED",
+                    error_message=f"获取报价失败 | {detail}",
+                )
                 return pending
 
             # 执行价护栏：报价均价超阈弃单（不追贵，保护回测 EV 口径）
