@@ -1,8 +1,11 @@
-"""报价 edge 实盘执行器（quote_momentum_v1 LIVE）。
+"""报价 edge 实盘执行器（LIVE 版本可配，当前 quote_contrarian_v1）。
 
-实时触发：5m 窗口内 DOWN 报价首次进入 [0.69, 0.75) 且 t∈[90,120)s → 真单押 DOWN。
-规则复用 quote_edge_detector.QUOTE_EDGE_RULES 冻结口径（回测同源，勿改）；
+实时触发：5m 窗口内 DOWN 报价首次进入所绑版本的规则区间 → 真单押 DOWN。
+版本由 settings.quote_edge_live_version 指定（白名单校验，v2 门禁版暂不支持），
+区间复用 quote_edge_detector.QUOTE_EDGE_RULES 冻结口径（回测同源，勿改）；
 影子轨继续归档记录（对照），实盘轨实时开火，二者互不干扰。
+2026-08-22 切 quote_contrarian_v1（生产 99 笔 wr 28.3% vs 平衡线 19.8%，
+唯一正 EV：avg +0.479 / cum +47.43；赔率型信号，接受长连亏）。
 
 安全护栏：
 1. 每窗至多一单：内存 fired 集合 + **先占位后下单**（CodeReview High#1：
@@ -36,21 +39,35 @@ from .quote_edge_detector import QUOTE_EDGE_RULES
 
 logger = logging.getLogger(__name__)
 
-LIVE_VERSION = "quote_momentum_v1"   # 首个上实盘的信号（用户圈定，2026-08-20）
+LIVE_ALLOWED_VERSIONS = ("quote_momentum_v1", "quote_contrarian_v1")
+# v2 门禁版需要触发时点的 BTC 价格序列，实盘采样链路只喂 down_price，
+# 配了会以 v1 区间裸下单（丢门禁）→ 白名单直接拒绝，等影子验证后再评估。
+EXEC_GUARD_MARGIN = 0.03            # 自动护栏 = 入场区间上界 + 此余量（滑点容忍）
 SIGNAL_BACKFILL_DELAY_MS = 180_000  # 窗口结束后 180s 回读影子信号（归档+结算已就绪）
 HEAL_INTERVAL_S = 300.0             # signal_id 自愈扫描间隔（Low#4：重启/延迟不丢对账）
 MAX_ORDER_AMOUNT_USDT = 50.0        # 单笔金额硬上限（Low#5：配置误写拒绝启动，不靠自律）
 
 
 class QuoteEdgeLiveTrader:
-    """报价 momentum 实盘执行器：采样循环喂价 → 区间命中 → 真单 DOWN。"""
+    """报价 edge 实盘执行器：采样循环喂价 → 区间命中 → 真单 DOWN。"""
 
     def __init__(self, trader) -> None:
         self._trader = trader  # BinancePredictionTrader（复用签名/报价/下单链路）
-        t_lo, t_hi, q_lo, q_hi = QUOTE_EDGE_RULES[LIVE_VERSION]
+        version = settings.quote_edge_live_version
+        if version not in LIVE_ALLOWED_VERSIONS:
+            # 配置误写拒绝启动（与 MAX_ORDER_AMOUNT_USDT 同哲学：不靠自律靠拒启）
+            raise ValueError(
+                f"报价 edge 实盘：未知/不支持的版本 {version!r}"
+                f"（白名单 {list(LIVE_ALLOWED_VERSIONS)}）")
+        t_lo, t_hi, q_lo, q_hi = QUOTE_EDGE_RULES[version]
+        self._version = version
         self._t_lo, self._t_hi, self._q_lo, self._q_hi = t_lo, t_hi, q_lo, q_hi
         self._amount = settings.quote_momentum_live_amount_usdt
-        self._max_exec = settings.quote_momentum_live_max_exec_price
+        exec_price = settings.quote_momentum_live_max_exec_price
+        if exec_price is None:
+            # 按版本自动：momentum→0.78（同旧默认）/ contrarian→0.28
+            exec_price = round(q_hi + EXEC_GUARD_MARGIN, 4)
+        self._max_exec = exec_price
         self._max_daily = settings.quote_momentum_live_max_daily_orders
         self._fired: set[int] = set()          # 本进程已开火/尝试过的 window_start
         self._tasks: set[asyncio.Task] = set()  # 在途任务（下单/回填/自愈）
@@ -124,7 +141,7 @@ class QuoteEdgeLiveTrader:
             order = await self._trader.execute_signal_trade(
                 prediction="DOWN",
                 amount_usdt=self._amount,
-                signal_version=LIVE_VERSION,
+                signal_version=self._version,
                 window_start=window_start,
                 max_exec_price=self._max_exec,
             )
@@ -165,7 +182,7 @@ class QuoteEdgeLiveTrader:
             async with async_session_factory() as session:
                 sig = (await session.execute(
                     sa_select(MisalignmentSignal.id).where(
-                        MisalignmentSignal.version == LIVE_VERSION,
+                        MisalignmentSignal.version == self._version,
                         MisalignmentSignal.window_start == window_start,
                     )
                 )).first()
@@ -174,7 +191,7 @@ class QuoteEdgeLiveTrader:
                     return
                 await session.execute(
                     sa_update(TradeOrderModel).where(
-                        TradeOrderModel.signal_version == LIVE_VERSION,
+                        TradeOrderModel.signal_version == self._version,
                         TradeOrderModel.window_start == window_start,
                         TradeOrderModel.signal_id.is_(None),
                     ).values(signal_id=sig[0])
@@ -195,7 +212,7 @@ class QuoteEdgeLiveTrader:
         async with async_session_factory() as session:
             row = (await session.execute(
                 sa_select(sa_func.count(TradeOrderModel.id)).where(
-                    TradeOrderModel.signal_version == LIVE_VERSION,
+                    TradeOrderModel.signal_version == self._version,
                     TradeOrderModel.status == "FILLED",
                     TradeOrderModel.created_at >= sa_func.date_trunc("day", sa_func.now()),
                 )
@@ -206,7 +223,7 @@ class QuoteEdgeLiveTrader:
         async with async_session_factory() as session:
             row = (await session.execute(
                 sa_select(TradeOrderModel.id).where(
-                    TradeOrderModel.signal_version == LIVE_VERSION,
+                    TradeOrderModel.signal_version == self._version,
                     TradeOrderModel.window_start == window_start,
                 ).limit(1)
             )).first()
@@ -233,7 +250,7 @@ class QuoteEdgeLiveTrader:
             async with async_session_factory() as session:
                 orders = (await session.execute(
                     sa_select(TradeOrderModel.window_start).where(
-                        TradeOrderModel.signal_version == LIVE_VERSION,
+                        TradeOrderModel.signal_version == self._version,
                         TradeOrderModel.signal_id.is_(None),
                         TradeOrderModel.created_at < cutoff,
                     ).order_by(TradeOrderModel.window_start.asc()).limit(20)
@@ -252,7 +269,7 @@ class QuoteEdgeLiveTrader:
     def status(self) -> dict:
         return {
             "enabled": settings.quote_momentum_live_enabled,
-            "version": LIVE_VERSION,
+            "version": self._version,
             "amount_usdt": self._amount,
             "max_exec_price": self._max_exec,
             "max_daily_orders": self._max_daily,

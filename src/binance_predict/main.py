@@ -438,7 +438,7 @@ async def _prediction_market_tracker() -> None:
                         settings.agent_predict_trigger_samples,
                     )
 
-                # 报价 edge 实盘（quote_momentum_v1 LIVE）：DOWN 报价首次进规则区间 → 真单。
+                # 报价 edge 实盘（版本可配）：DOWN 报价首次进所绑版本规则区间 → 真单。
                 # None 守卫：开关关闭时不装配；check 内纯内存比较，不阻塞采样循环。
                 if quote_edge_live_trader is not None and _current_window_end is not None:
                     quote_edge_live_trader.check(
@@ -923,7 +923,7 @@ async def lifespan(app: FastAPI):
         await quote_edge_detector.start()
         logger.info("报价 edge 影子检测器已启动（A 79.9%/EV+0.097，B 24%/EV+0.155，影子模式不下注）")
 
-    # 报价 edge 实盘（quote_momentum_v1 LIVE）：真单通道，默认 OFF；
+    # 报价 edge 实盘（版本可配，当前默认 quote_contrarian_v1）：真单通道，默认 OFF；
     # 开启前提：钱包配置就绪 + 用户人工设 quote_momentum_live_enabled=True。
     global quote_edge_live_trader
     if settings.quote_momentum_live_enabled:
@@ -935,15 +935,21 @@ async def lifespan(app: FastAPI):
                 qelt_module.MAX_ORDER_AMOUNT_USDT,
             )
         else:
-            quote_edge_live_trader = QuoteEdgeLiveTrader(prediction_trader)
-            await quote_edge_live_trader.start()
-            logger.info(
-                "报价 edge 实盘执行器已启动（真单！）| {} | {} USDT/单 | 执行价上限 {} | 日上限 {} 单",
-                quote_edge_live_trader.status()["version"],
-                settings.quote_momentum_live_amount_usdt,
-                settings.quote_momentum_live_max_exec_price,
-                settings.quote_momentum_live_max_daily_orders,
-            )
+            try:
+                quote_edge_live_trader = QuoteEdgeLiveTrader(prediction_trader)
+            except ValueError as exc:
+                # 版本白名单拒绝（v2 门禁版不支持等）：拒实盘不拖垮其他服务，fail fast 但不 fail all
+                logger.error("报价 edge 实盘拒绝启动：{}", exc)
+            else:
+                await quote_edge_live_trader.start()
+                _live_status = quote_edge_live_trader.status()
+                logger.info(
+                    "报价 edge 实盘执行器已启动（真单！）| {} | {} USDT/单 | 执行价上限 {} | 日上限 {} 单",
+                    _live_status["version"],
+                    _live_status["amount_usdt"],
+                    _live_status["max_exec_price"],
+                    _live_status["max_daily_orders"],
+                )
     else:
         logger.info("报价 edge 实盘未开启（quote_momentum_live_enabled=False），维持影子记录")
 

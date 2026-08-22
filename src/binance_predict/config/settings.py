@@ -306,15 +306,19 @@ class Settings(BaseSettings):
     # 规则冻结：A t∈[90,120)s×q∈[0.69,0.75) / B t∈[45,60)s×q∈[0.15,0.25)
     quote_edge_enabled: bool = True
 
-    # --- 报价 edge 实盘下单（quote_momentum_v1 LIVE，2026-08-20）---
-    # 实时触发：窗口内 DOWN 报价首次进 [0.69,0.75) 且 t∈[90,120)s → 真单押 DOWN。
+    # --- 报价 edge 实盘下单（LIVE 版本可配，2026-08-22 切 quote_contrarian_v1）---
+    # 实时触发：窗口内 DOWN 报价首次进规则区间 → 真单押 DOWN（区间随版本走）。
     # 每窗至多一单（内存 + DB 唯一约束双保险）；默认 OFF，配置就绪后人工开启。
     quote_momentum_live_enabled: bool = False
+    # 实盘绑定的信号版本（白名单内二选一，误写 → 执行器构造抛 ValueError 拒绝启动；
+    # v2 门禁版需价格序列，实盘采样链路暂不支持，等影子验证后再评估扩展）
+    quote_edge_live_version: str = "quote_contrarian_v1"
     # 实盘单笔金额（USDT，灰度 5）
     quote_momentum_live_amount_usdt: float = 5.0
-    # 执行价护栏：成交价超过此值弃单（影子回测 EV+0.097 对溢价敏感，
-    # 0.70 附近入场 EV≈0.40，0.75 处 EV≈0.307，0.78 起空间明显变薄）
-    quote_momentum_live_max_exec_price: float = 0.78
+    # 执行价护栏：成交均价超过此值弃单且滑点按它收紧。None=按版本自动推导
+    # （入场区间上界+0.03：momentum→0.78 与旧默认一致，contrarian→0.28）；
+    # 显式配置则全版本统一覆盖（收紧用，勿放大——EV 对入场溢价敏感）
+    quote_momentum_live_max_exec_price: float | None = None
     # 日单量护栏：当日 FILLED 达上限后停火（防行情极端密度暴涨散口）
     quote_momentum_live_max_daily_orders: int = 30
 

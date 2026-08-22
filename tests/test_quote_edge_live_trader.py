@@ -1,7 +1,8 @@
-"""报价 edge 实盘执行器单元测试（quote_momentum_v1 LIVE）。
+"""报价 edge 实盘执行器单元测试（LIVE 版本可配，momentum/contrarian 双版本）。
 
 覆盖：规则区间守卫（时点/报价/None/开关）、每窗一条、日单量护栏、
-重启防重（DB 已有尝试）、成交/未成交路径、execute_signal_trade 执行价护栏。
+重启防重（DB 已有尝试）、成交/未成交路径、execute_signal_trade 执行价护栏、
+版本白名单校验与自动护栏推导。
 
 不触网络/真实 DB：trader 与 DB 查询方法全部用替身/monkeypatch。
 """
@@ -42,8 +43,10 @@ class _FakeTrader:
         return self.result
 
 
-def _make_trader(monkeypatch, trader: _FakeTrader) -> QuoteEdgeLiveTrader:
+def _make_trader(monkeypatch, trader: _FakeTrader,
+                 version: str = "quote_momentum_v1") -> QuoteEdgeLiveTrader:
     monkeypatch.setattr(settings, "quote_momentum_live_enabled", True)
+    monkeypatch.setattr(settings, "quote_edge_live_version", version)
     t = QuoteEdgeLiveTrader(trader)
 
     async def _no_filled(self):
@@ -100,8 +103,9 @@ def test_check_quote_band_guards(monkeypatch) -> None:
 
 
 def test_check_rule_bounds_frozen(monkeypatch) -> None:
-    """规则常量必须与冻结口径一致（防再次口径漂移）。"""
-    assert qelt.QUOTE_EDGE_RULES[qelt.LIVE_VERSION] == (90.0, 120.0, 0.69, 0.75)
+    """规则常量必须与冻结口径一致（防再次口径漂移），两个 LIVE 候选都锁。"""
+    assert qelt.QUOTE_EDGE_RULES["quote_momentum_v1"] == (90.0, 120.0, 0.69, 0.75)
+    assert qelt.QUOTE_EDGE_RULES["quote_contrarian_v1"] == (45.0, 60.0, 0.15, 0.25)
 
 
 @pytest.mark.asyncio
@@ -132,7 +136,7 @@ async def test_fire_success_calls_trader_and_backfills(monkeypatch) -> None:
     assert call["signal_version"] == "quote_momentum_v1"
     assert call["window_start"] == WINDOW_START
     assert call["amount_usdt"] == settings.quote_momentum_live_amount_usdt
-    assert call["max_exec_price"] == settings.quote_momentum_live_max_exec_price
+    assert call["max_exec_price"] == 0.78  # momentum 自动推导（旧默认口径不变）
     assert t._fire_total == 1
 
 
@@ -194,6 +198,65 @@ def test_status_shape(monkeypatch) -> None:
     assert s["enabled"] is True
     assert s["version"] == "quote_momentum_v1"
     assert s["fire_total"] == 0
+
+
+# ============================================================
+# contrarian LIVE（2026-08-22 切换的默认版本）
+# ============================================================
+
+def test_default_live_version_is_contrarian() -> None:
+    """settings 默认必须切到 contrarian（唯一正 EV，用户 2026-08-22 圈定）；
+    防后续误改默认值静默回 momentum（负 EV）。"""
+    assert settings.quote_edge_live_version == "quote_contrarian_v1"
+    assert qelt.LIVE_ALLOWED_VERSIONS == ("quote_momentum_v1", "quote_contrarian_v1")
+
+
+def test_contrarian_band_guards(monkeypatch) -> None:
+    """contrarian 区间 t∈[45,60)s×q∈[0.15,0.25)（半开区间）。"""
+    t = _make_trader(monkeypatch, _FakeTrader(), version="quote_contrarian_v1")
+    ts = WINDOW_START + 50_000
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 44_999, 0.20) is False
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 60_000, 0.20) is False
+    assert t.check(WINDOW_START, WINDOW_END, ts, 0.1499) is False
+    assert t.check(WINDOW_START, WINDOW_END, ts, 0.25) is False
+    assert WINDOW_START not in t._fired
+
+
+@pytest.mark.asyncio
+async def test_contrarian_fire_derived_exec_guard(monkeypatch) -> None:
+    """contrarian 开火：signal_version 透传、执行价护栏自动推导 0.28（0.25+0.03）。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, version="quote_contrarian_v1")
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 50_000, 0.20) is True
+    await _drain(t)
+    call = fake.calls[0]
+    assert call["signal_version"] == "quote_contrarian_v1"
+    assert call["prediction"] == "DOWN"
+    assert call["max_exec_price"] == 0.28
+    assert t._fire_total == 1
+
+
+def test_momentum_exec_guard_backcompat(monkeypatch) -> None:
+    """momentum 未显式配置时推导 0.78（与旧默认完全一致，回测口径不变）。"""
+    t = _make_trader(monkeypatch, _FakeTrader())
+    assert t._max_exec == 0.78
+
+
+def test_explicit_exec_guard_override(monkeypatch) -> None:
+    """显式配置 max_exec_price 时覆盖推导（收紧场景）。"""
+    monkeypatch.setattr(settings, "quote_momentum_live_max_exec_price", 0.26)
+    t = _make_trader(monkeypatch, _FakeTrader(), version="quote_contrarian_v1")
+    assert t._max_exec == 0.26
+
+
+def test_unknown_version_rejected(monkeypatch) -> None:
+    """v2 门禁版/未知版本 → 构造抛 ValueError（配了会以 v1 区间裸下单丢门禁）。"""
+    monkeypatch.setattr(settings, "quote_edge_live_version", "quote_momentum_v2")
+    with pytest.raises(ValueError, match="白名单"):
+        QuoteEdgeLiveTrader(_FakeTrader())
+    monkeypatch.setattr(settings, "quote_edge_live_version", "nonexistent")
+    with pytest.raises(ValueError, match="不支持"):
+        QuoteEdgeLiveTrader(_FakeTrader())
 
 
 # ============================================================
