@@ -239,14 +239,15 @@ class BinancePredictionTrader:
         """从现货账户划转 USDT 入预测钱包（下单扣款来源）。
 
         预测市场下单扣的是预测钱包内余额（现货余额充足仍报 -9000
-        即未划转），调用 POST /sapi/v1/w3w/wallet/prediction/transfer/inbound。
+        即未划转），调用 POST /sapi/v1/w3w/wallet/prediction/transfer/outbound
+        （注意：官方 outbound = CEX→预测钱包入金，inbound 方向相反）。
         失败返回 None，详情写入 last_api_error。
         """
         amount_wei = str(int(round(amount_usdt * 10**18)))
         # 全参数走 query（与 place-order 同口径，签名可过）；早期的 -9000
         # 实为 API Key 缺万向划转权限，非编码方式问题（form/JSON 报 -1022）。
         signed_url = self._build_signed_url(
-            "/sapi/v1/w3w/wallet/prediction/transfer/inbound",
+            "/sapi/v1/w3w/wallet/prediction/transfer/outbound",
             {
                 "walletId": self._wallet_id,
                 "walletAddress": self._wallet_address,
