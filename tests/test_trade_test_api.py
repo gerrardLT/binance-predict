@@ -11,7 +11,9 @@ POST /api/trade/test（main.manual_trade_test）。
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -117,3 +119,47 @@ async def test_trade_test_failed_order_passthrough(monkeypatch) -> None:
         ManualTradeTestRequest(amount_usdt=1.0), _=None)
     assert out["status"] == "FAILED"
     assert "未找到 DOWN" in out["error_message"]
+
+
+# ============================================================
+# GET /api/trades/recent（实盘面板订单历史）
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_recent_trades_fields_and_limit() -> None:
+    """订单行字段透传（含 quote_json 提取的 average_price）；limit 截断到 1~100。"""
+    import binance_predict.main as m
+
+    row = SimpleNamespace(
+        id=1, signal_version="manual_test", window_start=1_787_412_600_000,
+        status="FAILED", order_id=None, token_id=None, amount_in=None,
+        quote_json={"averagePrice": 0.5},
+        error_message="获取报价失败 | HTTP 400: not enough USDT",
+        created_at=datetime(2026, 8, 22, 15, 35, tzinfo=timezone.utc),
+    )
+    db = AsyncMock()
+    result = MagicMock()
+    result.scalars.return_value.all.return_value = [row]
+    db.execute = AsyncMock(return_value=result)
+
+    out = await m.get_recent_trades(limit=200, _=None, db=db)
+    assert len(out["orders"]) == 1
+    o = out["orders"][0]
+    assert o["signal_version"] == "manual_test"
+    assert o["status"] == "FAILED"
+    assert o["average_price"] == 0.5
+    assert "HTTP 400" in o["error_message"]
+    assert o["created_at"].startswith("2026-08-22")
+
+
+@pytest.mark.asyncio
+async def test_recent_trades_empty() -> None:
+    import binance_predict.main as m
+
+    db = AsyncMock()
+    result = MagicMock()
+    result.scalars.return_value.all.return_value = []
+    db.execute = AsyncMock(return_value=result)
+
+    out = await m.get_recent_trades(limit=20, _=None, db=db)
+    assert out["orders"] == []

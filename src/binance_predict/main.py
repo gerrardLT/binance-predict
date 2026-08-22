@@ -1610,6 +1610,42 @@ async def get_latest_trade(
     }
 
 
+@app.get("/api/trades/recent")
+async def get_recent_trades(
+    limit: int = 20,
+    _: None = Depends(_require_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """最近交易订单列表（实盘面板：下单历史展示，含人工测试单与信号实盘单）。"""
+    from sqlalchemy import select
+    from .db.models import TradeOrderModel
+
+    limit = max(1, min(int(limit), 100))
+    stmt = (
+        select(TradeOrderModel)
+        .order_by(TradeOrderModel.created_at.desc())
+        .limit(limit)
+    )
+    orders = (await db.execute(stmt)).scalars().all()
+    return {
+        "orders": [
+            {
+                "id": o.id,
+                "signal_version": o.signal_version,
+                "window_start": o.window_start,
+                "status": o.status,
+                "order_id": o.order_id,
+                "token_id": o.token_id,
+                "amount_in": o.amount_in,
+                "average_price": (o.quote_json or {}).get("averagePrice"),
+                "error_message": o.error_message,
+                "created_at": o.created_at.isoformat() if o.created_at else None,
+            }
+            for o in orders
+        ]
+    }
+
+
 @app.get("/api/prediction-markets")
 async def list_prediction_markets(
     _: None = Depends(_require_auth),

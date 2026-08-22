@@ -474,6 +474,16 @@ const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ discoveries, snapshot_token: snapshotToken ?? null }),
     }).then(r => r.json()),
+  // 实盘面板（2026-08-22）：钱包/实盘状态/下单/订单历史
+  getPredictionWallet: () => fetch('/api/prediction-wallet').then(r => r.json()),
+  getLiveStatus: () => fetch('/api/misalignment/signals').then(r => r.json()),
+  getRecentTrades: (limit = 20) => fetch(`/api/trades/recent?limit=${limit}`).then(r => r.json()),
+  postTradeTest: (amount_usdt: number, prediction: string) =>
+    fetch('/api/trade/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ amount_usdt, prediction }),
+    }).then(r => r.json()),
 }
 
 // ============================================================
@@ -538,12 +548,190 @@ function Card({ title, children, className = '' }: { title: string; children: Re
 }
 
 // ============================================================
+// 实盘 Tab（账户状态 + 人工测试单 + 订单历史，2026-08-22）
+// ============================================================
+
+function LiveTradeTab() {
+  const [wallet, setWallet] = useState<Record<string, unknown> | null>(null)
+  const [live, setLive] = useState<Record<string, unknown> | null>(null)
+  const [orders, setOrders] = useState<Record<string, unknown>[]>([])
+  const [amount, setAmount] = useState('1')
+  const [side, setSide] = useState<'DOWN' | 'UP'>('DOWN')
+  const [busy, setBusy] = useState(false)
+  const [result, setResult] = useState<Record<string, unknown> | null>(null)
+
+  const refresh = useCallback(() => {
+    api.getPredictionWallet().then(setWallet).catch(() => {})
+    api.getLiveStatus().then(d => setLive(d?.quote_edge_live ?? null)).catch(() => {})
+    api.getRecentTrades().then(d => setOrders(d?.orders ?? [])).catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    refresh()
+    const timer = setInterval(refresh, 15000)
+    return () => clearInterval(timer)
+  }, [refresh])
+
+  const handleTestTrade = async () => {
+    const amt = parseFloat(amount)
+    if (!Number.isFinite(amt) || amt < 0.1 || amt > 5) {
+      alert('金额仅允许 0.1~5 USDT')
+      return
+    }
+    if (!window.confirm(
+      `确认下真实订单测试单？\n方向: ${side === 'DOWN' ? '↓ 看跌' : '↑ 看涨'} | 金额: ${amt} USDT\n\n这是真实订单，将从现货账户扣款。`)) return
+    setBusy(true)
+    setResult(null)
+    try {
+      const res = await api.postTradeTest(amt, side)
+      setResult(res)
+      refresh()
+    } catch (e) {
+      alert(`请求失败: ${(e as Error).message}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const walletErr = (wallet as { error?: string } | null)?.error
+  const regTs = wallet?.registered_time as number | undefined
+  const resultFilled = result?.status === 'FILLED'
+
+  return (
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      <Card title="账户状态">
+        <div className="space-y-2 text-sm">
+          <div className="flex justify-between gap-2">
+            <span className="text-gray-500 shrink-0">预测钱包</span>
+            {walletErr
+              ? <span className="text-red-600 text-right">{walletErr}</span>
+              : <span className="font-mono text-gray-800">{String(wallet?.wallet_address ?? '--')}</span>}
+          </div>
+          <div className="flex justify-between gap-2">
+            <span className="text-gray-500 shrink-0">钱包 ID</span>
+            <span className="font-mono text-gray-600 text-xs truncate">{String(wallet?.wallet_id ?? '--')}</span>
+          </div>
+          <div className="flex justify-between gap-2">
+            <span className="text-gray-500 shrink-0">钱包注册时间</span>
+            <span className="text-gray-700">{regTs ? new Date(regTs).toLocaleString() : '--'}</span>
+          </div>
+          <div className="border-t border-gray-100 my-2" />
+          <div className="flex justify-between gap-2">
+            <span className="text-gray-500 shrink-0">信号实盘</span>
+            {live
+              ? <span className="text-green-700 font-semibold">已开启 · {String(live.version)}</span>
+              : <span className="text-gray-500">未开启（影子模式）</span>}
+          </div>
+          {live && (
+            <>
+              <div className="flex justify-between gap-2">
+                <span className="text-gray-500 shrink-0">每单金额 / 执行价上限</span>
+                <span className="text-gray-700">{String(live.amount_usdt)} USDT / {String(live.max_exec_price)}</span>
+              </div>
+              <div className="flex justify-between gap-2">
+                <span className="text-gray-500 shrink-0">日上限 / 已开火</span>
+                <span className="text-gray-700">{String(live.max_daily_orders)} 单 / {String(live.fire_total)} 次</span>
+              </div>
+            </>
+          )}
+        </div>
+      </Card>
+
+      <Card title="人工测试单（真实下单）">
+        <div className="space-y-3 text-sm">
+          <div className="flex items-center gap-3">
+            <label className="text-gray-500 shrink-0">金额 (USDT)</label>
+            <input
+              type="number" min={0.1} max={5} step={0.5} value={amount}
+              onChange={e => setAmount(e.target.value)}
+              className="w-24 px-2 py-1 border border-gray-300 rounded text-gray-800"
+            />
+            <span className="text-xs text-gray-400">0.1~5</span>
+          </div>
+          <div className="flex items-center gap-3">
+            <span className="text-gray-500 shrink-0">方向</span>
+            <button
+              onClick={() => setSide('DOWN')}
+              className={`px-3 py-1 text-sm font-semibold rounded-full border ${side === 'DOWN' ? 'bg-red-100 text-red-700 border-red-300' : 'bg-white text-gray-500 border-gray-200'}`}
+            >↓ 看跌</button>
+            <button
+              onClick={() => setSide('UP')}
+              className={`px-3 py-1 text-sm font-semibold rounded-full border ${side === 'UP' ? 'bg-green-100 text-green-700 border-green-300' : 'bg-white text-gray-500 border-gray-200'}`}
+            >↑ 看涨</button>
+          </div>
+          <button
+            onClick={handleTestTrade}
+            disabled={busy}
+            className={`w-full py-2 rounded-lg font-bold text-white transition ${busy ? 'bg-gray-300 cursor-wait' : 'bg-brand hover:opacity-90'}`}
+          >
+            {busy ? '下单中…' : '下单（真实订单）'}
+          </button>
+          {result && (
+            <div className={`p-2 rounded text-xs ${resultFilled ? 'bg-green-50 text-green-800' : 'bg-red-50 text-red-700'}`}>
+              <div className="font-bold">{resultFilled ? '✓ 已成交 FILLED' : `✗ ${String(result.status ?? '未执行')}`}</div>
+              {result.order_id != null && <div>订单号: {String(result.order_id)}</div>}
+              {result.average_price != null && <div>成交均价: {String(result.average_price)}</div>}
+              {result.error_message != null && <div>{String(result.error_message)}</div>}
+              {result.error != null && <div>{String(result.error)}</div>}
+            </div>
+          )}
+          <p className="text-xs text-gray-400">
+            与信号实盘同链路（占位→报价→下单→落库）；同一 5m 窗口至多一单。
+          </p>
+        </div>
+      </Card>
+
+      <div className="lg:col-span-2">
+        <Card title="最近订单">
+          {orders.length === 0 ? (
+            <p className="text-sm text-gray-400">暂无订单记录</p>
+          ) : (
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="text-left text-gray-500 border-b border-gray-100">
+                  <th className="py-1 pr-2">时间</th>
+                  <th className="py-1 pr-2">版本</th>
+                  <th className="py-1 pr-2">状态</th>
+                  <th className="py-1 pr-2">均价</th>
+                  <th className="py-1 pr-2">金额 (USDT)</th>
+                  <th className="py-1">说明</th>
+                </tr>
+              </thead>
+              <tbody>
+                {orders.map(o => (
+                  <tr key={String(o.id)} className="border-b border-gray-50">
+                    <td className="py-1.5 pr-2 text-gray-600 whitespace-nowrap">
+                      {o.created_at ? new Date(String(o.created_at)).toLocaleString() : '--'}
+                    </td>
+                    <td className="py-1.5 pr-2 font-mono text-gray-700">{String(o.signal_version ?? '--')}</td>
+                    <td className="py-1.5 pr-2">
+                      <span className={`px-1.5 py-0.5 rounded font-bold ${o.status === 'FILLED' ? 'bg-green-100 text-green-700' : o.status === 'FAILED' ? 'bg-red-100 text-red-700' : 'bg-gray-100 text-gray-600'}`}>
+                        {String(o.status)}
+                      </span>
+                    </td>
+                    <td className="py-1.5 pr-2 font-mono">{o.average_price != null ? String(o.average_price) : '--'}</td>
+                    <td className="py-1.5 pr-2 font-mono">
+                      {o.amount_in != null ? (Number(o.amount_in) / 1e18).toFixed(2) : '--'}
+                    </td>
+                    <td className="py-1.5 text-gray-500">{String(o.error_message ?? '')}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </Card>
+      </div>
+    </div>
+  )
+}
+
+// ============================================================
 // Main App
 // ============================================================
 
 export default function App() {
   const [health, setHealth] = useState<HealthData | null>(null)
-  const [tab, setTab] = useState<'market' | 'agent' | 'monitor' | 'analysis'>('market')
+  const [tab, setTab] = useState<'market' | 'agent' | 'monitor' | 'analysis' | 'live'>('market')
 
   // 市场情绪
   const [pmPoints, setPmPoints] = useState<PMPoint[]>([])
@@ -636,6 +824,16 @@ export default function App() {
               }`}
             >
               信号分析
+            </button>
+            <button
+              onClick={() => setTab('live')}
+              className={`px-4 py-1.5 text-sm font-semibold rounded-full transition ${
+                tab === 'live'
+                  ? 'bg-white text-brand shadow-sm'
+                  : 'text-gray-600 hover:text-gray-900 hover:bg-white/60'
+              }`}
+            >
+              实盘交易
             </button>
           </div>
 
@@ -774,6 +972,7 @@ export default function App() {
         {tab === 'monitor' && <MonitorTab />}
 
         {tab === 'analysis' && <SignalAnalyticsTab />}
+        {tab === 'live' && <LiveTradeTab />}
       </main>
 
       {/* 右侧悬浮：LLM 轨迹面板（全局可见，5 秒轮询） */}
