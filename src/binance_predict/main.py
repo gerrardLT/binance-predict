@@ -853,6 +853,14 @@ async def lifespan(app: FastAPI):
                 "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS quote5m_down_15m FLOAT",
                 "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS quote5m_up_15m FLOAT",
                 "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS quote5m_ts_15m BIGINT",
+                # 信号关联字段 + 唯一约束/索引（与 alembic 迁移 u6f7g8h9i0j1 等价，存量 dev 库安全网）
+                "ALTER TABLE trade_orders ADD COLUMN IF NOT EXISTS signal_version VARCHAR(40)",
+                "ALTER TABLE trade_orders ADD COLUMN IF NOT EXISTS window_start BIGINT",
+                "ALTER TABLE trade_orders ADD COLUMN IF NOT EXISTS signal_id INTEGER",
+                "ALTER TABLE trade_orders ADD CONSTRAINT uq_trade_orders_version_window UNIQUE (signal_version, window_start)",
+                "CREATE INDEX IF NOT EXISTS ix_trade_orders_signal_version ON trade_orders (signal_version)",
+                # token_id 扩宽（与 alembic 迁移 w7a8b9c0d1e2 等价，存量 dev 库安全网；重复执行幂等）
+                "ALTER TABLE trade_orders ALTER COLUMN token_id TYPE VARCHAR(128)",
             ]:
                 try:
                     await conn.execute(text(col_sql))

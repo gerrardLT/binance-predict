@@ -7,6 +7,10 @@ Create Date: 2026-08-23
 预测市场 outcome tokenId 为 78 字符 hex，原 VARCHAR(50) 写入超长触发
 StringDataRightTruncationError → 成交订单 UPDATE 失败、行卡 PENDING
 （钱已花出但本地无记录）。扩到 VARCHAR(128) 修复。
+
+comment 与 models.py 严格对齐（单一事实源，避免 autogenerate 漂移）。
+downgrade 需保证无 >50 字符 token_id 行，否则 PG 报长度错误；
+必要时先手工清理再回滚（并还原建表时的原始 comment）。
 """
 from __future__ import annotations
 
@@ -23,6 +27,7 @@ def upgrade() -> None:
     op.alter_column(
         "trade_orders", "token_id",
         existing_type=sa.String(length=50),
+        existing_comment="Outcome Token ID",
         type_=sa.String(length=128),
         existing_nullable=True,
         comment="Outcome Token ID（预测市场 78 字符 hex）",
@@ -35,4 +40,5 @@ def downgrade() -> None:
         existing_type=sa.String(length=128),
         type_=sa.String(length=50),
         existing_nullable=True,
+        comment="Outcome Token ID",
     )

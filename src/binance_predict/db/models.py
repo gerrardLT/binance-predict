@@ -76,7 +76,7 @@ class TradeOrderModel(Base):
     )
     token_id: Mapped[str | None] = mapped_column(
         String(128), nullable=True,
-        comment="Outcome Token ID（预测市场为 78 字符 hex，旧 VARCHAR(50) 超长报错）",
+        comment="Outcome Token ID（预测市场 78 字符 hex）",
     )
     side: Mapped[str] = mapped_column(
         String(10), nullable=False, comment="BUY | SELL"
