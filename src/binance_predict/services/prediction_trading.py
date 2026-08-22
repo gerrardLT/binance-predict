@@ -285,16 +285,19 @@ class BinancePredictionTrader:
         官方文档核对，错误回显便于定位）。
         """
         self.last_api_error = None
-        # 文档示例仅 walletAddress（不传 walletId，避免多余参数报错）
-        params = self._sign_request({
-            "walletAddress": self._wallet_address,
-            "limit": limit,
-        })
+        # 文档示例仅 walletAddress；全参数走 query 手动拼 URL（httpx params=
+        # 的 URL 编码会导致签名串与实际 query 不一致，报 -1022）
+        signed_url = self._build_signed_url(
+            "/sapi/v1/w3w/wallet/prediction/order/history",
+            {
+                "walletAddress": self._wallet_address,
+                "limit": limit,
+            },
+        )
         try:
             client = self._get_client()
             resp = await client.get(
-                f"{self.BASE_URL}/sapi/v1/w3w/wallet/prediction/order/history",
-                params=params,
+                signed_url,
                 headers={"X-MBX-APIKEY": self._api_key},
             )
             resp.raise_for_status()
