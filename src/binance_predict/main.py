@@ -1745,16 +1745,17 @@ async def manual_trade_test(
             "error": "下单未执行（API Key 未配置 / 钱包获取失败 / 本窗口已有测试单）",
             "window_start": window_start,
         }
-    quote = order.quote_json or {}
+    # order 为 dict 快照（execute_signal_trade 不再返回 ORM 对象，
+    # 避免会话关闭后访问属性报 DetachedInstanceError）
     return {
-        "status": order.status,
-        "order_id": order.order_id,
-        "signal_version": order.signal_version,
-        "window_start": order.window_start,
-        "token_id": order.token_id or None,
-        "average_price": quote.get("averagePrice"),
-        "amount_in": quote.get("amountIn"),
-        "error_message": order.error_message,
+        "status": order.get("status"),
+        "order_id": order.get("order_id"),
+        "signal_version": order.get("signal_version"),
+        "window_start": order.get("window_start"),
+        "token_id": order.get("token_id") or None,
+        "average_price": order.get("average_price"),
+        "amount_in": order.get("amount_in"),
+        "error_message": order.get("error_message"),
     }
 
 
@@ -1791,6 +1792,25 @@ async def prediction_transfer_in(
         "transfer": resp,
         "spot_usdt_free": await prediction_trader.fetch_spot_usdt_balance(),
     }
+
+
+@app.get("/api/trades/binance-history")
+async def get_binance_order_history(
+    limit: int = 20,
+    _: None = Depends(_require_auth),
+):
+    """币安侧预测钱包订单历史（对账用：本地卡 PENDING 时确认是否真实成交）。"""
+    if not prediction_trader._api_key:
+        return {"error": "Binance API Key 未配置"}
+    if not prediction_trader._wallet_address or not prediction_trader._wallet_id:
+        wallet = await prediction_trader.fetch_wallet_info()
+        if not wallet:
+            return {"error": "未找到预测钱包"}
+    limit = max(1, min(int(limit), 100))
+    orders = await prediction_trader.query_order_history(limit=limit)
+    if orders is None:
+        return {"error": "查询失败（详见后端日志）", "orders": []}
+    return {"orders": orders}
 
 
 # ============================================================

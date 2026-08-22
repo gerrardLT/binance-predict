@@ -151,15 +151,16 @@ class QuoteEdgeLiveTrader:
                 return
 
             self._fire_total += 1
-            if order.status == "FILLED":
+            # execute_signal_trade 返回 dict 快照（非 ORM 对象，避免脱离会话访问报错）
+            if order.get("status") == "FILLED":
                 logger.info(
                     "报价 edge 实盘成交 | {} | order_id={} | token={} | amount_in={}",
-                    win_label, order.order_id, order.token_id, order.amount_in)
+                    win_label, order.get("order_id"), order.get("token_id"), order.get("amount_in"))
                 self._schedule(self._backfill_signal_link(window_start), window_end)
             else:
                 logger.warning(
                     "报价 edge 实盘未成交 | {} | status={} | {}",
-                    win_label, order.status, order.error_message)
+                    win_label, order.get("status"), order.get("error_message"))
         except Exception as exc:
             logger.warning("报价 edge 实盘：下单任务异常 | 窗口 {} | {} | {}",
                            win_label, type(exc).__name__, exc)

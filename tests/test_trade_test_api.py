@@ -2,6 +2,8 @@
 POST /api/trade/test（main.manual_trade_test）。
 
 不触网络/真实 DB：prediction_trader.execute_signal_trade 用替身。
+注：execute_signal_trade 返回 dict 快照（非 ORM 对象，避免脱离会话
+访问属性报 DetachedInstanceError 导致端点 500 + 行卡 PENDING）。
 核心分支：
 - 金额越界（<0.1 / >5）与方向非法 → 参数校验拒绝（不碰 trader）
 - order=None（key 未配/钱包失败/同窗已有测试单）→ error 提示
@@ -20,15 +22,15 @@ import pytest
 from binance_predict.models.schemas import ManualTradeTestRequest
 
 
-def _order(**over) -> SimpleNamespace:
+def _order(**over) -> dict:
+    """execute_signal_trade 返回的 dict 快照替身。"""
     base = dict(
-        status="FILLED", order_id="ORD-1", signal_version="manual_test",
+        id=1, status="FILLED", order_id="ORD-1", signal_version="manual_test",
         window_start=1_000_000_000_000, token_id="TOKEN-DOWN",
-        quote_json={"averagePrice": 0.5, "amountIn": "1000000"},
-        error_message=None,
+        amount_in="1000000", average_price=0.5, error_message=None,
     )
     base.update(over)
-    return SimpleNamespace(**base)
+    return base
 
 
 @pytest.mark.asyncio
@@ -112,7 +114,8 @@ async def test_trade_test_failed_order_passthrough(monkeypatch) -> None:
 
     async def _exec(**kw):
         return _order(status="FAILED", order_id=None, token_id="",
-                      quote_json={}, error_message="未找到 DOWN 方向的 token")
+                      average_price=None, amount_in=None,
+                      error_message="未找到 DOWN 方向的 token")
 
     monkeypatch.setattr(m.prediction_trader, "execute_signal_trade", _exec)
     out = await m.manual_trade_test(

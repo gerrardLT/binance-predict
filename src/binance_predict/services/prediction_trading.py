@@ -277,6 +277,37 @@ class BinancePredictionTrader:
             logger.error("预测钱包入金异常: {}", e)
             return None
 
+    async def query_order_history(self, limit: int = 20) -> list | None:
+        """查询预测钱包订单历史（GET order/history）。
+
+        用途：本地落库卡 PENDING 时对账，确认币安侧是否真实成交（钱是否
+        已花出）。失败返回 None。
+        """
+        params = self._sign_request({
+            "walletAddress": self._wallet_address,
+            "walletId": self._wallet_id,
+            "limit": limit,
+        })
+        try:
+            client = self._get_client()
+            resp = await client.get(
+                f"{self.BASE_URL}/sapi/v1/w3w/wallet/prediction/order/history",
+                params=params,
+                headers={"X-MBX-APIKEY": self._api_key},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("查询订单历史失败 (HTTP {}): {}", e.response.status_code, e.response.text[:300])
+            return None
+        except Exception as e:
+            logger.error("查询订单历史失败: {}", e)
+            return None
+
+        if isinstance(data, list):
+            return data
+        return data.get("orders", data.get("items", []))
+
     @staticmethod
     def _classify_period(market: dict) -> str | None:
         """按 title/slug 识别市场周期：'5m' | '15m' | None。先判 15m（含 '5m' 子串）。"""
@@ -640,9 +671,12 @@ class BinancePredictionTrader:
         signal_version: str,
         window_start: int,
         max_exec_price: float | None = None,
-    ) -> TradeOrderModel | None:
+    ) -> dict | None:
         """
         信号驱动实盘专用通道（报价 edge LIVE）：报价 → 执行价护栏 → 下单 → 落表。
+
+        返回 dict 快照（非 ORM 对象）：会话关闭后对象即脱离，调用方再访问
+        属性会抛 DetachedInstanceError（旧实现导致端点 500 + 行卡 PENDING）。
 
         与 execute_trade 的差异：
         1. 金额/信号版本/窗口由调用方显式传入（非配置默认）；
@@ -679,23 +713,20 @@ class BinancePredictionTrader:
                 token_id = self._down_token_id
             else:
                 logger.warning("未知预测方向: {}", prediction)
-                await self._update_signal_order(pending, "FAILED",
-                                                error_message=f"未知预测方向: {prediction}")
-                return pending
+                return await self._update_signal_order(
+                    pending, "FAILED", error_message=f"未知预测方向: {prediction}")
 
             if not token_id:
-                await self._update_signal_order(
+                return await self._update_signal_order(
                     pending, "FAILED", error_message=f"未找到 {prediction} 方向的 token")
-                return pending
 
             quote = await self.get_quote(token_id, "BUY", amount_usdt=amount_usdt)
             if not quote:
                 detail = self.last_api_error or "无详情（网络异常？）"
-                await self._update_signal_order(
+                return await self._update_signal_order(
                     pending, "FAILED",
                     error_message=f"获取报价失败 | {detail}",
                 )
-                return pending
 
             # 执行价护栏：报价均价超阈弃单（不追贵，保护回测 EV 口径）
             try:
@@ -703,11 +734,10 @@ class BinancePredictionTrader:
             except (TypeError, ValueError):
                 avg_price = 0.0
             if max_exec_price is not None and (avg_price <= 0 or avg_price > max_exec_price):
-                await self._update_signal_order(
+                return await self._update_signal_order(
                     pending, "FAILED",
                     error_message=f"执行价护栏弃单 | averagePrice={avg_price} > {max_exec_price}",
                     quote_json=quote)
-                return pending
 
             # 动态滑点收紧（CodeReview Medium#2）：FOK 成交价不得突破护栏价，
             # 否则 slippageBps=1200 会让 0.78 的护栏形同虚设（最高可成交 ~0.87）。
@@ -718,11 +748,10 @@ class BinancePredictionTrader:
 
             order_result = await self.place_order(quote, slippage_bps=slippage_bps)
             if not order_result:
-                await self._update_signal_order(pending, "FAILED",
-                                                error_message="下单失败", quote_json=quote)
-                return pending
+                return await self._update_signal_order(
+                    pending, "FAILED", error_message="下单失败", quote_json=quote)
 
-            await self._update_signal_order(
+            snapshot = await self._update_signal_order(
                 pending, "FILLED",
                 token_id=token_id,
                 amount_in=str(quote.get("amountIn", "")),
@@ -732,7 +761,7 @@ class BinancePredictionTrader:
             )
             logger.info("信号实盘成交 | signal={} | window={} | orderId={} | slippageBps={}",
                         signal_version, window_start, order_result.get("orderId"), slippage_bps)
-            return pending
+            return snapshot
 
     async def _reserve_order_slot(
         self, signal_version: str, window_start: int,
@@ -776,11 +805,16 @@ class BinancePredictionTrader:
         order_id: str | None = None,
         quote_json: dict | None = None,
         error_message: str | None = None,
-    ) -> None:
-        """把占位订单更新为终态（FILLED/FAILED）。
+    ) -> dict:
+        """把占位订单更新为终态（FILLED/FAILED），返回 dict 快照。
 
         交易所已成交而此处更新失败是最坏路径（行卡在 PENDING）：记 CRITICAL
         供日志健康检查报警，禁止静默（CodeReview High#1 修复配套）。
+
+        Fix（2026-08-23）：占位对象来自已关闭会话（脱离态），旧实现 db.add()
+        会当 INSERT 撞唯一键静默失败（行卡 PENDING）且调用方再访问属性报
+        DetachedInstanceError（端点 500）；改 merge() 按主键 UPDATE 并返回
+        dict 快照，调用方不再触碰 ORM 对象。
         """
         try:
             async with async_session_factory() as db:
@@ -797,12 +831,34 @@ class BinancePredictionTrader:
                     order.quote_json = quote_json
                 if error_message is not None:
                     order.error_message = error_message
-                db.add(order)
+                merged = await db.merge(order)
                 await db.commit()
+                return {
+                    "id": merged.id,
+                    "status": merged.status,
+                    "signal_version": merged.signal_version,
+                    "window_start": merged.window_start,
+                    "token_id": merged.token_id,
+                    "order_id": merged.order_id,
+                    "amount_in": merged.amount_in,
+                    "average_price": (merged.quote_json or {}).get("averagePrice"),
+                    "error_message": merged.error_message,
+                }
         except Exception as e:
             logger.critical(
                 "信号实盘：订单终态落库失败 | window={} | status={} | order_id={} | {}",
                 order.window_start, status, order_id, e)
+            return {
+                "id": getattr(order, "id", None),
+                "status": status,
+                "signal_version": getattr(order, "signal_version", None),
+                "window_start": getattr(order, "window_start", None),
+                "token_id": token_id,
+                "order_id": order_id,
+                "amount_in": amount_in,
+                "average_price": (quote_json or {}).get("averagePrice"),
+                "error_message": error_message,
+            }
 
     async def _save_order(
         self,

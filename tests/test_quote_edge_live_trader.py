@@ -21,13 +21,19 @@ WINDOW_START = 1_000_000_000_000          # 5m 窗口起点（ms）
 WINDOW_END = WINDOW_START + 300_000
 
 
-class _FakeOrder:
-    def __init__(self, status="FILLED", error_message=None):
-        self.status = status
-        self.order_id = "ORD-1"
-        self.token_id = "TOKEN-DOWN"
-        self.amount_in = "5000000000000000000"
-        self.error_message = error_message
+def _fake_order(status="FILLED", error_message=None) -> dict:
+    """execute_signal_trade 返回的 dict 快照替身。"""
+    return {
+        "id": 1,
+        "status": status,
+        "signal_version": "quote_momentum_v1",
+        "window_start": WINDOW_START,
+        "order_id": "ORD-1",
+        "token_id": "TOKEN-DOWN",
+        "amount_in": "5000000000000000000",
+        "average_price": None,
+        "error_message": error_message,
+    }
 
 
 class _FakeTrader:
@@ -36,7 +42,7 @@ class _FakeTrader:
     def __init__(self, result=object()):
         self.calls: list[dict] = []
         # 哨兵区分"未传参（默认 FILLED）"与"显式传 None（落库异常）"
-        self.result = _FakeOrder() if isinstance(result, object) and type(result) is object else result
+        self.result = _fake_order() if isinstance(result, object) and type(result) is object else result
 
     async def execute_signal_trade(self, **kwargs):
         self.calls.append(kwargs)
@@ -174,7 +180,7 @@ async def test_fire_restart_dedup_blocks(monkeypatch) -> None:
 @pytest.mark.asyncio
 async def test_fire_failed_order_no_crash(monkeypatch) -> None:
     """trader 返回 FAILED（如护栏弃单）→ 计入 fire_total、无回填、不抛异常。"""
-    fake = _FakeTrader(result=_FakeOrder(status="FAILED", error_message="执行价护栏弃单"))
+    fake = _FakeTrader(result=_fake_order(status="FAILED", error_message="执行价护栏弃单"))
     t = _make_trader(monkeypatch, fake)
     assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 100_000, 0.71)
     await _drain(t)
@@ -279,9 +285,7 @@ def _make_real_trader(monkeypatch) -> BinancePredictionTrader:
 
 
 def _pending_order():
-    p = _FakeOrder(status="PENDING")
-    p.window_start = WINDOW_START
-    return p
+    return _fake_order(status="PENDING")
 
 
 @pytest.mark.asyncio
@@ -296,7 +300,7 @@ async def test_signal_trade_price_guard_rejects(monkeypatch) -> None:
 
     async def _update(order, status, **kwargs):
         updates.append((status, kwargs))
-        order.status = status
+        return {**order, "status": status}
 
     async def _quote(_token, _side, amount_usdt=None):
         return {"averagePrice": 0.82, "amountIn": "1", "quoteId": "Q1"}
@@ -311,7 +315,7 @@ async def test_signal_trade_price_guard_rejects(monkeypatch) -> None:
 
     order = await trader.execute_signal_trade(
         "DOWN", 5.0, "quote_momentum_v1", WINDOW_START, max_exec_price=0.78)
-    assert order is pending
+    assert order["status"] == "FAILED"  # 返回 dict 快照（非占位 ORM 对象）
     assert updates[0][0] == "FAILED"
     assert "执行价护栏" in updates[0][1]["error_message"]
 
@@ -330,7 +334,7 @@ async def test_signal_trade_success_dynamic_slippage(monkeypatch) -> None:
 
     async def _update(order, status, **kwargs):
         updates.append((status, kwargs))
-        order.status = status
+        return {**order, "status": status, "order_id": kwargs.get("order_id")}
 
     async def _quote(_token, _side, amount_usdt=None):
         assert amount_usdt == 5.0  # 自定义金额透传到报价
@@ -347,7 +351,7 @@ async def test_signal_trade_success_dynamic_slippage(monkeypatch) -> None:
 
     order = await trader.execute_signal_trade(
         "DOWN", 5.0, "quote_momentum_v1", WINDOW_START, max_exec_price=0.78)
-    assert order is pending and order.status == "FILLED"
+    assert order["status"] == "FILLED" and order["order_id"] == "ORD-9"
     assert slippage_seen == [985]
     assert updates[0][0] == "FILLED"
     assert updates[0][1]["order_id"] == "ORD-9"
