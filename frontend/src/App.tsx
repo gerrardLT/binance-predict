@@ -484,6 +484,12 @@ const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ amount_usdt, prediction }),
     }).then(r => r.json()),
+  postTransferIn: (amount_usdt: number) =>
+    fetch('/api/prediction/transfer-in', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ amount_usdt }),
+    }).then(r => r.json()),
 }
 
 // ============================================================
@@ -559,6 +565,9 @@ function LiveTradeTab() {
   const [side, setSide] = useState<'DOWN' | 'UP'>('DOWN')
   const [busy, setBusy] = useState(false)
   const [result, setResult] = useState<Record<string, unknown> | null>(null)
+  const [transferAmt, setTransferAmt] = useState('5')
+  const [transferring, setTransferring] = useState(false)
+  const [transferResult, setTransferResult] = useState<Record<string, unknown> | null>(null)
 
   const refresh = useCallback(() => {
     api.getPredictionWallet().then(setWallet).catch(() => {})
@@ -597,6 +606,26 @@ function LiveTradeTab() {
   const regTs = wallet?.registered_time as number | undefined
   const resultFilled = result?.status === 'FILLED'
 
+  const handleTransferIn = async () => {
+    const amt = parseFloat(transferAmt)
+    if (!Number.isFinite(amt) || amt < 0.1 || amt > 20) {
+      alert('划转金额仅允许 0.1~20 USDT')
+      return
+    }
+    if (!window.confirm(`确认从现货账户划转 ${amt} USDT 到预测钱包？\n（下单扣的是预测钱包内余额）`)) return
+    setTransferring(true)
+    setTransferResult(null)
+    try {
+      const res = await api.postTransferIn(amt)
+      setTransferResult(res)
+      refresh()
+    } catch (e) {
+      alert(`请求失败: ${(e as Error).message}`)
+    } finally {
+      setTransferring(false)
+    }
+  }
+
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
       <Card title="账户状态">
@@ -621,6 +650,25 @@ function LiveTradeTab() {
               ? <span className={`font-mono font-bold ${(wallet.spot_usdt_free as number) >= 1 ? 'text-green-700' : 'text-red-600'}`}>{(wallet.spot_usdt_free as number).toFixed(4)}</span>
               : <span className="text-gray-400">查询失败</span>}
           </div>
+          <div className="flex items-center gap-2">
+            <span className="text-gray-500 shrink-0">划转入金</span>
+            <input
+              type="number" min={0.1} max={20} step={0.5} value={transferAmt}
+              onChange={e => setTransferAmt(e.target.value)}
+              className="w-20 px-2 py-1 border border-gray-300 rounded text-gray-800"
+            />
+            <button
+              onClick={handleTransferIn} disabled={transferring}
+              className="px-3 py-1 text-xs font-semibold rounded bg-blue-600 text-white disabled:opacity-50"
+            >{transferring ? '划转中…' : '现货 → 预测钱包'}</button>
+          </div>
+          {transferResult && (
+            <div className={`text-xs px-2 py-1 rounded ${transferResult.status === 'SUCCESS' ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-600 break-all'}`}>
+              {transferResult.status === 'SUCCESS'
+                ? `划转成功，现货余额 → ${typeof transferResult.spot_usdt_free === 'number' ? (transferResult.spot_usdt_free as number).toFixed(4) : '?'}`
+                : `划转失败: ${String(transferResult.error ?? '未知错误')}`}
+            </div>
+          )}
           <div className="border-t border-gray-100 my-2" />
           <div className="flex justify-between gap-2">
             <span className="text-gray-500 shrink-0">信号实盘</span>

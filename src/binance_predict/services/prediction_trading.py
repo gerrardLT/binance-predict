@@ -235,6 +235,45 @@ class BinancePredictionTrader:
                     return None
         return 0.0
 
+    async def transfer_in(self, amount_usdt: float) -> dict | None:
+        """从现货账户划转 USDT 入预测钱包（下单扣款来源）。
+
+        预测市场下单扣的是预测钱包内余额（现货余额充足仍报 -9000
+        即未划转），调用 POST /sapi/v1/w3w/wallet/prediction/transfer/inbound。
+        失败返回 None，详情写入 last_api_error。
+        """
+        amount_wei = str(int(round(amount_usdt * 10**18)))
+        signed_url = self._build_signed_url(
+            "/sapi/v1/w3w/wallet/prediction/transfer/inbound",
+            {
+                "walletId": self._wallet_id,
+                "walletAddress": self._wallet_address,
+                "fromTokenAmount": amount_wei,
+                "accountType": "SPOT",
+                "sourceBiz": "USER_TRANSFER",
+            },
+        )
+
+        try:
+            client = self._get_client()
+            resp = await client.post(
+                signed_url,
+                headers={"X-MBX-APIKEY": self._api_key},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            self.last_api_error = None
+            logger.info("预测钱包入金成功 | amount={} USDT | resp={}", amount_usdt, data)
+            return data
+        except httpx.HTTPStatusError as e:
+            self.last_api_error = f"HTTP {e.response.status_code}: {e.response.text[:300]}"
+            logger.error("预测钱包入金失败 (HTTP {}): {}", e.response.status_code, e.response.text)
+            return None
+        except Exception as e:
+            self.last_api_error = f"{type(e).__name__}: {e}"
+            logger.error("预测钱包入金异常: {}", e)
+            return None
+
     @staticmethod
     def _classify_period(market: dict) -> str | None:
         """按 title/slug 识别市场周期：'5m' | '15m' | None。先判 15m（含 '5m' 子串）。"""

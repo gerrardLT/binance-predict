@@ -209,3 +209,55 @@ async def test_fetch_spot_usdt_balance_parses_free(monkeypatch) -> None:
     monkeypatch.setattr(trader, "_get_client", lambda: client)
 
     assert await trader.fetch_spot_usdt_balance() == 12.34
+
+
+# ============================================================
+# POST /api/prediction/transfer-in（现货→预测钱包划转）
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_transfer_in_amount_bounds(monkeypatch) -> None:
+    """金额越界（0.05 / 21）→ 拒绝且不触达 transfer_in。"""
+    import binance_predict.main as m
+    from binance_predict.models.schemas import TransferInboundRequest
+
+    async def _never(_amount):  # pragma: no cover - 不应被调用
+        raise AssertionError("越界金额不应触达 transfer_in")
+
+    monkeypatch.setattr(m.prediction_trader, "transfer_in", _never)
+    out1 = await m.prediction_transfer_in(TransferInboundRequest(amount_usdt=0.05), _=None)
+    out2 = await m.prediction_transfer_in(TransferInboundRequest(amount_usdt=21.0), _=None)
+    assert "error" in out1 and "error" in out2
+
+
+@pytest.mark.asyncio
+async def test_transfer_in_success_and_failure(monkeypatch) -> None:
+    """成功 → SUCCESS + 刷新后现货余额；失败 → FAILED + last_api_error 透传。"""
+    import binance_predict.main as m
+    from binance_predict.models.schemas import TransferInboundRequest
+
+    monkeypatch.setattr(m.prediction_trader, "_api_key", "k")
+    monkeypatch.setattr(m.prediction_trader, "_wallet_address", "0xW")
+    monkeypatch.setattr(m.prediction_trader, "_wallet_id", "WID")
+
+    async def _ok(amount):
+        assert amount == 5.0
+        return {"transferId": "T-1"}
+
+    async def _bal():
+        return 103.83
+
+    monkeypatch.setattr(m.prediction_trader, "transfer_in", _ok)
+    monkeypatch.setattr(m.prediction_trader, "fetch_spot_usdt_balance", _bal)
+    out = await m.prediction_transfer_in(TransferInboundRequest(amount_usdt=5.0), _=None)
+    assert out["status"] == "SUCCESS"
+    assert out["spot_usdt_free"] == 103.83
+
+    async def _fail(_amount):
+        return None
+
+    monkeypatch.setattr(m.prediction_trader, "transfer_in", _fail)
+    monkeypatch.setattr(m.prediction_trader, "last_api_error", "HTTP 400: -9000")
+    out2 = await m.prediction_transfer_in(TransferInboundRequest(amount_usdt=5.0), _=None)
+    assert out2["status"] == "FAILED"
+    assert "-9000" in out2["error"]

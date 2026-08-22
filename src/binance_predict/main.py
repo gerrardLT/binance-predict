@@ -40,7 +40,7 @@ from .db.models import (
     SceneParamVersion,
     SentimentWindow,
 )
-from .models.schemas import CommitDeepLearnRequest, ManualTradeTestRequest
+from .models.schemas import CommitDeepLearnRequest, ManualTradeTestRequest, TransferInboundRequest
 from .services.agent_scheduler import AgentScheduler
 from .services.data_collector import BinanceDataCollector
 from .services.fake_breakout_detector import FakeBreakoutDetector
@@ -1755,6 +1755,41 @@ async def manual_trade_test(
         "average_price": quote.get("averagePrice"),
         "amount_in": quote.get("amountIn"),
         "error_message": order.error_message,
+    }
+
+
+@app.post("/api/prediction/transfer-in")
+async def prediction_transfer_in(
+    req: TransferInboundRequest,
+    _: None = Depends(_require_auth),
+):
+    """现货账户 → 预测钱包划转入金。
+
+    预测市场下单扣的是预测钱包内余额：现货余额充足但下单报 -9000
+    （ensure enough USDT）时，需先把 USDT 划转入预测钱包。
+    金额硬限 0.1~20 USDT（小额运维通道）。"""
+    if not (0.1 <= req.amount_usdt <= 20.0):
+        return {"error": "amount_usdt 仅允许 0.1~20"}
+    if not prediction_trader._api_key:
+        return {"error": "Binance API Key 未配置"}
+
+    # 确保钱包信息已加载（自动获取）
+    if not prediction_trader._wallet_address or not prediction_trader._wallet_id:
+        wallet = await prediction_trader.fetch_wallet_info()
+        if not wallet:
+            return {"error": "未找到预测钱包，请先在 Binance App 中开通"}
+
+    resp = await prediction_trader.transfer_in(req.amount_usdt)
+    if resp is None:
+        return {
+            "status": "FAILED",
+            "error": prediction_trader.last_api_error or "划转失败（无详情）",
+        }
+    # 划转后刷新现货余额供前端即时确认
+    return {
+        "status": "SUCCESS",
+        "transfer": resp,
+        "spot_usdt_free": await prediction_trader.fetch_spot_usdt_balance(),
     }
 
 

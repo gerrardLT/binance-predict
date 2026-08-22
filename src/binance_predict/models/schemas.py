@@ -264,6 +264,17 @@ class ManualTradeTestRequest(BaseModel):
     )
 
 
+class TransferInboundRequest(BaseModel):
+    """现货→预测钱包划转入金请求（POST /api/prediction/transfer-in）。
+
+    预测市场下单扣预测钱包内余额，现货余额充足仍报 -9000 时需先划转。
+    """
+
+    amount_usdt: float = Field(
+        default=1.0, description="划转金额（USDT），端点硬限 0.1~20"
+    )
+
+
 # ============================================================
 # LLM 调用轨迹（前端「LLM 轨迹」面板）
 # ============================================================
