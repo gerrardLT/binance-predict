@@ -1891,8 +1891,23 @@ async def tail_logs(
     if not settings.log_dir:
         return {"error": "文件日志未启用（log_dir 为空）"}
     path = os.path.join(settings.log_dir, "app.log")
+
+    # 目录清单（诊断：卷内文件属主/mtime 是否正常，非 root 容器无权写 root 属主文件）
+    entries: list[dict] = []
+    try:
+        for name in sorted(os.listdir(settings.log_dir)):
+            st = os.stat(os.path.join(settings.log_dir, name))
+            import datetime as _dt
+            entries.append({
+                "name": name, "size": st.st_size,
+                "mtime": _dt.datetime.fromtimestamp(st.st_mtime).isoformat(),
+                "uid": st.st_uid, "gid": st.st_gid,
+            })
+    except Exception as e:
+        entries = [{"error": f"列目录失败: {e}"}]
+
     if not os.path.exists(path):
-        return {"error": f"日志文件不存在: {path}"}
+        return {"error": f"日志文件不存在: {path}", "cwd": os.getcwd(), "entries": entries}
 
     maxlen = max(1, min(int(lines), 1000))
     buf: deque = deque(maxlen=maxlen)
@@ -1904,7 +1919,10 @@ async def tail_logs(
         return {"error": f"读取失败: {e}"}
 
     out = [ln for ln in buf if (not grep or grep in ln)]
-    return {"path": path, "tail_lines": len(buf), "matched": len(out), "lines": out}
+    return {
+        "path": path, "tail_lines": len(buf), "matched": len(out),
+        "lines": out, "cwd": os.getcwd(), "entries": entries,
+    }
 
 
 # ============================================================
