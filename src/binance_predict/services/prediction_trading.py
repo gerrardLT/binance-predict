@@ -243,29 +243,23 @@ class BinancePredictionTrader:
         失败返回 None，详情写入 last_api_error。
         """
         amount_wei = str(int(round(amount_usdt * 10**18)))
-        params = {
-            "walletId": self._wallet_id,
-            "walletAddress": self._wallet_address,
-            "fromTokenAmount": amount_wei,
-            "accountType": "SPOT",
-            "sourceBiz": "USER_TRANSFER",
-        }
-        # 官方示例参数走 --data 请求体（表单编码）：签名覆盖全部参数
-        # （含 timestamp/recvWindow），业务参数以 form data 发送；
-        # 全放 query 报 -9000，JSON body 报 -1022。
-        signed = self._sign_request(dict(params))
-        timestamp = signed["timestamp"]
-        recv_window = signed["recvWindow"]
-        signature = signed["signature"]
+        # 全参数走 query（与 place-order 同口径，签名可过）；早期的 -9000
+        # 实为 API Key 缺万向划转权限，非编码方式问题（form/JSON 报 -1022）。
+        signed_url = self._build_signed_url(
+            "/sapi/v1/w3w/wallet/prediction/transfer/inbound",
+            {
+                "walletId": self._wallet_id,
+                "walletAddress": self._wallet_address,
+                "fromTokenAmount": amount_wei,
+                "accountType": "SPOT",
+                "sourceBiz": "USER_TRANSFER",
+            },
+        )
 
         try:
             client = self._get_client()
             resp = await client.post(
-                (
-                    f"{self.BASE_URL}/sapi/v1/w3w/wallet/prediction/transfer/inbound"
-                    f"?timestamp={timestamp}&recvWindow={recv_window}&signature={signature}"
-                ),
-                data=params,
+                signed_url,
                 headers={"X-MBX-APIKEY": self._api_key},
             )
             resp.raise_for_status()
