@@ -41,6 +41,9 @@ class Settings(BaseSettings):
     # PostgreSQL + TimescaleDB 异步连接字符串
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/binance_predict"
     # --- Binance API 配置 ---
+    # 现货 REST 公共行情 base URL（api.binance.com 被网络封锁的环境可指向
+    # 官方公共行情镜像 data-api.binance.vision，API 路径完全一致；仅公开行情端点）
+    binance_api_base: str = "https://api.binance.com"
     # 现货 WebSocket 地址（公开行情，无需 API Key）
     binance_spot_ws_url: str = "wss://stream.binance.com:9443/ws"
     # --- 预测参数 ---

@@ -121,7 +121,7 @@ class BinanceDataCollector:
             中间价浮点数；若 REST 和缓存均无法获取有效价格则返回 0.0，
             调用方应检查返回值 > 0 以避免除零错误。
         """
-        url = "https://api.binance.com/api/v3/ticker/bookTicker"
+        url = f"{settings.binance_api_base}/api/v3/ticker/bookTicker"
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.get(url, params={"symbol": settings.symbol})
@@ -156,7 +156,7 @@ class BinanceDataCollector:
             该时刻所在 K 线的开盘价；失败返回 0.0，调用方应检查 > 0。
             返回 0.0 时本轮顺延，下轮重试（历史 kline 数据终将可得）。
         """
-        url = "https://api.binance.com/api/v3/klines"
+        url = f"{settings.binance_api_base}/api/v3/klines"
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.get(
@@ -209,7 +209,7 @@ class BinanceDataCollector:
         if interval_ms is None:
             logger.warning("fetch_recent_klines 不支持的周期 | interval={}", interval)
             return []
-        url = "https://api.binance.com/api/v3/klines"
+        url = f"{settings.binance_api_base}/api/v3/klines"
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.get(
