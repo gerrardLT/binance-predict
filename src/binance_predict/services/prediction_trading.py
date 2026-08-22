@@ -854,6 +854,7 @@ class BinancePredictionTrader:
                     "amount_in": merged.amount_in,
                     "average_price": (merged.quote_json or {}).get("averagePrice"),
                     "error_message": merged.error_message,
+                    "persisted": True,  # 真实落库成功（False=只返回快照未落库）
                 }
         except Exception as e:
             logger.critical(
@@ -869,6 +870,7 @@ class BinancePredictionTrader:
                 "amount_in": amount_in,
                 "average_price": (quote_json or {}).get("averagePrice"),
                 "error_message": error_message,
+                "persisted": False,  # 兜底快照：DB 未更新（行卡 PENDING）
             }
 
     async def _save_order(

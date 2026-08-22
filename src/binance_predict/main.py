@@ -1875,6 +1875,38 @@ async def sync_binance_orders(_: None = Depends(_require_auth)):
     return {"synced": len(synced), "details": synced, "binance_orders": len(history)}
 
 
+@app.get("/api/logs/tail")
+async def tail_logs(
+    lines: int = 200,
+    grep: str = "",
+    _: None = Depends(_require_auth),
+):
+    """读 loguru 文件日志尾部（生产诊断：容器 stdout 重建即丢，文件日志持久化在 volume）。
+
+    grep 支持子串过滤（如 CRITICAL / 订单终态落库失败）。
+    """
+    import os
+    from collections import deque
+
+    if not settings.log_dir:
+        return {"error": "文件日志未启用（log_dir 为空）"}
+    path = os.path.join(settings.log_dir, "app.log")
+    if not os.path.exists(path):
+        return {"error": f"日志文件不存在: {path}"}
+
+    maxlen = max(1, min(int(lines), 1000))
+    buf: deque = deque(maxlen=maxlen)
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                buf.append(ln.rstrip("\n"))
+    except Exception as e:
+        return {"error": f"读取失败: {e}"}
+
+    out = [ln for ln in buf if (not grep or grep in ln)]
+    return {"path": path, "tail_lines": len(buf), "matched": len(out), "lines": out}
+
+
 # ============================================================
 # [DEPRECATED] 情绪曲线回测自动触发（已退役，由 SentimentAgent.learn() 取代）
 # ============================================================
