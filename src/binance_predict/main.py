@@ -76,6 +76,15 @@ _current_window_end: int | None = None
 _window_entry_price: float | None = None
 _pm_market_info: dict = {}  # 最新预测市场元数据（供图表 API 只读访问）
 
+# 预测钱包视图 TTL 缓存（P0-1）：静态信息 300s / 余额 20s + 单飞锁。
+# 前端 15s 轮询 × N 客户端收敛为全服务每 20s 最多 1 组签名调用，
+# 单飞锁防缓存击穿 stampede；资金变动端点（划转）成功后主动置零时间戳作废。
+_wallet_view: dict = {}
+_wallet_view_ts: dict[str, float] = {"static": 0.0, "balance": 0.0}
+_wallet_view_lock = asyncio.Lock()
+_WALLET_STATIC_TTL = 300.0
+_WALLET_BALANCE_TTL = 20.0
+
 # 刚关闭窗口的快照（tracker 在窗口切换时写入，archiver 读取归档）：
 # 修复归档器读取"正在填充的当前窗口"导致采样点不足、sentiment_windows 长期不增长的竞态问题。
 _last_closed_window_end: int | None = None
@@ -1704,13 +1713,14 @@ async def list_prediction_markets_all(
 async def get_prediction_wallet(
     _: None = Depends(_require_auth),
 ):
-    """获取预测钱包信息（walletAddress + walletId，自动从 Binance API 获取）"""
+    """获取预测钱包信息（地址/ID/注册时间 + 现货与预测钱包余额）。
+
+    服务端 TTL 缓存：静态信息 300s / 余额 20s，单飞锁防 stampede。
+    预测钱包余额为探索型查询（wallet 内嵌字段 + asset/list 候选端点），
+    失败降级 None 不阻塞其余字段（沿用 spot_usdt_free 的 None 降级模式）。
+    """
     if not prediction_trader._api_key:
         return {"error": "Binance API Key 未配置"}
-
-    wallet = await prediction_trader.fetch_wallet_info()
-    if not wallet:
-        return {"error": "未找到预测钱包，请先在 Binance App 中开通预测市场"}
 
     def _mask_addr(addr: str | None) -> str | None:
         """地址脱敏：仅展示前6后4位"""
@@ -1718,12 +1728,41 @@ async def get_prediction_wallet(
             return None
         return f"{addr[:6]}...{addr[-4:]}" if len(addr) > 12 else "***"
 
-    return {
-        "wallet_address": _mask_addr(wallet.get("walletAddress")),
-        "wallet_id": wallet.get("walletId"),
-        "registered_time": wallet.get("registeredTime"),
-        "spot_usdt_free": await prediction_trader.fetch_spot_usdt_balance(),
-    }
+    now = time.time()
+    async with _wallet_view_lock:
+        # 拿到锁后重算新鲜度（前一个等待者可能刚刷新完）
+        static_fresh = (now - _wallet_view_ts["static"]) < _WALLET_STATIC_TTL
+        balance_fresh = (now - _wallet_view_ts["balance"]) < _WALLET_BALANCE_TTL
+        wallet_snapshot: dict | None = None
+        if not static_fresh:
+            wallet = await prediction_trader.fetch_wallet_info()
+            if wallet:
+                wallet_snapshot = wallet
+                _wallet_view.update({
+                    "wallet_address": _mask_addr(wallet.get("walletAddress")),
+                    "wallet_id": wallet.get("walletId"),
+                    "registered_time": wallet.get("registeredTime"),
+                })
+                _wallet_view_ts["static"] = now
+            else:
+                # 静态失败退避：60s 内不重试（防止每次请求都打签名 API）
+                _wallet_view_ts["static"] = now - _WALLET_STATIC_TTL + 60
+        if not balance_fresh:
+            spot = await prediction_trader.fetch_spot_usdt_balance()
+            pred = await prediction_trader.fetch_prediction_wallet_balance(
+                wallet=wallet_snapshot)
+            _wallet_view.update({
+                "spot_usdt_free": spot,
+                "prediction_usdt_free": pred.get("usdt_free"),
+                "wallet_assets": pred.get("assets"),
+                "prediction_balance_available": (
+                    pred.get("usdt_free") is not None or pred.get("assets") is not None
+                ),
+            })
+            _wallet_view_ts["balance"] = now
+        if "wallet_address" not in _wallet_view:
+            return {"error": "未找到预测钱包，请先在 Binance App 中开通预测市场"}
+        return dict(_wallet_view)
 
 
 @app.get("/api/prediction/quote-preview")
@@ -1824,6 +1863,8 @@ async def prediction_transfer_in(
             "status": "FAILED",
             "error": prediction_trader.last_api_error or "划转失败（无详情）",
         }
+    # 划转成功立即作废余额缓存（Commit 2 的 TTL 缓存），下次轮询取新值
+    _wallet_view_ts["balance"] = 0.0
     # 划转后刷新现货余额供前端即时确认
     return {
         "status": "SUCCESS",

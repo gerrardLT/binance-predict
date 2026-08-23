@@ -169,8 +169,16 @@ async def test_recent_trades_empty() -> None:
 
 
 # ============================================================
-# GET /api/prediction-wallet 附现货 USDT 余额
+# GET /api/prediction-wallet 附余额（TTL 缓存 + 预测钱包余额探索）
 # ============================================================
+
+def _stub_wallet_view(monkeypatch, m):
+    """隔离模块级钱包视图缓存（每测新 dict/新锁，防跨测污染与跨 loop 绑定）。"""
+    import asyncio
+    monkeypatch.setattr(m, "_wallet_view", {})
+    monkeypatch.setattr(m, "_wallet_view_ts", {"static": 0.0, "balance": 0.0})
+    monkeypatch.setattr(m, "_wallet_view_lock", asyncio.Lock())
+
 
 @pytest.mark.asyncio
 async def test_prediction_wallet_includes_spot_balance(monkeypatch) -> None:
@@ -184,12 +192,180 @@ async def test_prediction_wallet_includes_spot_balance(monkeypatch) -> None:
     async def _bal():
         return 12.34
 
+    async def _pred(wallet=None):
+        return {"usdt_free": None, "assets": None}
+
     monkeypatch.setattr(m.prediction_trader, "_api_key", "k")
     monkeypatch.setattr(m.prediction_trader, "fetch_wallet_info", _wallet)
     monkeypatch.setattr(m.prediction_trader, "fetch_spot_usdt_balance", _bal)
+    monkeypatch.setattr(m.prediction_trader, "fetch_prediction_wallet_balance", _pred)
+    _stub_wallet_view(monkeypatch, m)
     out = await m.get_prediction_wallet(_=None)
     assert out["wallet_id"] == "WID"
     assert out["spot_usdt_free"] == 12.34
+    # 预测余额探索失败 → 降级 None 不阻塞其余字段
+    assert out["prediction_usdt_free"] is None
+    assert out["wallet_assets"] is None
+    assert out["prediction_balance_available"] is False
+
+
+@pytest.mark.asyncio
+async def test_prediction_wallet_includes_prediction_balance(monkeypatch) -> None:
+    """预测余额探索成功 → prediction_usdt_free/wallet_assets/available 透传。"""
+    import binance_predict.main as m
+
+    async def _wallet():
+        return {"walletAddress": "0x" + "a" * 40, "walletId": "WID", "registeredTime": 1}
+
+    async def _bal():
+        return 12.34
+
+    assets = [{"asset": "USDT", "free": "5.5"}, {"asset": "BTC-UP-TOKEN", "balance": "2"}]
+
+    async def _pred(wallet=None):
+        return {"usdt_free": 5.5, "assets": assets}
+
+    monkeypatch.setattr(m.prediction_trader, "_api_key", "k")
+    monkeypatch.setattr(m.prediction_trader, "fetch_wallet_info", _wallet)
+    monkeypatch.setattr(m.prediction_trader, "fetch_spot_usdt_balance", _bal)
+    monkeypatch.setattr(m.prediction_trader, "fetch_prediction_wallet_balance", _pred)
+    _stub_wallet_view(monkeypatch, m)
+    out = await m.get_prediction_wallet(_=None)
+    assert out["prediction_usdt_free"] == 5.5
+    assert out["wallet_assets"] == assets
+    assert out["prediction_balance_available"] is True
+
+
+@pytest.mark.asyncio
+async def test_prediction_wallet_cache_ttl(monkeypatch) -> None:
+    """TTL 缓存：新鲜期内二次调用零 API；余额时间戳置零（划转作废）后仅重拉余额。"""
+    import binance_predict.main as m
+
+    calls = {"wallet": 0, "spot": 0, "pred": 0}
+
+    async def _wallet():
+        calls["wallet"] += 1
+        return {"walletAddress": "0x" + "a" * 40, "walletId": "WID", "registeredTime": 1}
+
+    async def _bal():
+        calls["spot"] += 1
+        return 1.0
+
+    async def _pred(wallet=None):
+        calls["pred"] += 1
+        return {"usdt_free": 2.0, "assets": None}
+
+    monkeypatch.setattr(m.prediction_trader, "_api_key", "k")
+    monkeypatch.setattr(m.prediction_trader, "fetch_wallet_info", _wallet)
+    monkeypatch.setattr(m.prediction_trader, "fetch_spot_usdt_balance", _bal)
+    monkeypatch.setattr(m.prediction_trader, "fetch_prediction_wallet_balance", _pred)
+    _stub_wallet_view(monkeypatch, m)
+    ts = m._wallet_view_ts  # monkeypatch 后的同一个 dict
+
+    out1 = await m.get_prediction_wallet(_=None)
+    assert calls == {"wallet": 1, "spot": 1, "pred": 1}
+    assert out1["prediction_usdt_free"] == 2.0
+
+    # 新鲜期内（静态 300s / 余额 20s）：全缓存命中，零 API
+    out2 = await m.get_prediction_wallet(_=None)
+    assert calls == {"wallet": 1, "spot": 1, "pred": 1}
+    assert out2 == out1
+
+    # 余额缓存作废（transfer-in 成功路径同款操作）：仅余额重新拉，静态仍命中
+    ts["balance"] = 0.0
+    await m.get_prediction_wallet(_=None)
+    assert calls == {"wallet": 1, "spot": 2, "pred": 2}
+
+
+@pytest.mark.asyncio
+async def test_prediction_wallet_static_failure_backoff(monkeypatch) -> None:
+    """静态信息失败：返回 error；退避期内重试一次后不再打 API。"""
+    import binance_predict.main as m
+
+    calls = {"wallet": 0}
+
+    async def _wallet():
+        calls["wallet"] += 1
+        return None
+
+    monkeypatch.setattr(m.prediction_trader, "_api_key", "k")
+    monkeypatch.setattr(m.prediction_trader, "fetch_wallet_info", _wallet)
+    monkeypatch.setattr(m.prediction_trader, "fetch_spot_usdt_balance", AsyncMock(return_value=1.0))
+    monkeypatch.setattr(m.prediction_trader, "fetch_prediction_wallet_balance",
+                        AsyncMock(return_value={"usdt_free": None, "assets": None}))
+    _stub_wallet_view(monkeypatch, m)
+
+    out = await m.get_prediction_wallet(_=None)
+    assert "未找到预测钱包" in out["error"]
+    # 退避期内（60s）：不再重试 wallet/list，仍返回 error
+    out2 = await m.get_prediction_wallet(_=None)
+    assert "error" in out2
+    assert calls["wallet"] == 1
+
+
+# ============================================================
+# 服务层：fetch_prediction_wallet_balance 两级探索
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_fetch_prediction_balance_from_wallet_dict(monkeypatch) -> None:
+    """①级探索：wallet dict 内嵌余额字段命中（usdtBalance）。"""
+    from binance_predict.services.prediction_trading import BinancePredictionTrader
+
+    trader = BinancePredictionTrader()
+    trader._api_key = "k"
+    trader._api_secret = "s"
+
+    async def _assets():
+        return None  # asset/list 探索失败（降级）
+
+    monkeypatch.setattr(trader, "_fetch_prediction_asset_list", _assets)
+    wallet = {"walletAddress": "0xW", "walletId": "WID", "usdtBalance": "5.5"}
+    out = await trader.fetch_prediction_wallet_balance(wallet=wallet)
+    assert out["usdt_free"] == 5.5
+    assert out["assets"] is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_prediction_balance_from_asset_list(monkeypatch) -> None:
+    """②级探索：wallet 无内嵌字段时从 asset/list 的 USDT 条目兑底。"""
+    from binance_predict.services.prediction_trading import BinancePredictionTrader
+
+    trader = BinancePredictionTrader()
+    trader._api_key = "k"
+    trader._api_secret = "s"
+
+    assets = [{"asset": "BTC-UP-TOKEN", "balance": "1.5"},
+              {"asset": "USDT", "free": "3.25"}]
+
+    async def _assets():
+        return assets
+
+    monkeypatch.setattr(trader, "_fetch_prediction_asset_list", _assets)
+    out = await trader.fetch_prediction_wallet_balance(wallet={"walletId": "WID"})
+    assert out["usdt_free"] == 3.25
+    assert out["assets"] == assets
+
+
+@pytest.mark.asyncio
+async def test_fetch_prediction_balance_all_failed(monkeypatch) -> None:
+    """两级全失败 → (None, None)，不抛异常（探索型端点天然 fallback）。"""
+    from binance_predict.services.prediction_trading import BinancePredictionTrader
+
+    trader = BinancePredictionTrader()
+    trader._api_key = "k"
+    trader._api_secret = "s"
+
+    async def _wallet():
+        return None
+
+    async def _assets():
+        return None
+
+    monkeypatch.setattr(trader, "fetch_wallet_info", _wallet)
+    monkeypatch.setattr(trader, "_fetch_prediction_asset_list", _assets)
+    out = await trader.fetch_prediction_wallet_balance()
+    assert out == {"usdt_free": None, "assets": None}
 
 
 @pytest.mark.asyncio

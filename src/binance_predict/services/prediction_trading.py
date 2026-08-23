@@ -30,6 +30,18 @@ from ..db.engine import async_session_factory
 from ..db.models import TradeOrderModel
 from . import clock_sync
 
+# ---------------------------------------------------------------------------
+# 预测钱包余额探索常量（P0-1：余额看不全）
+# 币安官方文档未公开预测钱包余额字段，采用两级探索实测后收敛：
+# ① wallet/list 响应内嵌余额字段候选 key（零额外 API 成本）；
+# ② 资产列表候选端点路径（实测后只需改这一处）。
+# ---------------------------------------------------------------------------
+_WALLET_BALANCE_KEYS: tuple[str, ...] = (
+    "balance", "usdtBalance", "availableBalance", "available",
+    "usdtFree", "free", "assetBalance",
+)
+_ASSET_LIST_PATH = "/sapi/v1/w3w/wallet/prediction/asset/list"
+
 
 class BinancePredictionTrader:
     """
@@ -202,6 +214,100 @@ class BinancePredictionTrader:
             self._wallet_id[:8] + "..." if self._wallet_id else "",
         )
         return wallet
+
+    async def fetch_prediction_wallet_balance(self, wallet: dict | None = None) -> dict:
+        """查询预测钱包 USDT 余额 + 资产列表（P0-1：余额看不全）。
+
+        两级探索（不猜参数，失败降级 None 不阻塞）：
+        ① 优先从 wallet/list 响应内嵌的候选字段取余额（_WALLET_BALANCE_KEYS，
+           零额外 API 成本）；
+        ② 资产列表候选端点 _ASSET_LIST_PATH（同时返回 outcome token 持仓，
+           P2-2② 复用）——实测后改模块常量一处即可。
+
+        返回 {"usdt_free": float | None, "assets": list | None}；
+        全部失败时两字段均为 None（探索型端点天然 fallback 语义）。
+        """
+        out: dict = {"usdt_free": None, "assets": None}
+        if wallet is None:
+            wallet = await self.fetch_wallet_info()
+
+        # ① wallet/list 内嵌余额字段
+        if wallet:
+            for key in _WALLET_BALANCE_KEYS:
+                v = wallet.get(key)
+                if v is None:
+                    continue
+                try:
+                    out["usdt_free"] = float(v)
+                    break
+                except (TypeError, ValueError):
+                    continue
+
+        # ② 资产列表端点（失败降级 None）
+        assets = await self._fetch_prediction_asset_list()
+        if assets is not None:
+            out["assets"] = assets
+            # ①未命中时从资产列表里找 USDT 条目兜底
+            if out["usdt_free"] is None:
+                for a in assets:
+                    if not isinstance(a, dict):
+                        continue
+                    symbol = str(a.get("asset") or a.get("symbol") or "").upper()
+                    if symbol != "USDT":
+                        continue
+                    free = a.get("free", a.get("balance"))
+                    if free is None:
+                        continue
+                    try:
+                        out["usdt_free"] = float(free)
+                    except (TypeError, ValueError):
+                        pass
+                    break
+        return out
+
+    async def _fetch_prediction_asset_list(self) -> list | None:
+        """预测钱包资产列表（探索型端点，路径 _ASSET_LIST_PATH 常量一处改）。
+
+        失败返回 None + last_api_error（上层降级不阻塞其余字段）。
+        签名 GET 用 _sign_request（标准 params= 方式，参照 fetch_wallet_info）。
+        """
+        req_params: dict = {}
+        if self._wallet_id:
+            req_params["walletId"] = self._wallet_id
+        if self._wallet_address:
+            req_params["walletAddress"] = self._wallet_address
+        params = self._sign_request(req_params)
+
+        try:
+            client = self._get_client()
+            resp = await client.get(
+                f"{self.BASE_URL}{_ASSET_LIST_PATH}",
+                params=params,
+                headers={"X-MBX-APIKEY": self._api_key},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except httpx.HTTPStatusError as e:
+            self.last_api_error = f"HTTP {e.response.status_code}: {e.response.text[:300]}"
+            logger.info(
+                "预测钱包资产列表查询失败（探索型端点，降级） | HTTP {} | {}",
+                e.response.status_code, e.response.text[:200],
+            )
+            return None
+        except Exception as e:
+            self.last_api_error = f"{type(e).__name__}: {e}"
+            logger.info("预测钱包资产列表查询异常（探索型端点，降级）: {}", e)
+            return None
+
+        # 响应结构未知：兼容 list 直返 / {"assets": [...]} 等包裹形态
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            for key in ("assets", "balances", "data", "list"):
+                v = data.get(key)
+                if isinstance(v, list):
+                    return v
+        return None
 
     async def fetch_spot_usdt_balance(self) -> float | None:
         """查询现货账户 USDT 可用余额（下单扣款来源）。
