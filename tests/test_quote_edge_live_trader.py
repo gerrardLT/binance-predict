@@ -265,6 +265,58 @@ def test_unknown_version_rejected(monkeypatch) -> None:
         QuoteEdgeLiveTrader(_FakeTrader())
 
 
+def test_amount_over_hard_cap_rejected(monkeypatch) -> None:
+    """Low#5：金额超硬上限 50 → 构造抛 ValueError（配置误写拒绝启动，不靠自律）。"""
+    monkeypatch.setattr(settings, "quote_momentum_live_amount_usdt", 51.0)
+    with pytest.raises(ValueError, match="硬上限"):
+        QuoteEdgeLiveTrader(_FakeTrader())
+
+
+async def _patch_db_noop(monkeypatch) -> None:
+    async def _no_filled(self):
+        return 0
+
+    async def _no_attempt(self, _ws):
+        return False
+
+    async def _no_backfill(self, _ws):
+        return None
+
+    monkeypatch.setattr(QuoteEdgeLiveTrader, "_count_filled_today", _no_filled)
+    monkeypatch.setattr(QuoteEdgeLiveTrader, "_has_attempt", _no_attempt)
+    monkeypatch.setattr(QuoteEdgeLiveTrader, "_backfill_signal_link", _no_backfill)
+
+
+@pytest.mark.asyncio
+async def test_toggle_runtime_switch(monkeypatch) -> None:
+    """P2-1 运行时开关：构造 OFF → 区间命中也不开火；toggle 置 True → 命中。
+
+    toggle 只改实例标志位，不动 settings（重启回落 .env 默认，fail-safe）。"""
+    monkeypatch.setattr(settings, "quote_momentum_live_enabled", False)
+    monkeypatch.setattr(settings, "quote_edge_live_version", "quote_momentum_v1")
+    fake = _FakeTrader()
+    t = QuoteEdgeLiveTrader(fake)
+    await _patch_db_noop(monkeypatch)
+    ts = WINDOW_START + 100_000
+    assert t.check(WINDOW_START, WINDOW_END, ts, 0.71) is False  # OFF：命中也不开火
+    assert not t._fired
+    t._enabled = True  # /api/live/toggle 置位路径
+    assert t.check(WINDOW_START, WINDOW_END, ts, 0.71) is True
+    s = t.status()
+    assert s["enabled"] is True and s["enabled_at_startup"] is False  # 快照不受 toggle 影响
+    await _drain(t)
+
+
+def test_status_dual_enabled_fields(monkeypatch) -> None:
+    """status 双字段：enabled=运行时状态 / enabled_at_startup=启动配置快照。"""
+    t = _make_trader(monkeypatch, _FakeTrader())  # enabled=True 构造
+    assert t.status()["enabled"] is True
+    assert t.status()["enabled_at_startup"] is True
+    t._enabled = False  # toggle 关闭后
+    assert t.status()["enabled"] is False
+    assert t.status()["enabled_at_startup"] is True  # 快照不变
+
+
 # ============================================================
 # execute_signal_trade：先占位后下单 + 执行价护栏 + 动态滑点（方法级 monkeypatch）
 # ============================================================

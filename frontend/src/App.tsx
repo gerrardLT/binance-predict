@@ -496,6 +496,12 @@ const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ amount_usdt }),
     }).then(r => r.json()),
+  postLiveToggle: (enabled: boolean) =>
+    fetch('/api/live/toggle', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    }).then(r => r.json()),
   getQuotePreview: () => fetch('/api/prediction/quote-preview').then(r => r.json()),
   postSyncBinance: () => fetch('/api/trades/sync-binance', { method: 'POST' }).then(r => r.json()),
 }
@@ -582,6 +588,7 @@ function LiveTradeTab() {
   const [nowMs, setNowMs] = useState(() => Date.now())
   const [syncing, setSyncing] = useState(false)
   const [syncResult, setSyncResult] = useState<Record<string, unknown> | null>(null)
+  const [togglingLive, setTogglingLive] = useState(false)
 
   const refresh = useCallback(() => {
     api.getPredictionWallet().then(setWallet).catch(() => {})
@@ -631,6 +638,7 @@ function LiveTradeTab() {
   const walletErr = (wallet as { error?: string } | null)?.error
   const regTs = wallet?.registered_time as number | undefined
   const resultFilled = result?.status === 'FILLED'
+  const liveEnabled = live?.enabled === true
 
   // 倒计时：服务端时钟修正后的剩余毫秒；<60s 红色警示
   const windowEnd = quote?.window_end as number | null | undefined
@@ -703,6 +711,22 @@ function LiveTradeTab() {
     }
   }
 
+  const handleLiveToggle = async (next: boolean) => {
+    if (!window.confirm(next
+      ? `确认开启信号实盘？\n版本: ${String(live?.version ?? '?')} | 每单 ${String(live?.amount_usdt ?? '?')} USDT\n\n命中规则区间将下真实订单押 DOWN（真金白银）；重启后回落 .env 默认。`
+      : '确认关闭信号实盘？\n（不取消在途任务，只阻止新单派生；重启后回落 .env 默认）')) return
+    setTogglingLive(true)
+    try {
+      const res = await api.postLiveToggle(next)
+      if (res?.error) alert(`切换失败: ${String(res.error)}`)
+      refresh()
+    } catch (e) {
+      alert(`请求失败: ${(e as Error).message}`)
+    } finally {
+      setTogglingLive(false)
+    }
+  }
+
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
       <Card title="账户状态">
@@ -767,14 +791,27 @@ function LiveTradeTab() {
             </div>
           )}
           <div className="border-t border-gray-100 my-2" />
-          <div className="flex justify-between gap-2">
+          <div className="flex justify-between gap-2 items-center">
             <span className="text-gray-500 shrink-0">信号实盘</span>
             {live
-              ? <span className="text-green-700 font-semibold">已开启 · {String(live.version)}</span>
-              : <span className="text-gray-500">未开启（影子模式）</span>}
+              ? <span className="flex items-center gap-2">
+                  {liveEnabled
+                    ? <span className="text-green-700 font-semibold">已开启 · {String(live.version)}</span>
+                    : <span className="text-amber-700 font-semibold">已关闭（不开火）</span>}
+                  <button
+                    onClick={() => handleLiveToggle(!liveEnabled)}
+                    disabled={togglingLive}
+                    className={`px-3 py-1 text-xs font-semibold rounded text-white disabled:opacity-50 ${liveEnabled ? 'bg-red-600' : 'bg-green-600'}`}
+                  >{togglingLive ? '切换中…' : liveEnabled ? '停止' : '开启'}</button>
+                </span>
+              : <span className="text-gray-400">未装配（启动异常，详见后端日志）</span>}
           </div>
           {live && (
             <>
+              <div className="flex justify-between gap-2">
+                <span className="text-gray-500 shrink-0">启动默认 / 当前</span>
+                <span className="text-gray-700">{live?.enabled_at_startup === true ? 'ON' : 'OFF'} / {liveEnabled ? 'ON' : 'OFF'}（重启回落 .env）</span>
+              </div>
               <div className="flex justify-between gap-2">
                 <span className="text-gray-500 shrink-0">每单金额 / 执行价上限</span>
                 <span className="text-gray-700">{String(live.amount_usdt)} USDT / {String(live.max_exec_price)}</span>

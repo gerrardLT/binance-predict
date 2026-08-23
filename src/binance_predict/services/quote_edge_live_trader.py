@@ -63,6 +63,12 @@ class QuoteEdgeLiveTrader:
         self._version = version
         self._t_lo, self._t_hi, self._q_lo, self._q_hi = t_lo, t_hi, q_lo, q_hi
         self._amount = settings.quote_momentum_live_amount_usdt
+        if self._amount > MAX_ORDER_AMOUNT_USDT:
+            # Low#5：配置误写拒绝启动（与版本白名单同哲学：不靠自律靠拒启）。
+            # main.py 装配区 except ValueError 接住 → 不装配 → toggle 端点报"执行器未装配"。
+            raise ValueError(
+                f"报价 edge 实盘：单笔金额 {self._amount} 超硬上限"
+                f" {MAX_ORDER_AMOUNT_USDT} USDT（配置误写拒绝启动）")
         exec_price = settings.quote_momentum_live_max_exec_price
         if exec_price is None:
             # 按版本自动：momentum→0.78（同旧默认）/ contrarian→0.28
@@ -75,6 +81,7 @@ class QuoteEdgeLiveTrader:
         self._healed_total = 0
         self._stopped = False                   # stop 后拒绝派生新下单任务（High#1）
         self._running = False
+        self._enabled = settings.quote_momentum_live_enabled  # 运行时开关（toggle 控制）
 
     async def start(self) -> None:
         """启动 signal_id 自愈扫描（下单触发由 tracker 喂价，无需自循环）。"""
@@ -90,7 +97,7 @@ class QuoteEdgeLiveTrader:
         """每次 5m 采样调用一次；命中规则区间则派生下单任务，返回是否开火。"""
         if self._stopped:
             return False
-        if not settings.quote_momentum_live_enabled:
+        if not self._enabled:  # 改读实例标志位
             return False
         if down_price is None:
             return False
@@ -268,8 +275,16 @@ class QuoteEdgeLiveTrader:
     # ------------------------------------------------------------------
 
     def status(self) -> dict:
+        """实盘状态（两个 enabled 字段：运行时启用状态 + 启动时配置快照）。
+
+        - enabled: self._enabled（运行时 toggle 后的实时状态）
+        - enabled_at_startup: settings.quote_momentum_live_enabled（启动时.env 默认值）
+        
+        前端显示 null 表示未装配；有实例但 enabled=False 则为关闭态。
+        """
         return {
-            "enabled": settings.quote_momentum_live_enabled,
+            "enabled": self._enabled,
+            "enabled_at_startup": settings.quote_momentum_live_enabled,
             "version": self._version,
             "amount_usdt": self._amount,
             "max_exec_price": self._max_exec,

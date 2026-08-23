@@ -45,6 +45,7 @@ from .models.schemas import (
     ManualTradeTestRequest,
     TransferInboundRequest,
     TransferOutboundRequest,
+    ToggleLiveRequest,
 )
 from .services.agent_scheduler import AgentScheduler
 from .services.data_collector import BinanceDataCollector
@@ -52,7 +53,6 @@ from .services.fake_breakout_detector import FakeBreakoutDetector
 from .services.misalignment_detector import MisalignmentDetector
 from .services.quote_edge_detector import QuoteEdgeDetector
 from .services.quote_edge_live_trader import QuoteEdgeLiveTrader
-from .services import quote_edge_live_trader as qelt_module
 from .services.trade_settler import TradeSettler
 from .services.llm_service import LLMService
 from .services.pattern_reevaluator import pattern_reevaluator
@@ -967,35 +967,24 @@ async def lifespan(app: FastAPI):
     await trade_settler.start()
     logger.info("交易结算器已启动（60s 扫描 FILLED 未结算订单，settled_at 锚点）")
 
-    # 报价 edge 实盘（版本可配，当前默认 quote_contrarian_v1）：真单通道，默认 OFF；
-    # 开启前提：钱包配置就绪 + 用户人工设 quote_momentum_live_enabled=True。
+    # 报价 edge 实盘执行器（版本可配）：无条件装配 + 实例标志位控制开火；
+    # 启动后 toggle ON/OFF 实时生效；重启后回落.env 默认。
     global quote_edge_live_trader
-    if settings.quote_momentum_live_enabled:
-        if settings.quote_momentum_live_amount_usdt > qelt_module.MAX_ORDER_AMOUNT_USDT:
-            # Low#5：金额配置无 sanity 上限会让日敞口 = amount×30 失控（误写 500 即 1.5 万/日）
-            logger.error(
-                "报价 edge 实盘拒绝启动：单笔金额 {} 超硬上限 {} USDT（防配置误写）",
-                settings.quote_momentum_live_amount_usdt,
-                qelt_module.MAX_ORDER_AMOUNT_USDT,
-            )
-        else:
-            try:
-                quote_edge_live_trader = QuoteEdgeLiveTrader(prediction_trader)
-            except ValueError as exc:
-                # 版本白名单拒绝（v2 门禁版不支持等）：拒实盘不拖垮其他服务，fail fast 但不 fail all
-                logger.error("报价 edge 实盘拒绝启动：{}", exc)
-            else:
-                await quote_edge_live_trader.start()
-                _live_status = quote_edge_live_trader.status()
-                logger.info(
-                    "报价 edge 实盘执行器已启动（真单！）| {} | {} USDT/单 | 执行价上限 {} | 日上限 {} 单",
-                    _live_status["version"],
-                    _live_status["amount_usdt"],
-                    _live_status["max_exec_price"],
-                    _live_status["max_daily_orders"],
-                )
+    try:
+        quote_edge_live_trader = QuoteEdgeLiveTrader(prediction_trader)
+    except ValueError as exc:
+        # 版本白名单拒绝（v2 门禁版不支持等）：拒实盘不拖垮其他服务，fail fast
+        logger.error("报价 edge 实盘执行器装配失败：{}", exc)
     else:
-        logger.info("报价 edge 实盘未开启（quote_momentum_live_enabled=False），维持影子记录")
+        await quote_edge_live_trader.start()
+        _live_status = quote_edge_live_trader.status()
+        logger.info(
+            "报价 edge 实盘执行器已加载（真单！）| {} | {} USDT/单 | 运行中={}| 上限{}单",
+            _live_status["version"],
+            _live_status["amount_usdt"],
+            "ON" if _live_status["enabled"] else "OFF (toggle)",
+            _live_status["max_daily_orders"],
+        )
 
     # 场景研究（M2）：LLM 研究员定期/累积/异常触发评估，假设只落库不生效
     # （M3 裁决 + 人工 promote 后才以 SHADOW 影子身份参与判定）
@@ -1870,6 +1859,28 @@ async def manual_trade_test(
         "amount_in": order.get("amount_in"),
         "error_message": order.get("error_message"),
     }
+
+
+@app.post("/api/live/toggle")
+async def live_toggle(
+    req: ToggleLiveRequest,
+    _: None = Depends(_require_auth),
+):
+    """实时开启/关闭报价 edge 实盘开火（QuoteEdgeLiveTrader，P2-1）。
+
+    fail-safe：重启后回落.env 默认值。响应返回当前 status()（enabled 已更新）。
+    ⚠️ 注意：本开关不取消在途任务（High#1），只阻止新单派生。
+    """
+    if quote_edge_live_trader is None:
+        return {"error": "执行器未装配（装配阶段异常？详见后端日志）"}
+    # 实时更新实例标志位
+    quote_edge_live_trader._enabled = req.enabled
+    _status = quote_edge_live_trader.status()
+    # 提示用户重启行为
+    out = {"message": f"实盘状态已切换为{'开启' if req.enabled else '关闭'}", "status": _status}
+    if not req.enabled and _status["enabled_at_startup"]:
+        out["warning"] = "重启后会落.env 默认值（若 enabled=False 则持续关闭）"
+    return out
 
 
 @app.post("/api/prediction/transfer-in")

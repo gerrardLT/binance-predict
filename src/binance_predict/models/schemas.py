@@ -287,6 +287,15 @@ class TransferOutboundRequest(BaseModel):
     )
 
 
+class ToggleLiveRequest(BaseModel):
+    """POST /api/live/toggle（QuoteEdgeLiveTrader 运行时开关，P2-1）。
+
+    实时控制实盘开火状态；重启后回落.env 默认（fail-safe）。
+    """
+
+    enabled: bool = Field(description="启用=True / 禁用=False")
+
+
 # ============================================================
 # LLM 调用轨迹（前端「LLM 轨迹」面板）
 # ============================================================
