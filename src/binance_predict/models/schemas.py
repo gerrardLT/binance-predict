@@ -275,6 +275,18 @@ class TransferInboundRequest(BaseModel):
     )
 
 
+class TransferOutboundRequest(BaseModel):
+    """预测钱包→现货划出提走请求（POST /api/prediction/transfer-out，P1-1）。
+
+    ⚠️ 官方端点命名反转：inbound=钱包→CEX 提走。响应含划转前后
+    现货余额（spot_before/spot_after/direction_confirmed）自证方向。
+    """
+
+    amount_usdt: float = Field(
+        default=1.0, description="划出金额（USDT），端点硬限 0.1~20（金丝雀先 0.1）"
+    )
+
+
 # ============================================================
 # LLM 调用轨迹（前端「LLM 轨迹」面板）
 # ============================================================

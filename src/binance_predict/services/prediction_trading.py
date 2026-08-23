@@ -43,6 +43,12 @@ _WALLET_BALANCE_KEYS: tuple[str, ...] = (
 )
 _ASSET_LIST_PATH = "/sapi/v1/w3w/wallet/prediction/asset/list"
 
+# 预测钱包划转端点（⚠️ 官方命名反转陷阱：
+#   outbound = CEX 现货→预测钱包（入金，transfer_in 用）
+#   inbound  = 预测钱包→CEX 现货（提走，transfer_out 用））
+_TRANSFER_OUTBOUND_PATH = "/sapi/v1/w3w/wallet/prediction/transfer/outbound"
+_TRANSFER_INBOUND_PATH = "/sapi/v1/w3w/wallet/prediction/transfer/inbound"
+
 
 class BinancePredictionTrader:
     """
@@ -354,7 +360,7 @@ class BinancePredictionTrader:
         # 全参数走 query（与 place-order 同口径，签名可过）；早期的 -9000
         # 实为 API Key 缺万向划转权限，非编码方式问题（form/JSON 报 -1022）。
         signed_url = self._build_signed_url(
-            "/sapi/v1/w3w/wallet/prediction/transfer/outbound",
+            _TRANSFER_OUTBOUND_PATH,
             {
                 "walletId": self._wallet_id,
                 "walletAddress": self._wallet_address,
@@ -382,6 +388,49 @@ class BinancePredictionTrader:
         except Exception as e:
             self.last_api_error = f"{type(e).__name__}: {e}"
             logger.error("预测钱包入金异常: {}", e)
+            return None
+
+    async def transfer_out(self, amount_usdt: float) -> dict | None:
+        """从预测钱包划转 USDT 回现货账户（提走/回笼通道，P1-1）。
+
+        ⚠️ 方向反转陷阱（与直觉相反，逐行镜像 transfer_in）：
+        官方端点 inbound = 预测钱包→CEX 现货（提走），
+        outbound = CEX 现货→预测钱包（入金，见 transfer_in）。
+        调用 POST /sapi/v1/w3w/wallet/prediction/transfer/inbound。
+        上层端点用划转前后现货余额差自证方向（金丝雀 0.1U 先行）。
+        失败返回 None，详情写入 last_api_error。
+        """
+        amount_wei = str(int(round(amount_usdt * 10**18)))
+        # 全参数走 query（与 transfer_in 同口径，签名可过）
+        signed_url = self._build_signed_url(
+            _TRANSFER_INBOUND_PATH,
+            {
+                "walletId": self._wallet_id,
+                "walletAddress": self._wallet_address,
+                "fromTokenAmount": amount_wei,
+                "accountType": "SPOT",
+                "sourceBiz": "USER_TRANSFER",
+            },
+        )
+
+        try:
+            client = self._get_client()
+            resp = await client.post(
+                signed_url,
+                headers={"X-MBX-APIKEY": self._api_key},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            self.last_api_error = None
+            logger.info("预测钱包提走成功 | amount={} USDT | resp={}", amount_usdt, data)
+            return data
+        except httpx.HTTPStatusError as e:
+            self.last_api_error = f"HTTP {e.response.status_code}: {e.response.text[:300]}"
+            logger.error("预测钱包提走失败 (HTTP {}): {}", e.response.status_code, e.response.text)
+            return None
+        except Exception as e:
+            self.last_api_error = f"{type(e).__name__}: {e}"
+            logger.error("预测钱包提走异常: {}", e)
             return None
 
     async def query_order_history(self, limit: int = 20) -> list | None:

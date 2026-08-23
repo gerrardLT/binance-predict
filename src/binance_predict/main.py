@@ -40,7 +40,12 @@ from .db.models import (
     SceneParamVersion,
     SentimentWindow,
 )
-from .models.schemas import CommitDeepLearnRequest, ManualTradeTestRequest, TransferInboundRequest
+from .models.schemas import (
+    CommitDeepLearnRequest,
+    ManualTradeTestRequest,
+    TransferInboundRequest,
+    TransferOutboundRequest,
+)
 from .services.agent_scheduler import AgentScheduler
 from .services.data_collector import BinanceDataCollector
 from .services.fake_breakout_detector import FakeBreakoutDetector
@@ -1902,6 +1907,59 @@ async def prediction_transfer_in(
         "transfer": resp,
         "spot_usdt_free": await prediction_trader.fetch_spot_usdt_balance(),
     }
+
+
+@app.post("/api/prediction/transfer-out")
+async def prediction_transfer_out(
+    req: TransferOutboundRequest,
+    _: None = Depends(_require_auth),
+):
+    """预测钱包 → 现货账户划出提走（P1-1）。
+
+    ⚠️ 官方端点命名反转：inbound = 预测钱包→CEX 现货（提走），
+    outbound = CEX→预测钱包（入金）。方向自证：划转前后各查一次现货
+    余额，余额增加才证明资金确实回到现货（响应回显 spot_before/
+    spot_after/direction_confirmed，防真金反向移动）。
+    金额硬限 0.1~20 USDT（小额运维通道；上线后先 0.1 金丝雀验证）。"""
+    if not (0.1 <= req.amount_usdt <= 20.0):
+        return {"error": "amount_usdt 仅允许 0.1~20"}
+    if not prediction_trader._api_key:
+        return {"error": "Binance API Key 未配置"}
+
+    # 确保钱包信息已加载（自动获取）
+    if not prediction_trader._wallet_address or not prediction_trader._wallet_id:
+        wallet = await prediction_trader.fetch_wallet_info()
+        if not wallet:
+            return {"error": "未找到预测钱包，请先在 Binance App 中开通"}
+
+    spot_before = await prediction_trader.fetch_spot_usdt_balance()
+    resp = await prediction_trader.transfer_out(req.amount_usdt)
+    if resp is None:
+        return {
+            "status": "FAILED",
+            "error": prediction_trader.last_api_error or "划转失败（无详情）",
+        }
+    # 划出成功立即作废余额缓存（预测钱包余额已减少）
+    _wallet_view_ts["balance"] = 0.0
+    # 方向自证：划转后刷新对比（余额增加才证明方向正确）
+    spot_after = await prediction_trader.fetch_spot_usdt_balance()
+    confirmed = (
+        spot_before is not None and spot_after is not None
+        and spot_after > spot_before
+    )
+    out = {
+        "status": "SUCCESS",
+        "transfer": resp,
+        "spot_before": spot_before,
+        "spot_after": spot_after,
+        "direction_confirmed": confirmed,
+    }
+    if not confirmed:
+        out["warning"] = (
+            "划转已提交但现货余额未见增加——请立即人工核对币安 App 划转记录"
+            "（防方向反转，真金反向移动风险）"
+        )
+    return out
 
 
 @app.get("/api/trades/binance-history")

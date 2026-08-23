@@ -448,6 +448,137 @@ async def test_transfer_in_success_and_failure(monkeypatch) -> None:
 
 
 # ============================================================
+# POST /api/prediction/transfer-out（预测钱包→现货划出，P1-1）
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_transfer_out_amount_bounds(monkeypatch) -> None:
+    """金额越界（0.05 / 21）→ 拒绝且不触达 transfer_out。"""
+    import binance_predict.main as m
+    from binance_predict.models.schemas import TransferOutboundRequest
+
+    async def _never(_amount):  # pragma: no cover - 不应被调用
+        raise AssertionError("越界金额不应触达 transfer_out")
+
+    monkeypatch.setattr(m.prediction_trader, "transfer_out", _never)
+    out1 = await m.prediction_transfer_out(TransferOutboundRequest(amount_usdt=0.05), _=None)
+    out2 = await m.prediction_transfer_out(TransferOutboundRequest(amount_usdt=21.0), _=None)
+    assert "error" in out1 and "error" in out2
+
+
+@pytest.mark.asyncio
+async def test_transfer_out_success_direction_confirmed(monkeypatch) -> None:
+    """成功且现货余额增加 → direction_confirmed=True（官方命名反转下的方向自证）。"""
+    import binance_predict.main as m
+    from binance_predict.models.schemas import TransferOutboundRequest
+
+    monkeypatch.setattr(m.prediction_trader, "_api_key", "k")
+    monkeypatch.setattr(m.prediction_trader, "_wallet_address", "0xW")
+    monkeypatch.setattr(m.prediction_trader, "_wallet_id", "WID")
+
+    async def _ok(amount):
+        assert amount == 0.1
+        return {"transferId": "T-2"}
+
+    balances = iter([100.0, 100.1])  # 划转前 → 划转后
+
+    async def _bal():
+        return next(balances)
+
+    monkeypatch.setattr(m.prediction_trader, "transfer_out", _ok)
+    monkeypatch.setattr(m.prediction_trader, "fetch_spot_usdt_balance", _bal)
+    out = await m.prediction_transfer_out(TransferOutboundRequest(amount_usdt=0.1), _=None)
+    assert out["status"] == "SUCCESS"
+    assert out["spot_before"] == 100.0
+    assert out["spot_after"] == 100.1
+    assert out["direction_confirmed"] is True
+    assert "warning" not in out
+
+
+@pytest.mark.asyncio
+async def test_transfer_out_direction_unconfirmed_warns(monkeypatch) -> None:
+    """划转返回成功但现货未见增加 → direction_confirmed=False + warning 人工核对。"""
+    import binance_predict.main as m
+    from binance_predict.models.schemas import TransferOutboundRequest
+
+    monkeypatch.setattr(m.prediction_trader, "_api_key", "k")
+    monkeypatch.setattr(m.prediction_trader, "_wallet_address", "0xW")
+    monkeypatch.setattr(m.prediction_trader, "_wallet_id", "WID")
+
+    async def _ok(_amount):
+        return {"transferId": "T-3"}
+
+    async def _bal():
+        return 100.0  # 前后不变（入账延迟/方向异常）
+
+    monkeypatch.setattr(m.prediction_trader, "transfer_out", _ok)
+    monkeypatch.setattr(m.prediction_trader, "fetch_spot_usdt_balance", _bal)
+    out = await m.prediction_transfer_out(TransferOutboundRequest(amount_usdt=1.0), _=None)
+    assert out["status"] == "SUCCESS"
+    assert out["direction_confirmed"] is False
+    assert "人工核对" in out["warning"]
+
+
+@pytest.mark.asyncio
+async def test_transfer_out_failure_passthrough(monkeypatch) -> None:
+    """失败 → FAILED + last_api_error 透传。"""
+    import binance_predict.main as m
+    from binance_predict.models.schemas import TransferOutboundRequest
+
+    monkeypatch.setattr(m.prediction_trader, "_api_key", "k")
+    monkeypatch.setattr(m.prediction_trader, "_wallet_address", "0xW")
+    monkeypatch.setattr(m.prediction_trader, "_wallet_id", "WID")
+
+    async def _fail(_amount):
+        return None
+
+    async def _bal():
+        return 100.0
+
+    monkeypatch.setattr(m.prediction_trader, "transfer_out", _fail)
+    monkeypatch.setattr(m.prediction_trader, "fetch_spot_usdt_balance", _bal)
+    monkeypatch.setattr(m.prediction_trader, "last_api_error", "HTTP 400: -9000")
+    out = await m.prediction_transfer_out(TransferOutboundRequest(amount_usdt=1.0), _=None)
+    assert out["status"] == "FAILED"
+    assert "-9000" in out["error"]
+
+
+@pytest.mark.asyncio
+async def test_transfer_paths_direction_guard(monkeypatch) -> None:
+    """防方向反转回归（服务层）：transfer_in → transfer/outbound（入金），
+    transfer_out → transfer/inbound（提走，官方命名反转）。"""
+    from binance_predict.services.prediction_trading import BinancePredictionTrader
+
+    trader = BinancePredictionTrader()
+    trader._api_key = "k"
+    trader._api_secret = "s"
+    trader._wallet_id = "WID"
+    trader._wallet_address = "0xW"
+
+    seen: list[str] = []
+
+    def _signed(path, params):
+        seen.append(path)
+        return f"https://api.binance.com{path}?signed"
+
+    monkeypatch.setattr(trader, "_build_signed_url", _signed)
+
+    resp = SimpleNamespace(status_code=200)
+    resp.raise_for_status = lambda: None
+    resp.json = lambda: {"transferId": "T"}
+    client = MagicMock()
+    client.post = AsyncMock(return_value=resp)
+    monkeypatch.setattr(trader, "_get_client", lambda: client)
+
+    assert await trader.transfer_in(1.0) == {"transferId": "T"}
+    assert await trader.transfer_out(1.0) == {"transferId": "T"}
+    assert seen == [
+        "/sapi/v1/w3w/wallet/prediction/transfer/outbound",
+        "/sapi/v1/w3w/wallet/prediction/transfer/inbound",
+    ]
+
+
+# ============================================================
 # POST /api/trades/sync-binance（对账回填卡 PENDING 行）
 # ============================================================
 

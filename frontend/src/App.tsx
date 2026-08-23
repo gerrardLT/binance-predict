@@ -490,6 +490,12 @@ const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ amount_usdt }),
     }).then(r => r.json()),
+  postTransferOut: (amount_usdt: number) =>
+    fetch('/api/prediction/transfer-out', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ amount_usdt }),
+    }).then(r => r.json()),
   getQuotePreview: () => fetch('/api/prediction/quote-preview').then(r => r.json()),
   postSyncBinance: () => fetch('/api/trades/sync-binance', { method: 'POST' }).then(r => r.json()),
 }
@@ -677,6 +683,26 @@ function LiveTradeTab() {
     }
   }
 
+  const handleTransferOut = async () => {
+    const amt = parseFloat(transferAmt)
+    if (!Number.isFinite(amt) || amt < 0.1 || amt > 20) {
+      alert('划出金额仅允许 0.1~20 USDT')
+      return
+    }
+    if (!window.confirm(`确认从预测钱包划出 ${amt} USDT 回现货账户？\n（首次使用建议 0.1 金丝雀验证：成功后现货余额应增加）`)) return
+    setTransferring(true)
+    setTransferResult(null)
+    try {
+      const res = await api.postTransferOut(amt)
+      setTransferResult(res)
+      refresh()
+    } catch (e) {
+      alert(`请求失败: ${(e as Error).message}`)
+    } finally {
+      setTransferring(false)
+    }
+  }
+
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
       <Card title="账户状态">
@@ -724,11 +750,19 @@ function LiveTradeTab() {
               onClick={handleTransferIn} disabled={transferring}
               className="px-3 py-1 text-xs font-semibold rounded bg-blue-600 text-white disabled:opacity-50"
             >{transferring ? '划转中…' : '现货 → 预测钱包'}</button>
+            <button
+              onClick={handleTransferOut} disabled={transferring}
+              className="px-3 py-1 text-xs font-semibold rounded bg-emerald-600 text-white disabled:opacity-50"
+            >{transferring ? '划转中…' : '预测钱包 → 现货'}</button>
           </div>
           {transferResult && (
-            <div className={`text-xs px-2 py-1 rounded ${transferResult.status === 'SUCCESS' ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-600 break-all'}`}>
+            <div className={`text-xs px-2 py-1 rounded ${transferResult.status === 'SUCCESS' && transferResult.direction_confirmed !== false ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-600 break-all'}`}>
               {transferResult.status === 'SUCCESS'
-                ? `划转成功，现货余额 → ${typeof transferResult.spot_usdt_free === 'number' ? (transferResult.spot_usdt_free as number).toFixed(4) : '?'}`
+                ? transferResult.direction_confirmed === true
+                  ? `划出成功，现货 ${typeof transferResult.spot_before === 'number' ? (transferResult.spot_before as number).toFixed(4) : '?'} → ${typeof transferResult.spot_after === 'number' ? (transferResult.spot_after as number).toFixed(4) : '?'}（方向已自证）`
+                  : transferResult.direction_confirmed === false
+                    ? `⚠ ${String(transferResult.warning ?? '划出已提交但现货余额未见增加，请立即人工核对划转记录')}`
+                    : `划转成功，现货余额 → ${typeof transferResult.spot_usdt_free === 'number' ? (transferResult.spot_usdt_free as number).toFixed(4) : '?'}`
                 : `划转失败: ${String(transferResult.error ?? '未知错误')}`}
             </div>
           )}
