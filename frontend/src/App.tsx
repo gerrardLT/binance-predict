@@ -655,6 +655,16 @@ function LiveTradeTab() {
   const openPositions = orders.filter(o => o.status === 'FILLED' && !o.settled_at)
   const openAmount = openPositions.reduce(
     (s, o) => s + (o.amount_in != null ? Number(o.amount_in) / 1e18 : 0), 0)
+  // 钱包持仓 outcome token（探索型端点 wallet_assets；null=不可查，非零过滤后渲染）
+  const walletAssets = Array.isArray(wallet?.wallet_assets)
+    ? (wallet.wallet_assets as Array<Record<string, unknown>>)
+    : null
+  const heldTokens = (walletAssets ?? []).filter(a => {
+    const sym = String(a?.asset ?? a?.symbol ?? '')
+    if (sym.toUpperCase() === 'USDT') return false  // USDT 已在上方余额行展示
+    const amt = Number(a?.free ?? a?.balance ?? 0)
+    return Number.isFinite(amt) && amt > 0
+  })
 
   const handleSyncBinance = async () => {
     if (!window.confirm('确认用币安侧订单历史对账本地 PENDING 订单？\n（本地卡 PENDING 但币安已成交的行会被订正为终态）')) return
@@ -762,6 +772,20 @@ function LiveTradeTab() {
             {openPositions.length > 0
               ? <span className="font-mono text-amber-700">{openPositions.length} 单 · {openAmount.toFixed(2)} USDT</span>
               : <span className="text-gray-400">--</span>}
+          </div>
+          <div className="flex justify-between gap-2">
+            <span className="text-gray-500 shrink-0">钱包持仓 Token</span>
+            {walletAssets == null
+              ? <span className="text-gray-400">暂不可查（探索型端点）</span>
+              : heldTokens.length === 0
+                ? <span className="text-gray-400">--（无 outcome token）</span>
+                : <span className="font-mono text-xs text-right break-all text-gray-800">
+                    {heldTokens.map(a => {
+                      const sym = String(a.asset ?? a.symbol ?? '?')
+                      const amt = Number(a.free ?? a.balance ?? 0)
+                      return `${sym.length > 10 ? sym.slice(0, 10) + '…' : sym} × ${amt > 1e12 ? (amt / 1e18).toFixed(4) : amt}`
+                    }).join(' | ')}
+                  </span>}
           </div>
           <div className="flex items-center gap-2">
             <span className="text-gray-500 shrink-0">划转入金</span>
