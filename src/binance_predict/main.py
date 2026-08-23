@@ -1726,6 +1726,36 @@ async def get_prediction_wallet(
     }
 
 
+@app.get("/api/prediction/quote-preview")
+async def get_quote_preview(_: None = Depends(_require_auth)):
+    """当前 5m 预测市场报价预览（前端倒计时/指示价用）。
+
+    纯内存读：数据源为 15s 采样器 _prediction_market_tracker 直写的模块级
+    _pm_market_info，零币安 API 成本。报价最多 15s 陈旧（指示价）；
+    实际成交价以下单响应 average_price 为准。
+    """
+    async with _state_lock:
+        snap = dict(_pm_market_info)
+    if not snap:
+        return {
+            "window_start": None,
+            "window_end": None,
+            "up_price": None,
+            "down_price": None,
+            "server_now_ms": int(time.time() * 1000),
+            "stale": True,
+        }
+    start, end = snap.get("start_date"), snap.get("end_date")
+    return {
+        "window_start": int(start) if start is not None else None,
+        "window_end": int(end) if end is not None else None,
+        "up_price": snap.get("up_price"),
+        "down_price": snap.get("down_price"),
+        "server_now_ms": int(time.time() * 1000),
+        "stale": False,
+    }
+
+
 @app.post("/api/trade/test")
 async def manual_trade_test(
     req: ManualTradeTestRequest,

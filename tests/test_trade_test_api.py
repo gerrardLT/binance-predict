@@ -316,3 +316,70 @@ async def test_sync_binance_backfills_pending_rows(monkeypatch) -> None:
     assert matched.quote_json["source"] == "binance_history_sync"
     assert unmatched.status == "PENDING"  # 无对应币安订单 → 不动
     db.commit.assert_awaited_once()
+
+
+# ============================================================
+# GET /api/prediction/quote-preview（报价预览：倒计时/指示价）
+# ============================================================
+
+def _fresh_lock():
+    """新锁隔离事件循环：模块级 _state_lock 可能已绑定其他测试的 loop
+    （Python 3.10+ asyncio.Lock 首次 await 时绑定 loop，跨 loop 复用会报错）。"""
+    import asyncio
+    return asyncio.Lock()
+
+
+@pytest.mark.asyncio
+async def test_quote_preview_snapshot_fields(monkeypatch) -> None:
+    """_pm_market_info 有数据 → 快照字段 + server_now_ms + stale=False。"""
+    import binance_predict.main as m
+
+    monkeypatch.setattr(m, "_state_lock", _fresh_lock())
+    monkeypatch.setattr(m, "_pm_market_info", {
+        "start_date": 1_000_000_000_000,
+        "end_date": 1_000_000_300_000,
+        "up_price": 0.45,
+        "down_price": 0.55,
+        "participant_count": 123,
+    })
+    out = await m.get_quote_preview(_=None)
+    assert out["stale"] is False
+    assert out["window_start"] == 1_000_000_000_000
+    assert out["window_end"] == 1_000_000_300_000
+    assert out["up_price"] == 0.45
+    assert out["down_price"] == 0.55
+    assert isinstance(out["server_now_ms"], int)
+    # 纯快照：不携带多余字段（participant_count 等仅供图表 API）
+    assert "participant_count" not in out
+
+
+@pytest.mark.asyncio
+async def test_quote_preview_stale_when_empty(monkeypatch) -> None:
+    """_pm_market_info 为空（启动初期/采样失败）→ stale=True 其余 None。"""
+    import binance_predict.main as m
+
+    monkeypatch.setattr(m, "_state_lock", _fresh_lock())
+    monkeypatch.setattr(m, "_pm_market_info", {})
+    out = await m.get_quote_preview(_=None)
+    assert out["stale"] is True
+    assert out["window_start"] is None
+    assert out["window_end"] is None
+    assert out["up_price"] is None
+    assert out["down_price"] is None
+    assert isinstance(out["server_now_ms"], int)
+
+
+@pytest.mark.asyncio
+async def test_quote_preview_none_dates(monkeypatch) -> None:
+    """有部分数据但 start/end 缺失 → 日期字段 None 但 stale=False（防御分支）。"""
+    import binance_predict.main as m
+
+    monkeypatch.setattr(m, "_state_lock", _fresh_lock())
+    monkeypatch.setattr(m, "_pm_market_info", {
+        "up_price": 0.5, "down_price": 0.5,
+    })
+    out = await m.get_quote_preview(_=None)
+    assert out["stale"] is False
+    assert out["window_start"] is None
+    assert out["window_end"] is None
+    assert out["up_price"] == 0.5

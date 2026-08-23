@@ -490,6 +490,8 @@ const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ amount_usdt }),
     }).then(r => r.json()),
+  getQuotePreview: () => fetch('/api/prediction/quote-preview').then(r => r.json()),
+  postSyncBinance: () => fetch('/api/trades/sync-binance', { method: 'POST' }).then(r => r.json()),
 }
 
 // ============================================================
@@ -568,11 +570,23 @@ function LiveTradeTab() {
   const [transferAmt, setTransferAmt] = useState('5')
   const [transferring, setTransferring] = useState(false)
   const [transferResult, setTransferResult] = useState<Record<string, unknown> | null>(null)
+  // 报价预览（15s 轮询 + 本地 1s 倒计时）：服务端时钟偏移修正本地计时
+  const [quote, setQuote] = useState<Record<string, unknown> | null>(null)
+  const [clockOffset, setClockOffset] = useState(0)
+  const [nowMs, setNowMs] = useState(() => Date.now())
+  const [syncing, setSyncing] = useState(false)
+  const [syncResult, setSyncResult] = useState<Record<string, unknown> | null>(null)
 
   const refresh = useCallback(() => {
     api.getPredictionWallet().then(setWallet).catch(() => {})
     api.getLiveStatus().then(d => setLive(d?.quote_edge_live ?? null)).catch(() => {})
     api.getRecentTrades().then(d => setOrders(d?.orders ?? [])).catch(() => {})
+    api.getQuotePreview().then((q: Record<string, unknown>) => {
+      setQuote(q)
+      if (typeof q?.server_now_ms === 'number') {
+        setClockOffset((q.server_now_ms as number) - Date.now())
+      }
+    }).catch(() => {})
   }, [])
 
   useEffect(() => {
@@ -580,6 +594,12 @@ function LiveTradeTab() {
     const timer = setInterval(refresh, 15000)
     return () => clearInterval(timer)
   }, [refresh])
+
+  // 本地 1s tick：用 window_end - server_now_ms 偏移算剩余秒（不新增网络轮询）
+  useEffect(() => {
+    const t = setInterval(() => setNowMs(Date.now()), 1000)
+    return () => clearInterval(t)
+  }, [])
 
   const handleTestTrade = async () => {
     const amt = parseFloat(amount)
@@ -605,6 +625,28 @@ function LiveTradeTab() {
   const walletErr = (wallet as { error?: string } | null)?.error
   const regTs = wallet?.registered_time as number | undefined
   const resultFilled = result?.status === 'FILLED'
+
+  // 倒计时：服务端时钟修正后的剩余毫秒；<60s 红色警示
+  const windowEnd = quote?.window_end as number | null | undefined
+  const remainSec = (typeof windowEnd === 'number' && quote && !quote.stale)
+    ? Math.max(0, Math.floor((windowEnd - (nowMs + clockOffset)) / 1000))
+    : null
+  const urgent = remainSec != null && remainSec < 60
+
+  const handleSyncBinance = async () => {
+    if (!window.confirm('确认用币安侧订单历史对账本地 PENDING 订单？\n（本地卡 PENDING 但币安已成交的行会被订正为终态）')) return
+    setSyncing(true)
+    setSyncResult(null)
+    try {
+      const res = await api.postSyncBinance()
+      setSyncResult(res)
+      refresh()
+    } catch (e) {
+      alert(`请求失败: ${(e as Error).message}`)
+    } finally {
+      setSyncing(false)
+    }
+  }
 
   const handleTransferIn = async () => {
     const amt = parseFloat(transferAmt)
@@ -693,6 +735,19 @@ function LiveTradeTab() {
 
       <Card title="人工测试单（真实下单）">
         <div className="space-y-3 text-sm">
+          {quote == null || quote.stale ? (
+            <div className="text-xs text-gray-400 rounded bg-gray-50 px-2 py-1.5">报价不可用（等待 15s 采样器…）</div>
+          ) : (
+            <div className={`flex items-center justify-between rounded px-2 py-1.5 text-xs ${urgent ? 'bg-red-50 text-red-700' : 'bg-blue-50 text-blue-700'}`}>
+              <span className="font-mono">
+                UP {typeof quote.up_price === 'number' ? quote.up_price.toFixed(3) : '--'} / DOWN {typeof quote.down_price === 'number' ? quote.down_price.toFixed(3) : '--'}
+                <span className="opacity-60">（指示价）</span>
+              </span>
+              <span className="font-mono font-bold tabular-nums">
+                {remainSec != null ? `剩余 ${Math.floor(remainSec / 60)}:${String(remainSec % 60).padStart(2, '0')}` : '--:--'}
+              </span>
+            </div>
+          )}
           <div className="flex items-center gap-3">
             <label className="text-gray-500 shrink-0">金额 (USDT)</label>
             <input
@@ -737,6 +792,22 @@ function LiveTradeTab() {
 
       <div className="lg:col-span-2">
         <Card title="最近订单">
+          <div className="flex items-center justify-between mb-2 gap-2">
+            <span className="text-xs text-gray-400">{orders.length} 条记录（每 15s 自动刷新）</span>
+            <div className="flex items-center gap-2">
+              {syncResult && (
+                <span className={`text-xs px-2 py-0.5 rounded ${syncResult.error ? 'bg-red-50 text-red-600' : 'bg-green-50 text-green-700'}`}>
+                  {syncResult.error
+                    ? String(syncResult.error)
+                    : `币安侧 ${String(syncResult.binance_orders ?? '?')} 单，已同步 ${String(syncResult.synced ?? 0)} 单`}
+                </span>
+              )}
+              <button
+                onClick={handleSyncBinance} disabled={syncing}
+                className="px-3 py-1 text-xs font-semibold rounded bg-slate-600 text-white disabled:opacity-50"
+              >{syncing ? '对账中…' : '对账（同步币安）'}</button>
+            </div>
+          </div>
           {orders.length === 0 ? (
             <p className="text-sm text-gray-400">暂无订单记录</p>
           ) : (
