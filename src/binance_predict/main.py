@@ -1687,6 +1687,7 @@ async def get_recent_trades(
                 "win": o.win,
                 "pnl": o.pnl,
                 "settled_at": o.settled_at.isoformat() if o.settled_at else None,
+                "redeemed_at": o.redeemed_at.isoformat() if o.redeemed_at else None,
                 "error_message": o.error_message,
                 "created_at": o.created_at.isoformat() if o.created_at else None,
             }

@@ -130,14 +130,13 @@ class TradeSettler:
 
     async def _settle_row(self, row: TradeOrderModel) -> bool:
         if row.direction is None:
-            # 旧数据（direction 落库前的订单）：无法判赢。未超 24h 下轮重试；
-            # 超 24h 兜底 EXPIRED（win=None/pnl=0 不计统计）——防永久卡
+            # 旧数据（direction 落库前的订单）：无法判赢，且字段无回填机制
+            #（direction 与下单同事务写入）——等待毫无意义，被扫出（超 7min
+            # 延迟）即 EXPIRED 出清（win=None/pnl=0 不计统计）。防永久卡
             # 「在途持仓」+ 每 60s 空扫（2026-08-23 生产实锤：4 笔 8/22 旧单
-            # direction=NULL 卡在途 3.85 USDT，每轮空扫告警刷屏）。
-            created = self._aware(row.created_at)
+            # direction=NULL 卡在途 3.85 USDT，每轮空扫告警刷屏；首版等 24h
+            # 反而让旧单多挂一天，收敛为立即出清）。
             now_dt = datetime.now(timezone.utc)
-            if created is not None and created > now_dt - EXPIRE_AFTER:
-                return False  # 未超 24h：等可能的字段回填，下轮重试
             async with async_session_factory() as session:
                 stmt = (
                     sa_update(TradeOrderModel)

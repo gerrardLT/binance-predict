@@ -176,6 +176,7 @@ async def test_recent_trades_fields_and_limit() -> None:
         status="FAILED", order_id=None, token_id=None, amount_in=None,
         quote_json={"averagePrice": 0.5},
         direction=None, settle_outcome=None, win=None, pnl=None, settled_at=None,
+        redeemed_at=None,
         error_message="获取报价失败 | HTTP 400: not enough USDT",
         created_at=datetime(2026, 8, 22, 15, 35, tzinfo=timezone.utc),
     )
@@ -192,6 +193,7 @@ async def test_recent_trades_fields_and_limit() -> None:
     assert o["average_price"] == 0.5
     assert o["direction"] is None      # 旧数据无 direction：透传 null
     assert o["settled_at"] is None     # 未结算 → null
+    assert o["redeemed_at"] is None    # 未领取 → null（新字段透传）
     assert "HTTP 400" in o["error_message"]
     assert o["created_at"].startswith("2026-08-22")
 
