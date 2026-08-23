@@ -1782,6 +1782,8 @@ async def get_prediction_wallet(
                 "prediction_balance_available": (
                     pred.get("usdt_free") is not None or pred.get("assets") is not None
                 ),
+                # 诊断透传：余额不可查时直接看币安返回的真实错误（无 SSH 也能定位）
+                "assets_api_error": getattr(prediction_trader, "last_assets_error", None),
             })
             _wallet_view_ts["balance"] = now
         if "wallet_address" not in _wallet_view:

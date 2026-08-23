@@ -84,6 +84,8 @@ class BinancePredictionTrader:
         # 最近一次 API 调用的错误详情（诊断透传：人工测试单/日志排查用；
         # get_quote/place_order 失败时写入，成功时清空）
         self.last_api_error: str | None = None
+        # 最近一次 payment-options 余额查询错误（诊断透传：前端"暂不可查"时定位原因）
+        self.last_assets_error: str | None = None
 
         # 缓存当前活跃的 BTC 预测市场信息
         self._active_market: dict | None = None
@@ -298,6 +300,7 @@ class BinancePredictionTrader:
             data = resp.json()
         except httpx.HTTPStatusError as e:
             self.last_api_error = f"HTTP {e.response.status_code}: {e.response.text[:300]}"
+            self.last_assets_error = self.last_api_error
             logger.info(
                 "预测钱包资产列表查询失败（探索型端点，降级） | HTTP {} | {}",
                 e.response.status_code, e.response.text[:200],
@@ -305,10 +308,12 @@ class BinancePredictionTrader:
             return None
         except Exception as e:
             self.last_api_error = f"{type(e).__name__}: {e}"
+            self.last_assets_error = self.last_api_error
             logger.info("预测钱包资产列表查询异常（探索型端点，降级）: {}", e)
             return None
 
         # 响应结构未知：兼容 list 直返 / {"options": [...]} 等包裹形态
+        self.last_assets_error = None
         logger.info(
             "预测钱包 payment-options 原始响应（收敛用）：{}",
             str(data)[:300],
