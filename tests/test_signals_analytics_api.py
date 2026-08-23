@@ -68,11 +68,11 @@ def _make_db(shadow_rows, scene_rows) -> AsyncMock:
 
 @pytest.mark.asyncio
 async def test_btc_klines_invalid_interval() -> None:
-    """interval 不在 1h/4h/1d → 422。"""
+    """interval 不在 5m/15m/1h/4h/1d → 422（5m/15m 已开放给实盘对照图）。"""
     import binance_predict.main as m
 
     with pytest.raises(HTTPException) as exc:
-        await m.get_btc_klines(interval="5m", limit=30)
+        await m.get_btc_klines(interval="3m", limit=30)
     assert exc.value.status_code == 422
 
 

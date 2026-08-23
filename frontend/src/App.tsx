@@ -571,6 +571,90 @@ function Card({ title, children, className = '' }: { title: string; children: Re
 // 实盘 Tab（账户状态 + 人工测试单 + 订单历史，2026-08-22）
 // ============================================================
 
+// 实盘对照图：BTC K 线（5m/15m）× 预测市场情绪曲线（UP/DOWN 报价，15s 采样）
+function LiveChartCard() {
+  const [p, setP] = useState<'5m' | '15m'>('5m')
+  const [klines, setKlines] = useState<BtcKline[]>([])
+  const [points, setPoints] = useState<PMPoint[]>([])
+
+  const load = useCallback(() => {
+    api.getBtcKlines(p, 96).then(k => {
+      if (k && Array.isArray(k.klines)) setKlines(k.klines as BtcKline[])
+    }).catch(() => {})
+    ;(p === '5m' ? api.getPredictionMarket() : api.getPredictionMarket15m())
+      .then(d => {
+        const pts = (d as { points?: PMPoint[] })?.points
+        setPoints(Array.isArray(pts) ? pts : [])
+      }).catch(() => {})
+  }, [p])
+
+  useEffect(() => { load() }, [load])
+  useEffect(() => {
+    const t = setInterval(load, 30_000)
+    return () => clearInterval(t)
+  }, [load])
+
+  const hhmm = (t: number) =>
+    new Date(t).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+
+  return (
+    <div className="lg:col-span-2">
+      <Card title={`BTC K 线 × 市场情绪对照（${p}，30s 刷新）`}>
+        <div className="flex items-center gap-3 mb-2 text-xs flex-wrap">
+          {(['5m', '15m'] as const).map(iv => (
+            <button key={iv} onClick={() => setP(iv)}
+              className={`px-2.5 py-0.5 rounded-md border transition ${
+                p === iv ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-gray-600 border-gray-300 hover:border-blue-400'
+              }`}>{iv}</button>
+          ))}
+          <span className="text-gray-400">
+            <span className="text-green-600">— UP 报价</span> · <span className="text-red-500">— DOWN 报价</span> · <span className="text-gray-600">— BTC 收盘</span>（情绪 = 预测市场报价，15s 采样）
+          </span>
+        </div>
+        <div className="space-y-3">
+          {klines.length > 0 ? (
+            <ResponsiveContainer width="100%" height={170}>
+              <LineChart data={klines.map(k => ({ t: k.open_time, close: k.close }))}
+                margin={{ top: 6, right: 12, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                <XAxis dataKey="t" type="number" domain={['dataMin', 'dataMax']} scale="time"
+                  tickFormatter={hhmm} tick={{ fontSize: 10 }} stroke="#9ca3af" />
+                <YAxis domain={['auto', 'auto']} tick={{ fontSize: 10 }} stroke="#9ca3af" width={64}
+                  tickFormatter={(v: number) => v.toLocaleString()} />
+                <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8, border: '1px solid #e5e7eb' }}
+                  labelFormatter={t => new Date(t as number).toLocaleString('zh-CN')}
+                  formatter={v => [typeof v === 'number' ? v.toLocaleString() : '--', 'BTC 收盘']} />
+                <Line dataKey="close" stroke="#374151" dot={false} strokeWidth={1.6} isAnimationActive={false} />
+              </LineChart>
+            </ResponsiveContainer>
+          ) : (
+            <div className="text-xs text-gray-400 h-10 flex items-center">K 线加载中…（{p}）</div>
+          )}
+          {points.length > 1 ? (
+            <ResponsiveContainer width="100%" height={130}>
+              <LineChart data={points.map(pt => ({ t: pt.timestamp, up: pt.up_price, down: pt.down_price }))}
+                margin={{ top: 6, right: 12, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                <XAxis dataKey="t" type="number" domain={['dataMin', 'dataMax']} scale="time"
+                  tickFormatter={hhmm} tick={{ fontSize: 10 }} stroke="#9ca3af" />
+                <YAxis domain={[0, 1]} tick={{ fontSize: 10 }} stroke="#9ca3af" width={64}
+                  tickFormatter={(v: number) => v.toFixed(2)} />
+                <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8, border: '1px solid #e5e7eb' }}
+                  labelFormatter={t => new Date(t as number).toLocaleString('zh-CN')}
+                  formatter={(v, name) => [typeof v === 'number' ? v.toFixed(3) : '--', name === 'up' ? 'UP' : 'DOWN']} />
+                <Line dataKey="up" stroke="#16a34a" dot={false} strokeWidth={1.6} connectNulls isAnimationActive={false} />
+                <Line dataKey="down" stroke="#ef4444" dot={false} strokeWidth={1.6} connectNulls isAnimationActive={false} />
+              </LineChart>
+            </ResponsiveContainer>
+          ) : (
+            <div className="text-xs text-gray-400 h-10 flex items-center">情绪曲线加载中…（{p}）</div>
+          )}
+        </div>
+      </Card>
+    </div>
+  )
+}
+
 function LiveTradeTab() {
   const [wallet, setWallet] = useState<Record<string, unknown> | null>(null)
   const [live, setLive] = useState<Record<string, unknown> | null>(null)
@@ -616,8 +700,8 @@ function LiveTradeTab() {
 
   const handleTestTrade = async () => {
     const amt = parseFloat(amount)
-    if (!Number.isFinite(amt) || amt < 0.1 || amt > 5) {
-      alert('金额仅允许 0.1~5 USDT')
+    if (!Number.isFinite(amt) || amt < 0.1 || amt > 50) {
+      alert('金额仅允许 0.1~50 USDT（与实盘单笔硬上限一致）')
       return
     }
     if (!window.confirm(
@@ -739,6 +823,7 @@ function LiveTradeTab() {
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      <LiveChartCard />
       <Card title="账户状态">
         <div className="space-y-2 text-sm">
           <div className="flex justify-between gap-2">
@@ -867,11 +952,34 @@ function LiveTradeTab() {
           <div className="flex items-center gap-3">
             <label className="text-gray-500 shrink-0">金额 (USDT)</label>
             <input
-              type="number" min={0.1} max={5} step={0.5} value={amount}
+              type="number" min={0.1} max={50} step={0.5} value={amount}
               onChange={e => setAmount(e.target.value)}
               className="w-24 px-2 py-1 border border-gray-300 rounded text-gray-800"
             />
-            <span className="text-xs text-gray-400">0.1~5</span>
+            <span className="text-xs text-gray-400">0.1~50</span>
+          </div>
+          {/* 金额预设：百分比按预测钱包余额计算（clamp 0.1~50），固定额直填（100U 超硬上限禁用） */}
+          <div className="flex items-center gap-1.5 flex-wrap text-xs">
+            <span className="text-gray-400 shrink-0">按余额</span>
+            {[2, 5, 10, 20].map(pct => {
+              const bal = typeof wallet?.prediction_usdt_free === 'number'
+                ? wallet.prediction_usdt_free as number : null
+              const disabled = bal == null
+              return (
+                <button key={pct} disabled={disabled}
+                  title={disabled ? '预测钱包余额不可查（等余额端点收敛）' : `${pct}% × ${bal!.toFixed(2)}U`}
+                  onClick={() => setAmount(String(Math.min(50, Math.max(0.1, +(bal! * pct / 100).toFixed(2)))))}
+                  className="px-2 py-0.5 rounded border border-gray-300 bg-white text-gray-700 hover:border-blue-400 disabled:opacity-40"
+                >{pct}%</button>
+              )
+            })}
+            <span className="text-gray-400 shrink-0 ml-2">固定</span>
+            {[1, 2, 5, 10, 20, 50, 100].map(u => (
+              <button key={u} disabled={u > 50} title={u > 50 ? '超单笔硬上限 50 USDT' : `${u} USDT`}
+                onClick={() => setAmount(String(u))}
+                className="px-2 py-0.5 rounded border border-gray-300 bg-white text-gray-700 hover:border-blue-400 disabled:opacity-40"
+              >{u}U</button>
+            ))}
           </div>
           <div className="flex items-center gap-3">
             <span className="text-gray-500 shrink-0">方向</span>

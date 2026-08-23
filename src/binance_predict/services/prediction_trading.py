@@ -32,16 +32,16 @@ from ..db.models import TradeOrderModel
 from . import clock_sync
 
 # ---------------------------------------------------------------------------
-# 预测钱包余额探索常量（P0-1：余额看不全）
-# 币安官方文档未公开预测钱包余额字段，采用两级探索实测后收敛：
+# 预测钱包余额常量（P0-1：余额看不全；2026-08-23 agent-reach 调研收敛）
 # ① wallet/list 响应内嵌余额字段候选 key（零额外 API 成本）；
-# ② 资产列表候选端点路径（实测后只需改这一处）。
+# ② 官方文档确认的余额端点：balance/payment-options（旧 asset/list 实测 404
+#    已废弃；返回结构未知，解析兼容多种包裹形态，响应原文打日志供收敛）。
 # ---------------------------------------------------------------------------
 _WALLET_BALANCE_KEYS: tuple[str, ...] = (
     "balance", "usdtBalance", "availableBalance", "available",
     "usdtFree", "free", "assetBalance",
 )
-_ASSET_LIST_PATH = "/sapi/v1/w3w/wallet/prediction/asset/list"
+_ASSET_LIST_PATH = "/sapi/v1/w3w/wallet/prediction/balance/payment-options"
 
 # 预测钱包划转端点（⚠️ 官方命名反转陷阱：
 #   outbound = CEX 现货→预测钱包（入金，transfer_in 用）
@@ -250,7 +250,7 @@ class BinancePredictionTrader:
                 except (TypeError, ValueError):
                     continue
 
-        # ② 资产列表端点（失败降级 None）
+        # ② 官方余额端点（payment-options；失败降级 None）
         assets = await self._fetch_prediction_asset_list()
         if assets is not None:
             out["assets"] = assets
@@ -262,7 +262,7 @@ class BinancePredictionTrader:
                     symbol = str(a.get("asset") or a.get("symbol") or "").upper()
                     if symbol != "USDT":
                         continue
-                    free = a.get("free", a.get("balance"))
+                    free = a.get("free", a.get("balance", a.get("amount")))
                     if free is None:
                         continue
                     try:
@@ -273,10 +273,12 @@ class BinancePredictionTrader:
         return out
 
     async def _fetch_prediction_asset_list(self) -> list | None:
-        """预测钱包资产列表（探索型端点，路径 _ASSET_LIST_PATH 常量一处改）。
+        """预测钱包余额/资产列表（官方 balance/payment-options 端点）。
 
         失败返回 None + last_api_error（上层降级不阻塞其余字段）。
         签名 GET 用 _sign_request（标准 params= 方式，参照 fetch_wallet_info）。
+        响应结构未知：兼容 list 直返 / {"options"/"assets"/...} 包裹形态，
+        并把响应原文前 300 字符打进日志（生产实测后收敛解析字段）。
         """
         req_params: dict = {}
         if self._wallet_id:
@@ -306,11 +308,15 @@ class BinancePredictionTrader:
             logger.info("预测钱包资产列表查询异常（探索型端点，降级）: {}", e)
             return None
 
-        # 响应结构未知：兼容 list 直返 / {"assets": [...]} 等包裹形态
+        # 响应结构未知：兼容 list 直返 / {"options": [...]} 等包裹形态
+        logger.info(
+            "预测钱包 payment-options 原始响应（收敛用）：{}",
+            str(data)[:300],
+        )
         if isinstance(data, list):
             return data
         if isinstance(data, dict):
-            for key in ("assets", "balances", "data", "list"):
+            for key in ("options", "assets", "balances", "data", "list"):
                 v = data.get(key)
                 if isinstance(v, list):
                     return v

@@ -1828,9 +1828,10 @@ async def manual_trade_test(
 
     与信号实盘共用 execute_signal_trade（先占位后下单），signal_version="manual_test"：
     同一 5m 窗口至多一单（唯一键防重），订单落 trade_orders 表可追溯。
-    金额硬限 0.1~5 USDT（链路验证用途，非交易通道）；不设执行价护栏。"""
-    if not (0.1 <= req.amount_usdt <= 5.0):
-        return {"error": "amount_usdt 仅允许 0.1~5（小额链路测试）"}
+    金额硬限 0.1~50 USDT（与实盘单笔硬上限 MAX_ORDER_AMOUNT_USDT 对齐）；
+    不设执行价护栏。"""
+    if not (0.1 <= req.amount_usdt <= 50.0):
+        return {"error": "amount_usdt 仅允许 0.1~50（与实盘单笔硬上限一致）"}
     if req.prediction not in ("UP", "DOWN"):
         return {"error": "prediction 仅允许 UP/DOWN"}
 
@@ -2267,8 +2268,8 @@ _BTC_KLINE_FAIL_TTL = 10.0
 @app.get("/api/chart/btc-klines")
 async def get_btc_klines(interval: str = "1d", limit: int = 30):
     """BTC K 线代理（信号分析面板背景图）：仅返回已收盘 K，升序。"""
-    if interval not in ("1h", "4h", "1d"):
-        raise HTTPException(status_code=422, detail=f"interval 仅支持 1h/4h/1d: {interval}")
+    if interval not in ("5m", "15m", "1h", "4h", "1d"):
+        raise HTTPException(status_code=422, detail=f"interval 仅支持 5m/15m/1h/4h/1d: {interval}")
     limit = max(10, min(limit, 200))
     tier = next((t for t in _BTC_KLINE_LIMIT_TIERS if t >= limit), _BTC_KLINE_LIMIT_TIERS[-1])
     now = time.time()

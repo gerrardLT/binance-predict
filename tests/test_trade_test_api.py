@@ -49,7 +49,7 @@ async def test_trade_test_amount_bounds_rejected(monkeypatch) -> None:
     out1 = await m.manual_trade_test(
         ManualTradeTestRequest(amount_usdt=0.05), _=None)
     out2 = await m.manual_trade_test(
-        ManualTradeTestRequest(amount_usdt=6.0), _=None)
+        ManualTradeTestRequest(amount_usdt=51.0), _=None)
     assert "error" in out1 and "error" in out2
     assert called == []
 
@@ -371,6 +371,41 @@ async def test_fetch_prediction_balance_all_failed(monkeypatch) -> None:
     monkeypatch.setattr(trader, "_fetch_prediction_asset_list", _assets)
     out = await trader.fetch_prediction_wallet_balance()
     assert out == {"usdt_free": None, "assets": None}
+
+
+def test_balance_endpoint_path_is_official() -> None:
+    """余额端点必须是官方 payment-options（旧 asset/list 实测 404，防回退）。"""
+    from binance_predict.services import prediction_trading as pt
+
+    assert pt._ASSET_LIST_PATH == (
+        "/sapi/v1/w3w/wallet/prediction/balance/payment-options"
+    )
+
+
+@pytest.mark.asyncio
+async def test_payment_options_response_parsing(monkeypatch) -> None:
+    """payment-options 响应兼容 {"options": [...]} 包裹与 amount 字段（2026-08-23 收敛）。"""
+    from binance_predict.services.prediction_trading import BinancePredictionTrader
+
+    trader = BinancePredictionTrader()
+    trader._api_key = "k"
+    trader._api_secret = "s"
+    trader._wallet_address = "0xW"
+    trader._wallet_id = "WID"
+
+    resp = SimpleNamespace(status_code=200)
+    resp.raise_for_status = lambda: None
+    resp.json = lambda: {"options": [
+        {"asset": "USDT", "amount": "8.75"},
+        {"asset": "BTC-UP-TOKEN", "amount": "12"},
+    ]}
+    client = MagicMock()
+    client.get = AsyncMock(return_value=resp)
+    monkeypatch.setattr(trader, "_get_client", lambda: client)
+
+    out = await trader.fetch_prediction_wallet_balance(wallet={"walletId": "WID"})
+    assert out["usdt_free"] == 8.75  # amount 字段兑底命中
+    assert out["assets"] == resp.json()["options"]
 
 
 @pytest.mark.asyncio
