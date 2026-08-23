@@ -110,6 +110,42 @@ async def test_trade_test_order_none_returns_error(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_trade_test_success_invalidates_balance_cache(monkeypatch) -> None:
+    """下单成功后作废 prediction-wallet 余额 TTL 缓存（前端实时余额依赖）。"""
+    import time
+
+    import binance_predict.main as m
+
+    async def _exec(**kw):
+        return _order()
+
+    monkeypatch.setattr(m.prediction_trader, "execute_signal_trade", _exec)
+    # 模拟新鲜缓存（未过期）
+    m._wallet_view_ts["balance"] = time.time()
+    await m.manual_trade_test(
+        ManualTradeTestRequest(amount_usdt=1.0), _=None)
+    assert m._wallet_view_ts["balance"] == 0.0  # 已作废
+
+
+@pytest.mark.asyncio
+async def test_trade_test_order_none_keeps_balance_cache(monkeypatch) -> None:
+    """未产生订单（None）不作废余额缓存（未花钱）。"""
+    import time
+
+    import binance_predict.main as m
+
+    async def _exec(**kw):
+        return None
+
+    monkeypatch.setattr(m.prediction_trader, "execute_signal_trade", _exec)
+    fresh = time.time()
+    m._wallet_view_ts["balance"] = fresh
+    await m.manual_trade_test(
+        ManualTradeTestRequest(amount_usdt=1.0), _=None)
+    assert m._wallet_view_ts["balance"] == fresh  # 未被作废
+
+
+@pytest.mark.asyncio
 async def test_trade_test_failed_order_passthrough(monkeypatch) -> None:
     """FAILED（如未找到 token）→ status=FAILED + error_message 透传。"""
     import binance_predict.main as m

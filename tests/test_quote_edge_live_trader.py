@@ -189,6 +189,30 @@ async def test_fire_failed_order_no_crash(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_fire_invalidates_balance_cache_hook(monkeypatch) -> None:
+    """产生订单（FILLED）后触发余额缓存作废钩子（前端实时余额依赖）。"""
+    fake = _FakeTrader()  # 默认 FILLED
+    t = _make_trader(monkeypatch, fake)
+    calls: list[None] = []
+    t._on_balance_change = lambda: calls.append(None)
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 100_000, 0.71)
+    await _drain(t)
+    assert calls == [None]  # 产生订单即作废（一次）
+
+
+@pytest.mark.asyncio
+async def test_fire_no_order_skips_balance_hook(monkeypatch) -> None:
+    """未产生订单（None）不触发余额钩子（未花钱，缓存无需作废）。"""
+    fake = _FakeTrader(result=None)
+    t = _make_trader(monkeypatch, fake)
+    calls: list[None] = []
+    t._on_balance_change = lambda: calls.append(None)
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 100_000, 0.71)
+    await _drain(t)
+    assert calls == []
+
+
+@pytest.mark.asyncio
 async def test_fire_trader_none_no_crash(monkeypatch) -> None:
     """trader 返回 None（落库异常）→ 不崩、不回填。"""
     fake = _FakeTrader(result=None)

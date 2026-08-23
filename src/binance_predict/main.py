@@ -977,6 +977,11 @@ async def lifespan(app: FastAPI):
         logger.error("报价 edge 实盘执行器装配失败：{}", exc)
     else:
         await quote_edge_live_trader.start()
+        # 余额缓存作废钩子：信号单成交后作废 prediction-wallet TTL 缓存
+        # （下单扣预测钱包余额；与划转端点同款失效逻辑，前端下次轮询即取新值）
+        quote_edge_live_trader._on_balance_change = (
+            lambda: _wallet_view_ts.__setitem__("balance", 0.0)
+        )
         _live_status = quote_edge_live_trader.status()
         logger.info(
             "报价 edge 实盘执行器已加载（真单！）| {} | {} USDT/单 | 运行中={}| 上限{}单",
@@ -1850,6 +1855,8 @@ async def manual_trade_test(
             "error": "下单未执行（API Key 未配置 / 钱包获取失败 / 本窗口已有测试单）",
             "window_start": window_start,
         }
+    # 产生订单即作废余额缓存（下单扣预测钱包余额；与划转端点同款失效逻辑）
+    _wallet_view_ts["balance"] = 0.0
     # order 为 dict 快照（execute_signal_trade 不再返回 ORM 对象，
     # 避免会话关闭后访问属性报 DetachedInstanceError）
     return {

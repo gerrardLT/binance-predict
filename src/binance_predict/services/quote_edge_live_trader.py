@@ -77,6 +77,9 @@ class QuoteEdgeLiveTrader:
         self._max_daily = settings.quote_momentum_live_max_daily_orders
         self._fired: set[int] = set()          # 本进程已开火/尝试过的 window_start
         self._tasks: set[asyncio.Task] = set()  # 在途任务（下单/回填/自愈）
+        # 余额缓存作废钩子（main 装配区注入：成交后作废 prediction-wallet 的 TTL 缓存，
+        # 前端下次轮询即取新余额；services 层不反向 import main，用回调解耦）
+        self._on_balance_change = None
         self._fire_total = 0
         self._healed_total = 0
         self._stopped = False                   # stop 后拒绝派生新下单任务（High#1）
@@ -158,6 +161,12 @@ class QuoteEdgeLiveTrader:
                 return
 
             self._fire_total += 1
+            # 成交后作废余额缓存（下单扣预测钱包余额，前端最多 35s 才能看到旧值）
+            if self._on_balance_change is not None:
+                try:
+                    self._on_balance_change()
+                except Exception:
+                    logger.warning("报价 edge 实盘：余额缓存作废回调异常（不影响下单）", exc_info=True)
             # execute_signal_trade 返回 dict 快照（非 ORM 对象，避免脱离会话访问报错）
             if order.get("status") == "FILLED":
                 logger.info(
