@@ -313,8 +313,8 @@ class Settings(BaseSettings):
     # 实盘绑定的信号版本（白名单内二选一，误写 → 执行器构造抛 ValueError 拒绝启动；
     # v2 门禁版需价格序列，实盘采样链路暂不支持，等影子验证后再评估扩展）
     quote_edge_live_version: str = "quote_contrarian_v1"
-    # 实盘单笔金额（USDT，灰度 5）
-    quote_momentum_live_amount_usdt: float = 5.0
+    # 实盘单笔金额（USDT，2026-08-23 灰度 5 → 2：降单笔敞口，硬上限 50 不变）
+    quote_momentum_live_amount_usdt: float = 2.0
     # 执行价护栏：成交均价超过此值弃单且滑点按它收紧。None=按版本自动推导
     # （入场区间上界+0.03：momentum→0.78 与旧默认一致，contrarian→0.28）；
     # 显式配置则全版本统一覆盖（收紧用，勿放大——EV 对入场溢价敏感）
