@@ -86,6 +86,8 @@ class BinancePredictionTrader:
         self.last_api_error: str | None = None
         # 最近一次 payment-options 余额查询错误（诊断透传：前端"暂不可查"时定位原因）
         self.last_assets_error: str | None = None
+        # 最近一次 payment-options 成功响应的原文前 500 字符（诊断透传：解析未命中时收敛字段）
+        self.last_assets_raw: str | None = None
 
         # 缓存当前活跃的 BTC 预测市场信息
         self._active_market: dict | None = None
@@ -317,6 +319,7 @@ class BinancePredictionTrader:
 
         # 响应结构未知：兼容 list 直返 / {"options": [...]} 等包裹形态
         self.last_assets_error = None
+        self.last_assets_raw = str(data)[:500]
         logger.info(
             "预测钱包 payment-options 原始响应（收敛用）：{}",
             str(data)[:300],
