@@ -384,7 +384,9 @@ def test_balance_endpoint_path_is_official() -> None:
 
 @pytest.mark.asyncio
 async def test_payment_options_response_parsing(monkeypatch) -> None:
-    """payment-options 响应兼容 {"options": [...]} 包裹与 amount 字段（2026-08-23 收敛）。"""
+    """payment-options 官方响应结构（2026-08-23 生产实测收敛）：
+    {"items": [{accountType/availableBalanceDisplay/enabled}...]}，
+    prediction_usdt_free 取 CeDeFi（预测钱包）那项。"""
     from binance_predict.services.prediction_trading import BinancePredictionTrader
 
     trader = BinancePredictionTrader()
@@ -395,17 +397,43 @@ async def test_payment_options_response_parsing(monkeypatch) -> None:
 
     resp = SimpleNamespace(status_code=200)
     resp.raise_for_status = lambda: None
-    resp.json = lambda: {"options": [
-        {"asset": "USDT", "amount": "8.75"},
-        {"asset": "BTC-UP-TOKEN", "amount": "12"},
+    resp.json = lambda: {"items": [
+        {"accountType": "CeDeFi", "availableBalanceDisplay": "1.94", "enabled": True},
+        {"accountType": "SPOT", "availableBalanceDisplay": "104.83", "enabled": True},
+        {"accountType": "FUNDING", "availableBalanceDisplay": "0.00", "enabled": True},
     ]}
     client = MagicMock()
     client.get = AsyncMock(return_value=resp)
     monkeypatch.setattr(trader, "_get_client", lambda: client)
 
     out = await trader.fetch_prediction_wallet_balance(wallet={"walletId": "WID"})
-    assert out["usdt_free"] == 8.75  # amount 字段兑底命中
-    assert out["assets"] == resp.json()["options"]
+    assert out["usdt_free"] == 1.94  # CeDeFi（预测钱包）条目命中，非 SPOT
+    assert out["assets"] == resp.json()["items"]
+
+
+@pytest.mark.asyncio
+async def test_payment_options_cedefi_disabled_falls_back(monkeypatch) -> None:
+    """CeDeFi 条目 enabled=False 时跳过（不误取不可用支付方式）。"""
+    from binance_predict.services.prediction_trading import BinancePredictionTrader
+
+    trader = BinancePredictionTrader()
+    trader._api_key = "k"
+    trader._api_secret = "s"
+    trader._wallet_address = "0xW"
+    trader._wallet_id = "WID"
+
+    resp = SimpleNamespace(status_code=200)
+    resp.raise_for_status = lambda: None
+    resp.json = lambda: {"items": [
+        {"accountType": "CeDeFi", "availableBalanceDisplay": "9.9", "enabled": False},
+        {"accountType": "SPOT", "availableBalanceDisplay": "104.83", "enabled": True},
+    ]}
+    client = MagicMock()
+    client.get = AsyncMock(return_value=resp)
+    monkeypatch.setattr(trader, "_get_client", lambda: client)
+
+    out = await trader.fetch_prediction_wallet_balance(wallet={"walletId": "WID"})
+    assert out["usdt_free"] is None  # CeDeFi 禁用 + 无 USDT 条目 → 不误取 SPOT
 
 
 @pytest.mark.asyncio

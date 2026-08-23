@@ -739,16 +739,23 @@ function LiveTradeTab() {
   const openPositions = orders.filter(o => o.status === 'FILLED' && !o.settled_at)
   const openAmount = openPositions.reduce(
     (s, o) => s + (o.amount_in != null ? Number(o.amount_in) / 1e18 : 0), 0)
-  // 钱包持仓 outcome token（探索型端点 wallet_assets；null=不可查，非零过滤后渲染）
+  // 钱包支付账户/持仓（官方 payment-options：items[].accountType，2026-08-23 生产实测收敛；
+  // null=不可查；旧探索形态 asset/symbol 兑底保留）
   const walletAssets = Array.isArray(wallet?.wallet_assets)
     ? (wallet.wallet_assets as Array<Record<string, unknown>>)
     : null
+  const payAccounts = (walletAssets ?? []).filter(a =>
+    typeof a?.accountType === 'string' && (a?.accountType as string).length > 0)
   const heldTokens = (walletAssets ?? []).filter(a => {
+    if (typeof a?.accountType === 'string' && (a?.accountType as string).length > 0) return false  // 账户形态走 payAccounts
     const sym = String(a?.asset ?? a?.symbol ?? '')
     if (sym.toUpperCase() === 'USDT') return false  // USDT 已在上方余额行展示
     const amt = Number(a?.free ?? a?.balance ?? 0)
     return Number.isFinite(amt) && amt > 0
   })
+  const PAY_ACCOUNT_LABEL: Record<string, string> = {
+    CeDeFi: '预测钱包', SPOT: '现货', FUNDING: '资金账户',
+  }
 
   const handleSyncBinance = async () => {
     if (!window.confirm('确认用币安侧订单历史对账本地 PENDING 订单？\n（本地卡 PENDING 但币安已成交的行会被订正为终态）')) return
@@ -858,6 +865,21 @@ function LiveTradeTab() {
               ? <span className="font-mono text-amber-700">{openPositions.length} 单 · {openAmount.toFixed(2)} USDT</span>
               : <span className="text-gray-400">--</span>}
           </div>
+          {payAccounts.length > 0 && (
+            <div className="flex justify-between gap-2">
+              <span className="text-gray-500 shrink-0">支付账户余额</span>
+              <span className="font-mono text-xs text-right break-all text-gray-800">
+                {payAccounts.map(a => {
+                  const t = String(a.accountType)
+                  const label = PAY_ACCOUNT_LABEL[t] ?? t
+                  const amt = Number(a.availableBalanceDisplay ?? 0)
+                  const disabled = a.enabled === false
+                  return `${label} ${Number.isFinite(amt) ? amt.toFixed(2) : '--'}${disabled ? '（禁用）' : ''}`
+                }).join(' · ')}
+              </span>
+            </div>
+          )}
+          {payAccounts.length === 0 && (
           <div className="flex justify-between gap-2">
             <span className="text-gray-500 shrink-0">钱包持仓 Token</span>
             {walletAssets == null
@@ -872,6 +894,7 @@ function LiveTradeTab() {
                     }).join(' | ')}
                   </span>}
           </div>
+          )}
           <div className="flex items-center gap-2">
             <span className="text-gray-500 shrink-0">划转入金</span>
             <input

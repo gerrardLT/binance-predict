@@ -258,11 +258,21 @@ class BinancePredictionTrader:
         assets = await self._fetch_prediction_asset_list()
         if assets is not None:
             out["assets"] = assets
-            # ①未命中时从资产列表里找 USDT 条目兜底
+            # ①未命中时兑底：官方形态 items[].accountType=CeDeFi（预测钱包，
+            # 生产实测 2026-08-23）或旧形态 asset/symbol==USDT 条目
             if out["usdt_free"] is None:
                 for a in assets:
                     if not isinstance(a, dict):
                         continue
+                    if str(a.get("accountType", "")).upper() == "CEDEFI":
+                        if a.get("enabled") is False:
+                            continue
+                        v = a.get("availableBalanceDisplay")
+                        try:
+                            out["usdt_free"] = float(v)
+                            break
+                        except (TypeError, ValueError):
+                            continue
                     symbol = str(a.get("asset") or a.get("symbol") or "").upper()
                     if symbol != "USDT":
                         continue
@@ -327,7 +337,8 @@ class BinancePredictionTrader:
         if isinstance(data, list):
             return data
         if isinstance(data, dict):
-            for key in ("options", "assets", "balances", "data", "list"):
+            # 生产实测（2026-08-23）：{"items": [{accountType/availableBalanceDisplay/enabled}...]}
+            for key in ("items", "options", "assets", "balances", "data", "list"):
                 v = data.get(key)
                 if isinstance(v, list):
                     return v
