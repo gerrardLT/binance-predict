@@ -409,6 +409,56 @@ async def test_payment_options_response_parsing(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_payment_options_signature_matches_sent_query(monkeypatch) -> None:
+    """-1022 回归锁：发送的 query string 必须与签名字符串逐字节一致。
+
+    根因（2026-08-23 生产实锤）：_sign_request 按字母序签名，但 httpx
+    params= 按 dict 插入序发送，币安按收到的原文验签 → -1022。
+    修复后必须走 _build_signed_url（手动拼 URL，签名串=发送串）。
+    """
+    import hashlib
+    import hmac as hmac_mod
+    from urllib.parse import parse_qsl
+
+    from binance_predict.services.prediction_trading import BinancePredictionTrader
+
+    trader = BinancePredictionTrader()
+    trader._api_key = "k"
+    trader._api_secret = "s"
+    trader._wallet_address = "0xW"
+    trader._wallet_id = "WID"
+
+    captured: dict = {}
+    resp = SimpleNamespace(status_code=200)
+    resp.raise_for_status = lambda: None
+    resp.json = lambda: {"options": []}
+
+    async def _get(url, headers=None):
+        captured["url"] = str(url)
+        return resp
+
+    client = MagicMock()
+    client.get = _get
+    monkeypatch.setattr(trader, "_get_client", lambda: client)
+
+    await trader._fetch_prediction_asset_list()
+    qs = captured["url"].split("?", 1)[1]
+    pairs = parse_qsl(qs)
+    sig = dict(pairs)["signature"]
+    no_sig = [f"{k}={v}" for k, v in pairs if k != "signature"]
+    # ① 发送串本身必须按字母序（签名时即此序）
+    assert no_sig == sorted(no_sig)
+    # ② signature 必须是对发送串原文的 HMAC-SHA256（逐字节一致才验签通过）
+    expected = hmac_mod.new(
+        b"s", "&".join(no_sig).encode(), hashlib.sha256
+    ).hexdigest()
+    assert sig == expected
+    # ③ 业务参数确实在请求里（walletId/walletAddress）
+    assert dict(pairs)["walletId"] == "WID"
+    assert dict(pairs)["walletAddress"] == "0xW"
+
+
+@pytest.mark.asyncio
 async def test_fetch_spot_usdt_balance_parses_free(monkeypatch) -> None:
     """服务层：从 /api/v3/account balances 取 USDT 的 free。"""
     from binance_predict.services.prediction_trading import BinancePredictionTrader

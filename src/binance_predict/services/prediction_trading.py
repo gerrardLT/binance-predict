@@ -278,7 +278,11 @@ class BinancePredictionTrader:
         """预测钱包余额/资产列表（官方 balance/payment-options 端点）。
 
         失败返回 None + last_api_error（上层降级不阻塞其余字段）。
-        签名 GET 用 _sign_request（标准 params= 方式，参照 fetch_wallet_info）。
+        Fix -1022（2026-08-23 生产实锤 assets_api_error）：_sign_request 按
+        字母序签名，而 httpx params= 按 dict 插入序发送；带 walletId/
+        walletAddress 时两序不同，币安按收到的 query string 原文验签 →
+        -1022。改用 _build_signed_url 手动拼 URL（签名串=发送串，
+        与下单端点修 -1022 同款方案）。
         响应结构未知：兼容 list 直返 / {"options"/"assets"/...} 包裹形态，
         并把响应原文前 300 字符打进日志（生产实测后收敛解析字段）。
         """
@@ -287,13 +291,12 @@ class BinancePredictionTrader:
             req_params["walletId"] = self._wallet_id
         if self._wallet_address:
             req_params["walletAddress"] = self._wallet_address
-        params = self._sign_request(req_params)
+        url = self._build_signed_url(_ASSET_LIST_PATH, req_params)
 
         try:
             client = self._get_client()
             resp = await client.get(
-                f"{self.BASE_URL}{_ASSET_LIST_PATH}",
-                params=params,
+                url,
                 headers={"X-MBX-APIKEY": self._api_key},
             )
             resp.raise_for_status()
