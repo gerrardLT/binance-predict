@@ -296,6 +296,18 @@ class ToggleLiveRequest(BaseModel):
     enabled: bool = Field(description="启用=True / 禁用=False")
 
 
+class RedeemRequest(BaseModel):
+    """POST /api/prediction/redeem（领取获胜 token 奖金，batch-redeem）。
+
+    token_ids 缺省 = 自动收集（钱包 PENDING_CLAIM 优先，DB win 未领取兑底）。
+    """
+
+    token_ids: list[str] | None = Field(
+        default=None,
+        description="要领取的 tokenId 列表；缺省自动收集全部可领",
+    )
+
+
 # ============================================================
 # LLM 调用轨迹（前端「LLM 轨迹」面板）
 # ============================================================

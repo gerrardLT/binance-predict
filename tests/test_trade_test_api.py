@@ -844,3 +844,277 @@ async def test_quote_preview_none_dates(monkeypatch) -> None:
     assert out["window_start"] is None
     assert out["window_end"] is None
     assert out["up_price"] == 0.5
+
+
+# ============================================================
+# 奖金领取（GET redeemable / POST redeem，batch-redeem）
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_fetch_pending_claim_positions_parsing(monkeypatch) -> None:
+    """PENDING_CLAIM 查询：{positions: [...]} 包裹解析 + 原文透传。
+
+    端点响应结构未实测（探索型）：兼容 positions/items/orders/data/list 包裹，
+    last_pending_raw 必须写入供生产收敛。
+    """
+    from binance_predict.services.prediction_trading import BinancePredictionTrader
+
+    trader = BinancePredictionTrader()
+    trader._api_key = "k"
+    trader._api_secret = "s"
+    trader._wallet_address = "0xW"
+    trader._wallet_id = "WID"
+
+    resp = SimpleNamespace(status_code=200)
+    resp.raise_for_status = lambda: None
+    resp.json = lambda: {"positions": [
+        {"tokenId": "T-13", "amount": "1"},
+        {"tokenId": "T-14", "amount": "2"},
+    ]}
+    client = MagicMock()
+    client.get = AsyncMock(return_value=resp)
+    monkeypatch.setattr(trader, "_get_client", lambda: client)
+
+    out = await trader.fetch_pending_claim_positions()
+    assert out == [{"tokenId": "T-13", "amount": "1"}, {"tokenId": "T-14", "amount": "2"}]
+    assert trader.last_pending_error is None
+    assert "T-13" in (trader.last_pending_raw or "")
+
+
+@pytest.mark.asyncio
+async def test_fetch_pending_claim_positions_fail_degrades(monkeypatch) -> None:
+    """HTTP 失败 → None + last_pending_error（降级不抛，端点兑底 DB 源）。"""
+    import httpx
+    from binance_predict.services.prediction_trading import BinancePredictionTrader
+
+    trader = BinancePredictionTrader()
+    trader._api_key = "k"
+    trader._api_secret = "s"
+    trader._wallet_address = "0xW"
+    trader._wallet_id = "WID"
+
+    resp = SimpleNamespace(status_code=400)
+    resp.raise_for_status = lambda: (_ for _ in ()).throw(
+        httpx.HTTPStatusError("400", request=MagicMock(), response=resp)
+    )
+    resp.text = '{"code":-1121,"msg":"Invalid symbol."}'
+    client = MagicMock()
+    client.get = AsyncMock(return_value=resp)
+    monkeypatch.setattr(trader, "_get_client", lambda: client)
+
+    out = await trader.fetch_pending_claim_positions()
+    assert out is None
+    assert "-1121" in (trader.last_pending_error or "")
+
+
+def test_extract_token_ids_variants() -> None:
+    """tokenId/token_id/id 键兼容 + 去重保序 + 非字典项跳过。"""
+    from binance_predict.services.prediction_trading import BinancePredictionTrader
+
+    trader = BinancePredictionTrader()
+    out = trader._extract_token_ids([
+        {"tokenId": "T-1"},
+        {"token_id": "T-2"},
+        {"id": "T-3"},
+        {"tokenId": "T-1"},   # 重复
+        "not-a-dict",          # 跳过
+        {"tokenId": ""},       # 空串跳过
+    ])
+    assert out == ["T-1", "T-2", "T-3"]
+
+
+@pytest.mark.asyncio
+async def test_redeem_tokens_signature_matches_sent_query(monkeypatch) -> None:
+    """-1022 回归锁（batch-redeem）：POST 的 query 必须字母序且签名=发送串原文；
+    tokenIds 逗号拼接在 query 里（与 transfer 同口径）。"""
+    import hashlib
+    import hmac as hmac_mod
+    from urllib.parse import parse_qsl
+
+    from binance_predict.services.prediction_trading import BinancePredictionTrader
+
+    trader = BinancePredictionTrader()
+    trader._api_key = "k"
+    trader._api_secret = "s"
+    trader._wallet_address = "0xW"
+    trader._wallet_id = "WID"
+
+    captured: dict = {}
+    resp = SimpleNamespace(status_code=200)
+    resp.raise_for_status = lambda: None
+    resp.json = lambda: {"success": True}
+
+    async def _post(url, headers=None):
+        captured["url"] = str(url)
+        return resp
+
+    client = MagicMock()
+    client.post = _post
+    monkeypatch.setattr(trader, "_get_client", lambda: client)
+
+    out = await trader.redeem_tokens(["T-13", "T-14"])
+    assert out == {"success": True}
+    assert captured["url"].startswith(
+        "https://api.binance.com/sapi/v1/w3w/wallet/prediction/batch-redeem?"
+    )
+    pairs = parse_qsl(captured["url"].split("?", 1)[1])
+    d = dict(pairs)
+    assert d["tokenIds"] == "T-13,T-14"
+    sig = d["signature"]
+    no_sig = [f"{k}={v}" for k, v in pairs if k != "signature"]
+    assert no_sig == sorted(no_sig)  # 发送串字母序（签名时即此序）
+    expected = hmac_mod.new(b"s", "&".join(no_sig).encode(), hashlib.sha256).hexdigest()
+    assert sig == expected
+
+
+@pytest.mark.asyncio
+async def test_redeem_tokens_empty_and_fail(monkeypatch) -> None:
+    """空列表 → NOOP+last_api_error；HTTP 失败 → None+错误透传。"""
+    import httpx
+    from binance_predict.services.prediction_trading import BinancePredictionTrader
+
+    trader = BinancePredictionTrader()
+    trader._api_key = "k"
+    trader._api_secret = "s"
+    trader._wallet_id = "WID"
+    trader._wallet_address = "0xW"
+
+    assert await trader.redeem_tokens([]) is None
+    assert "token_ids" in (trader.last_api_error or "")
+
+    resp = SimpleNamespace(status_code=400)
+    resp.raise_for_status = lambda: (_ for _ in ()).throw(
+        httpx.HTTPStatusError("400", request=MagicMock(), response=resp)
+    )
+    resp.text = '{"code":-1022,"msg":"Signature for this request is not valid."}'
+    client = MagicMock()
+    client.post = AsyncMock(return_value=resp)
+    monkeypatch.setattr(trader, "_get_client", lambda: client)
+
+    assert await trader.redeem_tokens(["T-1"]) is None
+    assert "-1022" in (trader.last_api_error or "")
+
+
+@pytest.mark.asyncio
+async def test_prediction_redeemable_merges_sources(monkeypatch) -> None:
+    """redeemable 端点：钱包 PENDING_CLAIM + DB win 未领取合并去重；
+    官方端点降级时 wallet_source=degraded 但 DB 源仍返回。"""
+    import binance_predict.main as m
+
+    async def _positions():
+        return [{"tokenId": "T-13"}]
+
+    monkeypatch.setattr(m.prediction_trader, "fetch_pending_claim_positions", _positions)
+    monkeypatch.setattr(m.prediction_trader, "last_pending_error", None)
+    monkeypatch.setattr(m.prediction_trader, "last_pending_raw", '{"positions":[...]}')
+
+    row = SimpleNamespace(id=13, token_id="T-13")   # DB 与钱包重叠 → 去重
+    row2 = SimpleNamespace(id=14, token_id="T-14")  # DB 独有
+    db = AsyncMock()
+    result = MagicMock()
+    result.all.return_value = [row, row2]
+    db.execute = AsyncMock(return_value=result)
+
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def _factory():
+        yield db
+
+    monkeypatch.setattr(m, "async_session_factory", _factory)
+
+    out = await m.prediction_redeemable(_=None)
+    assert out["claimable_tokens"] == ["T-13", "T-14"]
+    assert out["claimable_count"] == 2
+    assert out["wallet_source"] == "ok"
+    assert out["db_win_unclaimed_ids"] == [13, 14]
+
+    # 官方端点降级：DB 源兜底
+    async def _fail():
+        return None
+
+    monkeypatch.setattr(m.prediction_trader, "fetch_pending_claim_positions", _fail)
+    out2 = await m.prediction_redeemable(_=None)
+    assert out2["wallet_source"] == "degraded"
+    assert out2["claimable_tokens"] == ["T-13", "T-14"]
+
+
+@pytest.mark.asyncio
+async def test_prediction_redeem_success_marks_db_and_cache(monkeypatch) -> None:
+    """redeem 端点：自动收集 token → batch-redeem 成功 → 标记 DB redeemed_at
+    + 作废余额缓存（领取入 CeDeFi，前端下次轮询即新值）。"""
+    import binance_predict.main as m
+    from binance_predict.models.schemas import RedeemRequest
+
+    monkeypatch.setattr(m.prediction_trader, "_api_key", "k")
+    monkeypatch.setattr(m.prediction_trader, "_wallet_address", "0xW")
+    monkeypatch.setattr(m.prediction_trader, "_wallet_id", "WID")
+
+    async def _positions():
+        return [{"tokenId": "T-13"}, {"token_id": "T-14"}]
+
+    redeemed: list = []
+
+    async def _redeem(token_ids):
+        redeemed.append(list(token_ids))
+        return {"success": True}
+
+    monkeypatch.setattr(m.prediction_trader, "fetch_pending_claim_positions", _positions)
+    monkeypatch.setattr(m.prediction_trader, "redeem_tokens", _redeem)
+
+    db = AsyncMock()
+    db.execute = AsyncMock()
+
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def _factory():
+        yield db
+
+    monkeypatch.setattr(m, "async_session_factory", _factory)
+
+    m._wallet_view_ts["balance"] = 123.0  # 预置非零，验证被作废
+    out = await m.prediction_redeem(RedeemRequest(), _=None)
+
+    assert out["status"] == "SUCCESS"
+    assert out["redeemed"] == 2
+    assert redeemed == [["T-13", "T-14"]]
+    db.execute.assert_awaited()  # update redeemed_at 语句已发
+    db.commit.assert_awaited_once()
+    assert m._wallet_view_ts["balance"] == 0.0  # 余额缓存已作废
+
+
+@pytest.mark.asyncio
+async def test_prediction_redeem_noop(monkeypatch) -> None:
+    """两源皆空 → NOOP（不触达 batch-redeem）。"""
+    import binance_predict.main as m
+    from binance_predict.models.schemas import RedeemRequest
+
+    monkeypatch.setattr(m.prediction_trader, "_api_key", "k")
+    monkeypatch.setattr(m.prediction_trader, "_wallet_address", "0xW")
+    monkeypatch.setattr(m.prediction_trader, "_wallet_id", "WID")
+
+    async def _positions():
+        return []
+
+    async def _never(_ids):  # pragma: no cover - 不应被调用
+        raise AssertionError("无 token 不应触达 batch-redeem")
+
+    monkeypatch.setattr(m.prediction_trader, "fetch_pending_claim_positions", _positions)
+    monkeypatch.setattr(m.prediction_trader, "redeem_tokens", _never)
+
+    db = AsyncMock()
+    result = MagicMock()
+    result.all.return_value = []
+    db.execute = AsyncMock(return_value=result)
+
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def _factory():
+        yield db
+
+    monkeypatch.setattr(m, "async_session_factory", _factory)
+
+    out = await m.prediction_redeem(RedeemRequest(), _=None)
+    assert out["status"] == "NOOP"

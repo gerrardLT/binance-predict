@@ -504,6 +504,17 @@ const api = {
     }).then(r => r.json()),
   getQuotePreview: () => fetch('/api/prediction/quote-preview').then(r => r.json()),
   postSyncBinance: () => fetch('/api/trades/sync-binance', { method: 'POST' }).then(r => r.json()),
+  // 奖金领取（2026-08-23）：可领查询 + batch-redeem
+  getRedeemable: () => fetch('/api/prediction/redeemable').then(r => r.json()),
+  postRedeem: () =>
+    fetch('/api/prediction/redeem', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    }).then(r => r.json()),
+  // 线上信号概览：各影子版本累计统计（stats 按 version 服务端算）
+  getMisalignmentSignals: (version: string) =>
+    fetch(`/api/misalignment/signals?limit=1&version=${version}`).then(r => r.json()),
 }
 
 // ============================================================
@@ -554,6 +565,50 @@ function DiscoveryMethodBadge({ method }: { method?: string }) {
   }
   const m = meta[method || 'LEGACY'] || meta.LEGACY
   return <span className={`px-1.5 py-0.5 text-[10px] font-bold rounded ${m.cls}`}>{m.label}</span>
+}
+
+// 问号 hover 提示（信号说明等）：纯 CSS group-hover，无依赖
+function HelpHint({ text }: { text: string }) {
+  return (
+    <span className="relative group inline-flex items-center cursor-help align-middle" tabIndex={0}>
+      <span className="inline-flex items-center justify-center w-3.5 h-3.5 rounded-full border border-gray-400 text-gray-500 text-[9px] font-bold leading-none select-none">?</span>
+      <span className="absolute right-0 bottom-full mb-1.5 hidden group-hover:block group-focus-within:block z-30 w-72 rounded-lg bg-gray-800 text-gray-100 text-[11px] leading-relaxed px-3 py-2 text-left whitespace-normal shadow-xl">{text}</span>
+    </span>
+  )
+}
+
+// 线上信号说明（口径源：services/quote_edge_detector.py 冻结规则 + fake_breakout 场景）
+const SIGNAL_INFO: Record<string, { name: string; kind: '实盘' | '影子' | '场景'; desc: string }> = {
+  quote_contrarian_v1: {
+    name: '报价反向（B格逆势）', kind: '实盘',
+    desc: '5 分钟窗口开始后 45~60 秒内，DOWN token 报价首次跌入 [0.15, 0.25)（明显便宜）时买入 DOWN。低胜率高赔付：回测胜率 24%、EV +0.155（赢一次约赚 4 倍，可覆盖三次亏损）。当前唯一接入实盘下单的信号，每 5 分钟窗口至多开一单。',
+  },
+  quote_momentum_v1: {
+    name: '报价动量（A格顺势）', kind: '影子',
+    desc: '5 分钟窗口 90~120 秒内，DOWN token 报价首次进入 [0.69, 0.75)（强势确认）时押 DOWN。回测胜率 79.9%、EV +0.097。影子模式只记录不下单，累计数据达 promote 判据后可转实盘。',
+  },
+  quote_contrarian_v2: {
+    name: '报价反向·门禁版', kind: '影子',
+    desc: 'v1 区间 + 价格门禁：触发时点 BTC 未高于窗口开盘 ≥0.10%（只接「假冲高」，归因显示平盘窗贡献 86% 利润）。影子模式只记录不下单。',
+  },
+  quote_momentum_v2: {
+    name: '报价动量·门禁版', kind: '影子',
+    desc: 'v1 区间 + 价格门禁：触发时点 BTC 已低于窗口开盘 ≥0.10%（剔「假恐慌」，真跌段胜率 85% vs 假恐慌段 40%）。影子模式只记录不下单。',
+  },
+  x4_v1: {
+    name: '情绪错位', kind: '影子',
+    desc: '情绪窗口与价格走势错位检测（原 X4 假设：情绪采样窗口 UP% 异常偏离时的次窗下注方向）。影子模式只记录不下单。',
+  },
+  fake_breakout: {
+    name: '假突破场景', kind: '场景',
+    desc: '15 分钟周期内 BTC 破位后回落的场景监测（4h 高/低位假突破、动量衰竭等形态）。只告警与落表不下单；历史结算 DOWN 胜率约 55%。',
+  },
+}
+
+const SIGNAL_KIND_BADGE: Record<string, string> = {
+  '实盘': 'bg-green-100 text-green-700 border-green-300',
+  '影子': 'bg-purple-100 text-purple-700 border-purple-300',
+  '场景': 'bg-blue-100 text-blue-700 border-blue-300',
 }
 
 function Card({ title, children, className = '' }: { title: string; children: React.ReactNode; className?: string }) {
@@ -655,6 +710,82 @@ function LiveChartCard() {
   )
 }
 
+// 线上信号概览卡：实盘/影子/场景一屏总览（60s 轮询，统计为全量累计不随 limit 截断）
+function SignalsOverviewCard({ live }: { live: Record<string, unknown> | null }) {
+  const [stats, setStats] = useState<Record<string, Record<string, unknown> | null>>({})
+  const [fb, setFb] = useState<Record<string, unknown> | null>(null)
+
+  const refresh = useCallback(() => {
+    const versions = ['quote_contrarian_v1', 'quote_momentum_v1', 'quote_contrarian_v2', 'quote_momentum_v2', 'x4_v1']
+    versions.forEach(v => {
+      api.getMisalignmentSignals(v)
+        .then(d => setStats(prev => ({ ...prev, [v]: d?.stats ?? null })))
+        .catch(() => {})
+    })
+    api.getFakeBreakoutStats().then(setFb).catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    refresh()
+    const t = setInterval(refresh, 60000)
+    return () => clearInterval(t)
+  }, [refresh])
+
+  const liveVersion = typeof live?.version === 'string' ? live.version as string : null
+  const liveEnabled = live?.enabled === true
+
+  const rows: Array<{ key: string }> = [
+    ...(['quote_contrarian_v1', 'quote_momentum_v1', 'quote_contrarian_v2', 'quote_momentum_v2', 'x4_v1']
+      .map(key => ({ key }))),
+    { key: 'fake_breakout' },
+  ]
+
+  return (
+    <Card title="线上信号概览">
+      <div className="text-xs">
+        {rows.map(({ key }) => {
+          const info = SIGNAL_INFO[key]
+          if (!info) return null
+          const s = stats[key]
+          const isLive = key === liveVersion
+          let statText = '--'
+          if (key === 'fake_breakout') {
+            const total = fb?.total_signals
+            const wr = fb?.down_win_rate
+            statText = total != null
+              ? `${String(total)} 信号 · DOWN 胜率 ${typeof wr === 'number' ? (wr * 100).toFixed(0) : '?'}%`
+              : '--'
+          } else if (s != null) {
+            const n = s.settled as number | undefined
+            const wr = s.win_rate as number | null | undefined
+            const ev = s.avg_ev as number | null | undefined
+            statText = `${String(n ?? 0)} 注 · 胜率 ${wr != null ? (wr * 100).toFixed(0) : '?'}% · EV ${ev != null ? `${ev >= 0 ? '+' : ''}${ev.toFixed(3)}` : '?'}（影子结算口径）`
+          }
+          return (
+            <div key={key} className="flex items-center justify-between gap-2 py-1.5 border-b border-gray-50 last:border-0">
+              <span className="flex items-center gap-1.5 min-w-0">
+                <span className={`px-1.5 py-0.5 text-[10px] font-bold rounded border shrink-0 ${SIGNAL_KIND_BADGE[info.kind]}`}>{info.kind}</span>
+                <span className="text-gray-700 font-medium truncate">{info.name}</span>
+                <span className="text-[10px] text-gray-400 font-mono shrink-0 hidden sm:inline">{key}</span>
+                <HelpHint text={info.desc} />
+                {isLive && (
+                  <span className={`text-[10px] font-semibold shrink-0 ${liveEnabled ? 'text-green-700' : 'text-amber-600'}`}>
+                    · {liveEnabled ? `开火中 ${String(live?.amount_usdt ?? '?')}U/单` : '已停火'}
+                  </span>
+                )}
+              </span>
+              <span className="font-mono text-[11px] text-gray-600 shrink-0 text-right">{statText}</span>
+            </div>
+          )
+        })}
+        <p className="text-[10px] text-gray-400 mt-1.5">
+          实盘=命中规则真实下单；影子=只记录不下单（promote 判据：样本/胜率/EV）；场景=监测告警不下单。统计 60s 刷新。
+        </p>
+      </div>
+    </Card>
+  )
+}
+
 function LiveTradeTab() {
   const [wallet, setWallet] = useState<Record<string, unknown> | null>(null)
   const [live, setLive] = useState<Record<string, unknown> | null>(null)
@@ -673,11 +804,16 @@ function LiveTradeTab() {
   const [syncing, setSyncing] = useState(false)
   const [syncResult, setSyncResult] = useState<Record<string, unknown> | null>(null)
   const [togglingLive, setTogglingLive] = useState(false)
+  // 可领取奖金（赢单 token → batch-redeem → USDT）
+  const [redeemable, setRedeemable] = useState<Record<string, unknown> | null>(null)
+  const [redeeming, setRedeeming] = useState(false)
+  const [redeemResult, setRedeemResult] = useState<Record<string, unknown> | null>(null)
 
   const refresh = useCallback(() => {
     api.getPredictionWallet().then(setWallet).catch(() => {})
     api.getLiveStatus().then(d => setLive(d?.quote_edge_live ?? null)).catch(() => {})
     api.getRecentTrades().then(d => setOrders(d?.orders ?? [])).catch(() => {})
+    api.getRedeemable().then(setRedeemable).catch(() => {})
     api.getQuotePreview().then((q: Record<string, unknown>) => {
       setQuote(q)
       if (typeof q?.server_now_ms === 'number') {
@@ -813,8 +949,9 @@ function LiveTradeTab() {
   }
 
   const handleLiveToggle = async (next: boolean) => {
+    const liveInfo = SIGNAL_INFO[String(live?.version ?? '')]
     if (!window.confirm(next
-      ? `确认开启信号实盘？\n版本: ${String(live?.version ?? '?')} | 每单 ${String(live?.amount_usdt ?? '?')} USDT\n\n命中规则区间将下真实订单押 DOWN（真金白银）；重启后回落 .env 默认。`
+      ? `确认开启信号实盘？\n信号: ${liveInfo ? `${liveInfo.name}（${String(live?.version ?? '?')}）` : String(live?.version ?? '?')} | 每单 ${String(live?.amount_usdt ?? '?')} USDT\n\n命中规则区间将下真实订单押 DOWN（真金白银）；重启后回落 .env 默认。`
       : '确认关闭信号实盘？\n（不取消在途任务，只阻止新单派生；重启后回落 .env 默认）')) return
     setTogglingLive(true)
     try {
@@ -825,6 +962,23 @@ function LiveTradeTab() {
       alert(`请求失败: ${(e as Error).message}`)
     } finally {
       setTogglingLive(false)
+    }
+  }
+
+  const handleRedeem = async () => {
+    const n = Number(redeemable?.claimable_count ?? 0)
+    if (n <= 0) return
+    if (!window.confirm(`确认领取 ${n} 个获胜 token 的奖金？\n（batch-redeem 赎回后入预测钱包 USDT 余额）`)) return
+    setRedeeming(true)
+    setRedeemResult(null)
+    try {
+      const res = await api.postRedeem()
+      setRedeemResult(res)
+      refresh()
+    } catch (e) {
+      alert(`请求失败: ${(e as Error).message}`)
+    } finally {
+      setRedeeming(false)
     }
   }
 
@@ -865,6 +1019,34 @@ function LiveTradeTab() {
               ? <span className="font-mono text-amber-700">{openPositions.length} 单 · {openAmount.toFixed(2)} USDT</span>
               : <span className="text-gray-400">--</span>}
           </div>
+          {/* 可领取奖金：赢单 token 需手动 batch-redeem 才变 USDT（官方链路） */}
+          <div className="flex justify-between gap-2 items-center">
+            <span className="text-gray-500 shrink-0 flex items-center">
+              可领取奖金
+              <HelpHint text="赢单的奖金以获胜 token 形式留在链上钱包，不会自动变成 USDT；需要调官方 batch-redeem 赎回后才入预测钱包余额。赢单后记得来这里领取。" />
+            </span>
+            {Number(redeemable?.claimable_count ?? 0) > 0
+              ? <span className="flex items-center gap-2">
+                  <span className="font-mono font-semibold text-amber-600">
+                    {String(redeemable?.claimable_count)} 个 token 待领取
+                    {redeemable?.wallet_source === 'degraded' && <span className="text-gray-400 font-normal">（钱包查询降级，含本地兑底）</span>}
+                  </span>
+                  <button
+                    onClick={handleRedeem} disabled={redeeming}
+                    className="px-3 py-1 text-xs font-semibold rounded bg-amber-500 text-white disabled:opacity-50"
+                  >{redeeming ? '领取中…' : '领取奖金'}</button>
+                </span>
+              : <span className="text-gray-400">--</span>}
+          </div>
+          {redeemResult && (
+            <div className={`text-xs px-2 py-1 rounded break-all ${redeemResult.status === 'SUCCESS' ? 'bg-green-50 text-green-700' : redeemResult.status === 'NOOP' ? 'bg-gray-50 text-gray-500' : 'bg-red-50 text-red-600'}`}>
+              {redeemResult.status === 'SUCCESS'
+                ? `✓ 已领取 ${String(redeemResult.redeemed)} 个 token，奖金入预测钱包余额（前端刷新后可见）`
+                : redeemResult.status === 'NOOP'
+                  ? String(redeemResult.message ?? '无可领取持仓')
+                  : `领取失败: ${String(redeemResult.error ?? '未知错误')}`}
+            </div>
+          )}
           {payAccounts.length > 0 && (
             <div className="flex justify-between gap-2">
               <span className="text-gray-500 shrink-0">支付账户余额</span>
@@ -924,12 +1106,21 @@ function LiveTradeTab() {
           )}
           <div className="border-t border-gray-100 my-2" />
           <div className="flex justify-between gap-2 items-center">
-            <span className="text-gray-500 shrink-0">信号实盘</span>
+            <span className="text-gray-500 shrink-0 flex items-center">
+              信号实盘
+              <HelpHint text={SIGNAL_INFO[String(live?.version ?? '')]?.desc ?? '当前接入实盘下单的信号版本（详见「线上信号概览」卡）。'} />
+            </span>
             {live
               ? <span className="flex items-center gap-2">
                   {liveEnabled
-                    ? <span className="text-green-700 font-semibold">已开启 · {String(live.version)}</span>
-                    : <span className="text-amber-700 font-semibold">已关闭（不开火）</span>}
+                    ? <span className="text-green-700 font-semibold">
+                        已开启 · {SIGNAL_INFO[String(live.version)]?.name ?? String(live.version)}
+                        <span className="text-[10px] text-gray-400 font-mono ml-1">{String(live.version)}</span>
+                      </span>
+                    : <span className="text-amber-700 font-semibold">
+                        已关闭（不开火）
+                        <span className="text-[10px] text-gray-400 font-mono ml-1">{String(live.version)}</span>
+                      </span>}
                   <button
                     onClick={() => handleLiveToggle(!liveEnabled)}
                     disabled={togglingLive}
@@ -1037,6 +1228,9 @@ function LiveTradeTab() {
           </p>
         </div>
       </Card>
+
+      {/* 线上信号概览（第二行右列）：实盘/影子/场景一屏总览，问号 hover 看信号规则 */}
+      <SignalsOverviewCard live={live} />
 
       <div className="lg:col-span-2">
         <Card title="最近订单">

@@ -43,6 +43,7 @@ from .db.models import (
 from .models.schemas import (
     CommitDeepLearnRequest,
     ManualTradeTestRequest,
+    RedeemRequest,
     TransferInboundRequest,
     TransferOutboundRequest,
     ToggleLiveRequest,
@@ -886,6 +887,8 @@ async def lifespan(app: FastAPI):
                 "ALTER TABLE trade_orders ADD COLUMN IF NOT EXISTS settle_price FLOAT",
                 "ALTER TABLE trade_orders ADD COLUMN IF NOT EXISTS pnl FLOAT",
                 "ALTER TABLE trade_orders ADD COLUMN IF NOT EXISTS settled_at TIMESTAMPTZ",
+                # 奖金领取标记（与 alembic 迁移 l2e3f4g5h6i7 等价，存量 dev 库安全网）
+                "ALTER TABLE trade_orders ADD COLUMN IF NOT EXISTS redeemed_at TIMESTAMPTZ",
                 ("COMMENT ON COLUMN trade_orders.status IS "
                  "'PENDING | FILLED | FAILED（订单生命周期）；结算结果见 settle_outcome/win/pnl'"),
                 ("CREATE INDEX IF NOT EXISTS ix_trade_orders_settle_pending ON trade_orders (window_start) "
@@ -1982,6 +1985,107 @@ async def prediction_transfer_out(
             "（防方向反转，真金反向移动风险）"
         )
     return out
+
+
+@app.get("/api/prediction/redeemable")
+async def prediction_redeemable(_: None = Depends(_require_auth)):
+    """可领取奖金查询：钱包 PENDING_CLAIM（链上事实）+ DB win 未领取（对账）。
+
+    两源合并去重：官方 position/list?tab=PENDING_CLAIM 是链上事实（权威），
+    本地 DB win=true 且 redeemed_at IS NULL 兑底（官方端点探索期降级时仍有参考）。
+    诊断透传：api_error / raw_preview（无 SSH 收敛用）。
+    """
+    positions = await prediction_trader.fetch_pending_claim_positions()
+    wallet_tokens = prediction_trader._extract_token_ids(positions or [])
+
+    from sqlalchemy import select
+    from .db.models import TradeOrderModel
+
+    async with async_session_factory() as db:
+        rows = (await db.execute(
+            select(TradeOrderModel.id, TradeOrderModel.token_id)
+            .where(TradeOrderModel.win.is_(True))
+            .where(TradeOrderModel.redeemed_at.is_(None))
+            .where(TradeOrderModel.token_id.isnot(None))
+            .where(TradeOrderModel.token_id != "")
+        )).all()
+    db_tokens = [r.token_id for r in rows]
+
+    merged = list(dict.fromkeys(wallet_tokens + db_tokens))  # 去重保序
+    return {
+        "claimable_count": len(merged),
+        "claimable_tokens": merged,
+        "wallet_source": "ok" if positions is not None else "degraded",
+        "db_win_unclaimed_ids": [r.id for r in rows],
+        "positions_preview": (positions or [])[:10],
+        # 诊断透传（探索型端点收敛用）
+        "api_error": prediction_trader.last_pending_error,
+        "raw_preview": prediction_trader.last_pending_raw,
+    }
+
+
+@app.post("/api/prediction/redeem")
+async def prediction_redeem(
+    req: RedeemRequest,
+    _: None = Depends(_require_auth),
+):
+    """领取获胜 token 奖金（POST batch-redeem：链上 token → USDT）。
+
+    token_ids 缺省 = 自动收集（钱包 PENDING_CLAIM 优先，DB win 未领取兑底）；
+    成功后按 token_id 标记 DB redeemed_at + 作废余额缓存（领取入 CeDeFi）。
+    """
+    if not prediction_trader._api_key:
+        return {"error": "Binance API Key 未配置"}
+    if not prediction_trader._wallet_address or not prediction_trader._wallet_id:
+        wallet = await prediction_trader.fetch_wallet_info()
+        if not wallet:
+            return {"error": "未找到预测钱包，请先在 Binance App 中开通"}
+
+    token_ids = req.token_ids
+    if not token_ids:
+        positions = await prediction_trader.fetch_pending_claim_positions()
+        token_ids = prediction_trader._extract_token_ids(positions or [])
+    if not token_ids:
+        from sqlalchemy import select
+        from .db.models import TradeOrderModel
+
+        async with async_session_factory() as db:
+            rows = (await db.execute(
+                select(TradeOrderModel.token_id)
+                .where(TradeOrderModel.win.is_(True))
+                .where(TradeOrderModel.redeemed_at.is_(None))
+                .where(TradeOrderModel.token_id.isnot(None))
+                .where(TradeOrderModel.token_id != "")
+            )).all()
+        token_ids = [r.token_id for r in rows]
+    if not token_ids:
+        return {"status": "NOOP", "message": "无可领取持仓（没有赢单 token 待领取）"}
+
+    resp = await prediction_trader.redeem_tokens(token_ids)
+    if resp is None:
+        return {"status": "FAILED", "error": prediction_trader.last_api_error}
+
+    # 成功：按 token_id 标记 DB 已领取（win 单限定，幂等：redeemed_at IS NULL 守卫）
+    from sqlalchemy import update
+    from .db.models import TradeOrderModel
+
+    async with async_session_factory() as db:
+        await db.execute(
+            update(TradeOrderModel)
+            .where(TradeOrderModel.token_id.in_(token_ids))
+            .where(TradeOrderModel.win.is_(True))
+            .where(TradeOrderModel.redeemed_at.is_(None))
+            .values(redeemed_at=datetime.now(timezone.utc))
+        )
+        await db.commit()
+    # 领取入 CeDeFi：作废余额缓存，前端下次轮询即取新值
+    _wallet_view_ts["balance"] = 0.0
+    return {
+        "status": "SUCCESS",
+        "redeemed": len(token_ids),
+        "tokens": token_ids,
+        "resp_preview": str(resp)[:300],
+    }
 
 
 @app.get("/api/trades/binance-history")

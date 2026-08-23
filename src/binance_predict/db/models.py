@@ -136,6 +136,10 @@ class TradeOrderModel(Base):
         DateTime(timezone=True), nullable=True,
         comment="本地结算时间（NULL=未结算，扫描锚点）",
     )
+    redeemed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        comment="奖金领取时间（batch-redeem 成功后标记；NULL=未领取）",
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

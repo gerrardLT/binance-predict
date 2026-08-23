@@ -130,11 +130,38 @@ class TradeSettler:
 
     async def _settle_row(self, row: TradeOrderModel) -> bool:
         if row.direction is None:
-            # 旧数据（direction 落库前的订单）：无法判赢，跳过不结算
-            logger.warning(
-                "交易结算器：direction 为 NULL（旧数据），跳过 | id=%s | window=%s",
+            # 旧数据（direction 落库前的订单）：无法判赢。未超 24h 下轮重试；
+            # 超 24h 兜底 EXPIRED（win=None/pnl=0 不计统计）——防永久卡
+            # 「在途持仓」+ 每 60s 空扫（2026-08-23 生产实锤：4 笔 8/22 旧单
+            # direction=NULL 卡在途 3.85 USDT，每轮空扫告警刷屏）。
+            created = self._aware(row.created_at)
+            now_dt = datetime.now(timezone.utc)
+            if created is not None and created > now_dt - EXPIRE_AFTER:
+                return False  # 未超 24h：等可能的字段回填，下轮重试
+            async with async_session_factory() as session:
+                stmt = (
+                    sa_update(TradeOrderModel)
+                    .where(
+                        TradeOrderModel.id == row.id,
+                        TradeOrderModel.settled_at.is_(None),
+                    )
+                    .values(
+                        settle_outcome="EXPIRED",
+                        win=None,
+                        settle_price=None,
+                        pnl=0.0,
+                        settled_at=now_dt,
+                    )
+                )
+                result = await session.execute(stmt)
+                await session.commit()
+            if result.rowcount == 0:
+                return False
+            self._settled_count += 1
+            logger.info(
+                "订单结算 | id=%s | direction=NULL（旧数据）→ EXPIRED 出清 | window=%s",
                 row.id, row.window_start)
-            return False
+            return True
 
         now_dt = datetime.now(timezone.utc)
         window = await self._find_window(row.window_start)

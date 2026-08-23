@@ -202,9 +202,29 @@ async def test_idempotent_guard(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_direction_null_skipped(monkeypatch) -> None:
-    """旧数据 direction=None → 跳过：不查窗口、不写 UPDATE。"""
+    """旧数据 direction=None 且未超 24h → 跳过：不查窗口、不写 UPDATE。"""
     db = _Db([_row(direction=None)], _window("DOWN"))
     _stub_db(monkeypatch, db)
 
     assert await TradeSettler().poll_once() == 0
     assert db.updates == []
+
+
+@pytest.mark.asyncio
+async def test_direction_null_expired(monkeypatch) -> None:
+    """旧数据 direction=None 超 24h → EXPIRED 出清（防永久卡在途持仓）。
+
+    生产实锤（2026-08-23）：4 笔 8/22 旧单 direction=NULL 无限重扫。
+    """
+    old = datetime.now(timezone.utc) - timedelta(hours=25)
+    db = _Db([_row(direction=None, created_at=old)], _window("DOWN"))
+    _stub_db(monkeypatch, db)
+
+    assert await TradeSettler().poll_once() == 1
+
+    p = _params(db.updates[0])
+    assert p["settle_outcome"] == "EXPIRED"
+    assert p["win"] is None
+    assert p["pnl"] == 0.0
+    assert p["settle_price"] is None
+    db.commit.assert_awaited_once()

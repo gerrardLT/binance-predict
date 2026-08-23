@@ -49,6 +49,11 @@ _ASSET_LIST_PATH = "/sapi/v1/w3w/wallet/prediction/balance/payment-options"
 _TRANSFER_OUTBOUND_PATH = "/sapi/v1/w3w/wallet/prediction/transfer/outbound"
 _TRANSFER_INBOUND_PATH = "/sapi/v1/w3w/wallet/prediction/transfer/inbound"
 
+# 奖金领取（2026-08-23：官方 agentic wallet 文档确认：PENDING_CLAIM 查可领 token
+# → batch-redeem 领取；响应结构未实测，防御式解析 + 原文透传收敛）
+_POSITION_LIST_PATH = "/sapi/v1/w3w/wallet/prediction/position/list"
+_BATCH_REDEEM_PATH = "/sapi/v1/w3w/wallet/prediction/batch-redeem"
+
 
 class BinancePredictionTrader:
     """
@@ -88,6 +93,9 @@ class BinancePredictionTrader:
         self.last_assets_error: str | None = None
         # 最近一次 payment-options 成功响应的原文前 500 字符（诊断透传：解析未命中时收敛字段）
         self.last_assets_raw: str | None = None
+        # 可领持仓（PENDING_CLAIM）查询诊断：错误 + 成功响应原文
+        self.last_pending_error: str | None = None
+        self.last_pending_raw: str | None = None
 
         # 缓存当前活跃的 BTC 预测市场信息
         self._active_market: dict | None = None
@@ -459,6 +467,111 @@ class BinancePredictionTrader:
         except Exception as e:
             self.last_api_error = f"{type(e).__name__}: {e}"
             logger.error("预测钱包提走异常: {}", e)
+            return None
+
+    # ------------------------------------------------------------------
+    # 奖金领取（batch-redeem）：赢单 token → USDT
+    # ------------------------------------------------------------------
+
+    async def fetch_pending_claim_positions(self, limit: int = 50) -> list | None:
+        """查询可领取的获胜持仓（GET position/list?tab=PENDING_CLAIM）。
+
+        官方 agentic wallet 文档：--tab PENDING_CLAIM 返回已结算、赢了但
+        未赎回的 token 持仓。响应结构未实测：兼容 list 直返 /
+        {positions|items|orders|data} 包裹，原文透传 last_pending_raw 供收敛。
+        失败返回 None + last_pending_error（上层降级不阻塞）。
+        """
+        req_params: dict = {"tab": "PENDING_CLAIM", "limit": limit}
+        if self._wallet_id:
+            req_params["walletId"] = self._wallet_id
+        if self._wallet_address:
+            req_params["walletAddress"] = self._wallet_address
+        url = self._build_signed_url(_POSITION_LIST_PATH, req_params)
+
+        try:
+            client = self._get_client()
+            resp = await client.get(
+                url,
+                headers={"X-MBX-APIKEY": self._api_key},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except httpx.HTTPStatusError as e:
+            self.last_pending_error = f"HTTP {e.response.status_code}: {e.response.text[:300]}"
+            logger.info(
+                "可领持仓查询失败（探索型端点，降级） | HTTP {} | {}",
+                e.response.status_code, e.response.text[:200],
+            )
+            return None
+        except Exception as e:
+            self.last_pending_error = f"{type(e).__name__}: {e}"
+            logger.info("可领持仓查询异常（探索型端点，降级）: {}", e)
+            return None
+
+        self.last_pending_error = None
+        self.last_pending_raw = str(data)[:500]
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            for key in ("positions", "items", "orders", "data", "list"):
+                v = data.get(key)
+                if isinstance(v, list):
+                    return v
+        return None
+
+    def _extract_token_ids(self, positions: list) -> list[str]:
+        """从持仓列表提取 tokenId（兼容 tokenId/token_id 键，去重保序）。"""
+        seen: set[str] = set()
+        out: list[str] = []
+        for p in positions:
+            if not isinstance(p, dict):
+                continue
+            tid = p.get("tokenId") or p.get("token_id") or p.get("id")
+            if isinstance(tid, str) and tid and tid not in seen:
+                seen.add(tid)
+                out.append(tid)
+        return out
+
+    async def redeem_tokens(self, token_ids: list[str]) -> dict | None:
+        """领取获胜 token 奖金（POST batch-redeem，tokenIds 逗号拼接）。
+
+        官方端点（文档确认）：在链上赎回已结算的预测 token。
+        全参数走 query 签名（与 transfer 同口径，防 -1022）。
+        失败返回 None，详情写入 last_api_error。
+        """
+        if not token_ids:
+            self.last_api_error = "token_ids 为空（无可领取持仓）"
+            return None
+        signed_url = self._build_signed_url(
+            _BATCH_REDEEM_PATH,
+            {
+                "walletId": self._wallet_id,
+                "walletAddress": self._wallet_address,
+                "tokenIds": ",".join(token_ids),
+            },
+        )
+
+        try:
+            client = self._get_client()
+            resp = await client.post(
+                signed_url,
+                headers={"X-MBX-APIKEY": self._api_key},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            self.last_api_error = None
+            logger.info(
+                "奖金领取成功 | tokens={} | resp={}",
+                len(token_ids), str(data)[:300],
+            )
+            return data
+        except httpx.HTTPStatusError as e:
+            self.last_api_error = f"HTTP {e.response.status_code}: {e.response.text[:300]}"
+            logger.error("奖金领取失败 (HTTP {}): {}", e.response.status_code, e.response.text)
+            return None
+        except Exception as e:
+            self.last_api_error = f"{type(e).__name__}: {e}"
+            logger.error("奖金领取异常: {}", e)
             return None
 
     async def query_order_history(self, limit: int = 20) -> list | None:
