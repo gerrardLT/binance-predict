@@ -359,10 +359,13 @@ async def _prediction_market_tracker() -> None:
                         window_start_ms = window_end_ms - 5 * 60 * 1000
                         async with async_session_factory() as db:
                             from sqlalchemy import select as sa_select
+                            # market_period=5m 过滤：与归档同口径，避免把 15m 样本混入
+                            # 当前窗 _pm_history（供 PREDICT 事件的 current_curve）。
                             stmt = (
                                 sa_select(PredictionMarketSample)
                                 .where(PredictionMarketSample.timestamp >= window_start_ms)
                                 .where(PredictionMarketSample.timestamp < window_end_ms)
+                                .where(PredictionMarketSample.market_period == "5m")
                                 .order_by(PredictionMarketSample.timestamp.asc())
                             )
                             result = await db.execute(stmt)
@@ -520,11 +523,17 @@ async def _sentiment_window_archiver() -> None:
             start_ms = end_ms - 5 * 60 * 1000
 
             async with async_session_factory() as db:
-                # 查询窗口内的采样点
+                # 查询窗口内的采样点。
+                # market_period=5m 过滤（关键）：主循环每轮同时写 5m + 15m 两条样本
+                # （同一时间戳）。本窗口是 5m 情绪窗，若不过滤会把 15m 市场报价混入
+                # 曲线 → 下游影子检测器扫出 15m 幻影触发（实盘只看 5m，口径不一致）。
+                # 与回测脚本（local_quote_bin_winrate / local_edge_cell_constraints
+                # 均 market_period=="5m"）及实盘执行器对齐。走 ix_pm_samples_period_ts 索引。
                 stmt = (
                     sa_select(PredictionMarketSample)
                     .where(PredictionMarketSample.timestamp >= start_ms)
                     .where(PredictionMarketSample.timestamp < end_ms)
+                    .where(PredictionMarketSample.market_period == "5m")
                     .order_by(PredictionMarketSample.timestamp.asc())
                 )
                 result = await db.execute(stmt)
