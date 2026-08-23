@@ -475,6 +475,16 @@ class _HealResult:
         return self._rows
 
 
+class _HealRow:
+    """sa_select(window_start, signal_version).all() 的 Row 替身（可解包两列）。"""
+
+    def __init__(self, ws, ver):
+        self.ws, self.ver = ws, ver
+
+    def __iter__(self):
+        return iter((self.ws, self.ver))
+
+
 class _HealSession:
     def __init__(self, rows):
         self._rows = rows
@@ -491,17 +501,19 @@ class _HealSession:
 
 @pytest.mark.asyncio
 async def test_heal_once_backfills_stale_orders(monkeypatch) -> None:
-    """自愈扫描：缺 signal_id 的陈旧订单逐窗回填（Low#4）。"""
+    """自愈扫描：缺 signal_id 的陈旧订单逐窗回填，按各自 signal_version
+    （跨版本：热切换后旧版本订单同样自愈，不随当前绑定漂移）。"""
     t = _make_trader(monkeypatch, _FakeTrader())
-    monkeypatch.setattr(qelt, "async_session_factory", lambda: _HealSession([WINDOW_START]))
-    calls: list[int] = []
+    monkeypatch.setattr(qelt, "async_session_factory",
+                        lambda: _HealSession([_HealRow(WINDOW_START, "quote_momentum_v1")]))
+    calls: list[tuple[int, str | None]] = []
 
-    async def _bf(ws):
-        calls.append(ws)
+    async def _bf(ws, version=None):
+        calls.append((ws, version))
 
     t._backfill_signal_link = _bf
     await t._heal_once()
-    assert calls == [WINDOW_START]
+    assert calls == [(WINDOW_START, "quote_momentum_v1")]
     assert t._healed_total == 1
 
 
@@ -511,3 +523,179 @@ async def test_heal_once_no_stale_orders(monkeypatch) -> None:
     monkeypatch.setattr(qelt, "async_session_factory", lambda: _HealSession([]))
     await t._heal_once()
     assert t._healed_total == 0
+
+
+# ============================================================
+# switch_version：运行时热切信号（2026-08-23 前端可选信号实盘开关）
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_switch_version_updates_band_and_guard(monkeypatch) -> None:
+    """热切 momentum→contrarian：区间换为新版、护栏重算 0.28、
+    _fired 记忆保留（同窗双版本双单防线）。"""
+    monkeypatch.setattr(settings, "quote_momentum_live_max_exec_price", None)
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, version="quote_momentum_v1")
+    t._fired.add(999)  # 模拟旧版本已开火窗口
+
+    t.switch_version("quote_contrarian_v1")
+
+    assert t._version == "quote_contrarian_v1"
+    assert t._max_exec == 0.28
+    assert 999 in t._fired  # 记忆保留
+    # 旧区间（t=100s q=0.71 momentum 命中点）不再命中
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 100_000, 0.71) is False
+    # 新区间（t=50s q=0.20）命中（check 命中会派生任务，需异步环境）
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 50_000, 0.20) is True
+    await _drain(t)
+
+
+@pytest.mark.asyncio
+async def test_switch_version_fire_uses_new_version(monkeypatch) -> None:
+    """热切后开火：signal_version/max_exec_price 均按新版本下单。"""
+    monkeypatch.setattr(settings, "quote_momentum_live_max_exec_price", None)
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, version="quote_contrarian_v1")
+    t.switch_version("quote_momentum_v1")
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 100_000, 0.71) is True
+    await _drain(t)
+    call = fake.calls[0]
+    assert call["signal_version"] == "quote_momentum_v1"
+    assert call["max_exec_price"] == 0.78
+
+
+def test_switch_version_unknown_rejected(monkeypatch) -> None:
+    """非白名单版本（v2 门禁版/未知）→ ValueError，实例状态不变。"""
+    t = _make_trader(monkeypatch, _FakeTrader(), version="quote_momentum_v1")
+    with pytest.raises(ValueError, match="白名单"):
+        t.switch_version("quote_momentum_v2")
+    with pytest.raises(ValueError, match="不支持"):
+        t.switch_version("nonexistent")
+    assert t._version == "quote_momentum_v1"  # 状态不变
+
+
+def test_switch_version_explicit_exec_price_rejected(monkeypatch) -> None:
+    """显式配置 max_exec_price（与特定版本绑定）→ 拒绝热切（语义不明）。"""
+    monkeypatch.setattr(settings, "quote_momentum_live_max_exec_price", 0.26)
+    t = _make_trader(monkeypatch, _FakeTrader(), version="quote_contrarian_v1")
+    with pytest.raises(ValueError, match="显式配置"):
+        t.switch_version("quote_momentum_v1")
+    assert t._version == "quote_contrarian_v1"
+
+
+def test_available_versions_shape() -> None:
+    """available_versions：白名单全集 + 区间 + 自动护栏（前端选择层渲染源）。"""
+    avs = QuoteEdgeLiveTrader.available_versions()
+    assert [a["version"] for a in avs] == ["quote_momentum_v1", "quote_contrarian_v1"]
+    by_v = {a["version"]: a for a in avs}
+    assert by_v["quote_momentum_v1"]["auto_max_exec_price"] == 0.78
+    assert by_v["quote_contrarian_v1"]["auto_max_exec_price"] == 0.28
+
+
+def test_status_lists_available_versions(monkeypatch) -> None:
+    """status 携带 available_versions + version_at_startup（重启回落基准）。"""
+    t = _make_trader(monkeypatch, _FakeTrader())
+    s = t.status()
+    assert [a["version"] for a in s["available_versions"]] == list(
+        qelt.LIVE_ALLOWED_VERSIONS)
+    assert s["version_at_startup"] == settings.quote_edge_live_version
+
+
+@pytest.mark.asyncio
+async def test_guard_sqls_are_cross_version(monkeypatch) -> None:
+    """防重/日护栏 SQL 跨版本口径：in_(白名单) 而非 == 当前版本
+    （唯一键按 (signal_version, window_start) 隔离，DB 层拦不住跨版本重复；
+    日护栏不跨版本合计则切版本可重置计数继续打）。
+
+    注：直接构造执行器（不走 _make_trader——它把 _has_attempt/_count_
+    filled_today 桩掉了，验 SQL 必须走真方法）。
+    """
+    from sqlalchemy.dialects import postgresql
+
+    monkeypatch.setattr(settings, "quote_momentum_live_enabled", False)
+    monkeypatch.setattr(settings, "quote_edge_live_version", "quote_momentum_v1")
+    t = QuoteEdgeLiveTrader(_FakeTrader())
+
+    class _R:
+        def first(self):
+            return None
+
+        def scalar(self):
+            return 0
+
+    class _S:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def execute(self, stmt):
+            compiled = str(stmt.compile(dialect=postgresql.dialect(),
+                                        compile_kwargs={"literal_binds": True}))
+            _S.seen.append(compiled)
+            return _R()
+
+    _S.seen = []
+    monkeypatch.setattr(qelt, "async_session_factory", lambda: _S())
+
+    await t._has_attempt(WINDOW_START)
+    await t._count_filled_today()
+    joined = "\n".join(_S.seen)
+    assert "signal_version IN" in joined
+    assert "quote_momentum_v1" in joined and "quote_contrarian_v1" in joined
+
+
+# ============================================================
+# POST /api/live/toggle（端点层：可选 version 热切）
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_toggle_endpoint_switches_version(monkeypatch) -> None:
+    """带 version 开启：先切版本再置 enabled；响应携带新 status 与重启回落警示。"""
+    import binance_predict.main as m
+    from binance_predict.models.schemas import ToggleLiveRequest
+
+    t = _make_trader(monkeypatch, _FakeTrader(), version="quote_contrarian_v1")
+    t._enabled = False
+    monkeypatch.setattr(settings, "quote_momentum_live_max_exec_price", None)
+    monkeypatch.setattr(m, "quote_edge_live_trader", t)
+
+    out = await m.live_toggle(ToggleLiveRequest(enabled=True, version="quote_momentum_v1"), _=None)
+    assert "error" not in out
+    assert t._version == "quote_momentum_v1"
+    assert t._enabled is True
+    assert out["status"]["version"] == "quote_momentum_v1"
+    assert "quote_contrarian_v1" in out["warning"]  # 提示重启回落到启动默认
+
+
+@pytest.mark.asyncio
+async def test_toggle_endpoint_bad_version_atomic(monkeypatch) -> None:
+    """非法 version → error 早退，enabled 不动（原子性：切不过就不开火）。"""
+    import binance_predict.main as m
+    from binance_predict.models.schemas import ToggleLiveRequest
+
+    t = _make_trader(monkeypatch, _FakeTrader(), version="quote_contrarian_v1")
+    t._enabled = False
+    monkeypatch.setattr(m, "quote_edge_live_trader", t)
+
+    out = await m.live_toggle(
+        ToggleLiveRequest(enabled=True, version="quote_momentum_v2"), _=None)
+    assert "error" in out
+    assert t._enabled is False  # 未被置位
+    assert t._version == "quote_contrarian_v1"
+
+
+@pytest.mark.asyncio
+async def test_toggle_endpoint_without_version_keeps_binding(monkeypatch) -> None:
+    """不带 version（旧前端/只开关）：维持当前绑定，行为与 P2-1 完全一致。"""
+    import binance_predict.main as m
+    from binance_predict.models.schemas import ToggleLiveRequest
+
+    t = _make_trader(monkeypatch, _FakeTrader(), version="quote_contrarian_v1")
+    monkeypatch.setattr(m, "quote_edge_live_trader", t)
+
+    out = await m.live_toggle(ToggleLiveRequest(enabled=True), _=None)
+    assert "error" not in out
+    assert t._version == "quote_contrarian_v1"
+    assert t._enabled is True

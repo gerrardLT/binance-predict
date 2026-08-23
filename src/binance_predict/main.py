@@ -1883,16 +1883,30 @@ async def live_toggle(
 ):
     """实时开启/关闭报价 edge 实盘开火（QuoteEdgeLiveTrader，P2-1）。
 
-    fail-safe：重启后回落.env 默认值。响应返回当前 status()（enabled 已更新）。
+    可选 version：同时热切换实盘信号（白名单内，2026-08-23 前端可选信号）。
+    fail-safe：enabled 与版本均为运行时态，重启后回落.env 默认值。
+    响应返回当前 status()（enabled/version 已更新）。
     ⚠️ 注意：本开关不取消在途任务（High#1），只阻止新单派生。
     """
     if quote_edge_live_trader is None:
         return {"error": "执行器未装配（装配阶段异常？详见后端日志）"}
+    # 可选：先热切信号版本（失败早退，不动 enabled——原子性：切不过就不开火）
+    if req.version is not None and req.version != quote_edge_live_trader._version:
+        try:
+            quote_edge_live_trader.switch_version(req.version)
+        except ValueError as exc:
+            return {"error": f"信号版本切换失败：{exc}"}
     # 实时更新实例标志位
     quote_edge_live_trader._enabled = req.enabled
     _status = quote_edge_live_trader.status()
     # 提示用户重启行为
-    out = {"message": f"实盘状态已切换为{'开启' if req.enabled else '关闭'}", "status": _status}
+    msg = f"实盘状态已切换为{'开启' if req.enabled else '关闭'}"
+    if req.version is not None and req.version == _status["version"]:
+        msg += f"（信号：{_status['version']}）"
+    out = {"message": msg, "status": _status}
+    if req.version is not None and _status["version"] != _status["version_at_startup"]:
+        out["warning"] = ("信号版本为运行时切换，重启后回落 .env 默认"
+                          f"（{_status['version_at_startup']}）")
     if not req.enabled and _status["enabled_at_startup"]:
         out["warning"] = "重启后会落.env 默认值（若 enabled=False 则持续关闭）"
     return out

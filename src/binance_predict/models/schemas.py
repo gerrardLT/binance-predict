@@ -290,10 +290,16 @@ class TransferOutboundRequest(BaseModel):
 class ToggleLiveRequest(BaseModel):
     """POST /api/live/toggle（QuoteEdgeLiveTrader 运行时开关，P2-1）。
 
-    实时控制实盘开火状态；重启后回落.env 默认（fail-safe）。
+    实时控制实盘开火状态；可选 version 同时热切换实盘信号（白名单内，
+    切换为运行时态，重启后回落.env 默认，fail-safe）。
     """
 
     enabled: bool = Field(description="启用=True / 禁用=False")
+    version: str | None = Field(
+        default=None,
+        description="可选：切换到的实盘信号版本（LIVE_ALLOWED_VERSIONS 白名单内；"
+                    "None=维持当前绑定不动）",
+    )
 
 
 class RedeemRequest(BaseModel):

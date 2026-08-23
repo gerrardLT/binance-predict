@@ -496,11 +496,11 @@ const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ amount_usdt }),
     }).then(r => r.json()),
-  postLiveToggle: (enabled: boolean) =>
+  postLiveToggle: (enabled: boolean, version?: string) =>
     fetch('/api/live/toggle', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ enabled }),
+      body: JSON.stringify({ enabled, ...(version ? { version } : {}) }),
     }).then(r => r.json()),
   getQuotePreview: () => fetch('/api/prediction/quote-preview').then(r => r.json()),
   postSyncBinance: () => fetch('/api/trades/sync-binance', { method: 'POST' }).then(r => r.json()),
@@ -578,26 +578,28 @@ function HelpHint({ text }: { text: string }) {
 }
 
 // 线上信号说明（口径源：services/quote_edge_detector.py 冻结规则 + fake_breakout 场景）
-const SIGNAL_INFO: Record<string, { name: string; kind: '实盘' | '影子' | '场景'; desc: string }> = {
+// liveOk：实盘白名单内（后端 LIVE_ALLOWED_VERSIONS，可热切开启）；
+// v2 门禁版需 BTC 价格序列、x4 为跨窗错位、fake_breakout 为场景监测——均不支持实盘。
+const SIGNAL_INFO: Record<string, { name: string; kind: '实盘' | '影子' | '场景'; desc: string; liveOk?: boolean }> = {
   quote_contrarian_v1: {
-    name: '报价反向（B格逆势）', kind: '实盘',
-    desc: '5 分钟窗口开始后 45~60 秒内，DOWN token 报价首次跌入 [0.15, 0.25)（明显便宜）时买入 DOWN。低胜率高赔付：回测胜率 24%、EV +0.155（赢一次约赚 4 倍，可覆盖三次亏损）。当前唯一接入实盘下单的信号，每 5 分钟窗口至多开一单。',
+    name: '报价反向（B格逆势）', kind: '实盘', liveOk: true,
+    desc: '5 分钟窗口开始后 45~60 秒内，DOWN token 报价首次跌入 [0.15, 0.25)（明显便宜）时买入 DOWN。低胜率高赔付：回测胜率 24%、EV +0.155（赢一次约赚 4 倍，可覆盖三次亏损）。支持实盘下单，每 5 分钟窗口至多开一单。',
   },
   quote_momentum_v1: {
-    name: '报价动量（A格顺势）', kind: '影子',
-    desc: '5 分钟窗口 90~120 秒内，DOWN token 报价首次进入 [0.69, 0.75)（强势确认）时押 DOWN。回测胜率 79.9%、EV +0.097。影子模式只记录不下单，累计数据达 promote 判据后可转实盘。',
+    name: '报价动量（A格顺势）', kind: '影子', liveOk: true,
+    desc: '5 分钟窗口 90~120 秒内，DOWN token 报价首次进入 [0.69, 0.75)（强势确认）时押 DOWN。回测胜率 79.9%、EV +0.097。支持实盘下单（白名单内），每 5 分钟窗口至多开一单。',
   },
   quote_contrarian_v2: {
     name: '报价反向·门禁版', kind: '影子',
-    desc: 'v1 区间 + 价格门禁：触发时点 BTC 未高于窗口开盘 ≥0.10%（只接「假冲高」，归因显示平盘窗贡献 86% 利润）。影子模式只记录不下单。',
+    desc: 'v1 区间 + 价格门禁：触发时点 BTC 未高于窗口开盘 ≥0.10%（只接「假冲高」，归因显示平盘窗贡献 86% 利润）。需 BTC 价格门禁数据，暂不支持实盘（影子验证后评估）。',
   },
   quote_momentum_v2: {
     name: '报价动量·门禁版', kind: '影子',
-    desc: 'v1 区间 + 价格门禁：触发时点 BTC 已低于窗口开盘 ≥0.10%（剔「假恐慌」，真跌段胜率 85% vs 假恐慌段 40%）。影子模式只记录不下单。',
+    desc: 'v1 区间 + 价格门禁：触发时点 BTC 已低于窗口开盘 ≥0.10%（剔「假恐慌」，真跌段胜率 85% vs 假恐慌段 40%）。需 BTC 价格门禁数据，暂不支持实盘（影子验证后评估）。',
   },
   x4_v1: {
     name: '情绪错位', kind: '影子',
-    desc: '情绪窗口与价格走势错位检测（原 X4 假设：情绪采样窗口 UP% 异常偏离时的次窗下注方向）。影子模式只记录不下单。',
+    desc: '情绪窗口与价格走势错位检测（原 X4 假设：情绪采样窗口 UP% 异常偏离时的次窗下注方向）。跨窗错位架构，实盘链路为窗内报价触发，暂不支持实盘。',
   },
   fake_breakout: {
     name: '假突破场景', kind: '场景',
@@ -711,7 +713,13 @@ function LiveChartCard() {
 }
 
 // 线上信号概览卡：实盘/影子/场景一屏总览（60s 轮询，统计为全量累计不随 limit 截断）
-function SignalsOverviewCard({ live }: { live: Record<string, unknown> | null }) {
+// onPickLive：实盘白名单内信号行的「开实盘/切到此信号」回调（由 LiveTradeTab 注入，
+// 统一走 confirm + postLiveToggle(enabled, version)，避免两处开关状态不一致互咬）
+function SignalsOverviewCard({ live, onPickLive, busy = false }: {
+  live: Record<string, unknown> | null
+  onPickLive?: (version: string) => void
+  busy?: boolean
+}) {
   const [stats, setStats] = useState<Record<string, Record<string, unknown> | null>>({})
   const [fb, setFb] = useState<Record<string, unknown> | null>(null)
 
@@ -774,12 +782,22 @@ function SignalsOverviewCard({ live }: { live: Record<string, unknown> | null })
                   </span>
                 )}
               </span>
-              <span className="font-mono text-[11px] text-gray-600 shrink-0 text-right">{statText}</span>
+              <span className="flex items-center gap-1.5 shrink-0">
+                <span className="font-mono text-[11px] text-gray-600 text-right">{statText}</span>
+                {info.liveOk && onPickLive && !(isLive && liveEnabled) && (
+                  <button
+                    onClick={() => onPickLive(key)}
+                    disabled={busy}
+                    className="px-2 py-0.5 text-[10px] font-semibold rounded bg-green-600 text-white hover:bg-green-700 disabled:opacity-50 shrink-0"
+                    title={isLive ? '重新开火（已绑定此信号）' : '热切到此信号并开火（重启回落 .env 默认）'}
+                  >{isLive ? '开火' : '开实盘'}</button>
+                )}
+              </span>
             </div>
           )
         })}
         <p className="text-[10px] text-gray-400 mt-1.5">
-          实盘=命中规则真实下单；影子=只记录不下单（promote 判据：样本/胜率/EV）；场景=监测告警不下单。统计 60s 刷新。
+          实盘=命中规则真实下单（白名单内可点「开实盘」热切）；影子=只记录不下单（v2 门禁版/x4 暂不支持实盘，见各信号说明）；场景=监测告警不下单。统计 60s 刷新。
         </p>
       </div>
     </Card>
@@ -804,6 +822,8 @@ function LiveTradeTab() {
   const [syncing, setSyncing] = useState(false)
   const [syncResult, setSyncResult] = useState<Record<string, unknown> | null>(null)
   const [togglingLive, setTogglingLive] = useState(false)
+  // 信号选择层（开启实盘时挑选白名单内信号热切，2026-08-23）
+  const [showSignalPicker, setShowSignalPicker] = useState(false)
   // 可领取奖金（赢单 token → batch-redeem → USDT）
   const [redeemable, setRedeemable] = useState<Record<string, unknown> | null>(null)
   const [redeeming, setRedeeming] = useState(false)
@@ -948,14 +968,36 @@ function LiveTradeTab() {
     }
   }
 
-  const handleLiveToggle = async (next: boolean) => {
+  const handleLiveToggle = async (next: boolean, version?: string) => {
+    // 开启 + 已选具体信号：confirm 后带 version 热切并开火
+    if (next && version) {
+      const info = SIGNAL_INFO[version]
+      if (!window.confirm(
+        `确认开启信号实盘？\n信号: ${info ? `${info.name}（${version}）` : version} | 每单 ${String(live?.amount_usdt ?? '?')} USDT\n\n命中规则区间将下真实订单押 DOWN（真金白银）；信号为运行时切换，重启后回落 .env 默认。`)) return
+      setTogglingLive(true)
+      try {
+        const res = await api.postLiveToggle(true, version)
+        if (res?.error) alert(`切换失败: ${String(res.error)}`)
+        setShowSignalPicker(false)
+        refresh()
+      } catch (e) {
+        alert(`请求失败: ${(e as Error).message}`)
+      } finally {
+        setTogglingLive(false)
+      }
+      return
+    }
+    // 开启但未选信号 → 弹出选择层（白名单内可热切）；关闭 → 直接 confirm
+    if (next) {
+      setShowSignalPicker(true)
+      return
+    }
     const liveInfo = SIGNAL_INFO[String(live?.version ?? '')]
-    if (!window.confirm(next
-      ? `确认开启信号实盘？\n信号: ${liveInfo ? `${liveInfo.name}（${String(live?.version ?? '?')}）` : String(live?.version ?? '?')} | 每单 ${String(live?.amount_usdt ?? '?')} USDT\n\n命中规则区间将下真实订单押 DOWN（真金白银）；重启后回落 .env 默认。`
-      : '确认关闭信号实盘？\n（不取消在途任务，只阻止新单派生；重启后回落 .env 默认）')) return
+    if (!window.confirm(
+      `确认关闭信号实盘？\n当前信号: ${liveInfo ? `${liveInfo.name}（${String(live?.version ?? '?')}）` : String(live?.version ?? '?')}\n（不取消在途任务，只阻止新单派生；重启后回落 .env 默认）`)) return
     setTogglingLive(true)
     try {
-      const res = await api.postLiveToggle(next)
+      const res = await api.postLiveToggle(false)
       if (res?.error) alert(`切换失败: ${String(res.error)}`)
       refresh()
     } catch (e) {
@@ -1125,10 +1167,44 @@ function LiveTradeTab() {
                     onClick={() => handleLiveToggle(!liveEnabled)}
                     disabled={togglingLive}
                     className={`px-3 py-1 text-xs font-semibold rounded text-white disabled:opacity-50 ${liveEnabled ? 'bg-red-600' : 'bg-green-600'}`}
-                  >{togglingLive ? '切换中…' : liveEnabled ? '停止' : '开启'}</button>
+                  >{togglingLive ? '切换中…' : liveEnabled ? '停止' : '选信号开启'}</button>
                 </span>
               : <span className="text-gray-400">未装配（启动异常，详见后端日志）</span>}
           </div>
+          {/* 信号选择层：开启实盘时挑选白名单内信号热切（liveOk 白名单 = 后端 LIVE_ALLOWED_VERSIONS） */}
+          {live && showSignalPicker && (
+            <div className="bg-gray-50 border border-gray-200 rounded-lg p-2 space-y-1">
+              <div className="text-[11px] text-gray-500">选择要开火的信号（运行时切换，重启回落 .env 默认；v2 门禁版/x4 暂不支持实盘）：</div>
+              {(['quote_contrarian_v1', 'quote_momentum_v1'] as const)
+                .filter(v => SIGNAL_INFO[v])
+                .map(v => {
+                  const info = SIGNAL_INFO[v]
+                  const isCurrent = String(live.version) === v
+                  return (
+                    <button
+                      key={v}
+                      onClick={() => handleLiveToggle(true, v)}
+                      disabled={togglingLive}
+                      className={`w-full text-left px-2.5 py-1.5 rounded border text-xs transition-colors disabled:opacity-50 ${isCurrent
+                        ? 'border-green-400 bg-green-50'
+                        : 'border-gray-200 bg-white hover:border-green-300 hover:bg-green-50/50'}`}
+                    >
+                      <span className="flex items-center gap-1.5">
+                        <span className={`px-1.5 py-0.5 text-[10px] font-bold rounded border shrink-0 ${SIGNAL_KIND_BADGE[info.kind]}`}>{info.kind}</span>
+                        <span className="text-gray-800 font-medium">{info.name}</span>
+                        <span className="text-[10px] text-gray-400 font-mono">{v}</span>
+                        <HelpHint text={info.desc} />
+                        {isCurrent && <span className="text-[10px] text-green-700 font-semibold shrink-0">当前绑定</span>}
+                      </span>
+                    </button>
+                  )
+                })}
+              <button
+                onClick={() => setShowSignalPicker(false)}
+                className="text-[11px] text-gray-400 hover:text-gray-600 px-1"
+              >取消</button>
+            </div>
+          )}
           {live && (
             <>
               <div className="flex justify-between gap-2">
@@ -1230,7 +1306,7 @@ function LiveTradeTab() {
       </Card>
 
       {/* 线上信号概览（第二行右列）：实盘/影子/场景一屏总览，问号 hover 看信号规则 */}
-      <SignalsOverviewCard live={live} />
+      <SignalsOverviewCard live={live} onPickLive={v => handleLiveToggle(true, v)} busy={togglingLive} />
 
       <div className="lg:col-span-2">
         <Card title="最近订单">

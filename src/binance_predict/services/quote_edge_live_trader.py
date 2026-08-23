@@ -95,6 +95,52 @@ class QuoteEdgeLiveTrader:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
+    def switch_version(self, version: str) -> None:
+        """运行时热切换实盘信号版本（toggle 端点带 version 时调用）。
+
+        白名单校验与构造同理（v2 门禁版不支持等拒绝）；显式配置了
+        max_exec_price 时拒绝——显式护栏是针对特定版本设的，热切到另一
+        版本语义不明（如 contrarian 套 momentum 的 0.78 护栏形同虚设），
+        要切换请改为自动推导（配置置 None）。
+        防同窗双单：_fired 集合跨版本共用且不清空——同窗已用旧版本开过/
+        尝试过，新版本不再开（配合 _has_attempt 的跨版本 DB 预检双保险）。
+        运行时态：重启回落 settings.quote_edge_live_version（fail-safe）。
+        """
+        if version not in LIVE_ALLOWED_VERSIONS:
+            raise ValueError(
+                f"实盘信号切换：未知/不支持的版本 {version!r}"
+                f"（白名单 {list(LIVE_ALLOWED_VERSIONS)}）")
+        if settings.quote_momentum_live_max_exec_price is not None:
+            raise ValueError(
+                "实盘信号切换：已显式配置 max_exec_price，护栏与特定版本绑定，"
+                "拒绝热切（改为自动推导=配置置 None 后重启再切）")
+        t_lo, t_hi, q_lo, q_hi = QUOTE_EDGE_RULES[version]
+        old = self._version
+        self._version = version
+        self._t_lo, self._t_hi, self._q_lo, self._q_hi = t_lo, t_hi, q_lo, q_hi
+        self._max_exec = round(q_hi + EXEC_GUARD_MARGIN, 4)
+        # 本模块 logger 为 stdlib logging（% 格式化），f-string 预格式化避免
+        # 模块内旧有 {} 风格在无 try/except 保护路径下的 format 崩溃
+        logger.warning(
+            f"报价 edge 实盘：热切换信号版本 {old} → {version} | 新区间 "
+            f"t∈[{t_lo:.0f},{t_hi:.0f})s q∈[{q_lo:.2f},{q_hi:.2f}) | "
+            f"护栏 {self._max_exec:.2f} | 已开火窗口记忆保留（防同窗双单）")
+
+    @staticmethod
+    def available_versions() -> list[dict]:
+        """白名单内可热切的版本（前端选择层渲染：版本 + 区间 + 自动护栏）。"""
+        return [
+            {
+                "version": v,
+                "t_lo": QUOTE_EDGE_RULES[v][0],
+                "t_hi": QUOTE_EDGE_RULES[v][1],
+                "q_lo": QUOTE_EDGE_RULES[v][2],
+                "q_hi": QUOTE_EDGE_RULES[v][3],
+                "auto_max_exec_price": round(QUOTE_EDGE_RULES[v][3] + EXEC_GUARD_MARGIN, 4),
+            }
+            for v in LIVE_ALLOWED_VERSIONS
+        ]
+
     def check(self, window_start_ms: int, window_end_ms: int,
               ts_ms: int, down_price: float | None) -> bool:
         """每次 5m 采样调用一次；命中规则区间则派生下单任务，返回是否开火。"""
@@ -148,10 +194,11 @@ class QuoteEdgeLiveTrader:
                 " | 金额 {} USDT | 执行价上限 {}",
                 win_label, t_rel, down_price, self._amount, self._max_exec)
 
+            fire_version = self._version  # 捕获下单时版本：切换后回填仍对得上
             order = await self._trader.execute_signal_trade(
                 prediction="DOWN",
                 amount_usdt=self._amount,
-                signal_version=self._version,
+                signal_version=fire_version,
                 window_start=window_start,
                 max_exec_price=self._max_exec,
             )
@@ -172,7 +219,8 @@ class QuoteEdgeLiveTrader:
                 logger.info(
                     "报价 edge 实盘成交 | {} | order_id={} | token={} | amount_in={}",
                     win_label, order.get("order_id"), order.get("token_id"), order.get("amount_in"))
-                self._schedule(self._backfill_signal_link(window_start), window_end)
+                self._schedule(
+                    self._backfill_signal_link(window_start, fire_version), window_end)
             else:
                 logger.warning(
                     "报价 edge 实盘未成交 | {} | status={} | {}",
@@ -193,13 +241,19 @@ class QuoteEdgeLiveTrader:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-    async def _backfill_signal_link(self, window_start: int) -> None:
-        """窗口结算后把订单关联回影子信号（实盘 vs 影子一一对账）。"""
+    async def _backfill_signal_link(self, window_start: int,
+                                     version: str | None = None) -> None:
+        """窗口结算后把订单关联回影子信号（实盘 vs 影子一一对账）。
+
+        version 缺省 self._version（下单时同步调度的旧路径）；热切换后
+        在途回填任务必须带下单时的版本，否则查新版本的信号永远匹配不上。
+        """
+        v = version if version is not None else self._version
         try:
             async with async_session_factory() as session:
                 sig = (await session.execute(
                     sa_select(MisalignmentSignal.id).where(
-                        MisalignmentSignal.version == self._version,
+                        MisalignmentSignal.version == v,
                         MisalignmentSignal.window_start == window_start,
                     )
                 )).first()
@@ -208,7 +262,7 @@ class QuoteEdgeLiveTrader:
                     return
                 await session.execute(
                     sa_update(TradeOrderModel).where(
-                        TradeOrderModel.signal_version == self._version,
+                        TradeOrderModel.signal_version == v,
                         TradeOrderModel.window_start == window_start,
                         TradeOrderModel.signal_id.is_(None),
                     ).values(signal_id=sig[0])
@@ -226,10 +280,11 @@ class QuoteEdgeLiveTrader:
     async def _count_filled_today(self) -> int:
         # Low#3：date_trunc 取 PG 会话时区（容器内为 UTC），即"日"按 UTC 自然日计，
         # 北京时间 08:00 翻日；护栏语义自洽，对账时注明口径即可。
+        # 跨版本合计：热切换版本后日护栏不重新计数（否则 A 版打满切 B 版继续打）。
         async with async_session_factory() as session:
             row = (await session.execute(
                 sa_select(sa_func.count(TradeOrderModel.id)).where(
-                    TradeOrderModel.signal_version == self._version,
+                    TradeOrderModel.signal_version.in_(LIVE_ALLOWED_VERSIONS),
                     TradeOrderModel.status == "FILLED",
                     TradeOrderModel.created_at >= sa_func.date_trunc("day", sa_func.now()),
                 )
@@ -237,10 +292,13 @@ class QuoteEdgeLiveTrader:
         return int(row or 0)
 
     async def _has_attempt(self, window_start: int) -> bool:
+        # 跨版本预检：同窗已用任意白名单版本开过/尝试过（FILLED/FAILED 皆算）
+        # 则不再开——防热切换后同窗双单（唯一键按 (signal_version, window_start)
+        # 隔离，DB 层拦不住跨版本重复）。
         async with async_session_factory() as session:
             row = (await session.execute(
                 sa_select(TradeOrderModel.id).where(
-                    TradeOrderModel.signal_version == self._version,
+                    TradeOrderModel.signal_version.in_(LIVE_ALLOWED_VERSIONS),
                     TradeOrderModel.window_start == window_start,
                 ).limit(1)
             )).first()
@@ -261,19 +319,23 @@ class QuoteEdgeLiveTrader:
                 logger.warning("报价 edge 实盘：自愈扫描异常 | {}", exc)
 
     async def _heal_once(self) -> None:
-        """为超过 10 分钟仍缺 signal_id 的订单重试回填（幂等，可重复执行）。"""
+        """为超过 10 分钟仍缺 signal_id 的订单重试回填（幂等，可重复执行）。
+
+        跨版本扫描：热切换后旧版本的陈旧订单同样要自愈，按各自
+        signal_version 回填（不随当前绑定版本漂移）。
+        """
         try:
             cutoff = datetime.now(timezone.utc) - timedelta(minutes=10)
             async with async_session_factory() as session:
                 orders = (await session.execute(
-                    sa_select(TradeOrderModel.window_start).where(
-                        TradeOrderModel.signal_version == self._version,
+                    sa_select(TradeOrderModel.window_start, TradeOrderModel.signal_version).where(
+                        TradeOrderModel.signal_version.in_(LIVE_ALLOWED_VERSIONS),
                         TradeOrderModel.signal_id.is_(None),
                         TradeOrderModel.created_at < cutoff,
                     ).order_by(TradeOrderModel.window_start.asc()).limit(20)
-                )).scalars().all()
-            for ws in orders:
-                await self._backfill_signal_link(int(ws))
+                )).all()
+            for ws, ver in orders:
+                await self._backfill_signal_link(int(ws), ver)
             if orders:
                 self._healed_total += len(orders)
         except Exception as exc:
@@ -295,6 +357,8 @@ class QuoteEdgeLiveTrader:
             "enabled": self._enabled,
             "enabled_at_startup": settings.quote_momentum_live_enabled,
             "version": self._version,
+            "version_at_startup": settings.quote_edge_live_version,
+            "available_versions": self.available_versions(),
             "amount_usdt": self._amount,
             "max_exec_price": self._max_exec,
             "max_daily_orders": self._max_daily,
