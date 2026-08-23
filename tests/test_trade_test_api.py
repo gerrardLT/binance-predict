@@ -28,6 +28,7 @@ def _order(**over) -> dict:
         id=1, status="FILLED", order_id="ORD-1", signal_version="manual_test",
         window_start=1_000_000_000_000, token_id="TOKEN-DOWN",
         amount_in="1000000", average_price=0.5, error_message=None,
+        direction="DOWN",
     )
     base.update(over)
     return base
@@ -84,6 +85,7 @@ async def test_trade_test_success_fields(monkeypatch) -> None:
     assert out["status"] == "FILLED"
     assert out["order_id"] == "ORD-1"
     assert out["average_price"] == 0.5
+    assert out["direction"] == "DOWN"  # 3b：direction 落库后回显
     assert out["error_message"] is None
     assert seen["prediction"] == "DOWN"
     assert seen["amount_usdt"] == 1.0
@@ -137,6 +139,7 @@ async def test_recent_trades_fields_and_limit() -> None:
         id=1, signal_version="manual_test", window_start=1_787_412_600_000,
         status="FAILED", order_id=None, token_id=None, amount_in=None,
         quote_json={"averagePrice": 0.5},
+        direction=None, settle_outcome=None, win=None, pnl=None, settled_at=None,
         error_message="获取报价失败 | HTTP 400: not enough USDT",
         created_at=datetime(2026, 8, 22, 15, 35, tzinfo=timezone.utc),
     )
@@ -151,6 +154,8 @@ async def test_recent_trades_fields_and_limit() -> None:
     assert o["signal_version"] == "manual_test"
     assert o["status"] == "FAILED"
     assert o["average_price"] == 0.5
+    assert o["direction"] is None      # 旧数据无 direction：透传 null
+    assert o["settled_at"] is None     # 未结算 → null
     assert "HTTP 400" in o["error_message"]
     assert o["created_at"].startswith("2026-08-22")
 

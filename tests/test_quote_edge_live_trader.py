@@ -295,7 +295,7 @@ async def test_signal_trade_price_guard_rejects(monkeypatch) -> None:
     pending = _pending_order()
     updates: list[tuple] = []
 
-    async def _reserve(_v, _ws):
+    async def _reserve(_v, _ws, direction=None):
         return pending
 
     async def _update(order, status, **kwargs):
@@ -329,7 +329,7 @@ async def test_signal_trade_success_dynamic_slippage(monkeypatch) -> None:
     updates: list[tuple] = []
     slippage_seen: list[int] = []
 
-    async def _reserve(_v, _ws):
+    async def _reserve(_v, _ws, direction=None):
         return pending
 
     async def _update(order, status, **kwargs):
@@ -362,7 +362,7 @@ async def test_signal_trade_duplicate_window_skips(monkeypatch) -> None:
     """占位失败（同窗已有 PENDING/终态行）→ 花钱前拒绝，不取报价不下单（High#1）。"""
     trader = _make_real_trader(monkeypatch)
 
-    async def _reserve(_v, _ws):
+    async def _reserve(_v, _ws, direction=None):
         return None
 
     async def _quote(*a, **k):

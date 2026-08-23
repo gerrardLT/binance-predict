@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import time
 from typing import Any
 
 import httpx
@@ -748,6 +749,7 @@ class BinancePredictionTrader:
                 return await self._save_failed_order(
                     prediction_id, f"未找到 {prediction} 方向的 token",
                     agent_prediction_id=agent_prediction_id,
+                    direction=prediction,
                 )
 
             # 1. 获取报价
@@ -756,6 +758,7 @@ class BinancePredictionTrader:
                 return await self._save_failed_order(
                     prediction_id, "获取报价失败",
                     agent_prediction_id=agent_prediction_id,
+                    direction=prediction,
                 )
 
             # 2. 下单
@@ -764,9 +767,12 @@ class BinancePredictionTrader:
                 return await self._save_failed_order(
                     prediction_id, "下单失败", quote=quote,
                     agent_prediction_id=agent_prediction_id,
+                    direction=prediction,
                 )
 
-            # 3. 保存订单记录
+            # 3. 保存订单记录（direction 落库供结算判赢；window_start 缺省取当前 5m 窗口起点）
+            eff_window_start = window_start if window_start is not None else (
+                int(time.time() * 1000) // 300_000 * 300_000)
             return await self._save_order(
                 prediction_id=prediction_id,
                 agent_prediction_id=agent_prediction_id,
@@ -778,7 +784,8 @@ class BinancePredictionTrader:
                 status="FILLED",
                 quote_json=quote,
                 signal_version=signal_version,
-                window_start=window_start,
+                window_start=eff_window_start,
+                direction=prediction,
             )
 
     async def execute_signal_trade(
@@ -817,7 +824,8 @@ class BinancePredictionTrader:
 
         async with self._trade_lock:
             # 先占位后下单：PENDING 行占住唯一键；重复窗口（含重启/并发）在花钱前拒绝。
-            pending = await self._reserve_order_slot(signal_version, window_start)
+            pending = await self._reserve_order_slot(
+                signal_version, window_start, direction=prediction)
             if pending is None:
                 logger.info("信号实盘：窗口 {} 已有订单占位，跳过（每窗一单）", window_start)
                 return None
@@ -831,17 +839,19 @@ class BinancePredictionTrader:
             else:
                 logger.warning("未知预测方向: {}", prediction)
                 return await self._update_signal_order(
-                    pending, "FAILED", error_message=f"未知预测方向: {prediction}")
+                    pending, "FAILED", direction=prediction,
+                    error_message=f"未知预测方向: {prediction}")
 
             if not token_id:
                 return await self._update_signal_order(
-                    pending, "FAILED", error_message=f"未找到 {prediction} 方向的 token")
+                    pending, "FAILED", direction=prediction,
+                    error_message=f"未找到 {prediction} 方向的 token")
 
             quote = await self.get_quote(token_id, "BUY", amount_usdt=amount_usdt)
             if not quote:
                 detail = self.last_api_error or "无详情（网络异常？）"
                 return await self._update_signal_order(
-                    pending, "FAILED",
+                    pending, "FAILED", direction=prediction,
                     error_message=f"获取报价失败 | {detail}",
                 )
 
@@ -852,7 +862,7 @@ class BinancePredictionTrader:
                 avg_price = 0.0
             if max_exec_price is not None and (avg_price <= 0 or avg_price > max_exec_price):
                 return await self._update_signal_order(
-                    pending, "FAILED",
+                    pending, "FAILED", direction=prediction,
                     error_message=f"执行价护栏弃单 | averagePrice={avg_price} > {max_exec_price}",
                     quote_json=quote)
 
@@ -866,10 +876,12 @@ class BinancePredictionTrader:
             order_result = await self.place_order(quote, slippage_bps=slippage_bps)
             if not order_result:
                 return await self._update_signal_order(
-                    pending, "FAILED", error_message="下单失败", quote_json=quote)
+                    pending, "FAILED", direction=prediction,
+                    error_message="下单失败", quote_json=quote)
 
             snapshot = await self._update_signal_order(
                 pending, "FILLED",
+                direction=prediction,
                 token_id=token_id,
                 amount_in=str(quote.get("amountIn", "")),
                 amount_out=str(quote.get("amountOut", "")),
@@ -882,11 +894,13 @@ class BinancePredictionTrader:
 
     async def _reserve_order_slot(
         self, signal_version: str, window_start: int,
+        direction: str | None = None,
     ) -> TradeOrderModel | None:
         """先占位后下单（CodeReview High#1）：place_order 前先插 PENDING 行。
 
         占住 (signal_version, window_start) 唯一键，令每窗一单在花钱前生效：
         重复窗口（重启/并发）捕获 IntegrityError 返回 None，调用方放弃下单。
+        direction 占位即落库（结算判赢依赖；NULL 仅限旧数据）。
         """
         from sqlalchemy.exc import IntegrityError
         try:
@@ -900,6 +914,7 @@ class BinancePredictionTrader:
                     status="PENDING",
                     signal_version=signal_version,
                     window_start=window_start,
+                    direction=direction,
                 )
                 db.add(order)
                 await db.commit()
@@ -916,6 +931,7 @@ class BinancePredictionTrader:
         order: TradeOrderModel,
         status: str,
         *,
+        direction: str | None = None,
         token_id: str | None = None,
         amount_in: str | None = None,
         amount_out: str | None = None,
@@ -936,6 +952,8 @@ class BinancePredictionTrader:
         try:
             async with async_session_factory() as db:
                 order.status = status
+                if direction is not None:
+                    order.direction = direction
                 if token_id is not None:
                     order.token_id = token_id
                 if amount_in is not None:
@@ -955,6 +973,7 @@ class BinancePredictionTrader:
                     "status": merged.status,
                     "signal_version": merged.signal_version,
                     "window_start": merged.window_start,
+                    "direction": merged.direction,
                     "token_id": merged.token_id,
                     "order_id": merged.order_id,
                     "amount_in": merged.amount_in,
@@ -971,6 +990,7 @@ class BinancePredictionTrader:
                 "status": status,
                 "signal_version": getattr(order, "signal_version", None),
                 "window_start": getattr(order, "window_start", None),
+                "direction": direction if direction is not None else getattr(order, "direction", None),
                 "token_id": token_id,
                 "order_id": order_id,
                 "amount_in": amount_in,
@@ -993,6 +1013,7 @@ class BinancePredictionTrader:
         error_message: str | None = None,
         signal_version: str | None = None,
         window_start: int | None = None,
+        direction: str | None = None,
     ) -> TradeOrderModel | None:
         """
         保存订单到数据库
@@ -1001,6 +1022,7 @@ class BinancePredictionTrader:
         双向关联（旧 prediction_id 路径不传该值，行为保持不变）；
         error_message 仅在失败落库（status=FAILED）时写入，保证失败可追溯（规则 3，无静默降级）。
         signal_version/window_start 为报价 edge 实盘关联字段，旧路径不传保持 NULL。
+        direction 下单方向（UP/DOWN），结算判赢依赖（P0-2）。
         """
         try:
             async with async_session_factory() as db:
@@ -1018,6 +1040,7 @@ class BinancePredictionTrader:
                     error_message=error_message,
                     signal_version=signal_version,
                     window_start=window_start,
+                    direction=direction,
                 )
                 db.add(order)
                 await db.commit()
@@ -1038,6 +1061,7 @@ class BinancePredictionTrader:
         agent_prediction_id: int | None = None,
         signal_version: str | None = None,
         window_start: int | None = None,
+        direction: str | None = None,
     ) -> TradeOrderModel | None:
         """
         保存失败订单到数据库
@@ -1063,4 +1087,5 @@ class BinancePredictionTrader:
             error_message=error_msg,
             signal_version=signal_version,
             window_start=window_start,
+            direction=direction,
         )

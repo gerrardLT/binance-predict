@@ -92,7 +92,7 @@ class TradeOrderModel(Base):
     )
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="PENDING",
-        comment="PENDING | FILLED | FAILED"
+        comment="PENDING | FILLED | FAILED（订单生命周期）；结算结果见 settle_outcome/win/pnl"
     )
     quote_json: Mapped[dict | None] = mapped_column(
         JSONB, nullable=True, comment="报价响应 JSON"
@@ -110,6 +110,31 @@ class TradeOrderModel(Base):
     )
     signal_id: Mapped[int | None] = mapped_column(
         Integer, nullable=True, comment="窗口结算后回填的 misalignment_signals.id（实盘对账影子）"
+    )
+    # --- 结算闭环字段（P0-2，2026-08-23）：direction 落库 + 本地结算 ---
+    direction: Mapped[str | None] = mapped_column(
+        String(8), nullable=True,
+        comment="下单方向 UP/DOWN（占位时写入；NULL=旧数据）",
+    )
+    settle_outcome: Mapped[str | None] = mapped_column(
+        String(10), nullable=True,
+        comment="窗口结算结果 UP/DOWN/NOISE/EXPIRED（本地 SentimentWindow 口径）",
+    )
+    win: Mapped[bool | None] = mapped_column(
+        Boolean, nullable=True,
+        comment="是否赢（settle_outcome==direction；NOISE/EXPIRED 为 NULL）",
+    )
+    settle_price: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+        comment="结算参考价（窗口 exit_price，本地口径）",
+    )
+    pnl: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+        comment="结算盈亏 USDT（本地估算：赢=amount/均价-amount，输=-amount）",
+    )
+    settled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        comment="本地结算时间（NULL=未结算，扫描锚点）",
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

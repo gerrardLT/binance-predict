@@ -633,6 +633,15 @@ function LiveTradeTab() {
     : null
   const urgent = remainSec != null && remainSec < 60
 
+  // 结算统计（订单表尾累计行）+ 在途持仓（FILLED 未结算）
+  const settledOrders = orders.filter(o => o.settled_at != null)
+  const settledCount = settledOrders.length
+  const totalPnl = settledOrders.reduce(
+    (s, o) => s + (typeof o.pnl === 'number' ? (o.pnl as number) : 0), 0)
+  const openPositions = orders.filter(o => o.status === 'FILLED' && !o.settled_at)
+  const openAmount = openPositions.reduce(
+    (s, o) => s + (o.amount_in != null ? Number(o.amount_in) / 1e18 : 0), 0)
+
   const handleSyncBinance = async () => {
     if (!window.confirm('确认用币安侧订单历史对账本地 PENDING 订单？\n（本地卡 PENDING 但币安已成交的行会被订正为终态）')) return
     setSyncing(true)
@@ -697,6 +706,12 @@ function LiveTradeTab() {
             {typeof wallet?.spot_usdt_free === 'number'
               ? <span className={`font-mono font-bold ${(wallet.spot_usdt_free as number) >= 1 ? 'text-green-700' : 'text-red-600'}`}>{(wallet.spot_usdt_free as number).toFixed(4)}</span>
               : <span className="text-gray-400">查询失败</span>}
+          </div>
+          <div className="flex justify-between gap-2">
+            <span className="text-gray-500 shrink-0">在途持仓（未结算）</span>
+            {openPositions.length > 0
+              ? <span className="font-mono text-amber-700">{openPositions.length} 单 · {openAmount.toFixed(2)} USDT</span>
+              : <span className="text-gray-400">--</span>}
           </div>
           <div className="flex items-center gap-2">
             <span className="text-gray-500 shrink-0">划转入金</span>
@@ -785,6 +800,7 @@ function LiveTradeTab() {
             <div className={`p-2 rounded text-xs ${resultFilled ? 'bg-green-50 text-green-800' : 'bg-red-50 text-red-700'}`}>
               <div className="font-bold">{resultFilled ? '✓ 已成交 FILLED' : `✗ ${String(result.status ?? '未执行')}`}</div>
               {result.order_id != null && <div>订单号: {String(result.order_id)}</div>}
+              {result.direction != null && <div>方向: {String(result.direction)}</div>}
               {result.average_price != null && <div>成交均价: {String(result.average_price)}</div>}
               {result.error_message != null && <div>{String(result.error_message)}</div>}
               {result.error != null && <div>{String(result.error)}</div>}
@@ -822,9 +838,12 @@ function LiveTradeTab() {
                 <tr className="text-left text-gray-500 border-b border-gray-100">
                   <th className="py-1 pr-2">时间</th>
                   <th className="py-1 pr-2">版本</th>
+                  <th className="py-1 pr-2">方向</th>
                   <th className="py-1 pr-2">状态</th>
+                  <th className="py-1 pr-2">结果</th>
                   <th className="py-1 pr-2">均价</th>
                   <th className="py-1 pr-2">金额 (USDT)</th>
+                  <th className="py-1 pr-2">盈亏</th>
                   <th className="py-1">说明</th>
                 </tr>
               </thead>
@@ -836,18 +855,50 @@ function LiveTradeTab() {
                     </td>
                     <td className="py-1.5 pr-2 font-mono text-gray-700">{String(o.signal_version ?? '--')}</td>
                     <td className="py-1.5 pr-2">
+                      {o.direction === 'UP'
+                        ? <span className="px-1.5 py-0.5 rounded font-bold bg-green-100 text-green-700">UP</span>
+                        : o.direction === 'DOWN'
+                          ? <span className="px-1.5 py-0.5 rounded font-bold bg-red-100 text-red-700">DOWN</span>
+                          : <span className="text-gray-400">--</span>}
+                    </td>
+                    <td className="py-1.5 pr-2">
                       <span className={`px-1.5 py-0.5 rounded font-bold ${o.status === 'FILLED' ? 'bg-green-100 text-green-700' : o.status === 'FAILED' ? 'bg-red-100 text-red-700' : 'bg-gray-100 text-gray-600'}`}>
                         {String(o.status)}
                       </span>
+                    </td>
+                    <td className="py-1.5 pr-2">
+                      {o.win === true
+                        ? <span className="px-1.5 py-0.5 rounded font-bold bg-green-100 text-green-700">WIN</span>
+                        : o.win === false
+                          ? <span className="px-1.5 py-0.5 rounded font-bold bg-red-100 text-red-700">LOSE</span>
+                          : o.settle_outcome != null
+                            ? <span className="px-1.5 py-0.5 rounded font-bold bg-gray-100 text-gray-600">{String(o.settle_outcome)}</span>
+                            : <span className="text-gray-400">--</span>}
                     </td>
                     <td className="py-1.5 pr-2 font-mono">{o.average_price != null ? String(o.average_price) : '--'}</td>
                     <td className="py-1.5 pr-2 font-mono">
                       {o.amount_in != null ? (Number(o.amount_in) / 1e18).toFixed(2) : '--'}
                     </td>
+                    <td className={`py-1.5 pr-2 font-mono ${typeof o.pnl === 'number' ? ((o.pnl as number) >= 0 ? 'text-green-700' : 'text-red-600') : 'text-gray-400'}`}>
+                      {typeof o.pnl === 'number'
+                        ? `${(o.pnl as number) >= 0 ? '+' : ''}${(o.pnl as number).toFixed(2)}`
+                        : '--'}
+                    </td>
                     <td className="py-1.5 text-gray-500">{String(o.error_message ?? '')}</td>
                   </tr>
                 ))}
               </tbody>
+              {settledCount > 0 && (
+                <tfoot>
+                  <tr className="border-t border-gray-100 text-gray-600">
+                    <td colSpan={7} className="py-1.5">已结算 {settledCount} 单（本地估算口径）</td>
+                    <td className={`py-1.5 font-mono font-bold ${totalPnl >= 0 ? 'text-green-700' : 'text-red-600'}`}>
+                      {totalPnl >= 0 ? '+' : ''}{totalPnl.toFixed(2)}
+                    </td>
+                    <td className="py-1.5 text-gray-400">USDT</td>
+                  </tr>
+                </tfoot>
+              )}
             </table>
           )}
         </Card>

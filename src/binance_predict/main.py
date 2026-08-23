@@ -48,6 +48,7 @@ from .services.misalignment_detector import MisalignmentDetector
 from .services.quote_edge_detector import QuoteEdgeDetector
 from .services.quote_edge_live_trader import QuoteEdgeLiveTrader
 from .services import quote_edge_live_trader as qelt_module
+from .services.trade_settler import TradeSettler
 from .services.llm_service import LLMService
 from .services.pattern_reevaluator import pattern_reevaluator
 from .services.prediction_trading import BinancePredictionTrader
@@ -129,6 +130,9 @@ misalignment_detector: MisalignmentDetector | None = None
 
 # 报价 edge 影子检测器全局实例（A 顺势 q∈[0.69,0.75) / B 逆势 q∈[0.15,0.25)，只记录不下注）
 quote_edge_detector: QuoteEdgeDetector | None = None
+
+# 交易结算器全局实例（P0-2：FILLED 订单结算回填输赢/盈亏，常开）
+trade_settler: TradeSettler | None = None
 
 # 报价 edge 实盘执行器全局实例（quote_momentum_v1 LIVE，仅开关开启时装配，默认 None）
 quote_edge_live_trader: QuoteEdgeLiveTrader | None = None
@@ -870,6 +874,17 @@ async def lifespan(app: FastAPI):
                 "CREATE INDEX IF NOT EXISTS ix_trade_orders_signal_version ON trade_orders (signal_version)",
                 # token_id 扩宽（与 alembic 迁移 w7a8b9c0d1e2 等价，存量 dev 库安全网；重复执行幂等）
                 "ALTER TABLE trade_orders ALTER COLUMN token_id TYPE VARCHAR(128)",
+                # 结算闭环字段（与 alembic 迁移 x2y3z4a5b6c7 等价，存量 dev 库安全网；重复执行幂等）
+                "ALTER TABLE trade_orders ADD COLUMN IF NOT EXISTS direction VARCHAR(8)",
+                "ALTER TABLE trade_orders ADD COLUMN IF NOT EXISTS settle_outcome VARCHAR(10)",
+                "ALTER TABLE trade_orders ADD COLUMN IF NOT EXISTS win BOOLEAN",
+                "ALTER TABLE trade_orders ADD COLUMN IF NOT EXISTS settle_price FLOAT",
+                "ALTER TABLE trade_orders ADD COLUMN IF NOT EXISTS pnl FLOAT",
+                "ALTER TABLE trade_orders ADD COLUMN IF NOT EXISTS settled_at TIMESTAMPTZ",
+                ("COMMENT ON COLUMN trade_orders.status IS "
+                 "'PENDING | FILLED | FAILED（订单生命周期）；结算结果见 settle_outcome/win/pnl'"),
+                ("CREATE INDEX IF NOT EXISTS ix_trade_orders_settle_pending ON trade_orders (window_start) "
+                 "WHERE status = 'FILLED' AND settled_at IS NULL AND window_start IS NOT NULL"),
             ]:
                 try:
                     await conn.execute(text(col_sql))
@@ -940,6 +955,13 @@ async def lifespan(app: FastAPI):
         await quote_edge_detector.start()
         logger.info("报价 edge 影子检测器已启动（A 79.9%/EV+0.097，B 24%/EV+0.155，影子模式不下注）")
 
+    # 交易结算器（P0-2）：回读 SentimentWindow 结算 FILLED 订单输赢/盈亏。
+    # 无开关常开：行为只读窗口 + 回填结算字段，零资金风险。
+    global trade_settler
+    trade_settler = TradeSettler()
+    await trade_settler.start()
+    logger.info("交易结算器已启动（60s 扫描 FILLED 未结算订单，settled_at 锚点）")
+
     # 报价 edge 实盘（版本可配，当前默认 quote_contrarian_v1）：真单通道，默认 OFF；
     # 开启前提：钱包配置就绪 + 用户人工设 quote_momentum_live_enabled=True。
     global quote_edge_live_trader
@@ -1004,6 +1026,9 @@ async def lifespan(app: FastAPI):
     # 停止报价 edge 影子检测器
     if quote_edge_detector is not None:
         await quote_edge_detector.stop()
+    # 停止交易结算器
+    if trade_settler is not None:
+        await trade_settler.stop()
     # 停止报价 edge 实盘执行器（取消在途下单/回填任务）
     if quote_edge_live_trader is not None:
         await quote_edge_live_trader.stop()
@@ -1655,6 +1680,11 @@ async def get_recent_trades(
                 "token_id": o.token_id,
                 "amount_in": o.amount_in,
                 "average_price": (o.quote_json or {}).get("averagePrice"),
+                "direction": o.direction,
+                "settle_outcome": o.settle_outcome,
+                "win": o.win,
+                "pnl": o.pnl,
+                "settled_at": o.settled_at.isoformat() if o.settled_at else None,
                 "error_message": o.error_message,
                 "created_at": o.created_at.isoformat() if o.created_at else None,
             }
@@ -1827,6 +1857,7 @@ async def manual_trade_test(
     return {
         "status": order.get("status"),
         "order_id": order.get("order_id"),
+        "direction": order.get("direction"),
         "signal_version": order.get("signal_version"),
         "window_start": order.get("window_start"),
         "token_id": order.get("token_id") or None,
@@ -1952,6 +1983,23 @@ async def sync_binance_orders(_: None = Depends(_require_auth)):
             })
         await db.commit()
     return {"synced": len(synced), "details": synced, "binance_orders": len(history)}
+
+
+@app.post("/api/trades/settle-scan")
+async def settle_scan(_: None = Depends(_require_auth)):
+    """手动触发一次结算扫描（验证/补算用）：返回本次结算条数。
+
+    TradeSettler 常开 60s 自动扫描；本端点用于部署后验证、
+    归档器恢复后的手动补算。幂等：settled_at IS NULL 守卫，
+    重复调用只给未结算行生效。
+    """
+    if trade_settler is None:
+        return {"error": "结算器未装配（启动异常？详见后端日志）", "settled": 0}
+    try:
+        settled = await trade_settler.poll_once()
+    except Exception as e:
+        return {"error": f"扫描失败: {e}", "settled": 0}
+    return {"settled": settled}
 
 
 @app.get("/api/logs/tail")
