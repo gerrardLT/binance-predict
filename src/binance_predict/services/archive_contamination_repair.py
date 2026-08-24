@@ -14,6 +14,8 @@ sample_count≈40=20 轮询×2 市场）。下游报价 edge 影子系统性扫�
        x4 两版本按 window_start 或 target_window_start），按干净曲线重扫——
        quote_edge 重扫污染窗自身；x4 还需重扫污染窗的前一窗
        （触发可能来自干净前窗、结算价被污染目标窗污染）。
+       v3 跨窗依赖：v3b 日高读取当日全部早窗 BTC 曲线，重建窗同一 UTC 日
+       的全部后续窗 v3 行一并删除重落（v1/v2 无跨窗依赖，不受影响）。
     3. 实盘对账兼容：删除前先把引用旧信号 id 的订单 signal_id 置 NULL，
        heal 扫描会按 (version, window_start) 重新关联新信号。
 
@@ -49,7 +51,9 @@ MIN_REBUILD_SAMPLES = 5          # 原始样本过少无法可靠重建 → 跳�
 QUOTE_EDGE_VERSIONS = (
     "quote_momentum_v1", "quote_contrarian_v1",
     "quote_momentum_v2", "quote_contrarian_v2",
+    "quote_contrarian_v3a", "quote_contrarian_v3b",
 )
+QE_V3_VERSIONS = ("quote_contrarian_v3a", "quote_contrarian_v3b")
 X4_VERSIONS = ("x4_v1", "x4_v2")
 
 
@@ -142,6 +146,21 @@ def quote_edge_affected_starts(contaminated: set[int]) -> set[int]:
     return set(contaminated)
 
 
+def qe_v3_successor_starts(rebuilt_starts: set[int]) -> set[int]:
+    """v3b 跨窗依赖重扫集：重建窗同一 UTC 日的全部后续窗（不含重建窗自身）。
+
+    v3b 日高读取当日 ≤本窗的全部已归档窗 BTC 曲线：污染窗重建后，同日
+    后续窗的 v3b 判定基准全部变化，其存量 v3 行基于重建前的脏曲线，
+    必须删除后按干净曲线重落。仅对成功重建的窗展开（跳过窗曲线仍脏，
+    重扫无意义）；v1/v2 无跨窗依赖不受影响。升序重扫天然保证日高口径一致。
+    """
+    out: set[int] = set()
+    for c in rebuilt_starts:
+        day_end = ((c // 86_400_000) + 1) * 86_400_000
+        out.update(range(c + WINDOW_MS, day_end, WINDOW_MS))
+    return out
+
+
 def x4_affected_condition_values(contaminated: set[int]) -> set[int]:
     """x4 信号：触发窗（end_pct 判据）或结算目标窗（入场报价）任一被污染。"""
     return set(contaminated)
@@ -161,12 +180,16 @@ def x4_reprocess_starts(contaminated: set[int]) -> set[int]:
     return contaminated | prevs | nexts
 
 
-async def _delete_affected_signals(contaminated: set[int]) -> dict:
-    """删除受影响信号；先置空订单 signal_id 防悬挂（heal 扫描会重新关联）。"""
+async def _delete_affected_signals(contaminated: set[int],
+                                  v3_successors: set[int]) -> dict:
+    """删除受影响信号；先置空订单 signal_id 防悬挂（heal 扫描会重新关联）。
+
+    v3_successors：重建窗同日后续窗，只删 v3 版本行（v1/v2 无跨窗依赖）。
+    """
     qe_starts = quote_edge_affected_starts(contaminated)
     x4_starts = x4_affected_condition_values(contaminated)
-    deleted = {"quote_edge": 0, "x4": 0, "orders_unlinked": 0}
-    if not qe_starts and not x4_starts:
+    deleted = {"quote_edge": 0, "quote_edge_v3_succ": 0, "x4": 0, "orders_unlinked": 0}
+    if not qe_starts and not x4_starts and not v3_successors:
         return deleted
     async with async_session_factory() as session:
         qe_ids = (await session.execute(
@@ -175,6 +198,12 @@ async def _delete_affected_signals(contaminated: set[int]) -> dict:
                 MisalignmentSignal.window_start.in_(qe_starts),
             )
         )).scalars().all()
+        v3_succ_ids = (await session.execute(
+            sa_select(MisalignmentSignal.id).where(
+                MisalignmentSignal.version.in_(QE_V3_VERSIONS),
+                MisalignmentSignal.window_start.in_(v3_successors),
+            )
+        )).scalars().all() if v3_successors else []
         x4_ids = (await session.execute(
             sa_select(MisalignmentSignal.id).where(
                 MisalignmentSignal.version.in_(X4_VERSIONS),
@@ -193,6 +222,11 @@ async def _delete_affected_signals(contaminated: set[int]) -> dict:
                 sa_delete(MisalignmentSignal).where(MisalignmentSignal.id.in_(qe_ids))
             )
             deleted["quote_edge"] = int(res.rowcount or 0)
+        if v3_succ_ids:
+            res = await session.execute(
+                sa_delete(MisalignmentSignal).where(MisalignmentSignal.id.in_(v3_succ_ids))
+            )
+            deleted["quote_edge_v3_succ"] = int(res.rowcount or 0)
         if x4_ids:
             res = await session.execute(
                 sa_delete(MisalignmentSignal).where(MisalignmentSignal.id.in_(x4_ids))
@@ -237,7 +271,10 @@ async def repair_contaminated_archives() -> dict:
     # --- 2) 删除受影响信号（全部污染窗：重建窗重落，跳过窗曲线不可信、
     # 其信号同样不可信，一并删除避免虚高 EV 继续计入统计）---
     contaminated_starts = {int(w.start_time) for w in contaminated_wins}
-    deleted = await _delete_affected_signals(contaminated_starts)
+    rebuilt_starts = {int(w.start_time) for w in rebuilt_wins}
+    # v3b 跨窗依赖：重建窗同日后续窗的 v3 行基于重建前脏曲线，一并删除重落
+    v3_successors = qe_v3_successor_starts(rebuilt_starts) - contaminated_starts
+    deleted = await _delete_affected_signals(contaminated_starts, v3_successors)
     stats["deleted_quote_edge"] = deleted["quote_edge"]
     stats["deleted_x4"] = deleted["x4"]
     stats["orders_unlinked"] = deleted["orders_unlinked"]
@@ -249,17 +286,27 @@ async def repair_contaminated_archives() -> dict:
     from .quote_edge_detector import QuoteEdgeDetector
 
     by_start = {int(w.start_time): w for w in rebuilt_wins}
+    # quote_edge 重扫集 = 重建窗 ∪ v3 同日后续窗（后者从 DB 加载，
+    # 可能不存在/缺口）；升序处理保证 v3b 日高口径与实时路径一致，
+    # 后续窗已有的 v1/v2 行由 dup 查重跳过，只补 v3 行。
     qe_detector = QuoteEdgeDetector()
-    for w in rebuilt_wins:  # find 已按 end_time 升序
+    missing_succ = sorted(s for s in v3_successors if s not in by_start)
+    if missing_succ:
+        async with async_session_factory() as session:
+            succ_wins = (await session.execute(
+                sa_select(SentimentWindow)
+                .where(SentimentWindow.start_time.in_(missing_succ))
+            )).scalars().all()
+        for w in succ_wins:
+            by_start[int(w.start_time)] = w
+    for s in sorted(set(by_start) & (rebuilt_starts | v3_successors)):
         try:
-            await qe_detector._process_window(w)
+            await qe_detector._process_window(by_start[s])
             stats["rescanned"] += 1
         except Exception as exc:
-            logger.warning("污染自愈：quote_edge 重扫失败 | window {} | {}",
-                           w.start_time, exc)
+            logger.warning("污染自愈：quote_edge 重扫失败 | window {} | {}", s, exc)
     # x4：干净前窗（触发源重建）与干净后窗（结算重建信号）同样需参与重扫，
     # 缺失的从 DB 加载；升序保证先触发后结算。
-    rebuilt_starts = {int(w.start_time) for w in rebuilt_wins}
     neighbor_starts = sorted(
         s for s in x4_reprocess_starts(rebuilt_starts) if s not in by_start
     )

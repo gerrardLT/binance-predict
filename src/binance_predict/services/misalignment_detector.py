@@ -5,7 +5,9 @@
     回测成绩：IS 65.6%(n=122) / OOS 57.8%(n=45) / 合并 63.5%，
     EV +0.254 CI(0.038, 0.493)（费 2%+溢 0.01；瑕疵：实价覆盖 19%）。
 
-影子纪律（M4）：只记录不下注、不发邮件、不占风控配额。
+影子纪律（M4）：只记录不下注、不占风控配额。邮件推送（2026-08-25 用户要求
+全信号推送）：触发时经 signal_notify 推送（新鲜度闸自动静默冷启动回补/
+污染重扫），总开关 signal_push_email_enabled，全局日限防轰炸。
 数据流：完全复用 sentiment_windows 归档——
     1. 每 60s 轮询新归档窗口 W_n；
     2. W_n 收阳 & end_pct≤40 → 落 PENDING 信号（target = W_n.end_time 起的次窗）；
@@ -30,6 +32,7 @@ from sqlalchemy import select as sa_select
 
 from binance_predict.db.engine import async_session_factory
 from binance_predict.db.models import MisalignmentSignal, SentimentWindow
+from .signal_notify import fire_signal_email, is_fresh_signal
 
 logger = logging.getLogger(__name__)
 
@@ -253,6 +256,18 @@ class MisalignmentDetector:
                     datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc).strftime("%H:%M"),
                     end_pct, end_ms,
                 )
+                # 邮件推送（fire-and-forget）：仅实时新信号；回补/重扫静默
+                if is_fresh_signal(end_ms):
+                    fire_signal_email(
+                        "x4",
+                        f"[信号] x4_v1 | 押次窗DOWN | 窗口 "
+                        f"{datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).strftime('%m-%d %H:%M')} UTC",
+                        f"版本: x4_v1（影子，只记录不下注）\n"
+                        f"触发窗: {datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).strftime('%m-%d %H:%M')}"
+                        f"~{datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc).strftime('%H:%M')} UTC\n"
+                        f"条件: 本窗收阳 & 窗末 UP%={end_pct:.1f} ≤ 40\n"
+                        f"押注: 次窗 DOWN（目标窗起 {end_ms}，结算后落表）",
+                    )
 
             # --- x4_v2：v1 条件全同 + 平静市门禁（独立幂等/独立 commit，只加不改）---
             dup2 = await session.execute(
@@ -283,6 +298,18 @@ class MisalignmentDetector:
             datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).strftime("%m-%d %H:%M"),
             end_pct, past1h, end_ms,
         )
+        # 邮件推送（fire-and-forget）：仅实时新信号；回补/重扫静默
+        if is_fresh_signal(end_ms):
+            fire_signal_email(
+                "x4",
+                f"[信号] x4_v2 | 押次窗DOWN（平静市）| 窗口 "
+                f"{datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).strftime('%m-%d %H:%M')} UTC",
+                f"版本: x4_v2（影子，只记录不下注）\n"
+                f"触发窗: {datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).strftime('%m-%d %H:%M')}"
+                f"~{datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc).strftime('%H:%M')} UTC\n"
+                f"条件: 本窗收阳 & 窗末 UP%={end_pct:.1f} ≤ 40 & |前1h涨跌|={abs(past1h):.2f}% < 0.5%\n"
+                f"押注: 次窗 DOWN（目标窗起 {end_ms}，结算后落表）",
+            )
 
     async def _settle_pending_for(self, w: SentimentWindow) -> None:
         """本窗 start == 信号 target_window_start → 回读曲线结算。"""

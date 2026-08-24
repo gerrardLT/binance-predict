@@ -12,7 +12,9 @@
         回测：胜率 24.0%，EV +0.155，日频 13.7；
         裸条件（两轮 30+ 假设 OOS 全灭，无可信约束）。
 
-影子纪律（M4 同款）：只记录不下注、不发邮件、不占风控配额。
+影子纪律（M4 同款）：只记录不下注、不占风控配额。邮件推送（2026-08-25 用户
+要求全信号推送）：仅实时新信号经 signal_notify 推送（新鲜度闸自动静默
+冷启动回补/停机积压/污染重扫），总开关 signal_push_email_enabled，全局日限防轰炸。
 数据流（归档后处理，区别于 X4 的次窗结算）：
     1. 每 60s 轮询新归档 SentimentWindow；
     2. 扫 curve_down_price 曲线找规则区间内首个命中点（时点+报价）；
@@ -26,6 +28,17 @@ v2 价格门禁版（2026-08-22 5m 粒度归因落地，只加不改；v1 冻结
     quote_momentum_v2   = v1 区间 + 触发时点 BTC 已低于窗口开盘 ≥0.10%（剔假恐慌）；
     quote_contrarian_v2 = v1 区间 + 触发时点 BTC 未高于窗口开盘 ≥0.10%（只接假冲高）。
     门禁数据源 curve_btc_price（与报价曲线同步采样），只用 ≤触发时点采样点（严格 ex-ante）。
+
+v3 环境门禁版（2026-08-24 交替/延续归因落地，只加不改；v1/v2 冻结口径原样）：
+    quote_contrarian_v3a = v2 ∩ 前窗 outcome==DOWN（交替环境：前窗跌+本窗涨=V 反弹假冲高）；
+    quote_contrarian_v3b = v3a ∩ 触发时点距当日高点回落≥0.30%（含边界，与归因分桶同口径；震荡日：冲高更易衰竭）。
+    归因依据（scripts/local_contrarian_v2_brainstorm.py，142 笔）：前窗 DOWN 31.2%/+0.511
+    vs 前窗 UP 18.5%/−0.140；叠加距日高≥0.3% → 34.5%/+0.682（Wilson 下界过盈亏平衡线）。
+    距日高 = 当日（UTC）已归档窗口（含本窗）curve_btc_price 中 ≤触发时点的最大值；
+    处理按 end_time 升序，当日更晚窗口未归档，天然无未来函数；检测器内维护当日
+    running high 增量缓存（按 UTC 日重置，乱序窗口触发失效），避免每笔全天曲线回读。
+    环境数据缺失（前窗未归档/日高缺失）→ 不落 v3（保守跳过，v1/v2 不受影响）。
+    纪律：纯影子（只记录不下注），前向攒 ≥100 笔且 Wilson 下界过线才谈实盘。
 
 字段语义映射（复用 misalignment_signals 表）：
     end_pct → 触发时刻 DOWN 报价（X4 语义"触发窗末 UP%"的扩展，注释在案）；
@@ -43,6 +56,7 @@ from sqlalchemy import select as sa_select
 
 from binance_predict.db.engine import async_session_factory
 from binance_predict.db.models import MisalignmentSignal, SentimentWindow
+from .signal_notify import fire_signal_email, is_fresh_signal
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +84,14 @@ V2_PRICE_GUARDS: dict[str, tuple[str, str, float]] = {
     "quote_momentum_v2": ("quote_momentum_v1", "min_drop", -0.10),
     "quote_contrarian_v2": ("quote_contrarian_v1", "max_rise", 0.10),
 }
+
+# ---- v3 环境门禁（2026-08-24 交替/延续归因落地，只加不改；v1/v2 冻结口径原样） ----
+# v3 -> 是否额外要求距日高回落≥0.30%（含边界，与归因分桶同口径；v3a 否 / v3b 是）
+V3_ENV_GUARDS: dict[str, bool] = {
+    "quote_contrarian_v3a": False,
+    "quote_contrarian_v3b": True,
+}
+V3_DD_THRESHOLD = -0.30   # 距日高回落门槛（%，dd ≤ 阈值即过，含边界）
 
 
 def _outcome_of(w: SentimentWindow) -> str | None:
@@ -149,6 +171,38 @@ def _pass_v2_price_guard(version: str, w: SentimentWindow, quote_ts: int) -> boo
     return chg_pct <= threshold if mode == "min_drop" else chg_pct < threshold
 
 
+async def _prev_window_outcome(session, window_start_ms: int) -> str | None:
+    """前一个 5m 窗（window_start−300s）的结算方向；未归档/NOISE → None。
+
+    limit(1) 防御：sentiment_windows 唯一约束是 (start_time, end_time) 对，
+    历史导入库可能存在同 start_time 重复行，避免 scalar_one_or_none 抛
+    MultipleResultsFound 被误读为"落表失败"。
+    """
+    prev = (await session.execute(
+        sa_select(SentimentWindow.outcome).where(
+            SentimentWindow.start_time == window_start_ms - 300_000).limit(1)
+    )).scalar_one_or_none()
+    return prev if prev in ("UP", "DOWN") else None
+
+
+def _pass_v3_env_guard(version: str, w: SentimentWindow, quote_ts: int,
+                       prev_outcome: str | None, day_high: float | None) -> bool:
+    """v3 环境门禁（纯函数）：前窗 DOWN（交替环境）+ 可选距日高回落≥0.30%。
+
+    prev_outcome / day_high 由调用方预查（同窗 v3a/v3b 复用，避免重复 DB 往返）；
+    缺失（None）→ False（保守不落表，与 v2 的 None 语义等效）。
+    """
+    if prev_outcome != "DOWN":
+        return False
+    if not V3_ENV_GUARDS[version]:
+        return True
+    trig = _up_price_at_or_before(getattr(w, "curve_btc_price", None), quote_ts)
+    if trig is None or day_high is None or day_high <= 0:
+        return False
+    dd_pct = (trig - day_high) / day_high * 100.0
+    return dd_pct <= V3_DD_THRESHOLD
+
+
 def _ev_at_entry(win: bool, price: float) -> float:
     """单注 EV（回测口径，无溢价）：赢 0.98/q−1 / 输 −1。"""
     return (FEE_RET / price - 1.0) if win else -1.0
@@ -165,6 +219,11 @@ class QuoteEdgeDetector:
         self._task: asyncio.Task | None = None
         self._last_window_end: int | None = None  # 已处理过的最大窗口 end_time
         self._trigger_count = 0
+        # v3b 日高增量缓存：(UTC 日序号, running high, 已并入的最大 window_start)。
+        # 窗口按 end_time 升序处理时增量生效；乱序窗口（如污染重扫）触发重置。
+        self._dh_day: int | None = None
+        self._dh_high: float | None = None
+        self._dh_covered: int = -1
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -180,10 +239,13 @@ class QuoteEdgeDetector:
             logger.warning("报价 edge 影子：冷启动回补失败（忽略，循环内自愈）| {}", exc)
         self._task = asyncio.create_task(self._loop(), name="quote_edge_detector")
         logger.info(
-            "报价 edge 影子检测器启动 | v1 规则 {} + v2 价格门禁版 {} | EV=0.98/q−1（费 2%，影子模式只记录不下注）",
+            "报价 edge 影子检测器启动 | v1 规则 {} + v2 价格门禁版 {} + v3 环境门禁版 {}"
+            " | EV=0.98/q−1（费 2%，影子模式只记录不下注）",
             {k: f"t∈[{v[0]:.0f},{v[1]:.0f})s q∈[{v[2]:.2f},{v[3]:.2f})"
              for k, v in QUOTE_EDGE_RULES.items()},
             {k: f"{m}{p:+.2f}%" for k, (_b, m, p) in V2_PRICE_GUARDS.items()},
+            {k: ("前窗DOWN" + ("+距日高≥0.30%(含边界)" if dd else ""))
+             for k, dd in V3_ENV_GUARDS.items()},
         )
 
     async def stop(self) -> None:
@@ -231,6 +293,48 @@ class QuoteEdgeDetector:
             self._last_window_end = max(self._last_window_end or 0, int(w.end_time))
 
     # ------------------------------------------------------------------
+    # v3b 日高（增量缓存）
+    # ------------------------------------------------------------------
+
+    async def _day_high_btc(self, session, w: SentimentWindow,
+                            quote_ts: int) -> float | None:
+        """当日（UTC）已归档窗口（含本窗）BTC 曲线中 ≤quote_ts 的最高价。
+
+        与归因脚本 running high 口径一致；处理按 end_time 升序进行，
+        处理本窗时当日更晚窗口尚未归档，天然无未来函数。
+        增量缓存：当日首次查询取全范围后推进水位，之后每窗只增量
+        拉取水位之后的新窗口，避免全天 JSONB 曲线随日内时间线性回读。
+        """
+        # 乱序窗口（污染重扫等）会让缓存已并入的曲线失效 → 重置后取全范围
+        if self._dh_day is not None and int(w.start_time) < self._dh_covered:
+            self._dh_day, self._dh_high, self._dh_covered = None, None, -1
+        day_key = quote_ts // 86_400_000
+        if self._dh_day == day_key:
+            lo = self._dh_covered + 1      # 增量：只拉水位之后的窗口
+            best = self._dh_high
+        else:
+            lo = day_key * 86_400_000
+            best = None
+        curves = (await session.execute(
+            sa_select(SentimentWindow.curve_btc_price).where(
+                SentimentWindow.start_time >= lo,
+                SentimentWindow.start_time <= w.start_time,
+            )
+        )).scalars().all()
+        for curve in curves:
+            for p in curve or []:
+                t, v = p.get("t"), p.get("v")
+                if t is None or v is None:
+                    continue
+                if int(t) <= quote_ts and (best is None or float(v) > best):
+                    best = float(v)
+        # 推进水位：[lo, w.start] 范围窗口已全部并入（查询覆盖该范围）
+        self._dh_day = day_key
+        self._dh_high = best
+        self._dh_covered = max(self._dh_covered, int(w.start_time))
+        return best
+
+    # ------------------------------------------------------------------
     # 核心：单窗口处理（扫曲线 → 首个命中 → 落 SETTLED）
     # ------------------------------------------------------------------
 
@@ -240,13 +344,21 @@ class QuoteEdgeDetector:
         if outcome is None:
             return  # NOISE/缺结算：胜负不可判，不产生信号
 
-        # v1 冻结规则 + v2 门禁版（同区间，命中后过价格门禁才落表）
+        # v1 冻结规则 + v2 门禁版 + v3 环境门禁版（同区间，命中后过对应门禁才落表）
         rules: dict[str, tuple[float, float, float, float]] = dict(QUOTE_EDGE_RULES)
         for v2, (base, _mode, _pct) in V2_PRICE_GUARDS.items():
             rules[v2] = QUOTE_EDGE_RULES[base]
+        for v3 in V3_ENV_GUARDS:
+            rules[v3] = QUOTE_EDGE_RULES["quote_contrarian_v1"]  # v3 基于 contrarian 区间
 
         # per-rule 独立 commit（CodeReview Low#4）：单规则落表失败不回滚、
         # 不影响另一规则；trigger_count 仅在 commit 成功后自增。
+        # v3a/v3b 同窗复用：v2 价格门禁结果与前窗 outcome 只查一次（懒加载）。
+        v3_v2_ok: bool | None = None
+        v3_prev: str | None = None
+        v3_prev_fetched = False
+        v3_high: float | None = None
+        v3_high_fetched = False
         async with async_session_factory() as session:
             for version, (t_lo, t_hi, q_lo, q_hi) in rules.items():
                 try:
@@ -256,6 +368,20 @@ class QuoteEdgeDetector:
                     price, quote_ts = hit
                     if version in V2_PRICE_GUARDS and _pass_v2_price_guard(version, w, quote_ts) is not True:
                         continue  # 门禁未过/门禁数据缺失 → v2 不落（v1 不受影响）
+                    if version in V3_ENV_GUARDS:
+                        # v3 = v2 价格门禁 ∩ 环境门禁（chg 门禁先过，环境门禁再判）
+                        if v3_v2_ok is None:
+                            v3_v2_ok = _pass_v2_price_guard("quote_contrarian_v2", w, quote_ts) is True
+                        if not v3_v2_ok:
+                            continue
+                        if not v3_prev_fetched:
+                            v3_prev = await _prev_window_outcome(session, start_ms)
+                            v3_prev_fetched = True
+                        if V3_ENV_GUARDS[version] and not v3_high_fetched:
+                            v3_high = await self._day_high_btc(session, w, quote_ts)
+                            v3_high_fetched = True
+                        if not _pass_v3_env_guard(version, w, quote_ts, v3_prev, v3_high):
+                            continue  # 环境门禁未过/数据缺失 → v3 不落（v1/v2 不受影响）
                     dup = await session.execute(
                         sa_select(MisalignmentSignal.id).where(
                             MisalignmentSignal.version == version,
@@ -293,6 +419,21 @@ class QuoteEdgeDetector:
                         (quote_ts - start_ms) / 1000.0, price, outcome, win,
                         _ev_at_entry(win, price),
                     )
+                    # 邮件推送（fire-and-forget）：仅实时新信号；冷启动回补/
+                    # 积压/污染重扫的历史重放被新鲜度闸静默（只落表不推）。
+                    if is_fresh_signal(end_ms):
+                        win_str = "赢" if win else "输"
+                        fire_signal_email(
+                            "quote_edge",
+                            f"[信号] {version} | 押DOWN {win_str} | 窗口 "
+                            f"{datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).strftime('%m-%d %H:%M')} UTC",
+                            f"版本: {version}（影子，只记录不下注）\n"
+                            f"窗口: {datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).strftime('%m-%d %H:%M')}"
+                            f"~{datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc).strftime('%H:%M')} UTC\n"
+                            f"触发: t=+{(quote_ts - start_ms) / 1000.0:.0f}s DOWN报价 q={price:.3f}\n"
+                            f"结算: {outcome} → {win_str}\n"
+                            f"EV: {_ev_at_entry(win, price):+.3f}（0.98/q−1 / −1，费 2%）",
+                        )
                 except Exception as exc:
                     await session.rollback()
                     logger.warning("报价 edge 影子：rule {} 落表失败 | window {} | {}",
@@ -330,6 +471,8 @@ class QuoteEdgeDetector:
     # ------------------------------------------------------------------
 
     def status(self) -> dict:
+        """状态（status API 用）。注：trigger_count 计全部版本落表行数，
+        2026-08-24 起含 v3a/v3b 影子行，增速高于市场事件数属预期口径漂移。"""
         return {
             "running": self._running,
             "last_window_end": self._last_window_end,

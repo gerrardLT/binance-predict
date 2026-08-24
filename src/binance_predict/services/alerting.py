@@ -152,14 +152,15 @@ def _send_email_sync(subject: str, body: str, recipients: list[str]) -> None:
 async def send_plain_email(subject: str, body: str) -> bool:
     """通用纯文本邮件推送（复用 agent_alert_* SMTP 配置）。
 
-    供假突破信号等非健康报告场景复用同一 SMTP 通道。
-    仅在 agent_alert_email_enabled=True、SMTP host 与收件人均已配置时发送；
+    供信号推送等非健康报告场景复用同一 SMTP 物理通道；门禁开关是
+    signal_push_email_enabled（与告警开关 agent_alert_email_enabled 解耦，
+    暂停告警不影响信号邮件）。SMTP host 与收件人未配置时不发送；
     阻塞 smtplib 调用放入线程池，发送失败仅告警、不抛出。
 
     Returns:
         True=已发送（或成功入线程池），False=未配置/未启用/发送失败
     """
-    if not settings.agent_alert_email_enabled:
+    if not settings.signal_push_email_enabled:
         return False
     recipients = [x.strip() for x in settings.agent_alert_email_to.split(",") if x.strip()]
     if not settings.agent_alert_smtp_host or not recipients:
@@ -283,7 +284,12 @@ class AlertNotifier:
 
         overall_status=OK 时直接跳过。仅当存在「新」告警（未在窗口内推过）才推送，
         推送成功与否都刷新该批 code 的推送时刻，避免失败时下一轮立即重试轰炸。
+
+        总闸 agent_alert_notify_enabled=False 时直接跳过（邮件+webhook 全暂停）：
+        不 mark_sent，恢复后新告警能及时推送；慢性告警若仍在抑制窗内仍受抑制。
         """
+        if not settings.agent_alert_notify_enabled:
+            return []
         if report.overall_status == "OK":
             return []
         now = time.time()

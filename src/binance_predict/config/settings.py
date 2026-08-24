@@ -169,7 +169,10 @@ class Settings(BaseSettings):
     agent_alert_suppress_warn_seconds: float = 14400.0
 
     # --- 告警邮件推送（SMTP，主渠道；非 OK 状态且有新告警时触发）---
-    # 总开关；为 False 时不发邮件（即便配置了 SMTP）
+    # 告警推送总闸：False 时邮件+webhook 全部暂停（健康监控仍跑，仅不主动推送）。
+    # 与信号推送（signal_push_email_enabled）相互独立——暂停告警不影响信号邮件。
+    agent_alert_notify_enabled: bool = True
+    # 邮件渠道开关；为 False 时不发告警邮件（即便配置了 SMTP）
     agent_alert_email_enabled: bool = False
     # SMTP 服务器地址与端口（587=STARTTLS，465=SSL 需另配；默认走 STARTTLS）
     agent_alert_smtp_host: str = ""
@@ -192,6 +195,14 @@ class Settings(BaseSettings):
     agent_alert_webhook_url: str = ""
     # webhook POST 超时（秒）
     agent_alert_webhook_timeout: float = 5.0
+
+    # --- 信号邮件推送（所有信号族共用；SMTP 物理通道复用 agent_alert_smtp_*）---
+    # 总开关：与告警开关解耦——暂停告警（agent_alert_notify_enabled=False）
+    # 不影响信号邮件；场景信号还需各自子开关（fake_breakout_email_enabled）。
+    signal_push_email_enabled: bool = True
+    # 全局日上限（所有信号族合计）：超限后仍落表但不再发邮件，防轰炸。
+    # 依据：quote_edge 全版本约 40 笔/日 + x4 数笔 + 场景信号，80 留足余量。
+    signal_push_max_daily_emails: int = 80
 
     # --- 风控统计缓存（Fix #20）---
     # RiskController.refresh_daily_stats 的 TTL（秒），避免短时间内重复全量查询。

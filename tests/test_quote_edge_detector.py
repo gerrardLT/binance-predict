@@ -2,12 +2,14 @@
 
 覆盖：首个命中点查找（时点/报价区间/乱序/首中优先）、EV 公式、
 UP 对照价不含未来、outcome 判定、_process_window 落表（fake session）、
-v2 价格门禁（触发时点 BTC vs 窗口开盘；数据缺失/门禁未过只落 v1）。
+v2 价格门禁（触发时点 BTC vs 窗口开盘；数据缺失/门禁未过只落 v1）、
+v3 环境门禁（前窗 DOWN + 可选距日高回落；缺失/未过只落 v1/v2）。
 
 不触网络/真实 DB：async_session_factory 用 fake session 替身。
 """
 from __future__ import annotations
 
+import operator as _op
 from types import SimpleNamespace
 
 import pytest
@@ -162,9 +164,16 @@ class _FakeResult:
     def first(self):
         return self._first
 
+    def scalar_one_or_none(self):
+        return None  # v3 环境查询：前窗未归档 → 环境门禁拒（v3 不落）
+
+    def scalars(self):
+        # v3b 日高查询：无曲线 → 日高缺失（环境门禁拒）
+        return SimpleNamespace(all=lambda: [])
+
 
 class _FakeSession:
-    """最小替身：dup 查重返回固定值，add/commit 全记录。"""
+    """最小替身：dup 查重返回固定值，add/commit/rollback 全记录。"""
 
     def __init__(self, dup_first=None):
         self.added: list = []
@@ -183,6 +192,9 @@ class _FakeSession:
         self.added.append(obj)
 
     async def commit(self):
+        pass
+
+    async def rollback(self):
         pass
 
 
@@ -352,3 +364,222 @@ async def test_v2_gate_missing_data_v1_only(monkeypatch) -> None:
     )
     await d._process_window(w)
     assert [s.version for s in session.added] == ["quote_momentum_v1"]
+
+
+# ============================================================
+# v3 环境门禁：前窗 DOWN（交替环境）+ 可选距日高回落≥0.30%（含边界）
+# ============================================================
+
+def _stmt_range_bounds(stmt):
+    """解析 start_time 范围谓词 → (lo, hi)，钉死日高查询的无未来函数边界。"""
+    lo = hi = None
+    for cl in getattr(stmt.whereclause, "clauses", None) or []:
+        right = getattr(cl, "right", None)
+        val = getattr(right, "effective_value", None) if right is not None else None
+        if val is None:
+            continue
+        if getattr(cl, "operator", None) is _op.ge:
+            lo = val
+        elif getattr(cl, "operator", None) is _op.le:
+            hi = val
+    return lo, hi
+
+
+class _EnvSession:
+    """v3 环境查询替身：按 select 列名路由，并校验日高查询的范围谓词。
+
+    _prev_window_outcome 查 outcome 列（.scalar_one_or_none()），
+    _day_high_btc 查 curve_btc_price 列（.scalars().all()）；
+    expect_day_start/expect_max_start 非 None 时断言 SQL 的
+    start_time ∈ [lo, hi] 与期望一致（无未来函数边界被改即测试失败）。
+    """
+
+    def __init__(self, prev_outcome=None, day_high_curves=(),
+                 expect_day_start=None, expect_max_start=None):
+        self._prev = prev_outcome
+        self._curves = day_high_curves
+        self._expect_lo = expect_day_start
+        self._expect_hi = expect_max_start
+
+    async def execute(self, stmt):
+        keys = {getattr(c, "key", None) for c in stmt.selected_columns}
+        if "outcome" in keys:
+            return _EnvResult(scalar=self._prev)
+        lo, hi = _stmt_range_bounds(stmt)
+        if self._expect_lo is not None:
+            assert lo == self._expect_lo, f"日高查询下界 {lo} != 期望 {self._expect_lo}"
+        if self._expect_hi is not None:
+            assert hi == self._expect_hi, f"日高查询上界 {hi} != 期望 {self._expect_hi}"
+        return _EnvResult(scalars=list(self._curves))
+
+
+class _EnvResult:
+    def __init__(self, scalar=None, scalars=None):
+        self._scalar = scalar
+        self._scalars = scalars
+
+    def scalar_one_or_none(self):
+        return self._scalar
+
+    def scalars(self):
+        return SimpleNamespace(all=lambda: self._scalars)
+
+
+def _contra_v3_window(start_ms: int = 86_400_000) -> SentimentWindow:
+    """contrarian 触发窗（t=+50s q=0.20，触发时点 BTC 平盘过 v2 门禁）。"""
+    return SentimentWindow(
+        start_time=start_ms, end_time=start_ms + 300_000,
+        actual_return=-0.001, outcome="DOWN",
+        entry_price=100.0,
+        curve_down_price=[{"t": start_ms + 50_000, "v": 0.20}],
+        curve_btc_price=[{"t": start_ms, "v": 100.0},
+                         {"t": start_ms + 50_000, "v": 100.0}],
+    )
+
+
+def test_pass_v3_env_guard_prev_down_only() -> None:
+    """v3a：前窗 DOWN 过；前窗 UP / NOISE / 未归档 → 拒（保守不落表）。"""
+    w = _contra_v3_window()
+    ts = int(w.start_time) + 50_000
+    assert qed._pass_v3_env_guard("quote_contrarian_v3a", w, ts, "DOWN", None) is True
+    for prev in ("UP", "NOISE", None):
+        assert qed._pass_v3_env_guard("quote_contrarian_v3a", w, ts, prev, None) is False
+
+
+def test_pass_v3_env_guard_day_high_drawdown() -> None:
+    """v3b：v3a 基础上要求距日高回落≥0.30%（含边界）；缺失 → 拒。"""
+    w = _contra_v3_window()
+    ts = int(w.start_time) + 50_000
+    # 日高 100.50 → 触发时点 100.0 回落 −0.498% ≤ −0.30% → 过
+    assert qed._pass_v3_env_guard("quote_contrarian_v3b", w, ts, "DOWN", 100.50) is True
+    # 回落 −0.31%（过门槛）→ 过
+    assert qed._pass_v3_env_guard("quote_contrarian_v3b", w, ts, "DOWN", 100.31) is True
+    # 只回落 −0.10% → 拒；日高缺失 / 前窗非 DOWN → 拒
+    assert qed._pass_v3_env_guard("quote_contrarian_v3b", w, ts, "DOWN", 100.10) is False
+    assert qed._pass_v3_env_guard("quote_contrarian_v3b", w, ts, "DOWN", None) is False
+    assert qed._pass_v3_env_guard("quote_contrarian_v3b", w, ts, "UP", 100.50) is False
+
+
+def test_pass_v3_env_guard_boundary_inclusive(monkeypatch) -> None:
+    """含边界语义钉死：dd 恰等于阈值 → 过；阈值收紧一线 → 拒。"""
+    w = _contra_v3_window()
+    ts = int(w.start_time) + 50_000
+    high = 100.50
+    dd = (100.0 - high) / high * 100.0       # 实际回落 −0.4975…%
+    monkeypatch.setattr(qed, "V3_DD_THRESHOLD", dd)
+    assert qed._pass_v3_env_guard("quote_contrarian_v3b", w, ts, "DOWN", high) is True
+    monkeypatch.setattr(qed, "V3_DD_THRESHOLD", dd - 1e-9)
+    assert qed._pass_v3_env_guard("quote_contrarian_v3b", w, ts, "DOWN", high) is False
+
+
+@pytest.mark.asyncio
+async def test_day_high_btc_ex_ante_and_predicate_bounds() -> None:
+    """日高只取 ≤quote_ts 的点；SQL 范围谓词钉死为 [UTC 日界, 本窗 start]。"""
+    w = _contra_v3_window()
+    ts = int(w.start_time) + 50_000
+    day_start = (ts // 86_400_000) * 86_400_000
+    curves = [[{"t": ts - 300_000, "v": 101.0}, {"t": ts + 100_000, "v": 200.0}]]
+    session = _EnvSession(day_high_curves=curves,
+                          expect_day_start=day_start,
+                          expect_max_start=int(w.start_time))
+    d = QuoteEdgeDetector()
+    assert await d._day_high_btc(session, w, ts) == 101.0  # 未来点 200.0 不算
+
+
+@pytest.mark.asyncio
+async def test_day_high_btc_cache_incremental_and_reset() -> None:
+    """增量缓存：第二次查询下界推进到水位+1、高点累计；乱序窗口触发重置。"""
+    w1 = _contra_v3_window(start_ms=86_400_000)
+    w2 = _contra_v3_window(start_ms=86_700_000)
+    ts1 = int(w1.start_time) + 50_000
+    ts2 = int(w2.start_time) + 50_000
+    d = QuoteEdgeDetector()
+    s1 = _EnvSession(day_high_curves=[[{"t": ts1 - 50_000, "v": 102.0}]],
+                     expect_day_start=86_400_000, expect_max_start=int(w1.start_time))
+    assert await d._day_high_btc(s1, w1, ts1) == 102.0
+    # 第二次：下界 = 首窗 start+1（只拉增量）；新曲线 101 < 缓存 102 → 高点不变
+    s2 = _EnvSession(day_high_curves=[[{"t": ts2 - 50_000, "v": 101.0}]],
+                     expect_day_start=int(w1.start_time) + 1,
+                     expect_max_start=int(w2.start_time))
+    assert await d._day_high_btc(s2, w2, ts2) == 102.0
+    # 乱序窗口（start < 水位）→ 缓存重置，下界回到 UTC 日界
+    s3 = _EnvSession(day_high_curves=[[{"t": ts1 - 50_000, "v": 103.0}]],
+                     expect_day_start=86_400_000, expect_max_start=int(w1.start_time))
+    assert await d._day_high_btc(s3, w1, ts1) == 103.0
+
+
+def _v3_gate_stub(monkeypatch, v3a, v3b) -> None:
+    """把 v2 门禁固定为通过、v3 环境门禁按版本返回指定值。"""
+    monkeypatch.setattr(qed, "_pass_v2_price_guard", lambda *a: True)
+
+    def _guard(version, w, quote_ts, prev_outcome, day_high):
+        return {"quote_contrarian_v3a": v3a, "quote_contrarian_v3b": v3b}[version]
+
+    monkeypatch.setattr(qed, "_pass_v3_env_guard", _guard)
+
+
+@pytest.mark.asyncio
+async def test_v3_gate_pass_inserts_v1_v2_v3a_v3b(monkeypatch) -> None:
+    """v2+v3a+v3b 全过 → v1/v2/v3a/v3b 四条同窗落表，v3 字段与 v2 同源。"""
+    d, session = _make_detector(monkeypatch)
+    _v3_gate_stub(monkeypatch, v3a=True, v3b=True)
+    await d._process_window(_contra_v3_window())
+    versions = sorted(s.version for s in session.added)
+    assert versions == ["quote_contrarian_v1", "quote_contrarian_v2",
+                        "quote_contrarian_v3a", "quote_contrarian_v3b"]
+    v3b = next(s for s in session.added if s.version == "quote_contrarian_v3b")
+    assert v3b.entry_down_price == 0.20 and v3b.win is True
+    assert v3b.ev_at_entry == pytest.approx(0.98 / 0.20 - 1.0)  # 与 v1/v2 同口径
+    assert v3b.status == "SETTLED"
+
+
+@pytest.mark.asyncio
+async def test_v3a_fail_v3b_fail_only_v1_v2(monkeypatch) -> None:
+    """v3a 环境门禁未过 → v3a/v3b 都不落，v1/v2 不受影响（v3b⊂v3a）。"""
+    d, session = _make_detector(monkeypatch)
+    _v3_gate_stub(monkeypatch, v3a=False, v3b=False)
+    await d._process_window(_contra_v3_window())
+    versions = sorted(s.version for s in session.added)
+    assert versions == ["quote_contrarian_v1", "quote_contrarian_v2"]
+
+
+@pytest.mark.asyncio
+async def test_v3a_pass_v3b_fail_only_v3a(monkeypatch) -> None:
+    """v3a 过、v3b 距日高不足 → 只多落 v3a，v3b 拒。"""
+    d, session = _make_detector(monkeypatch)
+    _v3_gate_stub(monkeypatch, v3a=True, v3b=False)
+    await d._process_window(_contra_v3_window())
+    versions = sorted(s.version for s in session.added)
+    assert versions == ["quote_contrarian_v1", "quote_contrarian_v2",
+                        "quote_contrarian_v3a"]
+
+
+@pytest.mark.asyncio
+async def test_v3_requires_v2_price_gate(monkeypatch) -> None:
+    """v2 价格门禁未过（真冲高）→ v3 也不落：v3 = v2 ∩ 环境门禁。"""
+    d, session = _make_detector(monkeypatch)
+
+    def _guard(version, w, quote_ts, prev_outcome, day_high):
+        return True  # 环境门禁永远过
+
+    monkeypatch.setattr(qed, "_pass_v3_env_guard", _guard)
+    monkeypatch.setattr(qed, "_pass_v2_price_guard",
+                        lambda version, w, ts: version != "quote_contrarian_v2")
+    await d._process_window(_contra_v3_window())
+    versions = sorted(s.version for s in session.added)
+    assert versions == ["quote_contrarian_v1"]  # v2/v3a/v3b 全被价格门禁拦住
+
+
+@pytest.mark.asyncio
+async def test_momentum_unaffected_by_v3(monkeypatch) -> None:
+    """v3 只基于 contrarian 区间：momentum 窗不产生任何 v3 记录。"""
+    d, session = _make_detector(monkeypatch)
+    w = SentimentWindow(
+        start_time=0, end_time=300_000, actual_return=-0.001, outcome="DOWN",
+        entry_price=100.0,
+        curve_down_price=[{"t": 100_000, "v": 0.71}],
+        curve_btc_price=[{"t": 0, "v": 100.0}, {"t": 100_000, "v": 99.8}],
+    )
+    await d._process_window(w)
+    versions = sorted(s.version for s in session.added)
+    assert versions == ["quote_momentum_v1", "quote_momentum_v2"]

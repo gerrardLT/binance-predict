@@ -93,14 +93,17 @@ def test_critical_still_uses_short_window() -> None:
 
 
 @pytest.mark.asyncio
-async def test_notify_skips_ok_status() -> None:
+async def test_notify_skips_ok_status(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "agent_alert_notify_enabled", True)
     n = AlertNotifier()
     sent = await n.notify(_report("OK", []))
     assert sent == []
 
 
 @pytest.mark.asyncio
-async def test_notify_dedups_across_calls() -> None:
+async def test_notify_dedups_across_calls(monkeypatch) -> None:
+    # 钉死总闸开启（本地 .env 可能已置 false 暂停告警，与本用例无关）
+    monkeypatch.setattr(settings, "agent_alert_notify_enabled", True)
     n = AlertNotifier()
     report = _report("CRITICAL", [_alert("WINDOW_STALE")])
     # 首次推送返回该告警（邮件/webhook 均未配置，不触发外部 I/O）
@@ -109,3 +112,37 @@ async def test_notify_dedups_across_calls() -> None:
     # 立即二次调用（远小于抑制窗口）→ 被抑制
     second = await n.notify(report)
     assert second == []
+
+
+@pytest.mark.asyncio
+async def test_notify_paused_by_master_switch(monkeypatch) -> None:
+    """告警推送总闸（2026-08-25）：notify_enabled=False 时全暂停且不 mark_sent，
+    恢复后新告警能及时推送；信号推送开关与之解耦（由 signal_notify 测试覆盖）。"""
+    monkeypatch.setattr(settings, "agent_alert_notify_enabled", False)
+    n = AlertNotifier()
+    report = _report("CRITICAL", [_alert("WINDOW_STALE")])
+    assert await n.notify(report) == []
+    # 暂停期间不 mark_sent：恢复后同一告警立即推送（不吞告警）
+    monkeypatch.setattr(settings, "agent_alert_notify_enabled", True)
+    assert len(await n.notify(report)) == 1
+
+
+@pytest.mark.asyncio
+async def test_send_plain_email_gated_by_signal_switch(monkeypatch) -> None:
+    """send_plain_email 门控解耦：受 signal_push_email_enabled 控制，
+    不再依赖 agent_alert_email_enabled（暂停告警不影响信号邮件）。"""
+    from binance_predict.services import alerting
+
+    monkeypatch.setattr(settings, "signal_push_email_enabled", False)
+    monkeypatch.setattr(settings, "agent_alert_email_enabled", True)
+    assert await alerting.send_plain_email("s", "b") is False
+
+    # 信号开关开 + 告警开关关 → 照样能发（桩掉 SMTP）：
+    # 门控与告警开关彻底解耦
+    monkeypatch.setattr(settings, "signal_push_email_enabled", True)
+    monkeypatch.setattr(settings, "agent_alert_email_enabled", False)
+    monkeypatch.setattr(settings, "agent_alert_smtp_host", "smtp.test")
+    monkeypatch.setattr(settings, "agent_alert_email_to", "a@b.c")
+    monkeypatch.setattr(alerting, "_send_email_sync", lambda *a, **k: None)
+    assert await alerting.send_plain_email("s", "b") is True
+

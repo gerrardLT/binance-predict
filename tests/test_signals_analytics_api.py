@@ -220,7 +220,7 @@ async def test_analytics_regime_split_and_daily() -> None:
 
 @pytest.mark.asyncio
 async def test_analytics_empty_db() -> None:
-    """空数据：结构完整不崩溃（v2 门禁版部署即入面板，bench=None）。"""
+    """空数据：结构完整不崩溃（v2/v3 门禁版部署即入面板，bench=None）。"""
     import binance_predict.main as m
 
     db = _make_db([], [])
@@ -228,7 +228,8 @@ async def test_analytics_empty_db() -> None:
 
     assert set(out["shadow"].keys()) == {
         "x4_v1", "quote_momentum_v1", "quote_contrarian_v1",
-        "x4_v2", "quote_momentum_v2", "quote_contrarian_v2"}
+        "x4_v2", "quote_momentum_v2", "quote_contrarian_v2",
+        "quote_contrarian_v3a", "quote_contrarian_v3b"}
     for v, blk in out["shadow"].items():
         assert blk["summary"]["n"] == 0
         assert blk["summary"]["win_rate"] is None

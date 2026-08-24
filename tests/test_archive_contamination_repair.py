@@ -87,6 +87,31 @@ def test_x4_reprocess_includes_next_window_for_settlement() -> None:
     assert got2 == {t - W, t, t + W, t + 2 * W}
 
 
+def test_qe_v3_successors_cover_rest_of_utc_day() -> None:
+    # v3b 日高读取当日全部早窗 BTC 曲线 → 重建窗同一 UTC 日的全部后续窗
+    # 都在重扫集（不含重建窗自身），到 UTC 日界截止
+    day = 86_400_000                      # UTC 第 1 天 00:00
+    c = day + 60 * W                      # 当日第 61 窗
+    got = acr.qe_v3_successor_starts({c})
+    assert c not in got and c - W not in got
+    assert min(got) == c + W
+    assert max(got) == 2 * day - W        # 当日最后一窗
+    assert len(got) == 288 - 61           # 后续全部窗口
+
+
+def test_qe_v3_successors_empty_at_day_end_and_multi_day() -> None:
+    day = 86_400_000
+    # 当日末窗重建 → 同日无后续窗，不跨日
+    assert acr.qe_v3_successor_starts({2 * day - W}) == set()
+    # 多日重建窗：各自按所属 UTC 日展开，互不串日
+    got = acr.qe_v3_successor_starts({day, 2 * day})
+    assert got & {day, 2 * day} == set()  # 不含重建窗自身
+    assert day + W in got and 2 * day + W in got
+    # 不跨日：第 1 天重建窗的后续集到 2*day−W 截止，不含第 2 天起点本身之外的跨日窗
+    day1_succ = acr.qe_v3_successor_starts({day})
+    assert max(day1_succ) == 2 * day - W
+
+
 # ------------------------------------------------------------------
 # 重建口径消解幻影（复刻 rebuild 的曲线构建 + 检测器扫描）
 # ------------------------------------------------------------------
