@@ -1446,8 +1446,22 @@ function LiveTradeTab() {
 // Main App
 // ============================================================
 
+const TAB_IDS = ['market', 'agent', 'monitor', 'analysis', 'live'] as const
+type TabId = (typeof TAB_IDS)[number]
+
+// URL hash 记忆当前 tab：刷新 / 分享链接时回到原页，而不是一律落回首页
+const tabFromHash = (): TabId => {
+  const h = window.location.hash.slice(1)
+  return (TAB_IDS as readonly string[]).includes(h) ? (h as TabId) : 'market'
+}
+
 export default function App() {
-  const [tab, setTab] = useState<'market' | 'agent' | 'monitor' | 'analysis' | 'live'>('market')
+  const [tab, setTab] = useState<TabId>(tabFromHash)
+
+  // replaceState 不产生历史条目，避免污染浏览器后退键
+  useEffect(() => {
+    window.history.replaceState(null, '', '#' + tab)
+  }, [tab])
 
   // 市场情绪
   const [pmPoints, setPmPoints] = useState<PMPoint[]>([])
