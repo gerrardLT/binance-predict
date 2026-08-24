@@ -26,11 +26,12 @@ W = 5 * 60 * 1000
 
 def _win(start: int, curve_down_price: list | None = None,
          curve_up_price: list | None = None,
-         curve_up_pct: list | None = None) -> SimpleNamespace:
+         curve_up_pct: list | None = None,
+         curve_down_pct: list | None = None) -> SimpleNamespace:
     return SimpleNamespace(
         start_time=start, end_time=start + W,
         curve_down_price=curve_down_price, curve_up_price=curve_up_price,
-        curve_up_pct=curve_up_pct,
+        curve_up_pct=curve_up_pct, curve_down_pct=curve_down_pct,
     )
 
 
@@ -52,6 +53,8 @@ def test_window_is_contaminated_any_curve() -> None:
     assert acr.window_is_contaminated(_win(0, curve_down_price=dup)) is True
     assert acr.window_is_contaminated(_win(0, curve_up_price=dup)) is True
     assert acr.window_is_contaminated(_win(0, curve_up_pct=dup)) is True
+    # curve_down_pct 也是指纹之一（x4 结算 proxy 回退通道消费它）
+    assert acr.window_is_contaminated(_win(0, curve_down_pct=dup)) is True
     assert acr.window_is_contaminated(_win(0, curve_down_price=[{"t": 1, "v": 0.2}])) is False
 
 
@@ -69,8 +72,19 @@ def test_x4_reprocess_includes_clean_prev_window() -> None:
     # 重扫集合必须含 C（重触发）与 T（重结算），升序保证先触发后结算
     t = 1_000_000
     got = acr.x4_reprocess_starts({t})
-    assert got == {t - W, t}
-    assert sorted(got)[0] == t - W
+    assert t - W in got and t in got
+    assert sorted(got)[:2] == [t - W, t]
+
+
+def test_x4_reprocess_includes_next_window_for_settlement() -> None:
+    # 末位污染窗 L 自身触发的重建信号（target=L+5m 干净窗）需要后一窗结算；
+    # 缺后一窗 → PENDING 无人结算，检测器启动后误标 EXPIRED、SETTLED 记账丢失
+    t = 1_000_000
+    got = acr.x4_reprocess_starts({t})
+    assert t + W in got
+    # 连续污染块：内部窗互为前/后窗，集合边界两端各扩一窗
+    got2 = acr.x4_reprocess_starts({t, t + W})
+    assert got2 == {t - W, t, t + W, t + 2 * W}
 
 
 # ------------------------------------------------------------------

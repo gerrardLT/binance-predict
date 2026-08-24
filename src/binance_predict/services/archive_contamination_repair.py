@@ -23,8 +23,9 @@ sample_count≈40=20 轮询×2 市场）。下游报价 edge 影子系统性扫�
 """
 from __future__ import annotations
 
-import logging
 from datetime import datetime, timezone
+
+from loguru import logger
 
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import select as sa_select
@@ -37,8 +38,6 @@ from binance_predict.db.models import (
     SentimentWindow,
     TradeOrderModel,
 )
-
-logger = logging.getLogger(__name__)
 
 # 15m 采样开始积累的时间（samples 表注释口径）：之前不存在 15m 样本，
 # 不可能有污染 → 扫描下界，避免全表 JSON 解析。
@@ -65,6 +64,7 @@ def window_is_contaminated(w: SentimentWindow) -> bool:
         has_duplicate_ts(w.curve_down_price)
         or has_duplicate_ts(w.curve_up_price)
         or has_duplicate_ts(w.curve_up_pct)
+        or has_duplicate_ts(w.curve_down_pct)
     )
 
 
@@ -91,7 +91,10 @@ async def rebuild_window_from_raw_samples(w: SentimentWindow) -> SentimentWindow
     start_ms, end_ms = int(w.start_time), int(w.end_time)
     async with async_session_factory() as session:
         w = (await session.execute(
-            sa_select(SentimentWindow).where(SentimentWindow.start_time == start_ms)
+            sa_select(SentimentWindow).where(
+                SentimentWindow.start_time == start_ms,
+                SentimentWindow.end_time == end_ms,  # 与 uq_sw_start_end 对齐
+            )
         )).scalar_one_or_none()
         if w is None:
             return None
@@ -145,13 +148,17 @@ def x4_affected_condition_values(contaminated: set[int]) -> set[int]:
 
 
 def x4_reprocess_starts(contaminated: set[int]) -> set[int]:
-    """x4 重扫窗集合 = 污染窗 ∪ 其前一窗。
+    """x4 重扫窗集合 = 污染窗 ∪ 前一窗 ∪ 后一窗。
 
-    前一窗可能是干净触发源（其信号的结算价被污染目标窗污染，已被删除），
+    前一窗：可能是干净触发源（其信号的结算价被污染目标窗污染，已被删除），
     重扫后按干净曲线重新触发 PENDING，轮到目标窗时正常结算。
+    后一窗：污染窗自身触发的重建信号（target=后一窗）需要后一窗来结算；
+    若后一窗干净且不在集合内，PENDING 无人结算会被检测器误标 EXPIRED。
+    升序迭代天然保证先触发后结算。
     """
     prevs = {c - WINDOW_MS for c in contaminated}
-    return contaminated | prevs
+    nexts = {c + WINDOW_MS for c in contaminated}
+    return contaminated | prevs | nexts
 
 
 async def _delete_affected_signals(contaminated: set[int]) -> dict:
@@ -226,15 +233,16 @@ async def repair_contaminated_archives() -> dict:
             logger.warning("污染自愈：重建失败（跳过）| window {} | {}",
                            w.start_time, exc)
     stats["rebuilt"] = len(rebuilt_wins)
-    if not rebuilt_wins:
-        return stats
 
-    # --- 2) 删除受影响信号（重建窗集合）---
-    rebuilt_starts = {int(w.start_time) for w in rebuilt_wins}
-    deleted = await _delete_affected_signals(rebuilt_starts)
+    # --- 2) 删除受影响信号（全部污染窗：重建窗重落，跳过窗曲线不可信、
+    # 其信号同样不可信，一并删除避免虚高 EV 继续计入统计）---
+    contaminated_starts = {int(w.start_time) for w in contaminated_wins}
+    deleted = await _delete_affected_signals(contaminated_starts)
     stats["deleted_quote_edge"] = deleted["quote_edge"]
     stats["deleted_x4"] = deleted["x4"]
     stats["orders_unlinked"] = deleted["orders_unlinked"]
+    if not rebuilt_wins:
+        return stats
 
     # --- 3) 按干净曲线重落信号（复用检测器单窗逻辑，幂等约束防重）---
     from .misalignment_detector import MisalignmentDetector
@@ -249,18 +257,19 @@ async def repair_contaminated_archives() -> dict:
         except Exception as exc:
             logger.warning("污染自愈：quote_edge 重扫失败 | window {} | {}",
                            w.start_time, exc)
-    # x4：干净前窗的触发信号（结算被污染目标窗污染）同样被删除，
-    # 需加载前窗重触发 → 目标窗（已重建）结算，升序保证先触发后结算。
-    prev_starts = sorted(
-        (c - WINDOW_MS for c in rebuilt_starts if c - WINDOW_MS not in by_start)
+    # x4：干净前窗（触发源重建）与干净后窗（结算重建信号）同样需参与重扫，
+    # 缺失的从 DB 加载；升序保证先触发后结算。
+    rebuilt_starts = {int(w.start_time) for w in rebuilt_wins}
+    neighbor_starts = sorted(
+        s for s in x4_reprocess_starts(rebuilt_starts) if s not in by_start
     )
-    if prev_starts:
+    if neighbor_starts:
         async with async_session_factory() as session:
-            prev_wins = (await session.execute(
+            neighbor_wins = (await session.execute(
                 sa_select(SentimentWindow)
-                .where(SentimentWindow.start_time.in_(prev_starts))
+                .where(SentimentWindow.start_time.in_(neighbor_starts))
             )).scalars().all()
-        for w in prev_wins:
+        for w in neighbor_wins:
             by_start[int(w.start_time)] = w
     x4_detector = MisalignmentDetector()
     for s in sorted(set(by_start) & x4_reprocess_starts(rebuilt_starts)):
