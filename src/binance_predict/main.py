@@ -956,6 +956,17 @@ async def lifespan(app: FastAPI):
         await fake_breakout_detector.start()
         logger.info("场景检测器已启动（S1多头耗尽/S2空头耗尽/S4动量衰竭，真 OOS 修正版，信号模式不下注）")
 
+    # 归档污染一次性自愈（幂等）：历史 5m 归档窗曾被 15m 样本污染（写入路径
+    # 已由 commit 5fe6356 修复），此处从原始 5m 采样重建污染窗曲线并重落影子
+    # 信号；失败不阻塞启动。必须早于两个影子检测器冷启动回扫。
+    try:
+        from binance_predict.services.archive_contamination_repair import (
+            repair_contaminated_archives,
+        )
+        await repair_contaminated_archives()
+    except Exception as exc:
+        logger.error("归档污染自愈失败（不阻塞启动）: {}", exc)
+
     # X4 情绪错位影子信号（M4）：收阳&end≤40→押次窗DOWN，只记录不下注，
     # 次窗归档后回读真实报价与结算，攒 2~3 周定案经济账后人工 promote
     global misalignment_detector
