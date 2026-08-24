@@ -997,7 +997,8 @@ async def lifespan(app: FastAPI):
 
     # 多通道实盘执行器（MultiLiveTrader，2026-08-24 取代单版本 QuoteEdgeLiveTrader）：
     # 10 通道各自独立金额/日限/护栏/开关，三族触发（quote_edge 喂价/x4 轮询/场景钩子）；
-    # 无条件装配 + 通道标志位控制开火；启动后 toggle 逐通道热调；重启回落 LIVE_CHANNELS_JSON。
+    # 无条件装配 + 通道标志位控制开火；配置分层：代码默认 → LIVE_CHANNELS_JSON
+    # → DB 覆盖层（toggle 持久化，重启不丢设定）。
     global multi_live_trader
     try:
         multi_live_trader = MultiLiveTrader(prediction_trader)
@@ -1005,6 +1006,12 @@ async def lifespan(app: FastAPI):
         # 通道配置非法（未知通道名/金额超硬上限/护栏非法）：拒实盘不拖垮其他服务
         logger.error("多通道实盘执行器装配失败：{}", exc)
     else:
+        # DB 覆盖层（用户最后一次 toggle 的设定，优先级高于 env）；
+        # fail-safe：DB 异常回落 env 层配置，不阻塞服务启动
+        try:
+            await multi_live_trader.apply_db_overrides()
+        except Exception as exc:
+            logger.warning("多通道实盘：DB 覆盖层加载失败（回落 env 配置）| {}", exc)
         await multi_live_trader.start()
         # 余额缓存作废钩子：信号单成交后作废 prediction-wallet TTL 缓存
         # （下单扣预测钱包余额；与划转端点同款失效逻辑，前端下次轮询即取新值）
@@ -1915,8 +1922,8 @@ async def live_toggle(
     """实时开关/热调单个实盘通道（MultiLiveTrader，多通道时代重写）。
 
     通道白名单 LIVE_CHANNELS；可选 amount_usdt/max_daily_orders 同步热调
-    （校验同启动配置，非法值拒改不落库），立即生效。
-    fail-safe：均为运行时态，重启后回落 LIVE_CHANNELS_JSON。
+    （校验同启动配置，非法值拒改不落库），立即生效并持久化到
+    live_channel_overrides（重启不丢设定；DB 写失败仅告警不影响运行时生效）。
     ⚠️ 关闭不取消在途任务（High#1），只阻止该通道新单派生。
     """
     if multi_live_trader is None:
@@ -1928,6 +1935,12 @@ async def live_toggle(
             max_daily_orders=req.max_daily_orders)
     except ValueError as exc:
         return {"error": str(exc)}
+    try:
+        await multi_live_trader.persist_channel(req.channel)
+    except Exception as exc:
+        # 运行时已生效，仅持久化失败：告警不报错，下次 toggle 自愈
+        logger.warning("实盘通道配置持久化失败（重启将回落 env 配置）| {} | {}",
+                       req.channel, exc)
     _status = await multi_live_trader.status_async()
     _ch = next((c for c in _status["channels"] if c["channel"] == req.channel), None)
     if _ch is None:

@@ -742,6 +742,11 @@ async def test_toggle_endpoint_channel_flow(monkeypatch) -> None:
         return self.status()
 
     monkeypatch.setattr(MultiLiveTrader, "status_async", _status_async)
+
+    async def _persist(self, channel):
+        return None  # 免碰真实 DB（持久化行为见组 10 专项用例）
+
+    monkeypatch.setattr(MultiLiveTrader, "persist_channel", _persist)
     out = await m.live_toggle(
         ToggleLiveRequest(channel="x4_v1", enabled=True, amount_usdt=1.5),
         _=None)
@@ -761,6 +766,11 @@ async def test_toggle_endpoint_bad_channel_and_amount(monkeypatch) -> None:
     t = _make_trader(monkeypatch, _FakeTrader(), channels=[])
     monkeypatch.setattr(m, "multi_live_trader", t)
 
+    async def _persist(self, channel):
+        return None
+
+    monkeypatch.setattr(MultiLiveTrader, "persist_channel", _persist)
+
     out = await m.live_toggle(
         ToggleLiveRequest(channel="nonexistent", enabled=True), _=None)
     assert "error" in out
@@ -769,6 +779,108 @@ async def test_toggle_endpoint_bad_channel_and_amount(monkeypatch) -> None:
         _=None)
     assert "error" in out
     assert t._configs["x4_v1"].enabled is False   # 金额校验失败未被置位
+
+
+# ============================================================
+# 组 10：DB 覆盖层（toggle 持久化，重启不丢设定）
+# ============================================================
+
+class _OverrideSession:
+    """live_channel_overrides 会话桩：execute 回 rows / merge 记录 / commit 放行。"""
+
+    def __init__(self, rows: list) -> None:
+        self._rows = rows
+        self.merged: list = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def execute(self, stmt):
+        res = MagicMock()
+        res.scalars.return_value.all.return_value = self._rows
+        return res
+
+    async def merge(self, row):
+        self.merged.append(row)
+        return row
+
+    async def commit(self):
+        return None
+
+
+def _stub_override_db(monkeypatch, rows: list) -> _OverrideSession:
+    sess = _OverrideSession(rows)
+    monkeypatch.setattr(milt, "async_session_factory", lambda: sess)
+    return sess
+
+
+@pytest.mark.asyncio
+async def test_apply_db_overrides_applies_and_skips_bad(monkeypatch) -> None:
+    """DB 覆盖层：合法行覆盖 env 设定；未知通道行跳过不崩启动；
+    enabled_at_startup 重快照反映覆盖后的最终启动态。"""
+    t = _make_trader(monkeypatch, _FakeTrader(),
+                     channels=["quote_contrarian_v1"])
+    rows = [
+        SimpleNamespace(channel="x4_v1", enabled=True,
+                        amount_usdt=1.5, max_daily_orders=50),
+        SimpleNamespace(channel="ghost_channel", enabled=True,
+                        amount_usdt=2.0, max_daily_orders=10),
+        SimpleNamespace(channel="quote_contrarian_v1", enabled=False,
+                        amount_usdt=2.0, max_daily_orders=100),
+    ]
+    _stub_override_db(monkeypatch, rows)
+
+    applied = await t.apply_db_overrides()
+
+    assert applied == ["x4_v1", "quote_contrarian_v1"]   # ghost 被跳过
+    assert t._configs["x4_v1"].enabled is True
+    assert t._configs["x4_v1"].amount_usdt == 1.5
+    assert t._configs["x4_v1"].max_daily_orders == 50
+    assert t._configs["quote_contrarian_v1"].enabled is False   # DB 胜过 env 层
+    assert t._enabled_at_startup["quote_contrarian_v1"] is False
+
+
+@pytest.mark.asyncio
+async def test_persist_channel_writes_snapshot(monkeypatch) -> None:
+    """持久化：upsert 该通道当前完整配置快照（重启后恢复的正是最后设定）。"""
+    t = _make_trader(monkeypatch, _FakeTrader())
+    sess = _stub_override_db(monkeypatch, [])
+
+    t.set_channel("x4_v2", enabled=True, amount_usdt=3.0, max_daily_orders=7)
+    await t.persist_channel("x4_v2")
+
+    assert len(sess.merged) == 1
+    row = sess.merged[0]
+    assert row.channel == "x4_v2" and row.enabled is True
+    assert row.amount_usdt == 3.0 and row.max_daily_orders == 7
+    assert row.updated_at is not None
+
+
+@pytest.mark.asyncio
+async def test_toggle_endpoint_persists(monkeypatch) -> None:
+    """toggle 端点：运行时生效成功后持久化该通道（重启不丢设定链路）。"""
+    import binance_predict.main as m
+    from binance_predict.models.schemas import ToggleLiveRequest
+
+    t = _make_trader(monkeypatch, _FakeTrader(), channels=[])
+    monkeypatch.setattr(m, "multi_live_trader", t)
+    persisted: list[str] = []
+
+    async def _persist(self, channel):
+        persisted.append(channel)
+
+    async def _status_async(self):
+        return self.status()
+
+    monkeypatch.setattr(MultiLiveTrader, "persist_channel", _persist)
+    monkeypatch.setattr(MultiLiveTrader, "status_async", _status_async)
+    out = await m.live_toggle(
+        ToggleLiveRequest(channel="x4_v1", enabled=True), _=None)
+    assert "error" not in out
+    assert persisted == ["x4_v1"]
 
 
 # ============================================================

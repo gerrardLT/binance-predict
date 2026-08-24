@@ -41,7 +41,11 @@ from sqlalchemy import update as sa_update
 
 from binance_predict.config.settings import settings
 from binance_predict.db.engine import async_session_factory
-from binance_predict.db.models import MisalignmentSignal, TradeOrderModel
+from binance_predict.db.models import (
+    LiveChannelOverride,
+    MisalignmentSignal,
+    TradeOrderModel,
+)
 
 from .live_channels import (
     LIVE_CHANNELS,
@@ -508,11 +512,12 @@ class MultiLiveTrader:
     def set_channel(self, channel: str, enabled: bool | None = None,
                     amount_usdt: float | None = None,
                     max_daily_orders: int | None = None) -> None:
-        """运行时热调单通道（toggle 端点调用；重启回落 live_channels_json）。
+        """运行时热调单通道（toggle 端点调用）。
 
         白名单/数值校验同启动配置（不靠自律靠拒改）；在途任务不受影响。
         原子性：先校验全部参数再统一生效——任一非法则整体拒改，
         不会出现「enabled 已置位但金额校验失败」的半生效状态。
+        持久化由端点在生效成功后调 persist_channel（本方法不碰 DB，保持同步原子）。
         """
         if channel not in self._specs:
             raise ValueError(
@@ -534,6 +539,55 @@ class MultiLiveTrader:
             cfg.amount_usdt = float(amount_usdt)
         if max_daily_orders is not None:
             cfg.max_daily_orders = int(max_daily_orders)
+
+    async def apply_db_overrides(self) -> list[str]:
+        """启动分层最高层：从 live_channel_overrides 加载并覆盖 env 层配置。
+
+        在 start() 前调用（lifespan 装配区）。fail-safe：单行非法（未知通道/
+        数值超界）跳过并告警，不阻塞启动；DB 不可达由调用方兜底（回落 env 层）。
+        覆盖后重新快照 enabled_at_startup（状态字段反映最终启动态）。
+        """
+        async with async_session_factory() as session:
+            rows = list((await session.execute(
+                sa_select(LiveChannelOverride)
+            )).scalars().all())
+        applied: list[str] = []
+        for row in rows:
+            try:
+                self.set_channel(
+                    row.channel, enabled=row.enabled,
+                    amount_usdt=row.amount_usdt,
+                    max_daily_orders=row.max_daily_orders)
+            except ValueError as exc:
+                logger.warning("多通道实盘：DB 覆盖行非法已跳过 | {}", exc)
+                continue
+            applied.append(row.channel)
+        if applied:
+            self._enabled_at_startup = {
+                ch: cfg.enabled for ch, cfg in self._configs.items()
+            }
+            logger.info("多通道实盘：DB 覆盖层已应用 {} 通道 | {}",
+                        len(applied), applied)
+        return applied
+
+    async def persist_channel(self, channel: str) -> None:
+        """toggle 生效成功后 upsert 覆盖行（重启不丢设定）。
+
+        写的是该通道当前完整配置快照（含本次未显式传的字段），保证重启后
+        恢复的正是用户最后看到的设定。DB 写失败由端点告警不抛——
+        运行时已生效，下次 toggle 自愈。
+        """
+        cfg = self._configs[channel]
+        row = LiveChannelOverride(
+            channel=channel,
+            enabled=cfg.enabled,
+            amount_usdt=cfg.amount_usdt,
+            max_daily_orders=cfg.max_daily_orders,
+            updated_at=datetime.now(timezone.utc),
+        )
+        async with async_session_factory() as session:
+            await session.merge(row)
+            await session.commit()
 
     def status(self) -> dict:
         """同步状态（不含 DB 查询；今日成交数见 status_async）。"""

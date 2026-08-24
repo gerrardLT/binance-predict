@@ -1011,3 +1011,35 @@ class SceneParamVersion(Base):
         DateTime(timezone=True), nullable=True,
         comment="退为 RETIRED 的时刻（被新版本接替或人工回退）"
     )
+
+
+# ============================================================
+# 实盘通道配置覆盖表（MultiLiveTrader 运行时 toggle 持久化）
+# ============================================================
+
+class LiveChannelOverride(Base):
+    """实盘通道运行时配置的持久化覆盖层（重启不丢设定）。
+
+    启动配置分层：代码默认 → LIVE_CHANNELS_JSON（env）→ 本表（最高优先级，
+    代表用户最后一次 toggle 的设定）。toggle 端点在运行时生效成功后 upsert；
+    删行即回落到 env 层配置。
+    """
+    __tablename__ = "live_channel_overrides"
+
+    channel: Mapped[str] = mapped_column(
+        String(64), primary_key=True,
+        comment="通道名（LIVE_CHANNELS 白名单，如 quote_contrarian_v2）"
+    )
+    enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, comment="通道开关"
+    )
+    amount_usdt: Mapped[float] = mapped_column(
+        Float, nullable=False, comment="单笔金额 USDT（硬上限见 MAX_ORDER_AMOUNT_USDT）"
+    )
+    max_daily_orders: Mapped[int] = mapped_column(
+        Integer, nullable=False, comment="日单量上限（硬上限见 MAX_DAILY_ORDERS_CAP）"
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+        comment="最后一次 toggle 生效时刻（配置变更审计）"
+    )
