@@ -79,14 +79,22 @@ async def find_contaminated_windows(floor_ms: int) -> list[SentimentWindow]:
     return [w for w in rows if window_is_contaminated(w)]
 
 
-async def rebuild_window_from_raw_samples(w: SentimentWindow) -> bool:
+async def rebuild_window_from_raw_samples(w: SentimentWindow) -> SentimentWindow | None:
     """用原始 5m 采样重建曲线（与 main.py 归档器构建逻辑同口径）。
 
+    注意：入参 w 是旧 session 的 detached 对象，必须在新 session 内重查后
+    再改，否则变更不被跟踪、commit 静默空转。返回重建后的窗口对象
+    （供后续重扫直接消费）；样本缺失无法重建时返回 None。
     entry_price/exit_price/actual_return/outcome 为 BTC 现货快照口径，
-    与采样表污染无关，原样保留。返回是否完成重建（False=样本缺失跳过）。
+    与采样表污染无关，原样保留。
     """
     start_ms, end_ms = int(w.start_time), int(w.end_time)
     async with async_session_factory() as session:
+        w = (await session.execute(
+            sa_select(SentimentWindow).where(SentimentWindow.start_time == start_ms)
+        )).scalar_one_or_none()
+        if w is None:
+            return None
         samples = (await session.execute(
             sa_select(PredictionMarketSample)
             .where(PredictionMarketSample.timestamp >= start_ms)
@@ -99,7 +107,7 @@ async def rebuild_window_from_raw_samples(w: SentimentWindow) -> bool:
                 "污染自愈：窗口 {}~{} 原始 5m 样本仅 {} 条（<{}），跳过重建",
                 start_ms, end_ms, len(samples), MIN_REBUILD_SAMPLES,
             )
-            return False
+            return None
         part_vals = [s.participants for s in samples if s.participants is not None]
         vol_vals = [s.trade_volume for s in samples if s.trade_volume is not None]
         w.curve_up_pct = [
@@ -122,7 +130,8 @@ async def rebuild_window_from_raw_samples(w: SentimentWindow) -> bool:
         w.avg_participants = sum(part_vals) / len(part_vals) if part_vals else None
         w.avg_trade_volume = sum(vol_vals) / len(vol_vals) if vol_vals else None
         await session.commit()
-    return True
+        await session.refresh(w)  # 重载全部属性，detached 后仍可安全读取
+        return w
 
 
 def quote_edge_affected_starts(contaminated: set[int]) -> set[int]:
@@ -207,8 +216,9 @@ async def repair_contaminated_archives() -> dict:
     rebuilt_wins: list[SentimentWindow] = []
     for w in contaminated_wins:
         try:
-            if await rebuild_window_from_raw_samples(w):
-                rebuilt_wins.append(w)
+            rw = await rebuild_window_from_raw_samples(w)
+            if rw is not None:
+                rebuilt_wins.append(rw)
             else:
                 stats["skipped_no_samples"] += 1
         except Exception as exc:
