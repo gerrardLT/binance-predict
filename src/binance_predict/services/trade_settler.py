@@ -268,6 +268,12 @@ class TradeSettler:
                 pnl = -amount
             else:
                 pnl = None  # 均价/金额缺失：输向无需均价，赢向无法估算
+        elif outcome == "NOISE":
+            # 与 5m 路径同口径：NOISE 即时结算（win=None/pnl=0），避免空扫重扫
+            # 直到 settle_deadline+24h 才被误记为 EXPIRED
+            win = None
+            settle_price = self._to_float(sig.settle_btc_price)
+            pnl = 0.0
         elif sig.settle_deadline is not None and datetime.fromtimestamp(
                 sig.settle_deadline / 1000.0, tz=timezone.utc
         ) > now_dt - EXPIRE_AFTER:

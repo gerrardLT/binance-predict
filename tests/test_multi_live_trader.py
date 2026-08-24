@@ -204,6 +204,23 @@ def test_parse_bad_json_rejected(monkeypatch) -> None:
         parse_channel_config()
 
 
+def test_parse_null_amount_rejected(monkeypatch) -> None:
+    """amount_usdt=null → 归一为 ValueError（若放 TypeError 穿透 lifespan
+    会拖垮整个服务启动，违背“非法配置拒启但不拒服务”契约）。"""
+    monkeypatch.setattr(settings, "live_channels_json",
+                        json.dumps({"x4_v1": {"amount_usdt": None}}))
+    with pytest.raises(ValueError, match="amount_usdt 非法"):
+        parse_channel_config()
+
+
+def test_parse_non_int_daily_rejected(monkeypatch) -> None:
+    """max_daily_orders 非整数（2.5）→ ValueError（防 int() 静默截断成 2）。"""
+    monkeypatch.setattr(settings, "live_channels_json",
+                        json.dumps({"x4_v1": {"max_daily_orders": 2.5}}))
+    with pytest.raises(ValueError, match="需为整数"):
+        parse_channel_config()
+
+
 def test_channels_registry_shape() -> None:
     """注册表形状：10 通道全集、市场周期/方向/护栏与计划表逐项对齐。"""
     assert set(LIVE_CHANNELS) == {
@@ -1031,6 +1048,22 @@ async def test_settle_scene_lose(monkeypatch) -> None:
     assert p["settle_outcome"] == "UP"
     assert p["win"] is False
     assert p["pnl"] == pytest.approx(-2.0)
+
+
+@pytest.mark.asyncio
+async def test_settle_scene_noise(monkeypatch) -> None:
+    """NOISE：即时结算 win=None/pnl=0/settle_price=信号结算价（与 5m 同口径），
+    不再空扫重试直到 settle_deadline+24h 被误记 EXPIRED。"""
+    db = _SceneDb([_scene_row(direction="DOWN")], _scene_signal("NOISE"))
+    _stub_scene_db(monkeypatch, db)
+
+    assert await TradeSettler().poll_once() == 1
+
+    p = _params(db.updates[0])
+    assert p["settle_outcome"] == "NOISE"
+    assert p["win"] is None
+    assert p["pnl"] == 0.0
+    assert p["settle_price"] == pytest.approx(43250.0)
 
 
 @pytest.mark.asyncio

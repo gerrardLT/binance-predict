@@ -71,11 +71,15 @@ class MultiLiveTrader:
         # 解析启动配置（LIVE_CHANNELS_JSON 非法 → ValueError 拒绝装配，fail fast）
         self._configs = parse_channel_config()
         for ch, cfg in self._configs.items():
-            # 默认金额也可能被 settings 误写超上限（parse 只校验 JSON 覆盖段）
+            # 默认金额/日限也可能被 settings 误写超上限（parse 只校验 JSON 覆盖段）
             if not (0.1 <= cfg.amount_usdt <= MAX_ORDER_AMOUNT_USDT):
                 raise ValueError(
                     f"多通道实盘：通道 {ch} 单笔金额 {cfg.amount_usdt} 超硬上限"
                     f" {MAX_ORDER_AMOUNT_USDT} USDT（配置误写拒绝启动）")
+            if not (1 <= cfg.max_daily_orders <= MAX_DAILY_ORDERS_CAP):
+                raise ValueError(
+                    f"多通道实盘：通道 {ch} 日限 {cfg.max_daily_orders} 超硬上限"
+                    f" {MAX_DAILY_ORDERS_CAP}（配置误写拒绝启动）")
         self._enabled_at_startup = {ch: cfg.enabled for ch, cfg in self._configs.items()}
         self._tasks: set[asyncio.Task] = set()   # 在途任务（下单/回填/自愈/轮询）
         # 余额缓存作废钩子（main 装配区注入：services 层不反向 import main，用回调解耦）
@@ -249,6 +253,8 @@ class MultiLiveTrader:
         不抛（绝不阻塞检测循环——邮件 SMTP 卡死循环 16 分钟的事故教训）。
         """
         try:
+            if self._stopped:
+                return  # stop 后拒绝派生新下单任务（与 check/x4 同契约）
             channel = scene_pattern_to_channel(str(sig.get("pattern_type") or ""))
             if channel is None:
                 return

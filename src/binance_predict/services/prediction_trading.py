@@ -1018,6 +1018,14 @@ class BinancePredictionTrader:
                                signal_version)
                 return None
 
+        # 纯入参校验前置：非法周期在占位/拉行情之前拒绝——否则会烧掉
+        # (signal_version, window_start) 窗口槽位，且在持有全局 trade_lock 期间
+        # 白白消耗一次分页行情拉取、阻塞其它通道下单
+        if market_period not in ("5m", "15m"):
+            logger.warning("信号实盘：未知市场周期 {} | signal={}", market_period,
+                           signal_version)
+            return None
+
         async with self._trade_lock:
             # 先占位后下单：PENDING 行占住唯一键；重复窗口（含重启/并发）在花钱前拒绝。
             pending = await self._reserve_order_slot(
@@ -1028,11 +1036,6 @@ class BinancePredictionTrader:
                 return None
 
             await self.list_markets()
-
-            if market_period not in ("5m", "15m"):
-                return await self._update_signal_order(
-                    pending, "FAILED", direction=prediction,
-                    error_message=f"未知市场周期: {market_period}")
 
             if prediction == "UP":
                 token_id = (self._15m_up_token_id if market_period == "15m"

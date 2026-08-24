@@ -136,20 +136,38 @@ def parse_channel_config() -> dict[str, ChannelConfig]:
         if "enabled" in ov:
             cfg.enabled = bool(ov["enabled"])
         if "amount_usdt" in ov:
-            amount = float(ov["amount_usdt"])
+            try:
+                amount = float(ov["amount_usdt"])
+            except (TypeError, ValueError) as exc:
+                # null/非数值必须归一为 ValueError（main 装配只捕 ValueError）；
+                # 若放 TypeError 穿透 lifespan 会拖垮整个服务启动
+                raise ValueError(
+                    f"多通道实盘：通道 {ch} amount_usdt 非法：{ov['amount_usdt']!r}"
+                    "（需为数值）") from exc
             if not (0.1 <= amount <= MAX_ORDER_AMOUNT_USDT):
                 raise ValueError(
                     f"多通道实盘：通道 {ch} 单笔金额 {amount} 超界"
                     f" [0.1, {MAX_ORDER_AMOUNT_USDT}]（配置误写拒绝启动）")
             cfg.amount_usdt = amount
         if "max_daily_orders" in ov:
-            daily = int(ov["max_daily_orders"])
+            raw_daily = ov["max_daily_orders"]
+            # 拒绝小数/布尔/null：日限必须是干净整数，防 int(2.7)→2 静默截断
+            if isinstance(raw_daily, bool) or not isinstance(raw_daily, int):
+                raise ValueError(
+                    f"多通道实盘：通道 {ch} max_daily_orders 非法：{raw_daily!r}"
+                    "（需为整数）")
+            daily = raw_daily
             if not (1 <= daily <= MAX_DAILY_ORDERS_CAP):
                 raise ValueError(
                     f"多通道实盘：通道 {ch} 日限 {daily} 超界 [1, {MAX_DAILY_ORDERS_CAP}]")
             cfg.max_daily_orders = daily
         if "max_exec_price" in ov and ov["max_exec_price"] is not None:
-            exec_price = float(ov["max_exec_price"])
+            try:
+                exec_price = float(ov["max_exec_price"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"多通道实盘：通道 {ch} max_exec_price 非法：{ov['max_exec_price']!r}"
+                    "（需为数值）") from exc
             if not (0.01 <= exec_price <= 0.99):
                 raise ValueError(f"多通道实盘：通道 {ch} 护栏 {exec_price} 超界 [0.01, 0.99]")
             cfg.max_exec_price = exec_price
