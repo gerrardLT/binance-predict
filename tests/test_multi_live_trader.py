@@ -785,7 +785,12 @@ def _make_real_trader(monkeypatch, with_15m: bool = True) -> BinancePredictionTr
     async def _list():
         trader._down_token_id = "TOKEN-DOWN"
         if with_15m:
-            trader._15m_down_token_id = "TOKEN-15M-DOWN"
+            # 新锚定机制：按 startDate 建表，下单精确匹配 window_start
+            trader._15m_markets[WINDOW_START] = {
+                "end_date": WINDOW_START + 900_000,
+                "up_token": "TOKEN-15M-UP", "down_token": "TOKEN-15M-DOWN",
+                "up_price": 0.45, "down_price": 0.55,
+            }
         return []
 
     monkeypatch.setattr(trader, "list_markets", _list)
@@ -835,7 +840,7 @@ async def test_signal_trade_15m_token_and_scene_id(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_signal_trade_15m_token_missing_failed(monkeypatch) -> None:
-    """15m token 缺失（市场缓存未就绪）→ FAILED 落库，明确错误信息。"""
+    """15m 周期未在市场列表中找到（锚定守卫）→ FAILED 落库，不取报价。"""
     trader = _make_real_trader(monkeypatch, with_15m=False)
     updates: list[tuple] = []
 
@@ -848,7 +853,7 @@ async def test_signal_trade_15m_token_missing_failed(monkeypatch) -> None:
         return {**order, "status": status, **kwargs}
 
     async def _quote(*a, **k):
-        raise AssertionError("token 缺失不应走到取报价")
+        raise AssertionError("锚定拒单不应走到取报价")
 
     monkeypatch.setattr(trader, "_reserve_order_slot", _reserve)
     monkeypatch.setattr(trader, "_update_signal_order", _update)
@@ -859,6 +864,72 @@ async def test_signal_trade_15m_token_missing_failed(monkeypatch) -> None:
         max_exec_price=0.55, market_period="15m", scene_signal_id=7)
     assert order["status"] == "FAILED"
     assert "未找到 15m 市场 DOWN 方向的 token" in str(updates[0][1]["error_message"])
+
+
+@pytest.mark.asyncio
+async def test_signal_trade_15m_anchor_picks_right_cycle(monkeypatch) -> None:
+    """多周期列表（当前 + 未来）：token 必须取自 window_start 对应周期，
+    而非列表里更晚的市场（旧"最后一个覆盖"行为的回归用例）。"""
+    trader = _make_real_trader(monkeypatch, with_15m=False)
+    future = WINDOW_START + 900_000
+    quote_tokens: list[str] = []
+
+    async def _list():
+        # 目标周期先入表，未来周期后入表（旧行为会被后者覆盖）
+        trader._15m_markets[WINDOW_START] = {
+            "end_date": future, "up_token": "T-UP-N", "down_token": "T-DOWN-N",
+            "up_price": 0.5, "down_price": 0.5}
+        trader._15m_markets[future] = {
+            "end_date": future + 900_000, "up_token": "T-UP-NEXT",
+            "down_token": "T-DOWN-NEXT", "up_price": 0.5, "down_price": 0.5}
+        return []
+
+    async def _reserve(_v, _ws, direction=None, market_period="5m",
+                       scene_signal_id=None):
+        return _pending_order()
+
+    async def _update(order, status, **kwargs):
+        return {**order, "status": status, **kwargs}
+
+    async def _quote(token_id, side, amount_usdt=None):
+        quote_tokens.append(token_id)
+        return {"averagePrice": 0.55, "amountIn": "5", "amountOut": "9",
+                "quoteId": "Q1"}
+
+    async def _place(_q, slippage_bps=1200):
+        return {"orderId": "ORD-ANCHOR"}
+
+    monkeypatch.setattr(trader, "list_markets", _list)
+    monkeypatch.setattr(trader, "_reserve_order_slot", _reserve)
+    monkeypatch.setattr(trader, "_update_signal_order", _update)
+    monkeypatch.setattr(trader, "get_quote", _quote)
+    monkeypatch.setattr(trader, "place_order", _place)
+
+    order = await trader.execute_signal_trade(
+        "DOWN", 5.0, "scene_bull_exhaust", WINDOW_START,
+        max_exec_price=0.60, market_period="15m", scene_signal_id=42)
+    assert order["status"] == "FILLED"
+    assert quote_tokens == ["T-DOWN-N"]          # 取本单周期，非未来周期
+
+
+def test_parse_15m_entry() -> None:
+    """15m 市场解析：token/报价提取 + startDate 缺失/非法拒入表。"""
+    market = {
+        "startDate": WINDOW_START, "endDate": WINDOW_START + 900_000,
+        "markets": [{"outcomes": [
+            {"name": "Up", "tokenId": "T-U", "price": "0.4"},
+            {"name": "Down", "tokenId": "T-D", "price": "0.6"},
+        ]}],
+    }
+    start, entry = BinancePredictionTrader._parse_15m_entry(market)
+    assert start == WINDOW_START
+    assert entry["up_token"] == "T-U" and entry["down_token"] == "T-D"
+    assert entry["up_price"] == 0.4 and entry["down_price"] == 0.6
+    assert entry["end_date"] == WINDOW_START + 900_000
+    # startDate 缺失/非法 → None（不入表，无法锚定的市场不参与下单）
+    assert BinancePredictionTrader._parse_15m_entry({"endDate": 1}) is None
+    assert BinancePredictionTrader._parse_15m_entry(
+        {"startDate": "not-a-ts", "endDate": 1}) is None
 
 
 @pytest.mark.asyncio

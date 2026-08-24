@@ -121,6 +121,11 @@ class BinancePredictionTrader:
         self._15m_down_price: float | None = None
         self._15m_start_date: int | None = None
         self._15m_end_date: int | None = None
+        # 多周期 15m 市场表：startDate(ms) → {up/down_token, up/down_price, end_date}。
+        # API 同时列出当前周期 + 未来数小时的多个 15m 市场，下单必须按
+        # startDate 精确匹配信号窗口——旧"最后一个覆盖"单值缓存会拿到未来
+        # 市场的 token，场景单必押错周期（审计发现）
+        self._15m_markets: dict[int, dict] = {}
 
         if not self._api_key or not self._api_secret:
             logger.warning("Binance API Key/Secret 未配置，预测交易功能不可用")
@@ -626,6 +631,39 @@ class BinancePredictionTrader:
             return "5m"
         return None
 
+    @staticmethod
+    def _parse_15m_entry(market: dict) -> tuple[int, dict] | None:
+        """解析单个 15m 市场 → (startDate, {token/报价/end_date})；startDate 缺失/非法返回 None。
+
+        单位与 fake_breakout 的 market_start_15m 一致（epoch ms，检测器
+        已用 start_date == next_start 守卫在生产验证）。下单按 startDate 精确
+        匹配，防多周期列表下押错市场（审计发现）。
+        """
+        start_raw = market.get("startDate")
+        end_raw = market.get("endDate")
+        try:
+            start_ms = int(start_raw)
+        except (TypeError, ValueError):
+            return None
+        try:
+            end_ms = int(end_raw) if end_raw is not None else None
+        except (TypeError, ValueError):
+            end_ms = None
+        entry = {"end_date": end_ms, "up_token": None, "down_token": None,
+                 "up_price": None, "down_price": None}
+        for sub_market in market.get("markets", []):
+            for outcome in sub_market.get("outcomes", []):
+                name = outcome.get("name", "").upper()
+                token_id = outcome.get("tokenId")
+                price = outcome.get("price")
+                if name in ("UP", "YES"):
+                    entry["up_token"] = token_id
+                    entry["up_price"] = float(price) if price is not None else None
+                elif name in ("DOWN", "NO"):
+                    entry["down_token"] = token_id
+                    entry["down_price"] = float(price) if price is not None else None
+        return start_ms, entry
+
     async def list_markets(self) -> list[dict]:
         """
         查询活跃的 BTC 预测市场
@@ -713,20 +751,24 @@ class BinancePredictionTrader:
                     if not self._active_market and market.get("status") == "REGISTERED":
                         self._active_market = market
                 elif period == "15m":
-                    # 15 分钟市场：缓存 tokenId + 报价（假突破信号系统用，暂不下注）
-                    self._15m_start_date = market.get("startDate")
-                    self._15m_end_date = market.get("endDate")
-                    for sub_market in market.get("markets", []):
-                        for outcome in sub_market.get("outcomes", []):
-                            name = outcome.get("name", "").upper()
-                            token_id = outcome.get("tokenId")
-                            price = outcome.get("price")
-                            if name in ("UP", "YES"):
-                                self._15m_up_token_id = token_id
-                                self._15m_up_price = float(price) if price is not None else None
-                            elif name in ("DOWN", "NO"):
-                                self._15m_down_token_id = token_id
-                                self._15m_down_price = float(price) if price is not None else None
+                    # 15 分钟市场：API 同时列出多个周期（当前 + 未来数小时），
+                    # 逐周期按 startDate 建表，下单时精确匹配（见 _15m_markets 注释）
+                    parsed = self._parse_15m_entry(market)
+                    if parsed is None:
+                        continue  # startDate 缺失/非法：无法锚定，不入表
+                    start_ms, entry = parsed
+                    self._15m_markets[start_ms] = entry
+                    # 标量缓存（展示/日志用）只认当前周期 start ≤ now < end，
+                    # 不再被列表里最后一个（往往是未来）市场覆盖
+                    now_ms = int(time.time() * 1000)
+                    end_ms = entry["end_date"]
+                    if end_ms is not None and start_ms <= now_ms < end_ms:
+                        self._15m_start_date = start_ms
+                        self._15m_end_date = end_ms
+                        self._15m_up_token_id = entry["up_token"]
+                        self._15m_down_token_id = entry["down_token"]
+                        self._15m_up_price = entry["up_price"]
+                        self._15m_down_price = entry["down_price"]
                 else:
                     # 非 5m/15m 市场：仍提取 tokenId 作为备用（交易用）
                     for sub_market in market.get("markets", []):
@@ -737,6 +779,13 @@ class BinancePredictionTrader:
                                 self._up_token_id = token_id
                             elif name in ("DOWN", "NO") and not self._down_token_id:
                                 self._down_token_id = token_id
+
+        # 清退已结束的 15m 周期（防缓存随运行时间无界增长）
+        now_ms = int(time.time() * 1000)
+        self._15m_markets = {
+            s: e for s, e in self._15m_markets.items()
+            if e["end_date"] is None or e["end_date"] > now_ms
+        }
 
         logger.info(
             "查询到 {} 个 BTC 预测市场 | 5m UP={}({:.1%}) / DOWN={}({:.1%}) | 15m DOWN={} | 参与者={} | 交易量={}",
@@ -1037,17 +1086,26 @@ class BinancePredictionTrader:
 
             await self.list_markets()
 
-            if prediction == "UP":
-                token_id = (self._15m_up_token_id if market_period == "15m"
-                            else self._up_token_id)
-            elif prediction == "DOWN":
-                token_id = (self._15m_down_token_id if market_period == "15m"
-                            else self._down_token_id)
-            else:
+            if prediction not in ("UP", "DOWN"):
                 logger.warning("未知预测方向: {}", prediction)
                 return await self._update_signal_order(
                     pending, "FAILED", direction=prediction,
                     error_message=f"未知预测方向: {prediction}")
+
+            if market_period == "15m":
+                # 锚定校验：列表含多个 15m 周期，必须取本单窗口
+                # （window_start == startDate）的 token；缺失即拒单——
+                # 宁可错过不押错周期（旧"最后一个覆盖"行为会拿未来市场）
+                entry = self._15m_markets.get(window_start)
+                token_id = (entry["up_token"] if prediction == "UP"
+                            else entry["down_token"]) if entry else None
+                if entry is None:
+                    logger.warning(
+                        "信号实盘：15m 周期 {} 未在市场列表中找到（锚定守卫拒单）| 列表周期 {}",
+                        window_start, sorted(self._15m_markets))
+            else:
+                token_id = (self._up_token_id if prediction == "UP"
+                            else self._down_token_id)
 
             if not token_id:
                 return await self._update_signal_order(
