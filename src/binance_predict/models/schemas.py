@@ -288,17 +288,24 @@ class TransferOutboundRequest(BaseModel):
 
 
 class ToggleLiveRequest(BaseModel):
-    """POST /api/live/toggle（QuoteEdgeLiveTrader 运行时开关，P2-1）。
+    """POST /api/live/toggle（MultiLiveTrader 通道运行时开关，多通道时代重写）。
 
-    实时控制实盘开火状态；可选 version 同时热切换实盘信号（白名单内，
-    切换为运行时态，重启后回落.env 默认，fail-safe）。
+    单通道实时开关 + 可选金额/日限热调；通道白名单 LIVE_CHANNELS，
+    数值校验同启动配置（非法值拒改不落库）。均为运行时态，
+    重启后回落 LIVE_CHANNELS_JSON（fail-safe）。
     """
 
-    enabled: bool = Field(description="启用=True / 禁用=False")
-    version: str | None = Field(
+    channel: str = Field(
+        description="通道 ID（LIVE_CHANNELS 白名单内，如 quote_contrarian_v1 / x4_v1 / scene_bull_exhaust）"
+    )
+    enabled: bool = Field(description="启用=True / 禁用=False（在途任务不受影响）")
+    amount_usdt: float | None = Field(
         default=None,
-        description="可选：切换到的实盘信号版本（LIVE_ALLOWED_VERSIONS 白名单内；"
-                    "None=维持当前绑定不动）",
+        description="可选：热调单笔金额（0.1~50 USDT，立即生效）",
+    )
+    max_daily_orders: int | None = Field(
+        default=None,
+        description="可选：热调通道日限（1~500）",
     )
 
 

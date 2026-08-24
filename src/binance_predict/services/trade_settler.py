@@ -1,8 +1,14 @@
-"""交易结算器（P0-2）：回读 SentimentWindow 结算 FILLED 订单的输赢/盈亏。
+"""交易结算器（P0-2）：回读结算源回填 FILLED 订单的输赢/盈亏。
 
-结算源 = sentiment_windows（本地口径）：每 5 分钟归档器按 entry/exit 价
-判定 outcome（UP/DOWN/NOISE），start_time 与订单 window_start 同为
-5m 窗口起点 ms，可直接对齐。
+结算源分流（两口径，_settle_row 入口硬编码，防错配）：
+1. 5m 订单（默认）：回读 SentimentWindow——每 5 分钟归档器按 entry/exit
+   价判定 outcome（UP/DOWN/NOISE），start_time 与订单 window_start 同为
+   5m 窗口起点 ms，可直接对齐。
+2. 15m 场景订单（market_period='15m'）：回读 FakeBreakoutSignal
+   .settle_outcome（周期锚点口径：P(E) vs P(S)，与币安 15m 市场真实
+   结算一致）。**为何必须分流**：15m 周期起点与 5m 窗口起点数值重合
+   （900s 网格 ⊂ 300s 网格），若走 SentimentWindow 会被同名 5m 窗
+   错口径结算输赢——这是多通道改造最隐蔽的坑。
 
 扫描锚点 = trade_orders.settled_at IS NULL（部分索引
 ix_trade_orders_settle_pending 只覆盖待结算行，空转亚毫秒）。
@@ -34,7 +40,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select as sa_select, update as sa_update
 
 from binance_predict.db.engine import async_session_factory
-from binance_predict.db.models import SentimentWindow, TradeOrderModel
+from binance_predict.db.models import FakeBreakoutSignal, SentimentWindow, TradeOrderModel
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +135,10 @@ class TradeSettler:
     # ------------------------------------------------------------------
 
     async def _settle_row(self, row: TradeOrderModel) -> bool:
+        # 口径分流：15m 场景订单走 FakeBreakoutSignal 结算（防错配，见模块 docstring）
+        if row.market_period == "15m" or row.scene_signal_id is not None:
+            return await self._settle_scene_row(row)
+
         if row.direction is None:
             # 旧数据（direction 落库前的订单）：无法判赢，且字段无回填机制
             #（direction 与下单同事务写入）——等待毫无意义，被扫出（超 7min
@@ -217,6 +227,108 @@ class TradeSettler:
             row.id, row.window_start, row.direction, outcome, win,
             f"{pnl:+.4f}" if pnl is not None else "N/A", settle_price,
         )
+        return True
+
+    async def _settle_scene_row(self, row: TradeOrderModel) -> bool:
+        """15m 场景订单结算：回读 FakeBreakoutSignal.settle_outcome。
+
+        结算判定与 pnl 公式与 5m 路径同口径（win = direction == outcome；
+        赢 amount/avg_price−amount / 输 −amount）；settle_price 取信号行
+        settle_btc_price（15m 周期末 BTC 中间价 P(E)）。信号未结算
+        （PENDING）时 15m 检测器结算可能迟到：settle_deadline+24h 内
+        下轮重试，超期 EXPIRED 出清（与 5m 兜底一致）。
+        """
+        now_dt = datetime.now(timezone.utc)
+        if row.scene_signal_id is None:
+            # 理论不可达（scene_signal_id 与占位同事务落库）：出清防每 60s
+            # 空扫；CRITICAL 留痕供日志健康检查排查数据链异常
+            logger.critical(
+                "订单结算 | id=%s | 15m 订单缺 scene_signal_id（数据异常）"
+                "→ EXPIRED 出清 | window=%s", row.id, row.window_start)
+            return await self._expire_row(row, now_dt)
+
+        async with async_session_factory() as session:
+            sig = await session.get(FakeBreakoutSignal, int(row.scene_signal_id))
+        if sig is None:
+            # 信号行被运维 TRUNCATE/删除：无法判赢，出清不计统计
+            logger.critical(
+                "订单结算 | id=%s | 场景信号 %s 缺失（被清理？）→ EXPIRED 出清",
+                row.id, row.scene_signal_id)
+            return await self._expire_row(row, now_dt)
+
+        outcome = sig.settle_outcome
+        if outcome in ("UP", "DOWN"):
+            win = row.direction == outcome
+            amount = self._amount_usdt(row)
+            avg_price = self._avg_price(row)
+            settle_price = self._to_float(sig.settle_btc_price)
+            if win and amount is not None and avg_price is not None:
+                pnl = amount / avg_price - amount
+            elif not win and amount is not None:
+                pnl = -amount
+            else:
+                pnl = None  # 均价/金额缺失：输向无需均价，赢向无法估算
+        elif sig.settle_deadline is not None and datetime.fromtimestamp(
+                sig.settle_deadline / 1000.0, tz=timezone.utc
+        ) > now_dt - EXPIRE_AFTER:
+            return False  # 检测器结算迟到（PENDING）：deadline+24h 内重试
+        else:
+            win = None
+            settle_price = None
+            pnl = 0.0
+            outcome = "EXPIRED"
+
+        # 幂等守卫：WHERE settled_at IS NULL（与 _settle_row 同模式）
+        async with async_session_factory() as session:
+            stmt = (
+                sa_update(TradeOrderModel)
+                .where(
+                    TradeOrderModel.id == row.id,
+                    TradeOrderModel.settled_at.is_(None),
+                )
+                .values(
+                    settle_outcome=outcome,
+                    win=win,
+                    settle_price=settle_price,
+                    pnl=pnl,
+                    settled_at=now_dt,
+                )
+            )
+            result = await session.execute(stmt)
+            await session.commit()
+        if result.rowcount == 0:
+            return False  # 已被并发结算（幂等守卫生效）
+        self._settled_count += 1
+        logger.info(
+            "订单结算 | id=%s | scene_signal=%s | window=%s | direction=%s → %s"
+            " | win=%s | pnl=%s | settle_price=%s",
+            row.id, row.scene_signal_id, row.window_start, row.direction, outcome,
+            win, f"{pnl:+.4f}" if pnl is not None else "N/A", settle_price,
+        )
+        return True
+
+    async def _expire_row(self, row: TradeOrderModel, now_dt: datetime) -> bool:
+        """异常行出清（EXPIRED/win=None/pnl=0）：防永久卡「在途持仓」+ 空扫。"""
+        async with async_session_factory() as session:
+            stmt = (
+                sa_update(TradeOrderModel)
+                .where(
+                    TradeOrderModel.id == row.id,
+                    TradeOrderModel.settled_at.is_(None),
+                )
+                .values(
+                    settle_outcome="EXPIRED",
+                    win=None,
+                    settle_price=None,
+                    pnl=0.0,
+                    settled_at=now_dt,
+                )
+            )
+            result = await session.execute(stmt)
+            await session.commit()
+        if result.rowcount == 0:
+            return False
+        self._settled_count += 1
         return True
 
     # ------------------------------------------------------------------

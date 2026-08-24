@@ -985,9 +985,12 @@ class BinancePredictionTrader:
         signal_version: str,
         window_start: int,
         max_exec_price: float | None = None,
+        market_period: str = "5m",
+        scene_signal_id: int | None = None,
     ) -> dict | None:
         """
-        信号驱动实盘专用通道（报价 edge LIVE）：报价 → 执行价护栏 → 下单 → 落表。
+        信号驱动实盘专用通道（多通道 LIVE：quote_edge/x4 用 5m，场景用 15m）：
+        报价 → 执行价护栏 → 下单 → 落表。
 
         返回 dict 快照（非 ORM 对象）：会话关闭后对象即脱离，调用方再访问
         属性会抛 DetachedInstanceError（旧实现导致端点 500 + 行卡 PENDING）。
@@ -998,7 +1001,10 @@ class BinancePredictionTrader:
            (signal_version, window_start) 唯一键，重复窗口在下单前即拒绝；
            成功/失败 UPDATE 该行——重启防重不再依赖"钱出去后"的事后提交；
         3. 报价后、下单前检查 averagePrice ≤ max_exec_price，超限弃单（不追贵）；
-           且按护栏价动态收紧 slippageBps，成交价无法突破 max_exec_price。
+           且按护栏价动态收紧 slippageBps，成交价无法突破 max_exec_price；
+        4. market_period 分流（'5m'|'15m'）：15m 场景订单用 15m 市场 token
+           （结算走 FakeBreakoutSignal，trade_settler 按 market_period 分流）；
+           scene_signal_id 与占位同事务落库（下单即关联场景信号行，无需回填）。
         钱已出去而落库/更新失败时记 CRITICAL 日志，可追溯、不静默降级。
         """
         if not self._api_key or not self._api_secret:
@@ -1015,17 +1021,25 @@ class BinancePredictionTrader:
         async with self._trade_lock:
             # 先占位后下单：PENDING 行占住唯一键；重复窗口（含重启/并发）在花钱前拒绝。
             pending = await self._reserve_order_slot(
-                signal_version, window_start, direction=prediction)
+                signal_version, window_start, direction=prediction,
+                market_period=market_period, scene_signal_id=scene_signal_id)
             if pending is None:
                 logger.info("信号实盘：窗口 {} 已有订单占位，跳过（每窗一单）", window_start)
                 return None
 
             await self.list_markets()
 
+            if market_period not in ("5m", "15m"):
+                return await self._update_signal_order(
+                    pending, "FAILED", direction=prediction,
+                    error_message=f"未知市场周期: {market_period}")
+
             if prediction == "UP":
-                token_id = self._up_token_id
+                token_id = (self._15m_up_token_id if market_period == "15m"
+                            else self._up_token_id)
             elif prediction == "DOWN":
-                token_id = self._down_token_id
+                token_id = (self._15m_down_token_id if market_period == "15m"
+                            else self._down_token_id)
             else:
                 logger.warning("未知预测方向: {}", prediction)
                 return await self._update_signal_order(
@@ -1035,7 +1049,7 @@ class BinancePredictionTrader:
             if not token_id:
                 return await self._update_signal_order(
                     pending, "FAILED", direction=prediction,
-                    error_message=f"未找到 {prediction} 方向的 token")
+                    error_message=f"未找到 {market_period} 市场 {prediction} 方向的 token")
 
             quote = await self.get_quote(token_id, "BUY", amount_usdt=amount_usdt)
             if not quote:
@@ -1085,12 +1099,15 @@ class BinancePredictionTrader:
     async def _reserve_order_slot(
         self, signal_version: str, window_start: int,
         direction: str | None = None,
+        market_period: str = "5m",
+        scene_signal_id: int | None = None,
     ) -> TradeOrderModel | None:
         """先占位后下单（CodeReview High#1）：place_order 前先插 PENDING 行。
 
         占住 (signal_version, window_start) 唯一键，令每窗一单在花钱前生效：
         重复窗口（重启/并发）捕获 IntegrityError 返回 None，调用方放弃下单。
-        direction 占位即落库（结算判赢依赖；NULL 仅限旧数据）。
+        direction 占位即落库（结算判赢依赖；NULL 仅限旧数据）；
+        market_period/scene_signal_id 同事务落库（15m 结算分流依据）。
         """
         from sqlalchemy.exc import IntegrityError
         try:
@@ -1105,6 +1122,8 @@ class BinancePredictionTrader:
                     signal_version=signal_version,
                     window_start=window_start,
                     direction=direction,
+                    market_period=market_period,
+                    scene_signal_id=scene_signal_id,
                 )
                 db.add(order)
                 await db.commit()

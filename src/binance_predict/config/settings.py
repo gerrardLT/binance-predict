@@ -306,21 +306,19 @@ class Settings(BaseSettings):
     # 规则冻结：A t∈[90,120)s×q∈[0.69,0.75) / B t∈[45,60)s×q∈[0.15,0.25)
     quote_edge_enabled: bool = True
 
-    # --- 报价 edge 实盘下单（LIVE 版本可配，2026-08-22 切 quote_contrarian_v1）---
-    # 实时触发：窗口内 DOWN 报价首次进规则区间 → 真单押 DOWN（区间随版本走）。
-    # 每窗至多一单（内存 + DB 唯一约束双保险）；默认 OFF，配置就绪后人工开启。
-    quote_momentum_live_enabled: bool = False
-    # 实盘绑定的信号版本（白名单内二选一，误写 → 执行器构造抛 ValueError 拒绝启动；
-    # v2 门禁版需价格序列，实盘采样链路暂不支持，等影子验证后再评估扩展）
-    quote_edge_live_version: str = "quote_contrarian_v1"
-    # 实盘单笔金额（USDT，2026-08-23 灰度 5 → 2：降单笔敞口，硬上限 50 不变）
-    quote_momentum_live_amount_usdt: float = 2.0
-    # 执行价护栏：成交均价超过此值弃单且滑点按它收紧。None=按版本自动推导
-    # （入场区间上界+0.03：momentum→0.78 与旧默认一致，contrarian→0.28）；
-    # 显式配置则全版本统一覆盖（收紧用，勿放大——EV 对入场溢价敏感）
-    quote_momentum_live_max_exec_price: float | None = None
-    # 日单量护栏：当日 FILLED 达上限后停火（防行情极端密度暴涨散口）
-    quote_momentum_live_max_daily_orders: int = 30
+    # --- 多通道实盘（MultiLiveTrader，2026-08-24，取代旧单版本 quote_edge 实盘字段）---
+    # 10 通道（quote_edge v1/v2 × 2 + x4 × 2 + 场景 S1/S5/S2/S4）可同时开启；
+    # 每通道独立金额/日限/护栏，通道静态描述见 services/live_channels.py。
+    # 每通道每窗至多一单（内存 + DB 唯一约束双保险）。
+    # 每通道默认单注（USDT，硬上限 50 拒启，同旧哲学：不靠自律靠拒启）
+    live_default_amount_usdt: float = 2.0
+    # 每通道默认日单量护栏：当日该通道 FILLED 达上限后停火（用户拍板：各自 100）
+    live_default_max_daily_orders: int = 100
+    # 启动时通道覆盖配置（JSON 字符串，重启保持开启集——解决旧模式每次部署重置 OFF）：
+    # {"quote_contrarian_v1":{"enabled":true,"amount_usdt":2.0,"max_daily_orders":100,"max_exec_price":0.28},...}
+    # 未知通道/金额超限/非法值 → MultiLiveTrader 构造抛 ValueError 拒绝装配（fail fast）。
+    # 运行时 toggle/金额热调为内存态，重启回落本配置。
+    live_channels_json: str = ""
 
     # --- 场景研究（LLM 研究员，M2 2026-08-16）---
     # 总开关：False 时不启动研究调度循环

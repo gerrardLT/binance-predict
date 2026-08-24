@@ -52,8 +52,8 @@ from .services.agent_scheduler import AgentScheduler
 from .services.data_collector import BinanceDataCollector
 from .services.fake_breakout_detector import FakeBreakoutDetector
 from .services.misalignment_detector import MisalignmentDetector
+from .services.multi_live_trader import MultiLiveTrader
 from .services.quote_edge_detector import QuoteEdgeDetector
-from .services.quote_edge_live_trader import QuoteEdgeLiveTrader
 from .services.trade_settler import TradeSettler
 from .services.llm_service import LLMService
 from .services.pattern_reevaluator import pattern_reevaluator
@@ -140,8 +140,9 @@ quote_edge_detector: QuoteEdgeDetector | None = None
 # 交易结算器全局实例（P0-2：FILLED 订单结算回填输赢/盈亏，常开）
 trade_settler: TradeSettler | None = None
 
-# 报价 edge 实盘执行器全局实例（quote_momentum_v1 LIVE，仅开关开启时装配，默认 None）
-quote_edge_live_trader: QuoteEdgeLiveTrader | None = None
+# 多通道实盘执行器全局实例（MultiLiveTrader：10 通道三族触发，
+# 通道开关/金额/日限各自独立，启动回落 LIVE_CHANNELS_JSON，默认全关）
+multi_live_trader: MultiLiveTrader | None = None
 
 # 场景研究调度器全局实例（M2：LLM 研究员触发与编排，lifespan 中初始化）
 research_scheduler: "ResearchScheduler | None" = None
@@ -460,14 +461,18 @@ async def _prediction_market_tracker() -> None:
                         settings.agent_predict_trigger_samples,
                     )
 
-                # 报价 edge 实盘（版本可配）：DOWN 报价首次进所绑版本规则区间 → 真单。
-                # None 守卫：开关关闭时不装配；check 内纯内存比较，不阻塞采样循环。
-                if quote_edge_live_trader is not None and _current_window_end is not None:
-                    quote_edge_live_trader.check(
+                # 多通道实盘（quote_edge 族）：DOWN 报价首次进所绑版本规则区间 → 真单。
+                # None 守卫：未装配时跳过；check 内纯内存比较，不阻塞采样循环。
+                # v2 门禁喂价：_btc_mid（本次采样 BTC 中间价，L397）+ _window_entry_price
+                # （窗口开盘快照）——均为现有变量，零新采样成本。
+                if multi_live_trader is not None and _current_window_end is not None:
+                    multi_live_trader.check(
                         int(_current_window_end) - 300_000,
                         int(_current_window_end),
                         aligned_ts,
                         down_price,
+                        btc_price=_btc_mid,
+                        window_entry_price=_window_entry_price,
                     )
 
         except asyncio.CancelledError:
@@ -990,28 +995,33 @@ async def lifespan(app: FastAPI):
     await trade_settler.start()
     logger.info("交易结算器已启动（60s 扫描 FILLED 未结算订单，settled_at 锚点）")
 
-    # 报价 edge 实盘执行器（版本可配）：无条件装配 + 实例标志位控制开火；
-    # 启动后 toggle ON/OFF 实时生效；重启后回落.env 默认。
-    global quote_edge_live_trader
+    # 多通道实盘执行器（MultiLiveTrader，2026-08-24 取代单版本 QuoteEdgeLiveTrader）：
+    # 10 通道各自独立金额/日限/护栏/开关，三族触发（quote_edge 喂价/x4 轮询/场景钩子）；
+    # 无条件装配 + 通道标志位控制开火；启动后 toggle 逐通道热调；重启回落 LIVE_CHANNELS_JSON。
+    global multi_live_trader
     try:
-        quote_edge_live_trader = QuoteEdgeLiveTrader(prediction_trader)
+        multi_live_trader = MultiLiveTrader(prediction_trader)
     except ValueError as exc:
-        # 版本白名单拒绝（v2 门禁版不支持等）：拒实盘不拖垮其他服务，fail fast
-        logger.error("报价 edge 实盘执行器装配失败：{}", exc)
+        # 通道配置非法（未知通道名/金额超硬上限/护栏非法）：拒实盘不拖垮其他服务
+        logger.error("多通道实盘执行器装配失败：{}", exc)
     else:
-        await quote_edge_live_trader.start()
+        await multi_live_trader.start()
         # 余额缓存作废钩子：信号单成交后作废 prediction-wallet TTL 缓存
         # （下单扣预测钱包余额；与划转端点同款失效逻辑，前端下次轮询即取新值）
-        quote_edge_live_trader._on_balance_change = (
+        multi_live_trader._on_balance_change = (
             lambda: _wallet_view_ts.__setitem__("balance", 0.0)
         )
-        _live_status = quote_edge_live_trader.status()
+        # 场景钩子注入（检测器构造早于执行器装配，与 _on_balance_change 同模式补注入；
+        # 场景检测关闭时 detector 为 None，场景通道即使开启也无触发源——fail-safe）
+        if fake_breakout_detector is not None:
+            fake_breakout_detector._on_signal_fired = multi_live_trader.on_scene_signal
+        _live_status = multi_live_trader.status()
+        _enabled = [c["channel"] for c in _live_status["channels"] if c["enabled"]]
         logger.info(
-            "报价 edge 实盘执行器已加载（真单！）| {} | {} USDT/单 | 运行中={}| 上限{}单",
-            _live_status["version"],
-            _live_status["amount_usdt"],
-            "ON" if _live_status["enabled"] else "OFF (toggle)",
-            _live_status["max_daily_orders"],
+            "多通道实盘执行器已加载（真单！）| 通道 {}/{} 启用 {} | 默认 {} USDT/单",
+            len(_enabled), len(_live_status["channels"]),
+            _enabled or "（无，toggle 可开）",
+            _live_status["defaults"]["amount_usdt"],
         )
 
     # 场景研究（M2）：LLM 研究员定期/累积/异常触发评估，假设只落库不生效
@@ -1051,9 +1061,9 @@ async def lifespan(app: FastAPI):
     # 停止交易结算器
     if trade_settler is not None:
         await trade_settler.stop()
-    # 停止报价 edge 实盘执行器（取消在途下单/回填任务）
-    if quote_edge_live_trader is not None:
-        await quote_edge_live_trader.stop()
+    # 停止多通道实盘执行器（拒新单；在途下单任务等待完成，钱已出去的临界区不打断）
+    if multi_live_trader is not None:
+        await multi_live_trader.stop()
     # 停止 AgentScheduler（优雅关闭，等待当前阶段执行完毕）
     if agent_scheduler is not None:
         await agent_scheduler.stop()
@@ -1269,10 +1279,11 @@ async def list_misalignment_signals(
     }
     detector_status = misalignment_detector.status() if misalignment_detector else None
     quote_edge_status = quote_edge_detector.status() if quote_edge_detector else None
-    live_status = quote_edge_live_trader.status() if quote_edge_live_trader else None
+    live_status = (
+        await multi_live_trader.status_async() if multi_live_trader else None)
     return {"signals": signals, "total": len(signals), "stats": stats,
             "detector": detector_status, "quote_edge_detector": quote_edge_status,
-            "quote_edge_live": live_status}
+            "live_channels": live_status}
 
 
 @app.get("/api/scene/versions")
@@ -1901,35 +1912,34 @@ async def live_toggle(
     req: ToggleLiveRequest,
     _: None = Depends(_require_auth),
 ):
-    """实时开启/关闭报价 edge 实盘开火（QuoteEdgeLiveTrader，P2-1）。
+    """实时开关/热调单个实盘通道（MultiLiveTrader，多通道时代重写）。
 
-    可选 version：同时热切换实盘信号（白名单内，2026-08-23 前端可选信号）。
-    fail-safe：enabled 与版本均为运行时态，重启后回落.env 默认值。
-    响应返回当前 status()（enabled/version 已更新）。
-    ⚠️ 注意：本开关不取消在途任务（High#1），只阻止新单派生。
+    通道白名单 LIVE_CHANNELS；可选 amount_usdt/max_daily_orders 同步热调
+    （校验同启动配置，非法值拒改不落库），立即生效。
+    fail-safe：均为运行时态，重启后回落 LIVE_CHANNELS_JSON。
+    ⚠️ 关闭不取消在途任务（High#1），只阻止该通道新单派生。
     """
-    if quote_edge_live_trader is None:
+    if multi_live_trader is None:
         return {"error": "执行器未装配（装配阶段异常？详见后端日志）"}
-    # 可选：先热切信号版本（失败早退，不动 enabled——原子性：切不过就不开火）
-    if req.version is not None and req.version != quote_edge_live_trader._version:
-        try:
-            quote_edge_live_trader.switch_version(req.version)
-        except ValueError as exc:
-            return {"error": f"信号版本切换失败：{exc}"}
-    # 实时更新实例标志位
-    quote_edge_live_trader._enabled = req.enabled
-    _status = quote_edge_live_trader.status()
-    # 提示用户重启行为
-    msg = f"实盘状态已切换为{'开启' if req.enabled else '关闭'}"
-    if req.version is not None and req.version == _status["version"]:
-        msg += f"（信号：{_status['version']}）"
-    out = {"message": msg, "status": _status}
-    if req.version is not None and _status["version"] != _status["version_at_startup"]:
-        out["warning"] = ("信号版本为运行时切换，重启后回落 .env 默认"
-                          f"（{_status['version_at_startup']}）")
-    if not req.enabled and _status["enabled_at_startup"]:
-        out["warning"] = "重启后会落.env 默认值（若 enabled=False 则持续关闭）"
-    return out
+    try:
+        multi_live_trader.set_channel(
+            req.channel, enabled=req.enabled,
+            amount_usdt=req.amount_usdt,
+            max_daily_orders=req.max_daily_orders)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    _status = await multi_live_trader.status_async()
+    _ch = next((c for c in _status["channels"] if c["channel"] == req.channel), None)
+    if _ch is None:
+        return {"error": f"通道 {req.channel} 不在状态列表（内部错误）"}
+    return {
+        "message": (
+            f"通道 {_ch['display_name']} 已{'开启' if _ch['enabled'] else '关闭'}"
+            f"（金额 {_ch['amount_usdt']} USDT/单 | 日限 {_ch['max_daily_orders']} |"
+            f" 护栏 {_ch['max_exec_price']}）"
+        ),
+        "status": _status,
+    }
 
 
 @app.post("/api/prediction/transfer-in")

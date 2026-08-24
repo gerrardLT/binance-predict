@@ -33,12 +33,17 @@ WS = 1_787_400_000_000  # 任意 5m 窗口起点 ms
 
 
 def _row(**over) -> SimpleNamespace:
-    """TradeOrderModel 待结算行替身（FILLED + 未结算 + 超 7min 延迟）。"""
+    """TradeOrderModel 待结算行替身（FILLED + 未结算 + 超 7min 延迟）。
+
+    market_period/scene_signal_id 为 5m 默认值（15m 分流分支见
+    test_multi_live_trader.py 的场景结算用例）。
+    """
     base = dict(
         id=11, status="FILLED", settled_at=None, window_start=WS,
         created_at=datetime.now(timezone.utc) - timedelta(hours=2),
         direction="DOWN", amount_in=str(10 ** 18),  # 1 USDT
         quote_json={"averagePrice": 0.5},
+        market_period="5m", scene_signal_id=None,
     )
     base.update(over)
     return SimpleNamespace(**base)

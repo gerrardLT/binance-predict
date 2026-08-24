@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 
 from loguru import logger
@@ -300,9 +301,13 @@ class FakeBreakoutDetector:
         self,
         collector: BinanceDataCollector,
         pm_15m_latest: dict,
+        on_signal_fired: Callable[[dict], None] | None = None,
     ) -> None:
         self._collector = collector
         self._pm_15m = pm_15m_latest
+        # 实盘钩子（main 装配后亦可直接注入属性）：正式信号 fire 后回调
+        # MultiLiveTrader.on_scene_signal（影子不通知，防重复下单）
+        self._on_signal_fired = on_signal_fired
 
         self._running = False
         self._task: asyncio.Task | None = None
@@ -759,6 +764,8 @@ class FakeBreakoutDetector:
         self._last_signal_at[key] = now_ms
         if not shadow:
             self._daily_count += 1
+            # 实盘钩子：正式信号通知 MultiLiveTrader（影子不通知，防重复下单）
+            self._notify_signal_fired(signal)
 
         # 入场报价快照（fire-and-forget，与邮件后台任务同模式）：
         # 次周期开盘后抓真实 15m 市场报价 + 场景①加仓触发监测。
@@ -796,6 +803,27 @@ class FakeBreakoutDetector:
                 self._send_signal_email_bg(signal.id),
                 name=f"fbs_email_{signal.id}",
             )
+
+    def _notify_signal_fired(self, signal: FakeBreakoutSignal) -> None:
+        """实盘钩子（同步接口，fire-and-forget）：正式信号 fire 后通知执行器。
+
+        payload：{id, pattern_type, side, market_start_15m, market_end_15m}。
+        异常只告警不抛（绝不阻塞检测循环——邮件 SMTP 卡死循环 16 分钟的事故教训）；
+        S5 无影子概念（影子不派生 S5），两处 fire 点均安全调用。
+        """
+        if self._on_signal_fired is None:
+            return
+        try:
+            self._on_signal_fired({
+                "id": signal.id,
+                "pattern_type": signal.pattern_type,
+                "side": signal.side,
+                "market_start_15m": signal.market_start_15m,
+                "market_end_15m": signal.market_end_15m,
+            })
+        except Exception as exc:
+            logger.warning("场景信号实盘钩子异常（不影响检测循环）| #{} | {}",
+                           signal.id, exc)
 
     async def _send_signal_email_bg(self, signal_id: int) -> None:
         """后台邮件发送：重新查库拿完整信号，发送成功后回填 email_sent。"""
@@ -1063,6 +1091,8 @@ class FakeBreakoutDetector:
             return
 
         self._daily_count += 1
+        # 实盘钩子：S5 为正式信号派生（影子不派生），无需 shadow 判断
+        self._notify_signal_fired(signal)
         logger.info(
             "S5 确认信号触发 #{}（父 #{}）| 5m 收盘 {:.2f} < 周期开盘 {:.2f} | "
             "DOWN 入场 {} | 360 天回测：确认组 78.5% [75.0,81.6] 盈亏平衡 0.77 | 日内第 {} 条{}",

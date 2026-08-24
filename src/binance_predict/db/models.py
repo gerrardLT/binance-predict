@@ -111,6 +111,15 @@ class TradeOrderModel(Base):
     signal_id: Mapped[int | None] = mapped_column(
         Integer, nullable=True, comment="窗口结算后回填的 misalignment_signals.id（实盘对账影子）"
     )
+    # --- 多通道实盘（MultiLiveTrader，2026-08-24）：15m 市场与场景订单 ---
+    market_period: Mapped[str] = mapped_column(
+        String(8), nullable=False, default="5m", server_default="5m",
+        comment="下单市场周期 5m | 15m（结算分流依据：15m 走 FakeBreakoutSignal 结算）",
+    )
+    scene_signal_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True,
+        comment="场景订单关联的 fake_breakout_signals.id（15m 结算回读；仅 scene_* 通道写入）",
+    )
     # --- 结算闭环字段（P0-2，2026-08-23）：direction 落库 + 本地结算 ---
     direction: Mapped[str | None] = mapped_column(
         String(8), nullable=True,

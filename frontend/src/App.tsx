@@ -496,11 +496,15 @@ const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ amount_usdt }),
     }).then(r => r.json()),
-  postLiveToggle: (enabled: boolean, version?: string) =>
+  postLiveChannel: (channel: string, enabled: boolean, amountUsdt?: number, maxDailyOrders?: number) =>
     fetch('/api/live/toggle', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ enabled, ...(version ? { version } : {}) }),
+      body: JSON.stringify({
+        channel, enabled,
+        ...(amountUsdt != null ? { amount_usdt: amountUsdt } : {}),
+        ...(maxDailyOrders != null ? { max_daily_orders: maxDailyOrders } : {}),
+      }),
     }).then(r => r.json()),
   getQuotePreview: () => fetch('/api/prediction/quote-preview').then(r => r.json()),
   postSyncBinance: () => fetch('/api/trades/sync-binance', { method: 'POST' }).then(r => r.json()),
@@ -577,33 +581,49 @@ function HelpHint({ text }: { text: string }) {
   )
 }
 
-// 线上信号说明（口径源：services/quote_edge_detector.py 冻结规则 + fake_breakout 场景）
-// liveOk：实盘白名单内（后端 LIVE_ALLOWED_VERSIONS，可热切开启）；
-// v2 门禁版需 BTC 价格序列、x4 为跨窗错位、fake_breakout 为场景监测——均不支持实盘。
+// 线上信号通道说明（口径源：services/live_channels.py 注册表 + quote_edge_detector 冻结规则）
+// 2026-08-24 多通道实盘改造：10 通道全部支持实盘下单（liveOk），各自独立金额/日限/护栏，
+// 通道运行状态（开关/金额/日限/护栏/今日成交）来自后端 multi_live_trader.status_async()。
 const SIGNAL_INFO: Record<string, { name: string; kind: '实盘' | '影子' | '场景'; desc: string; liveOk?: boolean }> = {
   quote_contrarian_v1: {
     name: '报价反向（B格逆势）', kind: '实盘', liveOk: true,
-    desc: '5 分钟窗口开始后 45~60 秒内，DOWN token 报价首次跌入 [0.15, 0.25)（明显便宜）时买入 DOWN。低胜率高赔付：回测胜率 24%、EV +0.155（赢一次约赚 4 倍，可覆盖三次亏损）。支持实盘下单，每 5 分钟窗口至多开一单。',
+    desc: '5 分钟窗口开始后 45~60 秒内，DOWN token 报价首次跌入 [0.15, 0.25)（明显便宜）时买入 DOWN。低胜率高赔付：回测胜率 24%、EV +0.155（赢一次约赚 4 倍）。通道护栏 0.28（区间上界+0.03），每窗至多一单。',
   },
   quote_momentum_v1: {
     name: '报价动量（A格顺势）', kind: '影子', liveOk: true,
-    desc: '5 分钟窗口 90~120 秒内，DOWN token 报价首次进入 [0.69, 0.75)（强势确认）时押 DOWN。回测胜率 79.9%、EV +0.097。支持实盘下单（白名单内），每 5 分钟窗口至多开一单。',
+    desc: '5 分钟窗口 90~120 秒内，DOWN token 报价首次进入 [0.69, 0.75)（强势确认）时押 DOWN。回测胜率 79.9%、EV +0.097。通道护栏 0.78，每窗至多一单。',
   },
   quote_contrarian_v2: {
-    name: '报价反向·门禁版', kind: '影子',
-    desc: 'v1 区间 + 价格门禁：触发时点 BTC 未高于窗口开盘 ≥0.10%（只接「假冲高」，归因显示平盘窗贡献 86% 利润）。需 BTC 价格门禁数据，暂不支持实盘（影子验证后评估）。',
+    name: '报价反向·门禁版', kind: '影子', liveOk: true,
+    desc: 'v1 区间 + BTC 价格门禁：触发时点 BTC 未高于窗口开盘 ≥0.10%（只接「假冲高」，归因显示平盘窗贡献 86% 利润）。实盘已解锁（实时 BTC 喂价门禁），通道护栏 0.28。',
   },
   quote_momentum_v2: {
-    name: '报价动量·门禁版', kind: '影子',
-    desc: 'v1 区间 + 价格门禁：触发时点 BTC 已低于窗口开盘 ≥0.10%（剔「假恐慌」，真跌段胜率 85% vs 假恐慌段 40%）。需 BTC 价格门禁数据，暂不支持实盘（影子验证后评估）。',
+    name: '报价动量·门禁版', kind: '影子', liveOk: true,
+    desc: 'v1 区间 + BTC 价格门禁：触发时点 BTC 已低于窗口开盘 ≥0.10%（剔「假恐慌」，真跌段胜率 85% vs 假恐慌段 40%）。实盘已解锁（实时 BTC 喂价门禁），通道护栏 0.78。',
   },
   x4_v1: {
-    name: '情绪错位', kind: '影子',
-    desc: '情绪窗口与价格走势错位检测（原 X4 假设：情绪采样窗口 UP% 异常偏离时的次窗下注方向）。跨窗错位架构，实盘链路为窗内报价触发，暂不支持实盘。',
+    name: '情绪错位（收阳押次窗DOWN）', kind: '影子', liveOk: true,
+    desc: '本窗收阳但 15m 市场收尾情绪 ≤40 的错位 → 次窗 +150s 决策点押 DOWN（回测合并胜率 63.5%、EV +0.254）。实盘已解锁：PENDING 信号轮询→决策点下单，护栏 0.45，错过决策点不追单。',
   },
-  fake_breakout: {
-    name: '假突破场景', kind: '场景',
-    desc: '15 分钟周期内 BTC 破位后回落的场景监测（4h 高/低位假突破、动量衰竭等形态）。只告警与落表不下单；历史结算 DOWN 胜率约 55%。',
+  x4_v2: {
+    name: '情绪错位·平静市门禁版', kind: '影子', liveOk: true,
+    desc: 'x4_v1 + 平静市门禁（回测胜率 45.3%，仅平静市况触发）。实盘已解锁：同 x4_v1 决策点机制，护栏 0.50，错过决策点不追单。',
+  },
+  scene_bull_exhaust: {
+    name: '场景S1 多头耗尽（押DOWN）', kind: '场景', liveOk: true,
+    desc: '15m 周期刺破 4h 阻力 + 光头阳收盘确认 → 次周期开盘押 DOWN（真 OOS 胜率 64.4%，盈亏平衡 0.63）。实盘已解锁：15m 市场次周期开盘下单，护栏 0.60。',
+  },
+  scene_bull_exhaust_confirm: {
+    name: '场景S5 确认入场（押DOWN）', kind: '场景', liveOk: true,
+    desc: 'S1 信号 +5min 确认（次周期第 1 根 5m K 收盘 < 开盘）才买 DOWN（确认组胜率 78.5%，盈亏平衡 0.77）。实盘已解锁：确认时刻 15m 市场下单，护栏 0.75。',
+  },
+  scene_bear_exhaust: {
+    name: '场景S2 空头耗尽（押UP）', kind: '场景', liveOk: true,
+    desc: '15m 周期跌破 4h 支撑 + 收阴 + 放量 → 次周期开盘押 UP（胜率 53.6%，盈亏平衡 0.525）。护栏 0.55：跌态 UP 报价常在 0.79+，超护栏保护性弃单（负 EV 保护，属正确行为）。',
+  },
+  scene_momentum_fade: {
+    name: '场景S4 动量衰竭（押DOWN）', kind: '场景', liveOk: true,
+    desc: '连阳 ≥3 根 + 光头阳的动量衰竭 → 次周期开盘押 DOWN（胜率 55.4%，盈亏平衡 0.54）。实盘已解锁：15m 市场次周期开盘下单，护栏 0.55。',
   },
 }
 
@@ -712,24 +732,44 @@ function LiveChartCard() {
   )
 }
 
-// 线上信号概览卡：实盘/影子/场景一屏总览（60s 轮询，统计为全量累计不随 limit 截断）
-// onPickLive：实盘白名单内信号行的「开实盘/切到此信号」回调（由 LiveTradeTab 注入，
-// 统一走 confirm + postLiveToggle(enabled, version)，避免两处开关状态不一致互咬）
-function SignalsOverviewCard({ live, onPickLive, busy = false }: {
+// 多通道实盘状态类型（与后端 multi_live_trader.status_async() 严格对齐）
+interface LiveChannelStatus {
+  channel: string
+  display_name: string
+  family: string
+  market_period: string
+  direction: string
+  enabled: boolean
+  enabled_at_startup: boolean
+  amount_usdt: number
+  max_daily_orders: number
+  max_exec_price: number
+  auto_max_exec: number
+  fire_total: number
+  fired_windows: number[]
+  filled_today?: number
+}
+
+// 线上信号概览卡：10 通道一屏总览（60s 轮询，统计为全量累计不随 limit 截断）
+// onToggleChannel：行内通道开关回调（由 LiveTradeTab 注入，confirm 统一在那里，
+// 避免两处开关状态不一致互咬）
+function SignalsOverviewCard({ live, onToggleChannel, busy = false }: {
   live: Record<string, unknown> | null
-  onPickLive?: (version: string) => void
+  onToggleChannel?: (ch: LiveChannelStatus) => void
   busy?: boolean
 }) {
   const [stats, setStats] = useState<Record<string, Record<string, unknown> | null>>({})
   const [fb, setFb] = useState<Record<string, unknown> | null>(null)
 
   const refresh = useCallback(() => {
-    const versions = ['quote_contrarian_v1', 'quote_momentum_v1', 'quote_contrarian_v2', 'quote_momentum_v2', 'x4_v1']
+    // quote_edge/x4 六通道：misalignment 影子统计（版本名与通道名一致）
+    const versions = ['quote_contrarian_v1', 'quote_momentum_v1', 'quote_contrarian_v2', 'quote_momentum_v2', 'x4_v1', 'x4_v2']
     versions.forEach(v => {
       api.getMisalignmentSignals(v)
         .then(d => setStats(prev => ({ ...prev, [v]: d?.stats ?? null })))
         .catch(() => {})
     })
+    // scene 四通道：fake_breakout 全局统计（无按 pattern_type 细分的端点，作行内参考）
     api.getFakeBreakoutStats().then(setFb).catch(() => {})
   }, [])
 
@@ -739,65 +779,63 @@ function SignalsOverviewCard({ live, onPickLive, busy = false }: {
     return () => clearInterval(t)
   }, [refresh])
 
-  const liveVersion = typeof live?.version === 'string' ? live.version as string : null
-  const liveEnabled = live?.enabled === true
+  const channels = Array.isArray(live?.channels) ? live.channels as LiveChannelStatus[] : []
 
-  const rows: Array<{ key: string }> = [
-    ...(['quote_contrarian_v1', 'quote_momentum_v1', 'quote_contrarian_v2', 'quote_momentum_v2', 'x4_v1']
-      .map(key => ({ key }))),
-    { key: 'fake_breakout' },
-  ]
+  const fbTotal = fb?.total_signals
+  const fbWr = fb?.down_win_rate
+  const fbStatText = fbTotal != null
+    ? `${String(fbTotal)} 信号 · DOWN 胜率 ${typeof fbWr === 'number' ? (fbWr * 100).toFixed(0) : '?'}%`
+    : '--'
 
   return (
     <Card title="线上信号概览">
       <div className="text-xs">
-        {rows.map(({ key }) => {
-          const info = SIGNAL_INFO[key]
-          if (!info) return null
-          const s = stats[key]
-          const isLive = key === liveVersion
-          let statText = '--'
-          if (key === 'fake_breakout') {
-            const total = fb?.total_signals
-            const wr = fb?.down_win_rate
-            statText = total != null
-              ? `${String(total)} 信号 · DOWN 胜率 ${typeof wr === 'number' ? (wr * 100).toFixed(0) : '?'}%`
-              : '--'
+        {channels.map(ch => {
+          const info = SIGNAL_INFO[ch.channel]
+          const s = stats[ch.channel]
+          let statText: string
+          if (ch.family === 'scene') {
+            statText = `今日 ${String(ch.filled_today ?? 0)} 单 · 开火 ${String(ch.fire_total)}（场景全局：${fbStatText}）`
           } else if (s != null) {
             const n = s.settled as number | undefined
             const wr = s.win_rate as number | null | undefined
             const ev = s.avg_ev as number | null | undefined
-            statText = `${String(n ?? 0)} 注 · 胜率 ${wr != null ? (wr * 100).toFixed(0) : '?'}% · EV ${ev != null ? `${ev >= 0 ? '+' : ''}${ev.toFixed(3)}` : '?'}（影子结算口径）`
+            statText = `${String(n ?? 0)} 注 · 胜率 ${wr != null ? (wr * 100).toFixed(0) : '?'}% · EV ${ev != null ? `${ev >= 0 ? '+' : ''}${ev.toFixed(3)}` : '?'}（影子口径）`
+          } else {
+            statText = '--'
           }
           return (
-            <div key={key} className="flex items-center justify-between gap-2 py-1.5 border-b border-gray-50 last:border-0">
+            <div key={ch.channel} className="flex items-center justify-between gap-2 py-1.5 border-b border-gray-50 last:border-0">
               <span className="flex items-center gap-1.5 min-w-0">
-                <span className={`px-1.5 py-0.5 text-[10px] font-bold rounded border shrink-0 ${SIGNAL_KIND_BADGE[info.kind]}`}>{info.kind}</span>
-                <span className="text-gray-700 font-medium truncate">{info.name}</span>
-                <span className="text-[10px] text-gray-400 font-mono shrink-0 hidden sm:inline">{key}</span>
-                <HelpHint text={info.desc} />
-                {isLive && (
-                  <span className={`text-[10px] font-semibold shrink-0 ${liveEnabled ? 'text-green-700' : 'text-amber-600'}`}>
-                    · {liveEnabled ? `开火中 ${String(live?.amount_usdt ?? '?')}U/单` : '已停火'}
+                <span className={`px-1.5 py-0.5 text-[10px] font-bold rounded border shrink-0 ${SIGNAL_KIND_BADGE[info?.kind ?? '影子']}`}>{info?.kind ?? '影子'}</span>
+                <span className="text-gray-700 font-medium truncate">{info?.name ?? ch.display_name}</span>
+                <span className="text-[10px] text-gray-400 font-mono shrink-0 hidden sm:inline">{ch.channel}</span>
+                <HelpHint text={info?.desc ?? ''} />
+                {ch.enabled && (
+                  <span className="text-[10px] font-semibold shrink-0 text-green-700">
+                    · 开火中 {String(ch.amount_usdt)}U/单
                   </span>
                 )}
               </span>
               <span className="flex items-center gap-1.5 shrink-0">
                 <span className="font-mono text-[11px] text-gray-600 text-right">{statText}</span>
-                {info.liveOk && onPickLive && !(isLive && liveEnabled) && (
+                {onToggleChannel && (
                   <button
-                    onClick={() => onPickLive(key)}
+                    onClick={() => onToggleChannel(ch)}
                     disabled={busy}
-                    className="px-2 py-0.5 text-[10px] font-semibold rounded bg-green-600 text-white hover:bg-green-700 disabled:opacity-50 shrink-0"
-                    title={isLive ? '重新开火（已绑定此信号）' : '热切到此信号并开火（重启回落 .env 默认）'}
-                  >{isLive ? '开火' : '开实盘'}</button>
+                    className={`px-2 py-0.5 text-[10px] font-semibold rounded text-white disabled:opacity-50 shrink-0 ${ch.enabled ? 'bg-red-500 hover:bg-red-600' : 'bg-green-600 hover:bg-green-700'}`}
+                    title={ch.enabled ? '关闭该通道（在途任务不受影响）' : '开启该通道（confirm 后生效，独立金额/护栏/日限）'}
+                  >{ch.enabled ? '停火' : '开火'}</button>
                 )}
               </span>
             </div>
           )
         })}
+        {channels.length === 0 && (
+          <div className="text-gray-400 py-2">实盘通道状态不可用（执行器未装配？详见后端日志）</div>
+        )}
         <p className="text-[10px] text-gray-400 mt-1.5">
-          实盘=命中规则真实下单（白名单内可点「开实盘」热切）；影子=只记录不下单（v2 门禁版/x4 暂不支持实盘，见各信号说明）；场景=监测告警不下单。统计 60s 刷新。
+          10 通道全部支持实盘：每通道独立金额/日限/执行价护栏（通道管理与金额热调见「实盘交易」页）。影子统计 60s 刷新。
         </p>
       </div>
     </Card>
@@ -822,8 +860,8 @@ function LiveTradeTab() {
   const [syncing, setSyncing] = useState(false)
   const [syncResult, setSyncResult] = useState<Record<string, unknown> | null>(null)
   const [togglingLive, setTogglingLive] = useState(false)
-  // 信号选择层（开启实盘时挑选白名单内信号热切，2026-08-23）
-  const [showSignalPicker, setShowSignalPicker] = useState(false)
+  // 通道金额热调草稿（key=channel；仅在用户输入时存在，提交后清除）
+  const [amountDrafts, setAmountDrafts] = useState<Record<string, string>>({})
   // 可领取奖金（赢单 token → batch-redeem → USDT）
   const [redeemable, setRedeemable] = useState<Record<string, unknown> | null>(null)
   const [redeeming, setRedeeming] = useState(false)
@@ -831,7 +869,7 @@ function LiveTradeTab() {
 
   const refresh = useCallback(() => {
     api.getPredictionWallet().then(setWallet).catch(() => {})
-    api.getLiveStatus().then(d => setLive(d?.quote_edge_live ?? null)).catch(() => {})
+    api.getLiveStatus().then(d => setLive(d?.live_channels ?? null)).catch(() => {})
     api.getRecentTrades().then(d => setOrders(d?.orders ?? [])).catch(() => {})
     api.getRedeemable().then(setRedeemable).catch(() => {})
     api.getQuotePreview().then((q: Record<string, unknown>) => {
@@ -878,7 +916,10 @@ function LiveTradeTab() {
   const walletErr = (wallet as { error?: string } | null)?.error
   const regTs = wallet?.registered_time as number | undefined
   const resultFilled = result?.status === 'FILLED'
-  const liveEnabled = live?.enabled === true
+  // 多通道实盘：live = live_channels status（channels[] 见 LiveChannelStatus）
+  const liveChannels = Array.isArray(live?.channels) ? live.channels as LiveChannelStatus[] : []
+  const enabledCount = liveChannels.filter(c => c.enabled).length
+  const liveDefaults = (live?.defaults ?? {}) as Record<string, unknown>
 
   // 倒计时：服务端时钟修正后的剩余毫秒；<60s 红色警示
   const windowEnd = quote?.window_end as number | null | undefined
@@ -968,37 +1009,50 @@ function LiveTradeTab() {
     }
   }
 
-  const handleLiveToggle = async (next: boolean, version?: string) => {
-    // 开启 + 已选具体信号：confirm 后带 version 热切并开火
-    if (next && version) {
-      const info = SIGNAL_INFO[version]
-      if (!window.confirm(
-        `确认开启信号实盘？\n信号: ${info ? `${info.name}（${version}）` : version} | 每单 ${String(live?.amount_usdt ?? '?')} USDT\n\n命中规则区间将下真实订单押 DOWN（真金白银）；信号为运行时切换，重启后回落 .env 默认。`)) return
-      setTogglingLive(true)
-      try {
-        const res = await api.postLiveToggle(true, version)
-        if (res?.error) alert(`切换失败: ${String(res.error)}`)
-        setShowSignalPicker(false)
-        refresh()
-      } catch (e) {
-        alert(`请求失败: ${(e as Error).message}`)
-      } finally {
-        setTogglingLive(false)
-      }
-      return
-    }
-    // 开启但未选信号 → 弹出选择层（白名单内可热切）；关闭 → 直接 confirm
+  const handleChannelToggle = async (ch: LiveChannelStatus) => {
+    // 通道级开关：confirm 文案带该通道金额/护栏/日限（多通道时代重写，取代版本热切）
+    const info = SIGNAL_INFO[ch.channel]
+    const name = info?.name ?? ch.display_name
+    const next = !ch.enabled
     if (next) {
-      setShowSignalPicker(true)
-      return
+      if (!window.confirm(
+        `确认开启通道实盘？\n通道: ${name}（${ch.channel}）\n每单 ${String(ch.amount_usdt)} USDT | 执行价护栏 ${String(ch.max_exec_price)} | 日限 ${String(ch.max_daily_orders)} 单\n\n命中信号将下真实订单（真金白银）；重启后回落 LIVE_CHANNELS_JSON 配置。`)) return
+    } else {
+      if (!window.confirm(
+        `确认关闭通道实盘？\n通道: ${name}（${ch.channel}）\n（不取消在途任务，只阻止该通道新单派生）`)) return
     }
-    const liveInfo = SIGNAL_INFO[String(live?.version ?? '')]
-    if (!window.confirm(
-      `确认关闭信号实盘？\n当前信号: ${liveInfo ? `${liveInfo.name}（${String(live?.version ?? '?')}）` : String(live?.version ?? '?')}\n（不取消在途任务，只阻止新单派生；重启后回落 .env 默认）`)) return
     setTogglingLive(true)
     try {
-      const res = await api.postLiveToggle(false)
+      const res = await api.postLiveChannel(ch.channel, next)
       if (res?.error) alert(`切换失败: ${String(res.error)}`)
+      refresh()
+    } catch (e) {
+      alert(`请求失败: ${(e as Error).message}`)
+    } finally {
+      setTogglingLive(false)
+    }
+  }
+
+  const handleChannelAmount = async (ch: LiveChannelStatus) => {
+    // 金额热调：保存草稿值（校验同后端便硬限 0.1~50），不动开关状态
+    const amt = parseFloat(amountDrafts[ch.channel] ?? '')
+    if (!Number.isFinite(amt) || amt < 0.1 || amt > 50) {
+      alert('金额仅允许 0.1~50 USDT（与实盘单笔硬上限一致）')
+      return
+    }
+    if (amt === ch.amount_usdt) return
+    setTogglingLive(true)
+    try {
+      const res = await api.postLiveChannel(ch.channel, ch.enabled, amt)
+      if (res?.error) {
+        alert(`金额保存失败: ${String(res.error)}`)
+      } else {
+        setAmountDrafts(prev => {
+          const rest = { ...prev }
+          delete rest[ch.channel]
+          return rest
+        })
+      }
       refresh()
     } catch (e) {
       alert(`请求失败: ${(e as Error).message}`)
@@ -1149,77 +1203,69 @@ function LiveTradeTab() {
           <div className="border-t border-gray-100 my-2" />
           <div className="flex justify-between gap-2 items-center">
             <span className="text-gray-500 shrink-0 flex items-center">
-              信号实盘
-              <HelpHint text={SIGNAL_INFO[String(live?.version ?? '')]?.desc ?? '当前接入实盘下单的信号版本（详见「线上信号概览」卡）。'} />
+              信号实盘通道
+              <HelpHint text="10 个信号通道独立实盘：每通道独立开关/单笔金额/日限/执行价护栏。命中信号即下真实订单（FOK），重启回落 LIVE_CHANNELS_JSON 配置。" />
             </span>
-            {live
-              ? <span className="flex items-center gap-2">
-                  {liveEnabled
-                    ? <span className="text-green-700 font-semibold">
-                        已开启 · {SIGNAL_INFO[String(live.version)]?.name ?? String(live.version)}
-                        <span className="text-[10px] text-gray-400 font-mono ml-1">{String(live.version)}</span>
-                      </span>
-                    : <span className="text-amber-700 font-semibold">
-                        已关闭（不开火）
-                        <span className="text-[10px] text-gray-400 font-mono ml-1">{String(live.version)}</span>
-                      </span>}
-                  <button
-                    onClick={() => handleLiveToggle(!liveEnabled)}
-                    disabled={togglingLive}
-                    className={`px-3 py-1 text-xs font-semibold rounded text-white disabled:opacity-50 ${liveEnabled ? 'bg-red-600' : 'bg-green-600'}`}
-                  >{togglingLive ? '切换中…' : liveEnabled ? '停止' : '选信号开启'}</button>
+            {liveChannels.length > 0
+              ? <span className="flex items-baseline gap-1.5 text-right">
+                  <span className={enabledCount > 0 ? 'text-green-700 font-semibold' : 'text-amber-700 font-semibold'}>
+                    {enabledCount > 0 ? `${enabledCount}/${String(liveChannels.length)} 通道开启` : '全部关闭（不开火）'}
+                  </span>
+                  <span className="text-[10px] text-gray-400">
+                    默认 {String(liveDefaults.amount_usdt ?? '--')}U/单 · 在途任务 {String(live?.pending_tasks ?? 0)}
+                  </span>
                 </span>
               : <span className="text-gray-400">未装配（启动异常，详见后端日志）</span>}
           </div>
-          {/* 信号选择层：开启实盘时挑选白名单内信号热切（liveOk 白名单 = 后端 LIVE_ALLOWED_VERSIONS） */}
-          {live && showSignalPicker && (
+          {/* 通道管理面板：每通道一行「信号名/护栏/今日成交/累计开火/金额输入+保存/开关」，独立 toggle + 金额热调 */}
+          {liveChannels.length > 0 && (
             <div className="bg-gray-50 border border-gray-200 rounded-lg p-2 space-y-1">
-              <div className="text-[11px] text-gray-500">选择要开火的信号（运行时切换，重启回落 .env 默认；v2 门禁版/x4 暂不支持实盘）：</div>
-              {(['quote_contrarian_v1', 'quote_momentum_v1'] as const)
-                .filter(v => SIGNAL_INFO[v])
-                .map(v => {
-                  const info = SIGNAL_INFO[v]
-                  const isCurrent = String(live.version) === v
-                  return (
+              {liveChannels.map(ch => {
+                const info = SIGNAL_INFO[ch.channel]
+                const draft = amountDrafts[ch.channel]
+                const dirty = draft != null && draft !== String(ch.amount_usdt)
+                return (
+                  <div
+                    key={ch.channel}
+                    className={`flex items-center gap-2 px-2 py-1.5 rounded border text-xs ${ch.enabled ? 'border-green-300 bg-green-50/60' : 'border-gray-200 bg-white'}`}
+                  >
+                    <span className="flex items-center gap-1.5 min-w-0 flex-1">
+                      <span className={`px-1.5 py-0.5 text-[10px] font-bold rounded border shrink-0 ${SIGNAL_KIND_BADGE[info?.kind ?? '影子']}`}>{info?.kind ?? '影子'}</span>
+                      <span className="text-gray-800 font-medium truncate">{info?.name ?? ch.display_name}</span>
+                      <span className="text-[10px] text-gray-400 font-mono shrink-0 hidden md:inline">{ch.channel}</span>
+                      <HelpHint text={info?.desc ?? ch.display_name} />
+                    </span>
+                    <span className="shrink-0 font-mono text-[10px] text-gray-500 hidden sm:inline" title="执行价护栏 / 今日成交/日限 / 累计开火">
+                      护栏{String(ch.max_exec_price)} · 今日{String(ch.filled_today ?? 0)}/{String(ch.max_daily_orders)} · 开火{String(ch.fire_total)}
+                    </span>
+                    <span className="shrink-0 flex items-center gap-1">
+                      <input
+                        type="number" min={0.1} max={50} step={0.5}
+                        value={draft ?? String(ch.amount_usdt)}
+                        onChange={e => setAmountDrafts(prev => ({ ...prev, [ch.channel]: e.target.value }))}
+                        disabled={togglingLive}
+                        title={`单笔金额（0.1~50 USDT，硬上限 ${String(live?.amount_cap ?? 50)}）`}
+                        className="w-16 px-1.5 py-0.5 border border-gray-300 rounded text-gray-800 font-mono disabled:opacity-50"
+                      />
+                      <button
+                        onClick={() => handleChannelAmount(ch)}
+                        disabled={togglingLive || !dirty}
+                        className="px-1.5 py-0.5 rounded border border-blue-400 bg-white text-blue-700 font-semibold disabled:opacity-40"
+                        title="保存金额热调（立即生效，不影响在途任务）"
+                      >存</button>
+                    </span>
                     <button
-                      key={v}
-                      onClick={() => handleLiveToggle(true, v)}
+                      onClick={() => handleChannelToggle(ch)}
                       disabled={togglingLive}
-                      className={`w-full text-left px-2.5 py-1.5 rounded border text-xs transition-colors disabled:opacity-50 ${isCurrent
-                        ? 'border-green-400 bg-green-50'
-                        : 'border-gray-200 bg-white hover:border-green-300 hover:bg-green-50/50'}`}
-                    >
-                      <span className="flex items-center gap-1.5">
-                        <span className={`px-1.5 py-0.5 text-[10px] font-bold rounded border shrink-0 ${SIGNAL_KIND_BADGE[info.kind]}`}>{info.kind}</span>
-                        <span className="text-gray-800 font-medium">{info.name}</span>
-                        <span className="text-[10px] text-gray-400 font-mono">{v}</span>
-                        <HelpHint text={info.desc} />
-                        {isCurrent && <span className="text-[10px] text-green-700 font-semibold shrink-0">当前绑定</span>}
-                      </span>
-                    </button>
-                  )
-                })}
-              <button
-                onClick={() => setShowSignalPicker(false)}
-                className="text-[11px] text-gray-400 hover:text-gray-600 px-1"
-              >取消</button>
+                      className={`shrink-0 px-2 py-0.5 rounded font-bold text-white disabled:opacity-50 ${ch.enabled ? 'bg-red-600' : 'bg-green-600'}`}
+                    >{ch.enabled ? '停火' : '开火'}</button>
+                  </div>
+                )
+              })}
+              <p className="text-[10px] text-gray-400 pt-0.5">
+                金额输入后点「存」热调（立即生效）；开关各通道独立互不影响；重启回落 LIVE_CHANNELS_JSON 配置。5m 通道随窗触发，15m 场景通道次周期开盘入场。
+              </p>
             </div>
-          )}
-          {live && (
-            <>
-              <div className="flex justify-between gap-2">
-                <span className="text-gray-500 shrink-0">启动默认 / 当前</span>
-                <span className="text-gray-700">{live?.enabled_at_startup === true ? 'ON' : 'OFF'} / {liveEnabled ? 'ON' : 'OFF'}（重启回落 .env）</span>
-              </div>
-              <div className="flex justify-between gap-2">
-                <span className="text-gray-500 shrink-0">每单金额 / 执行价上限</span>
-                <span className="text-gray-700">{String(live.amount_usdt)} USDT / {String(live.max_exec_price)}</span>
-              </div>
-              <div className="flex justify-between gap-2">
-                <span className="text-gray-500 shrink-0">日上限 / 已开火</span>
-                <span className="text-gray-700">{String(live.max_daily_orders)} 单 / {String(live.fire_total)} 次</span>
-              </div>
-            </>
           )}
         </div>
       </Card>
@@ -1306,7 +1352,7 @@ function LiveTradeTab() {
       </Card>
 
       {/* 线上信号概览（第二行右列）：实盘/影子/场景一屏总览，问号 hover 看信号规则 */}
-      <SignalsOverviewCard live={live} onPickLive={v => handleLiveToggle(true, v)} busy={togglingLive} />
+      <SignalsOverviewCard live={live} onToggleChannel={handleChannelToggle} busy={togglingLive} />
 
       <div className="lg:col-span-2">
         <Card title="最近订单">
