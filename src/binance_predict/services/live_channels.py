@@ -81,6 +81,15 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     ),
 }
 
+# 纯影子版本显式登记（R9，2026-08-25 风险评审）：此前影子不变量仅靠
+# "白名单缺席"隐式保证——谁把 v3a 加进 LIVE_CHANNELS，它立刻变可开火+
+# 可推邮件通道且无任何测试失败。显式集合 + tests/test_shadow_live_disjoint.py
+# 不相交断言双保险；新增纯影子版本在此登记。
+SHADOW_ONLY_VERSIONS: frozenset[str] = frozenset({
+    "quote_contrarian_v3a",   # v2∩前窗 DOWN 交替环境（归因研究版，未过实盘门槛）
+    "quote_contrarian_v3b",   # v3a∩距日高回落≥0.30%（同上）
+})
+
 
 @dataclass
 class ChannelConfig:

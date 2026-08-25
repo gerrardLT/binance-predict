@@ -71,7 +71,8 @@ async def test_window_entry_price_uses_mid_price_snapshot() -> None:
     tracker_source = _get_tracker_source()
     archiver_source = _get_archiver_source()
     assert "_window_entry_price" in tracker_source
-    assert "collector.store.mid_price" in tracker_source
+    # R3 后入场价快照改走新鲜度闸（陈旧价返 0 → REST 后备），不再直读裸 mid_price
+    assert "collector.store.fresh_mid_price()" in tracker_source
     assert "_window_entry_price" in archiver_source
     assert re.search(r"for\s+k\s+in.*klines_5m.*entry_price", archiver_source, re.DOTALL) is None
 

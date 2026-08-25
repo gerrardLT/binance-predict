@@ -128,6 +128,27 @@ async def test_notify_paused_by_master_switch(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_notify_fund_critical_bypasses_master_switch(monkeypatch) -> None:
+    """资金类独立通道（R2）：总闸关闭时 ORDER_STUCK_PENDING 仍推送，
+    常规告警（WINDOW_STALE）静默且不被 mark_sent（恢复后不吞告警）。"""
+    monkeypatch.setattr(settings, "agent_alert_notify_enabled", False)
+    n = AlertNotifier()
+    fund = _alert("ORDER_STUCK_PENDING")
+    normal = _alert("WINDOW_STALE")
+    report = _report("CRITICAL", [fund, normal])
+
+    sent = await n.notify(report)
+    assert [a.code for a in sent] == ["ORDER_STUCK_PENDING"]
+
+    # 常规告警未被 mark_sent：恢复总闸后立即推送
+    monkeypatch.setattr(settings, "agent_alert_notify_enabled", True)
+    reopened = await n.notify(report)
+    codes = {a.code for a in reopened}
+    assert "WINDOW_STALE" in codes
+    assert "ORDER_STUCK_PENDING" not in codes  # 已在窗口内推过
+
+
+@pytest.mark.asyncio
 async def test_send_plain_email_gated_by_signal_switch(monkeypatch) -> None:
     """send_plain_email 门控解耦：受 signal_push_email_enabled 控制，
     不再依赖 agent_alert_email_enabled（暂停告警不影响信号邮件）。"""

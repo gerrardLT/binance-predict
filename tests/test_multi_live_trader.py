@@ -513,6 +513,9 @@ async def test_x4_poll_schedules_and_idempotent(monkeypatch) -> None:
     assert call["window_start"] == target
     assert call["max_exec_price"] == 0.45
     assert call["market_period"] == "5m"
+    # R7：决策点时限传入下单临界区，获锁后由 trader 复查（容差不只在锁前）
+    decision_ms = target + int(milt.DECISION_T_SEC * 1000)
+    assert call["deadline_ms"] == decision_ms + milt.X4_DECISION_TOLERANCE_MS
 
     await t._x4_poll_once()   # 同一信号再次被捞到：seen 幂等
     await _drain(t)
@@ -935,7 +938,8 @@ async def test_signal_trade_15m_token_and_scene_id(monkeypatch) -> None:
                 "quoteId": "Q1"}
 
     async def _place(_q, slippage_bps=1200):
-        return {"orderId": "ORD-15M"}
+        # R2 后按响应内 status 分流：真实响应含 status，替身同构
+        return {"orderId": "ORD-15M", "status": "FILLED"}
 
     monkeypatch.setattr(trader, "_reserve_order_slot", _reserve)
     monkeypatch.setattr(trader, "_update_signal_order", _update)
@@ -1009,7 +1013,7 @@ async def test_signal_trade_15m_anchor_picks_right_cycle(monkeypatch) -> None:
                 "quoteId": "Q1"}
 
     async def _place(_q, slippage_bps=1200):
-        return {"orderId": "ORD-ANCHOR"}
+        return {"orderId": "ORD-ANCHOR", "status": "FILLED"}
 
     monkeypatch.setattr(trader, "list_markets", _list)
     monkeypatch.setattr(trader, "_reserve_order_slot", _reserve)
@@ -1098,7 +1102,7 @@ async def test_signal_trade_success_dynamic_slippage(monkeypatch) -> None:
 
     async def _place(_q, slippage_bps=1200):
         slippage_seen.append(slippage_bps)
-        return {"orderId": "ORD-9"}
+        return {"orderId": "ORD-9", "status": "FILLED"}
 
     monkeypatch.setattr(trader, "_reserve_order_slot", _reserve)
     monkeypatch.setattr(trader, "_update_signal_order", _update)

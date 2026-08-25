@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import calendar
+import hmac
 import json
 import math
 import time
@@ -55,6 +56,7 @@ from .services.misalignment_detector import MisalignmentDetector
 from .services.multi_live_trader import MultiLiveTrader
 from .services.quote_edge_detector import QuoteEdgeDetector
 from .services.trade_settler import TradeSettler
+from .services.order_reconciler import OrderReconciler
 from .services.llm_service import LLMService
 from .services.pattern_reevaluator import pattern_reevaluator
 from .services.prediction_trading import BinancePredictionTrader
@@ -141,6 +143,9 @@ quote_edge_detector: QuoteEdgeDetector | None = None
 # 交易结算器全局实例（P0-2：FILLED 订单结算回填输赢/盈亏，常开）
 trade_settler: TradeSettler | None = None
 
+# 订单对账器全局实例（R2：卡 PENDING 订单回读币安历史订正终态，常开）
+order_reconciler: "OrderReconciler | None" = None
+
 # 多通道实盘执行器全局实例（MultiLiveTrader：10 通道三族触发，
 # 通道开关/金额/日限各自独立，启动回落 LIVE_CHANNELS_JSON，默认全关）
 multi_live_trader: MultiLiveTrader | None = None
@@ -178,7 +183,8 @@ async def _handle_15m_quote(quote_15m, ts_ms: int, *, persist: bool) -> None:
             open_15m = await collector.fetch_kline_open("15m", int(start_15m))
         else:
             # 正常切换：切换时刻现价即新周期开盘价（加速路径 ≤2s / 常规 ≤15s 滞后）
-            open_15m = collector.store.mid_price
+            # R3 新鲜度闸：陈旧价 → 0 → 走下方 REST 回读，不把停摆喂价当开盘价
+            open_15m = collector.store.fresh_mid_price()
             if not open_15m or open_15m <= 0:
                 open_15m = await collector.fetch_mid_price()
         _pm_15m_latest["cycle_open_price"] = open_15m if open_15m and open_15m > 0 else None
@@ -205,7 +211,7 @@ async def _handle_15m_quote(quote_15m, ts_ms: int, *, persist: bool) -> None:
                 down_pct=round(quote_15m.down_chance * 100, 1) if quote_15m.down_chance is not None else None,
                 participants=quote_15m.participants,
                 trade_volume=float(quote_15m.trade_volume) if quote_15m.trade_volume is not None else None,
-                btc_price=collector.store.mid_price or None,
+                btc_price=collector.store.fresh_mid_price() or None,
             ))
             await db.commit()
     except Exception as e:
@@ -322,7 +328,8 @@ async def _prediction_market_tracker() -> None:
                         # 入场价 = 旧窗口起点快照；出场价 = 本次切换时刻的 mid_price（即旧窗口终点）。
                         _last_closed_window_end = _current_window_end
                         _last_closed_window_entry_price = _window_entry_price
-                        _last_closed_window_exit_price = collector.store.mid_price
+                        # R3 新鲜度闸：陈旧价置 0，归档侧会走 fresh/fetch 重试而非错用旧价
+                        _last_closed_window_exit_price = collector.store.fresh_mid_price()
                         logger.info("5分钟市场窗口切换 | 清空图表缓存 | {} → {}", _current_window_end, new_window_end)
                         _pm_history.clear()
                     _current_window_end = new_window_end
@@ -330,7 +337,8 @@ async def _prediction_market_tracker() -> None:
                     _restored_current_window = False
                     # Bug 1.5 修复：窗口开始时快照 entry_price。优先用内存最新
                     # mid_price 快照（非阻塞），避免在 _state_lock 内做阻塞 REST 调用。
-                    _window_entry_price = collector.store.mid_price
+                    # R3 新鲜度闸：陈旧快照 → 0 → 走下方 REST 后备补偿
+                    _window_entry_price = collector.store.fresh_mid_price()
                     # Fix #12: 内存快照无效时用 REST 后备补偿（罕见路径），仍无效则告警
                     if not _window_entry_price or _window_entry_price <= 0:
                         _window_entry_price = await collector.fetch_mid_price()
@@ -395,8 +403,8 @@ async def _prediction_market_tracker() -> None:
 
             if up_chance is not None or down_chance is not None:
                 # BTC 现货中间价快照（与情绪采样同时刻）：验证情绪领先/滞后
-                # 价格的关键证据。内存快照无效时存 None，不阻塞、不伪造。
-                _btc_mid = collector.store.mid_price
+                # 价格的关键证据。内存快照无效或陈旧（R3 闸）时存 None，不阻塞、不伪造。
+                _btc_mid = collector.store.fresh_mid_price()
                 point = {
                     "timestamp": aligned_ts,
                     "up_price": up_price,
@@ -571,8 +579,17 @@ async def _sentiment_window_archiver() -> None:
 
                     # 修复：使用窗口切换时快照的价格。
                     # entry_price = 已关闭窗口起点快照；exit_price = 切换时刻价（窗口终点）。
+                    # R3 新鲜度闸：快照缺失时不回退陈旧内存价，改 REST 重试，仍无效跳过本窗
                     entry_price = closed_entry
-                    exit_price = closed_exit if (closed_exit and closed_exit > 0) else collector.store.mid_price
+                    exit_price = closed_exit if (closed_exit and closed_exit > 0) else collector.store.fresh_mid_price()
+                    if not exit_price or exit_price <= 0:
+                        exit_price = await collector.fetch_mid_price()
+                        if not exit_price or exit_price <= 0:
+                            logger.error(
+                                "情绪窗口跳过 | {}~{} | exit_price 始终无效（喂价可能停摆），跳过本次归档",
+                                start_ms, end_ms,
+                            )
+                            continue
 
                     # Fix #12: entry_price 异常时重试获取，避免生成无效归档记录
                     if not entry_price or entry_price <= 0:
@@ -712,6 +729,12 @@ async def _health_monitor_loop() -> None:
                     metrics_snapshot=snapshot,
                     consecutive_failures=consecutive_failures,
                     queue_depth=queue_depth,
+                    # R3 喂价停摆告警：从未更新传 inf（区分 CLI 的 None=不评估）
+                    spot_feed_age_s=(
+                        collector.store.mid_price_age_s()
+                        if collector.store.mid_price_age_s() is not None
+                        else float("inf")
+                    ),
                 )
 
                 # 非 OK 状态写日志；新告警经邮件/webhook 主动推送（同 code 抑制窗口内不重发）
@@ -1021,6 +1044,13 @@ async def lifespan(app: FastAPI):
     await trade_settler.start()
     logger.info("交易结算器已启动（60s 扫描 FILLED 未结算订单，settled_at 锚点）")
 
+    # 订单对账器（R2，2026-08-25 风险评审）：下单响应超时/状态未知的卡
+    # PENDING 行，周期回读币安订单历史订正终态（只回读不发起资金操作）
+    global order_reconciler
+    order_reconciler = OrderReconciler(prediction_trader)
+    await order_reconciler.start()
+    logger.info("订单对账器已启动（60s 回读卡 PENDING 订单，orderId/窗口无歧义双策略）")
+
     # 多通道实盘执行器启动（构造/DB覆盖/邮件闸注入已在检测器 start 前完成）
     if multi_live_trader is not None:
         await multi_live_trader.start()
@@ -1076,6 +1106,9 @@ async def lifespan(app: FastAPI):
     # 停止报价 edge 影子检测器
     if quote_edge_detector is not None:
         await quote_edge_detector.stop()
+    # 停止订单对账器（只读回读，随时可停）
+    if order_reconciler is not None:
+        await order_reconciler.stop()
     # 停止交易结算器
     if trade_settler is not None:
         await trade_settler.stop()
@@ -1127,14 +1160,38 @@ _bearer_scheme = HTTPBearer(auto_error=False)
 async def _require_auth(
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
 ) -> None:
-    """Bearer Token 认证依赖。
+    """Bearer Token 认证依赖（只读端点用）。
 
     仅当 settings.api_auth_token 非空时生效。空值表示开发环境，放行所有请求。
-    生产环境必须配置 API_AUTH_TOKEN，否则端点对外完全开放。
+    资金/写端点必须用 _require_auth_strict（fail-closed），不得用本依赖。
     """
     if not settings.api_auth_token:
         return  # 开发模式：未配置 token 则跳过认证
-    if credentials is None or credentials.credentials != settings.api_auth_token:
+    if (credentials is None
+            or not hmac.compare_digest(credentials.credentials, settings.api_auth_token)):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing authentication token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+async def _require_auth_strict(
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+) -> None:
+    """资金/写端点专用鉴权（fail-closed，2026-08-25 风险评审 R1）。
+
+    与 _require_auth 的区别：token 未配置时不放行而是 503——toggle/转账/
+    redeem/对账等端点在空 token 下对公网完全开放（可开满 10 通道/提走
+    余额），宁可运维显式报错也不留 fail-open 口子。
+    """
+    if not settings.api_auth_token:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="资金端点鉴权未配置：服务端必须设置 API_AUTH_TOKEN",
+        )
+    if (credentials is None
+            or not hmac.compare_digest(credentials.credentials, settings.api_auth_token)):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing authentication token",
@@ -1337,7 +1394,7 @@ async def list_scene_versions(
 @app.post("/api/scene/versions/{version_id}/adjudicate")
 async def adjudicate_scene_version(
     version_id: int,
-    _: None = Depends(_require_auth),
+    _: None = Depends(_require_auth_strict),
 ):
     """手动触发科学裁决（M3）：同窗 A/B 回测 + 四层硬门禁 → SHADOW/REJECTED。
 
@@ -1361,7 +1418,7 @@ async def adjudicate_scene_version(
 @app.post("/api/scene/versions/{version_id}/promote")
 async def promote_scene_version(
     version_id: int,
-    _: None = Depends(_require_auth),
+    _: None = Depends(_require_auth_strict),
     db: AsyncSession = Depends(get_db),
 ):
     """人工放行（终审，M3/M4）：SHADOW → ACTIVE，原 ACTIVE 转 RETIRED。
@@ -1565,7 +1622,7 @@ async def get_fake_breakout_stats(db: AsyncSession = Depends(get_db)):
 # ============================================================
 
 @app.post("/api/agent/patterns/reevaluate")
-async def trigger_pattern_reevaluate(_: None = Depends(_require_auth)):
+async def trigger_pattern_reevaluate(_: None = Depends(_require_auth_strict)):
     """手动触发一轮全量模式重回测（与后台调度同一入口）。"""
     summary = await pattern_reevaluator.run_all(trigger="MANUAL")
     return {"ok": True, "summary": summary}
@@ -1882,21 +1939,49 @@ async def get_quote_preview(_: None = Depends(_require_auth)):
     }
 
 
+# R6（2026-08-25 风险评审）：人工测试单日限——旧口径无日限无护栏，
+# 288 窗 × 50 USDT 理论敲口 14,400/日，绕过全部信号护栏哲学
+MANUAL_TEST_DAILY_LIMIT = 10
+
+
 @app.post("/api/trade/test")
 async def manual_trade_test(
     req: ManualTradeTestRequest,
-    _: None = Depends(_require_auth),
+    _: None = Depends(_require_auth_strict),
 ):
     """实盘链路人工测试单：钱包→市场→报价→下单→落库全链路验证。
 
     与信号实盘共用 execute_signal_trade（先占位后下单），signal_version="manual_test"：
     同一 5m 窗口至多一单（唯一键防重），订单落 trade_orders 表可追溯。
-    金额硬限 0.1~50 USDT（与实盘单笔硬上限 MAX_ORDER_AMOUNT_USDT 对齐）；
-    不设执行价护栏。"""
+    金额硬限 0.1~50 USDT（与实盘单笔硬上限 MAX_ORDER_AMOUNT_USDT 对齐）。
+
+    R6 护栏（2026-08-25 风险评审）：
+    ① 日限 MANUAL_TEST_DAILY_LIMIT 单，按 UTC 自然日计、全状态计数
+      （FAILED 重试也计数，防无限重试绕过）；
+    ② 强制 max_exec_price 执行价护栏（缺省 0.60，不追贵）。"""
     if not (0.1 <= req.amount_usdt <= 50.0):
         return {"error": "amount_usdt 仅允许 0.1~50（与实盘单笔硬上限一致）"}
     if req.prediction not in ("UP", "DOWN"):
         return {"error": "prediction 仅允许 UP/DOWN"}
+    if not (0.0 < req.max_exec_price < 1.0):
+        return {"error": "max_exec_price 须在开区间 (0, 1)：执行价护栏强制生效（R6）"}
+
+    # R6 日限：DB 口径按 UTC 自然日（date_trunc 与多通道日限同口径），
+    # 重启不清零；全状态计数防 FAILED 重试绕过
+    from sqlalchemy import select, func
+    from .db.models import TradeOrderModel
+    async with async_session_factory() as db:
+        today_count = int((await db.execute(
+            select(func.count(TradeOrderModel.id)).where(
+                TradeOrderModel.signal_version == "manual_test",
+                TradeOrderModel.created_at >= func.date_trunc("day", func.now()),
+            )
+        )).scalar() or 0)
+    if today_count >= MANUAL_TEST_DAILY_LIMIT:
+        return {
+            "error": f"人工测试单已达日限 {MANUAL_TEST_DAILY_LIMIT} 单"
+                     f"（今日已提交 {today_count}，按 UTC 日计），请次日再试",
+        }
 
     window_start = int(time.time() * 1000) // 300_000 * 300_000  # 当前 5m 窗口起点
     order = await prediction_trader.execute_signal_trade(
@@ -1904,6 +1989,7 @@ async def manual_trade_test(
         amount_usdt=req.amount_usdt,
         signal_version="manual_test",
         window_start=window_start,
+        max_exec_price=req.max_exec_price,
     )
     if order is None:
         return {
@@ -1930,7 +2016,7 @@ async def manual_trade_test(
 @app.post("/api/live/toggle")
 async def live_toggle(
     req: ToggleLiveRequest,
-    _: None = Depends(_require_auth),
+    _: None = Depends(_require_auth_strict),
 ):
     """实时开关/热调单个实盘通道（MultiLiveTrader，多通道时代重写）。
 
@@ -1971,7 +2057,7 @@ async def live_toggle(
 @app.post("/api/prediction/transfer-in")
 async def prediction_transfer_in(
     req: TransferInboundRequest,
-    _: None = Depends(_require_auth),
+    _: None = Depends(_require_auth_strict),
 ):
     """现货账户 → 预测钱包划转入金。
 
@@ -2008,7 +2094,7 @@ async def prediction_transfer_in(
 @app.post("/api/prediction/transfer-out")
 async def prediction_transfer_out(
     req: TransferOutboundRequest,
-    _: None = Depends(_require_auth),
+    _: None = Depends(_require_auth_strict),
 ):
     """预测钱包 → 现货账户划出提走（P1-1）。
 
@@ -2098,7 +2184,7 @@ async def prediction_redeemable(_: None = Depends(_require_auth)):
 @app.post("/api/prediction/redeem")
 async def prediction_redeem(
     req: RedeemRequest,
-    _: None = Depends(_require_auth),
+    _: None = Depends(_require_auth_strict),
 ):
     """领取获胜 token 奖金（POST batch-redeem：链上 token → USDT）。
 
@@ -2180,12 +2266,17 @@ async def get_binance_order_history(
 
 
 @app.post("/api/trades/sync-binance")
-async def sync_binance_orders(_: None = Depends(_require_auth)):
+async def sync_binance_orders(_: None = Depends(_require_auth_strict)):
     """对账回填：用币安侧订单历史把本地卡 PENDING 的行订正为终态。
 
     场景：端点曾返回 500 但币安侧实际已成交（钱已花出），本地行停留
-    在 PENDING。按 window_start 匹配（slug btc-updown-5m-<秒> 编码窗口
-    起始秒）；币安侧无对应订单的行保持 PENDING 不动。
+    在 PENDING。
+
+    匹配策略（R5 升级，与自动对账器 OrderReconciler 同款保守策略）：
+    ① 行带 orderId 且币安历史同 ID → 精确匹配；② 同窗口本地 PENDING
+    与币安订单各唯一 → 无歧义匹配（slug btc-updown-5m-<秒> 编码窗口
+    起始秒）；任一侧同窗多笔（多通道并行）→ 保持 PENDING 等人工，
+    绝不错配（旧单键 dict 覆盖会把一笔订单错配给同窗所有行）。
     """
     import re
     from decimal import Decimal
@@ -2202,14 +2293,19 @@ async def sync_binance_orders(_: None = Depends(_require_auth)):
     if history is None:
         return {"error": prediction_trader.last_api_error or "查询失败", "synced": 0}
 
-    # slug 末尾即窗口起始秒（如 btc-updown-5m-1787418600）
-    by_window: dict[int, dict] = {}
+    # slug 末尾即窗口起始秒（如 btc-updown-5m-1787418600）；同窗可能多笔，
+    # 用 list 保留而非 dict 覆盖（覆盖会静默丢候选导致错配）
+    by_order_id: dict[str, dict] = {}
+    by_window: dict[int, list[dict]] = {}
     for o in history:
         if not isinstance(o, dict):
             continue
+        oid = o.get("orderId")
+        if oid:
+            by_order_id[str(oid)] = o
         m = re.search(r"-(\d{10})$", o.get("slug") or "")
         if m:
-            by_window[int(m.group(1)) * 1000] = o
+            by_window.setdefault(int(m.group(1)) * 1000, []).append(o)
 
     synced: list[dict] = []
     async with async_session_factory() as db:
@@ -2218,8 +2314,20 @@ async def sync_binance_orders(_: None = Depends(_require_auth)):
             TradeOrderModel.window_start.isnot(None),
         )
         rows = (await db.execute(stmt)).scalars().all()
+        # 本地同窗 PENDING 计数：多通道并行时同窗多行，窗口匹配退化为歧义
+        local_by_window: dict[int, list] = {}
+        for r in rows:
+            local_by_window.setdefault(r.window_start, []).append(r)
         for row in rows:
-            bo = by_window.get(row.window_start)
+            bo: dict | None = None
+            if row.order_id and str(row.order_id) in by_order_id:
+                bo = by_order_id[str(row.order_id)]  # ① orderId 精确匹配
+            else:
+                candidates = by_window.get(row.window_start) or []
+                siblings = local_by_window.get(row.window_start) or []
+                if len(candidates) == 1 and len(siblings) == 1:
+                    bo = candidates[0]  # ② 窗口无歧义匹配
+                # ③ 任一侧同窗多笔 → 保持 PENDING，交人工/自动对账器
             if not bo:
                 continue
             filled = Decimal(str(bo.get("filledUsdtAmount") or "0"))
@@ -2241,7 +2349,7 @@ async def sync_binance_orders(_: None = Depends(_require_auth)):
 
 
 @app.post("/api/trades/settle-scan")
-async def settle_scan(_: None = Depends(_require_auth)):
+async def settle_scan(_: None = Depends(_require_auth_strict)):
     """手动触发一次结算扫描（验证/补算用）：返回本次结算条数。
 
     TradeSettler 常开 60s 自动扫描；本端点用于部署后验证、
@@ -2261,7 +2369,7 @@ async def settle_scan(_: None = Depends(_require_auth)):
 async def tail_logs(
     lines: int = 200,
     grep: str = "",
-    _: None = Depends(_require_auth),
+    _: None = Depends(_require_auth_strict),
 ):
     """读 loguru 文件日志尾部（生产诊断：容器 stdout 重建即丢，文件日志持久化在 volume）。
 
@@ -3066,6 +3174,12 @@ async def get_agent_health(
         metrics_snapshot=snapshot,
         consecutive_failures=consecutive_failures,
         queue_depth=queue_depth,
+        # R3 喂价停摆告警：从未更新传 inf（区分 CLI 的 None=不评估）
+        spot_feed_age_s=(
+            collector.store.mid_price_age_s()
+            if collector.store.mid_price_age_s() is not None
+            else float("inf")
+        ),
     )
     return report.model_dump()
 

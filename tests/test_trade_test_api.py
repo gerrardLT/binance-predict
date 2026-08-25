@@ -22,6 +22,25 @@ import pytest
 from binance_predict.models.schemas import ManualTradeTestRequest
 
 
+@pytest.fixture(autouse=True)
+def _stub_daily_limit_db(monkeypatch):
+    """R6：manual_trade_test 新增日限 DB 计数，基线桩为 0（未达限）；
+    日限用例自身再覆盖。其余同文件用例自带 factory 桩时后置 setattr 覆盖。"""
+    from contextlib import asynccontextmanager
+    import binance_predict.main as m
+
+    db = MagicMock()
+    res = MagicMock()
+    res.scalar.return_value = 0
+    db.execute = AsyncMock(return_value=res)
+
+    @asynccontextmanager
+    async def _factory():
+        yield db
+
+    monkeypatch.setattr(m, "async_session_factory", _factory)
+
+
 def _order(**over) -> dict:
     """execute_signal_trade 返回的 dict 快照替身。"""
     base = dict(
@@ -91,7 +110,7 @@ async def test_trade_test_success_fields(monkeypatch) -> None:
     assert seen["amount_usdt"] == 1.0
     assert seen["signal_version"] == "manual_test"
     assert seen["window_start"] % 300_000 == 0  # 5m 窗口对齐
-    assert "max_exec_price" not in seen or seen["max_exec_price"] is None
+    assert seen["max_exec_price"] == 0.60  # R6：护栏强制生效（缺省保守值）
 
 
 @pytest.mark.asyncio
@@ -160,6 +179,73 @@ async def test_trade_test_failed_order_passthrough(monkeypatch) -> None:
         ManualTradeTestRequest(amount_usdt=1.0), _=None)
     assert out["status"] == "FAILED"
     assert "未找到 DOWN" in out["error_message"]
+
+
+@pytest.mark.asyncio
+async def test_trade_test_daily_limit_rejects_over_cap(monkeypatch) -> None:
+    """R6：今日已提交 ≥ 日限 → 拒绝且不调 trader。"""
+    from contextlib import asynccontextmanager
+    import binance_predict.main as m
+
+    called = []
+
+    async def _exec(**kw):
+        called.append(kw)
+        return _order()
+
+    monkeypatch.setattr(m.prediction_trader, "execute_signal_trade", _exec)
+
+    db = MagicMock()
+    res = MagicMock()
+    res.scalar.return_value = m.MANUAL_TEST_DAILY_LIMIT  # 已达限
+    db.execute = AsyncMock(return_value=res)
+
+    @asynccontextmanager
+    async def _factory():
+        yield db
+
+    monkeypatch.setattr(m, "async_session_factory", _factory)
+
+    out = await m.manual_trade_test(
+        ManualTradeTestRequest(amount_usdt=1.0), _=None)
+    assert "日限" in out["error"]
+    assert called == []
+
+
+@pytest.mark.asyncio
+async def test_trade_test_max_exec_price_bounds_rejected(monkeypatch) -> None:
+    """R6：max_exec_price 越界（0 / 1 / 负）→ 拒绝且不调 trader。"""
+    import binance_predict.main as m
+
+    called = []
+
+    async def _exec(**kw):
+        called.append(kw)
+        return _order()
+
+    monkeypatch.setattr(m.prediction_trader, "execute_signal_trade", _exec)
+    for bad in (0.0, 1.0, -0.5):
+        out = await m.manual_trade_test(
+            ManualTradeTestRequest(amount_usdt=1.0, max_exec_price=bad), _=None)
+        assert "error" in out
+    assert called == []
+
+
+@pytest.mark.asyncio
+async def test_trade_test_explicit_max_exec_price_forwarded(monkeypatch) -> None:
+    """R6：显式传入的护栏值透传给 execute_signal_trade。"""
+    import binance_predict.main as m
+
+    seen = {}
+
+    async def _exec(**kw):
+        seen.update(kw)
+        return _order()
+
+    monkeypatch.setattr(m.prediction_trader, "execute_signal_trade", _exec)
+    await m.manual_trade_test(
+        ManualTradeTestRequest(amount_usdt=1.0, max_exec_price=0.45), _=None)
+    assert seen["max_exec_price"] == 0.45
 
 
 # ============================================================
@@ -779,6 +865,88 @@ async def test_sync_binance_backfills_pending_rows(monkeypatch) -> None:
     assert matched.quote_json["source"] == "binance_history_sync"
     assert unmatched.status == "PENDING"  # 无对应币安订单 → 不动
     db.commit.assert_awaited_once()
+
+
+def _sync_env(monkeypatch, history, rows):
+    """sync-binance 测试环境：桩 trader 历史 + DB 行集合，返回 db mock。"""
+    import binance_predict.main as m
+    from contextlib import asynccontextmanager
+
+    monkeypatch.setattr(m.prediction_trader, "_api_key", "k")
+    monkeypatch.setattr(m.prediction_trader, "_wallet_address", "0xW")
+
+    async def _history(limit=50):
+        return history
+
+    monkeypatch.setattr(m.prediction_trader, "query_order_history", _history)
+
+    db = AsyncMock()
+    result = MagicMock()
+    result.scalars.return_value.all.return_value = rows
+    db.execute = AsyncMock(return_value=result)
+
+    @asynccontextmanager
+    async def _factory():
+        yield db
+
+    monkeypatch.setattr(m, "async_session_factory", _factory)
+    return db
+
+
+def _pending_row(row_id, window_start, order_id=None) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=row_id, window_start=window_start, status="PENDING",
+        order_id=order_id, amount_in="0", quote_json=None, error_message=None)
+
+
+@pytest.mark.asyncio
+async def test_sync_binance_matches_by_order_id_when_ambiguous_window(monkeypatch) -> None:
+    """R5：同窗币安侧多笔（多通道并行）但行带 orderId → 仍精确匹配同 ID 订单。"""
+    import binance_predict.main as m
+
+    row = _pending_row(7, 1_787_418_600_000, order_id="B-2")
+    db = _sync_env(monkeypatch, [
+        {"orderId": "B-1", "slug": "btc-updown-5m-1787418600",
+         "status": "FILLED", "filledUsdtAmount": "9", "price": "0.9"},
+        {"orderId": "B-2", "slug": "btc-updown-5m-1787418600",
+         "status": "FILLED", "filledUsdtAmount": "1", "price": "0.5"},
+    ], [row])
+
+    out = await m.sync_binance_orders(_=None)
+    assert out["synced"] == 1
+    assert row.order_id == "B-2"  # 配到同 ID 那笔，而非窗口首笔 B-1
+    assert row.amount_in == str(10 ** 18)
+
+
+@pytest.mark.asyncio
+async def test_sync_binance_refuses_ambiguous_matches(monkeypatch) -> None:
+    """R5：任一侧同窗多笔且无 orderId → 绝不错配，两行都保持 PENDING。"""
+    import binance_predict.main as m
+
+    rows = [
+        _pending_row(7, 1_787_418_600_000),   # 同窗本地两行
+        _pending_row(8, 1_787_418_600_000),
+    ]
+    db = _sync_env(monkeypatch, [
+        {"orderId": "B-1", "slug": "btc-updown-5m-1787418600",
+         "status": "FILLED", "filledUsdtAmount": "1", "price": "0.5"},
+    ], rows)
+
+    out = await m.sync_binance_orders(_=None)
+    assert out["synced"] == 0
+    assert all(r.status == "PENDING" for r in rows)
+
+    # 币安侧同窗两笔 + 本地单行 → 同样歧义不匹配
+    rows2 = [_pending_row(11, 1_787_418_600_000)]
+    _sync_env(monkeypatch, [
+        {"orderId": "B-1", "slug": "btc-updown-5m-1787418600",
+         "status": "FILLED", "filledUsdtAmount": "1", "price": "0.5"},
+        {"orderId": "B-2", "slug": "btc-updown-5m-1787418600",
+         "status": "FILLED", "filledUsdtAmount": "2", "price": "0.6"},
+    ], rows2)
+    out2 = await m.sync_binance_orders(_=None)
+    assert out2["synced"] == 0
+    assert rows2[0].status == "PENDING"
 
 
 # ============================================================

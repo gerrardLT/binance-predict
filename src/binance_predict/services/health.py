@@ -24,7 +24,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config.settings import settings
-from ..db.models import AgentPrediction, PatternMemory, SentimentWindow
+from ..db.models import AgentPrediction, PatternMemory, SentimentWindow, TradeOrderModel
 from ..models.schemas import CalibrationBucket, HealthAlert, HealthReport
 
 # 情绪窗口固定 5 分钟；用于连续性 gap 检测与 PREDICT 心跳停摆判定
@@ -174,10 +174,14 @@ def derive_alerts(
     llm: dict | None,
     consecutive_failures: dict | None,
     has_memory: bool,
+    spot_feed_age_s: float | None = None,
+    pending_order_age_s: float | None = None,
 ) -> list[HealthAlert]:
     """依据各指标派生告警列表。
 
     has_memory=False（CLI --db-only）时跳过所有依赖内存态的告警。
+    spot_feed_age_s：现货喂价距今秒数；None=不评估（CLI --db-only），
+    喂价从未更新时调用方传 float('inf')。
     """
     alerts: list[HealthAlert] = []
 
@@ -209,6 +213,19 @@ def derive_alerts(
             message=f"已有 {predict_stats['active_pattern_count']} 个 ACTIVE 模式，但最近 "
                     f"{predict_stats['total']} 条预测匹配率为 0，模式形态可能与实时曲线口径不符",
         ))
+
+    # 3.5 订单卡 PENDING（DB 层，R2 2026-08-25 风险评审）：成交状态未知
+    # 超阈值 → 钱可能已出去而账未记，资金类 CRITICAL（独立于告警总闸推送）
+    if pending_order_age_s is not None:
+        threshold_s = settings.order_pending_stale_minutes * 60
+        if pending_order_age_s > threshold_s:
+            alerts.append(HealthAlert(
+                level="CRITICAL", code="ORDER_STUCK_PENDING",
+                message=f"存在卡 PENDING 订单，成交状态未知已 "
+                        f"{pending_order_age_s / 60:.0f} 分钟（阈值 "
+                        f"{settings.order_pending_stale_minutes:.0f} 分钟）——钱可能已出去而账未记，"
+                        f"对账器正在回读确认，请人工核对 /api/trades/binance-history",
+            ))
 
     if not has_memory:
         return alerts
@@ -248,6 +265,21 @@ def derive_alerts(
                 level="WARN", code="LLM_ERROR_RATE",
                 message=f"阶段 {phase} 成功率 {rate:.0%} 低于下限 "
                         f"{settings.agent_health_llm_success_rate_floor:.0%}（{total} 次调用）",
+            ))
+    # 8. 现货喂价停摆（内存态，2026-08-25 风险评审 R3）：喂价从未更新或距今
+    # 超过新鲜度上限 → 采样/破位/结算判定链均已拒用旧价，但喂价本身需人工介入
+    if spot_feed_age_s is not None and spot_feed_age_s > settings.spot_price_max_age_s:
+        if spot_feed_age_s == float("inf"):
+            alerts.append(HealthAlert(
+                level="CRITICAL", code="SPOT_FEED_STALE",
+                message="现货喂价从未收到更新（WS 可能未连接成功），采样/检测/结算链已拒用陈旧价",
+            ))
+        else:
+            alerts.append(HealthAlert(
+                level="CRITICAL", code="SPOT_FEED_STALE",
+                message=f"现货喂价距今 {spot_feed_age_s:.0f}s，超过新鲜度上限 "
+                        f"{settings.spot_price_max_age_s:.0f}s（WS 可能停摆），"
+                        f"采样/检测/结算链已拒用陈旧价",
             ))
     return alerts
 
@@ -344,6 +376,7 @@ class HealthService:
         metrics_snapshot: dict | None = None,
         consecutive_failures: dict | None = None,
         queue_depth: int | None = None,
+        spot_feed_age_s: float | None = None,
     ) -> HealthReport:
         """聚合 DB 真值与内存快照，产出 HealthReport。
 
@@ -352,6 +385,8 @@ class HealthService:
             metrics_snapshot: metrics_collector.get_snapshot()；CLI --db-only 时为 None
             consecutive_failures: {phase: 连续失败数}；同上
             queue_depth: 调度器当前队列深度；同上
+            spot_feed_age_s: 现货喂价距今秒数（collector.store.mid_price_age_s()，
+                从未更新传 inf）；None=不评估喂价告警（CLI --db-only）
         """
         now = datetime.now(timezone.utc)
         now_ms = int(time.time() * 1000)
@@ -388,6 +423,20 @@ class HealthService:
         )
         active_count = active_res.scalar_one() or 0
 
+        # 卡 PENDING 订单年龄（R2）：最老 PENDING 行距今；无卡单为 None
+        pending_res = await db.execute(
+            select(func.min(TradeOrderModel.created_at))
+            .where(TradeOrderModel.status == "PENDING")
+        )
+        oldest_pending = pending_res.scalar_one_or_none()
+        pending_order_age_s: float | None = None
+        if oldest_pending is not None:
+            created = (
+                oldest_pending if oldest_pending.tzinfo is not None
+                else oldest_pending.replace(tzinfo=timezone.utc)
+            )
+            pending_order_age_s = max(0.0, (now - created).total_seconds())
+
         # --- 指标计算 ---
         window_continuity = compute_window_continuity(start_times, now_ms)
         predict_stats = compute_predict_stats(directions, matched_flags, active_count)
@@ -399,6 +448,13 @@ class HealthService:
             "queue_depth": queue_depth,
             "phase_ages_s": phase_ages,
             "uptime_seconds": (metrics_snapshot or {}).get("uptime_seconds"),
+            # inf（从未更新）不能 JSON 落库，改用 bool 标记 + 有限 age
+            "spot_feed_age_s": (
+                None if spot_feed_age_s in (None, float("inf")) else round(spot_feed_age_s, 1)
+            ),
+            "spot_feed_ever_updated": (
+                None if spot_feed_age_s is None else spot_feed_age_s != float("inf")
+            ),
         }
         phase_success_rates = {
             phase: {
@@ -422,6 +478,8 @@ class HealthService:
             llm=llm,
             consecutive_failures=consecutive_failures,
             has_memory=has_memory,
+            spot_feed_age_s=spot_feed_age_s,
+            pending_order_age_s=pending_order_age_s,
         )
         overall_status = derive_overall_status(alerts)
         summary = build_summary(

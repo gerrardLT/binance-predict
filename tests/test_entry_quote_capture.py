@@ -33,6 +33,10 @@ class _FakeStore:
     def __init__(self, mid: float) -> None:
         self.mid_price = mid
 
+    def fresh_mid_price(self, max_age_s: float | None = None) -> float:
+        # 替身模拟喂价永远新鲜（R3 新鲜度闸语义）
+        return self.mid_price or 0.0
+
 
 class _FakeCollector:
     def __init__(self, mid: float) -> None:
@@ -210,6 +214,7 @@ async def _run_handle(monkeypatch, quote, ts_ms: int, persist: bool) -> tuple:
 
     col = MagicMock()
     col.store.mid_price = 64_000.0
+    col.store.fresh_mid_price = MagicMock(return_value=64_000.0)  # R3 闸：模拟喂价新鲜
     col.fetch_mid_price = AsyncMock(return_value=64_001.0)
     col.fetch_kline_open = AsyncMock(return_value=63_999.0)
     monkeypatch.setattr(m, "collector", col)
