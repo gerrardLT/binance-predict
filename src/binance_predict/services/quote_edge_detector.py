@@ -57,17 +57,18 @@ v3 环境门禁版（2026-08-24 交替/延续归因落地，只加不改；v1/v2
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 from datetime import datetime, timezone
 
+from loguru import logger
 from sqlalchemy import select as sa_select
 
 from binance_predict.db.engine import async_session_factory
 from binance_predict.db.models import MisalignmentSignal, SentimentWindow
 from .signal_notify import fire_signal_email, fmt_bjt, is_fresh_signal, is_live_enabled
 
-logger = logging.getLogger(__name__)
+# 注：2026-08-26 从 stdlib logging 改为 loguru——stdlib 无 handler 配置时
+# INFO 日志全部静默丢弃，本模块的启动/触发/回补日志自上线起从未真正输出过。
 
 # ---- 冻结口径（回测同源，勿动）----
 # rule -> (t_lo_s, t_hi_s, q_lo, q_hi)
