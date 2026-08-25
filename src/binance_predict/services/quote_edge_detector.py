@@ -12,9 +12,9 @@
         回测：胜率 24.0%，EV +0.155，日频 13.7；
         裸条件（两轮 30+ 假设 OOS 全灭，无可信约束）。
 
-影子纪律（M4 同款）：只记录不下注、不占风控配额。邮件推送（2026-08-25 用户
-要求全信号推送）：仅实时新信号经 signal_notify 推送（新鲜度闸自动静默
-冷启动回补/停机积压/污染重扫），总开关 signal_push_email_enabled，全局日限防轰炸。
+影子纪律（M4 同款）：只记录不下注、不占风控配额。邮件推送（2026-08-25）：
+仅实时新信号且对应通道已开启实盘开火才推（v3a/v3b 不在实盘白名单永不推），
+新鲜度闸自动静默回补/重扫；总开关 signal_push_email_enabled，全局日限防轰炸。
 数据流（归档后处理，区别于 X4 的次窗结算）：
     1. 每 60s 轮询新归档 SentimentWindow；
     2. 扫 curve_down_price 曲线找规则区间内首个命中点（时点+报价）；
@@ -56,7 +56,7 @@ from sqlalchemy import select as sa_select
 
 from binance_predict.db.engine import async_session_factory
 from binance_predict.db.models import MisalignmentSignal, SentimentWindow
-from .signal_notify import fire_signal_email, is_fresh_signal
+from .signal_notify import fire_signal_email, fmt_bjt, is_fresh_signal, is_live_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -419,17 +419,17 @@ class QuoteEdgeDetector:
                         (quote_ts - start_ms) / 1000.0, price, outcome, win,
                         _ev_at_entry(win, price),
                     )
-                    # 邮件推送（fire-and-forget）：仅实时新信号；冷启动回补/
-                    # 积压/污染重扫的历史重放被新鲜度闸静默（只落表不推）。
-                    if is_fresh_signal(end_ms):
+                    # 邮件推送（fire-and-forget）：仅实时新信号且该通道已开
+                    # 实盘开火；回补/重扫被新鲜度闸静默，v3a/v3b 不在实盘
+                    # 白名单永不推。
+                    if is_fresh_signal(end_ms) and is_live_enabled(version):
                         win_str = "赢" if win else "输"
                         fire_signal_email(
                             "quote_edge",
                             f"[信号] {version} | 押DOWN {win_str} | 窗口 "
-                            f"{datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).strftime('%m-%d %H:%M')} UTC",
+                            f"{fmt_bjt(start_ms)} 北京时间",
                             f"版本: {version}（影子，只记录不下注）\n"
-                            f"窗口: {datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).strftime('%m-%d %H:%M')}"
-                            f"~{datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc).strftime('%H:%M')} UTC\n"
+                            f"窗口: {fmt_bjt(start_ms)}~{fmt_bjt(end_ms, with_date=False)} 北京时间\n"
                             f"触发: t=+{(quote_ts - start_ms) / 1000.0:.0f}s DOWN报价 q={price:.3f}\n"
                             f"结算: {outcome} → {win_str}\n"
                             f"EV: {_ev_at_entry(win, price):+.3f}（0.98/q−1 / −1，费 2%）",

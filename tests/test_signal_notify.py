@@ -1,7 +1,8 @@
 """signal_notify 信号推送公共通道的单元测试（2026-08-25 全信号推送落地）。
 
-覆盖：新鲜度闸（历史重放静默）、总开关、全局日限防轰炸、跨 UTC 日翻转、
-fire-and-forget 入口异常隔离。不触发真实 SMTP（send_plain_email 被桩掉）。
+覆盖：新鲜度闸（历史重放静默）、实盘开火闸（只推已开火通道，未注入
+fail-safe 不推）、总开关、全局日限防轰炸、跨 UTC 日翻转、fire-and-forget
+入口异常隔离。不触发真实 SMTP（send_plain_email 被桩掉）。
 """
 from __future__ import annotations
 
@@ -30,6 +31,42 @@ def test_is_fresh_signal_boundary() -> None:
     # 恰在阈值内 → 新鲜；超 1ms → 历史重放
     assert sn.is_fresh_signal(now - sn.SIGNAL_FRESH_MS, now) is True
     assert sn.is_fresh_signal(now - sn.SIGNAL_FRESH_MS - 1, now) is False
+
+
+def test_fmt_bjt_converts_to_beijing_time() -> None:
+    """邮件时间口径：ms → 北京时间（UTC+8），跨日期边界正确。"""
+    # 2026-08-24 22:30 UTC = 2026-08-25 06:30 北京时间（跨日）
+    ms = 1787610600000
+    assert sn.fmt_bjt(ms) == "08-25 06:30"
+    assert sn.fmt_bjt(ms, with_date=False) == "06:30"
+
+
+# ------------------------------------------------------------------
+# 实盘开火闸：只推已开实盘开火通道的信号
+# ------------------------------------------------------------------
+
+def test_is_live_enabled_false_without_resolver(monkeypatch) -> None:
+    """resolver 未注入（MultiLiveTrader 装配失败/测试环境）→ 一律不推。"""
+    monkeypatch.setattr(sn, "_live_resolver", None)
+    assert sn.is_live_enabled("x4_v1") is False
+    assert sn.is_live_enabled("quote_momentum_v2") is False
+
+
+def test_is_live_enabled_follows_resolver(monkeypatch) -> None:
+    """注入后按运行时开关返回；未知通道（如 v3a/v3b）恒 False。"""
+    monkeypatch.setattr(sn, "_live_resolver", lambda ch: ch == "x4_v1")
+    assert sn.is_live_enabled("x4_v1") is True
+    assert sn.is_live_enabled("x4_v2") is False
+    assert sn.is_live_enabled("quote_contrarian_v3a") is False
+
+
+def test_is_live_enabled_swallows_resolver_errors(monkeypatch) -> None:
+    """resolver 抛异常 → 宁少勿多返回 False，不得把检测循环拖死。"""
+    def _boom(ch):
+        raise RuntimeError("configs not ready")
+
+    monkeypatch.setattr(sn, "_live_resolver", _boom)
+    assert sn.is_live_enabled("x4_v1") is False
 
 
 # ------------------------------------------------------------------

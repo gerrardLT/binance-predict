@@ -201,8 +201,9 @@ class Settings(BaseSettings):
     # 不影响信号邮件；场景信号还需各自子开关（fake_breakout_email_enabled）。
     signal_push_email_enabled: bool = True
     # 全局日上限（所有信号族合计）：超限后仍落表但不再发邮件，防轰炸。
-    # 依据：quote_edge 全版本约 40 笔/日 + x4 数笔 + 场景信号，80 留足余量。
-    signal_push_max_daily_emails: int = 80
+    # 2026-08-25 用户调至 800：实盘开火闸已收窄推送面（只推已开火通道，
+    # 日常 5~10 封），800 仅作异常洪峰（多通道齐开/极端行情）的兜底闸。
+    signal_push_max_daily_emails: int = 800
 
     # --- 风控统计缓存（Fix #20）---
     # RiskController.refresh_daily_stats 的 TTL（秒），避免短时间内重复全量查询。

@@ -66,7 +66,9 @@ from ..db.models import FakeBreakoutSignal, SceneParamVersion, SentimentWindow
 from . import clock_sync
 from .alerting import send_plain_email
 from .data_collector import BinanceDataCollector
+from .live_channels import scene_pattern_to_channel
 from .scene_params import DEFAULT_SCENE_PARAMS, SceneParams
+from .signal_notify import TZ_BJT, is_live_enabled
 
 # 超宽限阈值：到期后超过此宽限未结算的信号转 klines 精确补结算路径
 # （周期锚点口径下 P(S)/P(E) 均为历史时点，klines 必然可得，停机无损）
@@ -795,10 +797,14 @@ class FakeBreakoutDetector:
             "（影子，不发邮件）" if shadow else ("（超日限，不发邮件）" if over_daily_limit else ""),
         )
 
-        # 邮件推送（未超日限且非影子）：fire-and-forget，绝不阻塞检测循环。
+        # 邮件推送（未超日限且非影子，且对应场景通道已开实盘开火）：
+        # fire-and-forget，绝不阻塞检测循环。
         # 实测教训：SMTP 连接被防火墙丢包时同步等待会卡死整个循环 16 分钟，
         # 导致结算回读停摆（信号 #1 事故）。
-        if not shadow and settings.fake_breakout_email_enabled and not over_daily_limit:
+        scene_channel = scene_pattern_to_channel(pattern_type)
+        if (not shadow and settings.fake_breakout_email_enabled
+                and not over_daily_limit and scene_channel is not None
+                and is_live_enabled(scene_channel)):
             asyncio.create_task(
                 self._send_signal_email_bg(signal.id),
                 name=f"fbs_email_{signal.id}",
@@ -1109,12 +1115,13 @@ class FakeBreakoutDetector:
             )
 
     async def _send_signal_email(self, signal: FakeBreakoutSignal) -> bool:
+        # 邮件时间统一北京时间（2026-08-25 用户要求；此前为 UTC）
         t_str = datetime.fromtimestamp(
-            signal.signal_time / 1000, tz=timezone.utc
-        ).strftime("%Y-%m-%d %H:%M:%S UTC")
+            signal.signal_time / 1000, tz=TZ_BJT
+        ).strftime("%Y-%m-%d %H:%M:%S 北京时间")
         end_str = (
-            datetime.fromtimestamp(signal.market_end_15m / 1000, tz=timezone.utc).strftime(
-                "%H:%M:%S UTC"
+            datetime.fromtimestamp(signal.market_end_15m / 1000, tz=TZ_BJT).strftime(
+                "%H:%M:%S 北京时间"
             )
             if signal.market_end_15m
             else "未知"

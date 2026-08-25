@@ -589,6 +589,14 @@ class MultiLiveTrader:
             await session.merge(row)
             await session.commit()
 
+    def is_enabled(self, channel: str) -> bool:
+        """该通道当前是否已开实盘开火（运行时含 toggle 热调）；未知通道 False。
+
+        供信号邮件推送闸查询（signal_notify resolver）：只推已开火通道的信号。
+        """
+        cfg = self._configs.get(channel)
+        return cfg is not None and cfg.enabled
+
     def status(self) -> dict:
         """同步状态（不含 DB 查询；今日成交数见 status_async）。"""
         return {

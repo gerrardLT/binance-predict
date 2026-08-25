@@ -60,6 +60,7 @@ from .services.pattern_reevaluator import pattern_reevaluator
 from .services.prediction_trading import BinancePredictionTrader
 from .services.prediction_market_data import PredictionMarketDataService, MarketQuoteData
 from .services.sentiment_agent import SentimentAgent
+from .services.signal_notify import set_live_enabled_resolver
 from .services.metrics import metrics_collector
 
 # ============================================================
@@ -1012,6 +1013,9 @@ async def lifespan(app: FastAPI):
             await multi_live_trader.apply_db_overrides()
         except Exception as exc:
             logger.warning("多通道实盘：DB 覆盖层加载失败（回落 env 配置）| {}", exc)
+        # 信号邮件推送闸：只推已开实盘开火通道的信号（运行时读 configs，
+        # 含 toggle 热调；装配失败时 resolver 保持 None → 一律不推 fail-safe）
+        set_live_enabled_resolver(multi_live_trader.is_enabled)
         await multi_live_trader.start()
         # 余额缓存作废钩子：信号单成交后作废 prediction-wallet TTL 缓存
         # （下单扣预测钱包余额；与划转端点同款失效逻辑，前端下次轮询即取新值）
