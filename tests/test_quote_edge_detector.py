@@ -10,6 +10,7 @@ v3 环境门禁（前窗 DOWN + 可选距日高回落；缺失/未过只落 v1/v
 from __future__ import annotations
 
 import operator as _op
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -583,3 +584,80 @@ async def test_momentum_unaffected_by_v3(monkeypatch) -> None:
     await d._process_window(w)
     versions = sorted(s.version for s in session.added)
     assert versions == ["quote_momentum_v1", "quote_momentum_v2"]
+
+
+# ============================================================
+# 时段门禁（late_night_contrarian_v1：北京时间 22~24 时）
+# ============================================================
+
+LN_VERSION = "late_night_contrarian_v1"
+
+
+def _bjt_start_ms(hour: int, minute: int = 0) -> int:
+    """构造 2026-08-20 北京时间 hour:minute 的窗口开盘 ms 时间戳（UTC+8）。"""
+    base_utc = int(datetime(2026, 8, 20, tzinfo=timezone.utc).timestamp() * 1000)
+    return base_utc + (hour - 8) * 3_600_000 + minute * 60_000
+
+
+def test_pass_hour_guard_boundaries() -> None:
+    """北京 22:00/23:55 过；21:55/00:00（24 时）/12:00 拒；未注册门禁恒过。"""
+    assert qed._pass_hour_guard(LN_VERSION, _bjt_start_ms(22, 0)) is True
+    assert qed._pass_hour_guard(LN_VERSION, _bjt_start_ms(23, 55)) is True
+    assert qed._pass_hour_guard(LN_VERSION, _bjt_start_ms(21, 55)) is False
+    assert qed._pass_hour_guard(LN_VERSION, _bjt_start_ms(0, 0)) is False
+    assert qed._pass_hour_guard(LN_VERSION, _bjt_start_ms(12, 0)) is False
+    # 未注册时段门禁的版本恒过（存量冻结规则不受影响）
+    assert qed._pass_hour_guard("quote_contrarian_v1", _bjt_start_ms(12, 0)) is True
+    assert qed._pass_hour_guard("quote_momentum_v1", _bjt_start_ms(22, 0)) is True
+
+
+def _late_night_window(start_ms: int) -> SentimentWindow:
+    """只命中 late_night 规则的窗口（t=+60s q=0.27，收 DOWN）。"""
+    return SentimentWindow(
+        start_time=start_ms, end_time=start_ms + 300_000,
+        actual_return=-0.001, outcome="DOWN",
+        curve_down_price=[{"t": start_ms + 60_000, "v": 0.27}],
+    )
+
+
+@pytest.mark.asyncio
+async def test_late_night_in_window_inserts(monkeypatch) -> None:
+    """北京 23:55 开窗命中 t=+60s q=0.27 → 落表，字段与 v1 体系同源。"""
+    d, session = _make_detector(monkeypatch)
+    await d._process_window(_late_night_window(_bjt_start_ms(23, 55)))
+    assert [s.version for s in session.added] == [LN_VERSION]
+    sig: MisalignmentSignal = session.added[0]
+    assert sig.entry_down_price == 0.27 and sig.end_pct == 0.27
+    assert sig.entry_quote_kind == "real"
+    assert sig.win is True and sig.status == "SETTLED"
+    assert sig.ev_at_entry == pytest.approx(0.98 / 0.27 - 1.0)
+    assert sig.direction == "DOWN" and sig.target_window_start == sig.window_start
+
+
+@pytest.mark.asyncio
+async def test_late_night_outside_window_rejected(monkeypatch) -> None:
+    """同报价同时点但北京 21:55 开窗 → 时段门禁拒；同窗 contrarian 命中不受影响。"""
+    d, session = _make_detector(monkeypatch)
+    start = _bjt_start_ms(21, 55)
+    w = SentimentWindow(
+        start_time=start, end_time=start + 300_000,
+        actual_return=-0.001, outcome="DOWN",
+        curve_down_price=[{"t": start + 50_000, "v": 0.20},    # contrarian_v1 命中
+                          {"t": start + 60_000, "v": 0.27}],   # late_night 区间命中但时段拒
+    )
+    await d._process_window(w)
+    assert [s.version for s in session.added] == ["quote_contrarian_v1"]
+
+
+@pytest.mark.asyncio
+async def test_late_night_does_not_affect_other_rules(monkeypatch) -> None:
+    """北京 22:30 的 momentum 窗（q=0.71）→ momentum 照常落表，late_night 不命中。"""
+    d, session = _make_detector(monkeypatch)
+    start = _bjt_start_ms(22, 30)
+    w = SentimentWindow(
+        start_time=start, end_time=start + 300_000,
+        actual_return=-0.001, outcome="DOWN",
+        curve_down_price=[{"t": start + 100_000, "v": 0.71}],
+    )
+    await d._process_window(w)
+    assert [s.version for s in session.added] == ["quote_momentum_v1"]

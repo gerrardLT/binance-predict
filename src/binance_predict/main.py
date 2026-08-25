@@ -2438,6 +2438,9 @@ SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     "quote_contrarian_v2": (None, None, "逆势v2: v1+触发时未涨≥0.10%（归因: 平盘窗贡献 86% 利润）"),
     "quote_contrarian_v3a": (None, None, "逆势v3a: v2+前窗DOWN交替环境（归因: 31.2%/+0.511 vs 前窗UP 18.5%/−0.140）"),
     "quote_contrarian_v3b": (None, None, "逆势v3b: v3a+距日高回落≥0.30%含边界（归因: 34.5%/+0.682，Wilson 下界过线）"),
+    # 深夜时段变体：基准为 720 天 K 线代理回测（非真实报价同源），只钉胜率；
+    # EV 基准留 None（代理回测含溢 0.01 与影子无溢价口径不可直比）
+    "late_night_contrarian_v1": (0.347, None, "深夜逆势v1: 北京22~24时×t45~90s q∈[0.25,0.30)（720天K线代理回测胜率≈34.7%/赔率型边际，43天小样本51~56%系噪声）"),
 }
 # 周期切分点：08-19 00:00 UTC（三根大阳起点）；< 为震荡期（大涨前），≥ 为大涨期
 PUMP_TS_MS = int(datetime(2026, 8, 19, tzinfo=timezone.utc).timestamp() * 1000)
@@ -2541,6 +2544,7 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
         "x4_v1", "quote_momentum_v1", "quote_contrarian_v1",
         "x4_v2", "quote_momentum_v2", "quote_contrarian_v2",  # v2 门禁版（部署即入面板）
         "quote_contrarian_v3a", "quote_contrarian_v3b",  # v3 环境门禁版（纯影子）
+        "late_night_contrarian_v1",  # 深夜时段变体（纯影子，2026-08-26）
     ]
     versions += sorted({s.version for s in sh_rows} - set(versions))
     shadow = {}

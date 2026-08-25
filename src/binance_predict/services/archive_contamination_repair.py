@@ -52,6 +52,7 @@ QUOTE_EDGE_VERSIONS = (
     "quote_momentum_v1", "quote_contrarian_v1",
     "quote_momentum_v2", "quote_contrarian_v2",
     "quote_contrarian_v3a", "quote_contrarian_v3b",
+    "late_night_contrarian_v1",  # 深夜时段变体（无跨窗依赖，与 v1/v2 同等待遇）
 )
 QE_V3_VERSIONS = ("quote_contrarian_v3a", "quote_contrarian_v3b")
 X4_VERSIONS = ("x4_v1", "x4_v2")

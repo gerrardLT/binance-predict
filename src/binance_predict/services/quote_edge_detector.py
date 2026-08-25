@@ -40,6 +40,15 @@ v3 环境门禁版（2026-08-24 交替/延续归因落地，只加不改；v1/v2
     环境数据缺失（前窗未归档/日高缺失）→ 不落 v3（保守跳过，v1/v2 不受影响）。
     纪律：纯影子（只记录不下注），前向攒 ≥100 笔且 Wilson 下界过线才谈实盘。
 
+深夜时段变体（2026-08-26 落地，只加不改；v1/v2/v3 冻结口径原样）：
+    late_night_contrarian_v1 = 北京时间 22~24 时开窗 ∩ t∈[45,90)s DOWN 报价
+    首次进入 [0.25,0.30)（报价带与 contrarian_v1 相邻上移）。
+    依据：43 天线上数据发现（22~24时×0.25~0.30 EV+0.96）+ 180/360/720 天 K 线
+    代理回测修正——历史胜率 ≈34.7%（三档一致），小样本 51~56% 系噪声
+    （CI[40%,68%]）；费后 EV +0.21~+0.27 为赔率型边际（盈亏平衡胜率 ≈29%）。
+    时段门禁按窗口 start_time 的北京时间 hour ∈[22,24)；未注册门禁的版本不受影响。
+    纪律：纯影子前向攒样本，核对真实触发分布与 K 线代理回测一致后才谈实盘接入。
+
 字段语义映射（复用 misalignment_signals 表）：
     end_pct → 触发时刻 DOWN 报价（X4 语义"触发窗末 UP%"的扩展，注释在案）；
     target_window_start → window_start（本窗即目标窗，无次窗）；
@@ -67,10 +76,19 @@ QUOTE_EDGE_RULES: dict[str, tuple[float, float, float, float]] = {
     # 曾误写 [90,210) 导致口径漂移（CodeReview High#1），已收敛回 120。
     "quote_momentum_v1": (90.0, 120.0, 0.69, 0.75),
     "quote_contrarian_v1": (45.0, 60.0, 0.15, 0.25),
+    # 深夜时段变体：报价带相邻 contrarian_v1 上移；时段门禁见 HOUR_GUARDS。
+    "late_night_contrarian_v1": (45.0, 90.0, 0.25, 0.30),
 }
 FEE_RET = 0.98            # EV = 赢 0.98/q−1 / 输 −1（费 2%，无溢价，回测口径）
 POLL_INTERVAL = 60.0      # 轮询间隔（秒）
 BACKSCAN_WINDOWS = 12     # 冷启动回补窗口数（1 小时）
+
+# ---- 时段门禁（2026-08-26 深夜变体落地，只加不改）----
+# version -> 北京时间 hour [lo, hi)（按窗口 start_time 判定；北京时间 = UTC+8
+# 固定偏移无夏令时，直接位移计算）。未注册的版本 → 门禁恒过（存量规则不受影响）。
+HOUR_GUARDS: dict[str, tuple[int, int]] = {
+    "late_night_contrarian_v1": (22, 24),
+}
 
 # ---- v2 价格门禁（2026-08-22 5m 粒度归因落地，只加不改；触发区间与 v1 完全相同）----
 # chg% = (触发时点 BTC − 窗口开盘 BTC) / 窗口开盘 × 100，只用 ≤触发时点采样点（严格 ex-ante）：
@@ -92,6 +110,19 @@ V3_ENV_GUARDS: dict[str, bool] = {
     "quote_contrarian_v3b": True,
 }
 V3_DD_THRESHOLD = -0.30   # 距日高回落门槛（%，dd ≤ 阈值即过，含边界）
+
+
+def _pass_hour_guard(version: str, start_ms: int) -> bool:
+    """时段门禁：窗口 start_time 的北京时间 hour 须落在 [lo, hi)。
+
+    未注册门禁 → True（存量规则不受影响）。北京时间 = UTC+8 固定偏移，
+    epoch 小时 +8 后 mod 24 即北京时间小时（跨天自然正确）。
+    """
+    guard = HOUR_GUARDS.get(version)
+    if guard is None:
+        return True
+    hour = (start_ms // 3_600_000 + 8) % 24
+    return guard[0] <= hour < guard[1]
 
 
 def _outcome_of(w: SentimentWindow) -> str | None:
@@ -240,12 +271,13 @@ class QuoteEdgeDetector:
         self._task = asyncio.create_task(self._loop(), name="quote_edge_detector")
         logger.info(
             "报价 edge 影子检测器启动 | v1 规则 {} + v2 价格门禁版 {} + v3 环境门禁版 {}"
-            " | EV=0.98/q−1（费 2%，影子模式只记录不下注）",
+            " + 时段门禁 {} | EV=0.98/q−1（费 2%，影子模式只记录不下注）",
             {k: f"t∈[{v[0]:.0f},{v[1]:.0f})s q∈[{v[2]:.2f},{v[3]:.2f})"
              for k, v in QUOTE_EDGE_RULES.items()},
             {k: f"{m}{p:+.2f}%" for k, (_b, m, p) in V2_PRICE_GUARDS.items()},
             {k: ("前窗DOWN" + ("+距日高≥0.30%(含边界)" if dd else ""))
              for k, dd in V3_ENV_GUARDS.items()},
+            {k: f"北京{lo}~{hi}时" for k, (lo, hi) in HOUR_GUARDS.items()},
         )
 
     async def stop(self) -> None:
@@ -366,6 +398,8 @@ class QuoteEdgeDetector:
                     if hit is None:
                         continue
                     price, quote_ts = hit
+                    if not _pass_hour_guard(version, start_ms):
+                        continue  # 时段门禁未过 → 该规则跳过（其他规则不受影响）
                     if version in V2_PRICE_GUARDS and _pass_v2_price_guard(version, w, quote_ts) is not True:
                         continue  # 门禁未过/门禁数据缺失 → v2 不落（v1 不受影响）
                     if version in V3_ENV_GUARDS:
