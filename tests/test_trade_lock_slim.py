@@ -131,4 +131,4 @@ async def test_ensure_markets_fresh_empty_result_no_ts(monkeypatch) -> None:
     await trader._ensure_markets_fresh()
     await trader._ensure_markets_fresh()
     assert len(lists) == 2   # 故障不被 TTL 掩盖
-    assert trader._markets_fetched_at == 0.0
+    assert trader._markets_fetched_at == float("-inf")  # 哨兵不刷新（非 0：防刚启动容器误判）

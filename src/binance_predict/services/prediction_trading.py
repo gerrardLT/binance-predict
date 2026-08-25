@@ -101,8 +101,10 @@ class BinancePredictionTrader:
 
         # R7 锁瘦身：行情拉取 TTL 缓存（monotonic 时间戳）+ 拉取串行锁。
         # fetch 锁只串行 list_markets 本身（保护实例级 token 状态写入），
-        # 不阻塞下单临界区；TTL 内的调用方直接复用缓存
-        self._markets_fetched_at = 0.0
+        # 不阻塞下单临界区；TTL 内的调用方直接复用缓存。
+        # 哨兵用 -inf 而非 0：刚启动的容器 uptime 可能小于 TTL，
+        # 0 会被误判为“缓存新鲜”跳过首次拉取（CI 已实证）
+        self._markets_fetched_at = float("-inf")
         self._markets_fetch_lock = asyncio.Lock()
 
         # 最近一次 API 调用的错误详情（诊断透传：人工测试单/日志排查用；
