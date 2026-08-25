@@ -30,7 +30,6 @@ from ..config.settings import settings
 from ..db.engine import async_session_factory
 from ..db.models import TradeOrderModel
 from . import clock_sync
-from .rate_limit import binance_request
 
 # ---------------------------------------------------------------------------
 # 预测钱包余额常量（P0-1：余额看不全；2026-08-23 agent-reach 调研收敛）
@@ -54,18 +53,6 @@ _TRANSFER_INBOUND_PATH = "/sapi/v1/w3w/wallet/prediction/transfer/inbound"
 # → batch-redeem 领取；响应结构未实测，防御式解析 + 原文透传收敛）
 _POSITION_LIST_PATH = "/sapi/v1/w3w/wallet/prediction/position/list"
 _BATCH_REDEEM_PATH = "/sapi/v1/w3w/wallet/prediction/batch-redeem"
-
-# R2 下单响应状态校验（2026-08-25 风险评审）：币安侧已知「未成交」终态集合。
-# 命中即落 FAILED；FILLED 才记成交；其余/缺失状态一律保持 PENDING 交
-# OrderReconciler 回读币安历史确认（不臆断、不静默丢单）
-_ORDER_FAILED_STATUSES: frozenset[str] = frozenset(
-    {"CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "FAILED", "CANCELLING"}
-)
-
-# R7 锁瘦身（2026-08-25 风险评审）：list_markets 分页拉取（最坏 5 页×30s 超时）
-# 移出 trade_lock，结果带 TTL 缓存复用——锁内只保留占位+报价+下单，
-# 多通道串行时不再因行情拉取劣化后续通道决策时效
-_MARKETS_CACHE_TTL_S = 30.0
 
 
 class BinancePredictionTrader:
@@ -98,14 +85,6 @@ class BinancePredictionTrader:
         # 若多个 execute_trade 并发执行会交错覆写导致买入错误 token。
         # 本锁保证 list_markets + token 选择 + 下单 整体串行。
         self._trade_lock = asyncio.Lock()
-
-        # R7 锁瘦身：行情拉取 TTL 缓存（monotonic 时间戳）+ 拉取串行锁。
-        # fetch 锁只串行 list_markets 本身（保护实例级 token 状态写入），
-        # 不阻塞下单临界区；TTL 内的调用方直接复用缓存。
-        # 哨兵用 -inf 而非 0：刚启动的容器 uptime 可能小于 TTL，
-        # 0 会被误判为“缓存新鲜”跳过首次拉取（CI 已实证）
-        self._markets_fetched_at = float("-inf")
-        self._markets_fetch_lock = asyncio.Lock()
 
         # 最近一次 API 调用的错误详情（诊断透传：人工测试单/日志排查用；
         # get_quote/place_order 失败时写入，成功时清空）
@@ -229,7 +208,7 @@ class BinancePredictionTrader:
 
         try:
             client = self._get_client()
-            resp = await binance_request(client, "GET",
+            resp = await client.get(
                 f"{self.BASE_URL}/sapi/v1/w3w/wallet/prediction/wallet/list",
                 params=params,
                 headers={"X-MBX-APIKEY": self._api_key},
@@ -341,7 +320,7 @@ class BinancePredictionTrader:
 
         try:
             client = self._get_client()
-            resp = await binance_request(client, "GET",
+            resp = await client.get(
                 url,
                 headers={"X-MBX-APIKEY": self._api_key},
             )
@@ -388,7 +367,7 @@ class BinancePredictionTrader:
         params = self._sign_request({})
         try:
             client = self._get_client()
-            resp = await binance_request(client, "GET",
+            resp = await client.get(
                 f"{self.BASE_URL}/api/v3/account",
                 params=params,
                 headers={"X-MBX-APIKEY": self._api_key},
@@ -434,7 +413,7 @@ class BinancePredictionTrader:
 
         try:
             client = self._get_client()
-            resp = await binance_request(client, "POST",
+            resp = await client.post(
                 signed_url,
                 headers={"X-MBX-APIKEY": self._api_key},
             )
@@ -477,7 +456,7 @@ class BinancePredictionTrader:
 
         try:
             client = self._get_client()
-            resp = await binance_request(client, "POST",
+            resp = await client.post(
                 signed_url,
                 headers={"X-MBX-APIKEY": self._api_key},
             )
@@ -516,7 +495,7 @@ class BinancePredictionTrader:
 
         try:
             client = self._get_client()
-            resp = await binance_request(client, "GET",
+            resp = await client.get(
                 url,
                 headers={"X-MBX-APIKEY": self._api_key},
             )
@@ -579,7 +558,7 @@ class BinancePredictionTrader:
 
         try:
             client = self._get_client()
-            resp = await binance_request(client, "POST",
+            resp = await client.post(
                 signed_url,
                 headers={"X-MBX-APIKEY": self._api_key},
             )
@@ -619,7 +598,7 @@ class BinancePredictionTrader:
         )
         try:
             client = self._get_client()
-            resp = await binance_request(client, "GET",
+            resp = await client.get(
                 signed_url,
                 headers={"X-MBX-APIKEY": self._api_key},
             )
@@ -685,22 +664,6 @@ class BinancePredictionTrader:
                     entry["down_price"] = float(price) if price is not None else None
         return start_ms, entry
 
-    async def _ensure_markets_fresh(self) -> None:
-        """R7：TTL 内复用行情缓存，过期才拉取（锁外调用，不占 trade_lock）。
-
-        双检锁：首个到期的调用方持 fetch 锁拉取，其余等待后直接命中缓存。
-        拉取结果为空（网络故障/翻页全败）不刷时间戳——下次调用立即重试，
-        避免故障被 TTL 掩盖 30s。
-        """
-        if time.monotonic() - self._markets_fetched_at < _MARKETS_CACHE_TTL_S:
-            return
-        async with self._markets_fetch_lock:
-            if time.monotonic() - self._markets_fetched_at < _MARKETS_CACHE_TTL_S:
-                return
-            markets = await self.list_markets()
-            if markets:
-                self._markets_fetched_at = time.monotonic()
-
     async def list_markets(self) -> list[dict]:
         """
         查询活跃的 BTC 预测市场
@@ -724,7 +687,7 @@ class BinancePredictionTrader:
 
             try:
                 client = self._get_client()
-                resp = await binance_request(client, "GET",
+                resp = await client.get(
                     f"{self.BASE_URL}/sapi/v1/w3w/wallet/prediction/market/list",
                     params=params,
                     headers={"X-MBX-APIKEY": self._api_key},
@@ -881,7 +844,7 @@ class BinancePredictionTrader:
 
         try:
             client = self._get_client()
-            resp = await binance_request(client, "POST",
+            resp = await client.post(
                 signed_url,
                 headers={"X-MBX-APIKEY": self._api_key},
             )
@@ -939,7 +902,7 @@ class BinancePredictionTrader:
 
         try:
             client = self._get_client()
-            resp = await binance_request(client, "POST",
+            resp = await client.post(
                 signed_url,
                 headers={"X-MBX-APIKEY": self._api_key},
             )
@@ -1040,29 +1003,11 @@ class BinancePredictionTrader:
             # 2. 下单
             order_result = await self.place_order(quote)
             if not order_result:
-                # R2 回读确认：响应超时 ≠ 未成交，不落 FAILED（同 execute_signal_trade）；
-                # _save_failed_order 无 PENDING 语义，此处返回 None 不建账行，
-                # 币安侧若有成交由对账器回读历史时以无本地行可见（CRITICAL 留痕）
-                logger.critical(
-                    "实盘交易：下单响应超时/异常，成交状态未知 | prediction={} —— "
-                    "请核对币安订单历史确认是否真实成交", prediction)
-                return None
-
-            # R2 状态校验：按响应内 status 分流，非 FILLED 不记成交
-            resp_status = str(order_result.get("status") or "").upper()
-            if resp_status in _ORDER_FAILED_STATUSES:
                 return await self._save_failed_order(
-                    prediction_id, f"币安侧订单未成交 | status={resp_status}",
-                    quote=quote,
+                    prediction_id, "下单失败", quote=quote,
                     agent_prediction_id=agent_prediction_id,
                     direction=prediction,
                 )
-            if resp_status != "FILLED":
-                logger.critical(
-                    "实盘交易：下单响应状态非 FILLED（{}）| orderId={} —— "
-                    "不记成交，请核对币安订单历史", resp_status or "缺失",
-                    order_result.get("orderId"))
-                return None
 
             # 3. 保存订单记录（direction 落库供结算判赢；window_start 缺省取当前 5m 窗口起点）
             eff_window_start = window_start if window_start is not None else (
@@ -1091,7 +1036,6 @@ class BinancePredictionTrader:
         max_exec_price: float | None = None,
         market_period: str = "5m",
         scene_signal_id: int | None = None,
-        deadline_ms: int | None = None,
     ) -> dict | None:
         """
         信号驱动实盘专用通道（多通道 LIVE：quote_edge/x4 用 5m，场景用 15m）：
@@ -1110,8 +1054,6 @@ class BinancePredictionTrader:
         4. market_period 分流（'5m'|'15m'）：15m 场景订单用 15m 市场 token
            （结算走 FakeBreakoutSignal，trade_settler 按 market_period 分流）；
            scene_signal_id 与占位同事务落库（下单即关联场景信号行，无需回填）。
-        5. R7 锁瘦身：行情拉取在锁外完成（TTL 缓存复用）；deadline_ms 提供时
-           获锁后复查决策点时限——多通道串行等锁可能已超时，超期不落占位直接放弃。
         钱已出去而落库/更新失败时记 CRITICAL 日志，可追溯、不静默降级。
         """
         if not self._api_key or not self._api_secret:
@@ -1133,18 +1075,7 @@ class BinancePredictionTrader:
                            signal_version)
             return None
 
-        # R7：行情拉取移出锁（TTL 内复用缓存），锁内只做占位+下单
-        await self._ensure_markets_fresh()
-
         async with self._trade_lock:
-            # R7：获锁后复查决策点时限。多通道串行时后续通道在锁上排队，
-            # 拿到锁可能已越过决策点——追单会破坏回测口径，不占槽位直接放弃
-            if deadline_ms is not None and int(time.time() * 1000) > deadline_ms:
-                logger.warning(
-                    "信号实盘：获锁后已超决策点时限，放弃（不占槽位）| signal={} | window={}",
-                    signal_version, window_start)
-                return None
-
             # 先占位后下单：PENDING 行占住唯一键；重复窗口（含重启/并发）在花钱前拒绝。
             pending = await self._reserve_order_slot(
                 signal_version, window_start, direction=prediction,
@@ -1152,6 +1083,8 @@ class BinancePredictionTrader:
             if pending is None:
                 logger.info("信号实盘：窗口 {} 已有订单占位，跳过（每窗一单）", window_start)
                 return None
+
+            await self.list_markets()
 
             if prediction not in ("UP", "DOWN"):
                 logger.warning("未知预测方向: {}", prediction)
@@ -1207,37 +1140,9 @@ class BinancePredictionTrader:
 
             order_result = await self.place_order(quote, slippage_bps=slippage_bps)
             if not order_result:
-                # R2 回读确认：超时/网络异常 ≠ 未成交（钱可能已出去）。
-                # 保持 PENDING + 留痕，交 OrderReconciler 回读币安历史订正终态；
-                # 直接落 FAILED 会造成「钱出去了但账记未成交」的幻影丢单
-                logger.critical(
-                    "信号实盘：下单响应超时/异常，成交状态未知 | window={} | signal={} —— "
-                    "保持 PENDING 由订单对账器回读确认，勿人工干预",
-                    window_start, signal_version)
-                return await self._update_signal_order(
-                    pending, "PENDING", direction=prediction,
-                    error_message="下单响应超时/异常，成交状态未知，等待自动对账回读确认")
-
-            # R2 状态校验：不再以 HTTP 2xx 无条件视为成交，按响应内 status 分流
-            resp_status = str(order_result.get("status") or "").upper()
-            if resp_status in _ORDER_FAILED_STATUSES:
                 return await self._update_signal_order(
                     pending, "FAILED", direction=prediction,
-                    order_id=order_result.get("orderId"),
-                    error_message=f"币安侧订单未成交 | status={resp_status}",
-                    quote_json=quote)
-            if resp_status != "FILLED":
-                # 未知状态但带 orderId：落 PENDING 交对账器回读确认（不臆断 FILLED）
-                logger.critical(
-                    "信号实盘：下单响应状态非 FILLED（{}）| window={} | orderId={} —— "
-                    "保持 PENDING 由订单对账器回读确认",
-                    resp_status or "缺失", window_start, order_result.get("orderId"))
-                return await self._update_signal_order(
-                    pending, "PENDING", direction=prediction,
-                    token_id=token_id,
-                    order_id=order_result.get("orderId"),
-                    quote_json=quote,
-                    error_message=f"下单响应状态非 FILLED（{resp_status or '缺失'}），等待自动对账确认")
+                    error_message="下单失败", quote_json=quote)
 
             snapshot = await self._update_signal_order(
                 pending, "FILLED",

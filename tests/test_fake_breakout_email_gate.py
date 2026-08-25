@@ -69,10 +69,7 @@ def _detector(monkeypatch, parent: FakeBreakoutSignal) -> FakeBreakoutDetector:
 
     monkeypatch.setattr(fbd_mod, "async_session_factory", _factory)
     det = FakeBreakoutDetector(
-        # R3 后检测器读 fresh_mid_price()；替身无价返回 0（陈旧闸语义）
-        collector=SimpleNamespace(store=SimpleNamespace(
-            mid_price=None, fresh_mid_price=lambda max_age_s=None: 0.0,
-        )),
+        collector=SimpleNamespace(store=SimpleNamespace(mid_price=None)),
         pm_15m_latest={},
     )
     return det
@@ -125,29 +122,3 @@ async def test_s5_email_sent_when_channel_on(monkeypatch) -> None:
     det = _detector(monkeypatch, _parent_signal())
     mail = await _fire(det)
     mail.assert_awaited_once_with(99)
-
-
-@pytest.mark.asyncio
-async def test_scene_email_routed_through_signal_notify(monkeypatch) -> None:
-    """R8：场景邮件出口统一走 signal_notify.push_signal_email（全局开关+日限闸），
-    不再直连 SMTP——双轨日限（族 100 vs 全局 800）收敛为单一出口。"""
-    calls: list[tuple] = []
-
-    async def _push(tag, subject, body, now_ms):
-        calls.append((tag, subject))
-        return True
-
-    monkeypatch.setattr(fbd_mod, "push_signal_email", _push)
-    det = _detector(monkeypatch, _parent_signal())
-    assert await det._send_signal_email(_parent_signal()) is True
-    assert len(calls) == 1
-    assert calls[0][0] == "场景"  # tag 标记信号族
-
-
-@pytest.mark.asyncio
-async def test_scene_email_global_switch_off_blocks(monkeypatch) -> None:
-    """R8：信号推送总开关关闭 → 场景邮件同样被拦（旧直连路径绕过此闸）。"""
-    monkeypatch.setattr(settings, "signal_push_email_enabled", False)
-    det = _detector(monkeypatch, _parent_signal())
-    # 走真实 push_signal_email（内部 send_plain_email 因开关直接 False，无 SMTP I/O）
-    assert await det._send_signal_email(_parent_signal()) is False

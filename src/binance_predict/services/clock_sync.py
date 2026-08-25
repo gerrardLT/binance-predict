@@ -19,8 +19,6 @@ import time
 import httpx
 from loguru import logger
 
-from .rate_limit import binance_request
-
 _BINANCE_TIME_URL = "https://api.binance.com/api/v3/time"
 
 # 进程级共享时钟偏差（毫秒）
@@ -49,7 +47,7 @@ async def sync_server_time(*, force: bool = False, min_interval_sec: float = 60.
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 before = int(time.time() * 1000)
-                resp = await binance_request(client, "GET", _BINANCE_TIME_URL)
+                resp = await client.get(_BINANCE_TIME_URL)
                 after = int(time.time() * 1000)
                 server_time = resp.json()["serverTime"]
                 local_mid = (before + after) // 2

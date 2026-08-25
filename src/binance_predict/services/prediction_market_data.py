@@ -30,7 +30,6 @@ from loguru import logger
 
 from ..config.settings import settings
 from . import clock_sync
-from .rate_limit import binance_request
 
 
 @dataclass(frozen=True)
@@ -170,7 +169,7 @@ class PredictionMarketDataService:
 
             try:
                 client = self._get_client()
-                resp = await binance_request(client, "GET",
+                resp = await client.get(
                     f"{self.BASE_URL}/sapi/v1/w3w/wallet/prediction/market/list",
                     params=params,
                     headers={"X-MBX-APIKEY": self._api_key},

@@ -152,41 +152,6 @@ def test_derive_alerts_window_stale_critical() -> None:
     assert derive_overall_status(alerts) == "CRITICAL"
 
 
-def _base_derive_kwargs(**over) -> dict:
-    """derive_alerts 公共必填参数（干净态基线），over 覆盖个别项。"""
-    kw = dict(
-        window_continuity=_clean_continuity(),
-        predict_stats={"active_pattern_count": 0, "total": 0, "matched": 0},
-        phase_ages={},
-        queue_depth=None,
-        llm=None,
-        consecutive_failures=None,
-        has_memory=False,
-    )
-    kw.update(over)
-    return kw
-
-
-def test_derive_alerts_order_stuck_pending(monkeypatch) -> None:
-    """R2：卡 PENDING 订单超阈值 → ORDER_STUCK_PENDING CRITICAL（DB 层，
-    has_memory=False 也要评估——钱可能已出去而账未记）。"""
-    from binance_predict.config.settings import settings
-    monkeypatch.setattr(settings, "order_pending_stale_minutes", 15.0)
-    alerts = derive_alerts(pending_order_age_s=20 * 60, **_base_derive_kwargs())
-    codes = {a.code for a in alerts}
-    assert "ORDER_STUCK_PENDING" in codes
-    assert derive_overall_status(alerts) == "CRITICAL"
-
-
-def test_derive_alerts_order_pending_within_threshold_silent(monkeypatch) -> None:
-    """阈值内 / 未评估（None）不告警：对账器正常回读期间不误报。"""
-    from binance_predict.config.settings import settings
-    monkeypatch.setattr(settings, "order_pending_stale_minutes", 15.0)
-    for age in (5 * 60, None):
-        alerts = derive_alerts(pending_order_age_s=age, **_base_derive_kwargs())
-        assert "ORDER_STUCK_PENDING" not in {a.code for a in alerts}
-
-
 def test_derive_alerts_no_match_after_bootstrap(monkeypatch) -> None:
     # 系统B退役后 NO_MATCH 告警仅在意为启用（agent_loop_enabled）时才评估；
     # 用 monkeypatch 显式回到启用态验证告警逻辑本身

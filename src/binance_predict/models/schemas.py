@@ -257,15 +257,10 @@ class ManualTradeTestRequest(BaseModel):
     """实盘链路人工测试单请求（POST /api/trade/test，小额验证全链路）。"""
 
     amount_usdt: float = Field(
-        default=1.0, description="测试单金额（USDT），端点硬限 0.1~50"
+        default=1.0, description="测试单金额（USDT），端点硬限 0.1~5"
     )
     prediction: str = Field(
         default="DOWN", description="方向 UP/DOWN（测试单随意，验证链路为目的）"
-    )
-    max_exec_price: float = Field(
-        default=0.60,
-        description="执行价护栏（R6 强制，不追贵）：报价 averagePrice 超此值弃单，"
-                    "取值开区间 (0, 1)；缺省 0.60 保守口径",
     )
 
 

@@ -13,7 +13,6 @@ import websockets
 from loguru import logger
 
 from ..config.settings import settings
-from .rate_limit import binance_request
 
 
 @dataclass
@@ -31,28 +30,6 @@ class MarketDataStore:
         if self.best_bid > 0 and self.best_ask > 0:
             return (self.best_bid + self.best_ask) / 2
         return 0.0
-
-    def mid_price_age_s(self) -> float | None:
-        """喂价距今秒数；从未收到报价时返回 None（R3 喂价新鲜度闸/health 告警共用）。"""
-        if self.last_ws_spot_update <= 0:
-            return None
-        return max(0.0, time.time() - self.last_ws_spot_update)
-
-    def fresh_mid_price(self, max_age_s: float | None = None) -> float:
-        """新鲜度闸门版 mid_price（2026-08-25 风险评审 R3）。
-
-        仅当报价存在且距今 ≤ max_age_s 时返回 mid_price，否则返回 0.0。
-        资金/判定链路（窗口采样、破位检测、归档结算）必须用本方法而非
-        裸 mid_price，避免 WS 停摆后陈旧价直通 outcome 判定。
-
-        Args:
-            max_age_s: 新鲜度上限；缺省用 settings.spot_price_max_age_s
-        """
-        age = self.mid_price_age_s()
-        limit = settings.spot_price_max_age_s if max_age_s is None else max_age_s
-        if age is None or age > limit:
-            return 0.0
-        return self.mid_price
 
 
 class BinanceDataCollector:
@@ -147,7 +124,7 @@ class BinanceDataCollector:
         url = f"{settings.binance_api_base}/api/v3/ticker/bookTicker"
         try:
             async with httpx.AsyncClient(timeout=10) as client:
-                resp = await binance_request(client, "GET", url, params={"symbol": settings.symbol})
+                resp = await client.get(url, params={"symbol": settings.symbol})
                 resp.raise_for_status()
                 data = resp.json()
                 bid = float(data["bidPrice"])
@@ -182,7 +159,7 @@ class BinanceDataCollector:
         url = f"{settings.binance_api_base}/api/v3/klines"
         try:
             async with httpx.AsyncClient(timeout=10) as client:
-                resp = await binance_request(client, "GET",
+                resp = await client.get(
                     url,
                     params={
                         "symbol": settings.symbol,
@@ -235,7 +212,7 @@ class BinanceDataCollector:
         url = f"{settings.binance_api_base}/api/v3/klines"
         try:
             async with httpx.AsyncClient(timeout=10) as client:
-                resp = await binance_request(client, "GET",
+                resp = await client.get(
                     url,
                     params={
                         "symbol": settings.symbol,
@@ -267,24 +244,11 @@ class BinanceDataCollector:
             return []
 
     def _safe_cached_mid_price(self) -> float:
-        """返回缓存的 mid_price；缓存无效或陈旧（R3 新鲜度闸）时返回 0.0。
-
-        陈旧缓存不再作为回退值：喂价停摆时宁可让调用方本轮顺延（返回 0.0
-        的既有语义），也不把陈旧价送入结算/采样判定链路。
-        """
-        cached = self.store.fresh_mid_price()
+        """返回缓存的 mid_price，若为 0.0 则记录严重警告。"""
+        cached = self.store.mid_price
         if cached <= 0:
-            age = self.store.mid_price_age_s()
-            if self.store.mid_price <= 0:
-                logger.critical(
-                    "fetch_mid_price 缓存 mid_price 为 0.0，"
-                    "WebSocket 可能从未连接成功。请检查 Binance WS 连接状态。"
-                )
-            else:
-                logger.critical(
-                    "fetch_mid_price 回退缓存已陈旧（age={}s > {}s），拒绝回退陈旧价，"
-                    "返回 0.0 由调用方顺延——喂价可能已停摆",
-                    f"{age:.0f}" if age is not None else "无更新时间",
-                    settings.spot_price_max_age_s,
-                )
+            logger.critical(
+                "fetch_mid_price 缓存 mid_price 为 0.0，"
+                "WebSocket 可能从未连接成功。请检查 Binance WS 连接状态。"
+            )
         return cached

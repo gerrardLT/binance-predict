@@ -65,7 +65,7 @@ async def test_trading_preservation_execute_trade_fetches_token_id(direction):
     trader.list_markets = mock_list_markets
     trader.fetch_wallet_info = AsyncMock(return_value={"walletAddress": "w", "walletId": "wid"})
     trader.get_quote = AsyncMock(return_value={"quoteId": "q1", "amountIn": "1000", "amountOut": "500"})
-    trader.place_order = AsyncMock(return_value={"orderId": "order_1", "status": "FILLED"})
+    trader.place_order = AsyncMock(return_value={"orderId": "order_1"})
     trader._save_order = AsyncMock(return_value=MagicMock())
 
     await trader.execute_trade(prediction=direction, confidence=0.8, prediction_id=1)

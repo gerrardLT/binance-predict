@@ -46,13 +46,6 @@ class Settings(BaseSettings):
     binance_api_base: str = "https://api.binance.com"
     # 现货 WebSocket 地址（公开行情，无需 API Key）
     binance_spot_ws_url: str = "wss://stream.binance.com:9443/ws"
-    # 现货喂价新鲜度上限（秒，2026-08-25 风险评审 R3）：mid_price 距今超过此值
-    # 视为陈旧，资金/判定链路（窗口采样、破位检测、归档结算）一律拒绝使用，
-    # 避免 WS 停摆后陈旧价直通 outcome 判定；health 据此派生 SPOT_FEED_STALE 告警
-    spot_price_max_age_s: float = 15.0
-    # 订单卡 PENDING 告警阈值（分钟，R2）：成交状态未知超此时长 → health
-    # CRITICAL ORDER_STUCK_PENDING（资金类，独立于告警总闸推送）
-    order_pending_stale_minutes: float = 15.0
     # --- 预测参数 ---
     # 交易品种
     symbol: str = "BTCUSDT"

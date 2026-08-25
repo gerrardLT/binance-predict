@@ -236,9 +236,6 @@ class MultiLiveTrader:
                 window_start=target_start,
                 max_exec_price=resolve_max_exec(spec, cfg),
                 market_period="5m",
-                # R7：决策点时限传入下单临界区——多通道串行等锁后由 trader
-                # 获锁复查，超期不落占位直接放弃（锁前的检查不再唯一）
-                deadline_ms=decision_ms + X4_DECISION_TOLERANCE_MS,
             )
             await self._after_fill(order, version, cfg)
             if order is not None and order.get("status") == "FILLED":

@@ -245,20 +245,8 @@ async def send_webhook_alert(
         )
 
 
-# 资金类 CRITICAL 告警 code（R2）：总闸关闭时仍走独立通道推送——
-# 钱可能已出去而账未记、喂价停摆直通资金链类事故不能随常规告警静默
-_FUND_CRITICAL_CODES: frozenset[str] = frozenset(
-    {"ORDER_STUCK_PENDING", "SPOT_FEED_STALE"}
-)
-
-
 class AlertNotifier:
     """告警通知器：对告警按 code 去重抑制后，经配置渠道（邮件+webhook）主动推送。
-
-    资金类 CRITICAL 独立通道（R2，2026-08-25 风险评审）：_FUND_CRITICAL_CODES
-    中的告警在总闸 agent_alert_notify_enabled=False 时仍推送——钱可能已
-    出去而账未记类事故不能随总闸静默；其余告警维持总闸语义不变
-    （用户 2026-08-24 明确要求暂停常规告警推送，本通道不违背该决策）。
 
     抑制（分级，2026-08-15）：同一 code 在抑制窗口内只推一次，避免 60s 轮询轰炸：
     - CRITICAL 级：agent_alert_suppress_seconds（15 分钟，真故障要尽快知道）
@@ -297,28 +285,17 @@ class AlertNotifier:
         overall_status=OK 时直接跳过。仅当存在「新」告警（未在窗口内推过）才推送，
         推送成功与否都刷新该批 code 的推送时刻，避免失败时下一轮立即重试轰炸。
 
-        总闸 agent_alert_notify_enabled=False 时常规告警静默，但资金类
-        CRITICAL（_FUND_CRITICAL_CODES）走独立通道照常推送（R2）：
-        不 mark_sent 非资金告警，恢复后新告警能及时推送。
+        总闸 agent_alert_notify_enabled=False 时直接跳过（邮件+webhook 全暂停）：
+        不 mark_sent，恢复后新告警能及时推送；慢性告警若仍在抑制窗内仍受抑制。
         """
+        if not settings.agent_alert_notify_enabled:
+            return []
         if report.overall_status == "OK":
             return []
         now = time.time()
         fresh = self.filter_fresh(report.alerts, now)
         if not fresh:
             return []
-        if not settings.agent_alert_notify_enabled:
-            # 总闸关闭：仅资金类 CRITICAL 独立通道放行
-            fresh = [
-                a for a in fresh
-                if a.level == "CRITICAL" and a.code in _FUND_CRITICAL_CODES
-            ]
-            if not fresh:
-                return []
-            logger.warning(
-                "[ALERT] 告警总闸关闭，但资金类 CRITICAL 独立通道推送 | codes={}",
-                [a.code for a in fresh],
-            )
         await send_email_alert(report, fresh)
         await send_webhook_alert(report, fresh)
         self.mark_sent(fresh, now)

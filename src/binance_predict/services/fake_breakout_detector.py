@@ -64,10 +64,11 @@ from ..config.settings import settings
 from ..db.engine import async_session_factory
 from ..db.models import FakeBreakoutSignal, SceneParamVersion, SentimentWindow
 from . import clock_sync
+from .alerting import send_plain_email
 from .data_collector import BinanceDataCollector
 from .live_channels import scene_pattern_to_channel
 from .scene_params import DEFAULT_SCENE_PARAMS, SceneParams
-from .signal_notify import TZ_BJT, is_live_enabled, push_signal_email
+from .signal_notify import TZ_BJT, is_live_enabled
 
 # 超宽限阈值：到期后超过此宽限未结算的信号转 klines 精确补结算路径
 # （周期锚点口径下 P(S)/P(E) 均为历史时点，klines 必然可得，停机无损）
@@ -334,8 +335,6 @@ class FakeBreakoutDetector:
         # - _confirm_miss_count: 周期收盘确认时形态未命中的次数
         self._pending_count: int = 0
         self._confirm_miss_count: int = 0
-        # R3 喂价陈旧节流告警时间戳（陈旧时暂停破位检测，60s 一条防刷屏）
-        self._last_stale_warn_ts: float = 0.0
         # M4 影子并行：ACTIVE 版本名 + 可影子判定的 SHADOW 版本列表
         # （[{"version", "params": SceneParams}]；仅 classify 层参数差异的版本）
         self._active_version: str = "v1"
@@ -433,17 +432,7 @@ class FakeBreakoutDetector:
             try:
                 await self._refresh_levels()
 
-                # R3 新鲜度闸：陈旧价 → 0 → 本轮跳过破位检测（喂价停摆时
-                # 旧价可能误判破位 → 错误场景信号，甚至驱动真单）
-                mid = self._collector.store.fresh_mid_price()
-                if mid <= 0 and self._collector.store.mid_price > 0:
-                    now_wall = time.time()
-                    if now_wall - self._last_stale_warn_ts >= 60:
-                        self._last_stale_warn_ts = now_wall
-                        logger.warning(
-                            "场景检测器：现货喂价已陈旧（age={}s），本轮暂停破位检测",
-                            f"{self._collector.store.mid_price_age_s():.0f}",
-                        )
+                mid = self._collector.store.mid_price
                 # 统一用币安服务器时钟：与市场 end_date（币安时钟）比较无时钟偏差
                 now_ms = clock_sync.now_ms()
 
@@ -749,8 +738,7 @@ class FakeBreakoutDetector:
             side=side,
             signal_time=now_ms,
             resistance=rec["broken_level"],
-            # R3 新鲜度闸：陈旧现货价回落 K 线收盘价（影子记录字段，不伪造停摆价）
-            btc_price=self._collector.store.fresh_mid_price() or sig_k["close"],
+            btc_price=self._collector.store.mid_price or sig_k["close"],
             eps=eps,
             down_price_15m=self._pm_15m.get("down_price"),
             up_price_15m=self._pm_15m.get("up_price"),
@@ -959,8 +947,7 @@ class FakeBreakoutDetector:
                             )
 
                 if not add_done and matched:
-                    # R3 新鲜度闸：陈旧价 → 0 → 本轮不确认加仓破位，顺延下轮
-                    mid = self._collector.store.fresh_mid_price()
+                    mid = self._collector.store.mid_price
                     if mid and mid >= trigger_price:
                         ok = await self._update_signal(
                             signal_id,
@@ -1082,8 +1069,7 @@ class FakeBreakoutDetector:
             side=parent.side,
             signal_time=now_ms,
             resistance=parent.resistance,
-            # R3 新鲜度闸：陈旧现货价回落 5m 收盘价
-            btc_price=self._collector.store.fresh_mid_price() or c5_close,
+            btc_price=self._collector.store.mid_price or c5_close,
             eps=parent.eps,
             down_price_15m=q.get("down_price") if matched else None,
             up_price_15m=q.get("up_price") if matched else None,
@@ -1243,11 +1229,7 @@ class FakeBreakoutDetector:
             f"机制：破位动能收盘未回吐（买力/卖力耗尽），次周期兑现反转。\n"
             f"当前阶段：系统不下注，仅记录信号并到期回读结算方向。\n"
         )
-        # R8 收敛（2026-08-25 风险评审）：场景邮件不再直连 SMTP，统一走
-        # signal_notify 全局闸（signal_push_email_enabled 总开关 + 全局日限 800）——
-        # 此前场景族自有日限 100 与全局 800 双轨互不知情，S5 漏挂闸事故已证
-        # 复制粘贴纪律不可持续；信号 fire 为实时路径，新鲜度由调用侧保证。
-        return await push_signal_email("场景", subject, body, int(time.time() * 1000))
+        return await send_plain_email(subject, body)
 
     # ==================================================================
     # 到期结算回读（5m + 15m 双口径并行验证）
