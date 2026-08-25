@@ -420,6 +420,17 @@ interface DeepLearnStreamEvent {
 // API helpers（仅保留路径B/C相关端点）
 // ============================================================
 
+// API 鉴权 Token（R1 fail-closed）：资金端点必须携带 Bearer 头，
+// 否则服务端返 401/503。存 localStorage，页头锁形按钮可配置/清除
+const API_TOKEN_KEY = 'bp_api_token'
+const getApiToken = (): string => {
+  try { return localStorage.getItem(API_TOKEN_KEY) ?? '' } catch { return '' }
+}
+const authHeaders = (): Record<string, string> => {
+  const t = getApiToken()
+  return t ? { Authorization: `Bearer ${t}` } : {}
+}
+
 const api = {
   health: () => fetch('/api/health').then(r => r.json()),
   getPredictionMarket: () => fetch('/api/chart/prediction-market').then(r => r.json()),
@@ -473,25 +484,25 @@ const api = {
   postTradeTest: (amount_usdt: number, prediction: string) =>
     fetch('/api/trade/test', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify({ amount_usdt, prediction }),
     }).then(r => r.json()),
   postTransferIn: (amount_usdt: number) =>
     fetch('/api/prediction/transfer-in', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify({ amount_usdt }),
     }).then(r => r.json()),
   postTransferOut: (amount_usdt: number) =>
     fetch('/api/prediction/transfer-out', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify({ amount_usdt }),
     }).then(r => r.json()),
   postLiveChannel: (channel: string, enabled: boolean, amountUsdt?: number, maxDailyOrders?: number) =>
     fetch('/api/live/toggle', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify({
         channel, enabled,
         ...(amountUsdt != null ? { amount_usdt: amountUsdt } : {}),
@@ -499,13 +510,15 @@ const api = {
       }),
     }).then(r => r.json()),
   getQuotePreview: () => fetch('/api/prediction/quote-preview').then(r => r.json()),
-  postSyncBinance: () => fetch('/api/trades/sync-binance', { method: 'POST' }).then(r => r.json()),
+  postSyncBinance: () => fetch('/api/trades/sync-binance', {
+    method: 'POST', headers: { ...authHeaders() },
+  }).then(r => r.json()),
   // 奖金领取（2026-08-23）：可领查询 + batch-redeem
   getRedeemable: () => fetch('/api/prediction/redeemable').then(r => r.json()),
   postRedeem: () =>
     fetch('/api/prediction/redeem', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify({}),
     }).then(r => r.json()),
   // 线上信号概览：各影子版本累计统计（stats 按 version 服务端算）
@@ -516,6 +529,37 @@ const api = {
 // ============================================================
 // 公共组件
 // ============================================================
+
+function ApiTokenButton() {
+  // API 鉴权 Token 配置入口（R1 fail-closed）：资金操作需 Bearer 头，
+  // 存 localStorage；置空即清除
+  const [hasToken, setHasToken] = useState(() => !!getApiToken())
+  const configure = () => {
+    const input = window.prompt(
+      'API 鉴权 Token（资金操作需要；置空并确定 = 清除）：',
+      getApiToken(),
+    )
+    if (input === null) return
+    try {
+      if (input.trim()) localStorage.setItem(API_TOKEN_KEY, input.trim())
+      else localStorage.removeItem(API_TOKEN_KEY)
+    } catch { /* 隐私模式等存储不可用时静默（仅本会话生效失败） */ }
+    setHasToken(!!input.trim())
+  }
+  return (
+    <button
+      onClick={configure}
+      title={hasToken ? 'API Token 已配置（点击修改/清除）' : '未配置 API Token：资金操作将被服务端拒绝（401/503）'}
+      className={`absolute right-4 top-1/2 -translate-y-1/2 text-sm px-2 py-0.5 rounded-full border transition ${
+        hasToken
+          ? 'text-green-700 border-green-200 bg-green-50 hover:bg-green-100'
+          : 'text-red-600 border-red-200 bg-red-50 hover:bg-red-100'
+      }`}
+    >
+      {hasToken ? '🔓' : '🔒'}
+    </button>
+  )
+}
 
 function StatusDot({ ok }: { ok: boolean }) {
   return <span className={`inline-block w-2.5 h-2.5 rounded-full ${ok ? 'bg-green-500' : 'bg-red-500'}`} />
@@ -1499,7 +1543,7 @@ export default function App() {
   return (
     <div className="min-h-screen bg-[var(--bg)] flex flex-col">
       <header className="bg-white/95 backdrop-blur border-b border-gray-200 sticky top-0 z-10 shadow-sm">
-        <div className="max-w-6xl mx-auto px-4 py-1.5 flex justify-center">
+        <div className="max-w-6xl mx-auto px-4 py-1.5 flex justify-center relative">
           {/* 头部仅保留标签切换，最小化占用空间 */}
           <div className="flex items-center gap-1 bg-gray-100 rounded-full p-1">
             <button
@@ -1553,6 +1597,7 @@ export default function App() {
               实盘交易
             </button>
           </div>
+          <ApiTokenButton />
         </div>
       </header>
 
