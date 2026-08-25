@@ -60,7 +60,10 @@ def is_live_enabled(channel: str) -> bool:
         return False
     try:
         return bool(_live_resolver(channel))
-    except Exception:
+    except Exception as exc:
+        # 带日志的 fail-safe：resolver 持续故障时现象与“通道全关”相同，
+        # 无日志则全部信号邮件被无声关停，运维不可观测（2026-08-25 评审建议）
+        logger.warning("[SIGNAL] 实盘开火查询异常，按未开火处理 | channel={} | {}", channel, exc)
         return False
 
 

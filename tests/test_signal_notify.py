@@ -41,6 +41,12 @@ def test_fmt_bjt_converts_to_beijing_time() -> None:
     assert sn.fmt_bjt(ms, with_date=False) == "06:30"
 
 
+def test_daily_cap_default_is_800() -> None:
+    """日限默认值防回退：2026-08-25 用户拍板 80→800，误改回 80 应被 CI 拦下。"""
+    from binance_predict.config.settings import Settings
+    assert Settings().signal_push_max_daily_emails == 800
+
+
 # ------------------------------------------------------------------
 # 实盘开火闸：只推已开实盘开火通道的信号
 # ------------------------------------------------------------------

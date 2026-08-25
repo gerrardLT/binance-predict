@@ -786,6 +786,13 @@ class FakeBreakoutDetector:
             )
 
         direction = "DOWN" if side == "high" else "UP"
+        scene_channel = scene_pattern_to_channel(pattern_type)
+        email_blocked = (
+            "（影子，不发邮件）" if shadow
+            else ("（超日限，不发邮件）" if over_daily_limit
+                  else ("" if scene_channel is not None and is_live_enabled(scene_channel)
+                        else f"（实盘通道 {scene_channel} 未开，不发邮件）"))
+        )
         logger.info(
             "场景信号触发 #{} [{} {}{}] | 周期 {} 破{} {:.0f} | 信号K收{} 收盘位置 {:.2f} 量比 {} | "
             "次周期看 {} | 日内第 {} 条{}",
@@ -794,14 +801,13 @@ class FakeBreakoutDetector:
             "阳" if sig_k["close"] > sig_k["open"] else "阴", close_pos,
             f"{vol_ratio:.2f}" if vol_ratio is not None else "N/A",
             direction, self._daily_count,
-            "（影子，不发邮件）" if shadow else ("（超日限，不发邮件）" if over_daily_limit else ""),
+            email_blocked,
         )
 
         # 邮件推送（未超日限且非影子，且对应场景通道已开实盘开火）：
         # fire-and-forget，绝不阻塞检测循环。
         # 实测教训：SMTP 连接被防火墙丢包时同步等待会卡死整个循环 16 分钟，
         # 导致结算回读停摆（信号 #1 事故）。
-        scene_channel = scene_pattern_to_channel(pattern_type)
         if (not shadow and settings.fake_breakout_email_enabled
                 and not over_daily_limit and scene_channel is not None
                 and is_live_enabled(scene_channel)):
@@ -1099,16 +1105,25 @@ class FakeBreakoutDetector:
         self._daily_count += 1
         # 实盘钩子：S5 为正式信号派生（影子不派生），无需 shadow 判断
         self._notify_signal_fired(signal)
+        # 邮件闸与主信号路径同构（2026-08-25 评审发现 S5 路径漏挂实盘开火闸）：
+        # S5 pattern 恒为 bull_exhaust_confirm → scene_bull_exhaust_confirm
+        s5_channel = scene_pattern_to_channel(signal.pattern_type)
+        s5_blocked = (
+            "（超日限，不发邮件）" if over_daily_limit
+            else ("" if s5_channel is not None and is_live_enabled(s5_channel)
+                  else f"（实盘通道 {s5_channel} 未开，不发邮件）")
+        )
         logger.info(
             "S5 确认信号触发 #{}（父 #{}）| 5m 收盘 {:.2f} < 周期开盘 {:.2f} | "
             "DOWN 入场 {} | 360 天回测：确认组 78.5% [75.0,81.6] 盈亏平衡 0.77 | 日内第 {} 条{}",
             signal.id, parent_id, c5_close, anchor,
             q.get("down_price") if matched else "N/A",
             self._daily_count,
-            "（超日限，不发邮件）" if over_daily_limit else "",
+            s5_blocked,
         )
 
-        if settings.fake_breakout_email_enabled and not over_daily_limit:
+        if (settings.fake_breakout_email_enabled and not over_daily_limit
+                and s5_channel is not None and is_live_enabled(s5_channel)):
             asyncio.create_task(
                 self._send_signal_email_bg(signal.id),
                 name=f"fbs_email_{signal.id}",

@@ -952,6 +952,31 @@ async def lifespan(app: FastAPI):
     ]
     logger.info("现货 WS + 预测市场追踪 + 15m边界加速 + 情绪窗口归档 + 健康监控已启动")
 
+    # 多通道实盘执行器（MultiLiveTrader，2026-08-24 取代单版本 QuoteEdgeLiveTrader）：
+    # 10 通道各自独立金额/日限/护栏/开关，三族触发（quote_edge 喂价/x4 轮询/场景钩子）；
+    # 无条件装配 + 通道标志位控制开火；配置分层：代码默认 → LIVE_CHANNELS_JSON
+    # → DB 覆盖层（toggle 持久化，重启不丢设定）。
+    # 构造与邮件闸 resolver 注入必须早于三个检测器 start：is_enabled 只读
+    # __init__ 就绪的 _configs 不依赖 start()；若注入滞后，短暂重启后新鲜度窗
+    # （10 分钟）内的信号会命中首轮轮询——resolver 未注入 → 落表但永久丢推
+    #（邮件 fire-once 无补发，2026-08-25 评审发现的时序缝隙）。
+    global multi_live_trader
+    try:
+        multi_live_trader = MultiLiveTrader(prediction_trader)
+    except ValueError as exc:
+        # 通道配置非法（未知通道名/金额超硬上限/护栏非法）：拒实盘不拖垮其他服务
+        logger.error("多通道实盘执行器装配失败：{}", exc)
+    else:
+        # DB 覆盖层（用户最后一次 toggle 的设定，优先级高于 env）；
+        # fail-safe：DB 异常回落 env 层配置，不阻塞服务启动
+        try:
+            await multi_live_trader.apply_db_overrides()
+        except Exception as exc:
+            logger.warning("多通道实盘：DB 覆盖层加载失败（回落 env 配置）| {}", exc)
+        # 信号邮件推送闸：只推已开实盘开火通道的信号（运行时读 configs，
+        # 含 toggle 热调；装配失败时 resolver 保持 None → 一律不推 fail-safe）
+        set_live_enabled_resolver(multi_live_trader.is_enabled)
+
     # 场景信号系统：4h 破位记 pending → 15m 周期收盘确认 → 次周期信号（不下注）
     global fake_breakout_detector
     if settings.fake_breakout_enabled:
@@ -996,33 +1021,15 @@ async def lifespan(app: FastAPI):
     await trade_settler.start()
     logger.info("交易结算器已启动（60s 扫描 FILLED 未结算订单，settled_at 锚点）")
 
-    # 多通道实盘执行器（MultiLiveTrader，2026-08-24 取代单版本 QuoteEdgeLiveTrader）：
-    # 10 通道各自独立金额/日限/护栏/开关，三族触发（quote_edge 喂价/x4 轮询/场景钩子）；
-    # 无条件装配 + 通道标志位控制开火；配置分层：代码默认 → LIVE_CHANNELS_JSON
-    # → DB 覆盖层（toggle 持久化，重启不丢设定）。
-    global multi_live_trader
-    try:
-        multi_live_trader = MultiLiveTrader(prediction_trader)
-    except ValueError as exc:
-        # 通道配置非法（未知通道名/金额超硬上限/护栏非法）：拒实盘不拖垮其他服务
-        logger.error("多通道实盘执行器装配失败：{}", exc)
-    else:
-        # DB 覆盖层（用户最后一次 toggle 的设定，优先级高于 env）；
-        # fail-safe：DB 异常回落 env 层配置，不阻塞服务启动
-        try:
-            await multi_live_trader.apply_db_overrides()
-        except Exception as exc:
-            logger.warning("多通道实盘：DB 覆盖层加载失败（回落 env 配置）| {}", exc)
-        # 信号邮件推送闸：只推已开实盘开火通道的信号（运行时读 configs，
-        # 含 toggle 热调；装配失败时 resolver 保持 None → 一律不推 fail-safe）
-        set_live_enabled_resolver(multi_live_trader.is_enabled)
+    # 多通道实盘执行器启动（构造/DB覆盖/邮件闸注入已在检测器 start 前完成）
+    if multi_live_trader is not None:
         await multi_live_trader.start()
         # 余额缓存作废钩子：信号单成交后作废 prediction-wallet TTL 缓存
         # （下单扣预测钱包余额；与划转端点同款失效逻辑，前端下次轮询即取新值）
         multi_live_trader._on_balance_change = (
             lambda: _wallet_view_ts.__setitem__("balance", 0.0)
         )
-        # 场景钩子注入（检测器构造早于执行器装配，与 _on_balance_change 同模式补注入；
+        # 场景钩子注入（检测器构造晚于执行器装配，但钩子赋值无时序依赖；
         # 场景检测关闭时 detector 为 None，场景通道即使开启也无触发源——fail-safe）
         if fake_breakout_detector is not None:
             fake_breakout_detector._on_signal_fired = multi_live_trader.on_scene_signal
@@ -1075,6 +1082,8 @@ async def lifespan(app: FastAPI):
     # 停止多通道实盘执行器（拒新单；在途下单任务等待完成，钱已出去的临界区不打断）
     if multi_live_trader is not None:
         await multi_live_trader.stop()
+    # 复位邮件闸 resolver（防同进程二次 lifespan 残留指向旧 trader 的闭包）
+    set_live_enabled_resolver(None)
     # 停止 AgentScheduler（优雅关闭，等待当前阶段执行完毕）
     if agent_scheduler is not None:
         await agent_scheduler.stop()
