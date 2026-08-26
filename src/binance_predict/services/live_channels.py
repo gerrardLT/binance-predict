@@ -2,7 +2,8 @@
 
 通道 ID 与影子信号版本名对齐（订单 signal_version 直接用通道名，对账/统计天然一致）。
 三族触发机制（由 MultiLiveTrader 分别驱动，见 multi_live_trader.py）：
-- quote_edge：5m 采样循环喂价 → 窗内报价区间命中（v2 附加 BTC 门禁，实时喂价解锁）；
+- quote_edge：5m 采样循环喂价 → 窗内报价区间命中（v2 附加 BTC 门禁，实时喂价解锁；
+  v3 环境门禁版再叠加前窗 DOWN/距日高回落，异步 DB 核验后下单）；
 - x4：轮询 misalignment_signals PENDING → 次窗 +150s 决策点下单；
 - scene：fake_breakout_detector fire 钩子 → 次周期开盘下单（15m 市场）。
 
@@ -37,6 +38,7 @@ class ChannelSpec:
     auto_max_exec: float          # 默认执行价护栏（可被配置覆盖）
     display_name: str
     v2_guard: str | None = None   # quote_edge v2 门禁模式：min_drop | max_rise | None
+    v3_env: bool = False          # quote_edge v3 环境门禁（前窗DOWN [+距日高回落]，异步核验）
 
 
 def _qe_guard(version: str) -> float:
@@ -62,6 +64,17 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     "quote_contrarian_v2": ChannelSpec(
         "quote_contrarian_v2", "quote_edge", "5m", "DOWN", _qe_guard("quote_contrarian_v1"),
         "报价反向·门禁版", v2_guard="max_rise",
+    ),
+    # v3 环境门禁版：contrarian v1 区间 + v2 价格门禁 + 环境门禁
+    # （前窗 DOWN / 距日高回落≥0.30%，口径引用 quote_edge_detector.V3_ENV_GUARDS，
+    # 实时核验走异步 DB 查询，见 MultiLiveTrader._pass_live_v3_guard）
+    "quote_contrarian_v3a": ChannelSpec(
+        "quote_contrarian_v3a", "quote_edge", "5m", "DOWN", _qe_guard("quote_contrarian_v1"),
+        "报价反向·交替环境版", v2_guard="max_rise", v3_env=True,
+    ),
+    "quote_contrarian_v3b": ChannelSpec(
+        "quote_contrarian_v3b", "quote_edge", "5m", "DOWN", _qe_guard("quote_contrarian_v1"),
+        "报价反向·日高回落版", v2_guard="max_rise", v3_env=True,
     ),
     # --- x4 族（影子 PENDING → 次窗 +150s 决策点，入场价历史偏低）---
     "x4_v1": ChannelSpec("x4_v1", "x4", "5m", "DOWN", 0.45, "情绪错位（收阳押次窗DOWN）"),

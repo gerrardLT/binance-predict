@@ -141,7 +141,7 @@ quote_edge_detector: QuoteEdgeDetector | None = None
 # 交易结算器全局实例（P0-2：FILLED 订单结算回填输赢/盈亏，常开）
 trade_settler: TradeSettler | None = None
 
-# 多通道实盘执行器全局实例（MultiLiveTrader：10 通道三族触发，
+# 多通道实盘执行器全局实例（MultiLiveTrader：12 通道三族触发，
 # 通道开关/金额/日限各自独立，启动回落 LIVE_CHANNELS_JSON，默认全关）
 multi_live_trader: MultiLiveTrader | None = None
 
@@ -466,6 +466,8 @@ async def _prediction_market_tracker() -> None:
                 # None 守卫：未装配时跳过；check 内纯内存比较，不阻塞采样循环。
                 # v2 门禁喂价：_btc_mid（本次采样 BTC 中间价，L397）+ _window_entry_price
                 # （窗口开盘快照）——均为现有变量，零新采样成本。
+                # v3 日高喂价：window_btc_curve 从 _pm_history 提取本窗 BTC 时序
+                # （含本点），供 v3b 日高口径与影子对齐（影子含本窗 ≤quote_ts 点）。
                 if multi_live_trader is not None and _current_window_end is not None:
                     multi_live_trader.check(
                         int(_current_window_end) - 300_000,
@@ -474,6 +476,10 @@ async def _prediction_market_tracker() -> None:
                         down_price,
                         btc_price=_btc_mid,
                         window_entry_price=_window_entry_price,
+                        window_btc_curve=[
+                            {"t": p["timestamp"], "v": p["btc_price"]}
+                            for p in _pm_history if p.get("btc_price")
+                        ],
                     )
 
         except asyncio.CancelledError:
@@ -953,7 +959,7 @@ async def lifespan(app: FastAPI):
     logger.info("现货 WS + 预测市场追踪 + 15m边界加速 + 情绪窗口归档 + 健康监控已启动")
 
     # 多通道实盘执行器（MultiLiveTrader，2026-08-24 取代单版本 QuoteEdgeLiveTrader）：
-    # 10 通道各自独立金额/日限/护栏/开关，三族触发（quote_edge 喂价/x4 轮询/场景钩子）；
+    # 12 通道各自独立金额/日限/护栏/开关，三族触发（quote_edge 喂价/x4 轮询/场景钩子）；
     # 无条件装配 + 通道标志位控制开火；配置分层：代码默认 → LIVE_CHANNELS_JSON
     # → DB 覆盖层（toggle 持久化，重启不丢设定）。
     # 构造与邮件闸 resolver 注入必须早于三个检测器 start：is_enabled 只读
@@ -2427,17 +2433,18 @@ async def get_prediction_market_chart_15m(
 # 审计后版本一致：三套 EV 口径、逐版本盈亏平衡、PUMP_TS 周期切分。
 # ============================================================
 
-# 影子版本回测冻结基准（胜率, EV, 说明）；v2 为 2026-08-22 5m 归因落地的门禁版，
-# 无独立回测基准（bench=None → 面板不显示基准对比，只看影子实测）
+# 影子版本回测冻结基准（胜率, EV, 说明）；v2/v3 门禁版基准为 2026-08-26 真实数据
+# 回测（scripts/local_shadow_v2v3_real_backtest.py）：A 段=线上全历史 v1 已结算行
+# 过门禁（门禁为 v1 触发集纯子集），B 段=07-13~07-30 全曲线盲验重放；合并钉胜率。
 SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     "x4_v1": (0.635, 0.254, "错位: 本窗收阳&end≤40 → 次窗 DOWN"),
     "quote_momentum_v1": (0.799, 0.097, "顺势: 深折价方向同窗押注"),
     "quote_contrarian_v1": (0.240, 0.155, "逆势: 赔率型，胜率低赔率高"),
-    "x4_v2": (None, None, "错位v2: v1+|past1h|<0.5%平静市（归因: 57.6%/+9.70 vs 23%/−13.8）"),
-    "quote_momentum_v2": (None, None, "顺势v2: v1+触发时已跌≥0.10%（归因: 剔假恐慌 dip<0.15% 段 −0.43）"),
-    "quote_contrarian_v2": (None, None, "逆势v2: v1+触发时未涨≥0.10%（归因: 平盘窗贡献 86% 利润）"),
-    "quote_contrarian_v3a": (None, None, "逆势v3a: v2+前窗DOWN交替环境（归因: 31.2%/+0.511 vs 前窗UP 18.5%/−0.140）"),
-    "quote_contrarian_v3b": (None, None, "逆势v3b: v3a+距日高回落≥0.30%含边界（归因: 34.5%/+0.682，Wilson 下界过线）"),
+    "x4_v2": (0.553, 0.211, "错位v2: v1+|past1h|<0.5%平静市（真实回测 n=94 胜率55.3%，盲验段30笔66.7%）"),
+    "quote_momentum_v2": (0.750, 0.019, "顺势v2: v1+触发时已跌≥0.10%（真实回测 n=24 胜率75.0%，小样本CI宽）"),
+    "quote_contrarian_v2": (0.258, 0.235, "逆势v2: v1+触发时未涨≥0.10%（真实回测 n=155 胜率25.8%）"),
+    "quote_contrarian_v3a": (0.318, 0.528, "逆势v3a: v2+前窗DOWN交替环境（真实回测 n=85 胜率31.8%）"),
+    "quote_contrarian_v3b": (0.338, 0.646, "逆势v3b: v3a+距日高回落≥0.30%含边界（真实回测 n=65 胜率33.8%）"),
     # 深夜时段变体：基准为 720 天 K 线代理回测（非真实报价同源），只钉胜率；
     # EV 基准留 None（代理回测含溢 0.01 与影子无溢价口径不可直比）
     "late_night_contrarian_v1": (0.347, None, "深夜逆势v1: 北京22~24时×t45~90s q∈[0.25,0.30)（720天K线代理回测胜率≈34.7%/赔率型边际，43天小样本51~56%系噪声）"),
@@ -2543,7 +2550,7 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
     versions = [
         "x4_v1", "quote_momentum_v1", "quote_contrarian_v1",
         "x4_v2", "quote_momentum_v2", "quote_contrarian_v2",  # v2 门禁版（部署即入面板）
-        "quote_contrarian_v3a", "quote_contrarian_v3b",  # v3 环境门禁版（纯影子）
+        "quote_contrarian_v3a", "quote_contrarian_v3b",  # v3 环境门禁版（可选实盘通道，默认 OFF）
         "late_night_contrarian_v1",  # 深夜时段变体（纯影子，2026-08-26）
     ]
     versions += sorted({s.version for s in sh_rows} - set(versions))

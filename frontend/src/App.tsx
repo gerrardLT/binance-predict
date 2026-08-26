@@ -574,7 +574,7 @@ function HelpHint({ text }: { text: string }) {
 }
 
 // 线上信号通道说明（口径源：services/live_channels.py 注册表 + quote_edge_detector 冻结规则）
-// 2026-08-24 多通道实盘改造：10 通道全部支持实盘下单（liveOk），各自独立金额/日限/护栏，
+// 2026-08-24 多通道实盘改造：全部通道支持实盘下单（liveOk），各自独立金额/日限/护栏，
 // 通道运行状态（开关/金额/日限/护栏/今日成交）来自后端 multi_live_trader.status_async()。
 const SIGNAL_INFO: Record<string, { name: string; kind: '实盘' | '影子' | '场景'; desc: string; liveOk?: boolean }> = {
   quote_contrarian_v1: {
@@ -592,6 +592,14 @@ const SIGNAL_INFO: Record<string, { name: string; kind: '实盘' | '影子' | '�
   quote_momentum_v2: {
     name: '报价动量·门禁版', kind: '影子', liveOk: true,
     desc: 'v1 区间 + BTC 价格门禁：触发时点 BTC 已低于窗口开盘 ≥0.10%（剔「假恐慌」，真跌段胜率 85% vs 假恐慌段 40%）。实盘已解锁（实时 BTC 喂价门禁），通道护栏 0.78。',
+  },
+  quote_contrarian_v3a: {
+    name: '报价反向·交替环境版', kind: '影子', liveOk: true,
+    desc: 'contrarian v1 区间 + v2 价格门禁 + 环境门禁：前窗结算 DOWN（交替环境：前窗跌+本窗涨=V 反弹假冲高）。真实回测 n=85 胜率 31.8%、EV +0.528。实盘已解锁（前窗 outcome 异步 DB 核验，缺失弃单），通道护栏 0.28。',
+  },
+  quote_contrarian_v3b: {
+    name: '报价反向·日高回落版', kind: '影子', liveOk: true,
+    desc: 'v3a + 触发时点 BTC 距当日高点回落 ≥0.30%（含边界，震荡日冲高更易衰竭）。真实回测 n=65 胜率 33.8%、EV +0.646（单笔 EV 最优）。实盘已解锁（日高异步 DB 核验，缺失弃单），通道护栏 0.28。',
   },
   x4_v1: {
     name: '情绪错位（收阳押次窗DOWN）', kind: '影子', liveOk: true,
@@ -742,7 +750,7 @@ interface LiveChannelStatus {
   filled_today?: number
 }
 
-// 线上信号概览卡：10 通道一屏总览（60s 轮询，统计为全量累计不随 limit 截断）
+// 线上信号概览卡：12 通道一屏总览（60s 轮询，统计为全量累计不随 limit 截断）
 // onToggleChannel：行内通道开关回调（由 LiveTradeTab 注入，confirm 统一在那里，
 // 避免两处开关状态不一致互咬）
 function SignalsOverviewCard({ live, onToggleChannel, busy = false }: {
@@ -754,8 +762,8 @@ function SignalsOverviewCard({ live, onToggleChannel, busy = false }: {
   const [fb, setFb] = useState<Record<string, unknown> | null>(null)
 
   const refresh = useCallback(() => {
-    // quote_edge/x4 六通道：misalignment 影子统计（版本名与通道名一致）
-    const versions = ['quote_contrarian_v1', 'quote_momentum_v1', 'quote_contrarian_v2', 'quote_momentum_v2', 'x4_v1', 'x4_v2']
+    // quote_edge/x4 八通道：misalignment 影子统计（版本名与通道名一致）
+    const versions = ['quote_contrarian_v1', 'quote_momentum_v1', 'quote_contrarian_v2', 'quote_momentum_v2', 'quote_contrarian_v3a', 'quote_contrarian_v3b', 'x4_v1', 'x4_v2']
     versions.forEach(v => {
       api.getMisalignmentSignals(v)
         .then(d => setStats(prev => ({ ...prev, [v]: d?.stats ?? null })))
@@ -827,7 +835,7 @@ function SignalsOverviewCard({ live, onToggleChannel, busy = false }: {
           <div className="text-gray-400 py-2">实盘通道状态不可用（执行器未装配？详见后端日志）</div>
         )}
         <p className="text-[10px] text-gray-400 mt-1.5">
-          10 通道全部支持实盘：每通道独立金额/日限/执行价护栏（通道管理与金额热调见「实盘交易」页）。影子统计 60s 刷新。
+          12 通道全部支持实盘：每通道独立金额/日限/执行价护栏（通道管理与金额热调见「实盘交易」页）。影子统计 60s 刷新。
         </p>
       </div>
     </Card>

@@ -10,7 +10,8 @@
 - 实盘开火闸（2026-08-25 用户要求收窄）：只推送已开启实盘开火的通道。
   resolver 由 main.py 装配 MultiLiveTrader 后注入（读运行时 configs，含
   toggle 热调）；未注入/装配失败 → 一律不推（fail-safe 宁少勿多）。
-  v3a/v3b 不在 LIVE_CHANNELS 白名单 → resolver 恒 False，纯影子永不推送。
+  v3a/v3b 已注册为 LIVE_CHANNELS 可选通道（默认 OFF）：toggle 开启后才推，
+  未开启时 resolver 返回 False 不推。
 
 调用约定：各检测器落表成功后 fire-and-forget（asyncio.create_task）调用，
 与场景信号邮件同模式——SMTP 被防火墙丢包时绝不阻塞检测循环（信号 #1 事故教训）。

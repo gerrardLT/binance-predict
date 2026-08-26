@@ -1,6 +1,6 @@
 """多通道实盘执行器（MultiLiveTrader，2026-08-24 取代单版本 QuoteEdgeLiveTrader）。
 
-10 通道（通道注册表见 live_channels.py）可同时开启，每通道独立
+12 通道（通道注册表见 live_channels.py）可同时开启，每通道独立
 金额/日限/护栏/开关；通道 ID 与影子信号版本名对齐（订单 signal_version
 直接用通道名，实盘 vs 影子对账天然一致）。三族触发机制并存：
 
@@ -9,6 +9,11 @@
    v2 门禁版通过实时 BTC 喂价解锁：chg = (btc − 窗口开盘) / 开盘，
    阈值复用 V2_PRICE_GUARDS（min_drop ≤ −0.10% / max_rise < +0.10%）；
    门禁数据缺失不触发（与影子保守口径一致）。
+   v3 环境门禁版（v3a/v3b）：v2 价格门禁同步通过后派生异步核验任务
+   （前窗 outcome / 当日日高需 DB 查询，不阻塞采样循环），核验通过才下单；
+   前窗未归档（归档相位竞态）延迟重查一次；其余未过/缺失 → 弃单
+   （fired 占位保留，每窗至多一次尝试）。日高并本窗已采样 BTC 时序
+   （采样循环喂入），与影子口径对齐。
 2. x4 族（5m 市场）：轮询 misalignment_signals PENDING x4 信号 → 睡到
    次窗 +150s 决策点（DECISION_T_SEC 同源）→ 真单押 DOWN；
    错过决策点（容差 30s）不追单（与影子 PENDING→EXPIRED 语义一致）。
@@ -44,6 +49,7 @@ from binance_predict.db.engine import async_session_factory
 from binance_predict.db.models import (
     LiveChannelOverride,
     MisalignmentSignal,
+    SentimentWindow,
     TradeOrderModel,
 )
 
@@ -56,7 +62,13 @@ from .live_channels import (
     scene_pattern_to_channel,
 )
 from .misalignment_detector import DECISION_T_SEC
-from .quote_edge_detector import QUOTE_EDGE_RULES, V2_PRICE_GUARDS
+from .quote_edge_detector import (
+    QUOTE_EDGE_RULES,
+    V2_PRICE_GUARDS,
+    V3_ENV_GUARDS,
+    _pass_v3_env_guard,
+    _prev_window_outcome,
+)
 
 X4_VERSIONS = ("x4_v1", "x4_v2")
 SIGNAL_BACKFILL_DELAY_MS = 180_000  # 窗口结束后 180s 回读影子信号（归档+结算已就绪）
@@ -64,6 +76,7 @@ HEAL_INTERVAL_S = 300.0             # signal_id 自愈扫描间隔（重启/延�
 X4_POLL_INTERVAL_S = 30.0           # x4 PENDING 信号轮询间隔
 X4_DECISION_TOLERANCE_MS = 30_000   # 决策点错过容差（超时不追单）
 X4_RECENT_WINDOW_MS = 10 * 60 * 1000  # 只看近期 PENDING（更早的已无意义）
+V3_PREV_RETRY_DELAY_S = 30.0        # 前窗未归档延迟重查（归档在边界+15s，相位抖动余量）
 
 
 class MultiLiveTrader:
@@ -100,12 +113,16 @@ class MultiLiveTrader:
     def check(self, window_start_ms: int, window_end_ms: int,
               ts_ms: int, down_price: float | None,
               btc_price: float | None = None,
-              window_entry_price: float | None = None) -> list[str]:
+              window_entry_price: float | None = None,
+              window_btc_curve: list | None = None) -> list[str]:
         """每次 5m 采样调用一次；返回本轮开火的通道名列表。
 
         纯内存快速路径（不阻塞采样循环）；命中通道派生下单任务。
         v2 门禁需要 btc_price（当前采样 BTC 中间价）与 window_entry_price
         （窗口开盘 BTC 快照），缺失 → v2 通道不触发（fail-safe）。
+        v3 环境门禁需要 window_btc_curve（本窗已采样的 BTC 时序，
+        [{"t": ms, "v": price}, ...]）并入日高口径（与影子对齐）；
+        缺失时回落到更保守口径（仅归档曲线+触发点）。
         """
         if self._stopped or down_price is None:
             return []
@@ -119,23 +136,43 @@ class MultiLiveTrader:
                 continue
             if window_start_ms in cfg.fired:
                 continue
-            # v2 用 base(v1) 冻结区间（V2_PRICE_GUARDS 映射，勿复制数值）
-            rule_key = V2_PRICE_GUARDS[ch][0] if ch in V2_PRICE_GUARDS else ch
+            # v2 用 base(v1) 冻结区间；v3 基于 contrarian v1 区间
+            # （V2_PRICE_GUARDS/V3_ENV_GUARDS 映射，勿复制数值）
+            if ch in V2_PRICE_GUARDS:
+                rule_key = V2_PRICE_GUARDS[ch][0]
+            elif spec.v3_env:
+                rule_key = "quote_contrarian_v1"
+            else:
+                rule_key = ch
             t_lo, t_hi, q_lo, q_hi = QUOTE_EDGE_RULES[rule_key]
             if not (t_lo <= t_rel < t_hi):
                 continue
             if not (q_lo <= float(down_price) < q_hi):
                 continue
-            if spec.v2_guard is not None and not self._pass_live_v2_guard(
-                    ch, btc_price, window_entry_price):
-                continue
+            if spec.v2_guard is not None:
+                # v3 通道的价格门禁同 contrarian_v2（max_rise），阈值勿复制
+                guard_key = "quote_contrarian_v2" if spec.v3_env else ch
+                if not self._pass_live_v2_guard(
+                        guard_key, btc_price, window_entry_price):
+                    continue
             # 命中：立即占位（内存），防同通道同窗后续采样重复派生
             cfg.fired.add(window_start_ms)
-            task = asyncio.create_task(
-                self._fire_quote_edge(ch, window_start_ms, window_end_ms,
-                                      t_rel, float(down_price)),
-                name=f"live_qe_{ch}_{window_start_ms}",
-            )
+            if spec.v3_env:
+                # v3 环境门禁需异步 DB 核验（前窗 outcome / 日高）：
+                # 核验通过才进 _fire_quote_edge，未过/缺失 → 弃单
+                task = asyncio.create_task(
+                    self._verify_v3_env_and_fire(
+                        ch, window_start_ms, window_end_ms, t_rel,
+                        float(down_price), btc_price, int(ts_ms),
+                        window_btc_curve),
+                    name=f"live_qe_{ch}_{window_start_ms}",
+                )
+            else:
+                task = asyncio.create_task(
+                    self._fire_quote_edge(ch, window_start_ms, window_end_ms,
+                                          t_rel, float(down_price)),
+                    name=f"live_qe_{ch}_{window_start_ms}",
+                )
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
             fired.append(ch)
@@ -154,6 +191,109 @@ class MultiLiveTrader:
             return False
         chg_pct = (btc_price - window_entry_price) / window_entry_price * 100.0
         return chg_pct <= threshold if mode == "min_drop" else chg_pct < threshold
+
+    async def _verify_v3_env_and_fire(self, channel: str, window_start: int,
+                                      window_end: int, t_rel: float,
+                                      down_price: float,
+                                      btc_price: float | None,
+                                      quote_ts: int,
+                                      window_btc_curve: list | None = None) -> None:
+        """v3 环境门禁异步核验 → 通过才走常规 quote_edge 下单链路。
+
+        前窗未归档（归档相位竞态：边界后首个采样晚于 +15s 时，archiver
+        本轮会跳过刚关闭窗口）→ 延迟 V3_PREV_RETRY_DELAY_S 重查一次
+        （前窗结算在其结束时已定，延迟重查仍严格 ex-ante）；其余未过
+        原因 → 仅日志弃单（fired 占位已生效，本窗不再重试）；
+        任何异常只告警不抛（采样循环派生任务的共同契约）。
+        """
+        try:
+            passed, reason = await self._check_v3_env(
+                channel, window_start, quote_ts, btc_price, window_btc_curve)
+            if not passed and reason == "prev_not_archived" and not self._stopped:
+                await asyncio.sleep(V3_PREV_RETRY_DELAY_S)
+                if not self._stopped:
+                    passed, reason = await self._check_v3_env(
+                        channel, window_start, quote_ts, btc_price,
+                        window_btc_curve)
+            if not passed:
+                logger.info(
+                    "多通道实盘：{} v3 环境门禁未过，弃单 | 窗口 {} | 原因={}",
+                    channel, _fmt_win(window_start), reason)
+                return
+            await self._fire_quote_edge(channel, window_start, window_end,
+                                        t_rel, down_price)
+        except Exception as exc:
+            logger.warning("多通道实盘：v3 环境核验任务异常 | {} | 窗口 {} | {}",
+                           channel, _fmt_win(window_start), exc)
+
+    async def _pass_live_v3_guard(self, channel: str, window_start_ms: int,
+                                  quote_ts: int, btc_price: float | None,
+                                  window_btc_curve: list | None = None) -> bool:
+        """v3 环境门禁实时版（布尔封装，拒绝原因见 _check_v3_env）。"""
+        passed, _reason = await self._check_v3_env(
+            channel, window_start_ms, quote_ts, btc_price, window_btc_curve)
+        return passed
+
+    async def _check_v3_env(self, channel: str, window_start_ms: int,
+                            quote_ts: int, btc_price: float | None,
+                            window_btc_curve: list | None = None,
+                            ) -> tuple[bool, str]:
+        """v3 环境门禁实时版：前窗 DOWN（交替环境）+ 可选距日高回落≥0.30%。
+
+        返回 (passed, reason)，reason 供日志/重查分流：
+        btc_missing / prev_not_archived / prev_not_down /
+        day_high_missing / env_guard_reject / ok。
+        语义与影子门禁（quote_edge_detector._pass_v3_env_guard）对齐：
+        - 前窗 outcome 查 DB：前窗于边界 +15s 归档，触发时刻（本窗
+          +45~60s）通常已就绪；尚未归档 → prev_not_archived（调用方延迟重查）；
+        - 日高 = 当日已归档曲线 ≤quote_ts 最高价 ∪ 本窗已采样 BTC 时序
+          （window_btc_curve，调用方喂价）∪ 本次实时采样，严格 ex-ante；
+          window_btc_curve 缺失时回落到更保守口径（仅归档+触发点）；
+        - BTC/前窗/日高数据缺失 → 不触发（同影子 fail-safe 保守口径）。
+        """
+        if btc_price is None:
+            return False, "btc_missing"
+        async with async_session_factory() as session:
+            prev = await _prev_window_outcome(session, window_start_ms)
+            if prev is None:
+                return False, "prev_not_archived"
+            if prev != "DOWN":
+                return False, "prev_not_down"
+            if not V3_ENV_GUARDS.get(channel):
+                return True, "ok"
+            day_start = (quote_ts // 86_400_000) * 86_400_000
+            curves = (await session.execute(
+                sa_select(SentimentWindow.curve_btc_price).where(
+                    SentimentWindow.start_time >= day_start,
+                    SentimentWindow.start_time <= window_start_ms,
+                )
+            )).scalars().all()
+        best: float | None = None
+        for curve in curves:
+            for p in curve or []:
+                t, v = p.get("t"), p.get("v")
+                if t is None or v is None:
+                    continue
+                if int(t) <= quote_ts and (best is None or float(v) > best):
+                    best = float(v)
+        # 本窗已采样 BTC 时序 ∪ 触发时刻实时点（与影子「日高含本窗 ≤quote_ts
+        # 采样点」口径对齐；影子侧本窗已归档，实时侧本窗在内存）
+        for p in (window_btc_curve or []):
+            t, v = p.get("t"), p.get("v")
+            if t is None or v is None:
+                continue
+            if int(t) <= quote_ts and (best is None or float(v) > best):
+                best = float(v)
+        if best is None or float(btc_price) > best:
+            best = float(btc_price)
+        if best <= 0:
+            return False, "day_high_missing"
+        # 复用影子门禁纯函数：伪窗口只含触发时刻实时 BTC 点（trig 即 btc_price）
+        if not _pass_v3_env_guard(
+                channel, _LiveBtcPoint(quote_ts, float(btc_price)), quote_ts,
+                prev, best):
+            return False, "env_guard_reject"
+        return True, "ok"
 
     # ------------------------------------------------------------------
     # x4 族：PENDING 信号轮询 → 决策点下单
@@ -696,3 +836,11 @@ class MultiLiveTrader:
 def _fmt_win(window_start_ms: int) -> str:
     return datetime.fromtimestamp(
         window_start_ms / 1000, tz=timezone.utc).strftime("%m-%d %H:%M")
+
+
+class _LiveBtcPoint:
+    """实时触发点伪窗口：只含单个 BTC 采样点，供 _pass_v3_env_guard 复用
+    （trig 取 curve_btc_price 中 ≤quote_ts 的最晚点，即实时 BTC 价本身）。"""
+
+    def __init__(self, ts_ms: int, price: float) -> None:
+        self.curve_btc_price = [{"t": ts_ms, "v": price}]

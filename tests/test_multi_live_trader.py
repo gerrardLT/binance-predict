@@ -142,12 +142,12 @@ def _stub_select_db(monkeypatch, rows: list) -> None:
 # ============================================================
 
 def test_parse_defaults_all_off(monkeypatch) -> None:
-    """默认：全 10 通道 OFF、金额/日限取全局默认（用户拍板 2U / 100 单）。"""
+    """默认：全 12 通道 OFF、金额/日限取全局默认（用户拍板 2U / 100 单）。"""
     monkeypatch.setattr(settings, "live_default_amount_usdt", 2.0)
     monkeypatch.setattr(settings, "live_default_max_daily_orders", 100)
     monkeypatch.setattr(settings, "live_channels_json", "")
     cfgs = parse_channel_config()
-    assert len(cfgs) == 10
+    assert len(cfgs) == 12
     assert all(not c.enabled for c in cfgs.values())
     assert all(c.amount_usdt == 2.0 for c in cfgs.values())
     assert all(c.max_daily_orders == 100 for c in cfgs.values())
@@ -222,10 +222,11 @@ def test_parse_non_int_daily_rejected(monkeypatch) -> None:
 
 
 def test_channels_registry_shape() -> None:
-    """注册表形状：10 通道全集、市场周期/方向/护栏与计划表逐项对齐。"""
+    """注册表形状：12 通道全集、市场周期/方向/护栏与计划表逐项对齐。"""
     assert set(LIVE_CHANNELS) == {
         "quote_momentum_v1", "quote_contrarian_v1",
         "quote_momentum_v2", "quote_contrarian_v2",
+        "quote_contrarian_v3a", "quote_contrarian_v3b",
         "x4_v1", "x4_v2",
         "scene_bull_exhaust", "scene_bull_exhaust_confirm",
         "scene_bear_exhaust", "scene_momentum_fade",
@@ -236,6 +237,15 @@ def test_channels_registry_shape() -> None:
     assert by["quote_contrarian_v1"].auto_max_exec == 0.28
     assert by["quote_momentum_v2"].v2_guard == "min_drop"
     assert by["quote_contrarian_v2"].v2_guard == "max_rise"
+    # v3 环境门禁版：contrarian v1 区间护栏 + v2 价格门禁 + 环境门禁标志
+    for ch in ("quote_contrarian_v3a", "quote_contrarian_v3b"):
+        assert by[ch].family == "quote_edge"
+        assert by[ch].v2_guard == "max_rise"
+        assert by[ch].v3_env is True
+        assert by[ch].auto_max_exec == 0.28
+    assert by["quote_contrarian_v3a"].v3_env is True
+    assert all(not s.v3_env for ch, s in by.items()
+               if ch not in ("quote_contrarian_v3a", "quote_contrarian_v3b"))
     assert by["x4_v1"].auto_max_exec == 0.45
     assert by["x4_v2"].auto_max_exec == 0.50
     assert all(by[ch].market_period == "15m" for ch in
@@ -381,6 +391,193 @@ async def test_v2_gate_blocks_fire_when_rising(monkeypatch) -> None:
         == ["quote_momentum_v1"]
     await _drain(t)
     assert [c["signal_version"] for c in fake.calls] == ["quote_momentum_v1"]
+
+
+# ============================================================
+# 组 3b：v3 环境门禁通道（v3a/v3b，异步环境核验后才下单）
+# ============================================================
+
+def test_v3_blocks_when_v2_gate_missing(monkeypatch) -> None:
+    """v3：BTC 喂价缺失 → v2 价格门禁同步拦截，不派生环境核验任务。"""
+    t = _make_trader(monkeypatch, _FakeTrader(),
+                     channels=["quote_contrarian_v3a", "quote_contrarian_v3b"])
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 50_000, 0.20) == []
+
+
+def test_v3_blocks_when_price_rising(monkeypatch) -> None:
+    """v3：触发时 BTC 已涨 ≥0.10%（max_rise 不含边界）→ 不开火。"""
+    t = _make_trader(monkeypatch, _FakeTrader(),
+                     channels=["quote_contrarian_v3a"])
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 50_000, 0.20,
+                   btc_price=10010.0, window_entry_price=10000.0) == []
+
+
+@pytest.mark.asyncio
+async def test_v3_fire_when_env_gate_passes(monkeypatch) -> None:
+    """v3：区间命中 + 价格门禁过 + 环境核验过 → 真单押 DOWN，护栏 0.28。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["quote_contrarian_v3a"])
+
+    async def _env(self, channel, ws, ts, btc, curve=None):
+        return True, "ok"
+
+    monkeypatch.setattr(MultiLiveTrader, "_check_v3_env", _env)
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 50_000, 0.20,
+                   btc_price=9995.0, window_entry_price=10000.0) \
+        == ["quote_contrarian_v3a"]
+    await _drain(t)
+    call = fake.calls[0]
+    assert call["signal_version"] == "quote_contrarian_v3a"
+    assert call["prediction"] == "DOWN"
+    assert call["max_exec_price"] == 0.28
+    assert call["market_period"] == "5m"
+
+
+@pytest.mark.asyncio
+async def test_v3_env_gate_failure_aborts(monkeypatch) -> None:
+    """v3：环境核验未过 → 弃单；fired 占位保留，同窗不重派。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["quote_contrarian_v3b"])
+
+    async def _env(self, channel, ws, ts, btc, curve=None):
+        return False, "env_guard_reject"
+
+    monkeypatch.setattr(MultiLiveTrader, "_check_v3_env", _env)
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 50_000, 0.20,
+                   btc_price=9995.0, window_entry_price=10000.0) \
+        == ["quote_contrarian_v3b"]   # 同步预检已过，派生核验任务
+    await _drain(t)
+    assert fake.calls == []            # 核验未过 → 弃单
+    # 同窗后续采样不再派生（fired 占位已生效）
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 55_000, 0.21,
+                   btc_price=9995.0, window_entry_price=10000.0) == []
+
+
+@pytest.mark.asyncio
+async def test_v3_prev_not_archived_retry(monkeypatch) -> None:
+    """v3：前窗未归档（归档相位竞态）→ 延迟重查一次；第二次仍未过 → 弃单。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["quote_contrarian_v3a"])
+    calls: list[str] = []
+
+    async def _env(self, channel, ws, ts, btc, curve=None):
+        calls.append(channel)
+        return False, "prev_not_archived"
+
+    monkeypatch.setattr(MultiLiveTrader, "_check_v3_env", _env)
+    monkeypatch.setattr(milt, "V3_PREV_RETRY_DELAY_S", 0.0)  # 免等待
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 50_000, 0.20,
+                   btc_price=9995.0, window_entry_price=10000.0) \
+        == ["quote_contrarian_v3a"]
+    await _drain(t)
+    assert len(calls) == 2             # 首查 + 延迟重查一次
+    assert fake.calls == []            # 重查仍未归档 → 弃单
+
+
+@pytest.mark.asyncio
+async def test_v3_prev_retry_then_fire(monkeypatch) -> None:
+    """v3：首查 prev_not_archived → 重查通过 → 下单（归档追上的正常路径）。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["quote_contrarian_v3a"])
+    attempts = {"n": 0}
+
+    async def _env(self, channel, ws, ts, btc, curve=None):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            return False, "prev_not_archived"
+        return True, "ok"
+
+    monkeypatch.setattr(MultiLiveTrader, "_check_v3_env", _env)
+    monkeypatch.setattr(milt, "V3_PREV_RETRY_DELAY_S", 0.0)
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 50_000, 0.20,
+                   btc_price=9995.0, window_entry_price=10000.0) \
+        == ["quote_contrarian_v3a"]
+    await _drain(t)
+    assert attempts["n"] == 2
+    assert [c["signal_version"] for c in fake.calls] == ["quote_contrarian_v3a"]
+
+
+class _V3EnvSession:
+    """_check_v3_env 日高曲线查询会话桩（execute → 预设曲线列表）。
+
+    前窗 outcome 已由 monkeypatch 的 _prev_window_outcome 接管，
+    会话内实际只有日高曲线一次 execute。"""
+
+    def __init__(self, curves: list) -> None:
+        self._curves = curves
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def execute(self, stmt):
+        res = MagicMock()
+        res.scalars.return_value.all.return_value = self._curves
+        return res
+
+
+@pytest.mark.asyncio
+async def test_check_v3_env_branches(monkeypatch) -> None:
+    """v3 实时环境门禁分支：BTC 缺失/前窗未归档/前窗 UP 各自拒；
+    v3a 前窗过即通过；v3b 需距日高回落≤−0.30%（含边界）；
+    本窗喂价时序计入日高（W1 对齐影子口径）。"""
+    t = _make_trader(monkeypatch, _FakeTrader())
+    ts = WINDOW_START + 50_000
+    prev_holder = {"v": "DOWN"}
+
+    async def _prev(session, ws):
+        return prev_holder["v"]
+
+    monkeypatch.setattr(milt, "_prev_window_outcome", _prev)
+    # 当日已归档曲线：日高 10000（t ≤ quote_ts，ex-ante）
+    curves = [[{"t": WINDOW_START - 120_000, "v": 10000.0}]]
+    monkeypatch.setattr(milt, "async_session_factory",
+                        lambda: _V3EnvSession(curves))
+
+    # BTC 缺失 → btc_missing
+    assert await t._check_v3_env(
+        "quote_contrarian_v3a", WINDOW_START, ts, None) \
+        == (False, "btc_missing")
+    # 前窗未归档 → prev_not_archived（调用方延迟重查）
+    prev_holder["v"] = None
+    assert await t._check_v3_env(
+        "quote_contrarian_v3a", WINDOW_START, ts, 9995.0) \
+        == (False, "prev_not_archived")
+    # 前窗 UP → prev_not_down（交替环境不成立）
+    prev_holder["v"] = "UP"
+    assert await t._check_v3_env(
+        "quote_contrarian_v3a", WINDOW_START, ts, 9995.0) \
+        == (False, "prev_not_down")
+    prev_holder["v"] = "DOWN"
+    # v3a：前窗 DOWN 即通过（无日高要求）
+    assert await t._check_v3_env(
+        "quote_contrarian_v3a", WINDOW_START, ts, 9995.0) == (True, "ok")
+    # v3b：btc 9970 → 恰 −0.30% 含边界过；9975 → −0.25% 不过
+    assert await t._check_v3_env(
+        "quote_contrarian_v3b", WINDOW_START, ts, 9970.0) == (True, "ok")
+    assert await t._check_v3_env(
+        "quote_contrarian_v3b", WINDOW_START, ts, 9975.0) \
+        == (False, "env_guard_reject")
+    # W1：本窗喂价时序中的高点 10010 计入日高 → 9975 也过
+    # （回落 −0.35% ≥ 0.30%；无喂价时按归档日高 10000 会被拒）
+    assert await t._check_v3_env(
+        "quote_contrarian_v3b", WINDOW_START, ts, 9975.0,
+        window_btc_curve=[{"t": WINDOW_START + 20_000, "v": 10010.0}]) \
+        == (True, "ok")
+    # 喂价中 quote_ts 之后的点不计入（ex-ante）
+    assert await t._check_v3_env(
+        "quote_contrarian_v3b", WINDOW_START, ts, 9975.0,
+        window_btc_curve=[{"t": ts + 1000, "v": 10010.0}]) \
+        == (False, "env_guard_reject")
+    # 日高缺失（当日无归档曲线+无喂价）→ 回落触发点自保：
+    # 触发点即日高，距自身回落 0 < 0.30% → v3b 拒（保守口径）
+    monkeypatch.setattr(milt, "async_session_factory",
+                        lambda: _V3EnvSession([]))
+    assert await t._check_v3_env(
+        "quote_contrarian_v3b", WINDOW_START, ts, 9970.0) \
+        == (False, "env_guard_reject")
 
 
 # ============================================================
@@ -701,14 +898,14 @@ def test_set_channel_daily_over_cap_rejected(monkeypatch) -> None:
 
 
 def test_status_shape(monkeypatch) -> None:
-    """status：10 通道全量、enabled_any/defaults/amount_cap、单通道字段。"""
+    """status：12 通道全量、enabled_any/defaults/amount_cap、单通道字段。"""
     t = _make_trader(monkeypatch, _FakeTrader(), channels=["quote_contrarian_v1"])
     s = t.status()
     assert s["enabled_any"] is True
     assert s["amount_cap"] == 50
     assert s["defaults"]["amount_usdt"] == 2.0
     assert s["defaults"]["max_daily_orders"] == 100
-    assert len(s["channels"]) == 10
+    assert len(s["channels"]) == 12
     by = {c["channel"]: c for c in s["channels"]}
     c = by["quote_contrarian_v1"]
     assert c["enabled"] is True and c["enabled_at_startup"] is True

@@ -13,7 +13,8 @@
         裸条件（两轮 30+ 假设 OOS 全灭，无可信约束）。
 
 影子纪律（M4 同款）：只记录不下注、不占风控配额。邮件推送（2026-08-25）：
-仅实时新信号且对应通道已开启实盘开火才推（v3a/v3b 不在实盘白名单永不推），
+仅实时新信号且对应通道已开启实盘开火才推（v3a/v3b 已注册为可选实盘通道，
+toggle 开启后才推；未开启时 resolver 恒 False 不推），
 新鲜度闸自动静默回补/重扫；总开关 signal_push_email_enabled，全局日限防轰炸。
 数据流（归档后处理，区别于 X4 的次窗结算）：
     1. 每 60s 轮询新归档 SentimentWindow；
@@ -38,7 +39,9 @@ v3 环境门禁版（2026-08-24 交替/延续归因落地，只加不改；v1/v2
     处理按 end_time 升序，当日更晚窗口未归档，天然无未来函数；检测器内维护当日
     running high 增量缓存（按 UTC 日重置，乱序窗口触发失效），避免每笔全天曲线回读。
     环境数据缺失（前窗未归档/日高缺失）→ 不落 v3（保守跳过，v1/v2 不受影响）。
-    纪律：纯影子（只记录不下注），前向攒 ≥100 笔且 Wilson 下界过线才谈实盘。
+    实盘接入（2026-08-26 用户要求）：v3a/v3b 已注册为 LIVE_CHANNELS 可选通道
+    （toggle 选择性开启；实时环境门禁核验见 MultiLiveTrader._pass_live_v3_guard），
+    检测器侧仍只负责影子落表，实盘开火由 MultiLiveTrader 独立驱动。
 
 深夜时段变体（2026-08-26 落地，只加不改；v1/v2/v3 冻结口径原样）：
     late_night_contrarian_v1 = 北京时间 22~24 时开窗 ∩ t∈[45,90)s DOWN 报价
@@ -455,8 +458,8 @@ class QuoteEdgeDetector:
                         _ev_at_entry(win, price),
                     )
                     # 邮件推送（fire-and-forget）：仅实时新信号且该通道已开
-                    # 实盘开火；回补/重扫被新鲜度闸静默，v3a/v3b 不在实盘
-                    # 白名单永不推。
+                    # 实盘开火；回补/重扫被新鲜度闸静默，v3a/v3b 需 toggle
+                    # 开启后才推（未开启 resolver 恒 False）。
                     if is_fresh_signal(end_ms) and is_live_enabled(version):
                         win_str = "赢" if win else "输"
                         fire_signal_email(

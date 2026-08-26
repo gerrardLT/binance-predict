@@ -220,7 +220,7 @@ async def test_analytics_regime_split_and_daily() -> None:
 
 @pytest.mark.asyncio
 async def test_analytics_empty_db() -> None:
-    """空数据：结构完整不崩溃（v2/v3 门禁版部署即入面板，bench=None）。"""
+    """空数据：结构完整不崩溃（v2/v3 门禁版部署即入面板，bench=真实回测基准）。"""
     import binance_predict.main as m
 
     db = _make_db([], [])
@@ -235,8 +235,9 @@ async def test_analytics_empty_db() -> None:
         assert blk["summary"]["n"] == 0
         assert blk["summary"]["win_rate"] is None
         assert blk["curve"] == []
-    # v2 无回测基准（None 透传，面板只看影子实测）
-    assert out["shadow"]["x4_v2"]["summary"]["bench_winrate"] is None
+    # v2/v3 门禁版基准 = 2026-08-26 真实数据回测（local_shadow_v2v3_real_backtest.py）
+    assert out["shadow"]["x4_v2"]["summary"]["bench_winrate"] == 0.553
+    assert out["shadow"]["quote_contrarian_v3b"]["summary"]["bench_ev"] == 0.646
     assert out["shadow"]["quote_momentum_v2"]["summary"]["desc"].startswith("顺势v2")
     # 深夜变体：K 线代理回测只钉胜率基准，EV 基准因溢价口径差异留 None
     ln = out["shadow"]["late_night_contrarian_v1"]["summary"]
