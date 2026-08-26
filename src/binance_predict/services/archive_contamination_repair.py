@@ -53,8 +53,13 @@ QUOTE_EDGE_VERSIONS = (
     "quote_momentum_v2", "quote_contrarian_v2",
     "quote_contrarian_v3a", "quote_contrarian_v3b",
     "late_night_contrarian_v1",  # 深夜时段变体（无跨窗依赖，与 v1/v2 同等待遇）
+    "late_night_contrarian_v2",  # 深夜门禁 v2（有日高跨窗依赖，归入 QE_DAY_HIGH_VERSIONS）
 )
+# 仅作版本族语义分组保留；后续窗删除口径已迁移至 QE_DAY_HIGH_VERSIONS（2026-08-27：
+# v3a 无日高跨窗依赖，重建后存量行仍有效，不再参与删除重落）
 QE_V3_VERSIONS = ("quote_contrarian_v3a", "quote_contrarian_v3b")
+# 日高跨窗依赖版本（重建窗同日后续窗需删除重落）：v3b + 深夜门禁 v2（2026-08-27 只加不改）
+QE_DAY_HIGH_VERSIONS = ("quote_contrarian_v3b", "late_night_contrarian_v2")
 X4_VERSIONS = ("x4_v1", "x4_v2")
 
 
@@ -148,12 +153,12 @@ def quote_edge_affected_starts(contaminated: set[int]) -> set[int]:
 
 
 def qe_v3_successor_starts(rebuilt_starts: set[int]) -> set[int]:
-    """v3b 跨窗依赖重扫集：重建窗同一 UTC 日的全部后续窗（不含重建窗自身）。
+    """日高跨窗依赖重扫集：重建窗同一 UTC 日的全部后续窗（不含重建窗自身）。
 
-    v3b 日高读取当日 ≤本窗的全部已归档窗 BTC 曲线：污染窗重建后，同日
-    后续窗的 v3b 判定基准全部变化，其存量 v3 行基于重建前的脏曲线，
+    日高依赖版本（v3b / 深夜门禁 v2）读取当日 ≤本窗的全部已归档窗 BTC 曲线：
+    污染窗重建后，同日后续窗的判定基准全部变化，其存量行基于重建前的脏曲线，
     必须删除后按干净曲线重落。仅对成功重建的窗展开（跳过窗曲线仍脏，
-    重扫无意义）；v1/v2 无跨窗依赖不受影响。升序重扫天然保证日高口径一致。
+    重扫无意义）；无跨窗依赖版本不受影响。升序重扫天然保证日高口径一致。
     """
     out: set[int] = set()
     for c in rebuilt_starts:
@@ -185,7 +190,7 @@ async def _delete_affected_signals(contaminated: set[int],
                                   v3_successors: set[int]) -> dict:
     """删除受影响信号；先置空订单 signal_id 防悬挂（heal 扫描会重新关联）。
 
-    v3_successors：重建窗同日后续窗，只删 v3 版本行（v1/v2 无跨窗依赖）。
+    v3_successors：重建窗同日后续窗，只删日高依赖版本行（无跨窗依赖版本不删）。
     """
     qe_starts = quote_edge_affected_starts(contaminated)
     x4_starts = x4_affected_condition_values(contaminated)
@@ -201,7 +206,7 @@ async def _delete_affected_signals(contaminated: set[int],
         )).scalars().all()
         v3_succ_ids = (await session.execute(
             sa_select(MisalignmentSignal.id).where(
-                MisalignmentSignal.version.in_(QE_V3_VERSIONS),
+                MisalignmentSignal.version.in_(QE_DAY_HIGH_VERSIONS),
                 MisalignmentSignal.window_start.in_(v3_successors),
             )
         )).scalars().all() if v3_successors else []
@@ -273,7 +278,7 @@ async def repair_contaminated_archives() -> dict:
     # 其信号同样不可信，一并删除避免虚高 EV 继续计入统计）---
     contaminated_starts = {int(w.start_time) for w in contaminated_wins}
     rebuilt_starts = {int(w.start_time) for w in rebuilt_wins}
-    # v3b 跨窗依赖：重建窗同日后续窗的 v3 行基于重建前脏曲线，一并删除重落
+    # v3b/深夜门禁 v2 跨窗依赖：重建窗同日后续窗的日高依赖行基于重建前脏曲线，一并删除重落
     v3_successors = qe_v3_successor_starts(rebuilt_starts) - contaminated_starts
     deleted = await _delete_affected_signals(contaminated_starts, v3_successors)
     stats["deleted_quote_edge"] = deleted["quote_edge"]
@@ -287,9 +292,9 @@ async def repair_contaminated_archives() -> dict:
     from .quote_edge_detector import QuoteEdgeDetector
 
     by_start = {int(w.start_time): w for w in rebuilt_wins}
-    # quote_edge 重扫集 = 重建窗 ∪ v3 同日后续窗（后者从 DB 加载，
-    # 可能不存在/缺口）；升序处理保证 v3b 日高口径与实时路径一致，
-    # 后续窗已有的 v1/v2 行由 dup 查重跳过，只补 v3 行。
+    # quote_edge 重扫集 = 重建窗 ∪ 日高依赖同日后续窗（后者从 DB 加载，
+    # 可能不存在/缺口）；升序处理保证日高口径与实时路径一致，
+    # 后续窗已有的无跨窗依赖行由 dup 查重跳过，只补日高依赖行。
     qe_detector = QuoteEdgeDetector()
     missing_succ = sorted(s for s in v3_successors if s not in by_start)
     if missing_succ:

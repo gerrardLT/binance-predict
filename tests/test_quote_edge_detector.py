@@ -3,7 +3,8 @@
 覆盖：首个命中点查找（时点/报价区间/乱序/首中优先）、EV 公式、
 UP 对照价不含未来、outcome 判定、_process_window 落表（fake session）、
 v2 价格门禁（触发时点 BTC vs 窗口开盘；数据缺失/门禁未过只落 v1）、
-v3 环境门禁（前窗 DOWN + 可选距日高回落；缺失/未过只落 v1/v2）。
+v3 环境门禁（前窗 DOWN + 可选距日高回落；缺失/未过只落 v1/v2）、
+深夜门禁 v2（v1+距日高回落≥0.30%；日高缓存分族；缺失/未过只落 v1）。
 
 不触网络/真实 DB：async_session_factory 用 fake session 替身。
 """
@@ -159,8 +160,9 @@ def test_pass_v2_price_guard_ex_ante() -> None:
 # ============================================================
 
 class _FakeResult:
-    def __init__(self, first_val):
+    def __init__(self, first_val, scalars=None):
         self._first = first_val
+        self._scalars = scalars if scalars is not None else []
 
     def first(self):
         return self._first
@@ -169,16 +171,21 @@ class _FakeResult:
         return None  # v3 环境查询：前窗未归档 → 环境门禁拒（v3 不落）
 
     def scalars(self):
-        # v3b 日高查询：无曲线 → 日高缺失（环境门禁拒）
-        return SimpleNamespace(all=lambda: [])
+        # 日高查询：默认无曲线 → 日高缺失（日高门禁保守拒）
+        return SimpleNamespace(all=lambda: self._scalars)
 
 
 class _FakeSession:
-    """最小替身：dup 查重返回固定值，add/commit/rollback 全记录。"""
+    """最小替身：dup 查重返回固定值，add/commit/rollback 全记录。
 
-    def __init__(self, dup_first=None):
+    day_high_curves 非空时，日高查询（curve_btc_price 列）返回指定曲线，
+    供深夜门禁 v2 过门禁用例使用；默认空曲线 → 日高缺失 → 门禁保守拒。
+    """
+
+    def __init__(self, dup_first=None, day_high_curves=()):
         self.added: list = []
         self._dup_first = dup_first
+        self._curves = day_high_curves
 
     async def __aenter__(self):
         return self
@@ -187,6 +194,9 @@ class _FakeSession:
         return False
 
     async def execute(self, stmt):
+        keys = {getattr(c, "key", None) for c in stmt.selected_columns}
+        if "curve_btc_price" in keys:
+            return _FakeResult(self._dup_first, scalars=list(self._curves))
         return _FakeResult(self._dup_first)
 
     def add(self, obj):
@@ -199,8 +209,9 @@ class _FakeSession:
         pass
 
 
-def _make_detector(monkeypatch, dup_first=None) -> tuple[QuoteEdgeDetector, _FakeSession]:
-    session = _FakeSession(dup_first=dup_first)
+def _make_detector(monkeypatch, dup_first=None,
+                   day_high_curves=()) -> tuple[QuoteEdgeDetector, _FakeSession]:
+    session = _FakeSession(dup_first=dup_first, day_high_curves=day_high_curves)
 
     def _factory():
         return session
@@ -661,3 +672,126 @@ async def test_late_night_does_not_affect_other_rules(monkeypatch) -> None:
     )
     await d._process_window(w)
     assert [s.version for s in session.added] == ["quote_momentum_v1"]
+
+
+# ============================================================
+# 深夜门禁 v2（late_night_contrarian_v2：v1 ∩ 触发时点距日高回落≥0.30%，含边界）
+# ============================================================
+
+LN_V2_VERSION = "late_night_contrarian_v2"
+
+
+def _late_night_v2_window(start_ms: int, trig_btc: float = 99.6) -> SentimentWindow:
+    """late_night 命中窗（t=+60s q=0.27）+ 触发时点 BTC 曲线（门禁取价源）。"""
+    return SentimentWindow(
+        start_time=start_ms, end_time=start_ms + 300_000,
+        actual_return=-0.001, outcome="DOWN",
+        curve_down_price=[{"t": start_ms + 60_000, "v": 0.27}],
+        curve_btc_price=[{"t": start_ms + 60_000, "v": trig_btc}],
+    )
+
+
+def test_pass_dd_guard_boundary_and_missing() -> None:
+    """距日高回落达阈过（含边界）；不足/数据缺失 → 拒（保守不落）。"""
+    w = SimpleNamespace(curve_btc_price=[{"t": 100_000, "v": 99.70}])
+    # 日高 100.0 → dd ≈ −0.30%；回落 −0.40% 达阈 → 过（含边界不歧义段）
+    w_deep = SimpleNamespace(curve_btc_price=[{"t": 100_000, "v": 99.60}])
+    assert qed._pass_dd_guard(LN_V2_VERSION, w_deep, 100_000, 100.0) is True
+    # 日高 99.90 → dd ≈ −0.20% 不足 → 拒；日高 99.80 → dd ≈ −0.10% → 拒
+    assert qed._pass_dd_guard(LN_V2_VERSION, w, 100_000, 99.90) is False
+    assert qed._pass_dd_guard(LN_V2_VERSION, w, 100_000, 99.80) is False
+    # 日高缺失 / 触发价缺失（无曲线）/ 日高非正 → 拒（保守不落表）
+    assert qed._pass_dd_guard(LN_V2_VERSION, w, 100_000, None) is False
+    assert qed._pass_dd_guard(LN_V2_VERSION, SimpleNamespace(curve_btc_price=None),
+                              100_000, 100.0) is False
+    assert qed._pass_dd_guard(LN_V2_VERSION, w, 100_000, 0.0) is False
+
+
+def test_pass_dd_guard_boundary_inclusive(monkeypatch) -> None:
+    """含边界语义钉死（同 v3b 边界测试）：dd 恰等于阈值 → 过；阈值收紧一线 → 拒。"""
+    w = SimpleNamespace(curve_btc_price=[{"t": 100_000, "v": 99.70}])
+    high = 100.0
+    dd = (99.70 - high) / high * 100.0       # 实际回落 ≈ −0.30%
+    guards = dict(qed.LN_DD_GUARDS)
+    monkeypatch.setitem(qed.LN_DD_GUARDS, LN_V2_VERSION,
+                        ("late_night_contrarian_v1", dd))
+    assert qed._pass_dd_guard(LN_V2_VERSION, w, 100_000, high) is True
+    monkeypatch.setitem(qed.LN_DD_GUARDS, LN_V2_VERSION,
+                        ("late_night_contrarian_v1", dd - 1e-9))
+    assert qed._pass_dd_guard(LN_V2_VERSION, w, 100_000, high) is False
+    qed.LN_DD_GUARDS.update(guards)  # 双保险：monkeypatch 退出后自恢复
+
+
+def test_pass_dd_guard_ex_ante() -> None:
+    """门禁取价不含未来：触发点后的高点不参与（无未来函数）。"""
+    w = SimpleNamespace(curve_btc_price=[
+        {"t": 50_000, "v": 99.9}, {"t": 200_000, "v": 95.0}])
+    # 触发点 100s：≤100s 最晚点是 99.9；日高 100.0 → dd=−0.10% 不足 → 拒
+    assert qed._pass_dd_guard(LN_V2_VERSION, w, 100_000, 100.0) is False
+
+
+@pytest.mark.asyncio
+async def test_late_night_v2_gate_pass_dual_insert(monkeypatch) -> None:
+    """触发时点距日高回落 −0.40%（≥0.30%）→ v1+v2 双落，字段同源同口径。"""
+    start = _bjt_start_ms(22, 30)
+    d, session = _make_detector(
+        monkeypatch,
+        day_high_curves=[[{"t": start, "v": 100.0}]])   # 日高 100.0（≤触发时点）
+    await d._process_window(_late_night_v2_window(start, trig_btc=99.6))
+    versions = sorted(s.version for s in session.added)
+    assert versions == [LN_VERSION, LN_V2_VERSION]
+    v2 = next(s for s in session.added if s.version == LN_V2_VERSION)
+    assert v2.entry_down_price == 0.27 and v2.end_pct == 0.27
+    assert v2.entry_quote_ts == start + 60_000
+    assert v2.win is True and v2.status == "SETTLED"
+    assert v2.ev_at_entry == pytest.approx(0.98 / 0.27 - 1.0)  # 与 v1 同口径（无溢价）
+    assert v2.direction == "DOWN" and v2.target_window_start == start
+
+
+@pytest.mark.asyncio
+async def test_late_night_v2_gate_fail_only_v1(monkeypatch) -> None:
+    """回落仅 −0.05%（未过门禁）→ v2 拒，只落 v1（v1 不受影响）。"""
+    start = _bjt_start_ms(22, 30)
+    d, session = _make_detector(
+        monkeypatch,
+        day_high_curves=[[{"t": start, "v": 99.65}]])    # 日高 99.65 → dd≈−0.05%
+    await d._process_window(_late_night_v2_window(start, trig_btc=99.6))
+    assert [s.version for s in session.added] == [LN_VERSION]
+
+
+@pytest.mark.asyncio
+async def test_late_night_v2_missing_data_only_v1(monkeypatch) -> None:
+    """门禁数据缺失（无 BTC 曲线 / 日高无）→ v2 保守不落，v1 照常。"""
+    start = _bjt_start_ms(23, 0)
+    # 无 curve_btc_price：触发价缺失；日高查询空曲线：日高缺失 → 双拒
+    d, session = _make_detector(monkeypatch)
+    await d._process_window(_late_night_window(start))
+    assert [s.version for s in session.added] == [LN_VERSION]
+
+
+@pytest.mark.asyncio
+async def test_late_night_v2_hour_gate_applies(monkeypatch) -> None:
+    """v2 同样受时段门禁：北京 21:55 开窗 → v1/v2 都不落。"""
+    assert qed._pass_hour_guard(LN_V2_VERSION, _bjt_start_ms(22, 0)) is True
+    assert qed._pass_hour_guard(LN_V2_VERSION, _bjt_start_ms(21, 55)) is False
+    start = _bjt_start_ms(21, 55)
+    d, session = _make_detector(
+        monkeypatch,
+        day_high_curves=[[{"t": start, "v": 100.0}]])
+    await d._process_window(_late_night_v2_window(start, trig_btc=99.6))
+    assert session.added == []  # 时段门禁拦在日高查询之前（无多余 DB 往返）
+
+
+@pytest.mark.asyncio
+async def test_day_high_cache_family_isolation() -> None:
+    """日高缓存按族隔离：v3 族推进水位不影响 ln 族首次查询的日界下界。"""
+    w = _contra_v3_window(start_ms=86_400_000)
+    ts = int(w.start_time) + 50_000
+    d = QuoteEdgeDetector()
+    s_v3 = _EnvSession(day_high_curves=[[{"t": ts - 50_000, "v": 102.0}]],
+                       expect_day_start=86_400_000, expect_max_start=int(w.start_time))
+    assert await d._day_high_btc(s_v3, w, ts, cache_key="v3") == 102.0
+    # ln 族首次查询：下界仍是 UTC 日界（未受 v3 族水位推进污染）
+    s_ln = _EnvSession(day_high_curves=[[{"t": ts - 50_000, "v": 101.0}]],
+                       expect_day_start=86_400_000, expect_max_start=int(w.start_time))
+    assert await d._day_high_btc(s_ln, w, ts, cache_key="ln") == 101.0

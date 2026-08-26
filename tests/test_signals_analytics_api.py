@@ -230,7 +230,7 @@ async def test_analytics_empty_db() -> None:
         "x4_v1", "quote_momentum_v1", "quote_contrarian_v1",
         "x4_v2", "quote_momentum_v2", "quote_contrarian_v2",
         "quote_contrarian_v3a", "quote_contrarian_v3b",
-        "late_night_contrarian_v1"}
+        "late_night_contrarian_v1", "late_night_contrarian_v2"}
     for v, blk in out["shadow"].items():
         assert blk["summary"]["n"] == 0
         assert blk["summary"]["win_rate"] is None
@@ -243,6 +243,10 @@ async def test_analytics_empty_db() -> None:
     ln = out["shadow"]["late_night_contrarian_v1"]["summary"]
     assert ln["bench_winrate"] == 0.347 and ln["bench_ev"] is None
     assert ln["desc"].startswith("深夜逆势v1")
+    # 深夜门禁 v2：线上情绪窗重放 OOS 只钉胜率基准，EV 基准留 None（口径不直比）
+    ln2 = out["shadow"]["late_night_contrarian_v2"]["summary"]
+    assert ln2["bench_winrate"] == 0.440 and ln2["bench_ev"] is None
+    assert ln2["desc"].startswith("深夜逆势v2")
     assert out["scene"] == {}
     assert out["regime"]["phases"] == {}
     assert out["regime"]["by_version"] == {}

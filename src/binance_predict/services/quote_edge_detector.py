@@ -52,6 +52,15 @@ v3 环境门禁版（2026-08-24 交替/延续归因落地，只加不改；v1/v2
     时段门禁按窗口 start_time 的北京时间 hour ∈[22,24)；未注册门禁的版本不受影响。
     纪律：纯影子前向攒样本，核对真实触发分布与 K 线代理回测一致后才谈实盘接入。
 
+深夜门禁 v2（2026-08-27 F1 候选落地，只加不改；v1 冻结口径原样）：
+    late_night_contrarian_v2 = v1 ∩ 触发时点距当日高点回落≥0.30%（含边界，
+    dd_pct ≤ −0.30，与 v3b 距日高门禁同口径，数据源/无未来函数约束一致）。
+    依据（F1 优化发现）：线上情绪窗重放 OOS n=50 胜率 44.0% CI[31.2%,57.7%]
+    不含盈亏平衡线（≈27%）；被门禁剔除段（droph>−0.30）IS wr 0.140、EV 为负，
+    增益全部来自剔除亏损段。门禁数据缺失 → 不落 v2（保守跳过，v1 不受影响）。
+    日高增量缓存与 v3b 分族（cache_key 隔离）：同窗两族触发时点不同，
+    共缓存会互相污染 ≤quote_ts 过滤口径。纪律：纯影子，前向攒样本。
+
 字段语义映射（复用 misalignment_signals 表）：
     end_pct → 触发时刻 DOWN 报价（X4 语义"触发窗末 UP%"的扩展，注释在案）；
     target_window_start → window_start（本窗即目标窗，无次窗）；
@@ -82,6 +91,8 @@ QUOTE_EDGE_RULES: dict[str, tuple[float, float, float, float]] = {
     "quote_contrarian_v1": (45.0, 60.0, 0.15, 0.25),
     # 深夜时段变体：报价带相邻 contrarian_v1 上移；时段门禁见 HOUR_GUARDS。
     "late_night_contrarian_v1": (45.0, 90.0, 0.25, 0.30),
+    # 深夜门禁 v2：与 v1 同触发区间（门禁定义见 LN_DD_GUARDS，只加不改）。
+    "late_night_contrarian_v2": (45.0, 90.0, 0.25, 0.30),
 }
 FEE_RET = 0.98            # EV = 赢 0.98/q−1 / 输 −1（费 2%，无溢价，回测口径）
 POLL_INTERVAL = 60.0      # 轮询间隔（秒）
@@ -92,6 +103,14 @@ BACKSCAN_WINDOWS = 12     # 冷启动回补窗口数（1 小时）
 # 固定偏移无夏令时，直接位移计算）。未注册的版本 → 门禁恒过（存量规则不受影响）。
 HOUR_GUARDS: dict[str, tuple[int, int]] = {
     "late_night_contrarian_v1": (22, 24),
+    "late_night_contrarian_v2": (22, 24),
+}
+
+# ---- 深夜门禁 v2（2026-08-27 F1 候选落地，只加不改；v1 冻结口径原样）----
+# version -> (base 规则, 距日高回落阈值%)：触发时点距当日高点回落≥阈值（含边界）。
+# 门禁数据缺失（curve_btc_price/日高无）→ 不落 v2（保守跳过，v1 不受影响）。
+LN_DD_GUARDS: dict[str, tuple[str, float]] = {
+    "late_night_contrarian_v2": ("late_night_contrarian_v1", -0.30),
 }
 
 # ---- v2 价格门禁（2026-08-22 5m 粒度归因落地，只加不改；触发区间与 v1 完全相同）----
@@ -238,6 +257,21 @@ def _pass_v3_env_guard(version: str, w: SentimentWindow, quote_ts: int,
     return dd_pct <= V3_DD_THRESHOLD
 
 
+def _pass_dd_guard(version: str, w: SentimentWindow, quote_ts: int,
+                   day_high: float | None) -> bool:
+    """深夜门禁 v2 距日高门禁（纯函数）：触发时点距当日高点回落≥阈值（含边界）。
+
+    day_high 由调用方预查（_day_high_btc，cache_key 分族）；
+    缺失（None）→ False（保守不落表，与 v2 价格门禁 None 语义等效）。
+    """
+    threshold = LN_DD_GUARDS[version][1]
+    trig = _up_price_at_or_before(getattr(w, "curve_btc_price", None), quote_ts)
+    if trig is None or day_high is None or day_high <= 0:
+        return False
+    dd_pct = (trig - day_high) / day_high * 100.0
+    return dd_pct <= threshold
+
+
 def _ev_at_entry(win: bool, price: float) -> float:
     """单注 EV（回测口径，无溢价）：赢 0.98/q−1 / 输 −1。"""
     return (FEE_RET / price - 1.0) if win else -1.0
@@ -254,11 +288,11 @@ class QuoteEdgeDetector:
         self._task: asyncio.Task | None = None
         self._last_window_end: int | None = None  # 已处理过的最大窗口 end_time
         self._trigger_count = 0
-        # v3b 日高增量缓存：(UTC 日序号, running high, 已并入的最大 window_start)。
-        # 窗口按 end_time 升序处理时增量生效；乱序窗口（如污染重扫）触发重置。
-        self._dh_day: int | None = None
-        self._dh_high: float | None = None
-        self._dh_covered: int = -1
+        # 日高增量缓存（按族隔离）：cache_key -> (UTC 日序号, running high, 已并入的
+        # 最大 window_start)。v3b 与 late_night v2 同窗触发时点不同，共缓存会互相
+        # 污染 ≤quote_ts 过滤口径，故分族。窗口按 end_time 升序处理时增量生效；
+        # 乱序窗口（如污染重扫）触发重置。
+        self._dh_caches: dict[str, tuple[int, float | None, int]] = {}
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -275,13 +309,14 @@ class QuoteEdgeDetector:
         self._task = asyncio.create_task(self._loop(), name="quote_edge_detector")
         logger.info(
             "报价 edge 影子检测器启动 | v1 规则 {} + v2 价格门禁版 {} + v3 环境门禁版 {}"
-            " + 时段门禁 {} | EV=0.98/q−1（费 2%，影子模式只记录不下注）",
+            " + 时段门禁 {} + 深夜距日高门禁 {} | EV=0.98/q−1（费 2%，影子模式只记录不下注）",
             {k: f"t∈[{v[0]:.0f},{v[1]:.0f})s q∈[{v[2]:.2f},{v[3]:.2f})"
              for k, v in QUOTE_EDGE_RULES.items()},
             {k: f"{m}{p:+.2f}%" for k, (_b, m, p) in V2_PRICE_GUARDS.items()},
             {k: ("前窗DOWN" + ("+距日高≥0.30%(含边界)" if dd else ""))
              for k, dd in V3_ENV_GUARDS.items()},
             {k: f"北京{lo}~{hi}时" for k, (lo, hi) in HOUR_GUARDS.items()},
+            {k: f"{b}+距日高≥{abs(p):.2f}%(含边界)" for k, (b, p) in LN_DD_GUARDS.items()},
         )
 
     async def stop(self) -> None:
@@ -333,21 +368,22 @@ class QuoteEdgeDetector:
     # ------------------------------------------------------------------
 
     async def _day_high_btc(self, session, w: SentimentWindow,
-                            quote_ts: int) -> float | None:
+                            quote_ts: int, cache_key: str = "v3") -> float | None:
         """当日（UTC）已归档窗口（含本窗）BTC 曲线中 ≤quote_ts 的最高价。
 
         与归因脚本 running high 口径一致；处理按 end_time 升序进行，
         处理本窗时当日更晚窗口尚未归档，天然无未来函数。
-        增量缓存：当日首次查询取全范围后推进水位，之后每窗只增量
-        拉取水位之后的新窗口，避免全天 JSONB 曲线随日内时间线性回读。
+        增量缓存（按 cache_key 分族）：当日首次查询取全范围后推进水位，
+        之后每窗只增量拉取水位之后的新窗口，避免全天 JSONB 曲线随日内时间线性回读。
         """
+        dh_day, dh_high, dh_covered = self._dh_caches.get(cache_key, (None, None, -1))
         # 乱序窗口（污染重扫等）会让缓存已并入的曲线失效 → 重置后取全范围
-        if self._dh_day is not None and int(w.start_time) < self._dh_covered:
-            self._dh_day, self._dh_high, self._dh_covered = None, None, -1
+        if dh_day is not None and int(w.start_time) < dh_covered:
+            dh_day, dh_high, dh_covered = None, None, -1
         day_key = quote_ts // 86_400_000
-        if self._dh_day == day_key:
-            lo = self._dh_covered + 1      # 增量：只拉水位之后的窗口
-            best = self._dh_high
+        if dh_day == day_key:
+            lo = dh_covered + 1      # 增量：只拉水位之后的窗口
+            best = dh_high
         else:
             lo = day_key * 86_400_000
             best = None
@@ -365,9 +401,8 @@ class QuoteEdgeDetector:
                 if int(t) <= quote_ts and (best is None or float(v) > best):
                     best = float(v)
         # 推进水位：[lo, w.start] 范围窗口已全部并入（查询覆盖该范围）
-        self._dh_day = day_key
-        self._dh_high = best
-        self._dh_covered = max(self._dh_covered, int(w.start_time))
+        self._dh_caches[cache_key] = (
+            day_key, best, max(dh_covered, int(w.start_time)))
         return best
 
     # ------------------------------------------------------------------
@@ -386,6 +421,8 @@ class QuoteEdgeDetector:
             rules[v2] = QUOTE_EDGE_RULES[base]
         for v3 in V3_ENV_GUARDS:
             rules[v3] = QUOTE_EDGE_RULES["quote_contrarian_v1"]  # v3 基于 contrarian 区间
+        for ln in LN_DD_GUARDS:
+            rules[ln] = QUOTE_EDGE_RULES[LN_DD_GUARDS[ln][0]]  # 深夜门禁 v2 基于 v1 区间
 
         # per-rule 独立 commit（CodeReview Low#4）：单规则落表失败不回滚、
         # 不影响另一规则；trigger_count 仅在 commit 成功后自增。
@@ -395,6 +432,8 @@ class QuoteEdgeDetector:
         v3_prev_fetched = False
         v3_high: float | None = None
         v3_high_fetched = False
+        ln_high: float | None = None
+        ln_high_fetched = False
         async with async_session_factory() as session:
             for version, (t_lo, t_hi, q_lo, q_hi) in rules.items():
                 try:
@@ -420,6 +459,15 @@ class QuoteEdgeDetector:
                             v3_high_fetched = True
                         if not _pass_v3_env_guard(version, w, quote_ts, v3_prev, v3_high):
                             continue  # 环境门禁未过/数据缺失 → v3 不落（v1/v2 不受影响）
+                    if version in LN_DD_GUARDS:
+                        # 深夜门禁 v2：时段门禁已过（上方统一判定），再判距日高回落；
+                        # 日高缓存与 v3b 分族（同窗触发时点不同，口径不可共享）。
+                        if not ln_high_fetched:
+                            ln_high = await self._day_high_btc(
+                                session, w, quote_ts, cache_key="ln")
+                            ln_high_fetched = True
+                        if not _pass_dd_guard(version, w, quote_ts, ln_high):
+                            continue  # 门禁未过/数据缺失 → v2 不落（v1 不受影响）
                     dup = await session.execute(
                         sa_select(MisalignmentSignal.id).where(
                             MisalignmentSignal.version == version,
