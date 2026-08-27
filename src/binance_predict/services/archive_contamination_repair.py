@@ -339,3 +339,187 @@ async def repair_contaminated_archives() -> dict:
         stats["orders_unlinked"], stats["rescanned"],
     )
     return stats
+
+
+# ============================================================
+# 冷启动入场价断链自愈（2026-08-27 误结算事故修复）
+# ============================================================
+# 背景：部署重启落在 5m 窗口中间时，旧代码用重启时刻 mid_price 充当窗口
+# entry_price → 归档 outcome 可能翻转 → TradeSettler 按错误 outcome 结算订单
+#（实锤：20:10~20:15 窗 entry 79512≠真开盘 79444，DOWN 单误判赢 +30.33，
+# 币安官方结果 UP）。写入侧已修（冷启动 klines 精确回读），本段修历史数据。
+#
+# 污染指纹（断链）：正常窗口切换时 entry == 前一窗 exit（同一边界快照），
+# 冷启动污染窗的 entry 是窗中价 → 与前窗 exit 显著偏离。exit 永远是切换时刻
+# 真实价，不受污染，故链上断点即污染窗。
+
+# 断链判定相对容差：正常切换严格相等；边界处 mid 与 kline 开盘天然偏差
+# 实测 ≤$8（≈1e-4），容差取 2e-4 留裕量；真实断链偏差为几十美元级
+ENTRY_BREAK_REL_TOL = 2e-4
+
+
+async def _prev_exit_price(session, window_start_ms: int) -> float | None:
+    """前一窗（end_time == 本窗 start_time）的 exit_price；无前窗返回 None。"""
+    res = await session.execute(
+        sa_select(SentimentWindow.exit_price).where(
+            SentimentWindow.end_time == window_start_ms)
+    )
+    return res.scalar_one_or_none()
+
+
+async def detect_entry_break(
+    session, window_start_ms: int, entry_price: float | None,
+) -> bool:
+    """断链判定：本窗 entry 与前窗 exit 偏差超容差 → 冷启动污染嫌疑。
+
+    无前窗（库首窗）或价格无效 → False（无从判定，不动）。
+    """
+    if not entry_price or entry_price <= 0:
+        return False
+    prev_exit = await _prev_exit_price(session, window_start_ms)
+    if prev_exit is None or prev_exit <= 0:
+        return False
+    return abs(entry_price - prev_exit) > prev_exit * ENTRY_BREAK_REL_TOL
+
+
+async def resettle_window_orders(
+    session, window_start_ms: int, exit_price: float | None, outcome: str | None,
+) -> int:
+    """按修正后的 outcome 重结算窗口内已结算的 5m 订单（口径同 TradeSettler）。
+
+    仅处理 5m 非场景、direction 非空、已结算行；15m/场景订单结算不读本窗，
+    不受影响。返回改判条数。
+    """
+    from .trade_settler import TradeSettler
+
+    if outcome not in ("UP", "DOWN", "NOISE"):
+        return 0
+    rows = (await session.execute(
+        sa_select(TradeOrderModel)
+        .where(TradeOrderModel.window_start == window_start_ms)
+        .where(TradeOrderModel.status == "FILLED")
+        .where(TradeOrderModel.settled_at.isnot(None))
+        .where(TradeOrderModel.market_period == "5m")
+        .where(TradeOrderModel.scene_signal_id.is_(None))
+        .where(TradeOrderModel.direction.isnot(None))
+    )).scalars().all()
+    changed = 0
+    for row in rows:
+        if outcome == "NOISE":
+            win, pnl = None, 0.0
+        else:
+            win = row.direction == outcome
+            amount = TradeSettler._amount_usdt(row)
+            avg = TradeSettler._avg_price(row)
+            if win and amount is not None and avg is not None:
+                pnl = amount / avg - amount
+            elif not win and amount is not None:
+                pnl = -amount
+            else:
+                continue  # 金额/均价缺失无法重算，保持原值
+        if row.settle_outcome == outcome and row.win == win:
+            continue
+        logger.warning(
+            "断链重结算 | 订单 {} | 窗口 {} | {} win={} pnl={} → {} win={} pnl={:.2f}",
+            row.id, window_start_ms, row.settle_outcome, row.win, row.pnl,
+            outcome, win, pnl,
+        )
+        row.settle_outcome = outcome
+        row.win = win
+        row.pnl = pnl
+        row.settle_price = TradeSettler._to_float(exit_price)
+        changed += 1
+    return changed
+
+
+async def correct_entry_break(
+    session, window_start_ms: int, entry_price: float | None, collector,
+) -> float | None:
+    """归档时断链自愈：检出断链则 klines 精确回读窗口开盘价替代。
+
+    返回修正后的 entry（未检出/回读失败返回 None，调用方沿用原值）。
+    归档发生在结算（+7min）之前，此处修正即可阻断后续误结算。
+    """
+    if not await detect_entry_break(session, window_start_ms, entry_price):
+        return None
+    kopen = await collector.fetch_kline_open("5m", window_start_ms)
+    if not kopen or kopen <= 0:
+        logger.warning(
+            "断链自愈 | 窗口 {} entry={} 与前窗 exit 断链，kline 回读失败沿用原值",
+            window_start_ms, entry_price,
+        )
+        return None
+    logger.warning(
+        "断链自愈 | 窗口 {} entry {:.2f} → kline 开盘 {:.2f}（冷启动污染修正）",
+        window_start_ms, entry_price or 0.0, kopen,
+    )
+    return kopen
+
+
+async def heal_entry_break_windows(collector, hours: float = 24.0) -> dict:
+    """启动自愈：修复近 hours 小时内已归档的断链窗（含订单重结算），幂等。
+
+    覆盖「污染窗已归档、订单已结算」的历史事故场景（归档时钩子来不及救）。
+    修复后链恢复连续，再次启动 0 命中即 no-op。
+    """
+    import time
+
+    from sqlalchemy import update as _sa_update
+
+    stats = {"scanned": 0, "repaired": 0, "orders_resettled": 0}
+    cutoff_ms = int(time.time() * 1000) - int(hours * 3_600_000)
+    async with async_session_factory() as session:
+        wins = (await session.execute(
+            sa_select(SentimentWindow)
+            .where(SentimentWindow.start_time >= cutoff_ms)
+            .order_by(SentimentWindow.start_time.asc())
+        )).scalars().all()
+    for w in wins:
+        stats["scanned"] += 1
+        async with async_session_factory() as session:
+            if not await detect_entry_break(session, int(w.start_time), w.entry_price):
+                continue
+            kopen = await collector.fetch_kline_open("5m", int(w.start_time))
+            if not kopen or kopen <= 0:
+                logger.warning(
+                    "断链自愈（启动）| 窗口 {} kline 回读失败，下次启动重试",
+                    w.start_time,
+                )
+                continue
+            old_entry, old_outcome = w.entry_price, w.outcome
+            actual_return = (
+                w.exit_price / kopen - 1
+                if w.exit_price and w.exit_price > 0 else None
+            )
+            if actual_return is None:
+                new_outcome = None
+            elif actual_return > 0:
+                new_outcome = "UP"
+            elif actual_return < 0:
+                new_outcome = "DOWN"
+            else:
+                new_outcome = "NOISE"
+            await session.execute(
+                _sa_update(SentimentWindow)
+                .where(SentimentWindow.id == w.id)
+                .values(
+                    entry_price=kopen,
+                    actual_return=actual_return,
+                    outcome=new_outcome,
+                )
+            )
+            resettled = await resettle_window_orders(
+                session, int(w.start_time), w.exit_price, new_outcome)
+            await session.commit()
+        stats["repaired"] += 1
+        stats["orders_resettled"] += resettled
+        logger.warning(
+            "断链自愈（启动）| 窗口 {} | entry {:.2f}→{:.2f} | outcome {}→{} "
+            "| 订单重结算 {}",
+            w.start_time, old_entry or 0.0, kopen, old_outcome, new_outcome,
+            resettled,
+        )
+    if stats["repaired"]:
+        logger.warning("断链自愈（启动）完成 | 扫描 {} 修复 {} 订单重结算 {}",
+                       stats["scanned"], stats["repaired"], stats["orders_resettled"])
+    return stats

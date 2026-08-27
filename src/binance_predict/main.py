@@ -332,6 +332,16 @@ async def _prediction_market_tracker() -> None:
                     _current_window_end = new_window_end
                     # Bug 1.3 修复：窗口切换时重置 _restored_current_window
                     _restored_current_window = False
+                    # 冷启动（含部署重启）时当前窗口已开始：klines 精确回读窗口
+                    # 开盘价作双用锚点（入场快照 + 周期开盘价）。否则用重启时刻的
+                    # mid_price 当 entry → 归档 outcome 翻转 → 订单误结算
+                    # （2026-08-27 实锤：20:14 重启污染 20:10~20:15 窗，DOWN 单
+                    # 误判赢虚记 +30.33，币安侧实为 UP）。正常切换（进程存活跨越
+                    # 边界）内存 mid_price 即边界价，无需 REST。
+                    kline_open_5m = 0.0
+                    if prev_window_end is None:
+                        start_5m = int(quote.start_date) if quote.start_date else int(new_window_end) - 300_000
+                        kline_open_5m = await collector.fetch_kline_open("5m", start_5m)
                     # Bug 1.5 修复：窗口开始时快照 entry_price。优先用内存最新
                     # mid_price 快照（非阻塞），避免在 _state_lock 内做阻塞 REST 调用。
                     _window_entry_price = collector.store.mid_price
@@ -343,11 +353,13 @@ async def _prediction_market_tracker() -> None:
                                 "窗口切换时 entry_price 异常({})，将在归档时重新获取",
                                 _window_entry_price,
                             )
+                    # 冷启动 kline 回读成功时以其为准（重启落在窗中时 mid_price 是
+                    # 窗中价，不是开盘价）；归档器另有断链自愈兜底（双保险）
+                    if kline_open_5m > 0:
+                        _window_entry_price = kline_open_5m
                     # 周期开盘价快照（假突破 5m 周期锚点结算判定基准）：
                     # 正常切换 = 新窗口起点快照；冷启动时当前周期已开始，klines 精确回读
                     if prev_window_end is None:
-                        start_5m = int(quote.start_date) if quote.start_date else int(new_window_end) - 300_000
-                        kline_open_5m = await collector.fetch_kline_open("5m", start_5m)
                         _pm_5m_cycle_open_price = kline_open_5m if kline_open_5m > 0 else None
                     else:
                         _pm_5m_cycle_open_price = (
@@ -597,6 +609,15 @@ async def _sentiment_window_archiver() -> None:
                                 start_ms, end_ms,
                             )
                             continue
+
+                    # 断链自愈（2026-08-27 误结算事故）：冷启动落在窗中时快照的
+                    # entry 是窗中价（与前窗 exit 断链），klines 精确回读开盘价替代。
+                    # 归档先于结算（+7min），此处修正即阻断后续订单误结算。
+                    from .services.archive_contamination_repair import correct_entry_break
+                    repaired_entry = await correct_entry_break(
+                        db, start_ms, entry_price, collector)
+                    if repaired_entry is not None:
+                        entry_price = repaired_entry
 
                     # 计算实际结果（结算口径对齐）：预测市场只按涨跌方向赔付，
                     # 与幅度无关，故 outcome 按 actual_return 正负号标注；恰好为 0
@@ -1007,6 +1028,17 @@ async def lifespan(app: FastAPI):
         await repair_contaminated_archives()
     except Exception as exc:
         logger.error("归档污染自愈失败（不阻塞启动）: {}", exc)
+
+    # 冷启动入场价断链自愈（幂等）：部署重启落在窗中会污染该窗 entry_price →
+    # outcome 翻转 → 订单误结算（2026-08-27 事故）。修复近 24h 断链窗并重结算
+    # 已结算订单；失败不阻塞启动。
+    try:
+        from binance_predict.services.archive_contamination_repair import (
+            heal_entry_break_windows,
+        )
+        await heal_entry_break_windows(collector)
+    except Exception as exc:
+        logger.error("断链自愈失败（不阻塞启动）: {}", exc)
 
     # X4 情绪错位影子信号（M4）：收阳&end≤40→押次窗DOWN，只记录不下注，
     # 次窗归档后回读真实报价与结算，攒 2~3 周定案经济账后人工 promote
