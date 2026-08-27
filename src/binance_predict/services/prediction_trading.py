@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import math
 import time
 from typing import Any
 
@@ -1097,6 +1098,34 @@ class BinancePredictionTrader:
                 # （window_start == startDate）的 token；缺失即拒单——
                 # 宁可错过不押错周期（旧"最后一个覆盖"行为会拿未来市场）
                 entry = self._15m_markets.get(window_start)
+                
+                # 容差匹配：允许 ±2 秒偏差（应对 K 线对齐 vs 市场创建时间的微小差异）
+                if entry is None:
+                    tolerance_ms = 2 * 1000  # 2 秒，而不是之前的 2 分钟
+                    candidates = []
+                    for start_ms, e in self._15m_markets.items():
+                        diff = abs(start_ms - window_start)
+                        if diff <= tolerance_ms:
+                            candidates.append((diff, start_ms, e))
+                    if candidates:
+                        # 选最接近的一个
+                        candidates.sort(key=lambda x: x[0])
+                        _, best_start_ms, best_entry = candidates[0]
+                        entry = best_entry
+                        logger.info(
+                            "信号实盘：15m 周期 {} 容差匹配到 {} | 偏差 {}ms",
+                            window_start, best_start_ms, abs(best_start_ms - window_start))
+                    else:
+                        # 详细日志：打印所有可用周期
+                        logger.warning(
+                            "信号实盘：15m 周期 {} 未在市场列表中找到（锚定守卫拒单）\n"
+                            "   ├─ 可用周期 (start_date): {}\n"
+                            "   └─ 最近偏差：{} ms",
+                            window_start,
+                            sorted(self._15m_markets.keys()),
+                            min(abs(s - window_start) for s in self._15m_markets.keys()) if self._15m_markets else 0
+                        )
+                
                 token_id = (entry["up_token"] if prediction == "UP"
                             else entry["down_token"]) if entry else None
                 if entry is None:
@@ -1359,3 +1388,65 @@ class BinancePredictionTrader:
             window_start=window_start,
             direction=direction,
         )
+
+    # ------------------------------------------------------------------
+    # 订单核对功能（对账/验证）
+    # ------------------------------------------------------------------
+
+    async def verify_order_by_id(self, order_id: str) -> dict | None:
+        """通过订单 ID 查询单笔订单详情（用于对账）。
+
+        Args:
+            order_id: 币安返回的 orderId
+
+        Returns:
+            {
+                'order_id': str,
+                'token_id': str,
+                'side': 'BUY' | 'SELL',
+                'status': 'EXPIRED' | 'PENDING' | 'FILLED' | 'CANCELLED',
+                'average_price': float | None,
+                'amount_in': str | None,
+                'created_at': int (epoch ms),
+                'verified_at': datetime (UTC),
+                'raw_data': dict
+            }
+        """
+        self.last_api_error = None
+        signed_url = self._build_signed_url(
+            "/sapi/v1/w3w/wallet/prediction/order/query-by-orderId",
+            {
+                "walletAddress": self._wallet_address,
+                "orderId": order_id,
+            },
+        )
+        try:
+            client = self._get_client()
+            resp = await client.get(
+                signed_url,
+                headers={"X-MBX-APIKEY": self._api_key},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except httpx.HTTPStatusError as e:
+            self.last_api_error = f"HTTP {e.response.status_code}: {e.response.text[:300]}"
+            logger.error("查询订单详情失败 (HTTP {}): {}", e.response.status_code, e.response.text[:300])
+            return None
+        except Exception as e:
+            self.last_api_error = f"{type(e).__name__}: {e}"
+            logger.error("查询订单详情失败：{}", e)
+            return None
+
+        if isinstance(data, dict):
+            return {
+                'order_id': data.get('orderId'),
+                'token_id': data.get('tokenId'),
+                'side': data.get('side'),
+                'status': data.get('status'),
+                'average_price': data.get('averagePrice'),
+                'amount_in': data.get('amountIn'),
+                'created_at': data.get('createTime'),
+                'verified_at': int(time.time() * 1000),
+                'raw_data': data,
+            }
+        return None

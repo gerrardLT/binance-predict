@@ -2246,6 +2246,146 @@ async def sync_binance_orders(_: None = Depends(_require_auth)):
     return {"synced": len(synced), "details": synced, "binance_orders": len(history)}
 
 
+@app.post("/api/trades/sync-status")
+async def sync_order_status_from_binance(
+    _: None = Depends(_require_auth),
+):
+    """从币安同步真实订单状态到本地数据库（解决前端展示与币安不一致问题）。
+
+    背景：前端展示的盈亏 (pnl) 和"待领取 token"都是基于本地计算，
+    可能与币安实际不符（例如"WIN +30.33"对应币安侧 FAILED）。
+    
+    功能：实时调用币安订单查询接口，更新本地的 status/win/pnl/redeemed_at。
+    
+    Returns:
+        {
+            "synced_count": int,
+            "updated_orders": [
+                {
+                    "id": order_id,
+                    "order_id": binance_order_id,
+                    "old_status": "FILLED",
+                    "new_status": "FAILED",
+                    "old_pnl": 30.33,
+                    "new_pnl": -1.0,
+                    "binance_status": "FAILED",
+                    "changes": {...}
+                }
+            ],
+            "total_checked": int,
+        }
+    """
+    from decimal import Decimal
+    from sqlalchemy import select
+    from .db.models import TradeOrderModel
+
+    if not prediction_trader._api_key:
+        return {"error": "Binance API Key 未配置"}
+    
+    synced_count = 0
+    updated_orders = []
+    
+    # 1. 查询所有近期未完成的订单（包括 FILLED/FAILED）
+    async with async_session_factory() as db:
+        stmt = select(TradeOrderModel).where(
+            TradeOrderModel.status.in_("FILLED", "FAILED"),
+            TradeOrderModel.order_id.isnot(None),
+        )
+        orders = (await db.execute(stmt)).scalars().all()
+    
+    if not orders:
+        return {"synced_count": 0, "updated_orders": [], "total_checked": 0, "message": "没有需要同步的订单"}
+    
+    for order in orders:
+        # 2. 查询币安订单详情（通过 verify_order_by_id）
+        binance_order = await prediction_trader.verify_order_by_id(order.order_id)
+        
+        if not binance_order:
+            logger.warning(f"无法查询币安订单 {order.order_id} | 跳过")
+            continue
+        
+        # 3. 对比状态和价格
+        old_status = order.status
+        old_pnl = order.pnl
+        binance_status = binance_order.get("status")  # "FILLED" | "FAILED" | "EXPIRED"
+        
+        # 4. 更新数据库
+        changes = {}
+        should_update = False
+        
+        # 检查状态变更
+        if binance_status != order.status:
+            order.status = binance_status
+            changes["status"] = {"old": old_status, "new": binance_status}
+            should_update = True
+            logger.info(f"订单 {order.order_id} 状态变更：{old_status} → {binance_status}")
+        
+        # 检查价格变更（如果成交了）
+        if binance_status == "FILLED":
+            avg_price = binance_order.get("averagePrice")
+            filled_amount = binance_order.get("amountIn")  # 实际成交金额
+            
+            if avg_price and float(avg_price) != float(order.quote_json.get("averagePrice", 0)):
+                order.quote_json["averagePrice"] = float(avg_price)
+                order.amount_in = str(int(float(filled_amount) * 1e18)) if filled_amount else order.amount_in
+                changes["price"] = {
+                    "old": order.quote_json.get("averagePrice"),
+                    "new": avg_price
+                }
+                should_update = True
+                logger.info(f"订单 {order.order_id} 均价更新：{order.quote_json.get('averagePrice')} → {avg_price}")
+        
+        # 5. 重新计算 pnl（使用真实成交价）
+        new_pnl = _calculate_pnl_from_binance(order, binance_order)
+        if abs(new_pnl - (order.pnl or 0)) > 0.001:
+            order.pnl = new_pnl
+            changes["pnl"] = {"old": order.pnl, "new": new_pnl}
+            should_update = True
+            logger.info(f"订单 {order.order_id} 重新计算 pnl: {order.pnl:.4f}")
+        
+        if should_update:
+            await db.commit()
+            synced_count += 1
+            updated_orders.append({
+                "id": order.id,
+                "order_id": order.order_id,
+                "old_status": old_status,
+                "new_status": order.status,
+                "old_pnl": old_pnl,
+                "new_pnl": order.pnl,
+                "binance_status": binance_status,
+                "changes": changes,
+            })
+    
+    return {
+        "synced_count": synced_count,
+        "updated_orders": updated_orders,
+        "total_checked": len(orders),
+    }
+
+
+def _calculate_pnl_from_binance(order: TradeOrderModel, binance_order: dict) -> float:
+    """根据币安真实订单数据计算 pnl"""
+    try:
+        amount_in = Decimal(binance_order.get("amountIn", "0"))
+        average_price = Decimal(str(binance_order.get("averagePrice", 0)))
+        
+        if average_price <= 0:
+            return -float(amount_in)  # 没成交就视为失败
+        
+        # 赢：收到的 USDT = amount_in / average_price
+        usdt_received = amount_in / average_price
+        
+        # pnl = 收到的 USDT - 投入的 USDT
+        pnl = float(usdt_received - amount_in)
+        
+        return pnl
+        
+    except Exception as e:
+        logger.error(f"计算 pnl 失败：{e} | 返回 -1 作为默认值")
+        return -1.0
+
+
 @app.post("/api/trades/settle-scan")
 async def settle_scan(_: None = Depends(_require_auth)):
     """手动触发一次结算扫描（验证/补算用）：返回本次结算条数。
