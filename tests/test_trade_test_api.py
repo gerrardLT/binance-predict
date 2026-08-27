@@ -1122,3 +1122,81 @@ async def test_prediction_redeem_noop(monkeypatch) -> None:
 
     out = await m.prediction_redeem(RedeemRequest(), _=None)
     assert out["status"] == "NOOP"
+
+
+@pytest.mark.asyncio
+async def test_confirm_order_status(monkeypatch) -> None:
+    """confirm_order_status：以币安侧订单历史终态为准（防幽灵成交）。"""
+    import binance_predict.main as m
+
+    trader = m.prediction_trader
+
+    async def _history_filled(limit=20):
+        return [{"orderId": "B-1", "status": "FILLED"}]
+
+    monkeypatch.setattr(trader, "query_order_history", _history_filled)
+    assert await trader.confirm_order_status("B-1", attempts=1) == "FILLED"
+
+    async def _history_failed(limit=20):
+        return [{"orderId": "B-1", "status": "FAILED", "filledUsdtAmount": "0"}]
+
+    monkeypatch.setattr(trader, "query_order_history", _history_failed)
+    assert await trader.confirm_order_status("B-1", attempts=1) == "FAILED"
+
+    async def _history_missing(limit=20):
+        return [{"orderId": "OTHER", "status": "FILLED"}]
+
+    monkeypatch.setattr(trader, "query_order_history", _history_missing)
+    assert await trader.confirm_order_status("B-1", attempts=1) is None
+    assert await trader.confirm_order_status(None, attempts=1) is None
+
+
+@pytest.mark.asyncio
+async def test_sync_binance_downgrades_ghost_filled(monkeypatch) -> None:
+    """sync-binance 幽灵成交订正：本地 FILLED 而币安侧同 orderId 为 FAILED
+    → 改判 FAILED 并清除 win/pnl（不存在的盈亏不得污染统计/可领取列表）。"""
+    import binance_predict.main as m
+
+    monkeypatch.setattr(m.prediction_trader, "_api_key", "k")
+    monkeypatch.setattr(m.prediction_trader, "_wallet_address", "0xW")
+
+    async def _history(limit=100):
+        return [{"orderId": "B-1", "status": "FAILED", "filledUsdtAmount": "0",
+                 "slug": "btc-updown-5m-1787000000"}]
+
+    monkeypatch.setattr(m.prediction_trader, "query_order_history", _history)
+
+    ghost = SimpleNamespace(
+        id=74, order_id="B-1", status="FILLED", win=True, pnl=9.5,
+        settle_outcome="WIN", settled_at="2026-08-27", error_message=None,
+        window_start=1787000000000)
+    keep = SimpleNamespace(
+        id=75, order_id="B-2", status="FILLED", win=True, pnl=3.0,
+        settle_outcome="WIN", settled_at="2026-08-27", error_message=None,
+        window_start=1787000300000)
+
+    r_pending = MagicMock()
+    r_pending.scalars.return_value.all.return_value = []
+    r_filled = MagicMock()
+    r_filled.scalars.return_value.all.return_value = [ghost, keep]
+    db = AsyncMock()
+    db.execute = AsyncMock(side_effect=[r_pending, r_filled])
+
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def _factory():
+        yield db
+
+    monkeypatch.setattr(m, "async_session_factory", _factory)
+
+    out = await m.sync_binance_orders(_=None)
+
+    # 幽灵单改判并清结算字段；币安侧正常（历史中无 B-2 或状态非 FAILED）不动
+    assert ghost.status == "FAILED"
+    assert ghost.win is None and ghost.pnl is None
+    assert ghost.settle_outcome is None and ghost.settled_at is None
+    assert keep.status == "FILLED" and keep.win is True
+    assert out["synced"] == 1
+    assert out["details"][0]["corrected"] == "ghost_filled"
+    db.commit.assert_awaited_once()

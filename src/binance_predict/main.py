@@ -2256,11 +2256,14 @@ async def get_binance_order_history(
 
 @app.post("/api/trades/sync-binance")
 async def sync_binance_orders(_: None = Depends(_require_auth)):
-    """对账回填：用币安侧订单历史把本地卡 PENDING 的行订正为终态。
+    """对账回填：用币安侧订单历史订正本地行终态。
 
-    场景：端点曾返回 500 但币安侧实际已成交（钱已花出），本地行停留
+    场景一：端点曾返回 500 但币安侧实际已成交（钱已花出），本地行停留
     在 PENDING。按 window_start 匹配（slug btc-updown-5m-<秒> 编码窗口
     起始秒）；币安侧无对应订单的行保持 PENDING 不动。
+    场景二（幽灵成交订正）：本地 FILLED 但币安侧同 orderId 为 FAILED
+    （FOK 受理后翻转未成交）——改判 FAILED 并清除 win/pnl 等结算字段，
+    避免不存在的盈亏污染统计、win 单误入可领取列表。
     """
     import re
     from decimal import Decimal
@@ -2273,15 +2276,18 @@ async def sync_binance_orders(_: None = Depends(_require_auth)):
         wallet = await prediction_trader.fetch_wallet_info()
         if not wallet:
             return {"error": "未找到预测钱包"}
-    history = await prediction_trader.query_order_history(limit=50)
+    history = await prediction_trader.query_order_history(limit=100)
     if history is None:
         return {"error": prediction_trader.last_api_error or "查询失败", "synced": 0}
 
     # slug 末尾即窗口起始秒（如 btc-updown-5m-1787418600）
     by_window: dict[int, dict] = {}
+    by_orderid: dict[str, dict] = {}
     for o in history:
         if not isinstance(o, dict):
             continue
+        if o.get("orderId"):
+            by_orderid[str(o["orderId"])] = o
         m = re.search(r"-(\d{10})$", o.get("slug") or "")
         if m:
             by_window[int(m.group(1)) * 1000] = o
@@ -2310,6 +2316,29 @@ async def sync_binance_orders(_: None = Depends(_require_auth)):
             synced.append({
                 "id": row.id, "window_start": row.window_start,
                 "status": row.status, "order_id": row.order_id,
+            })
+
+        # 幽灵成交订正：本地 FILLED 而币安侧同 orderId 为 FAILED（FOK 受理后
+        # 翻转未成交）→ 改判 FAILED 并清结算字段（2026-08 对账发现 2 笔）
+        filled_rows = (await db.execute(
+            select(TradeOrderModel)
+            .where(TradeOrderModel.status == "FILLED")
+            .where(TradeOrderModel.order_id.isnot(None))
+        )).scalars().all()
+        for row in filled_rows:
+            bo = by_orderid.get(str(row.order_id))
+            if not bo or bo.get("status") != "FAILED":
+                continue
+            row.status = "FAILED"
+            row.win = None
+            row.pnl = None
+            row.settle_outcome = None
+            row.settled_at = None
+            row.error_message = "对账改判：币安侧订单终态 FAILED（幽灵成交订正）"
+            synced.append({
+                "id": row.id, "window_start": row.window_start,
+                "status": "FAILED", "order_id": row.order_id,
+                "corrected": "ghost_filled",
             })
         await db.commit()
     return {"synced": len(synced), "details": synced, "binance_orders": len(history)}

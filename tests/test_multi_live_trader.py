@@ -1103,6 +1103,13 @@ def _make_real_trader(monkeypatch, with_15m: bool = True) -> BinancePredictionTr
         return []
 
     monkeypatch.setattr(trader, "list_markets", _list)
+
+    # 默认币安侧终态回查为 FILLED（组 8 各用例聚焦下单分流逻辑；
+    # 幽灵成交/待对账路径有独立用例覆盖）
+    async def _confirm(_oid, attempts=3, delay=1.0):
+        return "FILLED"
+
+    monkeypatch.setattr(trader, "confirm_order_status", _confirm)
     return trader
 
 
@@ -1307,6 +1314,81 @@ async def test_signal_trade_success_dynamic_slippage(monkeypatch) -> None:
     assert order["status"] == "FILLED" and order["order_id"] == "ORD-9"
     assert slippage_seen == [985]
     assert updates[0][0] == "FILLED"
+
+
+@pytest.mark.asyncio
+async def test_signal_trade_ghost_fill_downgrade(monkeypatch) -> None:
+    """币安侧终态回查为 FAILED（FOK 受理后翻转）→ 落 FAILED，不伪造成交。"""
+    trader = _make_real_trader(monkeypatch)
+    updates: list[tuple] = []
+
+    async def _reserve(_v, _ws, direction=None, market_period="5m",
+                       scene_signal_id=None):
+        return _pending_order()
+
+    async def _update(order, status, **kwargs):
+        updates.append((status, kwargs))
+        return {**order, "status": status, **kwargs}
+
+    async def _quote(_token, _side, amount_usdt=None):
+        return {"averagePrice": 0.55, "amountIn": "5", "amountOut": "9",
+                "quoteId": "Q1"}
+
+    async def _place(_q, slippage_bps=1200):
+        return {"orderId": "ORD-GHOST"}
+
+    async def _confirm_failed(_oid, attempts=3, delay=1.0):
+        return "FAILED"
+
+    monkeypatch.setattr(trader, "_reserve_order_slot", _reserve)
+    monkeypatch.setattr(trader, "_update_signal_order", _update)
+    monkeypatch.setattr(trader, "get_quote", _quote)
+    monkeypatch.setattr(trader, "place_order", _place)
+    monkeypatch.setattr(trader, "confirm_order_status", _confirm_failed)
+
+    order = await trader.execute_signal_trade(
+        "DOWN", 5.0, "quote_momentum_v1", WINDOW_START, max_exec_price=0.78)
+    assert order["status"] == "FAILED"
+    assert updates[0][0] == "FAILED"
+    assert updates[0][1]["order_id"] == "ORD-GHOST"
+    assert "FOK 未成交" in updates[0][1]["error_message"]
+
+
+@pytest.mark.asyncio
+async def test_signal_trade_unconfirmed_stays_pending(monkeypatch) -> None:
+    """币安侧终态暂未确认（回查 None）→ 落 PENDING 交对账，不当作成交。"""
+    trader = _make_real_trader(monkeypatch)
+    updates: list[tuple] = []
+
+    async def _reserve(_v, _ws, direction=None, market_period="5m",
+                       scene_signal_id=None):
+        return _pending_order()
+
+    async def _update(order, status, **kwargs):
+        updates.append((status, kwargs))
+        return {**order, "status": status, **kwargs}
+
+    async def _quote(_token, _side, amount_usdt=None):
+        return {"averagePrice": 0.55, "amountIn": "5", "amountOut": "9",
+                "quoteId": "Q1"}
+
+    async def _place(_q, slippage_bps=1200):
+        return {"orderId": "ORD-UNCONFIRMED"}
+
+    async def _confirm_none(_oid, attempts=3, delay=1.0):
+        return None
+
+    monkeypatch.setattr(trader, "_reserve_order_slot", _reserve)
+    monkeypatch.setattr(trader, "_update_signal_order", _update)
+    monkeypatch.setattr(trader, "get_quote", _quote)
+    monkeypatch.setattr(trader, "place_order", _place)
+    monkeypatch.setattr(trader, "confirm_order_status", _confirm_none)
+
+    order = await trader.execute_signal_trade(
+        "DOWN", 5.0, "quote_momentum_v1", WINDOW_START, max_exec_price=0.78)
+    assert order["status"] == "PENDING"
+    assert updates[0][0] == "PENDING"
+    assert updates[0][1]["order_id"] == "ORD-UNCONFIRMED"
 
 
 @pytest.mark.asyncio

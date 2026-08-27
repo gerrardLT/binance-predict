@@ -622,6 +622,33 @@ class BinancePredictionTrader:
                 return orders
         return [data]
 
+    async def confirm_order_status(
+        self, order_id: str | None, attempts: int = 3, delay: float = 1.0,
+    ) -> str | None:
+        """回查刚下单订单的币安侧终态：'FILLED' / 'FAILED' / None。
+
+        place-order-bundle 返回 200 + orderId 不代表成交：FOK 单受理后仍可能
+        翻转为 FAILED（流动性不足等）。曾以"收到响应即成交"落库，产生幽灵成交
+        （2026-08 对账发现 2 笔：本地 FILLED + win/pnl，币安侧 filled=0）。
+        此处轮询订单历史以币安终态为准；None = 历史中暂无该单（调用方应落
+        PENDING，交由 /api/trades/sync-binance 对账，不伪造成交）。
+        """
+        if not order_id:
+            return None
+        for i in range(attempts):
+            history = await self.query_order_history(limit=20)
+            if history:
+                for o in history:
+                    if isinstance(o, dict) and order_id in (
+                        o.get("orderId"), o.get("vendorOrderId"),
+                    ):
+                        status = o.get("status")
+                        if status in ("FILLED", "FAILED"):
+                            return status
+            if i < attempts - 1:
+                await asyncio.sleep(delay)
+        return None
+
     @staticmethod
     def _classify_period(market: dict) -> str | None:
         """按 title/slug 识别市场周期：'5m' | '15m' | None。先判 15m（含 '5m' 子串）。"""
@@ -1010,9 +1037,32 @@ class BinancePredictionTrader:
                     direction=prediction,
                 )
 
-            # 3. 保存订单记录（direction 落库供结算判赢；window_start 缺省取当前 5m 窗口起点）
+            # 3. 币安侧终态回查（FOK 受理后仍可能翻转 FAILED；防幽灵成交）
             eff_window_start = window_start if window_start is not None else (
                 int(time.time() * 1000) // 300_000 * 300_000)
+            order_id = order_result.get("orderId")
+            confirmed = await self.confirm_order_status(order_id)
+            if confirmed == "FAILED":
+                # 币安侧订单未成交：落 FAILED，不伪造成交（规则 3）
+                return await self._save_order(
+                    prediction_id=prediction_id,
+                    agent_prediction_id=agent_prediction_id,
+                    token_id=token_id,
+                    side="BUY",
+                    amount_in="0",
+                    amount_out=None,
+                    order_id=order_id,
+                    status="FAILED",
+                    quote_json=quote,
+                    error_message="币安侧订单终态 FAILED（FOK 未成交）",
+                    signal_version=signal_version,
+                    window_start=eff_window_start,
+                    direction=prediction,
+                )
+            # FILLED → 落成交；暂未确认（历史尚无该单）→ PENDING 交对账兜底
+            status = "FILLED" if confirmed == "FILLED" else "PENDING"
+            if status == "PENDING":
+                logger.warning("币安侧终态暂未确认，落 PENDING 待对账 | orderId={}", order_id)
             return await self._save_order(
                 prediction_id=prediction_id,
                 agent_prediction_id=agent_prediction_id,
@@ -1020,8 +1070,8 @@ class BinancePredictionTrader:
                 side="BUY",
                 amount_in=str(quote.get("amountIn", "")),
                 amount_out=str(quote.get("amountOut", "")),
-                order_id=order_result.get("orderId"),
-                status="FILLED",
+                order_id=order_id,
+                status=status,
                 quote_json=quote,
                 signal_version=signal_version,
                 window_start=eff_window_start,
@@ -1173,17 +1223,33 @@ class BinancePredictionTrader:
                     pending, "FAILED", direction=prediction,
                     error_message="下单失败", quote_json=quote)
 
+            # 币安侧终态回查（FOK 受理后仍可能翻转 FAILED；防幽灵成交，
+            # 2026-08 对账发现 2 笔本地 FILLED 而币安 filled=0）
+            order_id = order_result.get("orderId")
+            confirmed = await self.confirm_order_status(order_id)
+            if confirmed == "FAILED":
+                return await self._update_signal_order(
+                    pending, "FAILED", direction=prediction, token_id=token_id,
+                    order_id=order_id, quote_json=quote,
+                    error_message="币安侧订单终态 FAILED（FOK 未成交）")
+
+            # FILLED → 落成交；暂未确认 → 保持 PENDING 交 sync-binance 对账
+            status = "FILLED" if confirmed == "FILLED" else "PENDING"
             snapshot = await self._update_signal_order(
-                pending, "FILLED",
+                pending, status,
                 direction=prediction,
                 token_id=token_id,
                 amount_in=str(quote.get("amountIn", "")),
                 amount_out=str(quote.get("amountOut", "")),
-                order_id=order_result.get("orderId"),
+                order_id=order_id,
                 quote_json=quote,
             )
-            logger.info("信号实盘成交 | signal={} | window={} | orderId={} | slippageBps={}",
-                        signal_version, window_start, order_result.get("orderId"), slippage_bps)
+            if status == "PENDING":
+                logger.warning("信号实盘：币安侧终态暂未确认，落 PENDING 待对账 | signal={} | window={} | orderId={}",
+                               signal_version, window_start, order_id)
+            else:
+                logger.info("信号实盘成交 | signal={} | window={} | orderId={} | slippageBps={}",
+                            signal_version, window_start, order_id, slippage_bps)
             return snapshot
 
     async def _reserve_order_slot(
