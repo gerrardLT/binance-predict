@@ -112,12 +112,16 @@ jobs:
             # 先解码到临时文件并校验非空，成功后再原子替换，避免解码失败把线上 .env 清空；
             # tr -d 容忍 secret 中可能混入的 CR（Windows 侧生成密文时常见）。
             if [ -n "${ENV_FILE_CONTENT:-}" ]; then
-              echo "$ENV_FILE_CONTENT" | tr -d '\r' | base64 -d > .env.tmp
-              if [ ! -s .env.tmp ]; then
-                echo "ERROR: ENV_FILE_CONTENT decoded to empty, keeping existing .env"
-                rm -f .env.tmp
+              trap 'rm -f .env.tmp' EXIT
+              if ! printf '%s\n' "$ENV_FILE_CONTENT" | tr -d '\r' | base64 -d > .env.tmp; then
+                echo "ERROR: ENV_FILE_CONTENT base64 decode failed, keeping existing .env"
                 exit 1
               fi
+              if [ ! -s .env.tmp ]; then
+                echo "ERROR: ENV_FILE_CONTENT decoded to empty, keeping existing .env"
+                exit 1
+              fi
+              chmod 600 .env.tmp
               mv .env.tmp .env
             fi
 

@@ -2148,7 +2148,13 @@ async def prediction_redeemable(_: None = Depends(_require_auth)):
         )).all()
     db_tokens = [r.token_id for r in rows]
 
-    merged = list(dict.fromkeys(wallet_tokens + db_tokens))  # 去重保序
+    if positions is None:
+        # 钱包查询降级：DB win 未领取兑底（官方端点探索期降级时仍有参考）
+        merged = list(dict.fromkeys(wallet_tokens + db_tokens))  # 去重保序
+    else:
+        # 钱包查询成功：链上事实为权威。DB 中链上已赎回/不可赎的 token
+        # 不得计入可领（否则送去 batch-redeem 会触发币安 400 -9000 SYSTEM_ERROR）
+        merged = wallet_tokens
     return {
         "claimable_count": len(merged),
         "claimable_tokens": merged,
@@ -2179,10 +2185,13 @@ async def prediction_redeem(
             return {"error": "未找到预测钱包，请先在 Binance App 中开通"}
 
     token_ids = req.token_ids
+    positions = None
     if not token_ids:
         positions = await prediction_trader.fetch_pending_claim_positions()
         token_ids = prediction_trader._extract_token_ids(positions or [])
-    if not token_ids:
+    if not token_ids and positions is None:
+        # DB 兜底仅限钱包查询降级时：链上返回成功且 PENDING_CLAIM 为空即代表无可领，
+        # 把 DB 未标记的 token 送去 batch-redeem 会触发币安 400 -9000 SYSTEM_ERROR
         from sqlalchemy import select
         from .db.models import TradeOrderModel
 
