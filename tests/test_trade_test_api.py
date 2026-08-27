@@ -999,8 +999,9 @@ async def test_redeem_tokens_empty_and_fail(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_prediction_redeemable_merges_sources(monkeypatch) -> None:
-    """redeemable 端点：钱包 PENDING_CLAIM + DB win 未领取合并去重；
-    官方端点降级时 wallet_source=degraded 但 DB 源仍返回。"""
+    """redeemable 端点：钱包查询成功时链上事实为权威（DB 独有 token 不并入，
+    防止送已不可赎的 token 给 batch-redeem 触发币安 400 -9000）；
+    官方端点降级时 wallet_source=degraded 且 DB 源兜底。"""
     import binance_predict.main as m
 
     async def _positions():
@@ -1010,8 +1011,8 @@ async def test_prediction_redeemable_merges_sources(monkeypatch) -> None:
     monkeypatch.setattr(m.prediction_trader, "last_pending_error", None)
     monkeypatch.setattr(m.prediction_trader, "last_pending_raw", '{"positions":[...]}')
 
-    row = SimpleNamespace(id=13, token_id="T-13")   # DB 与钱包重叠 → 去重
-    row2 = SimpleNamespace(id=14, token_id="T-14")  # DB 独有
+    row = SimpleNamespace(id=13, token_id="T-13")   # DB 与钱包重叠
+    row2 = SimpleNamespace(id=14, token_id="T-14")  # DB 独有（链上无 → 不得计入可领）
     db = AsyncMock()
     result = MagicMock()
     result.all.return_value = [row, row2]
@@ -1026,8 +1027,9 @@ async def test_prediction_redeemable_merges_sources(monkeypatch) -> None:
     monkeypatch.setattr(m, "async_session_factory", _factory)
 
     out = await m.prediction_redeemable(_=None)
-    assert out["claimable_tokens"] == ["T-13", "T-14"]
-    assert out["claimable_count"] == 2
+    # 钱包源成功：链上事实为权威，DB 独有的 T-14 不并入
+    assert out["claimable_tokens"] == ["T-13"]
+    assert out["claimable_count"] == 1
     assert out["wallet_source"] == "ok"
     assert out["db_win_unclaimed_ids"] == [13, 14]
 
