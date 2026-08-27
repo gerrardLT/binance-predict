@@ -16,19 +16,22 @@ from __future__ import annotations
 
 import asyncio
 import calendar
+import hmac
 import json
 import math
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from loguru import logger
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
 
 from .config.settings import settings
 from .db.engine import async_session_factory, get_db
@@ -42,6 +45,7 @@ from .db.models import (
 )
 from .models.schemas import (
     CommitDeepLearnRequest,
+    LoginRequest,
     ManualTradeTestRequest,
     RedeemRequest,
     TransferInboundRequest,
@@ -1124,6 +1128,42 @@ app.add_middleware(
 
 
 # ============================================================
+# Web 登录全局认证中间件（单一访问密码，密码即 Bearer Token）
+# ============================================================
+
+class LoginAuthMiddleware(BaseHTTPMiddleware):
+    """全局认证：所有 /api/* 请求须携带 Authorization: Bearer <LOGIN_PASSWORD>。
+
+    放行：非 /api 路径、OPTIONS（CORS 预检）、/api/auth/login 本身、
+    /api/health（部署流水线/容器探针需免认证探活）。
+    未配置 login_password 时一律 401（不做"空值即放行"的开发旁路）。
+    注册于 CORSMiddleware 之后（即最外层），预检先经本层直接放行。
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        if (
+            request.method == "OPTIONS"
+            or not path.startswith("/api")
+            or path in ("/api/auth/login", "/api/health")
+        ):
+            return await call_next(request)
+        expected = settings.login_password
+        auth_header = request.headers.get("Authorization", "")
+        token = auth_header[7:] if auth_header.startswith("Bearer ") else ""
+        if expected and token and hmac.compare_digest(token, expected):
+            return await call_next(request)
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Invalid or missing authentication token"},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+app.add_middleware(LoginAuthMiddleware)
+
+
+# ============================================================
 # API 认证依赖（安全修复 #2：Bearer Token 保护敏感端点）
 # ============================================================
 
@@ -1146,6 +1186,26 @@ async def _require_auth(
             detail="Invalid or missing authentication token",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+
+# ============================================================
+# Web 登录 API（单一访问密码，登录态由前端存 localStorage 不过期）
+# ============================================================
+
+@app.post("/api/auth/login")
+async def auth_login(body: LoginRequest):
+    """校验访问密码，成功返回 token（即密码本身，前端存 localStorage 后作 Bearer 携带）。"""
+    if not settings.login_password:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="服务端未配置登录密码（LOGIN_PASSWORD）",
+        )
+    if not hmac.compare_digest(body.password, settings.login_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="密码错误",
+        )
+    return {"ok": True, "token": settings.login_password}
 
 
 # ============================================================

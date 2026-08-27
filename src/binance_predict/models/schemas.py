@@ -241,6 +241,12 @@ class PatternChangeLogRecord(BaseModel):
 # API 请求模型
 # ============================================================
 
+class LoginRequest(BaseModel):
+    """Web 登录请求（POST /api/auth/login，单一访问密码）。"""
+
+    password: str = Field(description="访问密码（对应服务端 LOGIN_PASSWORD）")
+
+
 class CommitDeepLearnRequest(BaseModel):
     """深度分析确认写入请求。"""
 

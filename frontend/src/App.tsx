@@ -420,76 +420,104 @@ interface DeepLearnStreamEvent {
 // API helpers（仅保留路径B/C相关端点）
 // ============================================================
 
+// ============================================================
+// 登录态与请求封装（单一访问密码，存 localStorage 不过期）
+// ============================================================
+
+const AUTH_KEY = 'bp_auth_token'
+
+const getAuthToken = (): string | null => localStorage.getItem(AUTH_KEY)
+
+const setAuthToken = (token: string) => localStorage.setItem(AUTH_KEY, token)
+
+const clearAuthToken = () => localStorage.removeItem(AUTH_KEY)
+
+// 任一请求收到 401：清除本地登录态并派发事件，App 监听后回到登录页
+type ApiInit = RequestInit & { headers?: Record<string, string> }
+
+function authFetch(url: string, init: ApiInit = {}): Promise<Response> {
+  const token = getAuthToken()
+  const headers: Record<string, string> = { ...(init.headers || {}) }
+  if (token) headers['Authorization'] = `Bearer ${token}`
+  return fetch(url, { ...init, headers }).then(resp => {
+    if (resp.status === 401) {
+      clearAuthToken()
+      window.dispatchEvent(new Event('auth-logout'))
+    }
+    return resp
+  })
+}
+
 const api = {
-  health: () => fetch('/api/health').then(r => r.json()),
-  getPredictionMarket: () => fetch('/api/chart/prediction-market').then(r => r.json()),
-  getPredictionMarket15m: () => fetch('/api/chart/prediction-market/15m').then(r => r.json()),
-  runMomentumPredict: () => fetch('/api/sentiment/momentum-predict', { method: 'POST' }).then(r => r.json()),
-  getAgentStatus: () => fetch('/api/sentiment/agent/status').then(r => r.json()),
-  getAgentPatterns: () => fetch('/api/sentiment/agent/patterns').then(r => r.json()),
+  health: () => authFetch('/api/health').then(r => r.json()),
+  getPredictionMarket: () => authFetch('/api/chart/prediction-market').then(r => r.json()),
+  getPredictionMarket15m: () => authFetch('/api/chart/prediction-market/15m').then(r => r.json()),
+  runMomentumPredict: () => authFetch('/api/sentiment/momentum-predict', { method: 'POST' }).then(r => r.json()),
+  getAgentStatus: () => authFetch('/api/sentiment/agent/status').then(r => r.json()),
+  getAgentPatterns: () => authFetch('/api/sentiment/agent/patterns').then(r => r.json()),
   getAgentPredictions: (direction?: string) =>
-    fetch('/api/sentiment/agent/predictions' + (direction ? `?direction=${direction}` : '')).then(r => r.json()),
+    authFetch('/api/sentiment/agent/predictions' + (direction ? `?direction=${direction}` : '')).then(r => r.json()),
   getPatternHistory: (id: number) =>
-    fetch(`/api/sentiment/agent/patterns/${id}/history`).then(r => r.json()),
+    authFetch(`/api/sentiment/agent/patterns/${id}/history`).then(r => r.json()),
   getLLMTraces: (phase?: string) =>
-    fetch('/api/llm/traces' + (phase ? `?phase=${phase}` : '')).then(r => r.json()),
+    authFetch('/api/llm/traces' + (phase ? `?phase=${phase}` : '')).then(r => r.json()),
   getLLMTraceDetail: (id: number) =>
-    fetch(`/api/llm/traces/${id}`).then(r => r.json()),
+    authFetch(`/api/llm/traces/${id}`).then(r => r.json()),
   triggerDeepLearn: (maxWindows = 100) =>
-    fetch(`/api/sentiment/agent/deep-learn?max_windows=${maxWindows}`, { method: 'POST' }).then(r => r.json()),
+    authFetch(`/api/sentiment/agent/deep-learn?max_windows=${maxWindows}`, { method: 'POST' }).then(r => r.json()),
   runPyClusterDeepLearn: (maxWindows = 100) =>
-    fetch(`/api/sentiment/agent/deep-learn/pycluster?max_windows=${maxWindows}`, { method: 'POST' }).then(r => r.json()),
+    authFetch(`/api/sentiment/agent/deep-learn/pycluster?max_windows=${maxWindows}`, { method: 'POST' }).then(r => r.json()),
   runCompare: (maxWindows = 100) =>
-    fetch(`/api/sentiment/agent/deep-learn/compare?max_windows=${maxWindows}`, { method: 'POST' }).then(r => r.json()),
+    authFetch(`/api/sentiment/agent/deep-learn/compare?max_windows=${maxWindows}`, { method: 'POST' }).then(r => r.json()),
   getCompareLive: () =>
-    fetch('/api/sentiment/agent/deep-learn/compare/live').then(r => r.json()),
-  getAgentHealth: () => fetch('/api/agent/health').then(r => r.json()),
+    authFetch('/api/sentiment/agent/deep-learn/compare/live').then(r => r.json()),
+  getAgentHealth: () => authFetch('/api/agent/health').then(r => r.json()),
   getAgentEvolution: (days = 30) =>
-    fetch(`/api/sentiment/agent/evolution?days=${days}`).then(r => r.json()),
-  getFakeBreakoutStatus: () => fetch('/api/fake-breakout/status').then(r => r.json()),
+    authFetch(`/api/sentiment/agent/evolution?days=${days}`).then(r => r.json()),
+  getFakeBreakoutStatus: () => authFetch('/api/fake-breakout/status').then(r => r.json()),
   getFakeBreakoutSignals: (limit = 50) =>
-    fetch(`/api/fake-breakout/signals?limit=${limit}`).then(r => r.json()),
+    authFetch(`/api/fake-breakout/signals?limit=${limit}`).then(r => r.json()),
   getFakeBreakoutSignalPath: (signalId: number) =>
-    fetch(`/api/fake-breakout/signals/${signalId}/path`).then(r => r.json()),
-  getFakeBreakoutStats: () => fetch('/api/fake-breakout/stats').then(r => r.json()),
+    authFetch(`/api/fake-breakout/signals/${signalId}/path`).then(r => r.json()),
+  getFakeBreakoutStats: () => authFetch('/api/fake-breakout/stats').then(r => r.json()),
   getBtcKlines: (interval: string, limit: number) =>
-    fetch(`/api/chart/btc-klines?interval=${interval}&limit=${limit}`).then(r => r.json()),
-  getSignalsAnalytics: () => fetch('/api/signals/analytics').then(r => r.json()),
-  getPatternCompare: () => fetch('/api/agent/patterns/compare').then(r => r.json()),
+    authFetch(`/api/chart/btc-klines?interval=${interval}&limit=${limit}`).then(r => r.json()),
+  getSignalsAnalytics: () => authFetch('/api/signals/analytics').then(r => r.json()),
+  getPatternCompare: () => authFetch('/api/agent/patterns/compare').then(r => r.json()),
   getPatternBacktestRuns: (patternId: number, limit = 30) =>
-    fetch(`/api/agent/patterns/backtest-runs?pattern_id=${patternId}&limit=${limit}`).then(r => r.json()),
+    authFetch(`/api/agent/patterns/backtest-runs?pattern_id=${patternId}&limit=${limit}`).then(r => r.json()),
   triggerReevaluate: () =>
-    fetch('/api/agent/patterns/reevaluate', { method: 'POST' }).then(r => r.json()),
+    authFetch('/api/agent/patterns/reevaluate', { method: 'POST' }).then(r => r.json()),
   commitDeepLearn: (discoveries: DeepLearnDiscovery[], snapshotToken?: string | null) =>
-    fetch('/api/sentiment/agent/deep-learn/commit', {
+    authFetch('/api/sentiment/agent/deep-learn/commit', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ discoveries, snapshot_token: snapshotToken ?? null }),
     }).then(r => r.json()),
   // 实盘面板（2026-08-22）：钱包/实盘状态/下单/订单历史
-  getPredictionWallet: () => fetch('/api/prediction-wallet').then(r => r.json()),
-  getLiveStatus: () => fetch('/api/misalignment/signals').then(r => r.json()),
-  getRecentTrades: (limit = 20) => fetch(`/api/trades/recent?limit=${limit}`).then(r => r.json()),
+  getPredictionWallet: () => authFetch('/api/prediction-wallet').then(r => r.json()),
+  getLiveStatus: () => authFetch('/api/misalignment/signals').then(r => r.json()),
+  getRecentTrades: (limit = 20) => authFetch(`/api/trades/recent?limit=${limit}`).then(r => r.json()),
   postTradeTest: (amount_usdt: number, prediction: string) =>
-    fetch('/api/trade/test', {
+    authFetch('/api/trade/test', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ amount_usdt, prediction }),
     }).then(r => r.json()),
   postTransferIn: (amount_usdt: number) =>
-    fetch('/api/prediction/transfer-in', {
+    authFetch('/api/prediction/transfer-in', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ amount_usdt }),
     }).then(r => r.json()),
   postTransferOut: (amount_usdt: number) =>
-    fetch('/api/prediction/transfer-out', {
+    authFetch('/api/prediction/transfer-out', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ amount_usdt }),
     }).then(r => r.json()),
   postLiveChannel: (channel: string, enabled: boolean, amountUsdt?: number, maxDailyOrders?: number) =>
-    fetch('/api/live/toggle', {
+    authFetch('/api/live/toggle', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -498,19 +526,19 @@ const api = {
         ...(maxDailyOrders != null ? { max_daily_orders: maxDailyOrders } : {}),
       }),
     }).then(r => r.json()),
-  getQuotePreview: () => fetch('/api/prediction/quote-preview').then(r => r.json()),
-  postSyncBinance: () => fetch('/api/trades/sync-binance', { method: 'POST' }).then(r => r.json()),
+  getQuotePreview: () => authFetch('/api/prediction/quote-preview').then(r => r.json()),
+  postSyncBinance: () => authFetch('/api/trades/sync-binance', { method: 'POST' }).then(r => r.json()),
   // 奖金领取（2026-08-23）：可领查询 + batch-redeem
-  getRedeemable: () => fetch('/api/prediction/redeemable').then(r => r.json()),
+  getRedeemable: () => authFetch('/api/prediction/redeemable').then(r => r.json()),
   postRedeem: () =>
-    fetch('/api/prediction/redeem', {
+    authFetch('/api/prediction/redeem', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({}),
     }).then(r => r.json()),
   // 线上信号概览：各影子版本累计统计（stats 按 version 服务端算）
   getMisalignmentSignals: (version: string) =>
-    fetch(`/api/misalignment/signals?limit=1&version=${version}`).then(r => r.json()),
+    authFetch(`/api/misalignment/signals?limit=1&version=${version}`).then(r => r.json()),
 }
 
 // ============================================================
@@ -1463,7 +1491,82 @@ const tabFromHash = (): TabId => {
   return (TAB_IDS as readonly string[]).includes(h) ? (h as TabId) : 'market'
 }
 
+// ============================================================
+// 登录页（单一访问密码，登录态存 localStorage 不过期）
+// ============================================================
+
+function LoginPage({ onLogin }: { onLogin: () => void }) {
+  const [password, setPassword] = useState('')
+  const [error, setError] = useState('')
+  const [loading, setLoading] = useState(false)
+
+  const submit = async () => {
+    if (!password || loading) return
+    setLoading(true); setError('')
+    try {
+      const resp = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password }),
+      })
+      const data = await resp.json().catch(() => ({}))
+      if (resp.ok && data.token) {
+        setAuthToken(data.token)
+        onLogin()
+      } else {
+        setError(typeof data.detail === 'string' ? data.detail : '登录失败')
+      }
+    } catch {
+      setError('网络错误，请重试')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div className="min-h-screen bg-[var(--bg)] flex items-center justify-center px-4">
+      <div className="w-full max-w-sm bg-white rounded-2xl border border-gray-200 shadow-sm p-8">
+        <h1 className="text-lg font-bold text-gray-900 mb-1 text-center">BTC 5min 预测系统</h1>
+        <p className="text-xs text-gray-400 mb-6 text-center">请输入访问密码</p>
+        <input
+          type="password"
+          value={password}
+          onChange={e => setPassword(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') submit() }}
+          placeholder="访问密码"
+          autoFocus
+          className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-cyan-500/40 focus:border-cyan-500"
+        />
+        {error && <div className="mt-2 text-xs text-red-500">{error}</div>}
+        <button
+          onClick={submit}
+          disabled={loading || !password}
+          className="mt-4 w-full px-4 py-2 text-sm font-semibold text-white bg-cyan-600 rounded-lg hover:bg-cyan-700 disabled:opacity-50 transition"
+        >
+          {loading ? '登录中...' : '登 录'}
+        </button>
+      </div>
+    </div>
+  )
+}
+
 export default function App() {
+  // 登录门禁：无 token 时只渲染登录页；401/跨标签清除时回到登录页（刷新后凭 localStorage 直接进入）
+  const [authed, setAuthed] = useState(() => !!getAuthToken())
+
+  useEffect(() => {
+    const onLogout = () => setAuthed(false)
+    const onStorage = (e: StorageEvent) => { if (e.key === AUTH_KEY && !e.newValue) setAuthed(false) }
+    window.addEventListener('auth-logout', onLogout)
+    window.addEventListener('storage', onStorage)
+    return () => {
+      window.removeEventListener('auth-logout', onLogout)
+      window.removeEventListener('storage', onStorage)
+    }
+  }, [])
+
+  const handleLogout = () => { clearAuthToken(); setAuthed(false) }
+
   const [tab, setTab] = useState<TabId>(tabFromHash)
 
   // replaceState 不产生历史条目，避免污染浏览器后退键
@@ -1503,6 +1606,8 @@ export default function App() {
       setMomentumLoading(false)
     }
   }
+
+  if (!authed) return <LoginPage onLogin={() => setAuthed(true)} />
 
   return (
     <div className="min-h-screen bg-[var(--bg)] flex flex-col">
@@ -1561,6 +1666,13 @@ export default function App() {
               实盘交易
             </button>
           </div>
+          <button
+            onClick={handleLogout}
+            title="退出登录"
+            className="absolute right-4 top-1/2 -translate-y-1/2 text-[11px] text-gray-400 hover:text-red-500 transition"
+          >
+            退出
+          </button>
         </div>
       </header>
 
@@ -2494,7 +2606,7 @@ function DeepLearnModal({ onClose, onCommitted }: { onClose: () => void; onCommi
     setLiveLog([]); setProgressCount(0)
     setSnapshotToken(null); setTrainCount(0); setHoldoutCount(0)
     try {
-      const resp = await fetch(
+      const resp = await authFetch(
         `/api/sentiment/agent/deep-learn/stream?max_windows=${maxWindows}`,
         { method: 'POST' },
       )

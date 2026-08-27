@@ -83,6 +83,8 @@ class Settings(BaseSettings):
     # API Bearer Token 认证密钥。空字符串时禁用认证（仅开发环境）。
     # 生产环境必须设置，否则所有 API 端点对外开放。
     api_auth_token: str = ""
+    # Web 登录密码（单一访问密码）。未配置时所有 /api 请求返回 401，登录页提示未配置。
+    login_password: str = ""
 
     # --- Binance Prediction Trading 配置 ---
     # Binance API Key（用于预测市场交易，需在币安后台开启 Prediction Trading 权限）
