@@ -109,9 +109,16 @@ jobs:
               -o docker-compose.prod.yml || echo "WARN: failed to update docker-compose.prod.yml, using existing file"
 
             # 写入生产 .env（仅当 ENV_FILE_CONTENT 配置时覆盖，否则使用服务器上已有的 .env）
-            # 通过环境变量传递，避免 secrets 内联展开的特殊字符问题
+            # 先解码到临时文件并校验非空，成功后再原子替换，避免解码失败把线上 .env 清空；
+            # tr -d 容忍 secret 中可能混入的 CR（Windows 侧生成密文时常见）。
             if [ -n "${ENV_FILE_CONTENT:-}" ]; then
-              echo "$ENV_FILE_CONTENT" | base64 -d > .env
+              echo "$ENV_FILE_CONTENT" | tr -d '\r' | base64 -d > .env.tmp
+              if [ ! -s .env.tmp ]; then
+                echo "ERROR: ENV_FILE_CONTENT decoded to empty, keeping existing .env"
+                rm -f .env.tmp
+                exit 1
+              fi
+              mv .env.tmp .env
             fi
 
             # 登录 GHCR 拉取私有镜像（通过环境变量传递，避免内联展开）
