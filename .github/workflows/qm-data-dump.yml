@@ -51,7 +51,7 @@ jobs:
             set -euo pipefail
             test -s /tmp/qm_signals_dump.csv || { echo "dump 文件缺失"; exit 1; }
             echo QMDUMPBEGIN
-            base64 -w0 /tmp/qm_signals_dump.csv
+            gzip -c /tmp/qm_signals_dump.csv | base64 -w0
             echo
             echo QMDUMPEND
             rm -f /tmp/qm_signals_dump.csv
@@ -64,7 +64,8 @@ jobs:
           sed -n '/QMDUMPBEGIN/,/QMDUMPEND/p' stdout.raw | grep -v QMDUMP \
             | tr -cd 'A-Za-z0-9+/=' > dump.b64
           test -s dump.b64 || { echo "定界提取失败"; cat stdout.raw | head -5; exit 1; }
-          base64 -d dump.b64 > qm_signals_dump.csv
+          grep -c '\*\*\*' stdout.raw || echo "无脱敏痕迹"
+          base64 -d dump.b64 | gunzip > qm_signals_dump.csv
           wc -l qm_signals_dump.csv
           head -2 qm_signals_dump.csv
           git config user.name "github-actions[bot]"
