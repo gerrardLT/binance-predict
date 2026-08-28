@@ -68,11 +68,13 @@ jobs:
           base64 -d dump.b64 | gunzip > qm_signals_dump.csv
           wc -l qm_signals_dump.csv
           head -2 qm_signals_dump.csv
+          git clone --depth 1 \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" repo
+          cp qm_signals_dump.csv repo/
+          cd repo
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git remote set-url origin \
-            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           git checkout -b tmp/qm-data-dump
           git add qm_signals_dump.csv
-          git commit -m "data(temp): misalignment_signals qm_v1/v2 全历史行级 dump（取回后删分支）"
+          git commit -m "data(temp): misalignment_signals 全历史行级 dump（取回后删分支）"
           git push -f origin tmp/qm-data-dump
