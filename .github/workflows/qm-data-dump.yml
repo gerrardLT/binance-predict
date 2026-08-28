@@ -1,0 +1,72 @@
+# 临时数据取回：dump misalignment_signals 全表（quote_momentum_v1/v2）→ 临时分支
+# 背景：/api/misalignment/signals 硬上限 200 条，v1 全历史 505 笔取不回；
+# 经 Actions SSH 通道直连生产 DB 导出行级数据（含 entry_quote_ts），
+# 用于 qm_v2 科学评估的全历史配对分析。用后即删本 workflow 与临时分支。
+name: QM Data Dump
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dump misalignment_signals via VPS SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
+          script: |
+            set -euo pipefail
+            cd /www/wwwroot/binance-predict
+            DB_USER=$(grep -E '^DB_USER=' .env | cut -d= -f2 || true)
+            DB_PASSWORD=$(grep -E '^DB_PASSWORD=' .env | cut -d= -f2 || true)
+            DB_NAME=$(grep -E '^DB_NAME=' .env | cut -d= -f2 || true)
+            DB_USER=${DB_USER:-postgres}; DB_NAME=${DB_NAME:-binance_predict}
+            if [ -z "${DB_PASSWORD}" ]; then echo "DB_PASSWORD 未取到"; exit 1; fi
+            CONTAINER=$(docker compose -f docker-compose.prod.yml ps -q db)
+            if [ -z "${CONTAINER}" ]; then echo "db 容器未找到"; exit 1; fi
+            echo "container=${CONTAINER} db=${DB_NAME}"
+            docker exec -e PGPASSWORD="${DB_PASSWORD}" "${CONTAINER}" \
+              psql -U "${DB_USER}" -d "${DB_NAME}" > /tmp/qm_signals_dump.csv <<'SQL'
+            COPY (
+              SELECT id, version, window_start, window_end, end_pct, outcome_base,
+                     direction, target_window_start, entry_down_price, entry_up_price,
+                     entry_quote_ts, entry_quote_kind, settle_outcome, win,
+                     ev_at_entry, status
+              FROM misalignment_signals
+              WHERE version IN ('quote_momentum_v1', 'quote_momentum_v2')
+              ORDER BY version, window_start
+            ) TO STDOUT WITH CSV HEADER
+            SQL
+            wc -l /tmp/qm_signals_dump.csv
+      - name: Fetch dump via SSH and push to temp branch
+        shell: bash
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/vps_key
+          chmod 600 ~/.ssh/vps_key
+          scp -i ~/.ssh/vps_key -P "${VPS_PORT}" \
+            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "${VPS_USER}@${VPS_HOST}:/tmp/qm_signals_dump.csv" ./qm_signals_dump.csv
+          wc -l qm_signals_dump.csv
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git checkout -b tmp/qm-data-dump
+          git add qm_signals_dump.csv
+          git commit -m "data(temp): misalignment_signals qm_v1/v2 全历史行级 dump（取回后删分支）"
+          git push -f origin tmp/qm-data-dump
+          ssh -i ~/.ssh/vps_key -p "${VPS_PORT}" \
+            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "${VPS_USER}@${VPS_HOST}" "rm -f /tmp/qm_signals_dump.csv" || true
