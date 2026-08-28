@@ -1,0 +1,27 @@
+# 临时：给 sshd 增加 2222 端口（本地运营商干扰 22 出站；保留 22 不影响 Actions 通道）
+name: SSH Port
+
+on:
+  workflow_dispatch:
+
+jobs:
+  add-port:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add sshd port 2222
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
+          script: |
+            set -e
+            if ! grep -qE '^Port 2222\b' /etc/ssh/sshd_config; then
+              grep -qE '^Port 22\b' /etc/ssh/sshd_config || echo 'Port 22' >> /etc/ssh/sshd_config
+              echo 'Port 2222' >> /etc/ssh/sshd_config
+            fi
+            sshd -t
+            (systemctl restart sshd || systemctl restart ssh) || service ssh restart
+            sleep 1
+            ss -tlnp | grep -E ':(22|2222)\s' || netstat -tlnp | grep -E ':(22|2222)\s'
