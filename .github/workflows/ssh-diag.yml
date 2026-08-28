@@ -33,5 +33,12 @@ jobs:
             echo '--- 云厂商安全组类：bt/1panel 防火墙 ---'
             (ls /www/server/panel/v2/ 2>/dev/null | head -5 || true)
             (bt default 2>/dev/null | head -5 || echo '(no bt cli)')
+            echo '--- iptables IN_BT 链（宝塔防火墙）---'
+            (iptables -L IN_BT -n -v 2>/dev/null | head -60 || echo '(no IN_BT access)')
+            echo '--- 宝塔防火墙规则文件 ---'
+            (grep -v '^#' /www/server/panel/v2/config.json 2>/dev/null | head -3 || true)
+            (ls /www/server/panel/plugin/ 2>/dev/null | head -10 || true)
+            echo '--- nftables ---'
+            (nft list ruleset 2>/dev/null | head -60 || echo '(no nft)')
             echo '--- sshd 日志最近 20 行 ---'
             (journalctl -u sshd -n 20 --no-pager 2>/dev/null || journalctl -u ssh -n 20 --no-pager 2>/dev/null || tail -n 20 /var/log/auth.log 2>/dev/null || echo '(no logs)')
