@@ -1108,7 +1108,7 @@ function LiveTradeTab() {
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-      <LiveChartCard />
+      {/* 布局：交易操作区置顶（人工测试单/账户状态/最近订单），K 线对照与信号概览下移 */}
       <Card title="人工测试单（真实下单）">
         <div className="space-y-3 text-sm">
           {quote == null || quote.stale ? (
@@ -1189,8 +1189,6 @@ function LiveTradeTab() {
           </p>
         </div>
       </Card>
-
-      <SignalsOverviewCard live={live} onToggleChannel={handleChannelToggle} busy={togglingLive} />
 
       <div className="lg:col-span-2">
       <Card title="账户状态">
@@ -1474,6 +1472,10 @@ function LiveTradeTab() {
           )}
         </Card>
       </div>
+
+      {/* 参考信息（2026-08-28 移至下方）：K 线 × 市场情绪对照 + 线上信号概览 */}
+      <LiveChartCard />
+      <SignalsOverviewCard live={live} onToggleChannel={handleChannelToggle} busy={togglingLive} />
     </div>
   )
 }
