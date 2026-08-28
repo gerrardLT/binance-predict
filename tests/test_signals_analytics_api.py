@@ -13,7 +13,7 @@ collector.fetch_recent_klines 用 AsyncMock patch。
 - 影子累计曲线按 window_start 升序，win 非空才计入
 - 影子版本 = 冻结基准 ∪ 数据中出现版本（新版本 bench=None 容错）
 - 场景信号过滤 = 排除 SceneParamVersion 中 SHADOW 版本名（ACTIVE 演进名视为正式）；
-  端点共 3 次 db.execute（影子行 → SHADOW 版本名 → 场景行）
+  端点共 4 次 db.execute（影子行 → KREV 行 → SHADOW 版本名 → 场景行）
 - K 线缓存键 = interval:档位（limit 归档到固定档），上游失败 10s 负缓存
 """
 
@@ -49,15 +49,27 @@ def _scene_row(**over) -> SimpleNamespace:
     return SimpleNamespace(**base)
 
 
-def _make_db(shadow_rows, scene_rows) -> AsyncMock:
+def _krev_row(**over) -> SimpleNamespace:
+    """KREV 影子行替身（kline_shadow_signals）：无报价/无 EV，direction 恒 UP。"""
+    base = dict(
+        version="krev_a_v1", window_start=1_000_000_000_000,
+        win=True, ev_at_entry=None, entry_down_price=None,
+        entry_up_price=None, direction="UP",
+    )
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def _make_db(shadow_rows, scene_rows, krev_rows=()) -> AsyncMock:
     db = AsyncMock()
-    r1, r2, r3 = MagicMock(), MagicMock(), MagicMock()
+    r1, r2, r3, r4 = MagicMock(), MagicMock(), MagicMock(), MagicMock()
     # 端点用指定列 SELECT，结果直接 .all()（不再 .scalars()）；
-    # 3 次查询顺序：影子行 → SceneParamVersion SHADOW 版本名（默认空）→ 场景行
+    # 4 次查询顺序：影子行 → KREV 行 → SceneParamVersion SHADOW 版本名（默认空）→ 场景行
     r1.all.return_value = shadow_rows
-    r2.all.return_value = []
-    r3.all.return_value = scene_rows
-    db.execute = AsyncMock(side_effect=[r1, r2, r3])
+    r2.all.return_value = krev_rows
+    r3.all.return_value = []
+    r4.all.return_value = scene_rows
+    db.execute = AsyncMock(side_effect=[r1, r2, r3, r4])
     return db
 
 
@@ -230,7 +242,8 @@ async def test_analytics_empty_db() -> None:
         "x4_v1", "quote_momentum_v1", "quote_contrarian_v1",
         "x4_v2", "quote_momentum_v2", "quote_contrarian_v2",
         "quote_contrarian_v3a", "quote_contrarian_v3b",
-        "late_night_contrarian_v1", "late_night_contrarian_v2"}
+        "late_night_contrarian_v1", "late_night_contrarian_v2",
+        "krev_a_v1", "krev_b_v1"}
     for v, blk in out["shadow"].items():
         assert blk["summary"]["n"] == 0
         assert blk["summary"]["win_rate"] is None
@@ -247,10 +260,45 @@ async def test_analytics_empty_db() -> None:
     ln2 = out["shadow"]["late_night_contrarian_v2"]["summary"]
     assert ln2["bench_winrate"] == 0.440 and ln2["bench_ev"] is None
     assert ln2["desc"].startswith("深夜逆势v2")
+    # KREV K 线反转族：720d 冻结 holdout 只钉胜率基准，EV 基准留 None（口径不直比）
+    kr = out["shadow"]["krev_a_v1"]["summary"]
+    assert kr["bench_winrate"] == 0.642 and kr["bench_ev"] is None
+    assert kr["desc"].startswith("K线反转A")
+    assert out["shadow"]["krev_b_v1"]["summary"]["bench_winrate"] == 0.634
     assert out["scene"] == {}
     assert out["regime"]["phases"] == {}
     assert out["regime"]["by_version"] == {}
     assert out["regime"]["daily"] == []
+
+
+@pytest.mark.asyncio
+async def test_analytics_krev_merged_from_kline_shadow_table() -> None:
+    """KREV 行（kline_shadow_signals 表）并入影子统计：胜率曲线正常，
+    EV/盈亏平衡恒空（无报价结算），并参与 regime 归因。"""
+    import binance_predict.main as m
+
+    krev = [
+        _krev_row(version="krev_a_v1", window_start=1_000, win=True),
+        _krev_row(version="krev_b_v1", window_start=2_000, win=False),
+    ]
+    db = _make_db([], [], krev_rows=krev)
+    out = await m.get_signals_analytics(db)
+
+    a = out["shadow"]["krev_a_v1"]
+    assert a["summary"]["n"] == 1
+    assert a["summary"]["win_rate"] == 1.0
+    # 无报价/无 EV：EV 与盈亏平衡列恒空（前端显示 '—'），胜率曲线正常
+    assert a["summary"]["avg_ev"] is None and a["summary"]["cum_ev"] is None
+    assert a["summary"]["avg_breakeven"] is None
+    assert a["summary"]["bench_winrate"] == 0.642
+    assert [p["cum_wr"] for p in a["curve"]] == [1.0]
+    b = out["shadow"]["krev_b_v1"]
+    assert b["summary"]["win_rate"] == 0.0
+    assert b["summary"]["bench_winrate"] == 0.634
+    # regime 归因：KREV 行同样参与 pre/pump 拆分（早于 PUMP_TS_MS → pre）
+    bv = out["regime"]["by_version"]
+    assert bv["krev_a_v1"]["pre"] == {"n": 1, "wins": 1, "winrate": 1.0}
+    assert bv["krev_b_v1"]["pre"] == {"n": 1, "wins": 0, "winrate": 0.0}
 
 
 def test_shadow_breakeven_x4_family_includes_premium() -> None:

@@ -125,6 +125,12 @@ jobs:
               mv .env.tmp .env
             fi
 
+            # KREV K 线影子信号自 2026-08-28 起与其他影子信号一致默认开启
+            # （代码默认 true）。历史 secret 可能残留 KLINE_SHADOW_ENABLED=false
+            # 显式覆盖默认值，部署时兜底删除该行，保证线上行为与代码默认一致；
+            # 如需紧急停用：改 settings 默认值为 false 再部署。
+            sed -i '/^KLINE_SHADOW_ENABLED=false$/d' .env
+
             # 登录 GHCR 拉取私有镜像（通过环境变量传递，避免内联展开）
             echo "${GITHUB_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
 

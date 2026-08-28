@@ -3808,6 +3808,8 @@ const SHADOW_META: Record<string, { label: string; color: string }> = {
   x4_v1: { label: 'X4 misalign→DOWN', color: '#1f77b4' },
   quote_momentum_v1: { label: 'A momentum', color: '#d62728' },
   quote_contrarian_v1: { label: 'B contrarian', color: '#2ca02c' },
+  krev_a_v1: { label: 'KREV-A 反转→UP', color: '#9467bd' },
+  krev_b_v1: { label: 'KREV-B 反转→UP', color: '#e377c2' },
 }
 const SCENE_META: Record<string, { label: string; color: string }> = {
   bull_exhaust: { label: 'S1 bull_exhaust→DOWN', color: '#1f77b4' },
@@ -4055,7 +4057,7 @@ function SignalAnalyticsTab() {
       </Card>
 
       {/* 影子三版本 */}
-      <Card title="影子信号（x4 / momentum / contrarian）：累计胜率 vs 回测基准 vs 盈亏平衡">
+      <Card title="影子信号（x4 / momentum / contrarian / KREV K线反转）：累计胜率 vs 回测基准 vs 盈亏平衡">
         {analytics && (
           <>
             <div className="overflow-x-auto mb-3">

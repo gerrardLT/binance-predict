@@ -324,8 +324,10 @@ class Settings(BaseSettings):
     # --- K 线科学发现影子信号（KREV 族，2026-08-28）---
     # 720d 发现流水线冻结注册表条件的实时重放：15m bar 收盘后复用离线特征
     # 管道求值（口径逐位一致），次根收盘按回测口径结算。只记录不下注。
-    # 默认关闭：验证口径保真测试全绿后在 .env 显式置 KLINE_SHADOW_ENABLED=true
-    kline_shadow_enabled: bool = False
+    # 默认开启：与其他影子信号（fake_breakout/misalignment/quote_edge）一致，
+    # 部署即生效；口径保真测试已全绿（registry replay 381/132/137 & 378/130/134）。
+    # 仅作紧急停用制动力，正常情况下无需触碰。
+    kline_shadow_enabled: bool = True
     # 影子期邮件推送开关（默认静默，防轰炸；结算复盘口径预留）
     kline_shadow_email_enabled: bool = False
 

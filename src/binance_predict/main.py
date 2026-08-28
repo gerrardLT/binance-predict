@@ -2773,6 +2773,11 @@ SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     # 深夜门禁 v2：基准为线上情绪窗重放 OOS（F1 优化发现，r6 扩样池；非 K 线代理），
     # 只钉胜率；EV 基准留 None（重放均值与逐笔影子 EV 口径不直比）
     "late_night_contrarian_v2": (0.440, None, "深夜逆势v2: v1+触发时点距日高回落≥0.30%（线上情绪窗重放OOS n=50 胜率44.0% CI[31.2%,57.7%]，盈亏平衡≈27%，剔除段IS wr 0.140/EV负）"),
+    # KREV K 线反转族（2026-08-28）：基准为 720d 发现流水线冻结 holdout（样本外），
+    # 只钉胜率；EV 基准留 None（回测 EV@0.50 为固定价位口径，与 K 线涨跌结算的
+    # 无报价影子不可直比；holdout 参考 EV：A +0.234 / B +0.219）
+    "krev_a_v1": (0.642, None, "K线反转A: 距前低≤-0.09ATR+5根高效率阴跌+3子阴齐跌 → 押次根收阳（720d holdout n=137 胜率64.2%，月一致性0.957）"),
+    "krev_b_v1": (0.634, None, "K线反转B: 区间贴底+5根高效率阴跌+3子阴齐跌 → 押次根收阳（720d holdout n=134 胜率63.4%）"),
 }
 # 周期切分点：08-19 00:00 UTC（三根大阳起点）；< 为震荡期（大涨前），≥ 为大涨期
 PUMP_TS_MS = int(datetime(2026, 8, 19, tzinfo=timezone.utc).timestamp() * 1000)
@@ -2855,9 +2860,9 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
     胜负判定（场景/legacy）按 side 映射：side=high 押 DOWN、side=low 押 UP，
     与 /api/fake-breakout/stats 的 compute_pattern_stats 同语义。
     """
-    from sqlalchemy import select as sa_select
+    from sqlalchemy import literal as sa_literal, select as sa_select
 
-    from .db.models import MisalignmentSignal
+    from .db.models import KlineShadowSignal, MisalignmentSignal
     from .services.fake_breakout_detector import RESEARCH_WIN_RATES
 
     # ---- 影子信号：全量 SETTLED 升序（仅取所需列，避免整行 ORM 实体化）----
@@ -2871,6 +2876,23 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
         .where(MisalignmentSignal.status == "SETTLED")
         .order_by(MisalignmentSignal.window_start)
     )).all()
+    # KREV（kline_shadow_signals 表，2026-08-28 并入）：K 线反转影子，结算口径为
+    # 次根 K 线涨跌（无报价/无逐笔 EV），列对齐成与上表一致的行结构后合并——
+    # ev/entry 恒 None（前端对应列显示 '—'），direction 恒 UP（押次根收阳）。
+    krev_rows = (await db.execute(
+        sa_select(
+            KlineShadowSignal.version,
+            KlineShadowSignal.target_bar_start.label("window_start"),
+            KlineShadowSignal.win,
+            sa_literal(None).label("ev_at_entry"),
+            sa_literal(None).label("entry_down_price"),
+            sa_literal(None).label("entry_up_price"),
+            sa_literal("UP").label("direction"),
+        )
+        .where(KlineShadowSignal.status == "SETTLED")
+        .order_by(KlineShadowSignal.target_bar_start)
+    )).all()
+    sh_rows = list(sh_rows) + list(krev_rows)
     # 版本 = 冻结基准已知版本 ∪ 数据中出现的版本（新版本缺基准不崩，bench 为 None）
     versions = [
         "x4_v1", "quote_momentum_v1", "quote_contrarian_v1",
@@ -2878,6 +2900,7 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
         "quote_contrarian_v3a", "quote_contrarian_v3b",  # v3 环境门禁版（可选实盘通道，默认 OFF）
         "late_night_contrarian_v1",  # 深夜时段变体（纯影子，2026-08-26）
         "late_night_contrarian_v2",  # 深夜门禁 v2（纯影子，2026-08-27：v1+距日高回落≥0.30%）
+        "krev_a_v1", "krev_b_v1",  # K 线反转族（纯影子，2026-08-28：新表 kline_shadow_signals）
     ]
     versions += sorted({s.version for s in sh_rows} - set(versions))
     shadow = {}

@@ -310,8 +310,12 @@ def test_versions_isolated_from_trading_path() -> None:
         assert v not in LIVE_CHANNELS, f"{v} 不得注册实盘通道"
 
 
-def test_settings_default_off() -> None:
-    """默认关闭：合并即零行为变化，显式开启才生效。"""
+def test_settings_default_on() -> None:
+    """默认开启：与其他影子信号（fake_breakout/misalignment/quote_edge）一致。
+
+    影子模式零资金风险（只记录不下注、新表物理隔离），口径保真测试
+    已全绿，无需人为显式开启；开关仅作紧急停用制动力。
+    """
     from binance_predict.config.settings import settings
-    assert settings.kline_shadow_enabled is False
+    assert settings.kline_shadow_enabled is True
     assert settings.kline_shadow_email_enabled is False
