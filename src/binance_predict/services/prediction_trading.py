@@ -666,6 +666,9 @@ class BinancePredictionTrader:
         2026-08-28 补丁：amountIn ← filledUsdtAmount（实际成交金额）——
         FOK 只吃到部分深度时实际成交 < 请求金额（生产实锤：请求 3U 只成交 2U，
         本地仍按 3U 估算赢向盈亏虚高 55%）；原请求金额保留在 requestedAmountIn。
+        同日补丁二：携带 filledShareQty（扣 marketProviderFee 后的实际到手股数，
+        结算赢向优先按 股数−成本 对齐币安实现盈亏；费用以少给股数体现：
+        12.5 → 12.28 股）。
         """
         try:
             fill_price = float(fill_row.get("price"))
@@ -684,6 +687,12 @@ class BinancePredictionTrader:
         if filled_usdt > 0:
             merged["requestedAmountIn"] = quote.get("amountIn")
             merged["amountIn"] = str(int(filled_usdt * (10 ** 18)))
+        try:
+            filled_shares = float(fill_row.get("filledShareQty"))
+        except (TypeError, ValueError):
+            filled_shares = -1.0
+        if filled_shares > 0:
+            merged["filledShareQty"] = filled_shares
         return merged
 
     @staticmethod

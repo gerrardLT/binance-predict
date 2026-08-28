@@ -411,7 +411,10 @@ async def resettle_window_orders(
             win = row.direction == outcome
             amount = TradeSettler._amount_usdt(row)
             avg = TradeSettler._avg_price(row)
-            if win and amount is not None and avg is not None:
+            shares = TradeSettler._shares(row)
+            if win and amount is not None and shares is not None:
+                pnl = shares - amount  # 币安实际到手股数（已扣费）：对齐实现盈亏
+            elif win and amount is not None and avg is not None:
                 pnl = amount / avg - amount
             elif not win and amount is not None:
                 pnl = -amount

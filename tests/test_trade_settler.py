@@ -119,6 +119,26 @@ async def test_settle_win(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_settle_win_prefers_filled_shares(monkeypatch) -> None:
+    """赢向优先按币安实际到手股数算：pnl = filledShareQty − 成本（2026-08-28）。
+
+    marketProviderFee 以少给股数体现（生产实锤：2U/0.16 → 12.28 股而非 12.5）；
+    无费口径 2/0.16−2=10.5 比币安实现盈亏 10.27 高约费用额，
+    股数口径 12.28−2=10.28 才对得上。
+    """
+    db = _Db([_row(direction="DOWN", amount_in=str(2 * 10 ** 18),
+                   quote_json={"averagePrice": 0.16, "filledShareQty": 12.28})],
+             _window("DOWN"))
+    _stub_db(monkeypatch, db)
+
+    assert await TradeSettler().poll_once() == 1
+
+    p = _params(db.updates[0])
+    assert p["win"] is True
+    assert p["pnl"] == pytest.approx(12.28 - 2.0)
+
+
+@pytest.mark.asyncio
 async def test_settle_lose(monkeypatch) -> None:
     """输：direction!=outcome → win=False、pnl=-amount=-1.0（无需均价）。"""
     db = _Db([_row(direction="DOWN", quote_json=None)], _window("UP"))

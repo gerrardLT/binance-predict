@@ -232,6 +232,21 @@ async def test_resettle_win_recomputes_pnl() -> None:
 
 
 @pytest.mark.asyncio
+async def test_resettle_win_prefers_shares() -> None:
+    """改判后赢向优先股数口径（同 TradeSettler，2026-08-28）：
+    pnl = filledShareQty − 成本（已扣 marketProviderFee），而非无费的 amount/avg−amount。"""
+    row = _order(direction="UP", settle_outcome="DOWN", win=False,
+                 pnl=-3.0, amount_in=str(2 * 10 ** 18),
+                 quote_json={"averagePrice": 0.16, "filledShareQty": 12.28})
+    db = _Db(orders=[row])
+    changed = await acr.resettle_window_orders(db, S1, EXIT, "UP")
+
+    assert changed == 1
+    assert row.win is True
+    assert row.pnl == pytest.approx(12.28 - 2.0)
+
+
+@pytest.mark.asyncio
 async def test_resettle_noise() -> None:
     """NOISE：win=None、pnl=0.0（口径同 TradeSettler）。"""
     row = _order()

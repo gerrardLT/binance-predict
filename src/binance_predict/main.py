@@ -2424,7 +2424,9 @@ async def _sync_binance_orders_impl() -> dict:
 
         # 场景三：部分成交订正——以币安历史行 filledUsdtAmount 为权威，
         # 订正 FILLED 行 amount_in（FOK 只吃到部分深度时小于请求金额），
-        # 并按结算同口径重算已结算行 pnl（赢=amount/均价−amount，输=−amount）。
+        # 并按结算同口径重算已结算行 pnl（赢优先股数−成本，回退 amount/均价−amount，
+        # 输=−amount）；filledShareQty 同步回填 quote_json（已扣 marketProviderFee，
+        # 赢向无费口径比币安实现盈亏高约费用额，生产实锤 10.5 vs 10.27）。
         for row in filled_rows:
             bo = by_orderid.get(str(row.order_id))
             if not bo or bo.get("status") != "FILLED":
@@ -2440,24 +2442,38 @@ async def _sync_binance_orders_impl() -> dict:
                 local_wei = int(row.amount_in or 0)
             except (TypeError, ValueError):
                 local_wei = 0
-            if abs(actual_wei - local_wei) <= 10 ** 15:  # ≤0.001 USDT 视为一致（精度噪声）
+            amount_mismatch = abs(actual_wei - local_wei) > 10 ** 15  # ≤0.001 USDT 视为一致（精度噪声）
+            shares = TradeSettler._to_float(bo.get("filledShareQty"))
+            has_local_shares = TradeSettler._shares(row) is not None
+            # 跳过条件：金额一致 且（本地已有股数，或 币安未给股数/行未结算赢向 → 无新信息可回填）
+            if not amount_mismatch and (
+                has_local_shares
+                or not (shares and row.settled_at is not None and row.win)
+            ):
                 continue
-            row.amount_in = str(actual_wei)
             amt = float(filled_usdt)
+            if amount_mismatch:
+                row.amount_in = str(actual_wei)
+            if shares and not has_local_shares:
+                qj = dict(row.quote_json or {})
+                qj["filledShareQty"] = shares
+                row.quote_json = qj
             avg = TradeSettler._avg_price(row)
             if row.settled_at is not None and row.win is not None:
-                if row.win and avg is not None:
+                if row.win and shares:
+                    row.pnl = shares - amt
+                elif row.win and avg is not None:
                     row.pnl = amt / avg - amt
                 elif not row.win:
                     row.pnl = -amt
             amount_corrected.append({
                 "id": row.id, "order_id": row.order_id,
                 "old_amount": local_wei / 1e18, "new_amount": amt,
-                "pnl": row.pnl,
+                "shares": shares, "pnl": row.pnl,
             })
             logger.warning(
-                "部分成交订正 | 订单 {} | id={} | 请求金额 {} → 实际成交 {} USDT | pnl={}",
-                row.order_id, row.id, local_wei / 1e18, amt,
+                "部分成交订正 | 订单 {} | id={} | 金额 {} → {} USDT | 股数 {} | pnl={}",
+                row.order_id, row.id, local_wei / 1e18, amt, shares,
                 f"{row.pnl:+.4f}" if row.pnl is not None else "N/A")
         await db.commit()
     return {"synced": len(synced), "details": synced,

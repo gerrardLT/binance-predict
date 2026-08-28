@@ -1416,24 +1416,32 @@ async def test_signal_trade_success_dynamic_slippage(monkeypatch) -> None:
 
 
 def test_merge_fill_partial_fill_amount() -> None:
-    """部分成交订正（2026-08-28）：amountIn ← filledUsdtAmount。
+    """部分成交订正（2026-08-28）：amountIn ← filledUsdtAmount，
+    携带 filledShareQty（扣 marketProviderFee 后的实际到手股数）。
 
     FOK 只吃到部分深度时实际成交 < 请求金额；不订正则结算按请求金额
-    估算赢向盈亏虚高（生产实锤：请求 3U 只成交 2U，15.75 虚高 vs 实际 10.28）。
+    估算赢向盈亏虚高（生产实锤：请求 3U 只成交 2U，15.75 虚高 vs 实际 10.28）；
+    费用以少给股数体现（12.5 → 12.28 股），赢向按股数算才对得上币安实现盈亏。
     """
     quote = {"averagePrice": 0.71, "amountIn": "5000000000000000000", "quoteId": "Q1"}
     merged = BinancePredictionTrader._merge_fill_into_quote(
         quote, {"orderId": "O1", "status": "FILLED", "price": "0.55",
-                "filledUsdtAmount": "2"})
+                "filledUsdtAmount": "2", "filledShareQty": "12.28"})
     assert merged["averagePrice"] == 0.55
     assert merged["amountIn"] == "2000000000000000000"
     assert merged["requestedAmountIn"] == "5000000000000000000"
+    assert merged["filledShareQty"] == 12.28
     # filledUsdtAmount 缺失/零/非法 → 保持报价金额（无可靠数据不做半吊子回填）
     for bad in (None, "0", "abc"):
         row = {"price": "0.55", "filledUsdtAmount": bad}
         unchanged = BinancePredictionTrader._merge_fill_into_quote(quote, row)
         assert unchanged["amountIn"] == "5000000000000000000"
         assert "requestedAmountIn" not in unchanged
+    # filledShareQty 缺失/零/非法 → 不携带（结算回退无费估算口径）
+    for bad in (None, "0", "abc"):
+        row = {"price": "0.55", "filledUsdtAmount": "2", "filledShareQty": bad}
+        no_shares = BinancePredictionTrader._merge_fill_into_quote(quote, row)
+        assert "filledShareQty" not in no_shares
 
 
 @pytest.mark.asyncio

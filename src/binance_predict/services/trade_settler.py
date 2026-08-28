@@ -15,7 +15,9 @@ ix_trade_orders_settle_pending 只覆盖待结算行，空转亚毫秒）。
 
 结算规则：
     outcome ∈ {UP, DOWN}：win = (direction == outcome)；
-        pnl = amount/avg_price − amount（赢）/ −amount（输），
+        赢：优先 shares − amount（shares = quote_json.filledShareQty，币安实际
+        到手股数已扣 marketProviderFee，对齐实现盈亏；2026-08-28），
+        回退 amount/avg_price − amount；输：−amount。
         amount = amount_in/1e18，avg_price = quote_json.averagePrice。
     outcome == NOISE：win=None, pnl=0.0（return=0 极罕见 16/3522，
         真实赔付规则未知，保守记 0；settled_at 锚点天然终止重扫）。
@@ -24,8 +26,8 @@ ix_trade_orders_settle_pending 只覆盖待结算行，空转亚毫秒）。
         归档器恢复后可手动重算）。
     无匹配窗口且未超 24h：跳过，下轮重试。
 
-pnl 口径注释：本地估算（成交均价口径），币安侧验证阶段校正——
-不用 amount_out（落库的是 quote 预估值非成交实际值）。
+pnl 口径注释：本地估算（优先币安实际到手股数，回退无费成交均价口径），
+币安侧验证阶段校正——不用 amount_out（落库的是 quote 预估值非成交实际值）。
 
 结构克隆 quote_edge_detector 范式（60s 轮询 + per-row 独立
 commit/rollback + 异常不中断）；无 backscan——锚点是 settled_at
@@ -180,8 +182,11 @@ class TradeSettler:
             win = row.direction == outcome
             amount = self._amount_usdt(row)
             avg_price = self._avg_price(row)
+            shares = self._shares(row)
             settle_price = self._to_float(window.exit_price)
-            if win and amount is not None and avg_price is not None:
+            if win and amount is not None and shares is not None:
+                pnl = shares - amount  # 币安实际到手股数（已扣费）：对齐实现盈亏
+            elif win and amount is not None and avg_price is not None:
                 pnl = amount / avg_price - amount
             elif not win and amount is not None:
                 pnl = -amount
@@ -233,7 +238,7 @@ class TradeSettler:
         """15m 场景订单结算：回读 FakeBreakoutSignal.settle_outcome。
 
         结算判定与 pnl 公式与 5m 路径同口径（win = direction == outcome；
-        赢 amount/avg_price−amount / 输 −amount）；settle_price 取信号行
+        赢优先 股数−成本 回退 amount/avg_price−amount / 输 −amount）；settle_price 取信号行
         settle_btc_price（15m 周期末 BTC 中间价 P(E)）。信号未结算
         （PENDING）时 15m 检测器结算可能迟到：settle_deadline+24h 内
         下轮重试，超期 EXPIRED 出清（与 5m 兜底一致）。
@@ -261,8 +266,11 @@ class TradeSettler:
             win = row.direction == outcome
             amount = self._amount_usdt(row)
             avg_price = self._avg_price(row)
+            shares = self._shares(row)
             settle_price = self._to_float(sig.settle_btc_price)
-            if win and amount is not None and avg_price is not None:
+            if win and amount is not None and shares is not None:
+                pnl = shares - amount  # 币安实际到手股数（已扣费）：对齐实现盈亏
+            elif win and amount is not None and avg_price is not None:
                 pnl = amount / avg_price - amount
             elif not win and amount is not None:
                 pnl = -amount
@@ -361,6 +369,17 @@ class TradeSettler:
         """quote_json.averagePrice → 成交均价；无效/零返回 None。"""
         try:
             v = float((row.quote_json or {}).get("averagePrice") or 0)
+            return v if v > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _shares(row: TradeOrderModel) -> float | None:
+        """quote_json.filledShareQty → 币安实际到手股数（已扣 marketProviderFee，
+        成交确认/对账回填）；缺失/无效/零返回 None。2026-08-28：费用以少给股数
+        体现，无费估算（amount/均价）比币安实现盈亏高约费用额。"""
+        try:
+            v = float((row.quote_json or {}).get("filledShareQty") or 0)
             return v if v > 0 else None
         except (TypeError, ValueError):
             return None
