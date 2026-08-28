@@ -22,6 +22,7 @@ import hashlib
 import hmac
 import math
 import time
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import httpx
@@ -655,13 +656,16 @@ class BinancePredictionTrader:
 
     @staticmethod
     def _merge_fill_into_quote(quote: dict, fill_row: dict) -> dict:
-        """用币安订单历史行的实际成交价增强 quote_json（落库口径升级，2026-08-28）。
+        """用币安订单历史行的实际成交数据增强 quote_json（落库口径升级，2026-08-28）。
 
         averagePrice ← 历史行 price（实际成交均价，币安结算口径）；原报价
         预估均价保留在 quotedAvgPrice，fillSource 标记来源。落库后
         trade_settler._avg_price 读 quote_json.averagePrice 即自动升级为
         实际成交口径（结算/统计无需改动）。price 缺失/非法/≤0 时原样返回
         （无可靠成交价时不做半吊子回填，保持报价预估口径）。
+        2026-08-28 补丁：amountIn ← filledUsdtAmount（实际成交金额）——
+        FOK 只吃到部分深度时实际成交 < 请求金额（生产实锤：请求 3U 只成交 2U，
+        本地仍按 3U 估算赢向盈亏虚高 55%）；原请求金额保留在 requestedAmountIn。
         """
         try:
             fill_price = float(fill_row.get("price"))
@@ -673,6 +677,13 @@ class BinancePredictionTrader:
         merged["quotedAvgPrice"] = quote.get("averagePrice")
         merged["averagePrice"] = fill_price
         merged["fillSource"] = "binance_history_confirm"
+        try:
+            filled_usdt = Decimal(str(fill_row.get("filledUsdtAmount")))
+        except (InvalidOperation, TypeError, ValueError):
+            filled_usdt = Decimal(-1)
+        if filled_usdt > 0:
+            merged["requestedAmountIn"] = quote.get("amountIn")
+            merged["amountIn"] = str(int(filled_usdt * (10 ** 18)))
         return merged
 
     @staticmethod

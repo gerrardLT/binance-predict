@@ -2341,6 +2341,9 @@ async def _sync_binance_orders_impl() -> dict:
     场景二（幽灵成交订正）：本地 FILLED 但币安侧同 orderId 为 FAILED
     （FOK 受理后翻转未成交）——改判 FAILED 并清除 win/pnl 等结算字段，
     避免不存在的盈亏污染统计、win 单误入可领取列表。
+    场景三（部分成交订正，2026-08-28）：FOK 只吃到部分深度时实际成交金额 <
+    请求金额（生产实锤：请求 3U 只成交 2U，本地按 3U 估算赢向 pnl 虚高 55%）——
+    以币安历史行 filledUsdtAmount 为权威订正 amount_in，并重算已结算行 pnl。
     """
     import re
     from decimal import Decimal
@@ -2370,6 +2373,7 @@ async def _sync_binance_orders_impl() -> dict:
             by_window[int(m.group(1)) * 1000] = o
 
     synced: list[dict] = []
+    amount_corrected: list[dict] = []
     async with async_session_factory() as db:
         stmt = select(TradeOrderModel).where(
             TradeOrderModel.status == "PENDING",
@@ -2417,8 +2421,48 @@ async def _sync_binance_orders_impl() -> dict:
                 "status": "FAILED", "order_id": row.order_id,
                 "corrected": "ghost_filled",
             })
+
+        # 场景三：部分成交订正——以币安历史行 filledUsdtAmount 为权威，
+        # 订正 FILLED 行 amount_in（FOK 只吃到部分深度时小于请求金额），
+        # 并按结算同口径重算已结算行 pnl（赢=amount/均价−amount，输=−amount）。
+        for row in filled_rows:
+            bo = by_orderid.get(str(row.order_id))
+            if not bo or bo.get("status") != "FILLED":
+                continue
+            try:
+                filled_usdt = Decimal(str(bo.get("filledUsdtAmount") or "0"))
+            except Exception:
+                continue
+            if filled_usdt <= 0:
+                continue
+            actual_wei = int(filled_usdt * (10 ** 18))
+            try:
+                local_wei = int(row.amount_in or 0)
+            except (TypeError, ValueError):
+                local_wei = 0
+            if abs(actual_wei - local_wei) <= 10 ** 15:  # ≤0.001 USDT 视为一致（精度噪声）
+                continue
+            row.amount_in = str(actual_wei)
+            amt = float(filled_usdt)
+            avg = TradeSettler._avg_price(row)
+            if row.settled_at is not None and row.win is not None:
+                if row.win and avg is not None:
+                    row.pnl = amt / avg - amt
+                elif not row.win:
+                    row.pnl = -amt
+            amount_corrected.append({
+                "id": row.id, "order_id": row.order_id,
+                "old_amount": local_wei / 1e18, "new_amount": amt,
+                "pnl": row.pnl,
+            })
+            logger.warning(
+                "部分成交订正 | 订单 {} | id={} | 请求金额 {} → 实际成交 {} USDT | pnl={}",
+                row.order_id, row.id, local_wei / 1e18, amt,
+                f"{row.pnl:+.4f}" if row.pnl is not None else "N/A")
         await db.commit()
-    return {"synced": len(synced), "details": synced, "binance_orders": len(history)}
+    return {"synced": len(synced), "details": synced,
+            "amount_corrected": amount_corrected,
+            "binance_orders": len(history)}
 
 
 @app.post("/api/trades/sync-binance")
