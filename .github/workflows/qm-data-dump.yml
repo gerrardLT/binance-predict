@@ -24,9 +24,9 @@ jobs:
           script: |
             set -euo pipefail
             cd /www/wwwroot/binance-predict
-            DB_USER=$(grep -E '^DB_USER=' .env | cut -d= -f2 || true)
-            DB_PASSWORD=$(grep -E '^DB_PASSWORD=' .env | cut -d= -f2 || true)
-            DB_NAME=$(grep -E '^DB_NAME=' .env | cut -d= -f2 || true)
+            DB_USER=$(grep -E '^DB_USER=' .env | head -1 | cut -d= -f2 | tr -d '\r"' | xargs || true)
+            DB_PASSWORD=$(grep -E '^DB_PASSWORD=' .env | head -1 | cut -d= -f2- | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' || true)
+            DB_NAME=$(grep -E '^DB_NAME=' .env | head -1 | cut -d= -f2 | tr -d '\r"' | xargs || true)
             DB_USER=${DB_USER:-postgres}; DB_NAME=${DB_NAME:-binance_predict}
             if [ -z "${DB_PASSWORD}" ]; then echo "DB_PASSWORD 未取到"; exit 1; fi
             CONTAINER=$(docker compose -f docker-compose.prod.yml ps -q db)
