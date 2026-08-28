@@ -513,9 +513,6 @@ const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({}),
     }).then(r => r.json()),
-  // 线上信号概览：各影子版本累计统计（stats 按 version 服务端算）
-  getMisalignmentSignals: (version: string) =>
-    authFetch(`/api/misalignment/signals?limit=1&version=${version}`).then(r => r.json()),
 }
 
 // ============================================================
@@ -878,131 +875,108 @@ function TestTradeFab({ quote, remainSec, urgent, wallet, refresh }: {
   )
 }
 
-// 右侧抽屉：最近订单（2026-08-28 从主布局整行卡移入；数据由 LiveTradeTab 15s 轮询传入）
-function OrdersDrawer({ orders, syncing, syncResult, onSyncBinance }: {
+// 最近订单卡片（页面主区展示，2026-08-28 用户要求回归页面）
+function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
   orders: Record<string, unknown>[]
   syncing: boolean
   syncResult: Record<string, unknown> | null
   onSyncBinance: () => void
 }) {
-  const [open, setOpen] = useState(false)
   const settledOrders = orders.filter(o => o.settled_at != null)
   const settledCount = settledOrders.length
   const totalPnl = settledOrders.reduce(
     (s, o) => s + (typeof o.pnl === 'number' ? (o.pnl as number) : 0), 0)
 
   return (
-    <>
-      {!open && (
-        <button
-          onClick={() => setOpen(true)}
-          className="fixed right-0 top-[38%] -translate-y-1/2 z-40 bg-slate-600 text-white text-xs font-bold px-2 py-3 rounded-l-lg shadow-lg hover:bg-slate-700 transition"
-          style={{ writingMode: 'vertical-rl' }}
-          title="查看最近订单"
-        >
-          📋 最近订单
-        </button>
-      )}
-
-      <div
-        className={`fixed top-0 right-0 h-screen w-[760px] max-w-[94vw] bg-white shadow-2xl border-l border-gray-200 z-50 flex flex-col transition-transform duration-300 ${open ? 'translate-x-0' : 'translate-x-full'}`}
-      >
-        <div className="px-4 py-2.5 border-b border-gray-200 flex items-center justify-between shrink-0">
-          <span className="text-sm font-bold text-gray-800">📋 最近订单</span>
-          <button onClick={() => setOpen(false)} className="text-gray-400 hover:text-gray-700 text-lg leading-none px-1">✕</button>
-        </div>
-
-        <div className="flex-1 min-h-0 overflow-auto p-4">
-          <div className="flex items-center justify-between mb-2 gap-2">
-            <span className="text-xs text-gray-400">{orders.length} 条记录（每 15s 自动刷新）</span>
-            <div className="flex items-center gap-2">
-              {syncResult && (
-                <span className={`text-xs px-2 py-0.5 rounded ${syncResult.error ? 'bg-red-50 text-red-600' : 'bg-green-50 text-green-700'}`}>
-                  {syncResult.error
-                    ? String(syncResult.error)
-                    : `币安侧 ${String(syncResult.binance_orders ?? '?')} 单，已同步 ${String(syncResult.synced ?? 0)} 单`}
-                </span>
-              )}
-              <button
-                onClick={onSyncBinance} disabled={syncing}
-                className="px-3 py-1 text-xs font-semibold rounded bg-slate-600 text-white disabled:opacity-50"
-              >{syncing ? '对账中…' : '对账（同步币安）'}</button>
-            </div>
-          </div>
-          {orders.length === 0 ? (
-            <p className="text-sm text-gray-400">暂无订单记录</p>
-          ) : (
-            <table className="w-full text-xs">
-              <thead>
-                <tr className="text-left text-gray-500 border-b border-gray-100">
-                  <th className="py-1 pr-2">时间</th>
-                  <th className="py-1 pr-2">版本</th>
-                  <th className="py-1 pr-2">方向</th>
-                  <th className="py-1 pr-2">状态</th>
-                  <th className="py-1 pr-2">结果</th>
-                  <th className="py-1 pr-2">均价</th>
-                  <th className="py-1 pr-2">金额 (USDT)</th>
-                  <th className="py-1 pr-2">盈亏</th>
-                  <th className="py-1">说明</th>
-                </tr>
-              </thead>
-              <tbody>
-                {orders.map(o => (
-                  <tr key={String(o.id)} className="border-b border-gray-50">
-                    <td className="py-1.5 pr-2 text-gray-600 whitespace-nowrap">
-                      {o.created_at ? new Date(String(o.created_at)).toLocaleString() : '--'}
-                    </td>
-                    <td className="py-1.5 pr-2 font-mono text-gray-700">{String(o.signal_version ?? '--')}</td>
-                    <td className="py-1.5 pr-2">
-                      {o.direction === 'UP'
-                        ? <span className="px-1.5 py-0.5 rounded font-bold bg-green-100 text-green-700">UP</span>
-                        : o.direction === 'DOWN'
-                          ? <span className="px-1.5 py-0.5 rounded font-bold bg-red-100 text-red-700">DOWN</span>
-                          : <span className="text-gray-400">--</span>}
-                    </td>
-                    <td className="py-1.5 pr-2">
-                      <span className={`px-1.5 py-0.5 rounded font-bold ${o.status === 'FILLED' ? 'bg-green-100 text-green-700' : o.status === 'FAILED' ? 'bg-red-100 text-red-700' : 'bg-gray-100 text-gray-600'}`}>
-                        {String(o.status)}
-                      </span>
-                    </td>
-                    <td className="py-1.5 pr-2">
-                      {o.win === true
-                        ? <span className="px-1.5 py-0.5 rounded font-bold bg-green-100 text-green-700">WIN</span>
-                        : o.win === false
-                          ? <span className="px-1.5 py-0.5 rounded font-bold bg-red-100 text-red-700">LOSE</span>
-                          : o.settle_outcome != null
-                            ? <span className="px-1.5 py-0.5 rounded font-bold bg-gray-100 text-gray-600">{String(o.settle_outcome)}</span>
-                            : <span className="text-gray-400">--</span>}
-                    </td>
-                    <td className="py-1.5 pr-2 font-mono">{o.average_price != null ? String(o.average_price) : '--'}</td>
-                    <td className="py-1.5 pr-2 font-mono">
-                      {o.amount_in != null ? (Number(o.amount_in) / 1e18).toFixed(2) : '--'}
-                    </td>
-                    <td className={`py-1.5 pr-2 font-mono ${typeof o.pnl === 'number' ? ((o.pnl as number) >= 0 ? 'text-green-700' : 'text-red-600') : 'text-gray-400'}`}>
-                      {typeof o.pnl === 'number'
-                        ? `${(o.pnl as number) >= 0 ? '+' : ''}${(o.pnl as number).toFixed(2)}`
-                        : '--'}
-                    </td>
-                    <td className="py-1.5 text-gray-500">{String(o.error_message ?? '')}</td>
-                  </tr>
-                ))}
-              </tbody>
-              {settledCount > 0 && (
-                <tfoot>
-                  <tr className="border-t border-gray-100 text-gray-600">
-                    <td colSpan={7} className="py-1.5">已结算 {settledCount} 单（本地估算口径）</td>
-                    <td className={`py-1.5 font-mono font-bold ${totalPnl >= 0 ? 'text-green-700' : 'text-red-600'}`}>
-                      {totalPnl >= 0 ? '+' : ''}{totalPnl.toFixed(2)}
-                    </td>
-                    <td className="py-1.5 text-gray-400">USDT</td>
-                  </tr>
-                </tfoot>
-              )}
-            </table>
+    <Card title="最近订单">
+      <div className="flex items-center justify-between mb-2 gap-2">
+        <span className="text-xs text-gray-400">{orders.length} 条记录（每 15s 自动刷新）</span>
+        <div className="flex items-center gap-2">
+          {syncResult && (
+            <span className={`text-xs px-2 py-0.5 rounded ${syncResult.error ? 'bg-red-50 text-red-600' : 'bg-green-50 text-green-700'}`}>
+              {syncResult.error
+                ? String(syncResult.error)
+                : `币安侧 ${String(syncResult.binance_orders ?? '?')} 单，已同步 ${String(syncResult.synced ?? 0)} 单`}
+            </span>
           )}
+          <button
+            onClick={onSyncBinance} disabled={syncing}
+            className="px-3 py-1 text-xs font-semibold rounded bg-slate-600 text-white disabled:opacity-50"
+          >{syncing ? '对账中…' : '对账（同步币安）'}</button>
         </div>
       </div>
-    </>
+      {orders.length === 0 ? (
+        <p className="text-sm text-gray-400">暂无订单记录</p>
+      ) : (
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="text-left text-gray-500 border-b border-gray-100">
+              <th className="py-1 pr-2">时间</th>
+              <th className="py-1 pr-2">版本</th>
+              <th className="py-1 pr-2">方向</th>
+              <th className="py-1 pr-2">状态</th>
+              <th className="py-1 pr-2">结果</th>
+              <th className="py-1 pr-2">均价</th>
+              <th className="py-1 pr-2">金额 (USDT)</th>
+              <th className="py-1 pr-2">盈亏</th>
+              <th className="py-1">说明</th>
+            </tr>
+          </thead>
+          <tbody>
+            {orders.map(o => (
+              <tr key={String(o.id)} className="border-b border-gray-50">
+                <td className="py-1.5 pr-2 text-gray-600 whitespace-nowrap">
+                  {o.created_at ? new Date(String(o.created_at)).toLocaleString() : '--'}
+                </td>
+                <td className="py-1.5 pr-2 font-mono text-gray-700">{String(o.signal_version ?? '--')}</td>
+                <td className="py-1.5 pr-2">
+                  {o.direction === 'UP'
+                    ? <span className="px-1.5 py-0.5 rounded font-bold bg-green-100 text-green-700">UP</span>
+                    : o.direction === 'DOWN'
+                      ? <span className="px-1.5 py-0.5 rounded font-bold bg-red-100 text-red-700">DOWN</span>
+                      : <span className="text-gray-400">--</span>}
+                </td>
+                <td className="py-1.5 pr-2">
+                  <span className={`px-1.5 py-0.5 rounded font-bold ${o.status === 'FILLED' ? 'bg-green-100 text-green-700' : o.status === 'FAILED' ? 'bg-red-100 text-red-700' : 'bg-gray-100 text-gray-600'}`}>
+                    {String(o.status)}
+                  </span>
+                </td>
+                <td className="py-1.5 pr-2">
+                  {o.win === true
+                    ? <span className="px-1.5 py-0.5 rounded font-bold bg-green-100 text-green-700">WIN</span>
+                    : o.win === false
+                      ? <span className="px-1.5 py-0.5 rounded font-bold bg-red-100 text-red-700">LOSE</span>
+                      : o.settle_outcome != null
+                        ? <span className="px-1.5 py-0.5 rounded font-bold bg-gray-100 text-gray-600">{String(o.settle_outcome)}</span>
+                        : <span className="text-gray-400">--</span>}
+                </td>
+                <td className="py-1.5 pr-2 font-mono">{o.average_price != null ? String(o.average_price) : '--'}</td>
+                <td className="py-1.5 pr-2 font-mono">
+                  {o.amount_in != null ? (Number(o.amount_in) / 1e18).toFixed(2) : '--'}
+                </td>
+                <td className={`py-1.5 pr-2 font-mono ${typeof o.pnl === 'number' ? ((o.pnl as number) >= 0 ? 'text-green-700' : 'text-red-600') : 'text-gray-400'}`}>
+                  {typeof o.pnl === 'number'
+                    ? `${(o.pnl as number) >= 0 ? '+' : ''}${(o.pnl as number).toFixed(2)}`
+                    : '--'}
+                </td>
+                <td className="py-1.5 text-gray-500">{String(o.error_message ?? '')}</td>
+              </tr>
+            ))}
+          </tbody>
+          {settledCount > 0 && (
+            <tfoot>
+              <tr className="border-t border-gray-100 text-gray-600">
+                <td colSpan={7} className="py-1.5">已结算 {settledCount} 单（本地估算口径）</td>
+                <td className={`py-1.5 font-mono font-bold ${totalPnl >= 0 ? 'text-green-700' : 'text-red-600'}`}>
+                  {totalPnl >= 0 ? '+' : ''}{totalPnl.toFixed(2)}
+                </td>
+                <td className="py-1.5 text-gray-400">USDT</td>
+              </tr>
+            </tfoot>
+          )}
+        </table>
+      )}
+    </Card>
   )
 }
 
@@ -1054,98 +1028,6 @@ interface LiveChannelStatus {
   fire_total: number
   fired_windows: number[]
   filled_today?: number
-}
-
-// 线上信号概览卡：12 通道一屏总览（60s 轮询，统计为全量累计不随 limit 截断）
-// onToggleChannel：行内通道开关回调（由 LiveTradeTab 注入，confirm 统一在那里，
-// 避免两处开关状态不一致互咬）
-function SignalsOverviewCard({ live, onToggleChannel, busy = false }: {
-  live: Record<string, unknown> | null
-  onToggleChannel?: (ch: LiveChannelStatus) => void
-  busy?: boolean
-}) {
-  const [stats, setStats] = useState<Record<string, Record<string, unknown> | null>>({})
-  const [fb, setFb] = useState<Record<string, unknown> | null>(null)
-
-  const refresh = useCallback(() => {
-    // quote_edge/x4 八通道：misalignment 影子统计（版本名与通道名一致）
-    const versions = ['quote_contrarian_v1', 'quote_momentum_v1', 'quote_contrarian_v2', 'quote_momentum_v2', 'quote_contrarian_v3a', 'quote_contrarian_v3b', 'x4_v1', 'x4_v2']
-    versions.forEach(v => {
-      api.getMisalignmentSignals(v)
-        .then(d => setStats(prev => ({ ...prev, [v]: d?.stats ?? null })))
-        .catch(() => {})
-    })
-    // scene 四通道：fake_breakout 全局统计（无按 pattern_type 细分的端点，作行内参考）
-    api.getFakeBreakoutStats().then(setFb).catch(() => {})
-  }, [])
-
-  useEffect(() => {
-    refresh()
-    const t = setInterval(refresh, 60000)
-    return () => clearInterval(t)
-  }, [refresh])
-
-  const channels = Array.isArray(live?.channels) ? live.channels as LiveChannelStatus[] : []
-
-  const fbTotal = fb?.total_signals
-  const fbWr = fb?.down_win_rate
-  const fbStatText = fbTotal != null
-    ? `${String(fbTotal)} 信号 · DOWN 胜率 ${typeof fbWr === 'number' ? (fbWr * 100).toFixed(0) : '?'}%`
-    : '--'
-
-  return (
-    <Card title="线上信号概览">
-      <div className="text-xs">
-        {channels.map(ch => {
-          const info = SIGNAL_INFO[ch.channel]
-          const s = stats[ch.channel]
-          let statText: string
-          if (ch.family === 'scene') {
-            statText = `今日 ${String(ch.filled_today ?? 0)} 单 · 开火 ${String(ch.fire_total)}（场景全局：${fbStatText}）`
-          } else if (s != null) {
-            const n = s.settled as number | undefined
-            const wr = s.win_rate as number | null | undefined
-            const ev = s.avg_ev as number | null | undefined
-            statText = `${String(n ?? 0)} 注 · 胜率 ${wr != null ? (wr * 100).toFixed(0) : '?'}% · EV ${ev != null ? `${ev >= 0 ? '+' : ''}${ev.toFixed(3)}` : '?'}（影子口径）`
-          } else {
-            statText = '--'
-          }
-          return (
-            <div key={ch.channel} className="flex items-center justify-between gap-2 py-1.5 border-b border-gray-50 last:border-0">
-              <span className="flex items-center gap-1.5 min-w-0">
-                <span className={`px-1.5 py-0.5 text-[10px] font-bold rounded border shrink-0 ${SIGNAL_KIND_BADGE[info?.kind ?? '影子']}`}>{info?.kind ?? '影子'}</span>
-                <span className="text-gray-700 font-medium truncate">{info?.name ?? ch.display_name}</span>
-                <span className="text-[10px] text-gray-400 font-mono shrink-0 hidden sm:inline">{ch.channel}</span>
-                <HelpHint text={info?.desc ?? ''} />
-                {ch.enabled && (
-                  <span className="text-[10px] font-semibold shrink-0 text-green-700">
-                    · 开火中 {String(ch.amount_usdt)}U/单
-                  </span>
-                )}
-              </span>
-              <span className="flex items-center gap-1.5 shrink-0">
-                <span className="font-mono text-[11px] text-gray-600 text-right">{statText}</span>
-                {onToggleChannel && (
-                  <button
-                    onClick={() => onToggleChannel(ch)}
-                    disabled={busy}
-                    className={`px-2 py-0.5 text-[10px] font-semibold rounded text-white disabled:opacity-50 shrink-0 ${ch.enabled ? 'bg-red-500 hover:bg-red-600' : 'bg-green-600 hover:bg-green-700'}`}
-                    title={ch.enabled ? '关闭该通道（在途任务不受影响）' : '开启该通道（confirm 后生效，独立金额/护栏/日限）'}
-                  >{ch.enabled ? '停火' : '开火'}</button>
-                )}
-              </span>
-            </div>
-          )
-        })}
-        {channels.length === 0 && (
-          <div className="text-gray-400 py-2">实盘通道状态不可用（执行器未装配？详见后端日志）</div>
-        )}
-        <p className="text-[10px] text-gray-400 mt-1.5">
-          12 通道全部支持实盘：每通道独立金额/日限/执行价护栏（通道管理与金额热调见「实盘交易」页）。影子统计 60s 刷新。
-        </p>
-      </div>
-    </Card>
-  )
 }
 
 function LiveTradeTab() {
@@ -1209,7 +1091,7 @@ function LiveTradeTab() {
     : null
   const urgent = remainSec != null && remainSec < 60
 
-  // 在途持仓（FILLED 未结算；订单明细/累计盈亏已移入右侧 OrdersDrawer）
+  // 在途持仓（FILLED 未结算；订单明细/累计盈亏见账户状态下方「最近订单」）
   const openPositions = orders.filter(o => o.status === 'FILLED' && !o.settled_at)
   const openAmount = openPositions.reduce(
     (s, o) => s + (o.amount_in != null ? Number(o.amount_in) / 1e18 : 0), 0)
@@ -1550,12 +1432,14 @@ function LiveTradeTab() {
       </Card>
       </div>
 
-      <SignalsOverviewCard live={live} onToggleChannel={handleChannelToggle} busy={togglingLive} />
+      {/* 最近订单：主区账户状态下方（2026-08-28 用户要求回归页面展示） */}
+      <div className="lg:col-span-2">
+        <OrdersCard orders={orders} syncing={syncing} syncResult={syncResult} onSyncBinance={handleSyncBinance} />
+      </div>
     </div>
 
-    {/* 悬浮与抽屉（2026-08-28）：下单 FAB + 订单/K 线右侧抽屉 */}
+    {/* 悬浮与抽屉（2026-08-28）：下单 FAB + K 线右侧抽屉 */}
     <TestTradeFab quote={quote} remainSec={remainSec} urgent={urgent} wallet={wallet} refresh={refresh} />
-    <OrdersDrawer orders={orders} syncing={syncing} syncResult={syncResult} onSyncBinance={handleSyncBinance} />
     <ChartDrawer />
     </>
   )

@@ -131,6 +131,17 @@ jobs:
             # 如需紧急停用：改 settings 默认值为 false 再部署。
             sed -i '/^KLINE_SHADOW_ENABLED=false$/d' .env
 
+            # Agent 告警邮件总闸（2026-08-28 用户要求停发）：线上 .env 由
+            # ENV_FILE_CONTENT secret 写入，可能残留 true 或缺行（缺行时代码默认 true），
+            # 部署时强制置 false，停止 [Agent 告警] 邮件（健康监控仍跑，仅不推送）。
+            # 与信号邮件（SIGNAL_PUSH_EMAIL_ENABLED）解耦，信号推送不受影响。
+            # 如需恢复告警：删除下面四行并改 ENV_FILE_CONTENT secret 内置 true 再部署。
+            if grep -q '^AGENT_ALERT_NOTIFY_ENABLED=' .env; then
+              sed -i 's/^AGENT_ALERT_NOTIFY_ENABLED=.*/AGENT_ALERT_NOTIFY_ENABLED=false/' .env
+            else
+              echo 'AGENT_ALERT_NOTIFY_ENABLED=false' >> .env
+            fi
+
             # 登录 GHCR 拉取私有镜像（通过环境变量传递，避免内联展开）
             echo "${GITHUB_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
 
