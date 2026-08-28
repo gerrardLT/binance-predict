@@ -33,18 +33,11 @@ jobs:
             if [ -z "${CONTAINER}" ]; then echo "db 容器未找到"; exit 1; fi
             echo "container=${CONTAINER} db=${DB_NAME}"
             docker exec -e PGPASSWORD="${DB_PASSWORD}" "${CONTAINER}" \
-              psql -U "${DB_USER}" -d "${DB_NAME}" > /tmp/qm_signals_dump.csv <<'SQL'
-            COPY (
-              SELECT id, version, window_start, window_end, end_pct, outcome_base,
-                     direction, target_window_start, entry_down_price, entry_up_price,
-                     entry_quote_ts, entry_quote_kind, settle_outcome, win,
-                     ev_at_entry, status
-              FROM misalignment_signals
-              WHERE version IN ('quote_momentum_v1', 'quote_momentum_v2')
-              ORDER BY version, window_start
-            ) TO STDOUT WITH CSV HEADER
-            SQL
+              psql -U "${DB_USER}" -d "${DB_NAME}" -c "COPY (SELECT id, version, window_start, window_end, end_pct, outcome_base, direction, target_window_start, entry_down_price, entry_up_price, entry_quote_ts, entry_quote_kind, settle_outcome, win, ev_at_entry, status FROM misalignment_signals WHERE version LIKE \"quote_momentum%\" ORDER BY version, window_start) TO STDOUT WITH CSV HEADER" \
+              > /tmp/qm_signals_dump.csv
+            test -s /tmp/qm_signals_dump.csv || { echo "dump 为空"; exit 1; }
             wc -l /tmp/qm_signals_dump.csv
+            head -2 /tmp/qm_signals_dump.csv
       - name: Fetch dump content (base64 via ssh-action capture_stdout)
         id: fetch
         uses: appleboy/ssh-action@v1
