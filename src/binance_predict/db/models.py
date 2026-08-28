@@ -891,6 +891,84 @@ class MisalignmentSignal(Base):
     )
 
 
+class KlineShadowSignal(Base):
+    """
+    K 线科学发现影子信号（KREV 族）：720d 发现流水线冻结注册表条件的实时重放。
+
+    来源：output/kline_discovery_15m_720d_v2 冻结注册表——
+    KREV-A（Top3，holdout 64.2%/EV+0.234）：dist_prior_low_atr_5 ≤ -0.0935 ∧
+    efficiency_5 ≥ 0.8615 ∧ path3_all_down → 反转做多；
+    KREV-B（Top4，holdout 63.4%/EV+0.219）：range_pos_prior_5 ≤ -0.0468 ∧ 同上两条件。
+    只记录不下注：15m bar 收盘后复用离线特征管道（单一事实源）求值注册表条件
+    原文，次根收盘回读 OHLC 按回测口径结算，攒 2~3 周真实样本复核后人工 promote。
+    与下单路径物理隔离：新表不被任何下单代码引用，不进 X4_VERSIONS/LIVE_CHANNELS。
+    """
+    __tablename__ = "kline_shadow_signals"
+    __table_args__ = (
+        UniqueConstraint("version", "signal_bar_start", name="uq_kshadow_version_bar"),
+        Index("ix_kshadow_status", "status"),
+        Index("ix_kshadow_target_bar", "target_bar_start"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    version: Mapped[str] = mapped_column(
+        String(24), nullable=False,
+        comment="信号口径版本：krev_a_v1 / krev_b_v1（与冻结注册表条件一一对应）",
+    )
+    discovery_id: Mapped[str] = mapped_column(
+        String(16), nullable=False,
+        comment="冻结注册表 discovery_id（krev_a=fd191c44fb5c36 / krev_b=5c5e4c78ab4c3f）",
+    )
+    condition_text: Mapped[str] = mapped_column(
+        Text, nullable=False,
+        comment="注册表条件原文（逐字复制，审计口径保真用）",
+    )
+    timeframe: Mapped[str] = mapped_column(
+        String(4), nullable=False, default="15m", server_default="15m",
+        comment="信号周期（本族恒 15m）",
+    )
+    signal_bar_start: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, comment="信号根（15m）open_time（ms）"
+    )
+    signal_bar_end: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, comment="信号根 close_time（ms）= 判定时刻"
+    )
+    direction: Mapped[str] = mapped_column(
+        String(4), nullable=False, default="UP", server_default="UP",
+        comment="押注方向（reversal_1 信号根为阴线，恒押次根收阳 = UP）",
+    )
+    target_bar_start: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, comment="目标根（次 15m 根）open_time（ms）= signal_bar_end"
+    )
+    feature_snapshot: Mapped[dict | None] = mapped_column(
+        JSONB, nullable=True,
+        comment="触发时特征实际值快照（审计：实时值与离线口径对照）",
+    )
+    settle_open: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="次根开盘价（结算回读）"
+    )
+    settle_close: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="次根收盘价（结算回读）"
+    )
+    settle_outcome: Mapped[str | None] = mapped_column(
+        String(10), nullable=True, comment="次根方向 UP | DOWN | NOISE（平盘无法判向）"
+    )
+    win: Mapped[bool | None] = mapped_column(
+        Boolean, nullable=True,
+        comment="回测口径：次根收阳（close>open）即赢；NOISE/缺数据为 NULL",
+    )
+    status: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="PENDING", server_default="PENDING",
+        comment="PENDING（等次根收盘）| SETTLED（已结算）| EXPIRED（缺数据/超时未结算）",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    settled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 # ============================================================
 # 模式回测快照表（每个模式每次回测的完整记录，支撑无限进化与前后对比）
 # ============================================================

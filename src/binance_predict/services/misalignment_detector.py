@@ -5,9 +5,13 @@
     回测成绩：IS 65.6%(n=122) / OOS 57.8%(n=45) / 合并 63.5%，
     EV +0.254 CI(0.038, 0.493)（费 2%+溢 0.01；瑕疵：实价覆盖 19%）。
 
-影子纪律（M4）：只记录不下注、不占风控配额。邮件推送（2026-08-25）：
-仅对应通道已开启实盘开火才推，新鲜度闸自动静默冷启动回补/污染重扫；
-总开关 signal_push_email_enabled，全局日限防轰炸。
+影子纪律（M4）：只记录不下注、不占风控配额。邮件推送（2026-08-28 改为
+结算后复盘口径）：触发落表不再发预告邮件；结算置 SETTLED 落库后按
+新鲜度闸(sig.window_end) → 通道开关(is_live_enabled) → 实盘成交闸
+(has_live_filled_order，x4 订单 window_start=次窗起点即 target_window_start，
+决策点 +150s 已下单、此时早已终态，查询时序成立) 推送复盘邮件（含
+win/entry/EV），被实盘门禁拦下的信号不再推。新鲜度闸自动静默冷启动
+回补/污染重扫；总开关 signal_push_email_enabled，全局日限防轰炸。
 数据流：完全复用 sentiment_windows 归档——
     1. 每 60s 轮询新归档窗口 W_n；
     2. W_n 收阳 & end_pct≤40 → 落 PENDING 信号（target = W_n.end_time 起的次窗）；
@@ -32,7 +36,9 @@ from sqlalchemy import select as sa_select
 
 from binance_predict.db.engine import async_session_factory
 from binance_predict.db.models import MisalignmentSignal, SentimentWindow
-from .signal_notify import fire_signal_email, fmt_bjt, is_fresh_signal, is_live_enabled
+from .signal_notify import (
+    fire_signal_email, fmt_bjt, has_live_filled_order, is_fresh_signal, is_live_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -256,17 +262,8 @@ class MisalignmentDetector:
                     datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc).strftime("%H:%M"),
                     end_pct, end_ms,
                 )
-                # 邮件推送（fire-and-forget）：仅实时新信号且 x4_v1 已开实盘
-                if is_fresh_signal(end_ms) and is_live_enabled("x4_v1"):
-                    fire_signal_email(
-                        "x4",
-                        f"[信号] x4_v1 | 押次窗DOWN | 窗口 "
-                        f"{fmt_bjt(start_ms)} 北京时间",
-                        f"版本: x4_v1（影子，只记录不下注）\n"
-                        f"触发窗: {fmt_bjt(start_ms)}~{fmt_bjt(end_ms, with_date=False)} 北京时间\n"
-                        f"条件: 本窗收阳 & 窗末 UP%={end_pct:.1f} ≤ 40\n"
-                        f"押注: 次窗 DOWN（目标窗起 {fmt_bjt(end_ms)} 北京时间，结算后落表）",
-                    )
+                # 邮件推送已挪到结算回读后（_settle_pending_for，2026-08-28）：
+                # 落表预告改为结算复盘，且只推实盘已成交的信号（FILLED 闸）。
 
             # --- x4_v2：v1 条件全同 + 平静市门禁（独立幂等/独立 commit，只加不改）---
             dup2 = await session.execute(
@@ -297,18 +294,6 @@ class MisalignmentDetector:
             datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).strftime("%m-%d %H:%M"),
             end_pct, past1h, end_ms,
         )
-        # 邮件推送（fire-and-forget）：仅实时新信号且 x4_v2 已开实盘
-        if is_fresh_signal(end_ms) and is_live_enabled(X4_V2_VERSION):
-            fire_signal_email(
-                "x4",
-                f"[信号] x4_v2 | 押次窗DOWN（平静市）| 窗口 "
-                f"{fmt_bjt(start_ms)} 北京时间",
-                f"版本: x4_v2（影子，只记录不下注）\n"
-                f"触发窗: {fmt_bjt(start_ms)}~{fmt_bjt(end_ms, with_date=False)} 北京时间\n"
-                f"条件: 本窗收阳 & 窗末 UP%={end_pct:.1f} ≤ 40 & |前1h涨跌|={abs(past1h):.2f}% < 0.5%\n"
-                f"押注: 次窗 DOWN（目标窗起 {fmt_bjt(end_ms)} 北京时间，结算后落表）",
-            )
-
     async def _settle_pending_for(self, w: SentimentWindow) -> None:
         """本窗 start == 信号 target_window_start → 回读曲线结算。"""
         start_ms = int(w.start_time)
@@ -351,6 +336,42 @@ class MisalignmentDetector:
                     f"{sig.ev_at_entry:+.3f}" if sig.ev_at_entry is not None else "N/A",
                 )
             await session.commit()
+
+            # 邮件推送（2026-08-28 挪到结算回读后，fire-and-forget）：结算置
+            # SETTLED 落库后，对每条信号按闸链推复盘邮件——新鲜度闸
+            # (sig.window_end，回补/重扫静默) → 通道开关(is_live_enabled) →
+            # 实盘成交闸(has_live_filled_order：x4 订单 window_start=次窗起点
+            # 即 target_window_start，决策点 +150s 已下单，此时早已终态；被
+            # 实盘门禁拦下的信号无 FILLED 行 → 不推)。expire_on_commit=False，
+            # commit 后 sig 属性仍可安全读取。EXPIRED 行不推。边界：下单确认
+            # 暂落 PENDING、事后由对账翻成 FILLED 的信号会漏推（闸只在结算
+            # 时刻评估一次，宁少勿多）。
+            for sig in sigs:
+                if sig.status != "SETTLED":
+                    continue
+                if not (is_fresh_signal(int(sig.window_end))
+                        and is_live_enabled(sig.version)
+                        and await has_live_filled_order(
+                            sig.version, int(sig.target_window_start))):
+                    continue
+                win_str = "赢" if sig.win else "输"
+                entry = sig.entry_down_price
+                entry_str = f"{float(entry):.3f}" if entry is not None else "N/A"
+                ev = sig.ev_at_entry
+                ev_str = f"{float(ev):+.3f}" if ev is not None else "N/A"
+                fire_signal_email(
+                    "x4",
+                    f"[信号·实盘] {sig.version} | 押次窗DOWN {win_str} | 触发窗 "
+                    f"{fmt_bjt(int(sig.window_start))} 北京时间",
+                    f"版本: {sig.version}（实盘已成交，本邮件为结算复盘）\n"
+                    f"触发窗: {fmt_bjt(int(sig.window_start))}"
+                    f"~{fmt_bjt(int(sig.window_end), with_date=False)} 北京时间\n"
+                    f"条件: 本窗收阳 & 窗末 UP%={float(sig.end_pct):.1f} ≤ 40\n"
+                    f"押注: 次窗 DOWN（次窗 {fmt_bjt(int(sig.target_window_start))} 北京时间）\n"
+                    f"入场: 决策点 +{DECISION_T_SEC:.0f}s DOWN报价 {entry_str}\n"
+                    f"结算: {sig.settle_outcome} → {win_str}\n"
+                    f"EV: {ev_str}（0.98/(p+0.01)−1 / −1，费 2%+溢 0.01）",
+                )
 
     async def _expire_stale_pending(self) -> None:
         """超时未结算的 PENDING（次窗归档缺失/停机跨窗）→ EXPIRED，防永久挂起。"""

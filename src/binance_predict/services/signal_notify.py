@@ -12,6 +12,11 @@
   toggle 热调）；未注入/装配失败 → 一律不推（fail-safe 宁少勿多）。
   v3a/v3b 已注册为 LIVE_CHANNELS 可选通道（默认 OFF）：toggle 开启后才推，
   未开启时 resolver 返回 False 不推。
+- 实盘成交闸（2026-08-28 推送口径升级）：通道开着 ≠ 真实下注——v3 环境核验
+  失败 / 执行价护栏弃单 / 日单量停火 / FOK 未成交的信号此前照样推送，邮件
+  胜率因此偏离实盘胜率。现要求该信号在 trade_orders 存在 FILLED 行才推
+  （has_live_filled_order / has_scene_filled_order），各检测器的推送点同步
+  挪到结算回读后（结算时实盘订单早已终态，查询时序成立）。
 
 调用约定：各检测器落表成功后 fire-and-forget（asyncio.create_task）调用，
 与场景信号邮件同模式——SMTP 被防火墙丢包时绝不阻塞检测循环（信号 #1 事故教训）。
@@ -25,8 +30,11 @@ from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 
 from loguru import logger
+from sqlalchemy import select as sa_select
 
 from ..config.settings import settings
+from ..db.engine import async_session_factory
+from ..db.models import TradeOrderModel
 from .alerting import send_plain_email
 
 # 邮件展示时区：北京时间（2026-08-25 用户要求，推送邮件时间统一北京时间，
@@ -72,6 +80,51 @@ def is_fresh_signal(window_end_ms: int, now_ms: int | None = None) -> bool:
     """信号新鲜度判定：仅实时新信号才值得推送（历史重放静默）。"""
     now = now_ms if now_ms is not None else int(time.time() * 1000)
     return (now - int(window_end_ms)) <= SIGNAL_FRESH_MS
+
+
+async def has_live_filled_order(signal_version: str, window_start: int) -> bool:
+    """该信号对应的实盘订单是否真实成交（trade_orders 存在 FILLED 行）。
+
+    推送链最后一道闸：quote_edge / x4 通道按 (signal_version=通道名,
+    window_start) 精确匹配订单行；v3 环境核验失败、执行价护栏弃单、日单量
+    停火、FOK 未成交的信号无 FILLED 行 → 不推。查询异常按 False 处理
+    （宁少勿多，与 is_live_enabled 同 fail-safe 语义）。
+    """
+    try:
+        async with async_session_factory() as session:
+            row = (await session.execute(
+                sa_select(TradeOrderModel.id).where(
+                    TradeOrderModel.signal_version == signal_version,
+                    TradeOrderModel.window_start == window_start,
+                    TradeOrderModel.status == "FILLED",
+                ).limit(1)
+            )).first()
+        return row is not None
+    except Exception as exc:
+        logger.warning("[SIGNAL] 实盘成交查询异常，按未成交处理 | {} | 窗口 {} | {}",
+                       signal_version, window_start, exc)
+        return False
+
+
+async def has_scene_filled_order(scene_signal_id: int) -> bool:
+    """场景信号关联的实盘订单是否真实成交（按 scene_signal_id 匹配）。
+
+    场景订单下单时 scene_signal_id 与占位同事务落库（下单即关联，无需回填），
+    匹配天然可靠；影子信号无实盘订单 → 恒 False（影子行被推送闸天然过滤）。
+    """
+    try:
+        async with async_session_factory() as session:
+            row = (await session.execute(
+                sa_select(TradeOrderModel.id).where(
+                    TradeOrderModel.scene_signal_id == int(scene_signal_id),
+                    TradeOrderModel.status == "FILLED",
+                ).limit(1)
+            )).first()
+        return row is not None
+    except Exception as exc:
+        logger.warning("[SIGNAL] 场景实盘成交查询异常，按未成交处理 | #{} | {}",
+                       scene_signal_id, exc)
+        return False
 
 
 def fire_signal_email(tag: str, subject: str, body: str) -> None:

@@ -1,0 +1,35 @@
+{
+  "tf": "5m",
+  "data_summary": {
+    "rows": 5760
+  },
+  "budget": {
+    "discovery_frac": 0.6,
+    "validation_frac": 0.2,
+    "holdout_frac": 0.2,
+    "quantiles": [
+      0.1,
+      0.2,
+      0.3,
+      0.7,
+      0.8,
+      0.9
+    ],
+    "min_samples": 80,
+    "min_sample_frac": 0.01,
+    "fdr_alpha": 1.0,
+    "min_lift_pp": 0.0,
+    "min_validation_lift_pp": -1000000000.0,
+    "min_interaction_gain_pp": -1000000000.0,
+    "max_l1": 15,
+    "max_l2": 20,
+    "max_l3": 20,
+    "max_l3_tests": 50000,
+    "n_min_l2": 60,
+    "n_min_l3": 40,
+    "n_min_holdout": 20,
+    "shortlist_per_target": 8,
+    "final_holdout_rule": "⚠️ Final Holdout 前，shortlist 必须完全冻结（只触碰一次）"
+  },
+  "total_tests": 4012
+}

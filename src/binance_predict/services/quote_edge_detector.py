@@ -12,10 +12,13 @@
         回测：胜率 24.0%，EV +0.155，日频 13.7；
         裸条件（两轮 30+ 假设 OOS 全灭，无可信约束）。
 
-影子纪律（M4 同款）：只记录不下注、不占风控配额。邮件推送（2026-08-25）：
-仅实时新信号且对应通道已开启实盘开火才推（v3a/v3b 已注册为可选实盘通道，
-toggle 开启后才推；未开启时 resolver 恒 False 不推），
-新鲜度闸自动静默回补/重扫；总开关 signal_push_email_enabled，全局日限防轰炸。
+影子纪律（M4 同款）：只记录不下注、不占风控配额。邮件推送（2026-08-28
+改为实盘成交复盘口径）：仅实时新信号 + 对应通道已开启实盘开火 + 该信号
+在 trade_orders 存在 FILLED 行（has_live_filled_order）才推——落表发生在
+归档后处理（窗内触发后约 2min），MultiLiveTrader 窗内 45~120s 即已下单，
+查询时实盘订单早已终态；通道开但被实盘门禁拦下（环境核验/执行价护栏/
+日单量/FOK 未成交）的信号不再推，邮件口径对齐实盘成交集。新鲜度闸自动
+静默回补/重扫；总开关 signal_push_email_enabled，全局日限防轰炸。
 数据流（归档后处理，区别于 X4 的次窗结算）：
     1. 每 60s 轮询新归档 SentimentWindow；
     2. 扫 curve_down_price 曲线找规则区间内首个命中点（时点+报价）；
@@ -77,7 +80,9 @@ from sqlalchemy import select as sa_select
 
 from binance_predict.db.engine import async_session_factory
 from binance_predict.db.models import MisalignmentSignal, SentimentWindow
-from .signal_notify import fire_signal_email, fmt_bjt, is_fresh_signal, is_live_enabled
+from .signal_notify import (
+    fire_signal_email, fmt_bjt, has_live_filled_order, is_fresh_signal, is_live_enabled,
+)
 
 # 注：2026-08-26 从 stdlib logging 改为 loguru——stdlib 无 handler 配置时
 # INFO 日志全部静默丢弃，本模块的启动/触发/回补日志自上线起从未真正输出过。
@@ -505,16 +510,23 @@ class QuoteEdgeDetector:
                         (quote_ts - start_ms) / 1000.0, price, outcome, win,
                         _ev_at_entry(win, price),
                     )
-                    # 邮件推送（fire-and-forget）：仅实时新信号且该通道已开
-                    # 实盘开火；回补/重扫被新鲜度闸静默，v3a/v3b 需 toggle
-                    # 开启后才推（未开启 resolver 恒 False）。
-                    if is_fresh_signal(end_ms) and is_live_enabled(version):
+                    # 邮件推送（fire-and-forget）：仅实时新信号 + 该通道已开
+                    # 实盘开火 + trade_orders 存在该信号 FILLED 行（实盘成交闸，
+                    # 2026-08-28：通道开但被实盘门禁拦下的信号不再推）。落表
+                    # 发生在归档后处理（窗内触发后约 2min），MultiLiveTrader
+                    # 窗内 45~120s 即已下单，此时实盘订单早已终态，FILLED 查询
+                    # 时序成立；回补/重扫被新鲜度闸静默，v3a/v3b 需 toggle 开启
+                    # 后才推（未开启 resolver 恒 False）。边界：下单确认暂落
+                    # PENDING、事后由对账翻成 FILLED 的信号会漏推（闸只在落表
+                    # 时刻评估一次，宁少勿多）。
+                    if (is_fresh_signal(end_ms) and is_live_enabled(version)
+                            and await has_live_filled_order(version, start_ms)):
                         win_str = "赢" if win else "输"
                         fire_signal_email(
                             "quote_edge",
-                            f"[信号] {version} | 押DOWN {win_str} | 窗口 "
+                            f"[信号·实盘] {version} | 押DOWN {win_str} | 窗口 "
                             f"{fmt_bjt(start_ms)} 北京时间",
-                            f"版本: {version}（影子，只记录不下注）\n"
+                            f"版本: {version}（实盘已成交，本邮件为结算复盘）\n"
                             f"窗口: {fmt_bjt(start_ms)}~{fmt_bjt(end_ms, with_date=False)} 北京时间\n"
                             f"触发: t=+{(quote_ts - start_ms) / 1000.0:.0f}s DOWN报价 q={price:.3f}\n"
                             f"结算: {outcome} → {win_str}\n"

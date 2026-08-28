@@ -624,14 +624,18 @@ class BinancePredictionTrader:
 
     async def confirm_order_status(
         self, order_id: str | None, attempts: int = 3, delay: float = 1.0,
-    ) -> str | None:
-        """回查刚下单订单的币安侧终态：'FILLED' / 'FAILED' / None。
+    ) -> dict | None:
+        """回查刚下单订单的币安侧终态：命中订单历史行 dict / None。
 
         place-order-bundle 返回 200 + orderId 不代表成交：FOK 单受理后仍可能
         翻转为 FAILED（流动性不足等）。曾以"收到响应即成交"落库，产生幽灵成交
         （2026-08 对账发现 2 笔：本地 FILLED + win/pnl，币安侧 filled=0）。
         此处轮询订单历史以币安终态为准；None = 历史中暂无该单（调用方应落
         PENDING，交由 /api/trades/sync-binance 对账，不伪造成交）。
+
+        2026-08-28 语义变更：返回值由终态 str 改为命中的历史行 dict（终态取
+        row["status"]，另含 price/filledUsdtAmount 等），顺手把历史行的实际
+        成交价带回落库侧（execute_trade/execute_signal_trade 回填 quote_json）。
         """
         if not order_id:
             return None
@@ -644,10 +648,32 @@ class BinancePredictionTrader:
                     ):
                         status = o.get("status")
                         if status in ("FILLED", "FAILED"):
-                            return status
+                            return o
             if i < attempts - 1:
                 await asyncio.sleep(delay)
         return None
+
+    @staticmethod
+    def _merge_fill_into_quote(quote: dict, fill_row: dict) -> dict:
+        """用币安订单历史行的实际成交价增强 quote_json（落库口径升级，2026-08-28）。
+
+        averagePrice ← 历史行 price（实际成交均价，币安结算口径）；原报价
+        预估均价保留在 quotedAvgPrice，fillSource 标记来源。落库后
+        trade_settler._avg_price 读 quote_json.averagePrice 即自动升级为
+        实际成交口径（结算/统计无需改动）。price 缺失/非法/≤0 时原样返回
+        （无可靠成交价时不做半吊子回填，保持报价预估口径）。
+        """
+        try:
+            fill_price = float(fill_row.get("price"))
+        except (TypeError, ValueError):
+            return quote
+        if fill_price <= 0:
+            return quote
+        merged = dict(quote)
+        merged["quotedAvgPrice"] = quote.get("averagePrice")
+        merged["averagePrice"] = fill_price
+        merged["fillSource"] = "binance_history_confirm"
+        return merged
 
     @staticmethod
     def _classify_period(market: dict) -> str | None:
@@ -691,6 +717,81 @@ class BinancePredictionTrader:
                     entry["down_token"] = token_id
                     entry["down_price"] = float(price) if price is not None else None
         return start_ms, entry
+
+    async def _fetch_market_via_detail(
+        self, period: str, start_ms: int
+    ) -> dict | None:
+        """
+        list 端点兜底：按 marketTopicId 锚点 + market/detail 向前扫描预取市场。
+
+        背景（2026-08-28 实测修正）：market/list 只返回已开盘市场，而币安
+        未来周期市场提前创建且可直接交易（15m 提前约 22 分钟、5m 提前 30+
+        分钟，tradingStatus=OPEN）。开火点在边界后 0~2s 时新周期尚未进入
+        list，锚定守卫拒单——本方法经 detail 端点拿回未来市场条目。
+
+        定位方式：list 首页取当前周期 BTC 市场的 marketTopicId 作锚点，
+        相邻 ID 向后扫描（相邻 ID 交错 BTC/ETH/BNB 与 5m/15m），按可预测
+        slug `btc-updown-{period}-{epoch}` 精确匹配；命中即解析返回（同
+        _parse_15m_entry 结构），并要求 tradingStatus=OPEN。
+        """
+        slug_want = f"btc-updown-{period}-{start_ms // 1000}"
+        client = self._get_client()
+
+        async def _detail(topic_id: int) -> dict | None:
+            try:
+                signed = self._sign_request({"marketTopicId": topic_id})
+                resp = await client.get(
+                    f"{self.BASE_URL}/sapi/v1/w3w/wallet/prediction/market/detail",
+                    params=signed,
+                    headers={"X-MBX-APIKEY": self._api_key},
+                )
+                return resp.json() if resp.status_code == 200 else None
+            except Exception:
+                return None
+
+        # 锚点：list 首页找当前已开盘的同周期 BTC 市场
+        anchor = None
+        try:
+            signed = self._sign_request({"limit": 100, "offset": 0})
+            resp = await client.get(
+                f"{self.BASE_URL}/sapi/v1/w3w/wallet/prediction/market/list",
+                params=signed,
+                headers={"X-MBX-APIKEY": self._api_key},
+            )
+            resp.raise_for_status()
+            for m in resp.json().get("marketTopics", []):
+                if (m.get("chartType") == "CRYPTO_UP_DOWN"
+                        and m.get("symbol") == "BTCUSDT"
+                        and self._classify_period(m) == period):
+                    anchor = m.get("marketTopicId")
+                    break
+        except Exception as e:
+            logger.warning("detail 预取：锚点查询失败 | {}", e)
+        if anchor is None:
+            return None
+
+        for tid in range(anchor + 1, anchor + 48):
+            d = await _detail(tid)
+            if not d or d.get("slug") != slug_want:
+                continue
+            subs = d.get("markets", [])
+            trading = subs[0].get("tradingStatus") if subs else None
+            if trading != "OPEN":
+                logger.warning("detail 预取：命中但不可交易 | tid={} trading={}",
+                               tid, trading)
+                return None
+            parsed = self._parse_15m_entry(d)
+            if parsed is None:
+                return None
+            entry_start, entry = parsed
+            if abs(entry_start - start_ms) > 2000:
+                logger.warning("detail 预取：slug 命中但 startDate 偏差 {}ms | tid={}",
+                               entry_start - start_ms, tid)
+                return None
+            logger.info("detail 预取成功 | {} | topicId={} | 距开盘 {:.0f}s",
+                        period, tid, (entry_start - int(time.time() * 1000)) / 1000)
+            return entry
+        return None
 
     async def list_markets(self) -> list[dict]:
         """
@@ -1042,7 +1143,7 @@ class BinancePredictionTrader:
                 int(time.time() * 1000) // 300_000 * 300_000)
             order_id = order_result.get("orderId")
             confirmed = await self.confirm_order_status(order_id)
-            if confirmed == "FAILED":
+            if confirmed is not None and confirmed.get("status") == "FAILED":
                 # 币安侧订单未成交：落 FAILED，不伪造成交（规则 3）
                 return await self._save_order(
                     prediction_id=prediction_id,
@@ -1059,10 +1160,14 @@ class BinancePredictionTrader:
                     window_start=eff_window_start,
                     direction=prediction,
                 )
-            # FILLED → 落成交；暂未确认（历史尚无该单）→ PENDING 交对账兜底
-            status = "FILLED" if confirmed == "FILLED" else "PENDING"
+            # FILLED → 落成交（quote_json 回填实际成交均价，2026-08-28）；
+            # 暂未确认（历史尚无该单）→ PENDING 交对账兜底
+            status = ("FILLED" if confirmed is not None
+                      and confirmed.get("status") == "FILLED" else "PENDING")
             if status == "PENDING":
                 logger.warning("币安侧终态暂未确认，落 PENDING 待对账 | orderId={}", order_id)
+            else:
+                quote = self._merge_fill_into_quote(quote, confirmed)
             return await self._save_order(
                 prediction_id=prediction_id,
                 agent_prediction_id=agent_prediction_id,
@@ -1175,16 +1280,39 @@ class BinancePredictionTrader:
                             sorted(self._15m_markets.keys()),
                             min(abs(s - window_start) for s in self._15m_markets.keys()) if self._15m_markets else 0
                         )
+                        # list 只返回已开盘市场：新周期边界刚过时尚未可见。
+                        # 经 market/detail 预取未来市场（提前创建且可交易，2026-08-28 实测）
+                        entry = await self._fetch_market_via_detail("15m", window_start)
+                        if entry:
+                            self._15m_markets[window_start] = entry
                 
                 token_id = (entry["up_token"] if prediction == "UP"
                             else entry["down_token"]) if entry else None
                 if entry is None:
                     logger.warning(
-                        "信号实盘：15m 周期 {} 未在市场列表中找到（锚定守卫拒单）| 列表周期 {}",
+                        "信号实盘：15m 周期 {} 未在市场列表中找到（锚定守卫拒单，含 detail 预取）| 列表周期 {}",
                         window_start, sorted(self._15m_markets))
             else:
-                token_id = (self._up_token_id if prediction == "UP"
-                            else self._down_token_id)
+                # 5m 锚定：缓存 token 属于当前可见 5m 市场，开火瞬间新周期
+                # 可能尚未进入 list——startDate 不匹配本单窗口时同样走
+                # detail 预取，防押到上一周期（旧行为无锚定直接取缓存）
+                entry = None
+                cache_start = self._5m_start_date
+                try:
+                    cache_start = int(cache_start) if cache_start else None
+                except (TypeError, ValueError):
+                    cache_start = None
+                if cache_start is not None and abs(cache_start - window_start) <= 2000:
+                    token_id = (self._up_token_id if prediction == "UP"
+                                else self._down_token_id)
+                else:
+                    entry = await self._fetch_market_via_detail("5m", window_start)
+                    token_id = (entry["up_token"] if prediction == "UP"
+                                else entry["down_token"]) if entry else None
+                    if entry is None:
+                        logger.warning(
+                            "信号实盘：5m 窗口 {} 锚定失配且 detail 预取失败 | 缓存周期 {}",
+                            window_start, cache_start)
 
             if not token_id:
                 return await self._update_signal_order(
@@ -1227,14 +1355,18 @@ class BinancePredictionTrader:
             # 2026-08 对账发现 2 笔本地 FILLED 而币安 filled=0）
             order_id = order_result.get("orderId")
             confirmed = await self.confirm_order_status(order_id)
-            if confirmed == "FAILED":
+            if confirmed is not None and confirmed.get("status") == "FAILED":
                 return await self._update_signal_order(
                     pending, "FAILED", direction=prediction, token_id=token_id,
                     order_id=order_id, quote_json=quote,
                     error_message="币安侧订单终态 FAILED（FOK 未成交）")
 
-            # FILLED → 落成交；暂未确认 → 保持 PENDING 交 sync-binance 对账
-            status = "FILLED" if confirmed == "FILLED" else "PENDING"
+            # FILLED → 落成交（quote_json 回填实际成交均价，2026-08-28）；
+            # 暂未确认 → 保持 PENDING 交 sync-binance 对账
+            status = ("FILLED" if confirmed is not None
+                      and confirmed.get("status") == "FILLED" else "PENDING")
+            if status == "FILLED":
+                quote = self._merge_fill_into_quote(quote, confirmed)
             snapshot = await self._update_signal_order(
                 pending, status,
                 direction=prediction,
@@ -1248,8 +1380,9 @@ class BinancePredictionTrader:
                 logger.warning("信号实盘：币安侧终态暂未确认，落 PENDING 待对账 | signal={} | window={} | orderId={}",
                                signal_version, window_start, order_id)
             else:
-                logger.info("信号实盘成交 | signal={} | window={} | orderId={} | slippageBps={}",
-                            signal_version, window_start, order_id, slippage_bps)
+                logger.info("信号实盘成交 | signal={} | window={} | orderId={} | slippageBps={} | 成交价 {}（fillSource={}）",
+                            signal_version, window_start, order_id, slippage_bps,
+                            quote.get("averagePrice"), quote.get("fillSource", "quote_estimate"))
             return snapshot
 
     async def _reserve_order_slot(

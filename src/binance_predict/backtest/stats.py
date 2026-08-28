@@ -48,14 +48,18 @@ def exact_binomial_p(k: int, n: int, p0: float = 0.5) -> float:
     """
     if n <= 0:
         return 1.0
+    p0 = min(max(p0, 1e-12), 1 - 1e-12)
     if n <= 2000:
-        pk = math.comb(n, k) * p0 ** k * (1 - p0) ** (n - k)
+        # log 空间计算（原直接 comb 口径在 n 稍大时 int→float 溢出；判定逻辑不变）
+        lp0, lq0 = math.log(p0), math.log(1 - p0) if p0 < 1 else -math.inf
+        lc = [math.lgamma(n + 1) - math.lgamma(i + 1) - math.lgamma(n - i + 1)
+              for i in range(n + 1)]
+        lp = [lci + i * lp0 + (n - i) * lq0 for i, lci in enumerate(lc)]
+        lpk = lp[k]
         # 双侧：所有概率 ≤ 观测概率的结局之和（小样本精确，无须对称假设）
-        p_sum = 0.0
-        for i in range(n + 1):
-            pi = math.comb(n, i) * p0 ** i * (1 - p0) ** (n - i)
-            if pi <= pk * (1 + 1e-9):
-                p_sum += pi
+        sel = [x for x in lp if x <= lpk + 1e-9]
+        mx = max(sel)
+        p_sum = math.exp(mx) * sum(math.exp(x - mx) for x in sel)
         return min(1.0, p_sum)
     mu, sd = n * p0, math.sqrt(n * p0 * (1 - p0))
     zstat = abs(k - mu) - 0.5
@@ -121,33 +125,39 @@ def variance_ratio(returns: list[float], q: int) -> dict:
 
     随机漫步零假设下 VR(q)→1；VR>1 动量（正自相关），VR<1 均值回归。
     z 为同方差统计量，z_star 为异方差稳健统计量（Lo & MacKinlay 1988, RB 2.3）。
+
+    numpy 向量化实现（720d 级序列可用），数值与原逐元素实现一致。
     """
-    n = len(returns)
+    import numpy as np
+
+    r = np.asarray(returns, dtype=float)
+    n = len(r)
     if n < 4 * q or q < 2:
         return {"q": q, "vr": None, "z": None, "z_star": None, "n": n}
 
-    mu = sum(returns) / n
+    mu = float(r.mean())
+    d = r - mu
     m = q * (n - q + 1) * (1 - q / n)
-    var1 = sum((r - mu) ** 2 for r in returns) / (n - 1)
+    var1 = float((d * d).sum()) / (n - 1)
     if var1 <= 0:
         return {"q": q, "vr": None, "z": None, "z_star": None, "n": n}
 
     # q 期收益（重叠采样，对齐 LM 原文）；σ̂²(q) 已按 m 归一到单期尺度
-    varq = sum(
-        (sum(returns[i + j] for j in range(q)) - q * mu) ** 2 for i in range(n - q + 1)
-    ) / m
+    cs = np.concatenate([[0.0], np.cumsum(d)])
+    rq = cs[q:] - cs[:-q]                      # r_{t..t+q-1} - q·mu 的全量序列
+    varq = float((rq * rq).sum()) / m
     vr = varq / var1
 
     # 同方差 z
     z = math.sqrt(n * q) * (vr - 1) / math.sqrt(2 * (q - 1) * (2 * q - 1) / (3 * q)) if vr == vr else None
 
     # 异方差稳健 z*(q)（delta 法，theta(k) 为 k 阶自相关系数的样本估计）
-    def delta(k: int) -> float:
-        num = sum((returns[i] - mu) * (returns[i + k] - mu) for i in range(n - k))
-        den = sum((r - mu) ** 2 for r in returns)
-        return num / den if den > 0 else 0.0
-
-    theta = sum((2 * (q - k) / q) ** 2 * delta(k) ** 2 for k in range(1, q))
+    denom = float((d * d).sum())
+    theta = 0.0
+    if denom > 0:
+        for k in range(1, q):
+            delta = float((d[:-k] * d[k:]).sum()) / denom
+            theta += (2 * (q - k) / q) ** 2 * delta * delta
     if theta >= 0:
         z_star = math.sqrt(n) * (vr - 1) / math.sqrt(theta) if theta > 0 else None
     else:

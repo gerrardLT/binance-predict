@@ -40,11 +40,18 @@
 - 周期开盘价 P(S)：fire 时快照（cycle_open_end 配对守卫）；缺失则结算时 klines 精确回读
 - 周期末价 P(E)：到期+buffer 后 klines 精确读；超宽限（停机积压）下轮重试，停机无损
 
-当前阶段【不下注】：落表 + 邮件提醒 + 到期回读结算方向，积累实盘口径胜率/EV。
+当前阶段【不下注】：落表 + 到期回读结算方向，积累实盘口径胜率/EV。
+邮件推送（2026-08-28 推送口径升级）：触发不再发预告邮件；结算置 SETTLED
+后推复盘邮件——闸链 子开关(fake_breakout_email_enabled) → 通道开关
+(is_live_enabled) → 实盘成交闸(has_scene_filled_order：
+trade_orders.scene_signal_id == 信号 id 且 FILLED；影子无实盘订单天然被
+过滤，被实盘门禁拦下的信号同样不推)。
 
 风控（不下注阶段）：
 - pending 按 (side, 周期) 天然去重，一波冲高/冲低每周期最多一条信号
-- 日内信号上限（超限后仍落表但不再发邮件，防轰炸）
+- 日内信号上限（超限仍落表；结算邮件不重复此日限——场景邮件直连
+  send_plain_email 不走 push_signal_email 全局日限，洪峰由 子开关 + FILLED
+  闸收窄）
 - 确认重试：klines 拉取失败最多重试 5 次/60s，超时放弃（次周期已走远，入场价假设失效）
 
 生命周期由 main.py lifespan 管理：start() 启动循环，stop() 优雅停止。
@@ -68,7 +75,7 @@ from .alerting import send_plain_email
 from .data_collector import BinanceDataCollector
 from .live_channels import scene_pattern_to_channel
 from .scene_params import DEFAULT_SCENE_PARAMS, SceneParams
-from .signal_notify import TZ_BJT, is_live_enabled
+from .signal_notify import TZ_BJT, has_scene_filled_order, is_live_enabled
 
 # 超宽限阈值：到期后超过此宽限未结算的信号转 klines 精确补结算路径
 # （周期锚点口径下 P(S)/P(E) 均为历史时点，klines 必然可得，停机无损）
@@ -714,8 +721,9 @@ class FakeBreakoutDetector:
             return
 
         self._daily_rollover(now_ms)
-        # 风控 2：日内上限（超限仍落表，但不发邮件）；影子信号不占日限
-        over_daily_limit = (not shadow) and self._daily_count >= settings.fake_breakout_max_daily_signals
+        # 风控 2：日内上限计数——影子信号不占日限。2026-08-28 邮件推送挪到
+        # 结算回读后，此日限不再直接拦邮件（结算推送由 子开关 + FILLED 闸
+        # 收窄，见 _settle_15m），_daily_count 仅作观测计数。
 
         # 目标周期 = 次周期（时间网格推算，坐标必然可得，不走 EXPIRED 路径）
         next_start = cur_cycle * 900_000
@@ -787,11 +795,10 @@ class FakeBreakoutDetector:
 
         direction = "DOWN" if side == "high" else "UP"
         scene_channel = scene_pattern_to_channel(pattern_type)
-        email_blocked = (
-            "（影子，不发邮件）" if shadow
-            else ("（超日限，不发邮件）" if over_daily_limit
-                  else ("" if scene_channel is not None and is_live_enabled(scene_channel)
-                        else f"（实盘通道 {scene_channel} 未开，不发邮件）"))
+        email_blocked = (  # 结算是否推邮件的预判（推送已挪到结算回读后）
+            "（影子，结算不推邮件）" if shadow
+            else ("" if scene_channel is not None and is_live_enabled(scene_channel)
+                  else f"（实盘通道 {scene_channel} 未开，结算不推邮件）")
         )
         logger.info(
             "场景信号触发 #{} [{} {}{}] | 周期 {} 破{} {:.0f} | 信号K收{} 收盘位置 {:.2f} 量比 {} | "
@@ -804,17 +811,9 @@ class FakeBreakoutDetector:
             email_blocked,
         )
 
-        # 邮件推送（未超日限且非影子，且对应场景通道已开实盘开火）：
-        # fire-and-forget，绝不阻塞检测循环。
-        # 实测教训：SMTP 连接被防火墙丢包时同步等待会卡死整个循环 16 分钟，
-        # 导致结算回读停摆（信号 #1 事故）。
-        if (not shadow and settings.fake_breakout_email_enabled
-                and not over_daily_limit and scene_channel is not None
-                and is_live_enabled(scene_channel)):
-            asyncio.create_task(
-                self._send_signal_email_bg(signal.id),
-                name=f"fbs_email_{signal.id}",
-            )
+        # 邮件推送已挪到结算回读后（_settle_15m，2026-08-28）：触发不再发
+        # 预告邮件，结算置 SETTLED 后按 通道开关 → 实盘成交闸（FILLED）推
+        # 复盘邮件，被实盘门禁拦下的信号不再推。
 
     def _notify_signal_fired(self, signal: FakeBreakoutSignal) -> None:
         """实盘钩子（同步接口，fire-and-forget）：正式信号 fire 后通知执行器。
@@ -838,11 +837,15 @@ class FakeBreakoutDetector:
                            signal.id, exc)
 
     async def _send_signal_email_bg(self, signal_id: int) -> None:
-        """后台邮件发送：重新查库拿完整信号，发送成功后回填 email_sent。"""
+        """后台邮件发送：重新查库拿完整信号，发送成功后回填 email_sent。
+
+        email_sent=True 幂等守卫：已发过的信号不重发（结算推送与历史触发
+        路径共用入口，防同信号双邮件）。
+        """
         try:
             async with async_session_factory() as session:
                 signal = await session.get(FakeBreakoutSignal, signal_id)
-            if signal is None:
+            if signal is None or getattr(signal, "email_sent", False):
                 return
             sent = await self._send_signal_email(signal)
             if sent:
@@ -1051,7 +1054,8 @@ class FakeBreakoutDetector:
         入场价 = 确认时刻 15m 市场 DOWN 报价（start_date 守卫，防旧市场残值；
         报价缺失置 NULL，统计回退 0.51 理论价）。结算与父行同周期同锚点
         （cycle_open_price_15m 缺失时用第 1 根 5m open 兜底，即 P(S)）。每父信号
-        至多一条，天然去重；计入日限，邮件受日限控制（同正式信号风控）。
+        至多一条，天然去重；计入日限计数（邮件推送见 _settle_15m，2026-08-28
+        挪到结算回读后，不再在触发时发送）。
         """
         async with async_session_factory() as session:
             parent = await session.get(FakeBreakoutSignal, parent_id)
@@ -1062,7 +1066,6 @@ class FakeBreakoutDetector:
         matched = q.get("start_date") == next_start
         now_ms = clock_sync.now_ms()
         self._daily_rollover(now_ms)
-        over_daily_limit = self._daily_count >= settings.fake_breakout_max_daily_signals
 
         signal = FakeBreakoutSignal(
             level=parent.level,
@@ -1105,13 +1108,12 @@ class FakeBreakoutDetector:
         self._daily_count += 1
         # 实盘钩子：S5 为正式信号派生（影子不派生），无需 shadow 判断
         self._notify_signal_fired(signal)
-        # 邮件闸与主信号路径同构（2026-08-25 评审发现 S5 路径漏挂实盘开火闸）：
-        # S5 pattern 恒为 bull_exhaust_confirm → scene_bull_exhaust_confirm
+        # 邮件推送已挪到结算回读后（2026-08-28），与主信号路径同构：
+        # 结算置 SETTLED 后按 通道开关 → 实盘成交闸（FILLED）推复盘邮件
         s5_channel = scene_pattern_to_channel(signal.pattern_type)
-        s5_blocked = (
-            "（超日限，不发邮件）" if over_daily_limit
-            else ("" if s5_channel is not None and is_live_enabled(s5_channel)
-                  else f"（实盘通道 {s5_channel} 未开，不发邮件）")
+        s5_blocked = (  # 结算是否推邮件的预判（推送已挪到结算回读后）
+            "" if s5_channel is not None and is_live_enabled(s5_channel)
+            else f"（实盘通道 {s5_channel} 未开，结算不推邮件）"
         )
         logger.info(
             "S5 确认信号触发 #{}（父 #{}）| 5m 收盘 {:.2f} < 周期开盘 {:.2f} | "
@@ -1122,12 +1124,7 @@ class FakeBreakoutDetector:
             s5_blocked,
         )
 
-        if (settings.fake_breakout_email_enabled and not over_daily_limit
-                and s5_channel is not None and is_live_enabled(s5_channel)):
-            asyncio.create_task(
-                self._send_signal_email_bg(signal.id),
-                name=f"fbs_email_{signal.id}",
-            )
+        # 邮件推送已挪到结算回读后（_settle_15m，2026-08-28），同主信号路径。
 
     async def _send_signal_email(self, signal: FakeBreakoutSignal) -> bool:
         # 邮件时间统一北京时间（2026-08-25 用户要求；此前为 UTC）
@@ -1215,6 +1212,18 @@ class FakeBreakoutDetector:
                 else f"动量背景：连阳 ≥3 根 + 光头阳，信号 K 高点 {signal.resistance:.2f}（无破位要求）"
             )
         )
+        # 结算结果段（2026-08-28 推送挪到结算回读后：邮件即复盘，附结算结果；
+        # 结算推送仅对 SETTLED 行发出，EXPIRED/未结算行不会被推到这里）
+        settle_outcome = signal.settle_outcome
+        if settle_outcome in ("DOWN", "UP"):
+            win_str = "赢" if settle_outcome == direction else "输"
+        elif settle_outcome == "NOISE":
+            win_str = "平（NOISE）"
+        else:
+            win_str = "N/A"
+        settle_price_str = (
+            f"{signal.settle_btc_price:.2f}" if signal.settle_btc_price else "N/A"
+        )
         body = (
             f"确认时间：{t_str}\n"
             f"场景：{pattern_label}（pattern_type={pt or 'N/A'}）\n"
@@ -1226,7 +1235,10 @@ class FakeBreakoutDetector:
             f"入场方案：\n  {entry_plan}\n\n"
             f"回测依据（scripts/local_continuation_discovery.py，发现集→验证集盲验）：\n"
             f"  {backtest}\n"
-            f"机制：破位动能收盘未回吐（买力/卖力耗尽），次周期兑现反转。\n"
+            f"机制：破位动能收盘未回吐（买力/卖力耗尽），次周期兑现反转。\n\n"
+            f"——结算结果（周期锚点口径，与币安结算规则一致）——\n"
+            f"结算方向：{settle_outcome or 'N/A'} → 押 {direction} {win_str}\n"
+            f"结算 BTC 价：{settle_price_str}\n"
             f"当前阶段：系统不下注，仅记录信号并到期回读结算方向。\n"
         )
         return await send_plain_email(subject, body)
@@ -1372,6 +1384,7 @@ class FakeBreakoutDetector:
 
         live_price: float | None = None  # 惰性 fallback：仅 klines 失败且宽限内才取现价
         settled_pts: set[str] = set()  # 本次结算涉及的场景类型（结算后统一回填统计）
+        settled_rows: list[tuple[int, str]] = []  # 本次结算行 (id, pattern_type)（结算推送用）
         try:
             async with async_session_factory() as session:
                 for s in due:
@@ -1407,6 +1420,7 @@ class FakeBreakoutDetector:
                         row.settle_outcome = "NOISE"
                     row.status = "SETTLED"
                     settled_pts.add(row.pattern_type or row.pattern or "")
+                    settled_rows.append((row.id, row.pattern_type or ""))
                     logger.info(
                         "场景信号 15m 周期结算 #{} | 周期开盘 {:.0f} → 周期末 {:.0f} | {} | 入场价 {}",
                         row.id, anchor, close_price, row.settle_outcome, row.down_price_15m,
@@ -1415,6 +1429,28 @@ class FakeBreakoutDetector:
         except Exception as exc:
             logger.error("场景结算回填失败 | {}", exc)
             return
+        # 结算推送（2026-08-28：邮件挪到结算回读后，fire-and-forget）：对本次
+        # 置 SETTLED 的行按 子开关(fake_breakout_email_enabled，运维 kill
+        # switch) → 通道开关(is_live_enabled) → 实盘成交闸
+        # (has_scene_filled_order：trade_orders.scene_signal_id == 信号 id 且
+        # FILLED) 后台发复盘邮件。影子信号无实盘订单 → FILLED 闸恒 False 天然
+        # 过滤；被实盘门禁拦下的信号同样不推——邮件口径对齐实盘成交集。
+        # 不再重复 fake_breakout 日限判定：场景邮件直连 send_plain_email
+        # （不走 push_signal_email 全局日限），洪峰由 子开关 + FILLED 闸
+        # （实盘成交集远小于信号集）收窄；_send_signal_email_bg 自带
+        # email_sent 幂等。边界：下单确认暂落 PENDING、事后由对账翻成
+        # FILLED 的信号会漏推（闸只在结算时刻评估一次，宁少勿多）。
+        if settings.fake_breakout_email_enabled:
+            for row_id, pt in settled_rows:
+                channel = scene_pattern_to_channel(pt) if pt else None
+                if channel is None or not is_live_enabled(channel):
+                    continue
+                if not await has_scene_filled_order(row_id):
+                    continue
+                asyncio.create_task(
+                    self._send_signal_email_bg(row_id),
+                    name=f"fbs_email_{row_id}",
+                )
         # 统计维度回填（2026-08-17）：按本次结算涉及的场景类型更新累计指标
         for pt in sorted(settled_pts):
             if pt:

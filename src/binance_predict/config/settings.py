@@ -308,7 +308,8 @@ class Settings(BaseSettings):
     fake_breakout_max_daily_signals: int = 100
     # 结算回读死线缓冲（秒）：signal_time + 15min + 本缓冲后回读 BTC 价回填方向
     fake_breakout_settle_buffer_seconds: int = 90
-    # 信号邮件推送开关（复用 agent_alert_* SMTP 配置）
+    # 信号邮件推送开关（复用 agent_alert_* SMTP 配置；2026-08-28 起在
+    # _settle_15m 结算复盘推送路径生效——触发不再发预告邮件）
     fake_breakout_email_enabled: bool = True
 
     # --- X4 情绪错位影子信号（M4 影子并行，2026-08-19）---
@@ -319,6 +320,14 @@ class Settings(BaseSettings):
     # 影子模式：只记录不下注；归档后处理首个命中报价，落表即结算
     # 规则冻结：A t∈[90,120)s×q∈[0.69,0.75) / B t∈[45,60)s×q∈[0.15,0.25)
     quote_edge_enabled: bool = True
+
+    # --- K 线科学发现影子信号（KREV 族，2026-08-28）---
+    # 720d 发现流水线冻结注册表条件的实时重放：15m bar 收盘后复用离线特征
+    # 管道求值（口径逐位一致），次根收盘按回测口径结算。只记录不下注。
+    # 默认关闭：验证口径保真测试全绿后在 .env 显式置 KLINE_SHADOW_ENABLED=true
+    kline_shadow_enabled: bool = False
+    # 影子期邮件推送开关（默认静默，防轰炸；结算复盘口径预留）
+    kline_shadow_email_enabled: bool = False
 
     # --- 多通道实盘（MultiLiveTrader，2026-08-24，取代旧单版本 quote_edge 实盘字段）---
     # 12 通道（quote_edge v1/v2/v3 × contrarian 系 + momentum × 2 + x4 × 2 + 场景 S1/S5/S2/S4）

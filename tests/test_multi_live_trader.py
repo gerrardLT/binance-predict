@@ -1090,6 +1090,8 @@ def _make_real_trader(monkeypatch, with_15m: bool = True) -> BinancePredictionTr
     trader._api_secret = "s"
     trader._wallet_address = "0xWALLET"
     trader._wallet_id = "WID"
+    # 5m 锚定：缓存市场的 startDate 与本单窗口一致（默认路径不触发 detail 预取）
+    trader._5m_start_date = WINDOW_START
 
     async def _list():
         trader._down_token_id = "TOKEN-DOWN"
@@ -1104,10 +1106,17 @@ def _make_real_trader(monkeypatch, with_15m: bool = True) -> BinancePredictionTr
 
     monkeypatch.setattr(trader, "list_markets", _list)
 
+    # detail 预取默认不命中（避免单测触网；命中路径有独立用例覆盖）
+    async def _no_detail(_period, _start_ms):
+        return None
+
+    monkeypatch.setattr(trader, "_fetch_market_via_detail", _no_detail)
+
     # 默认币安侧终态回查为 FILLED（组 8 各用例聚焦下单分流逻辑；
-    # 幽灵成交/待对账路径有独立用例覆盖）
+    # 幽灵成交/待对账路径有独立用例覆盖）。
+    # 2026-08-28 confirm_order_status 返回命中历史行 dict（status 取终态）。
     async def _confirm(_oid, attempts=3, delay=1.0):
-        return "FILLED"
+        return {"orderId": _oid, "status": "FILLED", "price": "0.55"}
 
     monkeypatch.setattr(trader, "confirm_order_status", _confirm)
     return trader
@@ -1180,6 +1189,89 @@ async def test_signal_trade_15m_token_missing_failed(monkeypatch) -> None:
         max_exec_price=0.55, market_period="15m", scene_signal_id=7)
     assert order["status"] == "FAILED"
     assert "未找到 15m 市场 DOWN 方向的 token" in str(updates[0][1]["error_message"])
+
+
+@pytest.mark.asyncio
+async def test_signal_trade_15m_detail_prefetch_fallback(monkeypatch) -> None:
+    """list 未含目标周期（边界刚过新周期未可见）→ detail 预取未来市场命中，
+    正常报价下单并入缓存（2026-08-28 修复路径）。"""
+    trader = _make_real_trader(monkeypatch, with_15m=False)
+    quote_tokens: list[str] = []
+    fetched: list[tuple] = []
+
+    async def _detail(period, start_ms):
+        fetched.append((period, start_ms))
+        return {"end_date": start_ms + 900_000, "up_token": "T-FUT-UP",
+                "down_token": "T-FUT-DOWN", "up_price": 0.5, "down_price": 0.5}
+
+    async def _reserve(_v, _ws, direction=None, market_period="5m",
+                       scene_signal_id=None):
+        return _pending_order()
+
+    async def _update(order, status, **kwargs):
+        return {**order, "status": status, **kwargs}
+
+    async def _quote(token_id, side, amount_usdt=None):
+        quote_tokens.append(token_id)
+        return {"averagePrice": 0.55, "amountIn": "5", "amountOut": "9",
+                "quoteId": "Q1"}
+
+    async def _place(_q, slippage_bps=1200):
+        return {"orderId": "ORD-PREFETCH"}
+
+    monkeypatch.setattr(trader, "_fetch_market_via_detail", _detail)
+    monkeypatch.setattr(trader, "_reserve_order_slot", _reserve)
+    monkeypatch.setattr(trader, "_update_signal_order", _update)
+    monkeypatch.setattr(trader, "get_quote", _quote)
+    monkeypatch.setattr(trader, "place_order", _place)
+
+    order = await trader.execute_signal_trade(
+        "DOWN", 5.0, "scene_bull_exhaust", WINDOW_START,
+        max_exec_price=0.60, market_period="15m", scene_signal_id=42)
+    assert order["status"] == "FILLED"
+    assert fetched == [("15m", WINDOW_START)]
+    assert quote_tokens == ["T-FUT-DOWN"]
+    # 预取结果入缓存：后续同窗口重入直接命中，不再走 detail
+    assert trader._15m_markets[WINDOW_START]["down_token"] == "T-FUT-DOWN"
+
+
+@pytest.mark.asyncio
+async def test_signal_trade_5m_anchor_mismatch_prefetch(monkeypatch) -> None:
+    """5m 缓存市场与本单窗口不一致（开火瞬间新周期未进 list）→ 不用旧周期
+    token，走 detail 预取本窗口市场。"""
+    trader = _make_real_trader(monkeypatch)
+    trader._5m_start_date = WINDOW_START - 300_000  # 缓存属上一周期
+    quote_tokens: list[str] = []
+
+    async def _detail(period, start_ms):
+        return {"end_date": start_ms + 300_000, "up_token": "T5-UP",
+                "down_token": "T5-DOWN", "up_price": 0.5, "down_price": 0.5}
+
+    async def _reserve(_v, _ws, direction=None, market_period="5m",
+                       scene_signal_id=None):
+        return _pending_order()
+
+    async def _update(order, status, **kwargs):
+        return {**order, "status": status, **kwargs}
+
+    async def _quote(token_id, side, amount_usdt=None):
+        quote_tokens.append(token_id)
+        return {"averagePrice": 0.55, "amountIn": "5", "amountOut": "9",
+                "quoteId": "Q1"}
+
+    async def _place(_q, slippage_bps=1200):
+        return {"orderId": "ORD-5M-PREFETCH"}
+
+    monkeypatch.setattr(trader, "_fetch_market_via_detail", _detail)
+    monkeypatch.setattr(trader, "_reserve_order_slot", _reserve)
+    monkeypatch.setattr(trader, "_update_signal_order", _update)
+    monkeypatch.setattr(trader, "get_quote", _quote)
+    monkeypatch.setattr(trader, "place_order", _place)
+
+    order = await trader.execute_signal_trade(
+        "DOWN", 5.0, "quote_edge_v1", WINDOW_START, max_exec_price=0.60)
+    assert order["status"] == "FILLED"
+    assert quote_tokens == ["T5-DOWN"]  # 本窗口市场，非上一周期缓存
 
 
 @pytest.mark.asyncio
@@ -1314,6 +1406,11 @@ async def test_signal_trade_success_dynamic_slippage(monkeypatch) -> None:
     assert order["status"] == "FILLED" and order["order_id"] == "ORD-9"
     assert slippage_seen == [985]
     assert updates[0][0] == "FILLED"
+    # 2026-08-28 FILLED 回填：averagePrice=实际成交价（历史行 price 0.55），
+    # 原报价预估均价 0.71 保留在 quotedAvgPrice，来源标记 binance_history_confirm
+    assert updates[0][1]["quote_json"]["averagePrice"] == 0.55
+    assert updates[0][1]["quote_json"]["quotedAvgPrice"] == 0.71
+    assert updates[0][1]["quote_json"]["fillSource"] == "binance_history_confirm"
 
 
 @pytest.mark.asyncio
@@ -1338,7 +1435,7 @@ async def test_signal_trade_ghost_fill_downgrade(monkeypatch) -> None:
         return {"orderId": "ORD-GHOST"}
 
     async def _confirm_failed(_oid, attempts=3, delay=1.0):
-        return "FAILED"
+        return {"orderId": _oid, "status": "FAILED"}
 
     monkeypatch.setattr(trader, "_reserve_order_slot", _reserve)
     monkeypatch.setattr(trader, "_update_signal_order", _update)
@@ -1376,7 +1473,7 @@ async def test_signal_trade_unconfirmed_stays_pending(monkeypatch) -> None:
         return {"orderId": "ORD-UNCONFIRMED"}
 
     async def _confirm_none(_oid, attempts=3, delay=1.0):
-        return None
+        return None  # None=币安历史暂无该单，语义不变（落 PENDING 交对账）
 
     monkeypatch.setattr(trader, "_reserve_order_slot", _reserve)
     monkeypatch.setattr(trader, "_update_signal_order", _update)

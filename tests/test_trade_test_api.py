@@ -1126,22 +1126,29 @@ async def test_prediction_redeem_noop(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_confirm_order_status(monkeypatch) -> None:
-    """confirm_order_status：以币安侧订单历史终态为准（防幽灵成交）。"""
+    """confirm_order_status：以币安侧订单历史终态为准（防幽灵成交）。
+
+    2026-08-28 返回值语义变更：由终态 str 改为命中历史行 dict
+    （status 取终态，price 等字段供落库回填实际成交均价）。
+    """
     import binance_predict.main as m
 
     trader = m.prediction_trader
 
     async def _history_filled(limit=20):
-        return [{"orderId": "B-1", "status": "FILLED"}]
+        return [{"orderId": "B-1", "status": "FILLED", "price": "0.55"}]
 
     monkeypatch.setattr(trader, "query_order_history", _history_filled)
-    assert await trader.confirm_order_status("B-1", attempts=1) == "FILLED"
+    row = await trader.confirm_order_status("B-1", attempts=1)
+    assert row["status"] == "FILLED"
+    assert row["price"] == "0.55"      # 实际成交价随行带回（均价回填依据）
 
     async def _history_failed(limit=20):
         return [{"orderId": "B-1", "status": "FAILED", "filledUsdtAmount": "0"}]
 
     monkeypatch.setattr(trader, "query_order_history", _history_failed)
-    assert await trader.confirm_order_status("B-1", attempts=1) == "FAILED"
+    row = await trader.confirm_order_status("B-1", attempts=1)
+    assert row["status"] == "FAILED"
 
     async def _history_missing(limit=20):
         return [{"orderId": "OTHER", "status": "FILLED"}]

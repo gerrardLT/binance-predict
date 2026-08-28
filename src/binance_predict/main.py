@@ -55,6 +55,7 @@ from .models.schemas import (
 from .services.agent_scheduler import AgentScheduler
 from .services.data_collector import BinanceDataCollector
 from .services.fake_breakout_detector import FakeBreakoutDetector
+from .services.kline_shadow_detector import KlineShadowDetector
 from .services.misalignment_detector import MisalignmentDetector
 from .services.multi_live_trader import MultiLiveTrader
 from .services.quote_edge_detector import QuoteEdgeDetector
@@ -141,6 +142,9 @@ misalignment_detector: MisalignmentDetector | None = None
 
 # 报价 edge 影子检测器全局实例（A 顺势 q∈[0.69,0.75) / B 逆势 q∈[0.15,0.25)，只记录不下注）
 quote_edge_detector: QuoteEdgeDetector | None = None
+
+# K 线科学发现影子检测器全局实例（KREV 族：720d 冻结注册表条件实时重放，只记录不下注）
+kline_shadow_detector: KlineShadowDetector | None = None
 
 # 交易结算器全局实例（P0-2：FILLED 订单结算回填输赢/盈亏，常开）
 trade_settler: TradeSettler | None = None
@@ -706,6 +710,33 @@ async def _sentiment_window_archiver() -> None:
             await asyncio.sleep(30)
 
 
+async def _binance_reconcile_loop() -> None:
+    """币安订单定时对账循环（2026-08-28）：启动 5min 后首跑，此后每 30min 一次。
+
+    与手动 /api/trades/sync-binance 共用 _sync_binance_orders_impl：
+    PENDING 订单按 window_start 对账回填终态 + 幽灵成交订正，替代此前
+    "仅手动触发"的对账节奏（本地结算价源与币安存在差异，靠此自动订正）。
+    API Key 未配置 → impl 返回 error，本轮跳过下轮再查；异常只日志不退出
+    （下轮重试）。结果仅日志，无推送。
+    """
+    await asyncio.sleep(300)  # 启动缓冲：等 WS 喂价/实盘下单链路稳定，避开启动风暴
+    while True:
+        try:
+            result = await _sync_binance_orders_impl()
+            if result.get("error"):
+                logger.info("币安定时对账本轮跳过 | {}", result["error"])
+            else:
+                logger.info(
+                    "币安定时对账完成 | 订正 {} 条 | 币安侧订单 {} 条",
+                    result.get("synced", 0), result.get("binance_orders", 0),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("币安定时对账异常（下轮重试）| {}", exc)
+        await asyncio.sleep(1800)
+
+
 async def _health_monitor_loop() -> None:
     """Agent 运行健康后台监控循环。
 
@@ -980,6 +1011,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(_pm_15m_edge_accelerator(), name="pm_15m_edge_accel"),
         asyncio.create_task(_sentiment_window_archiver(), name="sw_archiver"),
         asyncio.create_task(_health_monitor_loop(), name="health_monitor"),
+        asyncio.create_task(_binance_reconcile_loop(), name="binance_reconcile"),
     ]
     logger.info("现货 WS + 预测市场追踪 + 15m边界加速 + 情绪窗口归档 + 健康监控已启动")
 
@@ -1056,6 +1088,16 @@ async def lifespan(app: FastAPI):
         await quote_edge_detector.start()
         logger.info("报价 edge 影子检测器已启动（A 79.9%/EV+0.097，B 24%/EV+0.155，影子模式不下注）")
 
+    # K 线科学发现影子信号（KREV 族）：720d 冻结注册表条件实时重放——
+    # 15m bar 收盘后复用离线特征管道求值注册表条件原文，次根收盘按回测
+    # 口径结算；只记录不下注，物理隔离于下单路径（新表不进 X4_VERSIONS/
+    # LIVE_CHANNELS）。默认开关关闭，口径保真测试全绿后 .env 显式开启。
+    global kline_shadow_detector
+    if settings.kline_shadow_enabled:
+        kline_shadow_detector = KlineShadowDetector(collector=collector)
+        await kline_shadow_detector.start()
+        logger.info("KREV K线影子检测器已启动（720d v2 Top3/Top4 反转做多，holdout 64.2%/63.4%，影子模式不下注）")
+
     # 交易结算器（P0-2）：回读 SentimentWindow 结算 FILLED 订单输赢/盈亏。
     # 无开关常开：行为只读窗口 + 回填结算字段，零资金风险。
     global trade_settler
@@ -1118,6 +1160,9 @@ async def lifespan(app: FastAPI):
     # 停止报价 edge 影子检测器
     if quote_edge_detector is not None:
         await quote_edge_detector.stop()
+    # 停止 K 线科学发现影子检测器
+    if kline_shadow_detector is not None:
+        await kline_shadow_detector.stop()
     # 停止交易结算器
     if trade_settler is not None:
         await trade_settler.stop()
@@ -2286,10 +2331,10 @@ async def get_binance_order_history(
     return {"orders": orders}
 
 
-@app.post("/api/trades/sync-binance")
-async def sync_binance_orders(_: None = Depends(_require_auth)):
-    """对账回填：用币安侧订单历史订正本地行终态。
+async def _sync_binance_orders_impl() -> dict:
+    """对账回填实现（/api/trades/sync-binance 端点主体，2026-08-28 抽函数不改行为）。
 
+    手动端点与定时对账循环（_binance_reconcile_loop）共用。
     场景一：端点曾返回 500 但币安侧实际已成交（钱已花出），本地行停留
     在 PENDING。按 window_start 匹配（slug btc-updown-5m-<秒> 编码窗口
     起始秒）；币安侧无对应订单的行保持 PENDING 不动。
@@ -2374,6 +2419,13 @@ async def sync_binance_orders(_: None = Depends(_require_auth)):
             })
         await db.commit()
     return {"synced": len(synced), "details": synced, "binance_orders": len(history)}
+
+
+@app.post("/api/trades/sync-binance")
+async def sync_binance_orders(_: None = Depends(_require_auth)):
+    """对账回填：用币安侧订单历史订正本地行终态（主体见 _sync_binance_orders_impl，
+    与 30min 定时对账循环共用，2026-08-28 抽函数）。"""
+    return await _sync_binance_orders_impl()
 
 
 @app.post("/api/trades/sync-status")
