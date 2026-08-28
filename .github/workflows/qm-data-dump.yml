@@ -45,20 +45,29 @@ jobs:
             ) TO STDOUT WITH CSV HEADER
             SQL
             wc -l /tmp/qm_signals_dump.csv
-      - name: Fetch dump via SSH and push to temp branch
+      - name: Fetch dump content (base64 via ssh-action capture_stdout)
+        id: fetch
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
+          capture_stdout: true
+          script: |
+            set -euo pipefail
+            test -s /tmp/qm_signals_dump.csv || { echo "dump 文件缺失"; exit 1; }
+            base64 -w0 /tmp/qm_signals_dump.csv
+            rm -f /tmp/qm_signals_dump.csv
+      - name: Decode dump and push to temp branch
         shell: bash
-        env:
-          VPS_HOST: ${{ secrets.VPS_HOST }}
-          VPS_USER: ${{ secrets.VPS_USER }}
-          VPS_PORT: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
         run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/vps_key
-          chmod 600 ~/.ssh/vps_key
-          scp -i ~/.ssh/vps_key -P "${VPS_PORT}" \
-            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            "${VPS_USER}@${VPS_HOST}:/tmp/qm_signals_dump.csv" ./qm_signals_dump.csv
+          cat > dump.b64 <<'EOF_B64'
+          ${{ steps.fetch.outputs.stdout }}
+          EOF_B64
+          base64 -d dump.b64 > qm_signals_dump.csv
           wc -l qm_signals_dump.csv
+          head -2 qm_signals_dump.csv
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git remote set-url origin \
@@ -67,6 +76,3 @@ jobs:
           git add qm_signals_dump.csv
           git commit -m "data(temp): misalignment_signals qm_v1/v2 全历史行级 dump（取回后删分支）"
           git push -f origin tmp/qm-data-dump
-          ssh -i ~/.ssh/vps_key -p "${VPS_PORT}" \
-            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            "${VPS_USER}@${VPS_HOST}" "rm -f /tmp/qm_signals_dump.csv" || true
