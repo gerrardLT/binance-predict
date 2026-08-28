@@ -136,25 +136,6 @@ interface PatternChangeLog {
   created_at: string | null
 }
 
-interface LLMTraceSummary {
-  id: number
-  phase: string
-  model: string
-  reasoning: string | null
-  result_summary: string | null
-  prompt_tokens: number | null
-  completion_tokens: number | null
-  estimated_cost_yuan: number | null
-  latency_s: number | null
-  created_at: string | null
-}
-
-interface LLMTraceDetail extends LLMTraceSummary {
-  system_prompt: string
-  user_message: string
-  assistant_output: Record<string, unknown> | null
-}
-
 interface DeepLearnDiscovery {
   operation: 'CREATE' | 'UPDATE'
   target_pattern_id: number | null
@@ -459,10 +440,6 @@ const api = {
     authFetch('/api/sentiment/agent/predictions' + (direction ? `?direction=${direction}` : '')).then(r => r.json()),
   getPatternHistory: (id: number) =>
     authFetch(`/api/sentiment/agent/patterns/${id}/history`).then(r => r.json()),
-  getLLMTraces: (phase?: string) =>
-    authFetch('/api/llm/traces' + (phase ? `?phase=${phase}` : '')).then(r => r.json()),
-  getLLMTraceDetail: (id: number) =>
-    authFetch(`/api/llm/traces/${id}`).then(r => r.json()),
   triggerDeepLearn: (maxWindows = 100) =>
     authFetch(`/api/sentiment/agent/deep-learn?max_windows=${maxWindows}`, { method: 'POST' }).then(r => r.json()),
   runPyClusterDeepLearn: (maxWindows = 100) =>
@@ -760,6 +737,307 @@ function LiveChartCard() {
   )
 }
 
+// 悬浮快速下单（右下角 FAB，2026-08-28）：原「人工测试单」卡改为悬浮。
+// 表单状态（amount/side/busy/result）自持有；报价/倒计时/钱包余额由 LiveTradeTab 15s 轮询传入。
+function TestTradeFab({ quote, remainSec, urgent, wallet, refresh }: {
+  quote: Record<string, unknown> | null
+  remainSec: number | null
+  urgent: boolean
+  wallet: Record<string, unknown> | null
+  refresh: () => void
+}) {
+  const [open, setOpen] = useState(false)
+  const [amount, setAmount] = useState('1')
+  const [side, setSide] = useState<'DOWN' | 'UP'>('DOWN')
+  const [busy, setBusy] = useState(false)
+  const [result, setResult] = useState<Record<string, unknown> | null>(null)
+
+  const handleTestTrade = async () => {
+    const amt = parseFloat(amount)
+    if (!Number.isFinite(amt) || amt < 0.1 || amt > 50) {
+      alert('金额仅允许 0.1~50 USDT（与实盘单笔硬上限一致）')
+      return
+    }
+    if (!window.confirm(
+      `确认下真实订单测试单？\n方向: ${side === 'DOWN' ? '↓ 看跌' : '↑ 看涨'} | 金额: ${amt} USDT\n\n这是真实订单，将从现货账户扣款。`)) return
+    setBusy(true)
+    setResult(null)
+    try {
+      const res = await api.postTradeTest(amt, side)
+      setResult(res)
+      refresh()
+    } catch (e) {
+      alert(`请求失败: ${(e as Error).message}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const resultFilled = result?.status === 'FILLED'
+
+  return (
+    <>
+      {/* 悬浮按钮（右下角常驻） */}
+      <button
+        onClick={() => setOpen(o => !o)}
+        className="fixed bottom-6 right-6 z-40 px-4 py-3 rounded-full shadow-lg font-bold text-white text-sm transition bg-brand hover:opacity-90"
+        title="人工测试单（真实下单）"
+      >
+        {busy ? '下单中…' : '⚡ 下单'}
+      </button>
+
+      {/* 展开卡片：点遮罩关闭 */}
+      {open && (
+        <>
+          <div className="fixed inset-0 z-40 bg-black/10" onClick={() => setOpen(false)} />
+          <div className="fixed bottom-24 right-6 z-50 w-[340px] max-w-[92vw] bg-white rounded-xl border border-gray-200 shadow-2xl p-4 space-y-3 text-sm">
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-bold text-gray-800">⚡ 快速下单（真实订单）</span>
+              <button onClick={() => setOpen(false)} className="text-gray-400 hover:text-gray-700 text-lg leading-none px-1">✕</button>
+            </div>
+            {quote == null || quote.stale ? (
+              <div className="text-xs text-gray-400 rounded bg-gray-50 px-2 py-1.5">报价不可用（等待 15s 采样器…）</div>
+            ) : (
+              <div className={`flex items-center justify-between rounded px-2 py-1.5 text-xs ${urgent ? 'bg-red-50 text-red-700' : 'bg-blue-50 text-blue-700'}`}>
+                <span className="font-mono">
+                  UP {typeof quote.up_price === 'number' ? quote.up_price.toFixed(3) : '--'} / DOWN {typeof quote.down_price === 'number' ? quote.down_price.toFixed(3) : '--'}
+                  <span className="opacity-60">（指示价）</span>
+                </span>
+                <span className="font-mono font-bold tabular-nums">
+                  {remainSec != null ? `剩余 ${Math.floor(remainSec / 60)}:${String(remainSec % 60).padStart(2, '0')}` : '--:--'}
+                </span>
+              </div>
+            )}
+            <div className="flex items-center gap-3">
+              <label className="text-gray-500 shrink-0">金额 (USDT)</label>
+              <input
+                type="number" min={0.1} max={50} step={0.5} value={amount}
+                onChange={e => setAmount(e.target.value)}
+                className="w-24 px-2 py-1 border border-gray-300 rounded text-gray-800"
+              />
+              <span className="text-xs text-gray-400">0.1~50</span>
+            </div>
+            {/* 金额预设：百分比按预测钱包余额计算（clamp 0.1~50），固定额直填（100U 超硬上限禁用） */}
+            <div className="flex items-center gap-1.5 flex-wrap text-xs">
+              <span className="text-gray-400 shrink-0">按余额</span>
+              {[2, 5, 10, 20].map(pct => {
+                const bal = typeof wallet?.prediction_usdt_free === 'number'
+                  ? wallet.prediction_usdt_free as number : null
+                const disabled = bal == null
+                return (
+                  <button key={pct} disabled={disabled}
+                    title={disabled ? '预测钱包余额不可查（等余额端点收敛）' : `${pct}% × ${bal!.toFixed(2)}U`}
+                    onClick={() => setAmount(String(Math.min(50, Math.max(0.1, +(bal! * pct / 100).toFixed(2)))))}
+                    className="px-2 py-0.5 rounded border border-gray-300 bg-white text-gray-700 hover:border-blue-400 disabled:opacity-40"
+                  >{pct}%</button>
+                )
+              })}
+              <span className="text-gray-400 shrink-0 ml-2">固定</span>
+              {[1, 2, 5, 10, 20, 50, 100].map(u => (
+                <button key={u} disabled={u > 50} title={u > 50 ? '超单笔硬上限 50 USDT' : `${u} USDT`}
+                  onClick={() => setAmount(String(u))}
+                  className="px-2 py-0.5 rounded border border-gray-300 bg-white text-gray-700 hover:border-blue-400 disabled:opacity-40"
+                >{u}U</button>
+              ))}
+            </div>
+            <div className="flex items-center gap-3">
+              <span className="text-gray-500 shrink-0">方向</span>
+              <button
+                onClick={() => setSide('DOWN')}
+                className={`px-3 py-1 text-sm font-semibold rounded-full border ${side === 'DOWN' ? 'bg-red-100 text-red-700 border-red-300' : 'bg-white text-gray-500 border-gray-200'}`}
+              >↓ 看跌</button>
+              <button
+                onClick={() => setSide('UP')}
+                className={`px-3 py-1 text-sm font-semibold rounded-full border ${side === 'UP' ? 'bg-green-100 text-green-700 border-green-300' : 'bg-white text-gray-500 border-gray-200'}`}
+              >↑ 看涨</button>
+            </div>
+            <button
+              onClick={handleTestTrade}
+              disabled={busy}
+              className={`w-full py-2 rounded-lg font-bold text-white transition ${busy ? 'bg-gray-300 cursor-wait' : 'bg-brand hover:opacity-90'}`}
+            >
+              {busy ? '下单中…' : '下单（真实订单）'}
+            </button>
+            {result && (
+              <div className={`p-2 rounded text-xs ${resultFilled ? 'bg-green-50 text-green-800' : 'bg-red-50 text-red-700'}`}>
+                <div className="font-bold">{resultFilled ? '✓ 已成交 FILLED' : `✗ ${String(result.status ?? '未执行')}`}</div>
+                {result.order_id != null && <div>订单号: {String(result.order_id)}</div>}
+                {result.direction != null && <div>方向: {String(result.direction)}</div>}
+                {result.average_price != null && <div>成交均价: {String(result.average_price)}</div>}
+                {result.error_message != null && <div>{String(result.error_message)}</div>}
+                {result.error != null && <div>{String(result.error)}</div>}
+              </div>
+            )}
+            <p className="text-xs text-gray-400">
+              与信号实盘同链路（占位→报价→下单→落库）；同一 5m 窗口至多一单。
+            </p>
+          </div>
+        </>
+      )}
+    </>
+  )
+}
+
+// 右侧抽屉：最近订单（2026-08-28 从主布局整行卡移入；数据由 LiveTradeTab 15s 轮询传入）
+function OrdersDrawer({ orders, syncing, syncResult, onSyncBinance }: {
+  orders: Record<string, unknown>[]
+  syncing: boolean
+  syncResult: Record<string, unknown> | null
+  onSyncBinance: () => void
+}) {
+  const [open, setOpen] = useState(false)
+  const settledOrders = orders.filter(o => o.settled_at != null)
+  const settledCount = settledOrders.length
+  const totalPnl = settledOrders.reduce(
+    (s, o) => s + (typeof o.pnl === 'number' ? (o.pnl as number) : 0), 0)
+
+  return (
+    <>
+      {!open && (
+        <button
+          onClick={() => setOpen(true)}
+          className="fixed right-0 top-[38%] -translate-y-1/2 z-40 bg-slate-600 text-white text-xs font-bold px-2 py-3 rounded-l-lg shadow-lg hover:bg-slate-700 transition"
+          style={{ writingMode: 'vertical-rl' }}
+          title="查看最近订单"
+        >
+          📋 最近订单
+        </button>
+      )}
+
+      <div
+        className={`fixed top-0 right-0 h-screen w-[760px] max-w-[94vw] bg-white shadow-2xl border-l border-gray-200 z-50 flex flex-col transition-transform duration-300 ${open ? 'translate-x-0' : 'translate-x-full'}`}
+      >
+        <div className="px-4 py-2.5 border-b border-gray-200 flex items-center justify-between shrink-0">
+          <span className="text-sm font-bold text-gray-800">📋 最近订单</span>
+          <button onClick={() => setOpen(false)} className="text-gray-400 hover:text-gray-700 text-lg leading-none px-1">✕</button>
+        </div>
+
+        <div className="flex-1 min-h-0 overflow-auto p-4">
+          <div className="flex items-center justify-between mb-2 gap-2">
+            <span className="text-xs text-gray-400">{orders.length} 条记录（每 15s 自动刷新）</span>
+            <div className="flex items-center gap-2">
+              {syncResult && (
+                <span className={`text-xs px-2 py-0.5 rounded ${syncResult.error ? 'bg-red-50 text-red-600' : 'bg-green-50 text-green-700'}`}>
+                  {syncResult.error
+                    ? String(syncResult.error)
+                    : `币安侧 ${String(syncResult.binance_orders ?? '?')} 单，已同步 ${String(syncResult.synced ?? 0)} 单`}
+                </span>
+              )}
+              <button
+                onClick={onSyncBinance} disabled={syncing}
+                className="px-3 py-1 text-xs font-semibold rounded bg-slate-600 text-white disabled:opacity-50"
+              >{syncing ? '对账中…' : '对账（同步币安）'}</button>
+            </div>
+          </div>
+          {orders.length === 0 ? (
+            <p className="text-sm text-gray-400">暂无订单记录</p>
+          ) : (
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="text-left text-gray-500 border-b border-gray-100">
+                  <th className="py-1 pr-2">时间</th>
+                  <th className="py-1 pr-2">版本</th>
+                  <th className="py-1 pr-2">方向</th>
+                  <th className="py-1 pr-2">状态</th>
+                  <th className="py-1 pr-2">结果</th>
+                  <th className="py-1 pr-2">均价</th>
+                  <th className="py-1 pr-2">金额 (USDT)</th>
+                  <th className="py-1 pr-2">盈亏</th>
+                  <th className="py-1">说明</th>
+                </tr>
+              </thead>
+              <tbody>
+                {orders.map(o => (
+                  <tr key={String(o.id)} className="border-b border-gray-50">
+                    <td className="py-1.5 pr-2 text-gray-600 whitespace-nowrap">
+                      {o.created_at ? new Date(String(o.created_at)).toLocaleString() : '--'}
+                    </td>
+                    <td className="py-1.5 pr-2 font-mono text-gray-700">{String(o.signal_version ?? '--')}</td>
+                    <td className="py-1.5 pr-2">
+                      {o.direction === 'UP'
+                        ? <span className="px-1.5 py-0.5 rounded font-bold bg-green-100 text-green-700">UP</span>
+                        : o.direction === 'DOWN'
+                          ? <span className="px-1.5 py-0.5 rounded font-bold bg-red-100 text-red-700">DOWN</span>
+                          : <span className="text-gray-400">--</span>}
+                    </td>
+                    <td className="py-1.5 pr-2">
+                      <span className={`px-1.5 py-0.5 rounded font-bold ${o.status === 'FILLED' ? 'bg-green-100 text-green-700' : o.status === 'FAILED' ? 'bg-red-100 text-red-700' : 'bg-gray-100 text-gray-600'}`}>
+                        {String(o.status)}
+                      </span>
+                    </td>
+                    <td className="py-1.5 pr-2">
+                      {o.win === true
+                        ? <span className="px-1.5 py-0.5 rounded font-bold bg-green-100 text-green-700">WIN</span>
+                        : o.win === false
+                          ? <span className="px-1.5 py-0.5 rounded font-bold bg-red-100 text-red-700">LOSE</span>
+                          : o.settle_outcome != null
+                            ? <span className="px-1.5 py-0.5 rounded font-bold bg-gray-100 text-gray-600">{String(o.settle_outcome)}</span>
+                            : <span className="text-gray-400">--</span>}
+                    </td>
+                    <td className="py-1.5 pr-2 font-mono">{o.average_price != null ? String(o.average_price) : '--'}</td>
+                    <td className="py-1.5 pr-2 font-mono">
+                      {o.amount_in != null ? (Number(o.amount_in) / 1e18).toFixed(2) : '--'}
+                    </td>
+                    <td className={`py-1.5 pr-2 font-mono ${typeof o.pnl === 'number' ? ((o.pnl as number) >= 0 ? 'text-green-700' : 'text-red-600') : 'text-gray-400'}`}>
+                      {typeof o.pnl === 'number'
+                        ? `${(o.pnl as number) >= 0 ? '+' : ''}${(o.pnl as number).toFixed(2)}`
+                        : '--'}
+                    </td>
+                    <td className="py-1.5 text-gray-500">{String(o.error_message ?? '')}</td>
+                  </tr>
+                ))}
+              </tbody>
+              {settledCount > 0 && (
+                <tfoot>
+                  <tr className="border-t border-gray-100 text-gray-600">
+                    <td colSpan={7} className="py-1.5">已结算 {settledCount} 单（本地估算口径）</td>
+                    <td className={`py-1.5 font-mono font-bold ${totalPnl >= 0 ? 'text-green-700' : 'text-red-600'}`}>
+                      {totalPnl >= 0 ? '+' : ''}{totalPnl.toFixed(2)}
+                    </td>
+                    <td className="py-1.5 text-gray-400">USDT</td>
+                  </tr>
+                </tfoot>
+              )}
+            </table>
+          )}
+        </div>
+      </div>
+    </>
+  )
+}
+
+// 右侧抽屉：BTC K 线 × 市场情绪对照（2026-08-28 从主布局移入；
+// LiveChartCard 常驻挂载保持 30s 轮询数据连续，抽屉仅控制可视）
+function ChartDrawer() {
+  const [open, setOpen] = useState(false)
+  return (
+    <>
+      {!open && (
+        <button
+          onClick={() => setOpen(true)}
+          className="fixed right-0 top-[62%] -translate-y-1/2 z-40 bg-blue-600 text-white text-xs font-bold px-2 py-3 rounded-l-lg shadow-lg hover:bg-blue-700 transition"
+          style={{ writingMode: 'vertical-rl' }}
+          title="查看 BTC K 线 × 市场情绪对照"
+        >
+          📈 K 线对照
+        </button>
+      )}
+
+      <div
+        className={`fixed top-0 right-0 h-screen w-[760px] max-w-[94vw] bg-gray-50 shadow-2xl border-l border-gray-200 z-50 flex flex-col transition-transform duration-300 ${open ? 'translate-x-0' : 'translate-x-full'}`}
+      >
+        <div className="px-4 py-2.5 border-b border-gray-200 bg-white flex items-center justify-between shrink-0">
+          <span className="text-sm font-bold text-gray-800">📈 BTC K 线对照</span>
+          <button onClick={() => setOpen(false)} className="text-gray-400 hover:text-gray-700 text-lg leading-none px-1">✕</button>
+        </div>
+        <div className="flex-1 min-h-0 overflow-auto p-3">
+          <LiveChartCard />
+        </div>
+      </div>
+    </>
+  )
+}
+
 // 多通道实盘状态类型（与后端 multi_live_trader.status_async() 严格对齐）
 interface LiveChannelStatus {
   channel: string
@@ -874,10 +1152,7 @@ function LiveTradeTab() {
   const [wallet, setWallet] = useState<Record<string, unknown> | null>(null)
   const [live, setLive] = useState<Record<string, unknown> | null>(null)
   const [orders, setOrders] = useState<Record<string, unknown>[]>([])
-  const [amount, setAmount] = useState('1')
-  const [side, setSide] = useState<'DOWN' | 'UP'>('DOWN')
-  const [busy, setBusy] = useState(false)
-  const [result, setResult] = useState<Record<string, unknown> | null>(null)
+  // 下单表单状态（amount/side/busy/result）已移入悬浮下单 TestTradeFab
   const [transferAmt, setTransferAmt] = useState('5')
   const [transferring, setTransferring] = useState(false)
   const [transferResult, setTransferResult] = useState<Record<string, unknown> | null>(null)
@@ -920,30 +1195,8 @@ function LiveTradeTab() {
     return () => clearInterval(t)
   }, [])
 
-  const handleTestTrade = async () => {
-    const amt = parseFloat(amount)
-    if (!Number.isFinite(amt) || amt < 0.1 || amt > 50) {
-      alert('金额仅允许 0.1~50 USDT（与实盘单笔硬上限一致）')
-      return
-    }
-    if (!window.confirm(
-      `确认下真实订单测试单？\n方向: ${side === 'DOWN' ? '↓ 看跌' : '↑ 看涨'} | 金额: ${amt} USDT\n\n这是真实订单，将从现货账户扣款。`)) return
-    setBusy(true)
-    setResult(null)
-    try {
-      const res = await api.postTradeTest(amt, side)
-      setResult(res)
-      refresh()
-    } catch (e) {
-      alert(`请求失败: ${(e as Error).message}`)
-    } finally {
-      setBusy(false)
-    }
-  }
-
   const walletErr = (wallet as { error?: string } | null)?.error
   const regTs = wallet?.registered_time as number | undefined
-  const resultFilled = result?.status === 'FILLED'
   // 多通道实盘：live = live_channels status（channels[] 见 LiveChannelStatus）
   const liveChannels = Array.isArray(live?.channels) ? live.channels as LiveChannelStatus[] : []
   const enabledCount = liveChannels.filter(c => c.enabled).length
@@ -956,11 +1209,7 @@ function LiveTradeTab() {
     : null
   const urgent = remainSec != null && remainSec < 60
 
-  // 结算统计（订单表尾累计行）+ 在途持仓（FILLED 未结算）
-  const settledOrders = orders.filter(o => o.settled_at != null)
-  const settledCount = settledOrders.length
-  const totalPnl = settledOrders.reduce(
-    (s, o) => s + (typeof o.pnl === 'number' ? (o.pnl as number) : 0), 0)
+  // 在途持仓（FILLED 未结算；订单明细/累计盈亏已移入右侧 OrdersDrawer）
   const openPositions = orders.filter(o => o.status === 'FILLED' && !o.settled_at)
   const openAmount = openPositions.reduce(
     (s, o) => s + (o.amount_in != null ? Number(o.amount_in) / 1e18 : 0), 0)
@@ -1107,89 +1356,9 @@ function LiveTradeTab() {
   }
 
   return (
+    <>
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-      {/* 布局：交易操作区置顶（人工测试单/账户状态/最近订单），K 线对照与信号概览下移 */}
-      <Card title="人工测试单（真实下单）">
-        <div className="space-y-3 text-sm">
-          {quote == null || quote.stale ? (
-            <div className="text-xs text-gray-400 rounded bg-gray-50 px-2 py-1.5">报价不可用（等待 15s 采样器…）</div>
-          ) : (
-            <div className={`flex items-center justify-between rounded px-2 py-1.5 text-xs ${urgent ? 'bg-red-50 text-red-700' : 'bg-blue-50 text-blue-700'}`}>
-              <span className="font-mono">
-                UP {typeof quote.up_price === 'number' ? quote.up_price.toFixed(3) : '--'} / DOWN {typeof quote.down_price === 'number' ? quote.down_price.toFixed(3) : '--'}
-                <span className="opacity-60">（指示价）</span>
-              </span>
-              <span className="font-mono font-bold tabular-nums">
-                {remainSec != null ? `剩余 ${Math.floor(remainSec / 60)}:${String(remainSec % 60).padStart(2, '0')}` : '--:--'}
-              </span>
-            </div>
-          )}
-          <div className="flex items-center gap-3">
-            <label className="text-gray-500 shrink-0">金额 (USDT)</label>
-            <input
-              type="number" min={0.1} max={50} step={0.5} value={amount}
-              onChange={e => setAmount(e.target.value)}
-              className="w-24 px-2 py-1 border border-gray-300 rounded text-gray-800"
-            />
-            <span className="text-xs text-gray-400">0.1~50</span>
-          </div>
-          {/* 金额预设：百分比按预测钱包余额计算（clamp 0.1~50），固定额直填（100U 超硬上限禁用） */}
-          <div className="flex items-center gap-1.5 flex-wrap text-xs">
-            <span className="text-gray-400 shrink-0">按余额</span>
-            {[2, 5, 10, 20].map(pct => {
-              const bal = typeof wallet?.prediction_usdt_free === 'number'
-                ? wallet.prediction_usdt_free as number : null
-              const disabled = bal == null
-              return (
-                <button key={pct} disabled={disabled}
-                  title={disabled ? '预测钱包余额不可查（等余额端点收敛）' : `${pct}% × ${bal!.toFixed(2)}U`}
-                  onClick={() => setAmount(String(Math.min(50, Math.max(0.1, +(bal! * pct / 100).toFixed(2)))))}
-                  className="px-2 py-0.5 rounded border border-gray-300 bg-white text-gray-700 hover:border-blue-400 disabled:opacity-40"
-                >{pct}%</button>
-              )
-            })}
-            <span className="text-gray-400 shrink-0 ml-2">固定</span>
-            {[1, 2, 5, 10, 20, 50, 100].map(u => (
-              <button key={u} disabled={u > 50} title={u > 50 ? '超单笔硬上限 50 USDT' : `${u} USDT`}
-                onClick={() => setAmount(String(u))}
-                className="px-2 py-0.5 rounded border border-gray-300 bg-white text-gray-700 hover:border-blue-400 disabled:opacity-40"
-              >{u}U</button>
-            ))}
-          </div>
-          <div className="flex items-center gap-3">
-            <span className="text-gray-500 shrink-0">方向</span>
-            <button
-              onClick={() => setSide('DOWN')}
-              className={`px-3 py-1 text-sm font-semibold rounded-full border ${side === 'DOWN' ? 'bg-red-100 text-red-700 border-red-300' : 'bg-white text-gray-500 border-gray-200'}`}
-            >↓ 看跌</button>
-            <button
-              onClick={() => setSide('UP')}
-              className={`px-3 py-1 text-sm font-semibold rounded-full border ${side === 'UP' ? 'bg-green-100 text-green-700 border-green-300' : 'bg-white text-gray-500 border-gray-200'}`}
-            >↑ 看涨</button>
-          </div>
-          <button
-            onClick={handleTestTrade}
-            disabled={busy}
-            className={`w-full py-2 rounded-lg font-bold text-white transition ${busy ? 'bg-gray-300 cursor-wait' : 'bg-brand hover:opacity-90'}`}
-          >
-            {busy ? '下单中…' : '下单（真实订单）'}
-          </button>
-          {result && (
-            <div className={`p-2 rounded text-xs ${resultFilled ? 'bg-green-50 text-green-800' : 'bg-red-50 text-red-700'}`}>
-              <div className="font-bold">{resultFilled ? '✓ 已成交 FILLED' : `✗ ${String(result.status ?? '未执行')}`}</div>
-              {result.order_id != null && <div>订单号: {String(result.order_id)}</div>}
-              {result.direction != null && <div>方向: {String(result.direction)}</div>}
-              {result.average_price != null && <div>成交均价: {String(result.average_price)}</div>}
-              {result.error_message != null && <div>{String(result.error_message)}</div>}
-              {result.error != null && <div>{String(result.error)}</div>}
-            </div>
-          )}
-          <p className="text-xs text-gray-400">
-            与信号实盘同链路（占位→报价→下单→落库）；同一 5m 窗口至多一单。
-          </p>
-        </div>
-      </Card>
-
+      {/* 2026-08-28 布局改造：下单→右下角悬浮 FAB；订单/K 线→右侧抽屉；主区仅留账户状态 + 信号概览 */}
       <div className="lg:col-span-2">
       <Card title="账户状态">
         <div className="space-y-2 text-sm">
@@ -1381,102 +1550,14 @@ function LiveTradeTab() {
       </Card>
       </div>
 
-      <div className="lg:col-span-2">
-        <Card title="最近订单">
-          <div className="flex items-center justify-between mb-2 gap-2">
-            <span className="text-xs text-gray-400">{orders.length} 条记录（每 15s 自动刷新）</span>
-            <div className="flex items-center gap-2">
-              {syncResult && (
-                <span className={`text-xs px-2 py-0.5 rounded ${syncResult.error ? 'bg-red-50 text-red-600' : 'bg-green-50 text-green-700'}`}>
-                  {syncResult.error
-                    ? String(syncResult.error)
-                    : `币安侧 ${String(syncResult.binance_orders ?? '?')} 单，已同步 ${String(syncResult.synced ?? 0)} 单`}
-                </span>
-              )}
-              <button
-                onClick={handleSyncBinance} disabled={syncing}
-                className="px-3 py-1 text-xs font-semibold rounded bg-slate-600 text-white disabled:opacity-50"
-              >{syncing ? '对账中…' : '对账（同步币安）'}</button>
-            </div>
-          </div>
-          {orders.length === 0 ? (
-            <p className="text-sm text-gray-400">暂无订单记录</p>
-          ) : (
-            <table className="w-full text-xs">
-              <thead>
-                <tr className="text-left text-gray-500 border-b border-gray-100">
-                  <th className="py-1 pr-2">时间</th>
-                  <th className="py-1 pr-2">版本</th>
-                  <th className="py-1 pr-2">方向</th>
-                  <th className="py-1 pr-2">状态</th>
-                  <th className="py-1 pr-2">结果</th>
-                  <th className="py-1 pr-2">均价</th>
-                  <th className="py-1 pr-2">金额 (USDT)</th>
-                  <th className="py-1 pr-2">盈亏</th>
-                  <th className="py-1">说明</th>
-                </tr>
-              </thead>
-              <tbody>
-                {orders.map(o => (
-                  <tr key={String(o.id)} className="border-b border-gray-50">
-                    <td className="py-1.5 pr-2 text-gray-600 whitespace-nowrap">
-                      {o.created_at ? new Date(String(o.created_at)).toLocaleString() : '--'}
-                    </td>
-                    <td className="py-1.5 pr-2 font-mono text-gray-700">{String(o.signal_version ?? '--')}</td>
-                    <td className="py-1.5 pr-2">
-                      {o.direction === 'UP'
-                        ? <span className="px-1.5 py-0.5 rounded font-bold bg-green-100 text-green-700">UP</span>
-                        : o.direction === 'DOWN'
-                          ? <span className="px-1.5 py-0.5 rounded font-bold bg-red-100 text-red-700">DOWN</span>
-                          : <span className="text-gray-400">--</span>}
-                    </td>
-                    <td className="py-1.5 pr-2">
-                      <span className={`px-1.5 py-0.5 rounded font-bold ${o.status === 'FILLED' ? 'bg-green-100 text-green-700' : o.status === 'FAILED' ? 'bg-red-100 text-red-700' : 'bg-gray-100 text-gray-600'}`}>
-                        {String(o.status)}
-                      </span>
-                    </td>
-                    <td className="py-1.5 pr-2">
-                      {o.win === true
-                        ? <span className="px-1.5 py-0.5 rounded font-bold bg-green-100 text-green-700">WIN</span>
-                        : o.win === false
-                          ? <span className="px-1.5 py-0.5 rounded font-bold bg-red-100 text-red-700">LOSE</span>
-                          : o.settle_outcome != null
-                            ? <span className="px-1.5 py-0.5 rounded font-bold bg-gray-100 text-gray-600">{String(o.settle_outcome)}</span>
-                            : <span className="text-gray-400">--</span>}
-                    </td>
-                    <td className="py-1.5 pr-2 font-mono">{o.average_price != null ? String(o.average_price) : '--'}</td>
-                    <td className="py-1.5 pr-2 font-mono">
-                      {o.amount_in != null ? (Number(o.amount_in) / 1e18).toFixed(2) : '--'}
-                    </td>
-                    <td className={`py-1.5 pr-2 font-mono ${typeof o.pnl === 'number' ? ((o.pnl as number) >= 0 ? 'text-green-700' : 'text-red-600') : 'text-gray-400'}`}>
-                      {typeof o.pnl === 'number'
-                        ? `${(o.pnl as number) >= 0 ? '+' : ''}${(o.pnl as number).toFixed(2)}`
-                        : '--'}
-                    </td>
-                    <td className="py-1.5 text-gray-500">{String(o.error_message ?? '')}</td>
-                  </tr>
-                ))}
-              </tbody>
-              {settledCount > 0 && (
-                <tfoot>
-                  <tr className="border-t border-gray-100 text-gray-600">
-                    <td colSpan={7} className="py-1.5">已结算 {settledCount} 单（本地估算口径）</td>
-                    <td className={`py-1.5 font-mono font-bold ${totalPnl >= 0 ? 'text-green-700' : 'text-red-600'}`}>
-                      {totalPnl >= 0 ? '+' : ''}{totalPnl.toFixed(2)}
-                    </td>
-                    <td className="py-1.5 text-gray-400">USDT</td>
-                  </tr>
-                </tfoot>
-              )}
-            </table>
-          )}
-        </Card>
-      </div>
-
-      {/* 参考信息（2026-08-28 移至下方）：K 线 × 市场情绪对照 + 线上信号概览 */}
-      <LiveChartCard />
       <SignalsOverviewCard live={live} onToggleChannel={handleChannelToggle} busy={togglingLive} />
     </div>
+
+    {/* 悬浮与抽屉（2026-08-28）：下单 FAB + 订单/K 线右侧抽屉 */}
+    <TestTradeFab quote={quote} remainSec={remainSec} urgent={urgent} wallet={wallet} refresh={refresh} />
+    <OrdersDrawer orders={orders} syncing={syncing} syncResult={syncResult} onSyncBinance={handleSyncBinance} />
+    <ChartDrawer />
+    </>
   )
 }
 
@@ -1796,9 +1877,6 @@ export default function App() {
         {tab === 'analysis' && <SignalAnalyticsTab />}
         {tab === 'live' && <LiveTradeTab />}
       </main>
-
-      {/* 右侧悬浮：LLM 轨迹面板（全局可见，5 秒轮询） */}
-      <LLMTracePanel />
     </div>
   )
 }
@@ -2396,183 +2474,6 @@ function MonitorTab() {
           </table>
         )}
       </Card>
-    </div>
-  )
-}
-
-// ============================================================
-// LLM 轨迹面板（右侧悬浮抽屉，5 秒轮询）
-// ============================================================
-
-const PHASE_META: Record<string, { label: string; cls: string }> = {
-  LEARN: { label: 'LEARN', cls: 'bg-blue-100 text-blue-700' },
-  DEEP_LEARN: { label: 'DEEP', cls: 'bg-purple-100 text-purple-700' },
-  PREDICT: { label: 'PREDICT', cls: 'bg-green-100 text-green-700' },
-  EVOLVE: { label: 'EVOLVE', cls: 'bg-amber-100 text-amber-700' },
-}
-
-function PhaseBadge({ phase }: { phase: string }) {
-  const m = PHASE_META[phase] || { label: phase, cls: 'bg-gray-100 text-gray-600' }
-  return <span className={`px-1.5 py-0.5 text-[10px] font-bold rounded ${m.cls}`}>{m.label}</span>
-}
-
-function LLMTracePanel() {
-  const [open, setOpen] = useState(false)
-  const [traces, setTraces] = useState<LLMTraceSummary[]>([])
-  const [phaseFilter, setPhaseFilter] = useState<string>('')
-  const [expandedId, setExpandedId] = useState<number | null>(null)
-  const [detail, setDetail] = useState<LLMTraceDetail | null>(null)
-  const [loadingDetail, setLoadingDetail] = useState(false)
-
-  const refresh = useCallback(() => {
-    api.getLLMTraces(phaseFilter || undefined)
-      .then(d => setTraces(Array.isArray(d) ? d : []))
-      .catch(() => {})
-  }, [phaseFilter])
-
-  // 仅在面板打开时轮询（5 秒）
-  useEffect(() => {
-    if (!open) return
-    refresh()
-    const timer = setInterval(refresh, 5000)
-    return () => clearInterval(timer)
-  }, [open, refresh])
-
-  const toggleDetail = async (id: number) => {
-    if (expandedId === id) {
-      setExpandedId(null)
-      setDetail(null)
-      return
-    }
-    setExpandedId(id)
-    setDetail(null)
-    setLoadingDetail(true)
-    try {
-      const d = await api.getLLMTraceDetail(id)
-      setDetail(d && typeof d === 'object' && 'id' in d ? d : null)
-    } catch {
-      setDetail(null)
-    } finally {
-      setLoadingDetail(false)
-    }
-  }
-
-  const fmtTime = (s: string | null) =>
-    s ? new Date(s).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '--'
-
-  return (
-    <>
-      {/* 悬浮触发按钮（右侧边缘，竖排文字） */}
-      {!open && (
-        <button
-          onClick={() => setOpen(true)}
-          className="fixed right-0 top-1/2 -translate-y-1/2 z-40 bg-indigo-600 text-white text-xs font-bold px-2 py-3 rounded-l-lg shadow-lg hover:bg-indigo-700 transition"
-          style={{ writingMode: 'vertical-rl' }}
-          title="查看 LLM 调用轨迹"
-        >
-          🧠 LLM 轨迹
-        </button>
-      )}
-
-      {/* 右侧抽屉 */}
-      <div
-        className={`fixed top-0 right-0 h-screen w-[440px] max-w-[92vw] bg-white shadow-2xl border-l border-gray-200 z-50 flex flex-col transition-transform duration-300 ${open ? 'translate-x-0' : 'translate-x-full'}`}
-      >
-        {/* 头部 */}
-        <div className="px-4 py-2.5 border-b border-gray-200 flex items-center justify-between shrink-0">
-          <div className="flex items-center gap-2">
-            <span className="text-sm font-bold text-gray-800">🧠 LLM 调用轨迹</span>
-            <span className="text-[10px] text-gray-400">每 5 秒刷新</span>
-          </div>
-          <button onClick={() => setOpen(false)} className="text-gray-400 hover:text-gray-700 text-lg leading-none px-1">✕</button>
-        </div>
-
-        {/* 阶段筛选 */}
-        <div className="px-4 py-2 border-b border-gray-100 flex items-center gap-1 flex-wrap shrink-0">
-          {['', 'LEARN', 'DEEP_LEARN', 'PREDICT', 'EVOLVE'].map(p => (
-            <button
-              key={p || 'ALL'}
-              onClick={() => { setPhaseFilter(p); setExpandedId(null); setDetail(null) }}
-              className={`px-2 py-0.5 text-[10px] font-medium rounded transition ${
-                phaseFilter === p ? 'bg-indigo-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
-              }`}
-            >
-              {p === '' ? '全部' : (PHASE_META[p]?.label ?? p)}
-            </button>
-          ))}
-        </div>
-
-        {/* 轨迹列表 */}
-        <div className="flex-1 min-h-0 overflow-auto p-3 space-y-2">
-          {traces.length === 0 ? (
-            <div className="text-center text-gray-400 py-10 text-sm">暂无 LLM 调用记录</div>
-          ) : (
-            traces.map(t => (
-              <div key={t.id} className="border border-gray-200 rounded-lg overflow-hidden">
-                <button
-                  onClick={() => toggleDetail(t.id)}
-                  className="w-full text-left px-3 py-2 hover:bg-gray-50 transition"
-                >
-                  <div className="flex items-center justify-between gap-2 mb-1">
-                    <div className="flex items-center gap-1.5">
-                      <PhaseBadge phase={t.phase} />
-                      <span className="text-[10px] text-gray-400 font-mono">{fmtTime(t.created_at)}</span>
-                    </div>
-                    <span className="text-[10px] text-gray-400 font-mono">
-                      {t.latency_s != null ? `${t.latency_s.toFixed(1)}s` : ''}
-                    </span>
-                  </div>
-                  {t.result_summary && (
-                    <div className="text-[11px] font-mono text-indigo-700 mb-0.5">{t.result_summary}</div>
-                  )}
-                  {t.reasoning && (
-                    <div className="text-[11px] text-gray-600 line-clamp-2">{t.reasoning}</div>
-                  )}
-                  <div className="flex items-center gap-3 mt-1 text-[10px] text-gray-400 font-mono">
-                    <span>tok {t.prompt_tokens ?? '?'}/{t.completion_tokens ?? '?'}</span>
-                    {t.estimated_cost_yuan != null && <span>¥{t.estimated_cost_yuan.toFixed(4)}</span>}
-                    <span className="truncate">{t.model}</span>
-                  </div>
-                </button>
-
-                {/* 展开详情 */}
-                {expandedId === t.id && (
-                  <div className="border-t border-gray-100 bg-gray-50 px-3 py-2 space-y-2">
-                    {loadingDetail ? (
-                      <div className="text-[10px] text-gray-400">加载详情中...</div>
-                    ) : !detail ? (
-                      <div className="text-[10px] text-red-400">详情加载失败</div>
-                    ) : (
-                      <>
-                        <TraceSection title="Reasoning（推理）" text={detail.reasoning || '（无）'} />
-                        <TraceSection title="System Prompt（系统提示词）" text={detail.system_prompt} collapsedHeight />
-                        <TraceSection title="User Message（输入）" text={detail.user_message} collapsedHeight />
-                        <div>
-                          <div className="text-[10px] font-bold text-gray-500 mb-1">Assistant Output（结构化输出）</div>
-                          <pre className="text-[10px] bg-white p-1.5 rounded border border-gray-200 overflow-auto max-h-64 whitespace-pre-wrap break-words">
-                            {detail.assistant_output ? JSON.stringify(detail.assistant_output, null, 2) : '（无）'}
-                          </pre>
-                        </div>
-                      </>
-                    )}
-                  </div>
-                )}
-              </div>
-            ))
-          )}
-        </div>
-      </div>
-    </>
-  )
-}
-
-function TraceSection({ title, text, collapsedHeight = false }: { title: string; text: string; collapsedHeight?: boolean }) {
-  return (
-    <div>
-      <div className="text-[10px] font-bold text-gray-500 mb-1">{title}</div>
-      <pre className={`text-[10px] bg-white p-1.5 rounded border border-gray-200 overflow-auto whitespace-pre-wrap break-words ${collapsedHeight ? 'max-h-40' : 'max-h-64'}`}>
-        {text}
-      </pre>
     </div>
   )
 }
