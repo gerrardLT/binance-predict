@@ -877,7 +877,8 @@ function TestTradeFab({ quote, remainSec, urgent, wallet, refresh }: {
 }
 
 // 最近订单卡片（页面主区展示，2026-08-28 用户要求回归页面；
-// 2026-08-29：加状态/通道/方向筛选 + 通道中文化与解释 + 分页）
+// 2026-08-29：加状态/通道/方向筛选 + 通道中文化与解释 + 分页；
+// 2026-08-29：加「目标周期」列——window_start + market_period 展示真正下注的窗口时段）
 const ORDERS_PAGE_SIZE = 20
 
 function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
@@ -962,6 +963,7 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
           <thead>
             <tr className="text-left text-gray-500 border-b border-gray-100">
               <th className="py-1 pr-2">时间</th>
+              <th className="py-1 pr-2" title="本单真正下注的市场周期时段（window_start 起，5m/15m 窗口）">目标周期</th>
               <th className="py-1 pr-2">通道</th>
               <th className="py-1 pr-2">方向</th>
               <th className="py-1 pr-2">状态</th>
@@ -980,6 +982,19 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
               <tr key={String(o.id)} className="border-b border-gray-50">
                 <td className="py-1.5 pr-2 text-gray-600 whitespace-nowrap">
                   {o.created_at ? new Date(String(o.created_at)).toLocaleString() : '--'}
+                </td>
+                <td className="py-1.5 pr-2 whitespace-nowrap">
+                  {typeof o.window_start === 'number' ? (() => {
+                    const ws = o.window_start as number
+                    const durMin = o.market_period === '15m' ? 15 : 5
+                    const hhmm = (ms: number) => new Date(ms).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+                    return (
+                      <span className="font-mono text-gray-700" title={`下注窗口：${new Date(ws).toLocaleString()} ~ ${new Date(ws + durMin * 60_000).toLocaleString()}`}>
+                        {hhmm(ws)}–{hhmm(ws + durMin * 60_000)}
+                        <span className="ml-1 px-1 rounded bg-gray-100 text-gray-500">{durMin}m</span>
+                      </span>
+                    )
+                  })() : <span className="text-gray-400">--</span>}
                 </td>
                 <td className="py-1.5 pr-2">
                   {info ? (
@@ -1029,7 +1044,7 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
           {settledCount > 0 && (
             <tfoot>
               <tr className="border-t border-gray-100 text-gray-600">
-                <td colSpan={7} className="py-1.5">已结算 {settledCount} 单（本地估算口径）</td>
+                <td colSpan={8} className="py-1.5">已结算 {settledCount} 单（本地估算口径）</td>
                 <td className={`py-1.5 font-mono font-bold ${totalPnl >= 0 ? 'text-green-700' : 'text-red-600'}`}>
                   {totalPnl >= 0 ? '+' : ''}{totalPnl.toFixed(2)}
                 </td>

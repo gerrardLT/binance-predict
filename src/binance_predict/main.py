@@ -1871,6 +1871,7 @@ async def get_recent_trades(
                 "id": o.id,
                 "signal_version": o.signal_version,
                 "window_start": o.window_start,
+                "market_period": o.market_period,
                 "status": o.status,
                 "order_id": o.order_id,
                 "token_id": o.token_id,

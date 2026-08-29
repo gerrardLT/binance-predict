@@ -173,6 +173,7 @@ async def test_recent_trades_fields_and_limit() -> None:
 
     row = SimpleNamespace(
         id=1, signal_version="manual_test", window_start=1_787_412_600_000,
+        market_period="5m",
         status="FAILED", order_id=None, token_id=None, amount_in=None,
         quote_json={"averagePrice": 0.5},
         direction=None, settle_outcome=None, win=None, pnl=None, settled_at=None,
@@ -190,6 +191,7 @@ async def test_recent_trades_fields_and_limit() -> None:
     o = out["orders"][0]
     assert o["signal_version"] == "manual_test"
     assert o["status"] == "FAILED"
+    assert o["market_period"] == "5m"  # 下注市场周期（前端「目标周期」列依据）
     assert o["average_price"] == 0.5
     assert o["direction"] is None      # 旧数据无 direction：透传 null
     assert o["settled_at"] is None     # 未结算 → null
