@@ -1890,6 +1890,45 @@ async def get_recent_trades(
     }
 
 
+@app.get("/api/trades/fund-flow")
+async def get_trades_fund_flow(
+    since_ms: int = 0,
+    limit: int = 5000,
+    _: None = Depends(_require_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """全量资金流水（资金变化面板）：不受 /api/trades/recent 的 100 条硬上限约束。
+
+    只返回资金派生所需精简字段（无 order_id/token_id/quote_json），
+    按 created_at 升序。since_ms 可选：只拉该毫秒时间戳之后的订单。
+    """
+    from sqlalchemy import select
+    from .db.models import TradeOrderModel
+
+    limit = max(1, min(int(limit), 5000))
+    stmt = select(TradeOrderModel).order_by(TradeOrderModel.created_at.asc()).limit(limit)
+    if since_ms > 0:
+        since_dt = datetime.fromtimestamp(int(since_ms) / 1000, tz=timezone.utc)
+        stmt = stmt.where(TradeOrderModel.created_at >= since_dt)
+    orders = (await db.execute(stmt)).scalars().all()
+    return {
+        "total": len(orders),
+        "orders": [
+            {
+                "signal_version": o.signal_version,
+                "status": o.status,
+                "amount_in": o.amount_in,
+                "direction": o.direction,
+                "win": o.win,
+                "pnl": o.pnl,
+                "settled_at": o.settled_at.isoformat() if o.settled_at else None,
+                "created_at": o.created_at.isoformat() if o.created_at else None,
+            }
+            for o in orders
+        ],
+    }
+
+
 @app.get("/api/prediction-markets")
 async def list_prediction_markets(
     _: None = Depends(_require_auth),

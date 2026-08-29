@@ -212,6 +212,39 @@ async def test_recent_trades_empty() -> None:
 
 
 # ============================================================
+# GET /api/trades/fund-flow（资金变化面板全量流水，不受 recent 100 条上限）
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_fund_flow_fields_and_total() -> None:
+    """精简字段透传（资金派生所需）+ total 计数；无 order_id/token_id 等重字段。"""
+    import binance_predict.main as m
+
+    row = SimpleNamespace(
+        signal_version="quote_contrarian_v3b", status="FILLED",
+        amount_in="1000000000000000000", direction="DOWN",
+        win=True, pnl=1.25,
+        settled_at=datetime(2026, 8, 29, 3, 10, tzinfo=timezone.utc),
+        created_at=datetime(2026, 8, 29, 3, 5, tzinfo=timezone.utc),
+    )
+    db = AsyncMock()
+    result = MagicMock()
+    result.scalars.return_value.all.return_value = [row]
+    db.execute = AsyncMock(return_value=result)
+
+    out = await m.get_trades_fund_flow(since_ms=0, limit=5000, _=None, db=db)
+    assert out["total"] == 1
+    o = out["orders"][0]
+    assert o["signal_version"] == "quote_contrarian_v3b"
+    assert o["status"] == "FILLED"
+    assert o["amount_in"] == "1000000000000000000"
+    assert o["win"] is True and o["pnl"] == 1.25
+    assert o["settled_at"].startswith("2026-08-29T03:10")
+    assert o["created_at"].startswith("2026-08-29T03:05")
+    assert "order_id" not in o and "token_id" not in o  # 精简体：不带重字段
+
+
+# ============================================================
 # GET /api/prediction-wallet 附余额（TTL 缓存 + 预测钱包余额探索）
 # ============================================================
 

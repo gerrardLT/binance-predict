@@ -475,6 +475,7 @@ const api = {
   getPredictionWallet: () => authFetch('/api/prediction-wallet').then(r => r.json()),
   getLiveStatus: () => authFetch('/api/misalignment/signals').then(r => r.json()),
   getRecentTrades: (limit = 100) => authFetch(`/api/trades/recent?limit=${limit}`).then(r => r.json()),
+  getFundFlow: () => authFetch('/api/trades/fund-flow').then(r => r.json()),
   postTradeTest: (amount_usdt: number, prediction: string) =>
     authFetch('/api/trade/test', {
       method: 'POST',
@@ -1079,10 +1080,27 @@ const FUND_PERIODS = [
 
 function FundsFlowCard({ orders }: { orders: Record<string, unknown>[] }) {
   const [period, setPeriod] = useState<string>('7d')
+  // 全量流水（新接口不受 recent 的 100 条上限）；拉取成功后替代 orders prop，
+  // 失败降级用 prop（最近 100 条）保证面板可用。随抽屉常驻挂载 30s 轮询。
+  const [fundOrders, setFundOrders] = useState<Record<string, unknown>[]>([])
+  useEffect(() => {
+    let alive = true
+    const pull = () => api.getFundFlow()
+      .then((d: Record<string, unknown>) => {
+        if (alive && Array.isArray(d?.orders) && (d.orders as unknown[]).length > 0) {
+          setFundOrders(d.orders as Record<string, unknown>[])
+        }
+      })
+      .catch(() => {})
+    pull()
+    const timer = setInterval(pull, 30_000)
+    return () => { alive = false; clearInterval(timer) }
+  }, [])
+  const src = fundOrders.length > 0 ? fundOrders : orders
 
   const events = useMemo(() => {
     const evs: FlowEvent[] = []
-    for (const o of orders) {
+    for (const o of src) {
       const amtWei = Number(o.amount_in ?? 0)
       if (!(amtWei > 0)) continue  // 失败/未成交单无资金占用（含待定单）
       const amt = amtWei / 1e18
@@ -1100,7 +1118,7 @@ function FundsFlowCard({ orders }: { orders: Record<string, unknown>[] }) {
       }
     }
     return evs.sort((a, b) => a.ts - b.ts)
-  }, [orders])
+  }, [src])
 
   const p = FUND_PERIODS.find(x => x.v === period) ?? FUND_PERIODS[1]
   const cutoff = p.ms > 0 ? Date.now() - p.ms : 0
@@ -1110,7 +1128,7 @@ function FundsFlowCard({ orders }: { orders: Record<string, unknown>[] }) {
   const net = inSum - outSum
   const tradeCount = inRange.filter(e => e.dir === '流出').length
   // 在途资金（未结算成交单，不受时间筛选影响）
-  const pendingOpen = orders.filter(o => o.status === 'FILLED' && o.settled_at == null && Number(o.amount_in ?? 0) > 0)
+  const pendingOpen = src.filter(o => o.status === 'FILLED' && o.settled_at == null && Number(o.amount_in ?? 0) > 0)
   const pendingAmt = pendingOpen.reduce((s, o) => s + Number(o.amount_in) / 1e18, 0)
 
   // 按本地日聚合净流入（柱）+ 累计净盈亏（折线）
@@ -1122,11 +1140,11 @@ function FundsFlowCard({ orders }: { orders: Record<string, unknown>[] }) {
   let acc = 0
   const daily = Array.from(byDay.entries()).map(([date, netAmt]) => {
     acc += netAmt
-    return { date, net: +netAmt.toFixed(3), cum: +acc.toFixed(3) }
+    return { date, '当日净流入': +netAmt.toFixed(3), '累计净盈亏': +acc.toFixed(3) }
   })
 
   // 结算表现统计（口径：本期内已结算成交单；pnl 输=-投入/赢=盈利/NOISE=0）
-  const settledInPeriod = orders.filter(o => {
+  const settledInPeriod = src.filter(o => {
     if (o.status !== 'FILLED' || !(Number(o.amount_in ?? 0) > 0)) return false
     const ts = Date.parse(String(o.settled_at ?? ''))
     return !Number.isNaN(ts) && ts >= cutoff
@@ -1144,8 +1162,8 @@ function FundsFlowCard({ orders }: { orders: Record<string, unknown>[] }) {
     if (run > peak) peak = run
     if (peak - run > maxDD) maxDD = peak - run
   }
-  const bestDay = daily.length ? daily.reduce((a, b) => (b.net > a.net ? b : a)) : null
-  const worstDay = daily.length ? daily.reduce((a, b) => (b.net < a.net ? b : a)) : null
+  const bestDay = daily.length ? daily.reduce((a, b) => (b['当日净流入'] > a['当日净流入'] ? b : a)) : null
+  const worstDay = daily.length ? daily.reduce((a, b) => (b['当日净流入'] < a['当日净流入'] ? b : a)) : null
 
   const rows = [...inRange].reverse()
   const statBox = 'flex-1 min-w-[110px] rounded-lg border border-gray-200 bg-gray-50/60 px-3 py-2'
@@ -1162,7 +1180,7 @@ function FundsFlowCard({ orders }: { orders: Record<string, unknown>[] }) {
             >{x.label}</button>
           ))}
         </div>
-        <span className="text-[10px] text-gray-400">划转记录不入库，此处仅含下注/结算流水（回流=本金+盈亏）</span>
+        <span className="text-[10px] text-gray-400">划转记录不入库，此处仅含下注/结算流水（回流=本金+盈亏）{fundOrders.length > 0 ? ` · 全量 ${fundOrders.length} 单` : ''}</span>
       </div>
       <div className="flex flex-wrap gap-2 mb-3 text-xs">
         <div className={statBox}>
@@ -1229,7 +1247,7 @@ function FundsFlowCard({ orders }: { orders: Record<string, unknown>[] }) {
             <Legend wrapperStyle={{ fontSize: 11 }} />
             <ReferenceLine yAxisId="net" y={0} stroke="#9ca3af" />
             <Bar yAxisId="net" dataKey="当日净流入" radius={[3, 3, 0, 0]} isAnimationActive={false}>
-              {daily.map((d, i) => <Cell key={i} fill={d.net >= 0 ? '#22c55e' : '#ef4444'} fillOpacity={0.55} />)}
+              {daily.map((d, i) => <Cell key={i} fill={d['当日净流入'] >= 0 ? '#22c55e' : '#ef4444'} fillOpacity={0.55} />)}
             </Bar>
             <Line yAxisId="cum" type="monotone" dataKey="累计净盈亏" stroke="#2563eb" strokeWidth={2}
               dot={{ r: 2 }} isAnimationActive={false} />
@@ -1238,8 +1256,8 @@ function FundsFlowCard({ orders }: { orders: Record<string, unknown>[] }) {
       )}
       {bestDay && worstDay && daily.length > 1 && (
         <div className="flex flex-wrap gap-3 text-[11px] text-gray-500 mt-1 mb-1">
-          <span>最佳单日：<span className="font-mono text-green-700">{bestDay.date} +{bestDay.net.toFixed(2)}</span></span>
-          <span>最差单日：<span className="font-mono text-red-600">{worstDay.date} {worstDay.net.toFixed(2)}</span></span>
+          <span>最佳单日：<span className="font-mono text-green-700">{bestDay.date} +{bestDay['当日净流入'].toFixed(2)}</span></span>
+          <span>最差单日：<span className="font-mono text-red-600">{worstDay.date} {worstDay['当日净流入'].toFixed(2)}</span></span>
           <span>已结算 {settledInPeriod.length} 单</span>
         </div>
       )}
