@@ -1,0 +1,55 @@
+{
+  "meta": {
+    "created": "2026-08-28",
+    "task": "quote_momentum_v2 进化探索预注册假设清单（运行前锁定，扫描脚本只读）",
+    "base": "quote_momentum_v1 触发集（t∈[90,120)s DOWN 报价首进 [0.69,0.75) 押本窗 DOWN）上的过滤器假设",
+    "discipline": "命中<10 直接 INSUFFICIENT；发现集 BH-FDR(q=0.1)；留出段只终验一次；经济闸=费2%+溢价0.01 逐注 bootstrap 95% CI 下界>0",
+    "features": {
+      "chg": "触发时点 BTC 相对本窗开盘 %（负=已跌；数据源 window.curve_btc_price 取 ≤触发时点采样点，严格 ex-ante）",
+      "dd_day": "触发时点距当日高点回落 %（≤0；当日 UTC 已归档窗 curve_btc_price 前缀最大值）",
+      "prev_outcome": "前窗结算方向",
+      "prev_chg": "前窗收盘 BTC 相对前窗开盘 %",
+      "vol30": "触发前 30min |BTC % 变化|",
+      "ret1h": "触发前 1h BTC % 变化",
+      "bj_h": "窗口开盘北京时间小时（UTC+8）",
+      "t_in": "触发点 t（秒）",
+      "q": "触发点 DOWN 报价"
+    },
+    "ops": "lte/gte/lt/gt/eq/in/between（between=[lo,hi) 左闭右开）"
+  },
+  "event_hypotheses": [
+    {"id": "h_chg_005", "family": "gate_threshold", "desc": "门禁阈值 -0.05%（单调性扫描）", "filters": [{"feature": "chg", "op": "lte", "value": -0.05}]},
+    {"id": "h_chg_008", "family": "gate_threshold", "desc": "门禁阈值 -0.08%（单调性扫描）", "filters": [{"feature": "chg", "op": "lte", "value": -0.08}]},
+    {"id": "h_chg_010", "family": "gate_threshold", "desc": "门禁阈值 -0.10%（= 冻结 v2 基线）", "filters": [{"feature": "chg", "op": "lte", "value": -0.10}]},
+    {"id": "h_chg_012", "family": "gate_threshold", "desc": "门禁阈值 -0.12%（单调性扫描）", "filters": [{"feature": "chg", "op": "lte", "value": -0.12}]},
+    {"id": "h_chg_015", "family": "gate_threshold", "desc": "门禁阈值 -0.15%（单调性扫描）", "filters": [{"feature": "chg", "op": "lte", "value": -0.15}]},
+    {"id": "h_chg_020", "family": "gate_threshold", "desc": "门禁阈值 -0.20%（单调性扫描）", "filters": [{"feature": "chg", "op": "lte", "value": -0.20}]},
+    {"id": "h_chg_030", "family": "gate_threshold", "desc": "门禁阈值 -0.30%（单调性扫描）", "filters": [{"feature": "chg", "op": "lte", "value": -0.30}]},
+    {"id": "h_t_early", "family": "time_band", "desc": "触发点前半段 t<105s", "filters": [{"feature": "t_in", "op": "lt", "value": 105.0}]},
+    {"id": "h_t_late", "family": "time_band", "desc": "触发点后半场 t>=105s", "filters": [{"feature": "t_in", "op": "gte", "value": 105.0}]},
+    {"id": "h_q_low", "family": "quote_band", "desc": "报价带下段 q<0.72（离散入场价可用性受限，可能 INSUFFICIENT）", "filters": [{"feature": "q", "op": "lt", "value": 0.72}]},
+    {"id": "h_q_high", "family": "quote_band", "desc": "报价带上段 q>=0.72（同上）", "filters": [{"feature": "q", "op": "gte", "value": 0.72}]},
+    {"id": "h_prev_down", "family": "environment", "desc": "前窗 DOWN（交替环境，仿 contrarian v3a 思路移植到顺势族）", "filters": [{"feature": "prev_outcome", "op": "eq", "value": "DOWN"}]},
+    {"id": "h_prev_up", "family": "environment", "desc": "前窗 UP（延续环境对照）", "filters": [{"feature": "prev_outcome", "op": "eq", "value": "UP"}]},
+    {"id": "h_dd_day", "family": "environment", "desc": "触发时点距日高回落≥0.30%（与 v3b/LN_v2 同口径）", "filters": [{"feature": "dd_day", "op": "lte", "value": -0.30}]},
+    {"id": "h_prev_chg_neg", "family": "environment", "desc": "前窗收阴（下跌延续语境）", "filters": [{"feature": "prev_chg", "op": "lt", "value": 0.0}]},
+    {"id": "h_vol_hi", "family": "volatility", "desc": "触发前 30min 波动高（|Δ|≥0.12%）", "filters": [{"feature": "vol30", "op": "gte", "value": 0.12}]},
+    {"id": "h_vol_lo", "family": "volatility", "desc": "触发前 30min 波动低（|Δ|<0.06%）", "filters": [{"feature": "vol30", "op": "lt", "value": 0.06}]},
+    {"id": "h_ret1h_neg", "family": "volatility", "desc": "触发前 1h 深跌（≤-0.20%）", "filters": [{"feature": "ret1h", "op": "lte", "value": -0.20}]},
+    {"id": "h_bj_late", "family": "hour_band", "desc": "北京时间 22~24 时（深夜段，与深夜逆势族同时段假设）", "filters": [{"feature": "bj_h", "op": "gte", "value": 22}]},
+    {"id": "h_bj_asia", "family": "hour_band", "desc": "北京时间 8~16 时（亚洲盘）", "filters": [{"feature": "bj_h", "op": "between", "value": [8, 16]}]},
+    {"id": "h_v2_prevdown", "family": "composite", "desc": "v2 门禁 ∩ 前窗 DOWN（双重环境确认）", "filters": [{"feature": "chg", "op": "lte", "value": -0.10}, {"feature": "prev_outcome", "op": "eq", "value": "DOWN"}]},
+    {"id": "h_v2_dd", "family": "composite", "desc": "v2 门禁 ∩ 距日高回落≥0.30%", "filters": [{"feature": "chg", "op": "lte", "value": -0.10}, {"feature": "dd_day", "op": "lte", "value": -0.30}]},
+    {"id": "h_v2_volhi", "family": "composite", "desc": "v2 门禁 ∩ 前 30min 高波动（趋势加速语境）", "filters": [{"feature": "chg", "op": "lte", "value": -0.10}, {"feature": "vol30", "op": "gte", "value": 0.12}]}
+  ],
+  "kline_proxy_hypotheses": {
+    "note": "K 线代理族：仅方向证据不作裁决。映射=5m 窗开盘价 -> 第 2 根 1m 收盘为触发点价（≈100~120s 决策点），触发=跌幅≥X%，结局=该 5m 窗收盘<开盘（押 DOWN）。数据=output/klines_1m_2224_720d.json（约 62 天，文件名 720d 为历史命名）。用途=检验门禁阈值单调性在近两月 1m 粒度上是否与线上事件域一致。",
+    "hypotheses": [
+      {"id": "kp_chg_005", "threshold_pct": -0.05},
+      {"id": "kp_chg_010", "threshold_pct": -0.10},
+      {"id": "kp_chg_015", "threshold_pct": -0.15},
+      {"id": "kp_chg_020", "threshold_pct": -0.20},
+      {"id": "kp_chg_030", "threshold_pct": -0.30}
+    ]
+  }
+}

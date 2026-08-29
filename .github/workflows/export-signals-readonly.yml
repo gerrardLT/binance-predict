@@ -1,0 +1,91 @@
+# ============================================================
+# 信号数据只读导出（时段胜率回测分析的数据源）
+# 手动触发 → SSH 到 VPS 纯 SELECT 导出 4 张信号表 CSV → 拉回 artifact
+#
+# 与 Deploy 流水线完全独立：不改 ci.yml/deploy.yml、不触发部署、
+# 不写生产任何数据（仅 SELECT + /tmp 临时文件，收尾清理）。
+# 导出产物供 scripts/local_timeslice_winrate.py 消费（下载 artifact 后
+# 解压到 output/timeslice_export_<date>/）。
+# ============================================================
+name: Export Signals (Readonly)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: export-signals-readonly
+  cancel-in-progress: false
+
+jobs:
+  export:
+    name: Export signal tables (read-only)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Export via SSH (pure SELECT)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
+          script: |
+            set -euo pipefail
+            cd /www/wwwroot/binance-predict
+            if [ ! -f docker-compose.prod.yml ]; then
+              echo "ERROR: docker-compose.prod.yml not found"
+              exit 1
+            fi
+
+            EXPORT_DIR=/tmp/timeslice_export
+            mkdir -p "$EXPORT_DIR"
+
+            # 纯 SELECT \copy 导出（容器内 psql 用户/库名取环境变量，避免硬编码）
+            export_table() {
+              local out="$1"; local sql="$2"
+              docker compose -f docker-compose.prod.yml exec -T db \
+                sh -c "psql -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -v ON_ERROR_STOP=1 -c '\copy ($sql) TO STDOUT WITH CSV HEADER'" \
+                > "$EXPORT_DIR/$out"
+            }
+
+            export_table misalignment_signals.csv "SELECT id, version, window_start, window_end, end_pct, direction, target_window_start, entry_down_price, entry_up_price, entry_quote_ts, entry_quote_kind, settle_outcome, win, ev_at_entry, status, created_at FROM misalignment_signals ORDER BY window_start"
+
+            export_table fake_breakout_signals.csv "SELECT id, signal_time, level, side, pattern_type, version, settle_outcome, settle_outcome_5m, entry_down_price_15m, ev_at_entry, status, created_at FROM fake_breakout_signals ORDER BY signal_time"
+
+            export_table kline_shadow_signals.csv "SELECT id, version, signal_bar_start, target_bar_start, direction, settle_outcome, win, status, created_at FROM kline_shadow_signals ORDER BY signal_bar_start"
+
+            export_table trade_orders.csv "SELECT id, created_at, signal_version, window_start, market_period, direction, side, status, settle_outcome, win, pnl FROM trade_orders ORDER BY created_at"
+
+            echo "---- 行数（含表头）----"
+            wc -l "$EXPORT_DIR"/*.csv
+            echo "---- 校验和 ----"
+            md5sum "$EXPORT_DIR"/*.csv
+
+      - name: Pull export back to runner
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
+          source: "/tmp/timeslice_export/*.csv"
+          target: "timeslice_export"
+          strip_components: 2
+
+      - name: Cleanup remote temp files
+        if: always()
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
+          script: rm -rf /tmp/timeslice_export
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: timeslice-export
+          path: timeslice_export/
+          retention-days: 7
