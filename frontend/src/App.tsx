@@ -1,9 +1,9 @@
-import { useState, useEffect, useCallback, useRef, Fragment } from 'react'
+import { useState, useEffect, useCallback, useRef, useMemo, Fragment } from 'react'
 import {
   XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, Area, AreaChart, ReferenceLine,
   BarChart, Bar, Legend, LineChart, Line,
-  ReferenceArea, ReferenceDot,
+  ReferenceArea, ReferenceDot, Cell,
 } from 'recharts'
 
 // ============================================================
@@ -474,7 +474,7 @@ const api = {
   // 实盘面板（2026-08-22）：钱包/实盘状态/下单/订单历史
   getPredictionWallet: () => authFetch('/api/prediction-wallet').then(r => r.json()),
   getLiveStatus: () => authFetch('/api/misalignment/signals').then(r => r.json()),
-  getRecentTrades: (limit = 20) => authFetch(`/api/trades/recent?limit=${limit}`).then(r => r.json()),
+  getRecentTrades: (limit = 100) => authFetch(`/api/trades/recent?limit=${limit}`).then(r => r.json()),
   postTradeTest: (amount_usdt: number, prediction: string) =>
     authFetch('/api/trade/test', {
       method: 'POST',
@@ -875,22 +875,62 @@ function TestTradeFab({ quote, remainSec, urgent, wallet, refresh }: {
   )
 }
 
-// 最近订单卡片（页面主区展示，2026-08-28 用户要求回归页面）
+// 最近订单卡片（页面主区展示，2026-08-28 用户要求回归页面；
+// 2026-08-29：加状态/通道/方向筛选 + 通道中文化与解释）
 function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
   orders: Record<string, unknown>[]
   syncing: boolean
   syncResult: Record<string, unknown> | null
   onSyncBinance: () => void
 }) {
-  const settledOrders = orders.filter(o => o.settled_at != null)
+  const [fStatus, setFStatus] = useState('ALL')
+  const [fChannel, setFChannel] = useState('ALL')
+  const [fDirection, setFDirection] = useState('ALL')
+
+  const channels = Array.from(new Set(
+    orders.map(o => String(o.signal_version ?? '')).filter(v => v && v !== '--'))).sort()
+  const filtered = orders.filter(o => {
+    if (fStatus !== 'ALL' && String(o.status ?? '') !== fStatus) return false
+    if (fChannel !== 'ALL' && String(o.signal_version ?? '') !== fChannel) return false
+    if (fDirection !== 'ALL' && String(o.direction ?? '') !== fDirection) return false
+    return true
+  })
+  const settledOrders = filtered.filter(o => o.settled_at != null)
   const settledCount = settledOrders.length
   const totalPnl = settledOrders.reduce(
     (s, o) => s + (typeof o.pnl === 'number' ? (o.pnl as number) : 0), 0)
+  const filterActive = fStatus !== 'ALL' || fChannel !== 'ALL' || fDirection !== 'ALL'
+  const selectCls = 'px-1.5 py-0.5 border border-gray-300 rounded text-xs text-gray-700 bg-white'
 
   return (
     <Card title="最近订单">
-      <div className="flex items-center justify-between mb-2 gap-2">
-        <span className="text-xs text-gray-400">{orders.length} 条记录（每 15s 自动刷新）</span>
+      <div className="flex items-center justify-between mb-2 gap-2 flex-wrap">
+        <div className="flex items-center gap-1.5 flex-wrap">
+          <select value={fStatus} onChange={e => setFStatus(e.target.value)} className={selectCls} title="按订单状态筛选">
+            <option value="ALL">全部状态</option>
+            <option value="FILLED">已成交 FILLED</option>
+            <option value="FAILED">失败 FAILED</option>
+            <option value="PENDING">待定 PENDING</option>
+          </select>
+          <select value={fChannel} onChange={e => setFChannel(e.target.value)} className={selectCls} title="按信号通道筛选">
+            <option value="ALL">全部通道</option>
+            {channels.map(v => (
+              <option key={v} value={v}>{SIGNAL_INFO[v]?.name ?? v}</option>
+            ))}
+          </select>
+          <select value={fDirection} onChange={e => setFDirection(e.target.value)} className={selectCls} title="按押注方向筛选">
+            <option value="ALL">全部方向</option>
+            <option value="DOWN">DOWN 看跌</option>
+            <option value="UP">UP 看涨</option>
+          </select>
+          {filterActive && (
+            <button
+              onClick={() => { setFStatus('ALL'); setFChannel('ALL'); setFDirection('ALL') }}
+              className="px-1.5 py-0.5 text-xs text-blue-600 hover:underline"
+            >清除筛选</button>
+          )}
+          <span className="text-xs text-gray-400">{filtered.length}/{orders.length} 条（每 15s 自动刷新）</span>
+        </div>
         <div className="flex items-center gap-2">
           {syncResult && (
             <span className={`text-xs px-2 py-0.5 rounded ${syncResult.error ? 'bg-red-50 text-red-600' : 'bg-green-50 text-green-700'}`}>
@@ -905,14 +945,14 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
           >{syncing ? '对账中…' : '对账（同步币安）'}</button>
         </div>
       </div>
-      {orders.length === 0 ? (
-        <p className="text-sm text-gray-400">暂无订单记录</p>
+      {filtered.length === 0 ? (
+        <p className="text-sm text-gray-400">{orders.length === 0 ? '暂无订单记录' : '当前筛选条件下无订单'}</p>
       ) : (
         <table className="w-full text-xs">
           <thead>
             <tr className="text-left text-gray-500 border-b border-gray-100">
               <th className="py-1 pr-2">时间</th>
-              <th className="py-1 pr-2">版本</th>
+              <th className="py-1 pr-2">通道</th>
               <th className="py-1 pr-2">方向</th>
               <th className="py-1 pr-2">状态</th>
               <th className="py-1 pr-2">结果</th>
@@ -923,12 +963,24 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
             </tr>
           </thead>
           <tbody>
-            {orders.map(o => (
+            {filtered.map(o => {
+              const ver = String(o.signal_version ?? '')
+              const info = SIGNAL_INFO[ver]
+              return (
               <tr key={String(o.id)} className="border-b border-gray-50">
                 <td className="py-1.5 pr-2 text-gray-600 whitespace-nowrap">
                   {o.created_at ? new Date(String(o.created_at)).toLocaleString() : '--'}
                 </td>
-                <td className="py-1.5 pr-2 font-mono text-gray-700">{String(o.signal_version ?? '--')}</td>
+                <td className="py-1.5 pr-2">
+                  {info ? (
+                    <span className="inline-flex items-center gap-1">
+                      <span className="text-gray-800">{info.name}</span>
+                      <HelpHint text={`${ver}（${info.kind}）：${info.desc}`} />
+                    </span>
+                  ) : (
+                    <span className="font-mono text-gray-700">{ver || '--'}</span>
+                  )}
+                </td>
                 <td className="py-1.5 pr-2">
                   {o.direction === 'UP'
                     ? <span className="px-1.5 py-0.5 rounded font-bold bg-green-100 text-green-700">UP</span>
@@ -938,21 +990,21 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
                 </td>
                 <td className="py-1.5 pr-2">
                   <span className={`px-1.5 py-0.5 rounded font-bold ${o.status === 'FILLED' ? 'bg-green-100 text-green-700' : o.status === 'FAILED' ? 'bg-red-100 text-red-700' : 'bg-gray-100 text-gray-600'}`}>
-                    {String(o.status)}
+                    {o.status === 'FILLED' ? '已成交' : o.status === 'FAILED' ? '失败' : o.status === 'PENDING' ? '待定' : String(o.status)}
                   </span>
                 </td>
                 <td className="py-1.5 pr-2">
                   {o.win === true
-                    ? <span className="px-1.5 py-0.5 rounded font-bold bg-green-100 text-green-700">WIN</span>
+                    ? <span className="px-1.5 py-0.5 rounded font-bold bg-green-100 text-green-700">赢</span>
                     : o.win === false
-                      ? <span className="px-1.5 py-0.5 rounded font-bold bg-red-100 text-red-700">LOSE</span>
+                      ? <span className="px-1.5 py-0.5 rounded font-bold bg-red-100 text-red-700">输</span>
                       : o.settle_outcome != null
                         ? <span className="px-1.5 py-0.5 rounded font-bold bg-gray-100 text-gray-600">{String(o.settle_outcome)}</span>
                         : <span className="text-gray-400">--</span>}
                 </td>
                 <td className="py-1.5 pr-2 font-mono">{o.average_price != null ? String(o.average_price) : '--'}</td>
                 <td className="py-1.5 pr-2 font-mono">
-                  {o.amount_in != null ? (Number(o.amount_in) / 1e18).toFixed(2) : '--'}
+                  {o.amount_in != null && Number(o.amount_in) > 0 ? (Number(o.amount_in) / 1e18).toFixed(2) : '--'}
                 </td>
                 <td className={`py-1.5 pr-2 font-mono ${typeof o.pnl === 'number' ? ((o.pnl as number) >= 0 ? 'text-green-700' : 'text-red-600') : 'text-gray-400'}`}>
                   {typeof o.pnl === 'number'
@@ -961,7 +1013,8 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
                 </td>
                 <td className="py-1.5 text-gray-500">{String(o.error_message ?? '')}</td>
               </tr>
-            ))}
+              )
+            })}
           </tbody>
           {settledCount > 0 && (
             <tfoot>
@@ -975,6 +1028,160 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
             </tfoot>
           )}
         </table>
+      )}
+    </Card>
+  )
+}
+
+// 资金变化面板（2026-08-29 用户要求）：纯前端从订单派生流水——
+// 后端划转（transfer-in/out）不入库，故只含下注流出与结算回流。
+// 口径：流出=成交单 amount_in（按下单时间）；回流=已结算赢单 amount_in+pnl（按结算时间）。
+interface FlowEvent {
+  ts: number
+  dir: '流出' | '回流'
+  amount: number
+  detail: string
+}
+const FUND_PERIODS = [
+  { v: '24h', label: '24小时', ms: 24 * 3600_000 },
+  { v: '7d', label: '7天', ms: 7 * 86_400_000 },
+  { v: '30d', label: '30天', ms: 30 * 86_400_000 },
+  { v: 'all', label: '全部', ms: 0 },
+] as const
+
+function FundsFlowCard({ orders }: { orders: Record<string, unknown>[] }) {
+  const [period, setPeriod] = useState<string>('7d')
+
+  const events = useMemo(() => {
+    const evs: FlowEvent[] = []
+    for (const o of orders) {
+      const amtWei = Number(o.amount_in ?? 0)
+      if (!(amtWei > 0)) continue  // 失败/未成交单无资金占用（含待定单）
+      const amt = amtWei / 1e18
+      const ver = String(o.signal_version ?? '--')
+      const name = SIGNAL_INFO[ver]?.name ?? ver
+      const dirStr = String(o.direction ?? '')
+      const created = Date.parse(String(o.created_at ?? ''))
+      if (o.status === 'FILLED' && !Number.isNaN(created)) {
+        evs.push({ ts: created, dir: '流出', amount: amt, detail: `${name} 下注 ${dirStr}` })
+      }
+      const settled = Date.parse(String(o.settled_at ?? ''))
+      if (o.win === true && !Number.isNaN(settled)) {
+        const pnl = typeof o.pnl === 'number' ? (o.pnl as number) : 0
+        evs.push({ ts: settled, dir: '回流', amount: amt + pnl, detail: `${name} 结算赢（含盈亏 ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}）` })
+      }
+    }
+    return evs.sort((a, b) => a.ts - b.ts)
+  }, [orders])
+
+  const p = FUND_PERIODS.find(x => x.v === period) ?? FUND_PERIODS[1]
+  const cutoff = p.ms > 0 ? Date.now() - p.ms : 0
+  const inRange = events.filter(e => e.ts >= cutoff)
+  const outSum = inRange.filter(e => e.dir === '流出').reduce((s, e) => s + e.amount, 0)
+  const inSum = inRange.filter(e => e.dir === '回流').reduce((s, e) => s + e.amount, 0)
+  const net = inSum - outSum
+  const tradeCount = inRange.filter(e => e.dir === '流出').length
+  // 在途资金（未结算成交单，不受时间筛选影响）
+  const pendingOpen = orders.filter(o => o.status === 'FILLED' && o.settled_at == null && Number(o.amount_in ?? 0) > 0)
+  const pendingAmt = pendingOpen.reduce((s, o) => s + Number(o.amount_in) / 1e18, 0)
+
+  // 按本地日聚合净流入（柱状图）
+  const byDay = new Map<string, number>()
+  for (const e of inRange) {
+    const key = new Date(e.ts).toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })
+    byDay.set(key, (byDay.get(key) ?? 0) + (e.dir === '回流' ? e.amount : -e.amount))
+  }
+  const daily = Array.from(byDay.entries()).map(([date, netAmt]) => ({ date, net: +netAmt.toFixed(3) }))
+
+  const rows = [...inRange].reverse()
+  const statBox = 'flex-1 min-w-[110px] rounded-lg border border-gray-200 bg-gray-50/60 px-3 py-2'
+
+  return (
+    <Card title="资金变化（订单流水）">
+      <div className="flex items-center justify-between mb-3 gap-2 flex-wrap">
+        <div className="flex items-center gap-1">
+          {FUND_PERIODS.map(x => (
+            <button
+              key={x.v}
+              onClick={() => setPeriod(x.v)}
+              className={`px-2.5 py-0.5 text-xs rounded-md border transition ${period === x.v ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-gray-600 border-gray-300 hover:border-blue-400'}`}
+            >{x.label}</button>
+          ))}
+        </div>
+        <span className="text-[10px] text-gray-400">划转记录不入库，此处仅含下注/结算流水（回流=本金+盈亏）</span>
+      </div>
+      <div className="flex flex-wrap gap-2 mb-3 text-xs">
+        <div className={statBox}>
+          <div className="text-gray-400 mb-0.5">下注流出</div>
+          <div className="text-base font-bold font-mono text-red-600">-{outSum.toFixed(2)}</div>
+        </div>
+        <div className={statBox}>
+          <div className="text-gray-400 mb-0.5">结算回流</div>
+          <div className="text-base font-bold font-mono text-green-600">+{inSum.toFixed(2)}</div>
+        </div>
+        <div className={statBox}>
+          <div className="text-gray-400 mb-0.5">净盈亏</div>
+          <div className={`text-base font-bold font-mono ${net >= 0 ? 'text-green-700' : 'text-red-600'}`}>
+            {net >= 0 ? '+' : ''}{net.toFixed(2)}
+          </div>
+        </div>
+        <div className={statBox}>
+          <div className="text-gray-400 mb-0.5">下注笔数</div>
+          <div className="text-base font-bold font-mono text-gray-800">{tradeCount}</div>
+        </div>
+        {pendingOpen.length > 0 && (
+          <div className={statBox}>
+            <div className="text-gray-400 mb-0.5">在途未结算</div>
+            <div className="text-base font-bold font-mono text-amber-600">{pendingAmt.toFixed(2)}（{pendingOpen.length} 单）</div>
+          </div>
+        )}
+      </div>
+      {daily.length > 0 && (
+        <ResponsiveContainer width="100%" height={160}>
+          <BarChart data={daily} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+            <XAxis dataKey="date" tick={{ fontSize: 10 }} stroke="#9ca3af" />
+            <YAxis tick={{ fontSize: 10 }} stroke="#9ca3af" width={48} />
+            <Tooltip
+              contentStyle={{ fontSize: 12, borderRadius: 8, border: '1px solid #e5e7eb' }}
+              formatter={v => [`${typeof v === 'number' && v >= 0 ? '+' : ''}${Number(v).toFixed(2)} USDT`, '当日净流入']}
+            />
+            <ReferenceLine y={0} stroke="#9ca3af" />
+            <Bar dataKey="net" radius={[3, 3, 0, 0]} isAnimationActive={false}>
+              {daily.map((d, i) => <Cell key={i} fill={d.net >= 0 ? '#22c55e' : '#ef4444'} fillOpacity={0.75} />)}
+            </Bar>
+          </BarChart>
+        </ResponsiveContainer>
+      )}
+      {rows.length === 0 ? (
+        <p className="text-sm text-gray-400 mt-2">当前时间范围内无资金流水</p>
+      ) : (
+        <div className="overflow-x-auto max-h-60 overflow-y-auto mt-2">
+          <table className="w-full text-xs">
+            <thead className="sticky top-0 bg-white">
+              <tr className="text-left text-gray-500 border-b border-gray-100">
+                <th className="py-1 pr-2">时间</th>
+                <th className="py-1 pr-2">类型</th>
+                <th className="py-1 pr-2">说明</th>
+                <th className="py-1 pr-2 text-right">金额 (USDT)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((e, i) => (
+                <tr key={i} className="border-b border-gray-50">
+                  <td className="py-1 pr-2 text-gray-600 whitespace-nowrap">{new Date(e.ts).toLocaleString()}</td>
+                  <td className="py-1 pr-2">
+                    <span className={`px-1.5 py-0.5 rounded font-bold ${e.dir === '流出' ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'}`}>{e.dir}</span>
+                  </td>
+                  <td className="py-1 pr-2 text-gray-500">{e.detail}</td>
+                  <td className={`py-1 pr-2 text-right font-mono font-bold ${e.dir === '流出' ? 'text-red-600' : 'text-green-700'}`}>
+                    {e.dir === '流出' ? '-' : '+'}{e.amount.toFixed(2)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
     </Card>
   )
@@ -1435,6 +1642,11 @@ function LiveTradeTab() {
       {/* 最近订单：主区账户状态下方（2026-08-28 用户要求回归页面展示） */}
       <div className="lg:col-span-2">
         <OrdersCard orders={orders} syncing={syncing} syncResult={syncResult} onSyncBinance={handleSyncBinance} />
+      </div>
+
+      {/* 资金变化面板：订单流水 + 时间周期筛选（2026-08-29） */}
+      <div className="lg:col-span-2">
+        <FundsFlowCard orders={orders} />
       </div>
     </div>
 
@@ -3592,20 +3804,32 @@ function Market15mPanel() {
 // ============================================================
 
 const SHADOW_META: Record<string, { label: string; color: string }> = {
-  x4_v1: { label: 'X4 misalign→DOWN', color: '#1f77b4' },
-  quote_momentum_v1: { label: 'A momentum', color: '#d62728' },
-  quote_contrarian_v1: { label: 'B contrarian', color: '#2ca02c' },
+  x4_v1: { label: 'X4 情绪错位→DOWN', color: '#1f77b4' },
+  quote_momentum_v1: { label: 'A 报价动量→DOWN', color: '#d62728' },
+  quote_contrarian_v1: { label: 'B 报价反向→DOWN', color: '#2ca02c' },
   krev_a_v1: { label: 'KREV-A 反转→UP', color: '#9467bd' },
   krev_b_v1: { label: 'KREV-B 反转→UP', color: '#e377c2' },
 }
 const SCENE_META: Record<string, { label: string; color: string }> = {
-  bull_exhaust: { label: 'S1 bull_exhaust→DOWN', color: '#1f77b4' },
-  bear_exhaust: { label: 'S2 bear_exhaust→UP', color: '#d62728' },
-  momentum_fade: { label: 'S4 momentum_fade→DOWN', color: '#2ca02c' },
-  bull_exhaust_confirm: { label: 'S5 confirm→DOWN', color: '#9467bd' },
+  bull_exhaust: { label: 'S1 多头耗尽→DOWN', color: '#1f77b4' },
+  bear_exhaust: { label: 'S2 空头耗尽→UP', color: '#d62728' },
+  momentum_fade: { label: 'S4 动量衰竭→DOWN', color: '#2ca02c' },
+  bull_exhaust_confirm: { label: 'S5 确认入场→DOWN', color: '#9467bd' },
   // legacy = pattern_type 为空的历史信号，胜负按 side 映射（与 /api/fake-breakout/stats
   // 同语义，审计脚本对其「一律 DOWN」的简化口径在 side=low 时不同）
-  legacy: { label: 'legacy 历史', color: '#7f7f7f' },
+  legacy: { label: 'legacy 历史信号', color: '#7f7f7f' },
+}
+// 分析面板版本/场景的详细解释：优先取 SIGNAL_INFO（场景键加 scene_ 前缀），
+// 未收录的（KREV / 历史 legacy）在此补写；后端动态发现的新版本回退展示原始键名。
+const ANALYTICS_EXTRA_DESC: Record<string, string> = {
+  krev_a_v1: 'K 线反转 A：5m K 线反转形态（看跌衰竭形态）→ 押 UP 的影子信号，仅记录不下单。',
+  krev_b_v1: 'K 线反转 B：5m K 线反转形态变体（下影线反转）→ 押 UP 的影子信号，仅记录不下单。',
+  legacy: 'pattern_type 为空的历史信号：胜负按 side 映射（high→DOWN 赢 / low→UP 赢），用于对齐早期统计口径。',
+}
+const signalDescFor = (kind: 'scene' | 'shadow', key: string): string => {
+  if (ANALYTICS_EXTRA_DESC[key]) return ANALYTICS_EXTRA_DESC[key]
+  const info = kind === 'scene' ? SIGNAL_INFO[`scene_${key}`] : SIGNAL_INFO[key]
+  return info?.desc ?? ''
 }
 // 后端动态发现的新版本/新场景的备用色（超出已知名单时按序取用）
 const EXTRA_COLORS = ['#8c564b', '#e377c2', '#17becf', '#bcbd22', '#7f7f7f']
@@ -3799,7 +4023,12 @@ function SignalAnalyticsTab() {
                     const dev = s.winrate != null && s.bench_winrate != null ? s.winrate - s.bench_winrate : null
                     return (
                       <tr key={k} className="border-b border-gray-100 hover:bg-gray-50">
-                        <td className="py-1 px-2 font-medium" style={{ color: m.color }}>{m.label}</td>
+                        <td className="py-1 px-2 font-medium" style={{ color: m.color }}>
+                          <span className="inline-flex items-center gap-1">
+                            {m.label}
+                            {signalDescFor('scene', k) && <HelpHint text={`${k}：${signalDescFor('scene', k)}`} />}
+                          </span>
+                        </td>
                         <td className="py-1 px-2 text-right font-mono">{s.n}</td>
                         <td className="py-1 px-2 text-right font-mono font-bold">{pct1(s.winrate)}</td>
                         <td className="py-1 px-2 text-right font-mono text-gray-500">{pct1(s.bench_winrate)}</td>
@@ -3868,7 +4097,12 @@ function SignalAnalyticsTab() {
                     const dev = s.win_rate != null && s.bench_winrate != null ? s.win_rate - s.bench_winrate : null
                     return (
                       <tr key={k} className="border-b border-gray-100 hover:bg-gray-50">
-                        <td className="py-1 px-2 font-medium" style={{ color: m.color }} title={s.desc}>{m.label}</td>
+                        <td className="py-1 px-2 font-medium" style={{ color: m.color }} title={s.desc}>
+                          <span className="inline-flex items-center gap-1">
+                            {m.label}
+                            {signalDescFor('shadow', k) && <HelpHint text={`${k}：${signalDescFor('shadow', k)}`} />}
+                          </span>
+                        </td>
                         <td className="py-1 px-2 text-right font-mono">{s.n}</td>
                         <td className="py-1 px-2 text-right font-mono font-bold">{pct1(s.win_rate)}</td>
                         <td className="py-1 px-2 text-right font-mono text-gray-500">{pct1(s.avg_breakeven)}</td>

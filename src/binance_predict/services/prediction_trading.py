@@ -1225,8 +1225,9 @@ class BinancePredictionTrader:
         2. **先占位后下单**（CodeReview High#1）：place_order 前先插 PENDING 行占住
            (signal_version, window_start) 唯一键，重复窗口在下单前即拒绝；
            成功/失败 UPDATE 该行——重启防重不再依赖"钱出去后"的事后提交；
-        3. 报价后、下单前检查 averagePrice ≤ max_exec_price，超限弃单（不追贵）；
-           且按护栏价动态收紧 slippageBps，成交价无法突破 max_exec_price；
+        3. 报价后、下单前检查 averagePrice < max_exec_price，超限/贴线弃单（不追贵）；
+           且按护栏价动态收紧 slippageBps，成交价无法突破 max_exec_price
+           （贴线时滑点空间为 0，币安拒收 slippageBps=0 → 贴线单必须弃，2026-08-29）；
         4. market_period 分流（'5m'|'15m'）：15m 场景订单用 15m 市场 token
            （结算走 FakeBreakoutSignal，trade_settler 按 market_period 分流）；
            scene_signal_id 与占位同事务落库（下单即关联场景信号行，无需回填）。
@@ -1352,10 +1353,12 @@ class BinancePredictionTrader:
                 avg_price = float(quote.get("averagePrice") or 0.0)
             except (TypeError, ValueError):
                 avg_price = 0.0
-            if max_exec_price is not None and (avg_price <= 0 or avg_price > max_exec_price):
+            # 护栏含贴线（>=）：报价=护栏价时滑点空间为 0，币安拒收
+            # slippageBps=0（-1102，2026-08-29 id=100 实证），贴线单无法安全提交。
+            if max_exec_price is not None and (avg_price <= 0 or avg_price >= max_exec_price):
                 return await self._update_signal_order(
                     pending, "FAILED", direction=prediction,
-                    error_message=f"执行价护栏弃单 | averagePrice={avg_price} > {max_exec_price}",
+                    error_message=f"执行价护栏弃单 | averagePrice={avg_price} >= {max_exec_price}（贴线无滑点空间）",
                     quote_json=quote)
 
             # 动态滑点收紧（CodeReview Medium#2）：FOK 成交价不得突破护栏价，

@@ -1320,6 +1320,61 @@ async def test_signal_trade_15m_anchor_picks_right_cycle(monkeypatch) -> None:
     assert quote_tokens == ["T-DOWN-N"]          # 取本单周期，非未来周期
 
 
+@pytest.mark.asyncio
+async def test_signal_trade_guard_boundary_touch_rejected(monkeypatch) -> None:
+    """护栏含贴线（2026-08-29 id=100 实证）：报价均价=护栏价时弃单，
+    不提交 slippageBps=0（币安 -1102 拒收）；低于护栏正常下单。"""
+    trader = _make_real_trader(monkeypatch)
+    placed: list[int] = []
+    updates: list[tuple] = []
+
+    async def _reserve(_v, _ws, direction=None, market_period="5m",
+                       scene_signal_id=None):
+        return _pending_order()
+
+    async def _update(order, status, **kwargs):
+        updates.append((status, kwargs))
+        return {**order, "status": status, **kwargs}
+
+    async def _quote(token_id, side, amount_usdt=None):
+        return {"averagePrice": 0.75, "amountIn": "5", "amountOut": "6",
+                "quoteId": "Q-BND"}
+
+    async def _place(_q, slippage_bps=1200):
+        placed.append(slippage_bps)
+        return {"orderId": "ORD-BND"}
+
+    monkeypatch.setattr(trader, "_reserve_order_slot", _reserve)
+    monkeypatch.setattr(trader, "_update_signal_order", _update)
+    monkeypatch.setattr(trader, "get_quote", _quote)
+    monkeypatch.setattr(trader, "place_order", _place)
+
+    # 贴线：0.75 >= 0.75 → FAILED，不下单
+    order = await trader.execute_signal_trade(
+        "DOWN", 5.0, "scene_bull_exhaust_confirm", WINDOW_START,
+        max_exec_price=0.75, market_period="15m", scene_signal_id=1)
+    assert order["status"] == "FAILED"
+    assert "贴线无滑点空间" in str(updates[-1][1]["error_message"])
+    assert placed == []
+
+    # 低于护栏（有滑点空间）→ 正常下单，滑点按护栏价收紧（0.74→0.75 ≈ 135bps）
+    async def _quote_ok(token_id, side, amount_usdt=None):
+        return {"averagePrice": 0.74, "amountIn": "5", "amountOut": "6",
+                "quoteId": "Q-BND2"}
+
+    monkeypatch.setattr(trader, "get_quote", _quote_ok)
+    trader._15m_markets[WINDOW_START + 300_000] = {
+        "end_date": WINDOW_START + 1200_000,
+        "up_token": "T-B2-UP", "down_token": "T-B2-DOWN",
+        "up_price": 0.26, "down_price": 0.74,
+    }
+    order2 = await trader.execute_signal_trade(
+        "DOWN", 5.0, "scene_bull_exhaust_confirm", WINDOW_START + 300_000,
+        max_exec_price=0.75, market_period="15m", scene_signal_id=2)
+    assert order2["status"] == "FILLED"
+    assert placed == [135]  # int((0.75/0.74−1)×10000)=135，非 0/非默认 1200
+
+
 def test_parse_15m_entry() -> None:
     """15m 市场解析：token/报价提取 + startDate 缺失/非法拒入表。"""
     market = {
