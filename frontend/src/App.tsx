@@ -3,7 +3,7 @@ import {
   XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, Area, AreaChart, ReferenceLine,
   BarChart, Bar, Legend, LineChart, Line,
-  ReferenceArea, ReferenceDot, Cell,
+  ReferenceArea, ReferenceDot, Cell, ComposedChart,
 } from 'recharts'
 
 // ============================================================
@@ -1113,13 +1113,39 @@ function FundsFlowCard({ orders }: { orders: Record<string, unknown>[] }) {
   const pendingOpen = orders.filter(o => o.status === 'FILLED' && o.settled_at == null && Number(o.amount_in ?? 0) > 0)
   const pendingAmt = pendingOpen.reduce((s, o) => s + Number(o.amount_in) / 1e18, 0)
 
-  // 按本地日聚合净流入（柱状图）
+  // 按本地日聚合净流入（柱）+ 累计净盈亏（折线）
   const byDay = new Map<string, number>()
   for (const e of inRange) {
     const key = new Date(e.ts).toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })
     byDay.set(key, (byDay.get(key) ?? 0) + (e.dir === '回流' ? e.amount : -e.amount))
   }
-  const daily = Array.from(byDay.entries()).map(([date, netAmt]) => ({ date, net: +netAmt.toFixed(3) }))
+  let acc = 0
+  const daily = Array.from(byDay.entries()).map(([date, netAmt]) => {
+    acc += netAmt
+    return { date, net: +netAmt.toFixed(3), cum: +acc.toFixed(3) }
+  })
+
+  // 结算表现统计（口径：本期内已结算成交单；pnl 输=-投入/赢=盈利/NOISE=0）
+  const settledInPeriod = orders.filter(o => {
+    if (o.status !== 'FILLED' || !(Number(o.amount_in ?? 0) > 0)) return false
+    const ts = Date.parse(String(o.settled_at ?? ''))
+    return !Number.isNaN(ts) && ts >= cutoff
+  })
+  const winCount = settledInPeriod.filter(o => o.win === true).length
+  const loseCount = settledInPeriod.filter(o => o.win === false).length
+  const winRate = (winCount + loseCount) > 0 ? winCount / (winCount + loseCount) : null
+  const totalPnl = settledInPeriod.reduce(
+    (s, o) => s + (typeof o.pnl === 'number' ? (o.pnl as number) : 0), 0)
+  const avgPnl = settledInPeriod.length > 0 ? totalPnl / settledInPeriod.length : 0
+  // 累计曲线最大回撤（按事件时点展开；起点为 0）
+  let run = 0, peak = 0, maxDD = 0
+  for (const e of inRange) {
+    run += e.dir === '回流' ? e.amount : -e.amount
+    if (run > peak) peak = run
+    if (peak - run > maxDD) maxDD = peak - run
+  }
+  const bestDay = daily.length ? daily.reduce((a, b) => (b.net > a.net ? b : a)) : null
+  const worstDay = daily.length ? daily.reduce((a, b) => (b.net < a.net ? b : a)) : null
 
   const rows = [...inRange].reverse()
   const statBox = 'flex-1 min-w-[110px] rounded-lg border border-gray-200 bg-gray-50/60 px-3 py-2'
@@ -1163,23 +1189,59 @@ function FundsFlowCard({ orders }: { orders: Record<string, unknown>[] }) {
             <div className="text-base font-bold font-mono text-amber-600">{pendingAmt.toFixed(2)}（{pendingOpen.length} 单）</div>
           </div>
         )}
+        <div className={statBox}>
+          <div className="text-gray-400 mb-0.5">胜率（已结算）</div>
+          <div className="text-base font-bold font-mono text-gray-800">
+            {winRate === null ? '--' : `${(winRate * 100).toFixed(0)}%`}
+            <span className="text-[10px] font-normal text-gray-400 ml-1">{winCount}胜/{loseCount}负</span>
+          </div>
+        </div>
+        <div className={statBox}>
+          <div className="text-gray-400 mb-0.5">已实现盈亏</div>
+          <div className={`text-base font-bold font-mono ${totalPnl >= 0 ? 'text-green-700' : 'text-red-600'}`}>
+            {totalPnl >= 0 ? '+' : ''}{totalPnl.toFixed(2)}
+          </div>
+        </div>
+        <div className={statBox}>
+          <div className="text-gray-400 mb-0.5">单笔均盈亏</div>
+          <div className={`text-base font-bold font-mono ${avgPnl >= 0 ? 'text-green-700' : 'text-red-600'}`}>
+            {settledInPeriod.length === 0 ? '--' : `${avgPnl >= 0 ? '+' : ''}${avgPnl.toFixed(3)}`}
+          </div>
+        </div>
+        <div className={statBox}>
+          <div className="text-gray-400 mb-0.5">最大回撤</div>
+          <div className="text-base font-bold font-mono text-red-600">
+            {inRange.length === 0 ? '--' : `-${maxDD.toFixed(2)}`}
+          </div>
+        </div>
       </div>
       {daily.length > 0 && (
-        <ResponsiveContainer width="100%" height={160}>
-          <BarChart data={daily} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
+        <ResponsiveContainer width="100%" height={200}>
+          <ComposedChart data={daily} margin={{ top: 8, right: 4, left: 0, bottom: 0 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
             <XAxis dataKey="date" tick={{ fontSize: 10 }} stroke="#9ca3af" />
-            <YAxis tick={{ fontSize: 10 }} stroke="#9ca3af" width={48} />
+            <YAxis yAxisId="net" tick={{ fontSize: 10 }} stroke="#9ca3af" width={48} />
+            <YAxis yAxisId="cum" orientation="right" tick={{ fontSize: 10 }} stroke="#2563eb" width={48} />
             <Tooltip
               contentStyle={{ fontSize: 12, borderRadius: 8, border: '1px solid #e5e7eb' }}
-              formatter={v => [`${typeof v === 'number' && v >= 0 ? '+' : ''}${Number(v).toFixed(2)} USDT`, '当日净流入']}
+              formatter={(v, name) => [`${typeof v === 'number' && v >= 0 ? '+' : ''}${Number(v).toFixed(2)} USDT`, String(name)]}
             />
-            <ReferenceLine y={0} stroke="#9ca3af" />
-            <Bar dataKey="net" radius={[3, 3, 0, 0]} isAnimationActive={false}>
-              {daily.map((d, i) => <Cell key={i} fill={d.net >= 0 ? '#22c55e' : '#ef4444'} fillOpacity={0.75} />)}
+            <Legend wrapperStyle={{ fontSize: 11 }} />
+            <ReferenceLine yAxisId="net" y={0} stroke="#9ca3af" />
+            <Bar yAxisId="net" dataKey="当日净流入" radius={[3, 3, 0, 0]} isAnimationActive={false}>
+              {daily.map((d, i) => <Cell key={i} fill={d.net >= 0 ? '#22c55e' : '#ef4444'} fillOpacity={0.55} />)}
             </Bar>
-          </BarChart>
+            <Line yAxisId="cum" type="monotone" dataKey="累计净盈亏" stroke="#2563eb" strokeWidth={2}
+              dot={{ r: 2 }} isAnimationActive={false} />
+          </ComposedChart>
         </ResponsiveContainer>
+      )}
+      {bestDay && worstDay && daily.length > 1 && (
+        <div className="flex flex-wrap gap-3 text-[11px] text-gray-500 mt-1 mb-1">
+          <span>最佳单日：<span className="font-mono text-green-700">{bestDay.date} +{bestDay.net.toFixed(2)}</span></span>
+          <span>最差单日：<span className="font-mono text-red-600">{worstDay.date} {worstDay.net.toFixed(2)}</span></span>
+          <span>已结算 {settledInPeriod.length} 单</span>
+        </div>
       )}
       {rows.length === 0 ? (
         <p className="text-sm text-gray-400 mt-2">当前时间范围内无资金流水</p>
