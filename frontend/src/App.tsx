@@ -876,7 +876,9 @@ function TestTradeFab({ quote, remainSec, urgent, wallet, refresh }: {
 }
 
 // 最近订单卡片（页面主区展示，2026-08-28 用户要求回归页面；
-// 2026-08-29：加状态/通道/方向筛选 + 通道中文化与解释）
+// 2026-08-29：加状态/通道/方向筛选 + 通道中文化与解释 + 分页）
+const ORDERS_PAGE_SIZE = 20
+
 function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
   orders: Record<string, unknown>[]
   syncing: boolean
@@ -886,6 +888,7 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
   const [fStatus, setFStatus] = useState('ALL')
   const [fChannel, setFChannel] = useState('ALL')
   const [fDirection, setFDirection] = useState('ALL')
+  const [page, setPage] = useState(1)
 
   const channels = Array.from(new Set(
     orders.map(o => String(o.signal_version ?? '')).filter(v => v && v !== '--'))).sort()
@@ -901,6 +904,11 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
     (s, o) => s + (typeof o.pnl === 'number' ? (o.pnl as number) : 0), 0)
   const filterActive = fStatus !== 'ALL' || fChannel !== 'ALL' || fDirection !== 'ALL'
   const selectCls = 'px-1.5 py-0.5 border border-gray-300 rounded text-xs text-gray-700 bg-white'
+  // 分页：筛选变化时回到第 1 页；超出范围时钳位（避免删数据后空白页）
+  useEffect(() => { setPage(1) }, [fStatus, fChannel, fDirection])
+  const totalPages = Math.max(1, Math.ceil(filtered.length / ORDERS_PAGE_SIZE))
+  const safePage = Math.min(page, totalPages)
+  const pageRows = filtered.slice((safePage - 1) * ORDERS_PAGE_SIZE, safePage * ORDERS_PAGE_SIZE)
 
   return (
     <Card title="最近订单">
@@ -948,6 +956,7 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
       {filtered.length === 0 ? (
         <p className="text-sm text-gray-400">{orders.length === 0 ? '暂无订单记录' : '当前筛选条件下无订单'}</p>
       ) : (
+        <>
         <table className="w-full text-xs">
           <thead>
             <tr className="text-left text-gray-500 border-b border-gray-100">
@@ -963,7 +972,7 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
             </tr>
           </thead>
           <tbody>
-            {filtered.map(o => {
+            {pageRows.map(o => {
               const ver = String(o.signal_version ?? '')
               const info = SIGNAL_INFO[ver]
               return (
@@ -1028,11 +1037,30 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
             </tfoot>
           )}
         </table>
+        {filtered.length > ORDERS_PAGE_SIZE && (
+          <div className="flex items-center justify-end gap-1 mt-2 text-xs">
+            <button
+              disabled={safePage <= 1} onClick={() => setPage(safePage - 1)}
+              className="px-2 py-0.5 rounded border border-gray-300 bg-white text-gray-600 disabled:opacity-40"
+            >上一页</button>
+            {Array.from({ length: totalPages }, (_, i) => i + 1).map(n => (
+              <button
+                key={n} onClick={() => setPage(n)}
+                className={`px-2 py-0.5 rounded border ${n === safePage ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-gray-600 border-gray-300 hover:border-blue-400'}`}
+              >{n}</button>
+            ))}
+            <button
+              disabled={safePage >= totalPages} onClick={() => setPage(safePage + 1)}
+              className="px-2 py-0.5 rounded border border-gray-300 bg-white text-gray-600 disabled:opacity-40"
+            >下一页</button>
+            <span className="text-gray-400 ml-1">每页 {ORDERS_PAGE_SIZE} 条</span>
+          </div>
+        )}
+        </>
       )}
     </Card>
   )
 }
-
 // 资金变化面板（2026-08-29 用户要求）：纯前端从订单派生流水——
 // 后端划转（transfer-in/out）不入库，故只含下注流出与结算回流。
 // 口径：流出=成交单 amount_in（按下单时间）；回流=已结算赢单 amount_in+pnl（按结算时间）。
@@ -1187,10 +1215,18 @@ function FundsFlowCard({ orders }: { orders: Record<string, unknown>[] }) {
   )
 }
 
-// 右侧抽屉：BTC K 线 × 市场情绪对照（2026-08-28 从主布局移入；
-// LiveChartCard 常驻挂载保持 30s 轮询数据连续，抽屉仅控制可视）
-function ChartDrawer() {
+// 右侧抽屉（2026-08-28 从主布局移入；2026-08-29 改为双 tab：K 线对照 / 资金变化）：
+// LiveChartCard 常驻挂载保持 30s 轮询数据连续，抽屉仅控制可视；两个面板始终渲染、用 hidden 切换，
+// 避免切 tab 时 LiveChartCard 卸载导致采样中断。
+function ChartDrawer({ orders }: { orders: Record<string, unknown>[] }) {
   const [open, setOpen] = useState(false)
+  const [tab, setTab] = useState<'chart' | 'funds'>('chart')
+  const tabBtn = (t: 'chart' | 'funds', label: string) => (
+    <button
+      onClick={() => setTab(t)}
+      className={`px-3 py-1 text-xs font-semibold rounded-md border transition ${tab === t ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-gray-600 border-gray-300 hover:border-blue-400'}`}
+    >{label}</button>
+  )
   return (
     <>
       {!open && (
@@ -1198,21 +1234,25 @@ function ChartDrawer() {
           onClick={() => setOpen(true)}
           className="fixed right-0 top-[62%] -translate-y-1/2 z-40 bg-blue-600 text-white text-xs font-bold px-2 py-3 rounded-l-lg shadow-lg hover:bg-blue-700 transition"
           style={{ writingMode: 'vertical-rl' }}
-          title="查看 BTC K 线 × 市场情绪对照"
+          title="查看 K 线对照 / 资金变化"
         >
-          📈 K 线对照
+          📈 面板
         </button>
       )}
 
       <div
         className={`fixed top-0 right-0 h-screen w-[760px] max-w-[94vw] bg-gray-50 shadow-2xl border-l border-gray-200 z-50 flex flex-col transition-transform duration-300 ${open ? 'translate-x-0' : 'translate-x-full'}`}
       >
-        <div className="px-4 py-2.5 border-b border-gray-200 bg-white flex items-center justify-between shrink-0">
-          <span className="text-sm font-bold text-gray-800">📈 BTC K 线对照</span>
+        <div className="px-4 py-2.5 border-b border-gray-200 bg-white flex items-center justify-between shrink-0 gap-2">
+          <div className="flex items-center gap-2">
+            {tabBtn('chart', '📈 K 线对照')}
+            {tabBtn('funds', '💰 资金变化')}
+          </div>
           <button onClick={() => setOpen(false)} className="text-gray-400 hover:text-gray-700 text-lg leading-none px-1">✕</button>
         </div>
         <div className="flex-1 min-h-0 overflow-auto p-3">
-          <LiveChartCard />
+          <div className={tab === 'chart' ? '' : 'hidden'}><LiveChartCard /></div>
+          <div className={tab === 'funds' ? '' : 'hidden'}><FundsFlowCard orders={orders} /></div>
         </div>
       </div>
     </>
@@ -1643,16 +1683,11 @@ function LiveTradeTab() {
       <div className="lg:col-span-2">
         <OrdersCard orders={orders} syncing={syncing} syncResult={syncResult} onSyncBinance={handleSyncBinance} />
       </div>
-
-      {/* 资金变化面板：订单流水 + 时间周期筛选（2026-08-29） */}
-      <div className="lg:col-span-2">
-        <FundsFlowCard orders={orders} />
-      </div>
     </div>
 
-    {/* 悬浮与抽屉（2026-08-28）：下单 FAB + K 线右侧抽屉 */}
+    {/* 悬浮与抽屉：下单 FAB + 右侧抽屉（K 线对照 / 资金变化双 tab，2026-08-29） */}
     <TestTradeFab quote={quote} remainSec={remainSec} urgent={urgent} wallet={wallet} refresh={refresh} />
-    <ChartDrawer />
+    <ChartDrawer orders={orders} />
     </>
   )
 }
