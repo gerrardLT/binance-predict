@@ -1773,3 +1773,136 @@ async def test_settle_scene_idempotent_guard(monkeypatch) -> None:
 
     assert await TradeSettler().poll_once() == 0
     assert len(db.updates) == 1
+
+
+# ============================================================
+# 组 10：15m 周期边界空窗修复（2026-08-30 S1 漏单：A 后台预热 + B 锚点回退）
+# ============================================================
+
+class _FakeHttpResp:
+    def __init__(self, payload: dict, status: int = 200) -> None:
+        self._payload = payload
+        self.status_code = status
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code != 200:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+class _FakeHttpClient:
+    """market/list + market/detail 双端点 HTTP 桓（记录 detail 扫描轨迹）。"""
+
+    def __init__(self, list_topics: list, details: dict) -> None:
+        self._list_topics = list_topics
+        self._details = details
+        self.detail_tids: list[int] = []
+
+    async def get(self, url, params=None, headers=None):
+        if url.endswith("/market/list"):
+            return _FakeHttpResp({"marketTopics": self._list_topics})
+        tid = int((params or {}).get("marketTopicId", -1))
+        self.detail_tids.append(tid)
+        d = self._details.get(tid)
+        return _FakeHttpResp(d, 200 if d is not None else 404)
+
+
+def _detail_trader(monkeypatch, client: _FakeHttpClient) -> BinancePredictionTrader:
+    trader = BinancePredictionTrader()
+    monkeypatch.setattr(trader, "_sign_request", lambda p: p)
+    monkeypatch.setattr(trader, "_get_client", lambda: client)
+    return trader
+
+
+@pytest.mark.asyncio
+async def test_market_warmup_loop_refreshes_periodically(monkeypatch) -> None:
+    """后台预热循环：定时调 refresh_markets 预缓存未来 15m 周期（修复 A）；
+    刷新异常只告警不打断循环（下轮照常预热）。"""
+    fake = _FakeTrader()
+    calls: list[int] = []
+
+    async def _refresh():
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("list 超时")
+
+    fake.refresh_markets = _refresh
+    t = _make_trader(monkeypatch, fake)
+    monkeypatch.setattr(milt, "MARKET_WARMUP_INTERVAL_S", 0.005)
+    t._running = True
+    task = asyncio.create_task(t._market_warmup_loop())
+    await asyncio.sleep(0.05)
+    t._running = False
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    assert len(calls) >= 2   # 首轮异常后循环仍继续（未被打断）
+
+
+@pytest.mark.asyncio
+async def test_start_registers_market_warmup_task(monkeypatch) -> None:
+    """start() 注册预热循环为辅助任务；stop() 将其取消并清场。"""
+    t = _make_trader(monkeypatch, _FakeTrader())
+    await t.start()
+    names = {task.get_name() for task in t._tasks}
+    assert "multi_live_market_warmup" in names
+    await t.stop()
+    assert t._stopped is True
+
+
+@pytest.mark.asyncio
+async def test_refresh_markets_holds_trade_lock(monkeypatch) -> None:
+    """refresh_markets 持下单锁刷新（与下单临界区互斥，防预热途中覆写 token）。"""
+    trader = BinancePredictionTrader()
+    locked_seen: list[bool] = []
+
+    async def _list():
+        locked_seen.append(trader._trade_lock.locked())
+
+    monkeypatch.setattr(trader, "list_markets", _list)
+    await trader.refresh_markets()
+    assert locked_seen == [True]
+
+
+@pytest.mark.asyncio
+async def test_detail_prefetch_fallback_anchor_backward_scan(monkeypatch) -> None:
+    """列表无同周期锚点（15m 整体空窗，2026-08-30 事故形态）→ 回退 5m
+    市场 tid 双向扫描；目标在锚点之前（tid 更小）也能命中（修复 B）。"""
+    slug_want = f"btc-updown-15m-{MARKET_START_15M // 1000}"
+    target_tid = 990   # 在 5m 锚点 1000 之前（目标比锚点先创建的场景）
+    client = _FakeHttpClient(
+        list_topics=[{"chartType": "CRYPTO_UP_DOWN", "symbol": "BTCUSDT",
+                      "title": "", "slug": "btc-updown-5m-999",
+                      "marketTopicId": 1000}],
+        details={target_tid: {
+            "slug": slug_want,
+            "startDate": MARKET_START_15M,
+            "endDate": MARKET_START_15M + 900_000,
+            "markets": [{"tradingStatus": "OPEN", "outcomes": [
+                {"name": "UP", "tokenId": "T-FB-UP", "price": 0.4},
+                {"name": "DOWN", "tokenId": "T-FB-DOWN", "price": 0.6},
+            ]}],
+        }},
+    )
+    trader = _detail_trader(monkeypatch, client)
+
+    entry = await trader._fetch_market_via_detail("15m", MARKET_START_15M)
+
+    assert entry is not None
+    assert entry["down_token"] == "T-FB-DOWN"
+    assert entry["up_token"] == "T-FB-UP"
+    assert target_tid in client.detail_tids   # 后向扫描覆盖到锚点之前的 ID
+
+
+@pytest.mark.asyncio
+async def test_detail_prefetch_no_anchor_gives_up(monkeypatch) -> None:
+    """列表完全空窗（5m/15m 锚点都没有）→ 返回 None 不抛（等后台预热/下次开火）。"""
+    client = _FakeHttpClient(list_topics=[], details={})
+    trader = _detail_trader(monkeypatch, client)
+
+    assert await trader._fetch_market_via_detail("15m", MARKET_START_15M) is None
+    assert client.detail_tids == []   # 无锚点不扫描，不烧调用预算

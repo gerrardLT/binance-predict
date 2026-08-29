@@ -753,6 +753,8 @@ class BinancePredictionTrader:
         相邻 ID 向后扫描（相邻 ID 交错 BTC/ETH/BNB 与 5m/15m），按可预测
         slug `btc-updown-{period}-{epoch}` 精确匹配；命中即解析返回（同
         _parse_15m_entry 结构），并要求 tradingStatus=OPEN。
+        列表无同周期锚点时（2026-08-30：周期边界 15m 整体空窗）回退用另一周期
+        的 BTC 市场 topicId 作扫描起点，前向+后向各扫 48（目标 ID 可能在锚点之前）。
         """
         slug_want = f"btc-updown-{period}-{start_ms // 1000}"
         client = self._get_client()
@@ -769,8 +771,10 @@ class BinancePredictionTrader:
             except Exception:
                 return None
 
-        # 锚点：list 首页找当前已开盘的同周期 BTC 市场
+        # 锚点：list 首页找已开盘的 BTC 市场（优先同周期；整体空窗时回退另一周期，2026-08-30）
         anchor = None
+        fallback_anchor = None
+        other_period = "5m" if period == "15m" else "15m"
         try:
             signed = self._sign_request({"limit": 100, "offset": 0})
             resp = await client.get(
@@ -780,17 +784,34 @@ class BinancePredictionTrader:
             )
             resp.raise_for_status()
             for m in resp.json().get("marketTopics", []):
-                if (m.get("chartType") == "CRYPTO_UP_DOWN"
-                        and m.get("symbol") == "BTCUSDT"
-                        and self._classify_period(m) == period):
+                if (m.get("chartType") != "CRYPTO_UP_DOWN"
+                        or m.get("symbol") != "BTCUSDT"):
+                    continue
+                m_period = self._classify_period(m)
+                if m_period == period and anchor is None:
                     anchor = m.get("marketTopicId")
-                    break
+                elif m_period == other_period and fallback_anchor is None:
+                    fallback_anchor = m.get("marketTopicId")
         except Exception as e:
             logger.warning("detail 预取：锚点查询失败 | {}", e)
         if anchor is None:
-            return None
+            # 列表里一个同周期市场都没有（周期边界整体空窗）：回退另一周期
+            # 锚点；连回退锚点都没有 → 列表完全空窗，放弃（等后台预热/下次开火）
+            anchor = fallback_anchor
+            if anchor is None:
+                return None
+            logger.info(
+                "detail 预取：无同周期锚点，用 {} 市场 tid={} 双向扫描 | 目标 {}",
+                other_period, anchor, slug_want)
+            # 回退锚点与目标的 ID 距离方向未知（目标可能在锚点之前创建）：
+            # 前向+后向各 48（约 2× 单向预算，回退路径低频可接受）；
+            # 向后扫同样只命中 slug 才采，不会押错周期。
+            scan_ids = [tid for tid in range(anchor + 1, anchor + 49) if tid > 0]
+            scan_ids += [tid for tid in range(anchor - 48, anchor) if tid > 0]
+        else:
+            scan_ids = list(range(anchor + 1, anchor + 49))
 
-        for tid in range(anchor + 1, anchor + 48):
+        for tid in scan_ids:
             d = await _detail(tid)
             if not d or d.get("slug") != slug_want:
                 continue
@@ -948,6 +969,15 @@ class BinancePredictionTrader:
             self._5m_trade_volume,
         )
         return btc_markets
+
+    async def refresh_markets(self) -> None:
+        """后台预热入口（MultiLiveTrader 定时调用，2026-08-30）。
+
+        持下单锁刷新市场列表——与下单临界区「list + token 选择 + 下单」
+        互斥（同 Fix #21 锁），防预热刷新在下单途中把 token 覆写成新周期。
+        """
+        async with self._trade_lock:
+            await self.list_markets()
 
     async def get_quote(
         self,

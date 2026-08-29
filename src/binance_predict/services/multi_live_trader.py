@@ -77,6 +77,7 @@ X4_POLL_INTERVAL_S = 30.0           # x4 PENDING 信号轮询间隔
 X4_DECISION_TOLERANCE_MS = 30_000   # 决策点错过容差（超时不追单）
 X4_RECENT_WINDOW_MS = 10 * 60 * 1000  # 只看近期 PENDING（更早的已无意义）
 V3_PREV_RETRY_DELAY_S = 30.0        # 前窗未归档延迟重查（归档在边界+15s，相位抖动余量）
+MARKET_WARMUP_INTERVAL_S = 60.0     # 市场列表后台预热间隔（未来 15m 周期预缓存，2026-08-30）
 
 
 class MultiLiveTrader:
@@ -511,6 +512,31 @@ class MultiLiveTrader:
                 logger.warning("多通道实盘：余额缓存作废回调异常（不影响下单）")
 
     # ------------------------------------------------------------------
+    # 市场列表后台预热（2026-08-30 S1 漏单修复 A）
+    # ------------------------------------------------------------------
+
+    async def _market_warmup_loop(self) -> None:
+        """定时刷新市场列表：未来 15m 周期提前入 _15m_markets 缓存。
+
+        背景（2026-08-30 S1 漏单）：场景通道在周期边界后 0~2s 开火，
+        币安 list 此刻可能尚未上架新周期（实测 3 vs 4 个市场）；此前
+        list_markets 只在开火下单时调用，缓存空 → 锚定守卫拒单。
+        后台预热让未来周期提前入缓存，边界开火直接命中；异常只告警。
+        """
+        while self._running:
+            try:
+                await asyncio.sleep(MARKET_WARMUP_INTERVAL_S)
+                await self._warmup_markets_once()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning("多通道实盘：市场预热异常 | {}", exc)
+
+    async def _warmup_markets_once(self) -> None:
+        """单次预热：走下单同锁的刷新入口（防与在途下单交错覆写 token）。"""
+        await self._trader.refresh_markets()
+
+    # ------------------------------------------------------------------
     # signal_id 回填（quote_edge 延迟回填 + 自愈；x4 即时回填）
     # ------------------------------------------------------------------
 
@@ -796,7 +822,7 @@ class MultiLiveTrader:
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        """启动辅助循环（heal + x4 轮询；quote_edge 触发由采样循环喂价）。"""
+        """启动辅助循环（heal + x4 轮询 + 市场预热；quote_edge 触发由采样循环喂价）。"""
         if self._running:
             return
         self._running = True
@@ -807,6 +833,7 @@ class MultiLiveTrader:
         for coro_factory, name in (
             (self._heal_loop, "multi_live_heal_loop"),
             (self._x4_loop, "multi_live_x4_loop"),
+            (self._market_warmup_loop, "multi_live_market_warmup"),
         ):
             task = asyncio.create_task(coro_factory(), name=name)
             self._tasks.add(task)
@@ -820,7 +847,7 @@ class MultiLiveTrader:
         self._running = False
         for task in list(self._tasks):
             if task.get_name() in ("multi_live_heal_loop", "multi_live_backfill",
-                                   "multi_live_x4_loop"):
+                                   "multi_live_x4_loop", "multi_live_market_warmup"):
                 task.cancel()
         for task in list(self._tasks):
             try:
