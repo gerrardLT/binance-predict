@@ -34,7 +34,9 @@ from binance_predict.config.settings import settings
 from binance_predict.db.models import FakeBreakoutSignal, TradeOrderModel
 from binance_predict.services.live_channels import (
     LIVE_CHANNELS,
+    ChannelConfig,
     parse_channel_config,
+    resolve_max_exec,
     scene_pattern_to_channel,
 )
 from binance_predict.services.multi_live_trader import MultiLiveTrader
@@ -251,7 +253,7 @@ def test_channels_registry_shape() -> None:
     assert all(by[ch].market_period == "15m" for ch in
                ("scene_bull_exhaust", "scene_bull_exhaust_confirm",
                 "scene_bear_exhaust", "scene_momentum_fade"))
-    assert by["scene_bull_exhaust"].auto_max_exec == 0.60
+    assert by["scene_bull_exhaust"].auto_max_exec == 0.70
     assert by["scene_bull_exhaust_confirm"].auto_max_exec == 0.75
     assert by["scene_bear_exhaust"].auto_max_exec == 0.55
     assert by["scene_momentum_fade"].auto_max_exec == 0.55
@@ -774,7 +776,7 @@ def _scene_sig(pattern_type: str, side: str, sig_id: int = 42) -> dict:
 
 @pytest.mark.asyncio
 async def test_scene_s1_down_15m(monkeypatch) -> None:
-    """S1（多头耗尽，side=high）→ 15m 市场押 DOWN，护栏 0.60。"""
+    """S1（多头耗尽，side=high）→ 15m 市场押 DOWN，护栏 0.70（2026-08-30 盘口校准）。"""
     fake = _FakeTrader()
     t = _make_trader(monkeypatch, fake, channels=["scene_bull_exhaust"])
     t.on_scene_signal(_scene_sig("bull_exhaust", "high"))
@@ -785,7 +787,7 @@ async def test_scene_s1_down_15m(monkeypatch) -> None:
     assert call["window_start"] == MARKET_START_15M
     assert call["market_period"] == "15m"
     assert call["scene_signal_id"] == 42
-    assert call["max_exec_price"] == 0.60
+    assert call["max_exec_price"] == 0.70
     assert call["amount_usdt"] == 2.0
 
 
@@ -1375,6 +1377,64 @@ async def test_signal_trade_guard_boundary_touch_rejected(monkeypatch) -> None:
     assert placed == [135]  # int((0.75/0.74−1)×10000)=135，非 0/非默认 1200
 
 
+@pytest.mark.asyncio
+async def test_signal_trade_s1_guard_070_calibration(monkeypatch) -> None:
+    """S1 护栏校准后默认 0.70（2026-08-30 盘口数据：旧 0.60 误拦胜率 75% 的入场价段）：
+    旧护栏误拦区间 [0.60,0.70) 内的报价 0.65 正常成交，贴线 0.70 仍弃单。"""
+    trader = _make_real_trader(monkeypatch)
+    guard = resolve_max_exec(LIVE_CHANNELS["scene_bull_exhaust"], ChannelConfig())
+    assert guard == 0.70  # 无显式配置时回落新默认值，非旧 0.60
+    placed: list[int] = []
+    updates: list[tuple] = []
+
+    async def _reserve(_v, _ws, direction=None, market_period="5m",
+                       scene_signal_id=None):
+        return _pending_order()
+
+    async def _update(order, status, **kwargs):
+        updates.append((status, kwargs))
+        return {**order, "status": status, **kwargs}
+
+    async def _place(_q, slippage_bps=1200):
+        placed.append(slippage_bps)
+        return {"orderId": "ORD-S1G"}
+
+    monkeypatch.setattr(trader, "_reserve_order_slot", _reserve)
+    monkeypatch.setattr(trader, "_update_signal_order", _update)
+    monkeypatch.setattr(trader, "place_order", _place)
+
+    # 报价 0.65：旧 0.60 护栏会拦（2026-08-29 id=99 实证），新护栏放行成交，
+    # 滑点按护栏价收紧 int((0.70/0.65−1)×10000)=769bps
+    async def _q1(token_id, side, amount_usdt=None):
+        return {"averagePrice": 0.65, "amountIn": "5", "amountOut": "7",
+                "quoteId": "Q-S1G1"}
+
+    monkeypatch.setattr(trader, "get_quote", _q1)
+    order = await trader.execute_signal_trade(
+        "DOWN", 5.0, "scene_bull_exhaust", WINDOW_START,
+        max_exec_price=guard, market_period="15m", scene_signal_id=1)
+    assert order["status"] == "FILLED"
+    assert placed == [769]
+
+    # 贴线：0.70 >= 0.70 → FAILED，不下单
+    async def _q2(token_id, side, amount_usdt=None):
+        return {"averagePrice": 0.70, "amountIn": "5", "amountOut": "7",
+                "quoteId": "Q-S1G2"}
+
+    monkeypatch.setattr(trader, "get_quote", _q2)
+    trader._15m_markets[WINDOW_START + 300_000] = {
+        "end_date": WINDOW_START + 1200_000,
+        "up_token": "T-S1G-UP", "down_token": "T-S1G-DOWN",
+        "up_price": 0.30, "down_price": 0.70,
+    }
+    order2 = await trader.execute_signal_trade(
+        "DOWN", 5.0, "scene_bull_exhaust", WINDOW_START + 300_000,
+        max_exec_price=guard, market_period="15m", scene_signal_id=2)
+    assert order2["status"] == "FAILED"
+    assert "贴线无滑点空间" in str(updates[-1][1]["error_message"])
+    assert len(placed) == 1  # 第二单未下到 place_order
+
+
 def test_parse_15m_entry() -> None:
     """15m 市场解析：token/报价提取 + startDate 缺失/非法拒入表。"""
     market = {
@@ -1501,9 +1561,14 @@ def test_merge_fill_partial_fill_amount() -> None:
 
 @pytest.mark.asyncio
 async def test_signal_trade_ghost_fill_downgrade(monkeypatch) -> None:
-    """币安侧终态回查为 FAILED（FOK 受理后翻转）→ 落 FAILED，不伪造成交。"""
+    """币安侧终态回查为 FAILED（FOK 受理后翻转）→ 重试仍 FAILED → 落 FAILED。
+
+    2026-08-30 起：终态 FAILED 会触发同槽位重试（最多 MAX_FOK_RETRIES 次）；
+    本用例回查恒 FAILED → 共 3 次下单（首次+2 重试），最终仍不伪造成交。
+    """
     trader = _make_real_trader(monkeypatch)
     updates: list[tuple] = []
+    place_calls: list[str] = []
 
     async def _reserve(_v, _ws, direction=None, market_period="5m",
                        scene_signal_id=None):
@@ -1518,6 +1583,7 @@ async def test_signal_trade_ghost_fill_downgrade(monkeypatch) -> None:
                 "quoteId": "Q1"}
 
     async def _place(_q, slippage_bps=1200):
+        place_calls.append(_q["quoteId"])
         return {"orderId": "ORD-GHOST"}
 
     async def _confirm_failed(_oid, attempts=3, delay=1.0):
@@ -1532,9 +1598,109 @@ async def test_signal_trade_ghost_fill_downgrade(monkeypatch) -> None:
     order = await trader.execute_signal_trade(
         "DOWN", 5.0, "quote_momentum_v1", WINDOW_START, max_exec_price=0.78)
     assert order["status"] == "FAILED"
+    assert len(place_calls) == 3  # 首次 + 2 次重试（重试报价同价仍过护栏）
     assert updates[0][0] == "FAILED"
     assert updates[0][1]["order_id"] == "ORD-GHOST"
     assert "FOK 未成交" in updates[0][1]["error_message"]
+    assert "已重试 2 次" in updates[0][1]["error_message"]
+
+
+@pytest.mark.asyncio
+async def test_signal_trade_fok_retry_second_attempt_fills(monkeypatch) -> None:
+    """FOK 首轮未成交 → 重新报价 0.52 重试（滑点放宽到护栏全空间）→ 成交。
+
+    2026-08-30 S1 实证：0.49 报价 / 0.6 护栏，首轮滑点钳在 1200bps（限价只到 0.55）
+    吃不满；重试轮滑点 = (0.6/0.52−1)=1538bps 不再钳 1200，覆盖到护栏价。
+    """
+    trader = _make_real_trader(monkeypatch)
+    updates: list[tuple] = []
+    slippage_seen: list[int] = []
+    quotes = [
+        {"averagePrice": 0.49, "amountIn": "5", "amountOut": "10", "quoteId": "Q1"},
+        {"averagePrice": 0.52, "amountIn": "5", "amountOut": "9", "quoteId": "Q2"},
+    ]
+    places = [{"orderId": "ORD-1"}, {"orderId": "ORD-2"}]
+    confirms = [
+        {"orderId": "ORD-1", "status": "FAILED"},
+        {"orderId": "ORD-2", "status": "FILLED", "price": "0.58"},
+    ]
+
+    async def _reserve(_v, _ws, direction=None, market_period="5m",
+                       scene_signal_id=None):
+        return _pending_order()
+
+    async def _update(order, status, **kwargs):
+        updates.append((status, kwargs))
+        return {**order, "status": status, **kwargs}
+
+    async def _quote(_token, _side, amount_usdt=None):
+        return quotes.pop(0)
+
+    async def _place(_q, slippage_bps=1200):
+        slippage_seen.append(slippage_bps)
+        return places.pop(0)
+
+    async def _confirm(_oid, attempts=3, delay=1.0):
+        return next(c for c in confirms if c["orderId"] == _oid)
+
+    monkeypatch.setattr(trader, "_reserve_order_slot", _reserve)
+    monkeypatch.setattr(trader, "_update_signal_order", _update)
+    monkeypatch.setattr(trader, "get_quote", _quote)
+    monkeypatch.setattr(trader, "place_order", _place)
+    monkeypatch.setattr(trader, "confirm_order_status", _confirm)
+
+    order = await trader.execute_signal_trade(
+        "DOWN", 5.0, "scene_bull_exhaust", WINDOW_START, max_exec_price=0.6)
+    assert order["status"] == "FILLED"
+    assert order["order_id"] == "ORD-2"  # 落库为重试单，非首次被拒单
+    # 首轮钳 1200（护栏空间 2244）；重试轮放宽到护栏全空间 1538 不再钳 1200
+    assert slippage_seen == [1200, 1538]
+    # FILLED 回填口径：成交价取币安历史行 price，重试报价均价保留在 quotedAvgPrice
+    assert updates[0][1]["quote_json"]["averagePrice"] == 0.58
+    assert updates[0][1]["quote_json"]["quotedAvgPrice"] == 0.52
+
+
+@pytest.mark.asyncio
+async def test_signal_trade_fok_retry_guardrail_rejects_retry_quote(monkeypatch) -> None:
+    """重试轮重新报价已涨破护栏（0.62 ≥ 0.6）→ 弃单不追贵，不再下第二单。"""
+    trader = _make_real_trader(monkeypatch)
+    updates: list[tuple] = []
+    place_calls: list[str] = []
+    quotes = [
+        {"averagePrice": 0.49, "amountIn": "5", "amountOut": "10", "quoteId": "Q1"},
+        {"averagePrice": 0.62, "amountIn": "5", "amountOut": "8", "quoteId": "Q2"},
+    ]
+
+    async def _reserve(_v, _ws, direction=None, market_period="5m",
+                       scene_signal_id=None):
+        return _pending_order()
+
+    async def _update(order, status, **kwargs):
+        updates.append((status, kwargs))
+        return {**order, "status": status, **kwargs}
+
+    async def _quote(_token, _side, amount_usdt=None):
+        return quotes.pop(0)
+
+    async def _place(_q, slippage_bps=1200):
+        place_calls.append(_q["quoteId"])
+        return {"orderId": "ORD-1"}
+
+    async def _confirm(_oid, attempts=3, delay=1.0):
+        return {"orderId": _oid, "status": "FAILED"}
+
+    monkeypatch.setattr(trader, "_reserve_order_slot", _reserve)
+    monkeypatch.setattr(trader, "_update_signal_order", _update)
+    monkeypatch.setattr(trader, "get_quote", _quote)
+    monkeypatch.setattr(trader, "place_order", _place)
+    monkeypatch.setattr(trader, "confirm_order_status", _confirm)
+
+    order = await trader.execute_signal_trade(
+        "DOWN", 5.0, "scene_bull_exhaust", WINDOW_START, max_exec_price=0.6)
+    assert order["status"] == "FAILED"
+    assert place_calls == ["Q1"]  # 护栏复检拦下重试单，未下第二单
+    assert "重试执行价护栏弃单" in updates[0][1]["error_message"]
+    assert updates[0][1]["order_id"] == "ORD-1"  # 首次单 orderId 保留供对账追溯
 
 
 @pytest.mark.asyncio

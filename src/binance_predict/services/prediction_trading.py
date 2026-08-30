@@ -56,6 +56,11 @@ _TRANSFER_INBOUND_PATH = "/sapi/v1/w3w/wallet/prediction/transfer/inbound"
 _POSITION_LIST_PATH = "/sapi/v1/w3w/wallet/prediction/position/list"
 _BATCH_REDEEM_PATH = "/sapi/v1/w3w/wallet/prediction/batch-redeem"
 
+# FOK 未成交即时重试次数（2026-08-30 成交率改进）：15m 开盘瞬间盘口极薄，
+# 首轮保守滑点（≤1200bps）常吃不满护栏价以内的 ask；币安侧终态 FAILED 后
+# 同槽位立即重新报价重试，重试轮滑点放宽到护栏全空间（成交价仍不破护栏）。
+MAX_FOK_RETRIES = 2
+
 
 class BinancePredictionTrader:
     """
@@ -1393,6 +1398,7 @@ class BinancePredictionTrader:
 
             # 动态滑点收紧（CodeReview Medium#2）：FOK 成交价不得突破护栏价，
             # 否则 slippageBps=1200 会让 0.78 的护栏形同虚设（最高可成交 ~0.87）。
+            # 首轮保守（≤1200bps）；FOK 未成交后的重试轮放宽到护栏全空间（见下）。
             slippage_bps = 1200
             if max_exec_price is not None and avg_price > 0:
                 cap = int((max_exec_price / avg_price - 1.0) * 10000)
@@ -1408,11 +1414,55 @@ class BinancePredictionTrader:
             # 2026-08 对账发现 2 笔本地 FILLED 而币安 filled=0）
             order_id = order_result.get("orderId")
             confirmed = await self.confirm_order_status(order_id)
+
+            # FOK 未成交即时重试（成交率改进，2026-08-30 S1 实证）：15m 开盘瞬间
+            # 盘口极薄（成交量仅 $37 量级），首轮保守滑点常吃不满护栏以内的 ask
+            # （0.49 报价 vs 0.6 护栏，限价只到 0.55，而市场两分钟内冲到 0.77）。
+            # 币安侧 FAILED 即同槽位重新报价重试：新报价过护栏复检（不追贵），
+            # 滑点放宽到护栏全空间——成交价仍不破 max_exec_price，回测口径不变；
+            # 复用同一 PENDING 占位，每窗一单/防重/日单量语义全部不变。
+            retries = 0
+            while (order_result and confirmed is not None
+                   and confirmed.get("status") == "FAILED"
+                   and retries < MAX_FOK_RETRIES):
+                retries += 1
+                logger.warning(
+                    "信号实盘：FOK 未成交，同槽位重试 {}/{} | signal={} | window={} | orderId={}",
+                    retries, MAX_FOK_RETRIES, signal_version, window_start, order_id)
+                retry_quote = await self.get_quote(token_id, "BUY", amount_usdt=amount_usdt)
+                if not retry_quote:
+                    break  # 重新报价失败 → 保持 FOK 失败终态，不伪报
+                try:
+                    retry_avg = float(retry_quote.get("averagePrice") or 0.0)
+                except (TypeError, ValueError):
+                    retry_avg = 0.0
+                # 护栏复检（含贴线）：重试报价已涨破/贴护栏 → 弃单不追贵，
+                # error 带上首次单 orderId 便于对账追溯。
+                if max_exec_price is not None and (
+                        retry_avg <= 0 or retry_avg >= max_exec_price):
+                    return await self._update_signal_order(
+                        pending, "FAILED", direction=prediction, token_id=token_id,
+                        order_id=order_id, quote_json=retry_quote,
+                        error_message=(
+                            f"重试执行价护栏弃单 | averagePrice={retry_avg} "
+                            f">= {max_exec_price}（贴线无滑点空间）"))
+                # 重试轮滑点 = 护栏全空间（不再钳 1200）；必须 ≥1（币安拒收 0，-1102）
+                retry_slippage = 1200
+                if max_exec_price is not None and retry_avg > 0:
+                    retry_slippage = max(
+                        1, int((max_exec_price / retry_avg - 1.0) * 10000))
+                retry_result = await self.place_order(retry_quote, slippage_bps=retry_slippage)
+                if not retry_result:
+                    break  # 重试单提交失败 → 保持 FOK 失败终态
+                quote, order_result = retry_quote, retry_result
+                order_id = order_result.get("orderId")
+                confirmed = await self.confirm_order_status(order_id)
+
             if confirmed is not None and confirmed.get("status") == "FAILED":
                 return await self._update_signal_order(
                     pending, "FAILED", direction=prediction, token_id=token_id,
                     order_id=order_id, quote_json=quote,
-                    error_message="币安侧订单终态 FAILED（FOK 未成交）")
+                    error_message=f"币安侧订单终态 FAILED（FOK 未成交，已重试 {retries} 次）")
 
             # FILLED → 落成交（quote_json 回填实际成交均价，2026-08-28）；
             # 暂未确认 → 保持 PENDING 交 sync-binance 对账

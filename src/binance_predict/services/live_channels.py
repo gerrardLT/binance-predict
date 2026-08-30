@@ -80,8 +80,11 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     "x4_v1": ChannelSpec("x4_v1", "x4", "5m", "DOWN", 0.45, "情绪错位（收阳押次窗DOWN）"),
     "x4_v2": ChannelSpec("x4_v2", "x4", "5m", "DOWN", 0.50, "情绪错位·平静市门禁版"),
     # --- 场景族（15m 市场次周期开盘入场；S5 为 +5min 确认入场）---
+    # S1 护栏 0.70：2026-08-30 盘口数据校准（原 0.60 拍脑袋值）——
+    # 41 个已结算信号中入场价 >=0.60 的 8 个胜率 75%（> 放行区间 61%），
+    # 开盘 DOWN 贵=回落已在发生（确认而非警告），0.60 误拦正收益单。
     "scene_bull_exhaust": ChannelSpec(
-        "scene_bull_exhaust", "scene", "15m", "DOWN", 0.60, "场景S1 多头耗尽（押DOWN）",
+        "scene_bull_exhaust", "scene", "15m", "DOWN", 0.70, "场景S1 多头耗尽（押DOWN）",
     ),
     "scene_bull_exhaust_confirm": ChannelSpec(
         "scene_bull_exhaust_confirm", "scene", "15m", "DOWN", 0.75, "场景S5 确认入场（押DOWN）",
