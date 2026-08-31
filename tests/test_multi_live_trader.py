@@ -255,7 +255,7 @@ def test_channels_registry_shape() -> None:
                 "scene_bear_exhaust", "scene_momentum_fade"))
     assert by["scene_bull_exhaust"].auto_max_exec == 0.70
     assert by["scene_bull_exhaust_confirm"].auto_max_exec == 0.75
-    assert by["scene_bear_exhaust"].auto_max_exec == 0.55
+    assert by["scene_bear_exhaust"].auto_max_exec == 0.65
     assert by["scene_momentum_fade"].auto_max_exec == 0.55
 
 
@@ -793,7 +793,7 @@ async def test_scene_s1_down_15m(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_scene_s2_up_15m(monkeypatch) -> None:
-    """S2（空头耗尽，side=low）→ 15m 市场押 UP，护栏 0.55。"""
+    """S2（空头耗尽，side=low）→ 15m 市场押 UP，护栏 0.65（2026-08-30 盘口校准）。"""
     fake = _FakeTrader()
     t = _make_trader(monkeypatch, fake, channels=["scene_bear_exhaust"])
     t.on_scene_signal(_scene_sig("bear_exhaust", "low"))
@@ -802,7 +802,7 @@ async def test_scene_s2_up_15m(monkeypatch) -> None:
     assert call["prediction"] == "UP"
     assert call["signal_version"] == "scene_bear_exhaust"
     assert call["market_period"] == "15m"
-    assert call["max_exec_price"] == 0.55
+    assert call["max_exec_price"] == 0.65
 
 
 @pytest.mark.asyncio
@@ -1429,6 +1429,68 @@ async def test_signal_trade_s1_guard_070_calibration(monkeypatch) -> None:
     }
     order2 = await trader.execute_signal_trade(
         "DOWN", 5.0, "scene_bull_exhaust", WINDOW_START + 300_000,
+        max_exec_price=guard, market_period="15m", scene_signal_id=2)
+    assert order2["status"] == "FAILED"
+    assert "贴线无滑点空间" in str(updates[-1][1]["error_message"])
+    assert len(placed) == 1  # 第二单未下到 place_order
+
+
+@pytest.mark.asyncio
+async def test_signal_trade_s2_guard_065_calibration(monkeypatch) -> None:
+    """S2 护栏校准后默认 0.65（2026-08-30 盘口数据：旧 0.55 拦掉 47% 信号，
+    被拦段胜率 88%/EV+0.39）：旧误拦区间 [0.55,0.65) 报价 0.60 正常成交，
+    贴线 0.65 仍弃单。S2 押 UP（与 S1 方向相反，验证 UP token 分流）。"""
+    trader = _make_real_trader(monkeypatch)
+    guard = resolve_max_exec(LIVE_CHANNELS["scene_bear_exhaust"], ChannelConfig())
+    assert guard == 0.65  # 无显式配置时回落新默认值，非旧 0.55
+    placed: list[int] = []
+    quote_tokens: list[str] = []
+    updates: list[tuple] = []
+
+    async def _reserve(_v, _ws, direction=None, market_period="5m",
+                       scene_signal_id=None):
+        return _pending_order()
+
+    async def _update(order, status, **kwargs):
+        updates.append((status, kwargs))
+        return {**order, "status": status, **kwargs}
+
+    async def _place(_q, slippage_bps=1200):
+        placed.append(slippage_bps)
+        return {"orderId": "ORD-S2G"}
+
+    async def _q1(token_id, side, amount_usdt=None):
+        quote_tokens.append(token_id)
+        return {"averagePrice": 0.60, "amountIn": "5", "amountOut": "8",
+                "quoteId": "Q-S2G1"}
+
+    monkeypatch.setattr(trader, "_reserve_order_slot", _reserve)
+    monkeypatch.setattr(trader, "_update_signal_order", _update)
+    monkeypatch.setattr(trader, "place_order", _place)
+    monkeypatch.setattr(trader, "get_quote", _q1)
+
+    # 报价 0.60：旧 0.55 护栏会拦，新护栏放行成交；押 UP → 取 up_token，
+    # 滑点 int((0.65/0.60−1)×10000)=833bps
+    order = await trader.execute_signal_trade(
+        "UP", 5.0, "scene_bear_exhaust", WINDOW_START,
+        max_exec_price=guard, market_period="15m", scene_signal_id=1)
+    assert order["status"] == "FILLED"
+    assert placed == [833]
+    assert quote_tokens and quote_tokens[0].endswith("UP")  # UP 方向取 up_token
+
+    # 贴线：0.65 >= 0.65 → FAILED，不下单
+    async def _q2(token_id, side, amount_usdt=None):
+        return {"averagePrice": 0.65, "amountIn": "5", "amountOut": "8",
+                "quoteId": "Q-S2G2"}
+
+    monkeypatch.setattr(trader, "get_quote", _q2)
+    trader._15m_markets[WINDOW_START + 300_000] = {
+        "end_date": WINDOW_START + 1200_000,
+        "up_token": "T-S2G-UP", "down_token": "T-S2G-DOWN",
+        "up_price": 0.65, "down_price": 0.35,
+    }
+    order2 = await trader.execute_signal_trade(
+        "UP", 5.0, "scene_bear_exhaust", WINDOW_START + 300_000,
         max_exec_price=guard, market_period="15m", scene_signal_id=2)
     assert order2["status"] == "FAILED"
     assert "贴线无滑点空间" in str(updates[-1][1]["error_message"])

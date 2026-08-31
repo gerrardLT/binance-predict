@@ -89,8 +89,10 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     "scene_bull_exhaust_confirm": ChannelSpec(
         "scene_bull_exhaust_confirm", "scene", "15m", "DOWN", 0.75, "场景S5 确认入场（押DOWN）",
     ),
+    # S2 护栏 0.65：2026-08-30 盘口数据校准（与 S1 同病）——47% 信号被旧 0.55 拦截，
+    # 被拦段 8 单胜率 88%、均值EV +0.39（与放行段同样赚钱）；开盘 UP 贵=反弹已启动。
     "scene_bear_exhaust": ChannelSpec(
-        "scene_bear_exhaust", "scene", "15m", "UP", 0.55, "场景S2 空头耗尽（押UP）",
+        "scene_bear_exhaust", "scene", "15m", "UP", 0.65, "场景S2 空头耗尽（押UP）",
     ),
     "scene_momentum_fade": ChannelSpec(
         "scene_momentum_fade", "scene", "15m", "DOWN", 0.55, "场景S4 动量衰竭（押DOWN）",
