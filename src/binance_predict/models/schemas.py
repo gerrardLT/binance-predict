@@ -313,6 +313,14 @@ class ToggleLiveRequest(BaseModel):
         default=None,
         description="可选：热调通道日限（1~500）",
     )
+    max_exec_price: float | None = Field(
+        default=None,
+        description="可选：热调执行价护栏（0.01~0.99，立即生效；None=不修改）",
+    )
+    reset_max_exec: bool = Field(
+        default=False,
+        description="可选：True=清空自定义护栏，回落通道预设值（优先于 max_exec_price）",
+    )
 
 
 class RedeemRequest(BaseModel):

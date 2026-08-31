@@ -76,6 +76,11 @@ class Settings(BaseSettings):
     log_rotation: str = "00:00"  # 每天零点切割
     log_retention: str = "14 days"  # 保留 14 天
 
+    # --- Predexon 历史数据源（仅供离线回填脚本读取，运行时不用）---
+    # scripts/predexon_backfill.py 直接从 .env 读此键（多 key 逗号分隔）；
+    # 显式声明收录，避免 pydantic-settings extra=forbid 拒绝整个配置加载。
+    predexon_api_key: str = ""
+
     # --- 安全配置 ---
     # CORS 允许的前端源（逗号分隔，如 "http://localhost:5173,https://example.com"）。
     # 空字符串默认仅允许 localhost 开发源。生产环境必须显式指定。

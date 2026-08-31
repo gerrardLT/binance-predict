@@ -970,6 +970,9 @@ async def lifespan(app: FastAPI):
                  "'PENDING | FILLED | FAILED（订单生命周期）；结算结果见 settle_outcome/win/pnl'"),
                 ("CREATE INDEX IF NOT EXISTS ix_trade_orders_settle_pending ON trade_orders (window_start) "
                  "WHERE status = 'FILLED' AND settled_at IS NULL AND window_start IS NOT NULL"),
+                # 执行价护栏自定义覆盖（与 alembic 迁移 y3z4a5b6c7d8 等价，存量 dev 库安全网）
+                ("ALTER TABLE live_channel_overrides ADD COLUMN IF NOT EXISTS "
+                 "max_exec_price FLOAT"),
             ]:
                 try:
                     await conn.execute(text(col_sql))
@@ -2117,9 +2120,10 @@ async def live_toggle(
 ):
     """实时开关/热调单个实盘通道（MultiLiveTrader，多通道时代重写）。
 
-    通道白名单 LIVE_CHANNELS；可选 amount_usdt/max_daily_orders 同步热调
-    （校验同启动配置，非法值拒改不落库），立即生效并持久化到
+    通道白名单 LIVE_CHANNELS；可选 amount_usdt/max_daily_orders/max_exec_price
+    同步热调（校验同启动配置，非法值拒改不落库），立即生效并持久化到
     live_channel_overrides（重启不丢设定；DB 写失败仅告警不影响运行时生效）。
+    护栏传 reset_max_exec=True 清空自定义回落通道预设值。
     ⚠️ 关闭不取消在途任务（High#1），只阻止该通道新单派生。
     """
     if multi_live_trader is None:
@@ -2128,7 +2132,9 @@ async def live_toggle(
         multi_live_trader.set_channel(
             req.channel, enabled=req.enabled,
             amount_usdt=req.amount_usdt,
-            max_daily_orders=req.max_daily_orders)
+            max_daily_orders=req.max_daily_orders,
+            max_exec_price=req.max_exec_price,
+            reset_max_exec=req.reset_max_exec)
     except ValueError as exc:
         return {"error": str(exc)}
     try:
@@ -2148,6 +2154,96 @@ async def live_toggle(
             f" 护栏 {_ch['max_exec_price']}）"
         ),
         "status": _status,
+    }
+
+
+@app.get("/api/live/pnl-curve")
+async def live_pnl_curve(
+    _: None = Depends(_require_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """每实盘通道已结算订单的累计盈亏趋势（右侧抽屉「盈利趋势」tab 数据源）。
+
+    口径：trade_orders 中 signal_version 属于通道注册表（LIVE_CHANNELS）、
+    FILLED 且已结算（win/pnl 非空）的行，按 window_start 时序逐单累计
+    本地估算 pnl（USDT）。未结算/FAILED/manual_test 单不计入。
+    返回全部有已结算数据的通道（含当前已关闭的），enabled 字段供前端过滤。
+    """
+    from sqlalchemy import select as sa_select
+    from .db.models import TradeOrderModel
+    from .services.live_channels import LIVE_CHANNELS
+
+    rows = (await db.execute(
+        sa_select(
+            TradeOrderModel.signal_version,
+            TradeOrderModel.window_start,
+            TradeOrderModel.settled_at,
+            TradeOrderModel.win,
+            TradeOrderModel.pnl,
+        ).where(
+            TradeOrderModel.signal_version.in_(list(LIVE_CHANNELS)),
+            TradeOrderModel.status == "FILLED",
+            TradeOrderModel.win.isnot(None),
+            TradeOrderModel.pnl.isnot(None),
+        ).order_by(TradeOrderModel.window_start.asc())
+    )).all()
+
+    # 通道元数据（中文名/开关态）优先取运行时状态，执行器未装配时回落注册表
+    meta: dict[str, dict] = {}
+    if multi_live_trader is not None:
+        try:
+            meta = {c["channel"]: c for c in
+                    (await multi_live_trader.status_async())["channels"]}
+        except Exception as exc:
+            logger.warning("pnl-curve 通道状态查询失败，回落注册表元数据 | {}", exc)
+    for ch, spec in LIVE_CHANNELS.items():
+        meta.setdefault(ch, {
+            "channel": ch, "display_name": spec.display_name,
+            "family": spec.family, "market_period": spec.market_period,
+            "enabled": False,
+        })
+
+    # 按通道分组累计（window_start 已升序；settle 时序与窗口时序一致）
+    by_ch: dict[str, list] = {}
+    for ver, ws, settled_at, win, pnl in rows:
+        by_ch.setdefault(ver, []).append(
+            {"window_start": int(ws), "win": bool(win), "pnl": float(pnl),
+             "t": int(settled_at.timestamp() * 1000) if settled_at else int(ws)})
+
+    channels_out = []
+    for ch, pts in by_ch.items():
+        cum = 0.0
+        points = []
+        for n, p in enumerate(pts, start=1):
+            cum += p["pnl"]
+            points.append({"n": n, "t": p["t"], "pnl": round(p["pnl"], 4),
+                           "cum": round(cum, 4), "win": p["win"]})
+        wins = sum(1 for p in pts if p["win"])
+        m = meta.get(ch, {})
+        channels_out.append({
+            "channel": ch,
+            "display_name": m.get("display_name", ch),
+            "family": m.get("family"),
+            "market_period": m.get("market_period"),
+            "enabled": bool(m.get("enabled")),
+            "settled_count": len(pts),
+            "win_count": wins,
+            "win_rate": round(wins / len(pts), 4) if pts else None,
+            "total_pnl": round(cum, 4),
+            "points": points,
+        })
+    channels_out.sort(key=lambda c: c["total_pnl"], reverse=True)
+
+    total_pnl = round(sum(c["total_pnl"] for c in channels_out), 4)
+    total_cnt = sum(c["settled_count"] for c in channels_out)
+    total_win = sum(c["win_count"] for c in channels_out)
+    return {
+        "channels": channels_out,
+        "total": {
+            "settled_count": total_cnt,
+            "total_pnl": total_pnl,
+            "win_rate": round(total_win / total_cnt, 4) if total_cnt else None,
+        },
     }
 
 

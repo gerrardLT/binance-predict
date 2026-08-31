@@ -677,10 +677,14 @@ class MultiLiveTrader:
 
     def set_channel(self, channel: str, enabled: bool | None = None,
                     amount_usdt: float | None = None,
-                    max_daily_orders: int | None = None) -> None:
+                    max_daily_orders: int | None = None,
+                    max_exec_price: float | None = None,
+                    reset_max_exec: bool = False) -> None:
         """运行时热调单通道（toggle 端点调用）。
 
         白名单/数值校验同启动配置（不靠自律靠拒改）；在途任务不受影响。
+        护栏（max_exec_price）：显式值 0.01~0.99 覆盖通道预设；reset_max_exec=True
+        清空自定义回落预设（两者同时传时 reset 优先——语义明确，不猜意图）。
         原子性：先校验全部参数再统一生效——任一非法则整体拒改，
         不会出现「enabled 已置位但金额校验失败」的半生效状态。
         持久化由端点在生效成功后调 persist_channel（本方法不碰 DB，保持同步原子）。
@@ -699,12 +703,22 @@ class MultiLiveTrader:
             raise ValueError(
                 f"多通道实盘：通道 {channel} 日限 {max_daily_orders} 超界"
                 f" [1, {MAX_DAILY_ORDERS_CAP}]")
+        if max_exec_price is not None and not reset_max_exec and not (
+                0.01 <= max_exec_price <= 0.99):
+            # 校验界与 parse_channel_config 的 JSON 覆盖段一致（0.01~0.99）
+            raise ValueError(
+                f"多通道实盘：通道 {channel} 护栏 {max_exec_price} 超界"
+                f" [0.01, 0.99]")
         if enabled is not None:
             cfg.enabled = bool(enabled)
         if amount_usdt is not None:
             cfg.amount_usdt = float(amount_usdt)
         if max_daily_orders is not None:
             cfg.max_daily_orders = int(max_daily_orders)
+        if reset_max_exec:
+            cfg.max_exec_price = None
+        elif max_exec_price is not None:
+            cfg.max_exec_price = float(max_exec_price)
 
     async def apply_db_overrides(self) -> list[str]:
         """启动分层最高层：从 live_channel_overrides 加载并覆盖 env 层配置。
@@ -723,7 +737,8 @@ class MultiLiveTrader:
                 self.set_channel(
                     row.channel, enabled=row.enabled,
                     amount_usdt=row.amount_usdt,
-                    max_daily_orders=row.max_daily_orders)
+                    max_daily_orders=row.max_daily_orders,
+                    max_exec_price=getattr(row, "max_exec_price", None))
             except ValueError as exc:
                 logger.warning("多通道实盘：DB 覆盖行非法已跳过 | {}", exc)
                 continue
@@ -749,6 +764,7 @@ class MultiLiveTrader:
             enabled=cfg.enabled,
             amount_usdt=cfg.amount_usdt,
             max_daily_orders=cfg.max_daily_orders,
+            max_exec_price=cfg.max_exec_price,
             updated_at=datetime.now(timezone.utc),
         )
         async with async_session_factory() as session:
@@ -792,6 +808,7 @@ class MultiLiveTrader:
             "max_daily_orders": cfg.max_daily_orders,
             "max_exec_price": resolve_max_exec(spec, cfg),
             "auto_max_exec": spec.auto_max_exec,
+            "custom_max_exec": cfg.max_exec_price is not None,
             "fire_total": cfg.fire_total,
             "fired_windows": sorted(cfg.fired)[-10:],
         }

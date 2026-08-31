@@ -1117,6 +1117,10 @@ class LiveChannelOverride(Base):
     max_daily_orders: Mapped[int] = mapped_column(
         Integer, nullable=False, comment="日单量上限（硬上限见 MAX_DAILY_ORDERS_CAP）"
     )
+    max_exec_price: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+        comment="执行价护栏自定义覆盖（NULL=回落通道预设 auto_max_exec）"
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(),
         comment="最后一次 toggle 生效时刻（配置变更审计）"

@@ -1024,7 +1024,8 @@ async def test_apply_db_overrides_applies_and_skips_bad(monkeypatch) -> None:
                      channels=["quote_contrarian_v1"])
     rows = [
         SimpleNamespace(channel="x4_v1", enabled=True,
-                        amount_usdt=1.5, max_daily_orders=50),
+                        amount_usdt=1.5, max_daily_orders=50,
+                        max_exec_price=0.55),
         SimpleNamespace(channel="ghost_channel", enabled=True,
                         amount_usdt=2.0, max_daily_orders=10),
         SimpleNamespace(channel="quote_contrarian_v1", enabled=False,
@@ -1038,6 +1039,7 @@ async def test_apply_db_overrides_applies_and_skips_bad(monkeypatch) -> None:
     assert t._configs["x4_v1"].enabled is True
     assert t._configs["x4_v1"].amount_usdt == 1.5
     assert t._configs["x4_v1"].max_daily_orders == 50
+    assert t._configs["x4_v1"].max_exec_price == 0.55    # 护栏自定义覆盖（DB 层）
     assert t._configs["quote_contrarian_v1"].enabled is False   # DB 胜过 env 层
     assert t._enabled_at_startup["quote_contrarian_v1"] is False
 
@@ -1048,13 +1050,15 @@ async def test_persist_channel_writes_snapshot(monkeypatch) -> None:
     t = _make_trader(monkeypatch, _FakeTrader())
     sess = _stub_override_db(monkeypatch, [])
 
-    t.set_channel("x4_v2", enabled=True, amount_usdt=3.0, max_daily_orders=7)
+    t.set_channel("x4_v2", enabled=True, amount_usdt=3.0, max_daily_orders=7,
+                  max_exec_price=0.52)
     await t.persist_channel("x4_v2")
 
     assert len(sess.merged) == 1
     row = sess.merged[0]
     assert row.channel == "x4_v2" and row.enabled is True
     assert row.amount_usdt == 3.0 and row.max_daily_orders == 7
+    assert row.max_exec_price == 0.52
     assert row.updated_at is not None
 
 
@@ -1080,6 +1084,114 @@ async def test_toggle_endpoint_persists(monkeypatch) -> None:
         ToggleLiveRequest(channel="x4_v1", enabled=True), _=None)
     assert "error" not in out
     assert persisted == ["x4_v1"]
+
+
+@pytest.mark.asyncio
+async def test_toggle_endpoint_max_exec_heat_tune(monkeypatch) -> None:
+    """toggle 端点护栏热调：设置生效并持久化；reset_max_exec=True 回落预设。"""
+    import binance_predict.main as m
+    from binance_predict.models.schemas import ToggleLiveRequest
+
+    t = _make_trader(monkeypatch, _FakeTrader(), channels=[])
+    monkeypatch.setattr(m, "multi_live_trader", t)
+
+    async def _persist(self, channel):
+        return None
+
+    async def _status_async(self):
+        return self.status()
+
+    monkeypatch.setattr(MultiLiveTrader, "persist_channel", _persist)
+    monkeypatch.setattr(MultiLiveTrader, "status_async", _status_async)
+
+    auto = t._specs["x4_v1"].auto_max_exec  # 0.45（预设值）
+    out = await m.live_toggle(
+        ToggleLiveRequest(channel="x4_v1", enabled=False,
+                          max_exec_price=0.58), _=None)
+    assert "error" not in out
+    assert t._configs["x4_v1"].max_exec_price == 0.58
+    by = {c["channel"]: c for c in out["status"]["channels"]}
+    assert by["x4_v1"]["max_exec_price"] == 0.58
+    assert by["x4_v1"]["custom_max_exec"] is True
+
+    out = await m.live_toggle(
+        ToggleLiveRequest(channel="x4_v1", enabled=False,
+                          reset_max_exec=True), _=None)
+    assert "error" not in out
+    assert t._configs["x4_v1"].max_exec_price is None     # 回落预设
+    by = {c["channel"]: c for c in out["status"]["channels"]}
+    assert by["x4_v1"]["max_exec_price"] == auto
+    assert by["x4_v1"]["custom_max_exec"] is False
+
+
+def test_set_channel_max_exec_bounds_atomic(monkeypatch) -> None:
+    """护栏热调校验：超界拒改（原子），enabled 不被半置位。"""
+    t = _make_trader(monkeypatch, _FakeTrader(), channels=[])
+    with pytest.raises(ValueError, match="超界"):
+        t.set_channel("x4_v1", enabled=True, max_exec_price=1.2)
+    assert t._configs["x4_v1"].enabled is False   # 校验失败整体拒改
+    with pytest.raises(ValueError, match="超界"):
+        t.set_channel("x4_v1", max_exec_price=0.001)
+    # 边界值合法：0.01 与 0.99
+    t.set_channel("x4_v1", max_exec_price=0.01)
+    assert t._configs["x4_v1"].max_exec_price == 0.01
+    t.set_channel("x4_v1", max_exec_price=0.99)
+    assert t._configs["x4_v1"].max_exec_price == 0.99
+
+
+# ============================================================
+# 组 11：盈亏趋势端点（GET /api/live/pnl-curve）
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_live_pnl_curve_endpoint(monkeypatch) -> None:
+    """pnl-curve：按通道分组累计 pnl；排除未结算/manual_test；
+    排序按总盈亏降序；执行器未装配时元数据回落注册表（enabled=False）。"""
+    import binance_predict.main as m
+
+    rows = [
+        # (signal_version, window_start, settled_at, win, pnl) 按 window_start 升序
+        ("quote_contrarian_v1", 1000,
+         datetime(2026, 8, 30, 10, 0, tzinfo=timezone.utc), True, 4.0),
+        ("scene_bull_exhaust", 1500, None, True, 1.5),
+        ("quote_contrarian_v1", 2000,
+         datetime(2026, 8, 30, 10, 5, tzinfo=timezone.utc), False, -2.0),
+    ]
+    _stub_select_db(monkeypatch, rows)
+    monkeypatch.setattr(m, "multi_live_trader", None)  # 元数据回落注册表
+
+    out = await m.live_pnl_curve(_=None, db=_SelectSession(rows))
+    assert out["total"]["settled_count"] == 3
+    assert out["total"]["total_pnl"] == 3.5
+    assert out["total"]["win_rate"] == round(2 / 3, 4)
+
+    by = {c["channel"]: c for c in out["channels"]}
+    # 排序：quote_contrarian_v1(+2.0) 在 scene_bull_exhaust(+1.5) 前
+    assert out["channels"][0]["channel"] == "quote_contrarian_v1"
+
+    q = by["quote_contrarian_v1"]
+    assert q["settled_count"] == 2 and q["win_count"] == 1
+    assert q["total_pnl"] == 2.0
+    assert [p["cum"] for p in q["points"]] == [4.0, 2.0]   # 逐单累计
+    assert q["points"][1]["n"] == 2
+    assert q["enabled"] is False   # 执行器未装配 → 回落注册表默认
+
+    s = by["scene_bull_exhaust"]
+    assert s["total_pnl"] == 1.5
+    assert s["points"][0]["t"] == 1500   # settled_at 缺失回落 window_start
+
+
+@pytest.mark.asyncio
+async def test_live_pnl_curve_endpoint_empty(monkeypatch) -> None:
+    """无已结算订单：channels 空列表，total 归零（不抛 500）。"""
+    import binance_predict.main as m
+
+    _stub_select_db(monkeypatch, [])
+    monkeypatch.setattr(m, "multi_live_trader", None)
+
+    out = await m.live_pnl_curve(_=None, db=_SelectSession([]))
+    assert out["channels"] == []
+    assert out["total"] == {"settled_count": 0, "total_pnl": 0, "win_rate": None}
 
 
 # ============================================================
