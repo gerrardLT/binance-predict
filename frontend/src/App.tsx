@@ -494,7 +494,10 @@ const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ amount_usdt }),
     }).then(r => r.json()),
-  postLiveChannel: (channel: string, enabled: boolean, amountUsdt?: number, maxDailyOrders?: number) =>
+  postLiveChannel: (
+    channel: string, enabled: boolean, amountUsdt?: number,
+    maxDailyOrders?: number, maxExecPrice?: number, resetMaxExec?: boolean,
+  ) =>
     authFetch('/api/live/toggle', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -502,9 +505,13 @@ const api = {
         channel, enabled,
         ...(amountUsdt != null ? { amount_usdt: amountUsdt } : {}),
         ...(maxDailyOrders != null ? { max_daily_orders: maxDailyOrders } : {}),
+        ...(maxExecPrice != null ? { max_exec_price: maxExecPrice } : {}),
+        ...(resetMaxExec ? { reset_max_exec: true } : {}),
       }),
     }).then(r => r.json()),
   getQuotePreview: () => authFetch('/api/prediction/quote-preview').then(r => r.json()),
+  // 盈利趋势（2026-08-31）：每实盘通道已结算订单累计盈亏曲线
+  getLivePnlCurve: () => authFetch('/api/live/pnl-curve').then(r => r.json()),
   postSyncBinance: () => authFetch('/api/trades/sync-binance', { method: 'POST' }).then(r => r.json()),
   // 奖金领取（2026-08-23）：可领查询 + batch-redeem
   getRedeemable: () => authFetch('/api/prediction/redeemable').then(r => r.json()),
@@ -1310,13 +1317,210 @@ function FundsFlowCard({ orders }: { orders: Record<string, unknown>[] }) {
   )
 }
 
-// 右侧抽屉（2026-08-28 从主布局移入；2026-08-29 改为双 tab：K 线对照 / 资金变化）：
-// LiveChartCard 常驻挂载保持 30s 轮询数据连续，抽屉仅控制可视；两个面板始终渲染、用 hidden 切换，
-// 避免切 tab 时 LiveChartCard 卸载导致采样中断。
+// ============================================================
+// 盈利趋势（2026-08-31）：每实盘通道已结算订单的累计盈亏曲线
+// 数据源 GET /api/live/pnl-curve（trade_orders 按通道分组逐单累计 pnl）
+// ============================================================
+
+interface PnlPoint { n: number; t: number; pnl: number; cum: number; win: boolean }
+interface PnlChannel {
+  channel: string
+  display_name: string
+  family: string | null
+  market_period: string | null
+  enabled: boolean
+  settled_count: number
+  win_count: number
+  win_rate: number | null
+  total_pnl: number
+  points: PnlPoint[]
+}
+interface PnlCurveData {
+  channels: PnlChannel[]
+  total: { settled_count: number; total_pnl: number; win_rate: number | null }
+}
+
+// 通道曲线色板（按 total_pnl 排序后的顺序取色，最多 12 通道）
+const PNL_COLORS = ['#2563eb', '#16a34a', '#dc2626', '#9333ea', '#ea580c',
+  '#0d9488', '#d946ef', '#6366f1', '#ca8a04', '#059669', '#e11d48', '#0284c7']
+
+// 曲线指标切换：数据点已含 pnl/win，胜率趋势 = 截至第 n 笔的滚动胜率（前端派生）
+type PnlMetric = 'cum' | 'rate' | 'pnl'
+const PNL_METRICS: { key: PnlMetric; label: string }[] = [
+  { key: 'cum', label: '累计盈亏' },
+  { key: 'rate', label: '胜率趋势' },
+  { key: 'pnl', label: '单笔盈亏' },
+]
+
+function PnlCurveCard() {
+  const [data, setData] = useState<PnlCurveData | null>(null)
+  const [onlyEnabled, setOnlyEnabled] = useState(false)
+  const [metric, setMetric] = useState<PnlMetric>('cum')
+  useEffect(() => {
+    const load = () => api.getLivePnlCurve().then(setData).catch(() => {})
+    load()
+    const timer = setInterval(load, 30000)
+    return () => clearInterval(timer)
+  }, [])
+
+  const allChans = data?.channels ?? []
+  const chans = allChans.filter(c => !onlyEnabled || c.enabled)
+  // 按笔序对齐：第 n 行 = 各通道第 n 笔已结算单的当前指标值（不足为 null，线段断开）
+  const maxLen = chans.reduce((m, c) => Math.max(m, c.points.length), 0)
+  const winSoFar: Record<string, number> = {}
+  for (const c of chans) winSoFar[c.display_name] = 0
+  const rows = Array.from({ length: maxLen }, (_, i) => {
+    const row: Record<string, number | null> = { n: i + 1 }
+    for (const c of chans) {
+      const p = c.points[i]
+      if (!p) { row[c.display_name] = null; continue }
+      if (p.win) winSoFar[c.display_name] += 1
+      row[c.display_name] = metric === 'rate'
+        ? Math.round((winSoFar[c.display_name] / (i + 1)) * 1000) / 10
+        : metric === 'pnl' ? p.pnl : p.cum
+    }
+    return row
+  })
+  const sumPnl = chans.reduce((s, c) => s + c.total_pnl, 0)
+  const sumCount = chans.reduce((s, c) => s + c.settled_count, 0)
+  const sumWin = chans.reduce((s, c) => s + c.win_count, 0)
+  const statBox = 'rounded-lg border border-gray-200 bg-gray-50/60 px-3 py-2'
+  const metricLabel = PNL_METRICS.find(m => m.key === metric)?.label ?? '累计盈亏'
+
+  return (
+    <Card title={`盈利趋势（每通道${metricLabel}）`}>
+      <div className="flex items-center justify-between mb-3 gap-2 flex-wrap">
+        <div className="flex items-center gap-1 flex-wrap">
+          {PNL_METRICS.map(mt => (
+            <button key={mt.key} onClick={() => setMetric(mt.key)}
+              className={`px-2 py-0.5 rounded-full text-[11px] border font-bold transition-colors ${metric === mt.key
+                ? 'bg-blue-600 text-white border-blue-600'
+                : 'bg-white text-gray-500 border-gray-300 hover:border-blue-400'}`}>
+              {mt.label}
+            </button>
+          ))}
+          <label className="ml-2 flex items-center gap-1.5 text-xs text-gray-600 cursor-pointer select-none">
+            <input type="checkbox" checked={onlyEnabled}
+              onChange={e => setOnlyEnabled(e.target.checked)}
+              className="accent-blue-600" />
+            仅当前开启实盘的通道
+          </label>
+        </div>
+        <span className="text-[10px] text-gray-400">
+          口径：已结算成交单（本地估算 pnl，赢=股数−成本，输=−投入）；胜率趋势=截至该笔的滚动胜率；每 30s 刷新
+        </span>
+      </div>
+      {allChans.length === 0 ? (
+        <p className="text-sm text-gray-400 py-6 text-center">
+          暂无已结算的实盘订单——开启通道实盘并等订单结算后生成曲线
+        </p>
+      ) : (
+        <>
+          <div className="flex flex-wrap gap-2 mb-3 text-xs">
+            <div className={statBox}>
+              <div className="text-gray-400 mb-0.5">累计盈亏（USDT）</div>
+              <div className={`text-base font-bold font-mono ${sumPnl >= 0 ? 'text-green-700' : 'text-red-600'}`}>
+                {sumPnl >= 0 ? '+' : ''}{sumPnl.toFixed(2)}
+              </div>
+            </div>
+            <div className={statBox}>
+              <div className="text-gray-400 mb-0.5">已结算单数</div>
+              <div className="text-base font-bold font-mono text-gray-800">{sumCount}</div>
+            </div>
+            <div className={statBox}>
+              <div className="text-gray-400 mb-0.5">总胜率</div>
+              <div className="text-base font-bold font-mono text-gray-800">
+                {sumCount > 0 ? `${((sumWin / sumCount) * 100).toFixed(0)}%` : '--'}
+                <span className="text-[10px] font-normal text-gray-400 ml-1">{sumWin}胜/{sumCount - sumWin}负</span>
+              </div>
+            </div>
+            <div className={statBox}>
+              <div className="text-gray-400 mb-0.5">有单通道</div>
+              <div className="text-base font-bold font-mono text-gray-800">
+                {chans.length}<span className="text-[10px] font-normal text-gray-400 ml-1">/ {allChans.length}</span>
+              </div>
+            </div>
+          </div>
+          {maxLen > 0 ? (
+            <ResponsiveContainer width="100%" height={260}>
+              <LineChart data={rows} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                <XAxis dataKey="n" tick={{ fontSize: 10 }} stroke="#9ca3af"
+                  label={{ value: '已结算单序号', position: 'insideBottomRight', offset: -2, fontSize: 10, fill: '#9ca3af' }} />
+                <YAxis tick={{ fontSize: 10 }} stroke="#9ca3af" width={52}
+                  domain={metric === 'rate' ? [0, 100] : undefined}
+                  tickFormatter={(v: number) => metric === 'rate' ? `${v}%` : v.toFixed(1)} />
+                <Tooltip
+                  contentStyle={{ fontSize: 12, borderRadius: 8, border: '1px solid #e5e7eb' }}
+                  formatter={(v) => metric === 'rate'
+                    ? [`${Number(v).toFixed(1)}%`, undefined]
+                    : [`${Number(v) >= 0 ? '+' : ''}${Number(v).toFixed(2)} USDT`, undefined]}
+                  labelFormatter={(n) => `第 ${n} 笔已结算单`} />
+                <Legend wrapperStyle={{ fontSize: 11 }} />
+                <ReferenceLine y={metric === 'rate' ? 50 : 0} stroke="#9ca3af" />
+                {chans.map((c, i) => (
+                  <Line key={c.channel} type="monotone" dataKey={c.display_name}
+                    stroke={PNL_COLORS[i % PNL_COLORS.length]}
+                    strokeWidth={2} dot={false} connectNulls isAnimationActive={false} />
+                ))}
+              </LineChart>
+            </ResponsiveContainer>
+          ) : (
+            <p className="text-sm text-gray-400 py-4 text-center">所选通道暂无已结算订单</p>
+          )}
+          <div className="overflow-x-auto max-h-52 overflow-y-auto mt-2">
+            <table className="w-full text-xs">
+              <thead className="sticky top-0 bg-white">
+                <tr className="text-left text-gray-500 border-b border-gray-100">
+                  <th className="py-1 pr-2">通道</th>
+                  <th className="py-1 pr-2">状态</th>
+                  <th className="py-1 pr-2 text-right">已结算</th>
+                  <th className="py-1 pr-2 text-right">胜率</th>
+                  <th className="py-1 pr-2 text-right">累计盈亏 (USDT)</th>
+                </tr>
+              </thead>
+              <tbody>
+                {chans.map(c => {
+                  const info = SIGNAL_INFO[c.channel]
+                  const color = PNL_COLORS[chans.findIndex(x => x.channel === c.channel) % PNL_COLORS.length]
+                  return (
+                    <tr key={c.channel} className="border-b border-gray-50">
+                      <td className="py-1 pr-2">
+                        <span className="inline-block w-2 h-2 rounded-full mr-1.5 shrink-0" style={{ background: color }} />
+                        <span className="text-gray-800">{info?.name ?? c.display_name}</span>
+                      </td>
+                      <td className="py-1 pr-2">
+                        <span className={`px-1.5 py-0.5 text-[10px] font-bold rounded border ${c.enabled ? 'bg-green-100 text-green-700 border-green-300' : 'bg-gray-100 text-gray-500 border-gray-200'}`}>
+                          {c.enabled ? '实盘中' : '已停火'}
+                        </span>
+                      </td>
+                      <td className="py-1 pr-2 text-right font-mono text-gray-600">{c.settled_count}</td>
+                      <td className="py-1 pr-2 text-right font-mono text-gray-600">
+                        {c.win_rate == null ? '--' : `${(c.win_rate * 100).toFixed(0)}%`}
+                      </td>
+                      <td className={`py-1 pr-2 text-right font-mono font-bold ${c.total_pnl >= 0 ? 'text-green-700' : 'text-red-600'}`}>
+                        {c.total_pnl >= 0 ? '+' : ''}{c.total_pnl.toFixed(2)}
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </Card>
+  )
+}
+
+// 右侧抽屉（2026-08-28 从主布局移入；2026-08-29 双 tab；2026-08-31 增至三 tab：
+// K 线对照 / 资金变化 / 盈利趋势）：
+// LiveChartCard 常驻挂载保持 30s 轮询数据连续，抽屉仅控制可视；各面板始终渲染、
+// 用 hidden 切换，避免切 tab 时 LiveChartCard 卸载导致采样中断。
 function ChartDrawer({ orders }: { orders: Record<string, unknown>[] }) {
   const [open, setOpen] = useState(false)
-  const [tab, setTab] = useState<'chart' | 'funds'>('chart')
-  const tabBtn = (t: 'chart' | 'funds', label: string) => (
+  const [tab, setTab] = useState<'chart' | 'funds' | 'pnl'>('chart')
+  const tabBtn = (t: 'chart' | 'funds' | 'pnl', label: string) => (
     <button
       onClick={() => setTab(t)}
       className={`px-3 py-1 text-xs font-semibold rounded-md border transition ${tab === t ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-gray-600 border-gray-300 hover:border-blue-400'}`}
@@ -1329,7 +1533,7 @@ function ChartDrawer({ orders }: { orders: Record<string, unknown>[] }) {
           onClick={() => setOpen(true)}
           className="fixed right-0 top-[62%] -translate-y-1/2 z-40 bg-blue-600 text-white text-xs font-bold px-2 py-3 rounded-l-lg shadow-lg hover:bg-blue-700 transition"
           style={{ writingMode: 'vertical-rl' }}
-          title="查看 K 线对照 / 资金变化"
+          title="查看 K 线对照 / 资金变化 / 盈利趋势"
         >
           📈 面板
         </button>
@@ -1342,12 +1546,14 @@ function ChartDrawer({ orders }: { orders: Record<string, unknown>[] }) {
           <div className="flex items-center gap-2">
             {tabBtn('chart', '📈 K 线对照')}
             {tabBtn('funds', '💰 资金变化')}
+            {tabBtn('pnl', '📊 盈利趋势')}
           </div>
           <button onClick={() => setOpen(false)} className="text-gray-400 hover:text-gray-700 text-lg leading-none px-1">✕</button>
         </div>
         <div className="flex-1 min-h-0 overflow-auto p-3">
           <div className={tab === 'chart' ? '' : 'hidden'}><LiveChartCard /></div>
           <div className={tab === 'funds' ? '' : 'hidden'}><FundsFlowCard orders={orders} /></div>
+          <div className={tab === 'pnl' ? '' : 'hidden'}><PnlCurveCard /></div>
         </div>
       </div>
     </>
@@ -1367,6 +1573,7 @@ interface LiveChannelStatus {
   max_daily_orders: number
   max_exec_price: number
   auto_max_exec: number
+  custom_max_exec: boolean
   fire_total: number
   fired_windows: number[]
   filled_today?: number
@@ -1389,6 +1596,8 @@ function LiveTradeTab() {
   const [togglingLive, setTogglingLive] = useState(false)
   // 通道金额热调草稿（key=channel；仅在用户输入时存在，提交后清除）
   const [amountDrafts, setAmountDrafts] = useState<Record<string, string>>({})
+  // 通道护栏热调草稿（key=channel；同金额模式，保存后清除）
+  const [guardDrafts, setGuardDrafts] = useState<Record<string, string>>({})
   // 可领取奖金（赢单 token → batch-redeem → USDT）
   const [redeemable, setRedeemable] = useState<Record<string, unknown> | null>(null)
   const [redeeming, setRedeeming] = useState(false)
@@ -1549,6 +1758,39 @@ function LiveTradeTab() {
         alert(`金额保存失败: ${String(res.error)}`)
       } else {
         setAmountDrafts(prev => {
+          const rest = { ...prev }
+          delete rest[ch.channel]
+          return rest
+        })
+      }
+      refresh()
+    } catch (e) {
+      alert(`请求失败: ${(e as Error).message}`)
+    } finally {
+      setTogglingLive(false)
+    }
+  }
+
+  const handleChannelGuard = async (ch: LiveChannelStatus, reset = false) => {
+    // 护栏热调：执行价上限（贴线弃单），校验同后端 0.01~0.99；
+    // reset=True 清空自定义回落通道预设值（预设=ChannelSpec.auto_max_exec）
+    let val = 0
+    if (!reset) {
+      val = parseFloat(guardDrafts[ch.channel] ?? '')
+      if (!Number.isFinite(val) || val < 0.01 || val > 0.99) {
+        alert('护栏仅允许 0.01~0.99（报价均价 ≥ 护栏即弃单，含贴线）')
+        return
+      }
+      if (val === ch.max_exec_price) return
+    } else if (!ch.custom_max_exec) return
+    setTogglingLive(true)
+    try {
+      const res = await api.postLiveChannel(
+        ch.channel, ch.enabled, undefined, undefined, reset ? undefined : val, reset)
+      if (res?.error) {
+        alert(`护栏保存失败: ${String(res.error)}`)
+      } else {
+        setGuardDrafts(prev => {
           const rest = { ...prev }
           delete rest[ch.channel]
           return rest
@@ -1738,8 +1980,33 @@ function LiveTradeTab() {
                       <span className="text-[10px] text-gray-400 font-mono shrink-0 hidden md:inline">{ch.channel}</span>
                       <HelpHint text={info?.desc ?? ch.display_name} />
                     </span>
-                    <span className="shrink-0 font-mono text-[10px] text-gray-500 hidden sm:inline" title="执行价护栏 / 今日成交/日限 / 累计开火">
-                      护栏{String(ch.max_exec_price)} · 今日{String(ch.filled_today ?? 0)}/{String(ch.max_daily_orders)} · 开火{String(ch.fire_total)}
+                    <span className="shrink-0 flex items-center gap-1">
+                      <span className="text-[10px] text-gray-500">护栏</span>
+                      <input
+                        type="number" min={0.01} max={0.99} step={0.01}
+                        value={guardDrafts[ch.channel] ?? String(ch.max_exec_price)}
+                        onChange={e => setGuardDrafts(prev => ({ ...prev, [ch.channel]: e.target.value }))}
+                        disabled={togglingLive}
+                        title={`执行价护栏（0.01~0.99，报价均价 ≥ 护栏即弃单含贴线；预设 ${String(ch.auto_max_exec)}）`}
+                        className="w-14 px-1 py-0.5 border border-gray-300 rounded font-mono text-[10px] text-gray-800 disabled:opacity-50"
+                      />
+                      <button
+                        onClick={() => handleChannelGuard(ch)}
+                        disabled={togglingLive || guardDrafts[ch.channel] == null || guardDrafts[ch.channel] === String(ch.max_exec_price)}
+                        className="px-1.5 py-0.5 rounded border border-blue-400 bg-white text-blue-700 font-semibold text-[10px] disabled:opacity-40"
+                        title="保存护栏热调（立即生效，持久化重启不丢）"
+                      >存</button>
+                      {ch.custom_max_exec && (
+                        <button
+                          onClick={() => handleChannelGuard(ch, true)}
+                          disabled={togglingLive}
+                          className="px-1 py-0.5 rounded border border-amber-400 bg-white text-amber-700 text-[10px] disabled:opacity-40"
+                          title={`已自定义覆盖，点击回落通道预设 ${String(ch.auto_max_exec)}`}
+                        >↺</button>
+                      )}
+                    </span>
+                    <span className="shrink-0 font-mono text-[10px] text-gray-500 hidden sm:inline" title="今日成交/日限 / 累计开火">
+                      今日{String(ch.filled_today ?? 0)}/{String(ch.max_daily_orders)} · 开火{String(ch.fire_total)}
                     </span>
                     <span className="shrink-0 flex items-center gap-1">
                       <input
@@ -1766,7 +2033,7 @@ function LiveTradeTab() {
                 )
               })}
               <p className="text-[10px] text-gray-400 pt-0.5">
-                金额输入后点「存」热调（立即生效）；开关各通道独立互不影响；重启回落 LIVE_CHANNELS_JSON 配置。5m 通道随窗触发，15m 场景通道次周期开盘入场。
+                金额/护栏输入后点「存」热调（立即生效，重启不丢）；护栏=报价均价上限（≥ 即弃单含贴线），「↺」回落通道预设；开关各通道独立互不影响。5m 通道随窗触发，15m 场景通道次周期开盘入场。
               </p>
             </div>
           )}
