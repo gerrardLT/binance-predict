@@ -64,6 +64,20 @@ v3 环境门禁版（2026-08-24 交替/延续归因落地，只加不改；v1/v2
     日高增量缓存与 v3b 分族（cache_key 隔离）：同窗两族触发时点不同，
     共缓存会互相污染 ≤quote_ts 过滤口径。纪律：纯影子，前向攒样本。
 
+v4 regime 门禁版（2026-08-31 Part 3 长周期回测落地，只加不改；v1~v3 冻结口径原样）：
+    quote_contrarian_v4 = v1 ∩ 触发时点过去 24h BTC 收益 ret24 ≤ −1.0%（含边界）。
+    依据（Predexon 真实订单簿 62 天，bid×官方 outcome，严格 ex-ante 口径——
+    orig 口径 closes[i] 未来函数已修正，量化见 output/predexon_bt_followup_*.md）：
+    down 段 wr 27.6% CI[23.6,31.9] EV+0.250（n=442，CI 下界过盈亏平衡线 21.9%），
+    up 段 +0.066 / range −0.009（EV≈0）——正边际集中在下跌周期；分月稳定
+    （07 +0.179 / 08 +0.355）。
+    ret24 数据源 btc_regime.regime_feed（5m K 线 60s TTL 缓存），严格 ex-ante
+    口径 closes[i−1]（触发时点所在 K 未收盘，其 close 是未来数据，不用）；
+    影子/实盘/回测三方同口径零漂移（ex-ante 修正量化见
+    output/predexon_bt_followup_*.md）。数据缺失 → 不落 v4（保守跳过，v1 不受影响）。
+    纪律：纯影子前向攒样本 1~2 周，核对真实触发频率（预期 ≈6.7/天）与 ret24
+    分布、成交价 spread 与回测一致后才谈实盘接入。
+
 字段语义映射（复用 misalignment_signals 表）：
     end_pct → 触发时刻 DOWN 报价（X4 语义"触发窗末 UP%"的扩展，注释在案）；
     target_window_start → window_start（本窗即目标窗，无次窗）；
@@ -72,7 +86,6 @@ v3 环境门禁版（2026-08-24 交替/延续归因落地，只加不改；v1/v2
 from __future__ import annotations
 
 import asyncio
-import time
 from datetime import datetime, timezone
 
 from loguru import logger
@@ -80,6 +93,7 @@ from sqlalchemy import select as sa_select
 
 from binance_predict.db.engine import async_session_factory
 from binance_predict.db.models import MisalignmentSignal, SentimentWindow
+from .btc_regime import regime_feed
 from .signal_notify import (
     fire_signal_email, fmt_bjt, has_live_filled_order, is_fresh_signal, is_live_enabled,
 )
@@ -138,6 +152,14 @@ V3_ENV_GUARDS: dict[str, bool] = {
     "quote_contrarian_v3b": True,
 }
 V3_DD_THRESHOLD = -0.30   # 距日高回落门槛（%，dd ≤ 阈值即过，含边界）
+
+# ---- v4 regime 门禁（2026-08-31 Part 3 长周期回测落地，只加不改；v1~v3 冻结口径原样）----
+# v4 -> (base 规则, ret24 阈值%)：触发时点过去 24h BTC 收益 ≤ 阈值（含边界）才落表。
+# ret24 数据源 btc_regime.regime_feed（5m K 线，ex-ante closes[i−1] 口径）；
+# 数据缺失 → 不落 v4（保守跳过，v1 不受影响）。阈值 −1.0 为先验设定非扫描值。
+REGIME_GUARDS: dict[str, tuple[str, float]] = {
+    "quote_contrarian_v4": ("quote_contrarian_v1", -1.0),
+}
 
 
 def _pass_hour_guard(version: str, start_ms: int) -> bool:
@@ -277,6 +299,15 @@ def _pass_dd_guard(version: str, w: SentimentWindow, quote_ts: int,
     return dd_pct <= threshold
 
 
+def _pass_regime_guard(threshold_pct: float, ret24: float | None) -> bool:
+    """v4 regime 门禁（纯函数）：触发时点 ret24% ≤ 阈值（含边界）。
+
+    ret24 由调用方预查（btc_regime.regime_feed，影子/实盘同源）；
+    缺失（None）→ False（保守不落表，与 v2 价格门禁 None 语义等效）。
+    """
+    return ret24 is not None and ret24 * 100.0 <= threshold_pct
+
+
 def _ev_at_entry(win: bool, price: float) -> float:
     """单注 EV（回测口径，无溢价）：赢 0.98/q−1 / 输 −1。"""
     return (FEE_RET / price - 1.0) if win else -1.0
@@ -314,7 +345,8 @@ class QuoteEdgeDetector:
         self._task = asyncio.create_task(self._loop(), name="quote_edge_detector")
         logger.info(
             "报价 edge 影子检测器启动 | v1 规则 {} + v2 价格门禁版 {} + v3 环境门禁版 {}"
-            " + 时段门禁 {} + 深夜距日高门禁 {} | EV=0.98/q−1（费 2%，影子模式只记录不下注）",
+            " + 时段门禁 {} + 深夜距日高门禁 {} + regime 门禁 {}"
+            " | EV=0.98/q−1（费 2%，影子模式只记录不下注）",
             {k: f"t∈[{v[0]:.0f},{v[1]:.0f})s q∈[{v[2]:.2f},{v[3]:.2f})"
              for k, v in QUOTE_EDGE_RULES.items()},
             {k: f"{m}{p:+.2f}%" for k, (_b, m, p) in V2_PRICE_GUARDS.items()},
@@ -322,6 +354,7 @@ class QuoteEdgeDetector:
              for k, dd in V3_ENV_GUARDS.items()},
             {k: f"北京{lo}~{hi}时" for k, (lo, hi) in HOUR_GUARDS.items()},
             {k: f"{b}+距日高≥{abs(p):.2f}%(含边界)" for k, (b, p) in LN_DD_GUARDS.items()},
+            {k: f"{b}+ret24≤{p:+.1f}%(含边界)" for k, (b, p) in REGIME_GUARDS.items()},
         )
 
     async def stop(self) -> None:
@@ -428,6 +461,8 @@ class QuoteEdgeDetector:
             rules[v3] = QUOTE_EDGE_RULES["quote_contrarian_v1"]  # v3 基于 contrarian 区间
         for ln in LN_DD_GUARDS:
             rules[ln] = QUOTE_EDGE_RULES[LN_DD_GUARDS[ln][0]]  # 深夜门禁 v2 基于 v1 区间
+        for v4 in REGIME_GUARDS:
+            rules[v4] = QUOTE_EDGE_RULES[REGIME_GUARDS[v4][0]]  # v4 基于 base 区间
 
         # per-rule 独立 commit（CodeReview Low#4）：单规则落表失败不回滚、
         # 不影响另一规则；trigger_count 仅在 commit 成功后自增。
@@ -473,6 +508,17 @@ class QuoteEdgeDetector:
                             ln_high_fetched = True
                         if not _pass_dd_guard(version, w, quote_ts, ln_high):
                             continue  # 门禁未过/数据缺失 → v2 不落（v1 不受影响）
+                    if version in REGIME_GUARDS:
+                        # v4 regime 门禁：触发时点 ret24 ≤ 阈值（K 线 ex-ante 口径，
+                        # 60s TTL 缓存共享）；拉取失败/样本不足 → None → 不落 v4。
+                        r24 = await regime_feed.ret24_at(quote_ts)
+                        if not _pass_regime_guard(REGIME_GUARDS[version][1], r24):
+                            if r24 is None:
+                                # 缺失可观测：前向样本期需区分「未触发」与「数据缺失跳过」
+                                logger.warning(
+                                    "报价 edge：{} ret24 缺失，本窗不落 | 窗口 {} | feed={}",
+                                    version, w.start_time, regime_feed.status())
+                            continue  # 门禁未过/数据缺失 → v4 不落（v1 不受影响）
                     dup = await session.execute(
                         sa_select(MisalignmentSignal.id).where(
                             MisalignmentSignal.version == version,

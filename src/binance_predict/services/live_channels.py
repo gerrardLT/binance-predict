@@ -39,6 +39,7 @@ class ChannelSpec:
     display_name: str
     v2_guard: str | None = None   # quote_edge v2 门禁模式：min_drop | max_rise | None
     v3_env: bool = False          # quote_edge v3 环境门禁（前窗DOWN [+距日高回落]，异步核验）
+    regime_gate: bool = False     # quote_edge v4 regime 门禁（ret24≤阈值，K 线异步核验）
 
 
 def _qe_guard(version: str) -> float:
@@ -75,6 +76,16 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     "quote_contrarian_v3b": ChannelSpec(
         "quote_contrarian_v3b", "quote_edge", "5m", "DOWN", _qe_guard("quote_contrarian_v1"),
         "报价反向·日高回落版", v2_guard="max_rise", v3_env=True,
+    ),
+    # v4 regime 门禁版：contrarian v1 区间 + ret24 ≤ −1.0% 门禁（触发时点过去
+    # 24h BTC 收益，5m K 线 ex-ante 口径，阈值引用 quote_edge_detector.
+    # REGIME_GUARDS，实时核验走 btc_regime.regime_feed 异步缓存，见
+    # MultiLiveTrader._check_regime）。回测依据（Predexon 真实订单簿 62 天，
+    # 严格 ex-ante 口径）：down 段 wr 27.6% CI[23.6,31.9] EV+0.250（CI 下界
+    # 过盈亏平衡线 21.9%），up/range 段 EV≈0。
+    "quote_contrarian_v4": ChannelSpec(
+        "quote_contrarian_v4", "quote_edge", "5m", "DOWN", _qe_guard("quote_contrarian_v1"),
+        "报价反向·下跌周期版", regime_gate=True,
     ),
     # --- x4 族（影子 PENDING → 次窗 +150s 决策点，入场价历史偏低）---
     "x4_v1": ChannelSpec("x4_v1", "x4", "5m", "DOWN", 0.45, "情绪错位（收阳押次窗DOWN）"),

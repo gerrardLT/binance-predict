@@ -41,6 +41,10 @@ from binance_predict.services.live_channels import (
 )
 from binance_predict.services.multi_live_trader import MultiLiveTrader
 from binance_predict.services.prediction_trading import BinancePredictionTrader
+from binance_predict.services.quote_edge_detector import (
+    QUOTE_EDGE_RULES,
+    REGIME_GUARDS,
+)
 from binance_predict.services.trade_settler import TradeSettler
 
 WINDOW_START = 1_000_000_000_000           # 5m 窗口起点（ms）
@@ -144,12 +148,12 @@ def _stub_select_db(monkeypatch, rows: list) -> None:
 # ============================================================
 
 def test_parse_defaults_all_off(monkeypatch) -> None:
-    """默认：全 12 通道 OFF、金额/日限取全局默认（用户拍板 2U / 100 单）。"""
+    """默认：全 13 通道 OFF、金额/日限取全局默认（用户拍板 2U / 100 单）。"""
     monkeypatch.setattr(settings, "live_default_amount_usdt", 2.0)
     monkeypatch.setattr(settings, "live_default_max_daily_orders", 100)
     monkeypatch.setattr(settings, "live_channels_json", "")
     cfgs = parse_channel_config()
-    assert len(cfgs) == 12
+    assert len(cfgs) == 13
     assert all(not c.enabled for c in cfgs.values())
     assert all(c.amount_usdt == 2.0 for c in cfgs.values())
     assert all(c.max_daily_orders == 100 for c in cfgs.values())
@@ -224,11 +228,12 @@ def test_parse_non_int_daily_rejected(monkeypatch) -> None:
 
 
 def test_channels_registry_shape() -> None:
-    """注册表形状：12 通道全集、市场周期/方向/护栏与计划表逐项对齐。"""
+    """注册表形状：13 通道全集、市场周期/方向/护栏与计划表逐项对齐。"""
     assert set(LIVE_CHANNELS) == {
         "quote_momentum_v1", "quote_contrarian_v1",
         "quote_momentum_v2", "quote_contrarian_v2",
         "quote_contrarian_v3a", "quote_contrarian_v3b",
+        "quote_contrarian_v4",
         "x4_v1", "x4_v2",
         "scene_bull_exhaust", "scene_bull_exhaust_confirm",
         "scene_bear_exhaust", "scene_momentum_fade",
@@ -583,6 +588,128 @@ async def test_check_v3_env_branches(monkeypatch) -> None:
 
 
 # ============================================================
+# 组 3.5：v4 regime 门禁（ret24 K 线核验，影子/实盘同口径，2026-08-31）
+# ============================================================
+
+V4_VERSION = "quote_contrarian_v4"
+
+
+def test_v4_channel_registration() -> None:
+    """v4 通道注册完整性：LIVE_CHANNELS/REGIME_GUARDS/QUOTE_EDGE_RULES 三方对齐。"""
+    spec = LIVE_CHANNELS[V4_VERSION]
+    assert spec.family == "quote_edge" and spec.regime_gate is True
+    assert spec.v2_guard is None and spec.v3_env is False   # v4 不叠加 v2/v3 门禁
+    base, thr = REGIME_GUARDS[V4_VERSION]
+    assert base == "quote_contrarian_v1"                    # 触发区间引用 v1 冻结口径
+    assert QUOTE_EDGE_RULES[base][2:] == (0.15, 0.25)
+    assert thr == -1.0                                      # ret24 阈值（含边界）
+    assert spec.auto_max_exec == round(0.25 + 0.03, 4)      # 护栏同 v1 推导
+
+
+@pytest.mark.asyncio
+async def test_v4_regime_gate_fires_on_pass(monkeypatch) -> None:
+    """v4：门禁通过 → 派生核验任务并下单；同窗后续采样不重复派生。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=[V4_VERSION])
+
+    async def _ok(self, channel, quote_ts):
+        return True, "ok"
+
+    monkeypatch.setattr(MultiLiveTrader, "_check_regime", _ok)
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 50_000, 0.20)\
+        == [V4_VERSION]
+    await _drain(t)
+    assert [c["signal_version"] for c in fake.calls] == [V4_VERSION]
+    # 同窗后续采样（fired 占位已生效）不再派生
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 55_000, 0.21) == []
+    await _drain(t)
+    assert len(fake.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_v4_regime_gate_rejects(monkeypatch) -> None:
+    """v4：门禁未过 → 同步预检已过、核验弃单；同窗不再重试。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=[V4_VERSION])
+
+    async def _reject(self, channel, quote_ts):
+        return False, "regime_reject"
+
+    monkeypatch.setattr(MultiLiveTrader, "_check_regime", _reject)
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 50_000, 0.20)\
+        == [V4_VERSION]                 # 同步预检已过，派生核验任务
+    await _drain(t)
+    assert fake.calls == []             # 核验未过 → 弃单
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 55_000, 0.21) == []
+
+
+@pytest.mark.asyncio
+async def test_v4_regime_gate_missing_ret24_retry_once(monkeypatch) -> None:
+    """v4：ret24 缺失 → 延迟重查一次；仍缺失 → 弃单；重查通过 → 下单。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=[V4_VERSION])
+    calls = {"n": 0}
+
+    async def _missing(self, channel, quote_ts):
+        calls["n"] += 1
+        return False, "ret24_missing"
+
+    monkeypatch.setattr(MultiLiveTrader, "_check_regime", _missing)
+    monkeypatch.setattr(milt, "REGIME_RETRY_DELAY_S", 0.0)  # 免等待
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 50_000, 0.20)\
+        == [V4_VERSION]
+    await _drain(t)
+    assert calls["n"] == 2              # 首查 + 延迟重查一次
+    assert fake.calls == []
+
+    # 重查通过场景：首次 K 线拉取失败，重试后恢复
+    fake2 = _FakeTrader()
+    t2 = _make_trader(monkeypatch, fake2, channels=[V4_VERSION])
+    attempts = {"n": 0}
+
+    async def _flaky(self, channel, quote_ts):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            return False, "ret24_missing"
+        return True, "ok"
+
+    monkeypatch.setattr(MultiLiveTrader, "_check_regime", _flaky)
+    monkeypatch.setattr(milt, "REGIME_RETRY_DELAY_S", 0.0)
+    assert t2.check(WINDOW_START, WINDOW_END, WINDOW_START + 50_000, 0.20)\
+        == [V4_VERSION]
+    await _drain(t2)
+    assert attempts["n"] == 2
+    assert [c["signal_version"] for c in fake2.calls] == [V4_VERSION]
+
+
+@pytest.mark.asyncio
+async def test_check_regime_branches(monkeypatch) -> None:
+    """_check_regime 分支：贴线含边界（恰 −1.0% 过 / −0.9% 拒）；
+    ret24 缺失保守拒；未注册 regime 门禁的通道拒绝。"""
+    t = _make_trader(monkeypatch, _FakeTrader())
+
+    class _Feed:
+        def __init__(self, v):
+            self._v = v
+
+        async def ret24_at(self, ts_ms):
+            return self._v
+
+    feed = _Feed(-0.010)                # 恰 −1.0% → 含边界过
+    monkeypatch.setattr(milt, "regime_feed", feed)
+    assert await t._check_regime(V4_VERSION, 123) == (True, "ok")
+    feed._v = -0.009                    # −0.9% → 拒
+    assert await t._check_regime(V4_VERSION, 123)\
+        == (False, "regime_reject")
+    feed._v = None                      # K 线缺失 → 保守拒
+    assert await t._check_regime(V4_VERSION, 123)\
+        == (False, "ret24_missing")
+    feed._v = -0.012
+    assert await t._check_regime("quote_contrarian_v3a", 123)\
+        == (False, "no_regime_guard")   # 未注册 regime 门禁的通道
+
+
+# ============================================================
 # 组 4：_fire 路径（日限/防重/失败容错/余额钩子）
 # ============================================================
 
@@ -900,14 +1027,14 @@ def test_set_channel_daily_over_cap_rejected(monkeypatch) -> None:
 
 
 def test_status_shape(monkeypatch) -> None:
-    """status：12 通道全量、enabled_any/defaults/amount_cap、单通道字段。"""
+    """status：13 通道全量、enabled_any/defaults/amount_cap、单通道字段。"""
     t = _make_trader(monkeypatch, _FakeTrader(), channels=["quote_contrarian_v1"])
     s = t.status()
     assert s["enabled_any"] is True
     assert s["amount_cap"] == 50
     assert s["defaults"]["amount_usdt"] == 2.0
     assert s["defaults"]["max_daily_orders"] == 100
-    assert len(s["channels"]) == 12
+    assert len(s["channels"]) == 13
     by = {c["channel"]: c for c in s["channels"]}
     c = by["quote_contrarian_v1"]
     assert c["enabled"] is True and c["enabled_at_startup"] is True

@@ -1,6 +1,6 @@
 """多通道实盘执行器（MultiLiveTrader，2026-08-24 取代单版本 QuoteEdgeLiveTrader）。
 
-12 通道（通道注册表见 live_channels.py）可同时开启，每通道独立
+13 通道（通道注册表见 live_channels.py）可同时开启，每通道独立
 金额/日限/护栏/开关；通道 ID 与影子信号版本名对齐（订单 signal_version
 直接用通道名，实盘 vs 影子对账天然一致）。三族触发机制并存：
 
@@ -53,6 +53,7 @@ from binance_predict.db.models import (
     TradeOrderModel,
 )
 
+from .btc_regime import regime_feed
 from .live_channels import (
     LIVE_CHANNELS,
     MAX_DAILY_ORDERS_CAP,
@@ -64,8 +65,10 @@ from .live_channels import (
 from .misalignment_detector import DECISION_T_SEC
 from .quote_edge_detector import (
     QUOTE_EDGE_RULES,
+    REGIME_GUARDS,
     V2_PRICE_GUARDS,
     V3_ENV_GUARDS,
+    _pass_regime_guard,
     _pass_v3_env_guard,
     _prev_window_outcome,
 )
@@ -77,6 +80,7 @@ X4_POLL_INTERVAL_S = 30.0           # x4 PENDING 信号轮询间隔
 X4_DECISION_TOLERANCE_MS = 30_000   # 决策点错过容差（超时不追单）
 X4_RECENT_WINDOW_MS = 10 * 60 * 1000  # 只看近期 PENDING（更早的已无意义）
 V3_PREV_RETRY_DELAY_S = 30.0        # 前窗未归档延迟重查（归档在边界+15s，相位抖动余量）
+REGIME_RETRY_DELAY_S = 30.0         # v4 ret24 K 线拉取失败延迟重查（重试后窗内仍可下单）
 MARKET_WARMUP_INTERVAL_S = 60.0     # 市场列表后台预热间隔（未来 15m 周期预缓存，2026-08-30）
 
 
@@ -137,12 +141,14 @@ class MultiLiveTrader:
                 continue
             if window_start_ms in cfg.fired:
                 continue
-            # v2 用 base(v1) 冻结区间；v3 基于 contrarian v1 区间
-            # （V2_PRICE_GUARDS/V3_ENV_GUARDS 映射，勿复制数值）
+            # v2 用 base(v1) 冻结区间；v3 基于 contrarian v1 区间；
+            # v4 基于 REGIME_GUARDS base 区间（映射，勿复制数值）
             if ch in V2_PRICE_GUARDS:
                 rule_key = V2_PRICE_GUARDS[ch][0]
             elif spec.v3_env:
                 rule_key = "quote_contrarian_v1"
+            elif ch in REGIME_GUARDS:
+                rule_key = REGIME_GUARDS[ch][0]
             else:
                 rule_key = ch
             t_lo, t_hi, q_lo, q_hi = QUOTE_EDGE_RULES[rule_key]
@@ -166,6 +172,15 @@ class MultiLiveTrader:
                         ch, window_start_ms, window_end_ms, t_rel,
                         float(down_price), btc_price, int(ts_ms),
                         window_btc_curve),
+                    name=f"live_qe_{ch}_{window_start_ms}",
+                )
+            elif spec.regime_gate:
+                # v4 regime 门禁需异步 K 线核验（ret24，影子/实盘同口径）：
+                # 核验通过才进 _fire_quote_edge，未过/缺失 → 弃单
+                task = asyncio.create_task(
+                    self._verify_regime_and_fire(
+                        ch, window_start_ms, window_end_ms, t_rel,
+                        float(down_price), int(ts_ms)),
                     name=f"live_qe_{ch}_{window_start_ms}",
                 )
             else:
@@ -234,6 +249,51 @@ class MultiLiveTrader:
         passed, _reason = await self._check_v3_env(
             channel, window_start_ms, quote_ts, btc_price, window_btc_curve)
         return passed
+
+    async def _verify_regime_and_fire(self, channel: str, window_start: int,
+                                      window_end: int, t_rel: float,
+                                      down_price: float, quote_ts: int) -> None:
+        """v4 regime 门禁异步核验 → 通过才走常规 quote_edge 下单链路。
+
+        ret24 取触发时点（K 线 ex-ante 口径，btc_regime.regime_feed 60s TTL
+        缓存，与影子同源同口径）；数据缺失（拉取失败/样本不足）→ 延迟重查
+        一次（瞬时 REST 故障重试后窗内仍可下单）；仍缺失或未过阈值 → 仅日志
+        弃单（fired 占位已生效，本窗不再重试）；任何异常只告警不抛
+        （采样循环派生任务的共同契约）。
+        """
+        try:
+            passed, reason = await self._check_regime(channel, quote_ts)
+            if not passed and reason == "ret24_missing" and not self._stopped:
+                await asyncio.sleep(REGIME_RETRY_DELAY_S)
+                if not self._stopped:
+                    passed, reason = await self._check_regime(channel, quote_ts)
+            if not passed:
+                logger.info(
+                    "多通道实盘：{} regime 门禁未过，弃单 | 窗口 {} | 原因={}",
+                    channel, _fmt_win(window_start), reason)
+                return
+            await self._fire_quote_edge(channel, window_start, window_end,
+                                        t_rel, down_price)
+        except Exception as exc:
+            logger.warning("多通道实盘：{} regime 核验任务异常 | 窗口 {} | {}",
+                           channel, _fmt_win(window_start), exc)
+
+    async def _check_regime(self, channel: str, quote_ts: int) -> tuple[bool, str]:
+        """v4 regime 门禁实时版：触发时点 ret24 ≤ 阈值（含边界，影子同口径）。
+
+        返回 (passed, reason)：ret24_missing / no_regime_guard /
+        regime_reject / ok。阈值引用 REGIME_GUARDS（勿复制数值）；ret24
+        缺失 → 不触发（与影子「门禁数据缺失不落表」同保守口径）。
+        """
+        guard = REGIME_GUARDS.get(channel)
+        if guard is None:
+            return False, "no_regime_guard"
+        ret24 = await regime_feed.ret24_at(quote_ts)
+        if ret24 is None:
+            return False, "ret24_missing"
+        if not _pass_regime_guard(guard[1], ret24):
+            return False, "regime_reject"
+        return True, "ok"
 
     async def _check_v3_env(self, channel: str, window_start_ms: int,
                             quote_ts: int, btc_price: float | None,

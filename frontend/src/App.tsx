@@ -611,6 +611,10 @@ const SIGNAL_INFO: Record<string, { name: string; kind: '实盘' | '影子' | '�
     name: '报价反向·日高回落版', kind: '影子', liveOk: true,
     desc: 'v3a + 触发时点 BTC 距当日高点回落 ≥0.30%（含边界，震荡日冲高更易衰竭）。真实回测 n=65 胜率 33.8%、EV +0.646（单笔 EV 最优）。实盘已解锁（日高异步 DB 核验，缺失弃单），通道护栏 0.28。',
   },
+  quote_contrarian_v4: {
+    name: '报价反向·下跌周期版', kind: '影子', liveOk: true,
+    desc: 'contrarian v1 区间 + regime 门禁：触发时点过去 24h BTC 收益 ≤ −1.0%（含边界，只在下跌周期开火）。62 天真实订单簿回测（严格 ex-ante 口径）：down 段 n=442 胜率 27.6%、EV +0.250（CI 下界过盈亏平衡线），up/range 段 EV≈0——正边际集中在下跌周期。5m K 线严格 ex-ante 口径（影子/实盘同源，缺失保守弃单），每窗至多一单，通道护栏 0.28。',
+  },
   x4_v1: {
     name: '情绪错位（收阳押次窗DOWN）', kind: '影子', liveOk: true,
     desc: '本窗收阳但 15m 市场收尾情绪 ≤40 的错位 → 次窗 +150s 决策点押 DOWN（回测合并胜率 63.5%、EV +0.254）。实盘已解锁：PENDING 信号轮询→决策点下单，护栏 0.45，错过决策点不追单。',

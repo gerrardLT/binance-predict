@@ -795,3 +795,84 @@ async def test_day_high_cache_family_isolation() -> None:
     s_ln = _EnvSession(day_high_curves=[[{"t": ts - 50_000, "v": 101.0}]],
                        expect_day_start=86_400_000, expect_max_start=int(w.start_time))
     assert await d._day_high_btc(s_ln, w, ts, cache_key="ln") == 101.0
+
+
+# ============================================================
+# v4 regime 门禁（ret24 K 线，影子/实盘同口径，2026-08-31）
+# ============================================================
+
+V4_VERSION = "quote_contrarian_v4"
+
+
+def _feed(monkeypatch, value) -> None:
+    """ret24 桩：regime_feed.ret24_at 恒返回 value（None 模拟 K 线缺失）。"""
+
+    class _Feed:
+        async def ret24_at(self, ts_ms):
+            return value
+
+    monkeypatch.setattr(qed, "regime_feed", _Feed())
+
+
+def _v4_window(start_ms=1_000_000_000):
+    """contrarian v1 触发窗：t=50s q=0.20，结算 DOWN（v4 与 v1 同区间双落用）。"""
+    return SentimentWindow(
+        start_time=start_ms, end_time=start_ms + 300_000,
+        actual_return=-0.001, outcome="DOWN",
+        curve_down_price=[{"t": start_ms + 50_000, "v": 0.20}],
+    )
+
+
+def test_pass_regime_guard_pure() -> None:
+    """纯函数钉死：None 拒 / 阈值含边界（×100 百分比换算）。"""
+    assert qed._pass_regime_guard(-1.0, -0.012) is True
+    assert qed._pass_regime_guard(-1.0, -0.010) is True   # 恰等于阈值 → 过
+    assert qed._pass_regime_guard(-1.0, -0.009) is False
+    assert qed._pass_regime_guard(-1.0, None) is False    # K 线缺失保守拒
+
+
+@pytest.mark.asyncio
+async def test_v4_regime_guard_pass_dual_insert(monkeypatch) -> None:
+    """ret24=−1.2%（≤−1.0%）→ v1+v4 双落，v4 字段与 v1 同源同口径。"""
+    d, session = _make_detector(monkeypatch)
+    _feed(monkeypatch, -0.012)
+    await d._process_window(_v4_window())
+    versions = sorted(s.version for s in session.added)
+    assert versions == ["quote_contrarian_v1", V4_VERSION]
+    v4 = next(s for s in session.added if s.version == V4_VERSION)
+    assert v4.entry_down_price == 0.20 and v4.end_pct == 0.20
+    assert v4.win is True and v4.status == "SETTLED"
+    assert v4.ev_at_entry == pytest.approx(0.98 / 0.20 - 1.0)
+    assert v4.direction == "DOWN" and v4.target_window_start == 1_000_000_000
+
+
+@pytest.mark.asyncio
+async def test_v4_regime_guard_boundary_inclusive(monkeypatch) -> None:
+    """贴线：ret24 恰 −1.0% → 过；−0.9% → 拒（v1 不受影响）。"""
+    d, session = _make_detector(monkeypatch)
+    _feed(monkeypatch, -0.010)
+    await d._process_window(_v4_window())
+    assert sorted(s.version for s in session.added) == \
+        ["quote_contrarian_v1", V4_VERSION]
+    d2, s2 = _make_detector(monkeypatch)
+    _feed(monkeypatch, -0.009)
+    await d2._process_window(_v4_window())
+    assert [s.version for s in s2.added] == ["quote_contrarian_v1"]
+
+
+@pytest.mark.asyncio
+async def test_v4_regime_guard_missing_data_only_v1(monkeypatch) -> None:
+    """K 线缺失（ret24=None）→ v4 保守不落，v1 照常。"""
+    d, session = _make_detector(monkeypatch)
+    _feed(monkeypatch, None)
+    await d._process_window(_v4_window())
+    assert [s.version for s in session.added] == ["quote_contrarian_v1"]
+
+
+@pytest.mark.asyncio
+async def test_v4_regime_guard_up_reject(monkeypatch) -> None:
+    """上涨周期（ret24=+0.8%）→ v4 拒，只落 v1（门禁语义反向验证）。"""
+    d, session = _make_detector(monkeypatch)
+    _feed(monkeypatch, 0.008)
+    await d._process_window(_v4_window())
+    assert [s.version for s in session.added] == ["quote_contrarian_v1"]
