@@ -314,6 +314,10 @@ def test_fetch_history_refuses_frozen_paths():
 def test_config_bool_atoms_match_engine_namespace():
     """池漂移守卫：build_namespace 的 bool 列集合必须与冻结 config 完全一致。"""
     import local_naked_k_combo_engine as E
+    import local_naked_k_prepare as prep
+    if not (os.path.exists(os.path.join(ROOT, "output", "klines_5m_2160d.csv"))
+            or os.path.exists(prep.CSV_5M)):
+        pytest.skip("离线 5m K 线产物不存在（池漂移守卫需真实数据，跳过）")
     missing = [k for k in ("a", "b") if k in ()]
     assert not missing
     ns_bool = E.namespace_bool_keys()
