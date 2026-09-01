@@ -15,7 +15,7 @@ import pytest
 
 from binance_predict.backtest.stats import ev, variance_ratio
 from binance_predict.discovery import (
-    Klines, bh_fdr, build_feature_matrix, build_targets, make_atoms,
+    Klines, aggregate_to, bh_fdr, build_feature_matrix, build_targets, make_atoms,
     merge_r3, run_block_ci, run_combos, run_l1, run_oos, write_outputs,
 )
 from binance_predict.discovery.hypotheses import DEFAULTS
@@ -74,6 +74,40 @@ def test_no_lookahead_in_features():
         a, b = fm1.cols[name][:m], fm2.cols[name][:m]
         eq = (a == b) | (np.isnan(a.astype(float)) & np.isnan(b.astype(float)))
         assert eq.all(), f"特征 {name} 泄漏未来信息"
+
+
+# ---------------- 高周期输入守卫（1h/4h 自聚合防护） ----------------
+
+def test_feature_matrix_htf_input_no_crash():
+    """1h/4h 输入时多周期共振自聚合无意义：不得抛异常，自共振列填空语义。"""
+    kl5 = synth_klines()
+    for bar_ms in (3_600_000, 14_400_000):
+        klh = aggregate_to(kl5, bar_ms)
+        fm = build_feature_matrix(klh, bar_ms)
+        n = len(klh)
+        for tf_ms, tag in ((3_600_000, "1h"), (14_400_000, "4h")):
+            assert len(fm.cols[f"align_{tag}"]) == n
+            if tf_ms <= bar_ms:  # 自共振/降周期无意义 → 全 False/0
+                assert not fm.cols[f"align_{tag}"].any()
+                assert (fm.cols[f"slot_in_{tag}"] == 0).all()
+
+
+def test_align_and_slot_unchanged_for_5m():
+    """5m 输入下 align/slot 列口径与守卫前一致（回归）。"""
+    kl = synth_klines()
+    fm = build_feature_matrix(kl, BAR_MS)
+    t = kl.t
+    # slot_in_4h 口径：(t // bar_ms) % 48
+    assert (fm.cols["slot_in_4h"] == ((t // BAR_MS) % 48).astype(np.int16)).all()
+    assert (fm.cols["slot_in_1h"] == ((t // BAR_MS) % 12).astype(np.int16)).all()
+    # align_1h 与手工聚合对照（末根已收盘的 1h 方向）
+    kl1h = aggregate_to(kl, 3_600_000)
+    hdir = np.sign(kl1h.c - kl1h.o)
+    j = np.searchsorted(kl1h.t, t - 3_600_000, side="right") - 1
+    ok = j >= 0
+    hd = np.where(ok, hdir[np.clip(j, 0, len(kl1h) - 1)], np.nan)
+    expect = np.where(ok, np.sign(kl.c - kl.o) * hd > 0, False)
+    assert (fm.cols["align_1h"] == expect).all()
 
 
 # ---------------- 统计口径回归 ----------------

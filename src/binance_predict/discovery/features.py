@@ -405,7 +405,13 @@ def build_feature_matrix(kl: Klines, bar_ms: int, k5: Klines | None = None) -> F
     fm.add("shock_dir", "extreme", np.sign(ret1[np.clip(last_shock_idx, 0, N - 1)]) * np.isfinite(since))
 
     # ---- 发散批：多周期共振（1h/4h 最后收盘方向与当前根同向）----
+    # 守卫：输入周期 >= 目标周期（如 1h/4h 输入）时，自聚合无意义且 aggregate_to 会抛
+    # ValueError（n_sub<=1），此时 align 语义为空，直接填 False/0 跳过；
+    # slot 列顺序保持与既有产物一致（4h 在前）
     for tf_ms, tag in ((3_600_000, "1h"), (14_400_000, "4h")):
+        if tf_ms <= bar_ms:
+            fm.add(f"align_{tag}", "multiscale", np.zeros(N, dtype=bool))
+            continue
         htf = aggregate_to(kl, tf_ms)
         if len(htf) > 1:
             hdir = np.sign(htf.c - htf.o)
@@ -415,8 +421,11 @@ def build_feature_matrix(kl: Klines, bar_ms: int, k5: Klines | None = None) -> F
             fm.add(f"align_{tag}", "multiscale", np.where(ok, dir_ * hd > 0, False))
         else:
             fm.add(f"align_{tag}", "multiscale", np.zeros(N, dtype=bool))
-    fm.add("slot_in_4h", "multiscale", ((t // bar_ms) % (14_400_000 // bar_ms)).astype(np.int16))
-    fm.add("slot_in_1h", "multiscale", ((t // bar_ms) % (3_600_000 // bar_ms)).astype(np.int16))
+    for tf_ms, tag in ((14_400_000, "4h"), (3_600_000, "1h")):
+        if tf_ms <= bar_ms:
+            fm.add(f"slot_in_{tag}", "multiscale", np.zeros(N, dtype=np.int16))
+            continue
+        fm.add(f"slot_in_{tag}", "multiscale", ((t // bar_ms) % (tf_ms // bar_ms)).astype(np.int16))
 
     # ---- 发散批：周期路径（15m 周期内 3 根 5m 形态）----
     if k5 is not None and len(k5) >= 3:
