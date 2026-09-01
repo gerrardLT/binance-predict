@@ -32,7 +32,7 @@ v2 门禁（2026-09-01 切片分析后验假设，与 v1 并行双行落库）�
     ② 非低波：ATR / 前 24h ATR 中位数 ≥ 0.8（窗口有限值须 >20；低波样本 25%）。
     720d 冻结：门禁后触发 78 / 触价 29，触价收跌 69.0%（后验切片，非预注册，
     影子期前向验证决定是否保留）。入场/结算/放弃状态机与 v1 完全一致。
-    审计锚点：.pytest_tmp/hm_slice_followup.py + hm_v2_freeze_counts.py。
+    审计锚点：scripts/hm_slice_followup_720d.py + scripts/hm_v2_freeze_counts_720d.py。
 
 影子纪律：只记录不下注、不注册 LIVE_CHANNELS、不进 X4_VERSIONS，新表
 pattern_shadow_signals 不被任何下单代码引用（物理隔离）。
@@ -166,7 +166,7 @@ def detect_weak_hm(kl: Klines, atr: np.ndarray) -> np.ndarray:
 def v2_gate_mask(kl: Klines, atr: np.ndarray) -> np.ndarray:
     """v2 门禁（向量化）：非下跌段 ∧ 非低波；历史不足一律不通过。
 
-    与 .pytest_tmp/hm_slice_followup.py 口径逐字一致：
+    与 scripts/hm_slice_followup_720d.py 口径逐字一致：
     ret24 = c[i]/c[i−96] − 1 > −0.01；atr_ratio = atr[i]/median(atr[i−96:i]) ≥ 0.8，
     中位数窗口内有限值须 >20 否则视为不可判（不通过）。
     """

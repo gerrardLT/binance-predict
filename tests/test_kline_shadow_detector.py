@@ -34,9 +34,12 @@ COND_B = ("range_pos_prior_5 <= -0.0467509994 AND "
           "efficiency_5 >= 0.861468132 AND path3_all_down == True")
 
 # 冻结注册表命中计数（output/kline_discovery_15m_720d_v2/discovery_registry.csv）
+# 2026-09-01 重冻结：720d K 线产物窗口滑动重生成，三段边界随 n 平移，计数按
+# 当前窗口重放复核（重放脚本 .pytest_tmp/krev_refreeze_counts.py）；性能基准
+# （胜率 64.2%/63.4%）仍锚定原发现注册表，不随窗口滑动重算。
 REGISTRY_COUNTS = {
-    "fd191c44fb5c36": (381, 132, 137),  # KREV-A：发现/验证/holdout
-    "5c5e4c78ab4c3f": (378, 130, 134),  # KREV-B
+    "fd191c44fb5c36": (384, 130, 133),  # KREV-A：发现/验证/holdout
+    "5c5e4c78ab4c3f": (382, 128, 130),  # KREV-B
 }
 
 
