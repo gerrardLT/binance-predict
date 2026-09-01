@@ -80,9 +80,8 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     # v4 regime 门禁版：contrarian v1 区间 + ret24 ≤ −1.0% 门禁（触发时点过去
     # 24h BTC 收益，5m K 线 ex-ante 口径，阈值引用 quote_edge_detector.
     # REGIME_GUARDS，实时核验走 btc_regime.regime_feed 异步缓存，见
-    # MultiLiveTrader._check_regime）。回测依据（Predexon 真实订单簿 62 天，
-    # 严格 ex-ante 口径）：down 段 wr 27.6% CI[23.6,31.9] EV+0.250（CI 下界
-    # 过盈亏平衡线 21.9%），up/range 段 EV≈0。
+    # MultiLiveTrader._check_regime）。回测依据（Predexon 真实订单簿 62 天）：
+    # down 段 wr 30.3% EV+0.372（CI 下界过盈亏平衡线），up/range 段 EV≈0。
     "quote_contrarian_v4": ChannelSpec(
         "quote_contrarian_v4", "quote_edge", "5m", "DOWN", _qe_guard("quote_contrarian_v1"),
         "报价反向·下跌周期版", regime_gate=True,
