@@ -4211,6 +4211,7 @@ const SHADOW_META: Record<string, { label: string; color: string }> = {
   krev_a_v1: { label: 'KREV-A 反转→UP', color: '#9467bd' },
   krev_b_v1: { label: 'KREV-B 反转→UP', color: '#e377c2' },
   hm_touch_down_v1: { label: 'HM 上吊线反弹→DOWN', color: '#8c564b' },
+  hm_touch_down_v2: { label: 'HM 上吊线反弹v2→DOWN', color: '#bcbd22' },
 }
 const SCENE_META: Record<string, { label: string; color: string }> = {
   bull_exhaust: { label: 'S1 多头耗尽→DOWN', color: '#1f77b4' },
@@ -4227,6 +4228,7 @@ const ANALYTICS_EXTRA_DESC: Record<string, string> = {
   krev_a_v1: 'K 线反转 A：5m K 线反转形态（看跌衰竭形态）→ 押 UP 的影子信号，仅记录不下单。',
   krev_b_v1: 'K 线反转 B：5m K 线反转形态变体（下影线反转）→ 押 UP 的影子信号，仅记录不下单。',
   hm_touch_down_v1: 'HM 上吊线反弹入场：弱收盘上吊线（15m 小实体+深下影+贴 20 根高位+CLV≤0.75）→ 次 15m 周期内 10 分钟里若先反弹触及开盘价+0.25×ATR，按触及时刻真实报价记录押 DOWN（影子，不下单）。先破 −0.25×ATR、迟到触及或未触及均放弃，仅触及样本进胜率统计。720d 回测触价收跌率 58.7% vs 市场隐含 47.1%（n=46，覆盖率~36%），探索性发现，影子期即前向验证。',
+  hm_touch_down_v2: 'HM 上吊线反弹 v2：v1 基础上叠加触发时点门禁——排除下跌段（过去 24h 跌≥1%）与低波环境（ATR 低于近 24h 中位数 80%）。720d 切片分析发现这两类样本负边际（下跌段 41.7% / 低波 25%），门禁后触发 78、触价 29、收跌率 69.0%。属后验切片假设（非预注册），与 v1 并行双行采集，影子期前向验证决定是否保留。',
   legacy: 'pattern_type 为空的历史信号：胜负按 side 映射（high→DOWN 赢 / low→UP 赢），用于对齐早期统计口径。',
 }
 const signalDescFor = (kind: 'scene' | 'shadow', key: string): string => {

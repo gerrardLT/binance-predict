@@ -2999,6 +2999,10 @@ SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     # HM 上吊线反弹入场族（2026-09-01）：基准为 720d 探索性回测（x=0.25 触及格），
     # 只钉胜率；EV 基准留 None（回测基准=市场隐含代理，与逐触价影子报价口径不直比）
     "hm_touch_down_v1": (0.587, None, "HM上吊线反弹入场: 弱收盘上吊线→次15m周期反弹触及+0.25×ATR→押收跌（720d n=46 触价口径收跌58.7% vs 隐含47.1%，覆盖率~36%，探索性发现待前向验证）"),
+    # HM v2（2026-09-01 切片分析后验假设）：v1+非下跌段∧非低波门禁；基准为后验切片数，
+    # 非预注册，影子期前向验证决定是否保留（审计锚点：下跌段41.7%/低波25%负边际 →
+    # 门禁后 720d 触发78/触价29/收跌69.0%，冻结数硬闸门见 tests/test_hm_shadow_detector.py）
+    "hm_touch_down_v2": (0.690, None, "HM上吊线反弹v2: v1+非下跌段∧非低波门禁（720d后验切片 门禁后触发78/触价29 收跌69.0%；下跌段与低波样本负边际被排除，待前向验证）"),
 }
 # 周期切分点：08-19 00:00 UTC（三根大阳起点）；< 为震荡期（大涨前），≥ 为大涨期
 PUMP_TS_MS = int(datetime(2026, 8, 19, tzinfo=timezone.utc).timestamp() * 1000)
@@ -3140,6 +3144,7 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
         "late_night_contrarian_v2",  # 深夜门禁 v2（纯影子，2026-08-27：v1+距日高回落≥0.30%）
         "krev_a_v1", "krev_b_v1",  # K 线反转族（纯影子，2026-08-28：新表 kline_shadow_signals）
         "hm_touch_down_v1",  # HM 上吊线反弹入场（纯影子，2026-09-01：新表 pattern_shadow_signals）
+        "hm_touch_down_v2",  # HM v2：v1+非下跌段∧非低波门禁（纯影子，2026-09-01 后验切片）
     ]
     versions += sorted({s.version for s in sh_rows} - set(versions))
     shadow = {}

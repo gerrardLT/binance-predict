@@ -1,4 +1,4 @@
-"""弱收盘上吊线反弹入场影子检测器（hm_touch_down_v1）：窗内等价位触发 → 押 15m 收跌。
+"""弱收盘上吊线反弹入场影子检测器（hm_touch_down_v1 / v2）：窗内等价位触发 → 押 15m 收跌。
 
 冻结规则（预注册口径，源自 720d 探索研究，审计锚点
 scripts/hm_touch_entry_research_720d.py）：
@@ -26,6 +26,14 @@ fetch_kline_open("15m", target_start) 回读）：
 覆盖率 ~36%（127 次信号仅 ~46 次等到入场点）。注意：这是从 15 个探索性格子
 中挑出的（精确二项 p≈0.06），前向验证正是影子期的目的。
 
+v2 门禁（2026-09-01 切片分析后验假设，与 v1 并行双行落库）：
+    触发时点（形态根收盘）额外要求：
+    ① 非下跌段：ret24 = c[i]/c[i−96] − 1 > −1.0%（下跌段样本 41.7% < 基线，负边际）；
+    ② 非低波：ATR / 前 24h ATR 中位数 ≥ 0.8（窗口有限值须 >20；低波样本 25%）。
+    720d 冻结：门禁后触发 78 / 触价 29，触价收跌 69.0%（后验切片，非预注册，
+    影子期前向验证决定是否保留）。入场/结算/放弃状态机与 v1 完全一致。
+    审计锚点：.pytest_tmp/hm_slice_followup.py + hm_v2_freeze_counts.py。
+
 影子纪律：只记录不下注、不注册 LIVE_CHANNELS、不进 X4_VERSIONS，新表
 pattern_shadow_signals 不被任何下单代码引用（物理隔离）。
 """
@@ -47,11 +55,13 @@ from binance_predict.discovery.features import atr_series
 from binance_predict.services import clock_sync
 
 VERSION = "hm_touch_down_v1"
+VERSION2 = "hm_touch_down_v2"
+ALL_VERSIONS = (VERSION, VERSION2)  # 入场/裁决/结算双版本同步（v2 = v1 ∩ 门禁）
 BAR_MS_15M = 900_000
 BAR_MS_1M = 60_000
 ATR_WINDOW = 20                 # ATR20：前 20 根 range% 均值（与 atr_series 默认 w 一致）
 POLL_INTERVAL = 60.0            # 收盘轮询间隔（秒）
-WARMUP_BARS = 40                # 15m 历史根数（20 前置 + 12 回补余量）
+WARMUP_BARS = 120               # 15m 历史根数（v2 门禁需 96 根回看 + 12 回补余量）
 BACKSCAN_BARS = 12              # 冷启动/追赶回补根数（3 小时）
 PENDING_EXPIRE_MS = 4 * 3_600_000  # 目标根起点后 4h 仍未结算 → EXPIRED（兜底）
 
@@ -64,6 +74,11 @@ OPEN_RETRY_S = 5.0              # 目标周期开盘价回读重试间隔（秒�
 QUOTE_MAX_AGE_MS = 20_000       # TOUCHED 报价快照可接受的最大龄（tracker 15s 采样）
 REPLAY_1M_LIMIT = 60            # 重启重建最多回拉 60 根 1m（更早窗口 → RESTART_GAP）
 CLV_MAX = 0.75                  # 弱收盘判据
+
+# ---- v2 门禁参数（2026-09-01 切片分析冻结，勿动）----
+V2_RET24_MIN = -0.01            # 非下跌段：过去 24h 涨幅 > −1.0%
+V2_ATR_RATIO_MIN = 0.8          # 非低波：ATR / 前 24h ATR 中位数 ≥ 0.8
+V2_REGIME_WINDOW = 96           # 24h = 96 根 15m
 
 RULE_TEXT = (
     "hm_touch_down_v1 预注册冻结规则（720d 探索研究，2026-09 冻结）："
@@ -78,6 +93,16 @@ RULE_TEXT = (
     "重启 1m 重建，不确定标 RESTART_GAP 弃，不回灌。"
     "结算仅 TOUCHED：目标根 close<open = win；平盘 NOISE/EXPIRED。"
     "参考基准：触及收跌率 58.7% vs 隐含 47.1%（720d n=46），覆盖率 ~36%。"
+)
+
+RULE_TEXT_V2 = (
+    "hm_touch_down_v2 冻结规则（2026-09-01 切片分析后验假设，与 v1 并行双行落库）："
+    "v1 全部触发与入场规则之外，触发时点额外门禁："
+    "① 非下跌段：ret24 = close/close[−24h] − 1 > −1.0%；"
+    "② 非低波：ATR20 / 前 24h ATR 中位数 ≥ 0.8（窗口有限值 >20）。"
+    "720d 冻结：门禁后触发 78 / 触价 29，触价收跌 69.0%（20/29）——"
+    "后验切片非预注册，影子期前向验证决定是否保留。"
+    "入场/结算/放弃状态机与 v1 完全一致（同锚点同障碍同裁决）。"
 )
 
 
@@ -138,6 +163,34 @@ def detect_weak_hm(kl: Klines, atr: np.ndarray) -> np.ndarray:
     return shape & pos & np.isfinite(atr_s) & weak & kl.cont
 
 
+def v2_gate_mask(kl: Klines, atr: np.ndarray) -> np.ndarray:
+    """v2 门禁（向量化）：非下跌段 ∧ 非低波；历史不足一律不通过。
+
+    与 .pytest_tmp/hm_slice_followup.py 口径逐字一致：
+    ret24 = c[i]/c[i−96] − 1 > −0.01；atr_ratio = atr[i]/median(atr[i−96:i]) ≥ 0.8，
+    中位数窗口内有限值须 >20 否则视为不可判（不通过）。
+    """
+    n = len(kl.c)
+    m = np.zeros(n, dtype=bool)
+    if n <= V2_REGIME_WINDOW:
+        return m
+    ret24 = np.full(n, np.nan)
+    ret24[V2_REGIME_WINDOW:] = kl.c[V2_REGIME_WINDOW:] / kl.c[:-V2_REGIME_WINDOW] - 1
+    # median(atr[i−96:i])：滑窗行 k = atr[k:k+96] → med[k+96]（窗口不含本根）
+    rows = sliding_window_view(atr, V2_REGIME_WINDOW)[: n - V2_REGIME_WINDOW]
+    fin = np.isfinite(rows).sum(axis=1)
+    med = np.full(n, np.nan)
+    good = fin > 20
+    if good.any():
+        med[V2_REGIME_WINDOW:][good] = np.nanmedian(rows[good], axis=1)
+    ratio = np.full(n, np.nan)
+    ok = np.isfinite(atr) & np.isfinite(med) & (med > 0)
+    ratio[ok] = atr[ok] / med[ok]
+    m[V2_REGIME_WINDOW:] = ((ret24[V2_REGIME_WINDOW:] > V2_RET24_MIN)
+                            & (ratio[V2_REGIME_WINDOW:] >= V2_ATR_RATIO_MIN))
+    return m
+
+
 def entry_decision(mid: float, up_level: float, dn_level: float, t_rel_s: float) -> str:
     """单样本入场裁决（纯函数）。
 
@@ -196,9 +249,10 @@ class HmShadowDetector:
             logger.warning("HM 影子：冷启动回补失败（忽略，循环内自愈）| {}", exc)
         self._task = asyncio.create_task(self._loop(), name="hm_shadow_detector")
         logger.info(
-            "HM 上吊线反弹影子检测器启动 | {} | 预注册冻结规则（720d n=46 触价收跌 "
-            "58.7% vs 隐含 47.1%，覆盖率 ~36%）| 频率 ~5 天 1 触发（影子模式：只记录不下注）",
-            VERSION,
+            "HM 上吊线反弹影子检测器启动 | {} + {}（非下跌段∧非低波门禁，720d 冻结 78 触发/"
+            "29 触价/69.0%）| 预注册基准 720d n=46 触价收跌 58.7% vs 隐含 47.1% | "
+            "频率 ~5 天 1 触发（影子模式：只记录不下注）",
+            VERSION, VERSION2,
         )
 
     async def stop(self) -> None:
@@ -253,6 +307,7 @@ class HmShadowDetector:
         kl = _to_klines(closed_15m, BAR_MS_15M)
         atr = atr_series(kl)
         mask = detect_weak_hm(kl, atr)
+        gate = v2_gate_mask(kl, atr)
         clv = clv_series(kl)
         if self._last_evaluated_bar is None:
             first_idx = max(0, len(closed_15m) - BACKSCAN_BARS)  # 冷启动：回补最近 12 根
@@ -273,6 +328,12 @@ class HmShadowDetector:
                 if await self._record_signal(session, closed_15m[i], float(atr[i]), float(clv[i])):
                     added += 1
                     recorded.append(closed_15m[i])
+                    # v2 = v1 ∩ 门禁：门禁通过时同触发再落一行（同状态机同步裁决）
+                    if bool(gate[i]):
+                        await self._record_signal(
+                            session, closed_15m[i], float(atr[i]), float(clv[i]),
+                            version=VERSION2, rule_text=RULE_TEXT_V2,
+                        )
             if added:
                 await session.commit()
                 self._trigger_count += added
@@ -283,20 +344,21 @@ class HmShadowDetector:
         for bar in recorded:
             self._spawn_watcher(int(bar["open_time"]), int(bar["open_time"]) + BAR_MS_15M)
 
-    async def _record_signal(self, session, bar: dict, atr_val: float, clv_val: float) -> bool:
+    async def _record_signal(self, session, bar: dict, atr_val: float, clv_val: float,
+                             version: str = VERSION, rule_text: str = RULE_TEXT) -> bool:
         """幂等落 PENDING：唯一约束 (version, signal_bar_start) + 先查后插。"""
         start_ms = int(bar["open_time"])
         exists = (await session.execute(
             sa_select(PatternShadowSignal.id).where(
-                PatternShadowSignal.version == VERSION,
+                PatternShadowSignal.version == version,
                 PatternShadowSignal.signal_bar_start == start_ms,
             )
         )).scalar_one_or_none()
         if exists is not None:
             return False
         session.add(PatternShadowSignal(
-            version=VERSION,
-            rule_text=RULE_TEXT,
+            version=version,
+            rule_text=rule_text,
             signal_bar_start=start_ms,
             signal_bar_end=start_ms + BAR_MS_15M,
             target_bar_start=start_ms + BAR_MS_15M,
@@ -439,7 +501,7 @@ class HmShadowDetector:
     async def _patch_levels(self, signal_bar_start: int, o: float, up: float, dn: float) -> None:
         async with async_session_factory() as session:
             await session.execute(sa_update(PatternShadowSignal).where(
-                PatternShadowSignal.version == VERSION,
+                PatternShadowSignal.version.in_(ALL_VERSIONS),
                 PatternShadowSignal.signal_bar_start == signal_bar_start,
                 PatternShadowSignal.status == "PENDING",
             ).values(target_open=o, up_level=up, dn_level=dn))
@@ -459,7 +521,7 @@ class HmShadowDetector:
                 quote = float(q["down_price"])
         async with async_session_factory() as session:
             await session.execute(sa_update(PatternShadowSignal).where(
-                PatternShadowSignal.version == VERSION,
+                PatternShadowSignal.version.in_(ALL_VERSIONS),
                 PatternShadowSignal.signal_bar_start == signal_bar_start,
                 PatternShadowSignal.status == "PENDING",
             ).values(entry_state=state, touch_ts=touch_ts, touch_price=touch_price,

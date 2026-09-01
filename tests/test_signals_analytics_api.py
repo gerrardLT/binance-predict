@@ -256,7 +256,7 @@ async def test_analytics_empty_db() -> None:
         "x4_v2", "quote_momentum_v2", "quote_contrarian_v2",
         "quote_contrarian_v3a", "quote_contrarian_v3b", "quote_contrarian_v4",
         "late_night_contrarian_v1", "late_night_contrarian_v2",
-        "krev_a_v1", "krev_b_v1", "hm_touch_down_v1"}
+        "krev_a_v1", "krev_b_v1", "hm_touch_down_v1", "hm_touch_down_v2"}
     for v, blk in out["shadow"].items():
         assert blk["summary"]["n"] == 0
         assert blk["summary"]["win_rate"] is None
@@ -286,6 +286,10 @@ async def test_analytics_empty_db() -> None:
     hm = out["shadow"]["hm_touch_down_v1"]["summary"]
     assert hm["bench_winrate"] == 0.587 and hm["bench_ev"] is None
     assert hm["desc"].startswith("HM上吊线反弹入场")
+    # HM v2：后验切片基准 0.690（非预注册，影子期前向验证）
+    hm2 = out["shadow"]["hm_touch_down_v2"]["summary"]
+    assert hm2["bench_winrate"] == 0.690 and hm2["bench_ev"] is None
+    assert hm2["desc"].startswith("HM上吊线反弹v2")
     assert out["scene"] == {}
     assert out["regime"]["phases"] == {}
     assert out["regime"]["by_version"] == {}

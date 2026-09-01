@@ -22,12 +22,15 @@ from binance_predict.services.hm_shadow_detector import (
     ENTRY_X,
     HmShadowDetector,
     RULE_TEXT,
+    RULE_TEXT_V2,
     VERSION,
+    VERSION2,
     _to_klines,
     atr_for_target,
     clv_series,
     detect_weak_hm,
     entry_decision,
+    v2_gate_mask,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -66,10 +69,39 @@ def test_720d_replay_trigger_count(kl720) -> None:
     assert len(i2) == 127
 
 
+def test_720d_replay_v2_gate_count(kl720) -> None:
+    """硬闸门：v1 触发 ∩ v2 门禁（非下跌段∧非低波）计数 == 冻结数 78。
+
+    冻结口径（.pytest_tmp/hm_v2_freeze_counts.py，2026-09-01）：ret24>−1% ∧
+    ATR/前 24h ATR 中位数≥0.8 → 127 触发中 78 个通过（触价 29，收跌 69.0%）。
+    同时验证向量化门禁与切片脚本循环口径在真实数据上逐位一致。
+    """
+    atr = atr_series(kl720)
+    idx = np.flatnonzero(detect_weak_hm(kl720, atr) & v2_gate_mask(kl720, atr))
+    assert len(idx) == 78, f"v2 门禁后计数 {len(idx)} != 冻结数 78（口径漂移）"
+    # 交叉验证：切片脚本的循环口径（中位数窗口有限值 >20）与向量化逐位一致
+    n = len(kl720)
+    c, W = kl720.c, hsd.V2_REGIME_WINDOW
+    med_loop = np.full(n, np.nan)
+    for i in range(W, n):
+        w = atr[i - W:i]
+        w = w[np.isfinite(w)]
+        if len(w) > 20:
+            med_loop[i] = np.median(w)
+    ret24 = np.full(n, np.nan)
+    ret24[W:] = c[W:] / c[:-W] - 1
+    gate_loop = np.zeros(n, dtype=bool)
+    fin = np.isfinite(ret24) & np.isfinite(med_loop) & (med_loop > 0) & np.isfinite(atr)
+    gate_loop[fin] = ((ret24[fin] > hsd.V2_RET24_MIN)
+                      & (atr[fin] / med_loop[fin] >= hsd.V2_ATR_RATIO_MIN))
+    assert bool((gate_loop != v2_gate_mask(kl720, atr)).any()) is False
+
+
 def test_short_window_fidelity(kl720) -> None:
-    """硬闸门：短窗（40 根）判定与全量矩阵逐根一致（实时侧每轮只拉 40 根）。"""
+    """硬闸门：短窗（120 根）触发与 v2 门禁判定与全量矩阵逐根一致。"""
     atr = atr_series(kl720)
     mask = detect_weak_hm(kl720, atr)
+    gate = v2_gate_mask(kl720, atr)
     W = hsd.WARMUP_BARS
     rows = [{"open_time": int(kl720.t[i]), "open": float(kl720.o[i]),
              "high": float(kl720.h[i]), "low": float(kl720.l[i]),
@@ -78,6 +110,11 @@ def test_short_window_fidelity(kl720) -> None:
     kl_short = _to_klines(rows, BAR_MS_15M)
     m_short = detect_weak_hm(kl_short, atr_series(kl_short))
     assert int((m_short != mask[-W:]).sum()) == 0, "短窗判定与全量不一致"
+    # v2 门禁只对末 BACKSCAN_BARS 根保真：短窗内更早索引的 24h 中位数窗口被短窗
+    # 边界截断，数学上不可比；实时/回补只评估末 12 根，末 12 根的中位数窗口恰在窗内。
+    B = hsd.BACKSCAN_BARS
+    g_short = v2_gate_mask(kl_short, atr_series(kl_short))
+    assert int((g_short[-B:] != gate[-B:]).sum()) == 0, "末 12 根 v2 门禁与全量不一致"
 
 
 def test_atr_for_target_matches_atr_series(kl720) -> None:
@@ -174,6 +211,77 @@ def test_gap_before_signal_no_trigger() -> None:
     kl, atr = _kl(rows)
     assert bool(kl.cont[-1]) is False
     assert bool(detect_weak_hm(kl, atr)[-1]) is False
+
+
+# ============================================================
+# v2 门禁：合成边界（非下跌段 ∧ 非低波）
+# ============================================================
+
+def test_v2_gate_flat_history_passes() -> None:
+    """121 根平盘基底：ret24=0 > −1% ∧ ATR比=1.0 ≥ 0.8 → 通过。"""
+    rows = _hm_rows(n_base=121)
+    kl, atr = _kl(rows)
+    assert bool(v2_gate_mask(kl, atr)[-1]) is True
+
+
+def test_v2_gate_downtrend_blocked() -> None:
+    """过去 24h 跌 >1%（末根对 96 根前收盘 −1.5%）→ 下跌段拦截。"""
+    rows = _hm_rows(n_base=121)
+    rows[24]["close"] = 101.5  # 末根下标 120；120−96=24 → ret24 ≈ −1.48%
+    kl, atr = _kl(rows)
+    assert bool(v2_gate_mask(kl, atr)[-1]) is False
+
+
+def test_v2_gate_low_vol_blocked() -> None:
+    """近段波动压缩（末 30 根 range 降为 1/10）→ ATR比 <0.8 拦截。"""
+    rows = _hm_rows(n_base=121)
+    for r in rows[-30:]:
+        r["high"], r["low"] = r["open"] + 0.002, r["open"] - 0.002
+    kl, atr = _kl(rows)
+    assert bool(v2_gate_mask(kl, atr)[-1]) is False
+
+
+def test_v2_gate_insufficient_history_blocked() -> None:
+    """历史 ≤96 根：24h 回看不足 → 一律不通过（保守）。"""
+    rows = _hm_rows(n_base=96)
+    kl, atr = _kl(rows)
+    assert bool(v2_gate_mask(kl, atr).any()) is False
+
+
+@pytest.mark.asyncio
+async def test_evaluate_new_bars_dual_rows_when_gate_passes(monkeypatch) -> None:
+    """形态触发 ∩ 门禁通过 → 同信号根双行落库（v1 基准 + v2 过滤版）。"""
+    rows = _hm_rows(n_base=120)
+    _append_hm_bar(rows, o=100.0, c=99.991, h=100.005, l=99.97)
+    session = _FakeSession(scalar=None)  # 两个版本存在性查询均未命中
+    monkeypatch.setattr(hsd, "async_session_factory", lambda: _FakeSessionCtx(session))
+    d = _detector()
+    d._spawn_watcher = lambda *a: None  # type: ignore[method-assign]
+    await d._evaluate_new_bars(rows)
+    assert sorted(s.version for s in session.added) == [VERSION, VERSION2]
+    v2 = next(s for s in session.added if s.version == VERSION2)
+    assert v2.rule_text == RULE_TEXT_V2 and v2.entry_state == "WAITING"
+
+
+@pytest.mark.asyncio
+async def test_evaluate_new_bars_single_row_when_gate_blocked(monkeypatch) -> None:
+    """形态触发但门禁拦截（下跌段）→ 仅落 v1 行，v2 不记录。
+
+    用下跌段而非低波做拦截源：低波压缩会连带改变 ATR，几何触发条件全按
+    ATR 缩放，会破坏形态构造；改 96 根前收盘只动 ret24，几何条件不受影响。
+    """
+    rows = _hm_rows(n_base=120)
+    rows[24]["close"] = 101.5  # 末根下标 120；120−96=24 → ret24 ≈ −1.49% ≤ −1%
+    _append_hm_bar(rows, o=100.0, c=99.991, h=100.005, l=99.97)
+    kl_chk, atr_chk = _kl(rows)
+    assert bool(detect_weak_hm(kl_chk, atr_chk)[-1]) is True   # 前置：形态仍触发
+    assert bool(v2_gate_mask(kl_chk, atr_chk)[-1]) is False    # 前置：门禁拦截
+    session = _FakeSession(scalar=None)
+    monkeypatch.setattr(hsd, "async_session_factory", lambda: _FakeSessionCtx(session))
+    d = _detector()
+    d._spawn_watcher = lambda *a: None  # type: ignore[method-assign]
+    await d._evaluate_new_bars(rows)
+    assert [s.version for s in session.added] == [VERSION]
 
 
 # ============================================================
@@ -534,8 +642,9 @@ async def test_resume_pending_respawns_watchers(monkeypatch) -> None:
 def test_version_isolated_from_trading_path() -> None:
     from binance_predict.services.live_channels import LIVE_CHANNELS
     from binance_predict.services.multi_live_trader import X4_VERSIONS
-    assert VERSION not in X4_VERSIONS, f"{VERSION} 不得进入 X4 下单白名单"
-    assert VERSION not in LIVE_CHANNELS, f"{VERSION} 不得注册实盘通道"
+    for v in (VERSION, VERSION2):
+        assert v not in X4_VERSIONS, f"{v} 不得进入 X4 下单白名单"
+        assert v not in LIVE_CHANNELS, f"{v} 不得注册实盘通道"
 
 
 def test_rule_text_frozen_constants() -> None:
@@ -544,6 +653,11 @@ def test_rule_text_frozen_constants() -> None:
     assert hsd.TOUCH_DEADLINE_S == 600
     assert CLV_MAX == 0.75
     assert "0.25" in RULE_TEXT and "600s" in RULE_TEXT
+    # v2 门禁冻结参数（2026-09-01 切片分析）
+    assert hsd.V2_RET24_MIN == -0.01
+    assert hsd.V2_ATR_RATIO_MIN == 0.8
+    assert hsd.V2_REGIME_WINDOW == 96
+    assert "−1.0%" in RULE_TEXT_V2 and "≥ 0.8" in RULE_TEXT_V2
 
 
 def test_settings_default_on() -> None:
