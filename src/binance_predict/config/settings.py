@@ -336,6 +336,13 @@ class Settings(BaseSettings):
     # 影子期邮件推送开关（默认静默，防轰炸；结算复盘口径预留）
     kline_shadow_email_enabled: bool = False
 
+    # --- HM 上吊线反弹入场影子信号（hm_touch_down_v1，2026-09-01）---
+    # 弱收盘上吊线 → 次 15m 周期内等反弹触及 +0.25×ATR（2s 轮询 mid 裁决）
+    # → 记录押 DOWN 的影子虚拟入场（快照触及时刻真实报价）。只记录不下注，
+    # 与下单路径物理隔离。720d 触价收跌 58.7% vs 隐含 47.1%（n=46，p≈0.06，
+    # 探索性发现，影子期即前向验证）。开关仅作紧急停用制动力。
+    hm_shadow_enabled: bool = True
+
     # --- 多通道实盘（MultiLiveTrader，2026-08-24，取代旧单版本 quote_edge 实盘字段）---
     # 12 通道（quote_edge v1/v2/v3 × contrarian 系 + momentum × 2 + x4 × 2 + 场景 S1/S5/S2/S4）
     # 可同时开启；每通道独立金额/日限/护栏，通道静态描述见 services/live_channels.py。

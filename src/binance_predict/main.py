@@ -55,6 +55,7 @@ from .models.schemas import (
 from .services.agent_scheduler import AgentScheduler
 from .services.data_collector import BinanceDataCollector
 from .services.fake_breakout_detector import FakeBreakoutDetector
+from .services.hm_shadow_detector import HmShadowDetector
 from .services.kline_shadow_detector import KlineShadowDetector
 from .services.misalignment_detector import MisalignmentDetector
 from .services.multi_live_trader import MultiLiveTrader
@@ -145,6 +146,9 @@ quote_edge_detector: QuoteEdgeDetector | None = None
 
 # K 线科学发现影子检测器全局实例（KREV 族：720d 冻结注册表条件实时重放，只记录不下注）
 kline_shadow_detector: KlineShadowDetector | None = None
+
+# HM 上吊线反弹入场影子检测器全局实例（hm_touch_down_v1：窗内等价位触发，只记录不下注）
+hm_shadow_detector: HmShadowDetector | None = None
 
 # 交易结算器全局实例（P0-2：FILLED 订单结算回填输赢/盈亏，常开）
 trade_settler: TradeSettler | None = None
@@ -1101,6 +1105,18 @@ async def lifespan(app: FastAPI):
         await kline_shadow_detector.start()
         logger.info("KREV K线影子检测器已启动（720d v2 Top3/Top4 反转做多，holdout 64.2%/63.4%，影子模式不下注）")
 
+    # HM 上吊线反弹入场影子信号（2026-09-01）：弱收盘上吊线 → 次 15m 周期内
+    # 等反弹触及 +0.25×ATR（2s 轮询 mid 裁决）→ 记录押 DOWN 的虚拟入场。
+    # 只记录不下注，物理隔离于下单路径（新表不进 X4_VERSIONS/LIVE_CHANNELS）。
+    global hm_shadow_detector
+    if settings.hm_shadow_enabled:
+        hm_shadow_detector = HmShadowDetector(
+            collector=collector,
+            pm_15m_latest=_pm_15m_latest,
+        )
+        await hm_shadow_detector.start()
+        logger.info("HM 影子检测器已启动（720d n=46 触价收跌 58.7% vs 隐含 47.1%，探索性发现，影子模式不下注）")
+
     # 交易结算器（P0-2）：回读 SentimentWindow 结算 FILLED 订单输赢/盈亏。
     # 无开关常开：行为只读窗口 + 回填结算字段，零资金风险。
     global trade_settler
@@ -1166,6 +1182,9 @@ async def lifespan(app: FastAPI):
     # 停止 K 线科学发现影子检测器
     if kline_shadow_detector is not None:
         await kline_shadow_detector.stop()
+    # 停止 HM 上吊线反弹入场影子检测器
+    if hm_shadow_detector is not None:
+        await hm_shadow_detector.stop()
     # 停止交易结算器
     if trade_settler is not None:
         await trade_settler.stop()
@@ -2963,6 +2982,9 @@ SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     "quote_contrarian_v2": (0.258, 0.235, "逆势v2: v1+触发时未涨≥0.10%（真实回测 n=155 胜率25.8%）"),
     "quote_contrarian_v3a": (0.318, 0.528, "逆势v3a: v2+前窗DOWN交替环境（真实回测 n=85 胜率31.8%）"),
     "quote_contrarian_v3b": (0.338, 0.646, "逆势v3b: v3a+距日高回落≥0.30%含边界（真实回测 n=65 胜率33.8%）"),
+    # v4 regime 门禁版：基准为 Predexon 真实订单簿 62 天回测（down 段），
+    # EV 基准钉 +0.372（与回测实现口径同源：赢 0.98/(q+0.01)−1 / 输 −1）
+    "quote_contrarian_v4": (0.303, 0.372, "逆势v4: v1+ret24≤−1.0%下跌周期门禁（62天真实订单簿回测 down段 n=413 胜率30.3%，up/range段 EV≈0）"),
     # 深夜时段变体：基准为 720 天 K 线代理回测（非真实报价同源），只钉胜率；
     # EV 基准留 None（代理回测含溢 0.01 与影子无溢价口径不可直比）
     "late_night_contrarian_v1": (0.347, None, "深夜逆势v1: 北京22~24时×t45~90s q∈[0.25,0.30)（720天K线代理回测胜率≈34.7%/赔率型边际，43天小样本51~56%系噪声）"),
@@ -2974,6 +2996,9 @@ SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     # 无报价影子不可直比；holdout 参考 EV：A +0.234 / B +0.219）
     "krev_a_v1": (0.642, None, "K线反转A: 距前低≤-0.09ATR+5根高效率阴跌+3子阴齐跌 → 押次根收阳（720d holdout n=137 胜率64.2%，月一致性0.957）"),
     "krev_b_v1": (0.634, None, "K线反转B: 区间贴底+5根高效率阴跌+3子阴齐跌 → 押次根收阳（720d holdout n=134 胜率63.4%）"),
+    # HM 上吊线反弹入场族（2026-09-01）：基准为 720d 探索性回测（x=0.25 触及格），
+    # 只钉胜率；EV 基准留 None（回测基准=市场隐含代理，与逐触价影子报价口径不直比）
+    "hm_touch_down_v1": (0.587, None, "HM上吊线反弹入场: 弱收盘上吊线→次15m周期反弹触及+0.25×ATR→押收跌（720d n=46 触价口径收跌58.7% vs 隐含47.1%，覆盖率~36%，探索性发现待前向验证）"),
 }
 # 周期切分点：08-19 00:00 UTC（三根大阳起点）；< 为震荡期（大涨前），≥ 为大涨期
 PUMP_TS_MS = int(datetime(2026, 8, 19, tzinfo=timezone.utc).timestamp() * 1000)
@@ -3058,7 +3083,7 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
     """
     from sqlalchemy import literal as sa_literal, select as sa_select
 
-    from .db.models import KlineShadowSignal, MisalignmentSignal
+    from .db.models import KlineShadowSignal, MisalignmentSignal, PatternShadowSignal
     from .services.fake_breakout_detector import RESEARCH_WIN_RATES
 
     # ---- 影子信号：全量 SETTLED 升序（仅取所需列，避免整行 ORM 实体化）----
@@ -3074,7 +3099,7 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
     )).all()
     # KREV（kline_shadow_signals 表，2026-08-28 并入）：K 线反转影子，结算口径为
     # 次根 K 线涨跌（无报价/无逐笔 EV），列对齐成与上表一致的行结构后合并——
-    # ev/entry 恒 None（前端对应列显示 '—'），direction 恒 UP（押次根收阳）。
+    # ev/entry 恒 None（前端对应列显示 '—'），direction 读真实列（本族恒 UP）。
     krev_rows = (await db.execute(
         sa_select(
             KlineShadowSignal.version,
@@ -3083,20 +3108,38 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
             sa_literal(None).label("ev_at_entry"),
             sa_literal(None).label("entry_down_price"),
             sa_literal(None).label("entry_up_price"),
-            sa_literal("UP").label("direction"),
+            KlineShadowSignal.direction.label("direction"),
         )
         .where(KlineShadowSignal.status == "SETTLED")
         .order_by(KlineShadowSignal.target_bar_start)
     )).all()
-    sh_rows = list(sh_rows) + list(krev_rows)
+    # HM 上吊线反弹入场（pattern_shadow_signals 表，2026-09-01 并入）：窗内触价入场影子，
+    # 结算口径=目标根收阴（押 DOWN），入场报价=触及时刻 DOWN 真实报价；仅 TOUCHED 行
+    # 进 SETTLED（其余入场态无结算不进面板），逐笔 EV 口径暂无（ev 恒 None）。
+    pattern_rows = (await db.execute(
+        sa_select(
+            PatternShadowSignal.version,
+            PatternShadowSignal.target_bar_start.label("window_start"),
+            PatternShadowSignal.win,
+            sa_literal(None).label("ev_at_entry"),
+            PatternShadowSignal.entry_down_quote.label("entry_down_price"),
+            sa_literal(None).label("entry_up_price"),
+            sa_literal("DOWN").label("direction"),
+        )
+        .where(PatternShadowSignal.status == "SETTLED")
+        .order_by(PatternShadowSignal.target_bar_start)
+    )).all()
+    sh_rows = list(sh_rows) + list(krev_rows) + list(pattern_rows)
     # 版本 = 冻结基准已知版本 ∪ 数据中出现的版本（新版本缺基准不崩，bench 为 None）
     versions = [
         "x4_v1", "quote_momentum_v1", "quote_contrarian_v1",
         "x4_v2", "quote_momentum_v2", "quote_contrarian_v2",  # v2 门禁版（部署即入面板）
         "quote_contrarian_v3a", "quote_contrarian_v3b",  # v3 环境门禁版（可选实盘通道，默认 OFF）
+        "quote_contrarian_v4",  # v4 regime 门禁版（下跌周期，默认 OFF）
         "late_night_contrarian_v1",  # 深夜时段变体（纯影子，2026-08-26）
         "late_night_contrarian_v2",  # 深夜门禁 v2（纯影子，2026-08-27：v1+距日高回落≥0.30%）
         "krev_a_v1", "krev_b_v1",  # K 线反转族（纯影子，2026-08-28：新表 kline_shadow_signals）
+        "hm_touch_down_v1",  # HM 上吊线反弹入场（纯影子，2026-09-01：新表 pattern_shadow_signals）
     ]
     versions += sorted({s.version for s in sh_rows} - set(versions))
     shadow = {}

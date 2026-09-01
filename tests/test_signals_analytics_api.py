@@ -13,7 +13,7 @@ collector.fetch_recent_klines 用 AsyncMock patch。
 - 影子累计曲线按 window_start 升序，win 非空才计入
 - 影子版本 = 冻结基准 ∪ 数据中出现版本（新版本 bench=None 容错）
 - 场景信号过滤 = 排除 SceneParamVersion 中 SHADOW 版本名（ACTIVE 演进名视为正式）；
-  端点共 4 次 db.execute（影子行 → KREV 行 → SHADOW 版本名 → 场景行）
+  端点共 5 次 db.execute（影子行 → KREV 行 → pattern 行 → SHADOW 版本名 → 场景行）
 - K 线缓存键 = interval:档位（limit 归档到固定档），上游失败 10s 负缓存
 """
 
@@ -60,16 +60,29 @@ def _krev_row(**over) -> SimpleNamespace:
     return SimpleNamespace(**base)
 
 
-def _make_db(shadow_rows, scene_rows, krev_rows=()) -> AsyncMock:
+def _pattern_row(**over) -> SimpleNamespace:
+    """HM 触价影子行替身（pattern_shadow_signals）：仅 TOUCHED 进 SETTLED，
+    direction 恒 DOWN，入场报价=触及时刻 DOWN 真实报价，无逐笔 EV。"""
+    base = dict(
+        version="hm_touch_down_v1", window_start=1_000_000_000_000,
+        win=True, ev_at_entry=None, entry_down_price=0.52,
+        entry_up_price=None, direction="DOWN",
+    )
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def _make_db(shadow_rows, scene_rows, krev_rows=(), pattern_rows=()) -> AsyncMock:
     db = AsyncMock()
-    r1, r2, r3, r4 = MagicMock(), MagicMock(), MagicMock(), MagicMock()
+    r1, r2, r3, r4, r5 = (MagicMock() for _ in range(5))
     # 端点用指定列 SELECT，结果直接 .all()（不再 .scalars()）；
-    # 4 次查询顺序：影子行 → KREV 行 → SceneParamVersion SHADOW 版本名（默认空）→ 场景行
+    # 5 次查询顺序：影子行 → KREV 行 → pattern 行 → SceneParamVersion SHADOW 版本名（默认空）→ 场景行
     r1.all.return_value = shadow_rows
     r2.all.return_value = krev_rows
-    r3.all.return_value = []
-    r4.all.return_value = scene_rows
-    db.execute = AsyncMock(side_effect=[r1, r2, r3, r4])
+    r3.all.return_value = pattern_rows
+    r4.all.return_value = []
+    r5.all.return_value = scene_rows
+    db.execute = AsyncMock(side_effect=[r1, r2, r3, r4, r5])
     return db
 
 
@@ -241,9 +254,9 @@ async def test_analytics_empty_db() -> None:
     assert set(out["shadow"].keys()) == {
         "x4_v1", "quote_momentum_v1", "quote_contrarian_v1",
         "x4_v2", "quote_momentum_v2", "quote_contrarian_v2",
-        "quote_contrarian_v3a", "quote_contrarian_v3b",
+        "quote_contrarian_v3a", "quote_contrarian_v3b", "quote_contrarian_v4",
         "late_night_contrarian_v1", "late_night_contrarian_v2",
-        "krev_a_v1", "krev_b_v1"}
+        "krev_a_v1", "krev_b_v1", "hm_touch_down_v1"}
     for v, blk in out["shadow"].items():
         assert blk["summary"]["n"] == 0
         assert blk["summary"]["win_rate"] is None
@@ -252,6 +265,10 @@ async def test_analytics_empty_db() -> None:
     assert out["shadow"]["x4_v2"]["summary"]["bench_winrate"] == 0.553
     assert out["shadow"]["quote_contrarian_v3b"]["summary"]["bench_ev"] == 0.646
     assert out["shadow"]["quote_momentum_v2"]["summary"]["desc"].startswith("顺势v2")
+    # v4 regime 门禁版：62 天真实订单簿回测 down 段基准（胜率+EV 双钉）
+    v4 = out["shadow"]["quote_contrarian_v4"]["summary"]
+    assert v4["bench_winrate"] == 0.303 and v4["bench_ev"] == 0.372
+    assert v4["desc"].startswith("逆势v4")
     # 深夜变体：K 线代理回测只钉胜率基准，EV 基准因溢价口径差异留 None
     ln = out["shadow"]["late_night_contrarian_v1"]["summary"]
     assert ln["bench_winrate"] == 0.347 and ln["bench_ev"] is None
@@ -265,6 +282,10 @@ async def test_analytics_empty_db() -> None:
     assert kr["bench_winrate"] == 0.642 and kr["bench_ev"] is None
     assert kr["desc"].startswith("K线反转A")
     assert out["shadow"]["krev_b_v1"]["summary"]["bench_winrate"] == 0.634
+    # HM 触价族：720d 探索性回测只钉胜率基准 0.587，EV 基准留 None（口径不直比）
+    hm = out["shadow"]["hm_touch_down_v1"]["summary"]
+    assert hm["bench_winrate"] == 0.587 and hm["bench_ev"] is None
+    assert hm["desc"].startswith("HM上吊线反弹入场")
     assert out["scene"] == {}
     assert out["regime"]["phases"] == {}
     assert out["regime"]["by_version"] == {}
@@ -299,6 +320,33 @@ async def test_analytics_krev_merged_from_kline_shadow_table() -> None:
     bv = out["regime"]["by_version"]
     assert bv["krev_a_v1"]["pre"] == {"n": 1, "wins": 1, "winrate": 1.0}
     assert bv["krev_b_v1"]["pre"] == {"n": 1, "wins": 0, "winrate": 0.0}
+
+
+@pytest.mark.asyncio
+async def test_analytics_pattern_merged_from_pattern_shadow_table() -> None:
+    """HM 触价行（pattern_shadow_signals 表）并入影子统计：胜率曲线正常，
+    盈亏平衡按 DOWN 入场报价算（q/0.98 无溢价），EV 恒空（无逐笔落库口径）。"""
+    import binance_predict.main as m
+
+    patt = [
+        _pattern_row(window_start=1_000, win=True, entry_down_price=0.52),
+        _pattern_row(window_start=2_000, win=False, entry_down_price=0.49),
+    ]
+    db = _make_db([], [], pattern_rows=patt)
+    out = await m.get_signals_analytics(db)
+
+    hm = out["shadow"]["hm_touch_down_v1"]
+    assert hm["summary"]["n"] == 2
+    assert hm["summary"]["win_rate"] == 0.5
+    assert hm["summary"]["avg_ev"] is None and hm["summary"]["cum_ev"] is None
+    # 盈亏平衡 = 逐笔 DOWN 报价均值 / 0.98（非 x4 系，无溢价）
+    assert hm["summary"]["avg_breakeven"] == pytest.approx(
+        ((0.52 / 0.98) + (0.49 / 0.98)) / 2, abs=1e-9)
+    assert hm["summary"]["bench_winrate"] == 0.587
+    assert [p["cum_wr"] for p in hm["curve"]] == [1.0, 0.5]
+    # regime 归因：早于 PUMP_TS_MS → pre
+    bv = out["regime"]["by_version"]
+    assert bv["hm_touch_down_v1"]["pre"] == {"n": 2, "wins": 1, "winrate": 0.5}
 
 
 def test_shadow_breakeven_x4_family_includes_premium() -> None:

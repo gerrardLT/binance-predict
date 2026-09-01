@@ -969,6 +969,110 @@ class KlineShadowSignal(Base):
     )
 
 
+class PatternShadowSignal(Base):
+    """
+    K 线形态入场影子信号（hm_touch_down_v1 族）：窗内等价位触发的影子重放。
+
+    冻结规则（预注册，2026-09）：弱收盘上吊线（15m：小实体+深下影+贴 20 根高位+
+    CLV≤0.75）→ 次 15m 周期内等反弹，mid 先触及 开盘价+0.25×ATR20（600s 内且未先破
+    下障碍）即记录押 DOWN 的虚拟入场（快照触及时刻真实 DOWN 报价）；先破 −0.25×ATR、
+    迟到触及或全程未触按对应状态放弃。仅 TOUCHED 行进结算：目标根收阴（close<open）
+    即赢。720d 回测基准：触价收跌率 58.7% vs 隐含 47.1%（n=46，覆盖率 ~36%），
+    探索性发现（p≈0.06），影子期即前向验证。
+    与下单路径物理隔离：本表不被任何下单代码引用，不进 X4_VERSIONS/LIVE_CHANNELS。
+    """
+    __tablename__ = "pattern_shadow_signals"
+    __table_args__ = (
+        UniqueConstraint("version", "signal_bar_start", name="uq_pshadow_version_bar"),
+        Index("ix_pshadow_status", "status"),
+        Index("ix_pshadow_target_bar", "target_bar_start"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    version: Mapped[str] = mapped_column(
+        String(24), nullable=False,
+        comment="信号口径版本：hm_touch_down_v1（与冻结规则一一对应）",
+    )
+    signal_bar_start: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, comment="信号根（15m 上吊线）open_time（ms）"
+    )
+    signal_bar_end: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, comment="信号根 close_time（ms）= 判定时刻"
+    )
+    target_bar_start: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, comment="目标周期（次 15m）open_time（ms）= signal_bar_end"
+    )
+    atr_snapshot: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+        comment="信号根 ATR20 快照（atr_series 口径：前 20 根 range% 均值 ×open，ex-ante）",
+    )
+    signal_bar_open: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="信号根开盘价（审计快照）"
+    )
+    signal_bar_close: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="信号根收盘价（审计快照）"
+    )
+    clv: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+        comment="信号根 CLV=(close−low)/(high−low)（≤0.75 触发，range≤0 不触发）",
+    )
+    target_open: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+        comment="目标周期开盘价 O（入场锚点，fetch_kline_open 回读）",
+    )
+    up_level: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="上障碍 = O+0.25×ATR（触及即虚拟入场）"
+    )
+    dn_level: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="下障碍 = O−0.25×ATR（先破即放弃）"
+    )
+    entry_state: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="WAITING", server_default="WAITING",
+        comment=("入场状态机：WAITING | TOUCHED | ABANDON_LOWER | ABANDON_LATE | "
+                 "NOT_TOUCHED | FEED_GAP | NO_DATA | RESTART_GAP"),
+    )
+    touch_ts: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True,
+        comment="触及时刻（ms）；实时裁决为采样时刻，1m 重建为所在 1m 棒 open_time 近似",
+    )
+    touch_price: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+        comment="触及价格；实时裁决为当时 mid，1m 重建为上障碍价近似",
+    )
+    entry_down_quote: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+        comment="TOUCHED 时刻 15m 市场 DOWN token 真实报价（未来护栏定标数据；缺失/重建为 NULL）",
+    )
+    settle_open: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="目标根开盘价（结算回读）"
+    )
+    settle_close: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="目标根收盘价（结算回读）"
+    )
+    settle_outcome: Mapped[str | None] = mapped_column(
+        String(10), nullable=True,
+        comment="目标根方向 DOWN（赢）| UP（输）| NOISE（平盘）；仅 TOUCHED 行填写",
+    )
+    win: Mapped[bool | None] = mapped_column(
+        Boolean, nullable=True,
+        comment="押 DOWN 命中 = 目标根收阴（close<open）；非 TOUCHED/NOISE 为 NULL",
+    )
+    status: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="PENDING", server_default="PENDING",
+        comment="PENDING（入场裁决/等结算）| SETTLED（TOUCHED 已结算）| EXPIRED（未触/放弃/超时）",
+    )
+    rule_text: Mapped[str] = mapped_column(
+        Text, nullable=False,
+        comment="冻结规则原文（预注册口径逐字落库，审计用）",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    settled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 # ============================================================
 # 模式回测快照表（每个模式每次回测的完整记录，支撑无限进化与前后对比）
 # ============================================================

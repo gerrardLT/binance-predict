@@ -195,7 +195,7 @@ class BinanceDataCollector:
         多拉 1 根并丢弃最后一根（当前未收盘的 K），保证返回的全部是完整 K。
 
         Args:
-            interval: K 线周期（"5m" | "15m" | "1h" | "4h" | "1d"）
+            interval: K 线周期（"1m" | "5m" | "15m" | "1h" | "4h" | "1d"）
             limit: 需要的已收盘 K 线数量
 
         Returns:
@@ -203,6 +203,7 @@ class BinanceDataCollector:
             失败返回空列表，调用方下轮重试。
         """
         interval_ms = {
+            "1m": 60_000,
             "5m": 300_000, "15m": 900_000,
             "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000,
         }.get(interval)
