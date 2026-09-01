@@ -1,0 +1,40 @@
+# ============================================================
+# 临时只读验证：HM v2 部署后线上生效确认（2026-09-01，用后即删）
+# 手动触发 → SSH 到 VPS：curl /api/health + 容器启动日志查双版本行。
+# 与 export-signals-readonly.yml 同模式：纯读、不写生产、不触发部署。
+# ============================================================
+name: Verify HM v2 Deploy (Temp Readonly)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: verify-hm-v2-deploy
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify HM v2 online (read-only)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Verify via SSH (read-only)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
+          script: |
+            set -euo pipefail
+            cd /www/wwwroot/binance-predict
+            echo "---- /api/health ----"
+            curl -sf http://localhost:8002/api/health || echo "HEALTH FAIL"
+            echo ""
+            echo "---- 后端容器镜像 ----"
+            docker compose -f docker-compose.prod.yml images backend || true
+            echo "---- 启动日志：HM 影子检测器（双版本）----"
+            docker compose -f docker-compose.prod.yml logs backend --since 30m 2>&1 | grep -a "HM" | tail -20 || echo "(no HM lines)"
+            echo "---- 启动时间 ----"
+            docker compose -f docker-compose.prod.yml ps backend || true
