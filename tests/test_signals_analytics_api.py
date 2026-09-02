@@ -256,7 +256,8 @@ async def test_analytics_empty_db() -> None:
         "x4_v2", "quote_momentum_v2", "quote_contrarian_v2",
         "quote_contrarian_v3a", "quote_contrarian_v3b", "quote_contrarian_v4",
         "late_night_contrarian_v1", "late_night_contrarian_v2",
-        "krev_a_v1", "krev_b_v1", "hm_touch_down_v1", "hm_touch_down_v2"}
+        "krev_a_v1", "krev_b_v1", "hm_touch_down_v1", "hm_touch_down_v2",
+        "rev_p1_v1", "rev_p2_v1", "s5_deep_z20_v1", "quote_momentum_v3"}
     for v, blk in out["shadow"].items():
         assert blk["summary"]["n"] == 0
         assert blk["summary"]["win_rate"] is None
@@ -290,6 +291,22 @@ async def test_analytics_empty_db() -> None:
     hm2 = out["shadow"]["hm_touch_down_v2"]["summary"]
     assert hm2["bench_winrate"] == 0.690 and hm2["bench_ev"] is None
     assert hm2["desc"].startswith("HM上吊线反弹v2")
+    # 反转形态 P1/P2（共表 kline_shadow_signals）：720d/oos 几何口径回测点估计只钉胜率，
+    # EV 基准留 None（纯 K 线收盘结算无报价，与 KREV 同构）
+    rp1 = out["shadow"]["rev_p1_v1"]["summary"]
+    assert rp1["bench_winrate"] == 0.620 and rp1["bench_ev"] is None
+    assert rp1["desc"].startswith("反转P1")
+    rp2 = out["shadow"]["rev_p2_v1"]["summary"]
+    assert rp2["bench_winrate"] == 0.624 and rp2["bench_ev"] is None
+    assert rp2["desc"].startswith("反转P2")
+    # S5 深档（共表 pattern_shadow_signals）：深档回测点估计只钉胜率，EV 基准留 None（含机械成分）
+    s5 = out["shadow"]["s5_deep_z20_v1"]["summary"]
+    assert s5["bench_winrate"] == 0.913 and s5["bench_ev"] is None
+    assert s5["desc"].startswith("S5深档")
+    # 报价动量 v3（misalignment_signals）：修正未来函数后回测只钉胜率，EV 基准留 None（门禁待前向验证）
+    qm3 = out["shadow"]["quote_momentum_v3"]["summary"]
+    assert qm3["bench_winrate"] == 0.802 and qm3["bench_ev"] is None
+    assert qm3["desc"].startswith("报价动量v3")
     assert out["scene"] == {}
     assert out["regime"]["phases"] == {}
     assert out["regime"]["by_version"] == {}

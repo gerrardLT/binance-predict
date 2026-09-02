@@ -876,3 +876,140 @@ async def test_v4_regime_guard_up_reject(monkeypatch) -> None:
     _feed(monkeypatch, 0.008)
     await d._process_window(_v4_window())
     assert [s.version for s in session.added] == ["quote_contrarian_v1"]
+
+
+# ============================================================
+# v3 非连涨门禁（quote_momentum_v3：momentum_v1 ∩ 最后已收 15m 非连涨）
+# 防未来函数红线：门禁用 bar_start=(quote_ts//900_000−1)*900_000（当前 15m 的前一根，
+# 必已收盘），绝不用未收盘的当前 15m（其 close 是未来数据）。数据缺失 → None → 不落 v3。
+# ============================================================
+
+V3_VERSION = "quote_momentum_v3"
+_BAR = 900_000
+_CUR = 1_700_000_000_000 // _BAR * _BAR     # 触发时刻所属（未收盘）15m 起点
+_PREV = _CUR - _BAR                         # 最后一根已收盘 15m（门禁用）
+_PREV2 = _CUR - 2 * _BAR
+
+
+def _k15(*pairs) -> list[dict]:
+    """(open_time, close) 序列 → 15m K 线 dict 列表（升序）。"""
+    return [{"open_time": t, "close": c} for t, c in pairs]
+
+
+def test_pass_streak_guard_non_rising_true() -> None:
+    """最后已收 15m 收跌（close[PREV] ≤ close[PREV2]）→ 非连涨 → 过（True）。"""
+    assert qed._pass_streak_guard(_k15((_PREV2, 100.0), (_PREV, 99.0)), _CUR + 100_000) is True
+
+
+def test_pass_streak_guard_rising_false() -> None:
+    """最后已收 15m 收涨（close[PREV] > close[PREV2]）→ 连涨 → 拦（False）。"""
+    assert qed._pass_streak_guard(_k15((_PREV2, 100.0), (_PREV, 101.0)), _CUR + 100_000) is False
+
+
+def test_pass_streak_guard_flat_boundary_true() -> None:
+    """贴线：close[PREV] == close[PREV2]（非严格上涨）→ 非连涨 → 过（含边界）。"""
+    assert qed._pass_streak_guard(_k15((_PREV2, 100.0), (_PREV, 100.0)), _CUR + 100_000) is True
+
+
+def test_pass_streak_guard_ignores_unfinished_current_bar() -> None:
+    """防未来函数红线：未收盘当前 15m（CUR）即便在列表里且大涨/大跌，门禁只看 PREV。
+
+    正向：PREV 非连涨（99≤100）+ CUR 暴涨 200 → True（若误用 CUR 判连涨会得 False）。
+    反向：PREV 连涨（101>100）+ CUR 暴跌 50 → False（若误用 CUR 判非连涨会得 True）。
+    """
+    assert qed._pass_streak_guard(
+        _k15((_PREV2, 100.0), (_PREV, 99.0), (_CUR, 200.0)), _CUR + 100_000) is True
+    assert qed._pass_streak_guard(
+        _k15((_PREV2, 100.0), (_PREV, 101.0), (_CUR, 50.0)), _CUR + 100_000) is False
+
+
+def test_pass_streak_guard_quote_ts_on_bar_boundary() -> None:
+    """quote_ts 恰在 15m 边界：CUR 起点 → 用 PREV；CUR 前 1ms（属 PREV）→ 用 PREV2。"""
+    klines = _k15((_PREV2, 98.0), (_PREV, 99.0), (_CUR, 100.0))  # close 递增（连涨）
+    # quote_ts=CUR（边界起点，所属 15m=CUR）→ bar_start=PREV：99≤98? 否 → False
+    assert qed._pass_streak_guard(klines, _CUR) is False
+    # quote_ts=CUR−1（属 PREV）→ bar_start=PREV2：j=0 无前一根 → None
+    assert qed._pass_streak_guard(klines, _CUR - 1) is None
+
+
+def test_pass_streak_guard_missing_data_none() -> None:
+    """数据缺失/不覆盖/跨断点 → None（保守不落 v3，与「数据缺失不落」同义）。"""
+    ts = _CUR + 100_000
+    assert qed._pass_streak_guard([], ts) is None                     # 空
+    assert qed._pass_streak_guard(_k15((_PREV2, 100.0)), ts) is None   # 缺 PREV
+    assert qed._pass_streak_guard(_k15((_PREV, 99.0)), ts) is None     # 缺 PREV 前一根（j<1）
+    # 跨断点：PREV 的前一根非严格相邻（PREV2−BAR）→ 连涨语义失效 → None
+    assert qed._pass_streak_guard(_k15((_PREV2 - _BAR, 100.0), (_PREV, 99.0)), ts) is None
+
+
+class _FakeKlineCollector:
+    def __init__(self, rows: list[dict]) -> None:
+        self._rows = rows
+        self.calls = 0
+
+    async def fetch_recent_klines(self, timeframe: str, limit: int) -> list[dict]:
+        self.calls += 1
+        return self._rows[-limit:]
+
+
+def _make_v3_detector(monkeypatch, klines15, with_collector: bool = True):
+    session = _FakeSession(dup_first=None)
+    monkeypatch.setattr(qed, "async_session_factory", lambda: session)
+    collector = _FakeKlineCollector(klines15) if with_collector else None
+    return QuoteEdgeDetector(collector=collector), session, collector
+
+
+def _v3_window(start_ms: int) -> SentimentWindow:
+    """momentum 命中窗（t=+100s q=0.71）；start 对齐 15m 边界 → quote_ts 落在 CUR。"""
+    return SentimentWindow(
+        start_time=start_ms, end_time=start_ms + 300_000,
+        actual_return=-0.001, outcome="DOWN",
+        curve_down_price=[{"t": start_ms + 100_000, "v": 0.71}],
+    )
+
+
+@pytest.mark.asyncio
+async def test_v3_lands_with_v1_on_non_rising(monkeypatch) -> None:
+    """非连涨 → v3 与 v1 均落表；v3 字段与 v1 同口径（DOWN/SETTLED/真实报价 EV）。"""
+    d, session, coll = _make_v3_detector(monkeypatch, _k15((_PREV2, 100.0), (_PREV, 99.0)))
+    await d._process_window(_v3_window(_CUR))
+    assert sorted(s.version for s in session.added) == ["quote_momentum_v1", V3_VERSION]
+    v3 = next(s for s in session.added if s.version == V3_VERSION)
+    assert v3.entry_down_price == 0.71 and v3.end_pct == 0.71
+    assert v3.win is True and v3.status == "SETTLED" and v3.direction == "DOWN"
+    assert v3.ev_at_entry == pytest.approx(0.98 / 0.71 - 1.0)
+    assert coll.calls == 1  # 每窗至多懒拉一次
+
+
+@pytest.mark.asyncio
+async def test_v3_blocked_on_rising_only_v1(monkeypatch) -> None:
+    """连涨 → v3 门禁拦，只落 v1（门禁语义正向验证）。"""
+    d, session, _ = _make_v3_detector(monkeypatch, _k15((_PREV2, 100.0), (_PREV, 101.0)))
+    await d._process_window(_v3_window(_CUR))
+    assert [s.version for s in session.added] == ["quote_momentum_v1"]
+
+
+@pytest.mark.asyncio
+async def test_v3_blocked_without_collector(monkeypatch) -> None:
+    """collector 未注入（None）→ 保守不落 v3，v1 照常（物理隔离，不影响存量）。"""
+    d, session, _ = _make_v3_detector(monkeypatch, None, with_collector=False)
+    await d._process_window(_v3_window(_CUR))
+    assert [s.version for s in session.added] == ["quote_momentum_v1"]
+
+
+@pytest.mark.asyncio
+async def test_v3_blocked_on_kline_data_missing(monkeypatch) -> None:
+    """回补历史窗口拿不到当时 15m（klines 不覆盖 PREV）→ None → 不落 v3，只 v1。"""
+    d, session, _ = _make_v3_detector(
+        monkeypatch, _k15((_PREV2 - 5 * _BAR, 100.0), (_PREV2 - 4 * _BAR, 99.0)))
+    await d._process_window(_v3_window(_CUR))
+    assert [s.version for s in session.added] == ["quote_momentum_v1"]
+
+
+@pytest.mark.asyncio
+async def test_v3_ignores_unfinished_current_bar_integration(monkeypatch) -> None:
+    """防未来函数（端到端）：未收盘 CUR 大涨也在列表里，门禁只看 PREV → v3 照常落。"""
+    d, session, _ = _make_v3_detector(
+        monkeypatch, _k15((_PREV2, 100.0), (_PREV, 99.0), (_CUR, 200.0)))
+    await d._process_window(_v3_window(_CUR))
+    assert V3_VERSION in [s.version for s in session.added]

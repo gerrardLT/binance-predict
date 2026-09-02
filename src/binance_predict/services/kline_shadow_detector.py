@@ -76,6 +76,10 @@ K5_BACKSCAN_BARS = 40           # 回补窗口 12×3=36 根 5m + 余量
 PENDING_EXPIRE_MS = 4 * 3_600_000  # 目标根起点后 4h 仍未结算 → EXPIRED（数据缺失兜底）
 # 审计快照特征（两条条件涉及的全部特征 + path3）
 SNAPSHOT_FEATURES = ("dist_prior_low_atr_5", "efficiency_5", "range_pos_prior_5", "path3_all_down")
+# 本检测器负责的 version（结算/超时只认这些）——kline_shadow_signals 表另被反转影子
+# 检测器（reversal_shadow_detector，rev_p1_v1/rev_p2_v1）共用，各自 version 隔离，
+# 杜绝本检测器的硬编码 UP 语义误结算 rev_p2_v1（DOWN）。
+KREV_VERSIONS = [s["version"] for s in SHADOW_CONDITIONS]
 
 
 def _to_klines(rows: list[dict], bar_ms: int) -> Klines:
@@ -270,6 +274,7 @@ class KlineShadowDetector:
         async with async_session_factory() as session:
             pendings = (await session.execute(
                 sa_select(KlineShadowSignal).where(
+                    KlineShadowSignal.version.in_(KREV_VERSIONS),
                     KlineShadowSignal.status == "PENDING",
                     KlineShadowSignal.target_bar_start.in_(starts),
                 )
@@ -303,6 +308,7 @@ class KlineShadowDetector:
         async with async_session_factory() as session:
             stale = (await session.execute(
                 sa_select(KlineShadowSignal).where(
+                    KlineShadowSignal.version.in_(KREV_VERSIONS),
                     KlineShadowSignal.status == "PENDING",
                     KlineShadowSignal.target_bar_start < cutoff,
                 )

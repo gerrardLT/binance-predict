@@ -161,6 +161,17 @@ REGIME_GUARDS: dict[str, tuple[str, float]] = {
     "quote_contrarian_v4": ("quote_contrarian_v1", -1.0),
 }
 
+# ---- v3 非连涨门禁（2026-09-03 quote_momentum_v3 落地，只加不改；v1 冻结口径原样）----
+# version -> base 规则：v3 = base 区间命中 ∩ 触发时点「最后一根已收盘 15m」非连涨
+# （close[j] ≤ close[j-1]）。防未来函数红线：j 定位 bar_start=(quote_ts//900_000−1)
+# *900_000（当前 15m 的前一根，必已收盘），绝不用当前未收盘 15m（close 是未来数据）。
+# 数据缺失（回补历史窗口拿不到当时 15m / collector 未注入）→ 不落 v3（保守跳过，
+# v1 不受影响）。研究口径：回测修正未来函数后门禁效应≈0（80.2% vs 连涨 76.4%，
+# CI 重叠），影子期前向验证门禁是否真实有效。
+STREAK_GUARDS: dict[str, str] = {
+    "quote_momentum_v3": "quote_momentum_v1",
+}
+
 
 def _pass_hour_guard(version: str, start_ms: int) -> bool:
     """时段门禁：窗口 start_time 的北京时间 hour 须落在 [lo, hi)。
@@ -308,6 +319,27 @@ def _pass_regime_guard(threshold_pct: float, ret24: float | None) -> bool:
     return ret24 is not None and ret24 * 100.0 <= threshold_pct
 
 
+def _pass_streak_guard(klines15: list[dict], quote_ts: int) -> bool | None:
+    """v3 非连涨门禁（纯函数）：触发时点「最后一根已收盘 15m」未连涨才过。
+
+    防未来函数红线（审计锚点）：bar_start=(quote_ts//900_000 − 1)*900_000——触发
+    时刻所属 15m 的「前一根」（必已收盘），绝不用当前未收盘 15m（其 close 是未来数据）。
+    非连涨 ⟺ close[j] ≤ close[j-1]（j = open_time==bar_start 的根）。klines15 覆盖不到
+    bar_start 或其前一根（回补历史窗口拿不到当时 15m）/ 前一根与 bar_start 非严格相邻
+    （跨断点连涨语义失效）→ None（保守不落 v3，与「数据缺失不落」同义）。
+
+    返回：True（非连涨，过）/ False（连涨，拦）/ None（数据不足，不落）。
+    """
+    bar_start = (quote_ts // 900_000 - 1) * 900_000
+    starts = [int(k["open_time"]) for k in klines15]
+    if bar_start not in starts:
+        return None
+    j = starts.index(bar_start)
+    if j < 1 or starts[j] - starts[j - 1] != 900_000:
+        return None  # 前一根不在窗口内 / 跨断点 → 连涨不可判
+    return float(klines15[j]["close"]) <= float(klines15[j - 1]["close"])
+
+
 def _ev_at_entry(win: bool, price: float) -> float:
     """单注 EV（回测口径，无溢价）：赢 0.98/q−1 / 输 −1。"""
     return (FEE_RET / price - 1.0) if win else -1.0
@@ -319,7 +351,8 @@ class QuoteEdgeDetector:
     归档后处理模式：落表时窗口已结算，无 PENDING 阶段（区别于 X4 的次窗结算）。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, collector=None) -> None:
+        self._collector = collector  # v3 非连涨门禁拉 15m K 线用（None → v3 保守不落）
         self._running = False
         self._task: asyncio.Task | None = None
         self._last_window_end: int | None = None  # 已处理过的最大窗口 end_time
@@ -345,7 +378,7 @@ class QuoteEdgeDetector:
         self._task = asyncio.create_task(self._loop(), name="quote_edge_detector")
         logger.info(
             "报价 edge 影子检测器启动 | v1 规则 {} + v2 价格门禁版 {} + v3 环境门禁版 {}"
-            " + 时段门禁 {} + 深夜距日高门禁 {} + regime 门禁 {}"
+            " + 时段门禁 {} + 深夜距日高门禁 {} + regime 门禁 {} + 非连涨门禁 {}"
             " | EV=0.98/q−1（费 2%，影子模式只记录不下注）",
             {k: f"t∈[{v[0]:.0f},{v[1]:.0f})s q∈[{v[2]:.2f},{v[3]:.2f})"
              for k, v in QUOTE_EDGE_RULES.items()},
@@ -355,6 +388,7 @@ class QuoteEdgeDetector:
             {k: f"北京{lo}~{hi}时" for k, (lo, hi) in HOUR_GUARDS.items()},
             {k: f"{b}+距日高≥{abs(p):.2f}%(含边界)" for k, (b, p) in LN_DD_GUARDS.items()},
             {k: f"{b}+ret24≤{p:+.1f}%(含边界)" for k, (b, p) in REGIME_GUARDS.items()},
+            {k: f"{b}∩非连涨(末收15m)" for k, b in STREAK_GUARDS.items()},
         )
 
     async def stop(self) -> None:
@@ -463,6 +497,8 @@ class QuoteEdgeDetector:
             rules[ln] = QUOTE_EDGE_RULES[LN_DD_GUARDS[ln][0]]  # 深夜门禁 v2 基于 v1 区间
         for v4 in REGIME_GUARDS:
             rules[v4] = QUOTE_EDGE_RULES[REGIME_GUARDS[v4][0]]  # v4 基于 base 区间
+        for v3s in STREAK_GUARDS:
+            rules[v3s] = QUOTE_EDGE_RULES[STREAK_GUARDS[v3s]]  # v3 非连涨门禁基于 momentum_v1 区间
 
         # per-rule 独立 commit（CodeReview Low#4）：单规则落表失败不回滚、
         # 不影响另一规则；trigger_count 仅在 commit 成功后自增。
@@ -474,6 +510,8 @@ class QuoteEdgeDetector:
         v3_high_fetched = False
         ln_high: float | None = None
         ln_high_fetched = False
+        # v3 非连涨门禁 klines15 懒拉（每窗至多一次；None=未拉，[]=拉失败/collector 缺失）
+        streak_klines: list[dict] | None = None
         async with async_session_factory() as session:
             for version, (t_lo, t_hi, q_lo, q_hi) in rules.items():
                 try:
@@ -519,6 +557,18 @@ class QuoteEdgeDetector:
                                     "报价 edge：{} ret24 缺失，本窗不落 | 窗口 {} | feed={}",
                                     version, w.start_time, regime_feed.status())
                             continue  # 门禁未过/数据缺失 → v4 不落（v1 不受影响）
+                    if version in STREAK_GUARDS:
+                        # v3 非连涨门禁：触发时点「最后一根已收盘 15m」未连涨才落。
+                        # 防未来函数红线——bar_start=(quote_ts//900_000−1)*900_000（当前
+                        # 15m 的前一根，绝不用未收盘的当前 15m）。klines15 每窗懒拉一次；
+                        # collector 未注入/覆盖不到 → None → 保守不落 v3（v1 不受影响）。
+                        if streak_klines is None:
+                            streak_klines = (
+                                await self._collector.fetch_recent_klines("15m", 4)
+                                if self._collector is not None else []
+                            )
+                        if _pass_streak_guard(streak_klines, quote_ts) is not True:
+                            continue  # 门禁未过/数据缺失 → v3 不落（v1 不受影响）
                     dup = await session.execute(
                         sa_select(MisalignmentSignal.id).where(
                             MisalignmentSignal.version == version,

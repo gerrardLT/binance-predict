@@ -16,15 +16,21 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
+from binance_predict.db.models import FakeBreakoutSignal, PatternShadowSignal
+from binance_predict.services import fake_breakout_detector as fbd
 from binance_predict.services.fake_breakout_detector import (
     CLOSE_POS_MIN,
     FEE,
     PATTERN_GROUP,
     POS4H_MIN,
     RESEARCH_WIN_RATES,
+    S5_DEEP_RULE_TEXT,
+    S5_DEEP_VERSION,
+    S5_DEEP_Z5,
     VOL_RATIO_MIN,
     FakeBreakoutDetector,
     classify_close_pattern,
@@ -413,3 +419,190 @@ def test_s5_pattern_stats_ev_uses_785_entry() -> None:
     assert s["avg_ev_at_entry"] == pytest.approx(p * (1.0 + ret) - 1.0, abs=1e-6)
     # 盈亏平衡入场价 ≈ 0.769：0.65 入场为正 EV，与回测敏感性表一致
     assert s["avg_ev_at_entry"] > 0
+
+
+# ============================================================
+# S5 深档影子（z5 ≤ −20bp → pattern_shadow_signals，纯影子不下注，2026-09-03）
+# 门禁在 _fire_s5_signal：z5<=S5_DEEP_Z5 且 matched（+5min 报价属本目标周期）才落；
+# 落表复用 _fire_s5_deep_shadow（幂等：唯一约束 version+signal_bar_start，先查后插）。
+# 不触真实 DB：async_session_factory / clock_sync 全替身，按类型过滤捕获的 add 对象。
+# ============================================================
+
+NEXT_START = 1_000_000_000_000
+NEXT_END = NEXT_START + 900_000
+
+
+class _S5Result:
+    def __init__(self, scalar) -> None:
+        self._scalar = scalar
+
+    def scalar_one_or_none(self):
+        return self._scalar
+
+
+class _S5Session:
+    """假 session：get 返回父信号；execute().scalar_one_or_none() 返回幂等探针值；add 累积。"""
+
+    def __init__(self, parent=None, exists=None) -> None:
+        self._parent = parent
+        self._exists = exists
+        self.added: list = []
+        self.commits = 0
+
+    async def get(self, model, pk):
+        return self._parent
+
+    async def execute(self, stmt):
+        return _S5Result(self._exists)
+
+    def add(self, obj) -> None:
+        self.added.append(obj)
+
+    async def commit(self) -> None:
+        self.commits += 1
+
+    async def refresh(self, obj) -> None:
+        return None
+
+
+class _S5Ctx:
+    def __init__(self, session: _S5Session) -> None:
+        self._s = session
+
+    async def __aenter__(self) -> _S5Session:
+        return self._s
+
+    async def __aexit__(self, *exc) -> bool:
+        return False
+
+
+class _FakeStore:
+    def __init__(self, mid: float) -> None:
+        self.mid_price = mid
+
+
+class _FakeCollector:
+    def __init__(self, mid: float = 64_000.0) -> None:
+        self.store = _FakeStore(mid)
+
+
+def _s5_parent() -> SimpleNamespace:
+    return SimpleNamespace(
+        level="4h", side="high", resistance=65_000.0, eps=0.001,
+        market_start_15m=NEXT_START, market_end_15m=NEXT_END,
+        cycle_open_price_15m=100.0, close_pos=0.9, vol_ratio=1.2,
+        version="v1", settle_deadline=NEXT_END,
+    )
+
+
+def _mk_s5_detector(monkeypatch, pm: dict, session: _S5Session,
+                    now_ms: int = NEXT_START + 5_000) -> FakeBreakoutDetector:
+    det = FakeBreakoutDetector(collector=_FakeCollector(), pm_15m_latest=pm)
+    det._running = True
+    monkeypatch.setattr(fbd, "async_session_factory", lambda: _S5Ctx(session))
+    clock = MagicMock()
+    clock.now_ms = MagicMock(return_value=now_ms)
+    monkeypatch.setattr(fbd, "clock_sync", clock)
+    return det
+
+
+def _shadows(session: _S5Session) -> list:
+    return [o for o in session.added if isinstance(o, PatternShadowSignal)]
+
+
+@pytest.mark.asyncio
+async def test_s5_deep_shadow_lands_on_z20(monkeypatch) -> None:
+    """z5=−30bp ≤ −20bp + 报价匹配本周期 → 落 pattern_shadow，逐字段校验口径。"""
+    pm = {"start_date": NEXT_START, "end_date": NEXT_END,
+          "down_price": 0.63, "up_price": 0.36, "updated_ts": NEXT_START + 4_000}
+    session = _S5Session(parent=_s5_parent(), exists=None)
+    det = _mk_s5_detector(monkeypatch, pm, session)
+
+    await det._fire_s5_signal(7, NEXT_START, NEXT_END, c5_close=99.7, anchor=100.0)
+
+    shadows = _shadows(session)
+    assert len(shadows) == 1
+    sh = shadows[0]
+    assert sh.version == S5_DEEP_VERSION == "s5_deep_z20_v1"
+    assert sh.rule_text == S5_DEEP_RULE_TEXT
+    assert sh.signal_bar_start == NEXT_START - 900_000  # 父 S1 周期起点（保唯一约束）
+    assert sh.signal_bar_end == NEXT_START
+    assert sh.target_bar_start == NEXT_START            # 结算目标根（次周期）
+    assert sh.entry_state == "TOUCHED"                  # +5min 确认即入场，无触价等待
+    assert sh.touch_ts == NEXT_START + 5_000
+    assert sh.entry_down_quote == 0.63                  # 快照 +5min 真实 DOWN 报价
+    assert sh.status == "PENDING"
+
+
+@pytest.mark.asyncio
+async def test_s5_deep_shadow_boundary_z_at_threshold(monkeypatch) -> None:
+    """贴线：z5 取阈值 S5_DEEP_Z5（−20bp）→ 门禁含等号（<=），落深档影子。"""
+    anchor = 100.0
+    c5_close = anchor * (1.0 + S5_DEEP_Z5)          # z5 恰在 −20bp 阈值
+    assert c5_close / anchor - 1.0 <= S5_DEEP_Z5    # 与门禁同源算术，含等号成立
+    pm = {"start_date": NEXT_START, "down_price": 0.62, "up_price": 0.37,
+          "updated_ts": NEXT_START + 4_000}
+    session = _S5Session(parent=_s5_parent(), exists=None)
+    det = _mk_s5_detector(monkeypatch, pm, session)
+
+    await det._fire_s5_signal(7, NEXT_START, NEXT_END, c5_close=c5_close, anchor=anchor)
+
+    assert len(_shadows(session)) == 1
+
+
+@pytest.mark.asyncio
+async def test_s5_deep_shadow_skips_shallow_z(monkeypatch) -> None:
+    """z5=−10bp > −20bp：S5 主行照落，但深档影子不落（深回落子集才前向验证）。"""
+    pm = {"start_date": NEXT_START, "down_price": 0.60, "up_price": 0.39,
+          "updated_ts": NEXT_START + 4_000}
+    session = _S5Session(parent=_s5_parent(), exists=None)
+    det = _mk_s5_detector(monkeypatch, pm, session)
+
+    await det._fire_s5_signal(7, NEXT_START, NEXT_END, c5_close=99.9, anchor=100.0)
+
+    assert _shadows(session) == []
+    # S5 主行仍落（浅回落也是确认信号，只是不进深档影子）
+    assert any(isinstance(o, FakeBreakoutSignal) for o in session.added)
+
+
+@pytest.mark.asyncio
+async def test_s5_deep_shadow_skips_unmatched_quote(monkeypatch) -> None:
+    """深回落(z5=−50bp)但报价属旧市场(start_date 不匹配)：无法定标 EV → 保守不落。"""
+    pm = {"start_date": NEXT_START - 900_000, "down_price": 0.99, "up_price": 0.01,
+          "updated_ts": NEXT_START - 60_000}
+    session = _S5Session(parent=_s5_parent(), exists=None)
+    det = _mk_s5_detector(monkeypatch, pm, session)
+
+    await det._fire_s5_signal(7, NEXT_START, NEXT_END, c5_close=99.5, anchor=100.0)
+
+    assert _shadows(session) == []  # z5 深，但 matched=False → 跳过
+
+
+@pytest.mark.asyncio
+async def test_s5_deep_shadow_idempotent(monkeypatch) -> None:
+    """幂等：exists 探针命中（同 version+signal_bar_start 已有行）→ 不重复落、不 commit。"""
+    session = _S5Session(exists=123)  # 已存在
+    det = _mk_s5_detector(monkeypatch, {}, session)
+
+    await det._fire_s5_deep_shadow(
+        NEXT_START, NEXT_START + 5_000, z5=-0.003, down_quote=0.63,
+    )
+
+    assert _shadows(session) == []
+    assert session.commits == 0
+
+
+@pytest.mark.asyncio
+async def test_s5_deep_shadow_none_quote_records_null(monkeypatch) -> None:
+    """防御：down_quote=None → entry_down_quote 记 NULL（仍落行，matched 由调用方保证）。"""
+    session = _S5Session(exists=None)
+    det = _mk_s5_detector(monkeypatch, {}, session)
+
+    await det._fire_s5_deep_shadow(
+        NEXT_START, NEXT_START + 5_000, z5=-0.0025, down_quote=None,
+    )
+
+    shadows = _shadows(session)
+    assert len(shadows) == 1
+    assert shadows[0].entry_down_quote is None
+    assert shadows[0].status == "PENDING"

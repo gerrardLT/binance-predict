@@ -69,7 +69,7 @@ from sqlalchemy import desc, or_, select
 
 from ..config.settings import settings
 from ..db.engine import async_session_factory
-from ..db.models import FakeBreakoutSignal, SceneParamVersion, SentimentWindow
+from ..db.models import FakeBreakoutSignal, PatternShadowSignal, SceneParamVersion, SentimentWindow
 from . import clock_sync
 from .alerting import send_plain_email
 from .data_collector import BinanceDataCollector
@@ -115,6 +115,21 @@ S5_CONFIRM_DELAY_MS = 300_000                        # 次周期第 1 根 5m 收
 S5_CONFIRM_GRACE_MS = 8_000                          # 收盘后缓冲（等 klines 落库）
 S5_CONFIRM_MAX_WAIT_MS = 90_000                      # 5m K 拉不到的放弃上限
 QUOTE_5M_DELAY_MS = 300_000                          # +5min 报价快照时点（与 S5 确认同时刻）
+
+# S5 深档影子（2026-09-03）：z5 ≤ −20bp 的深回落确认子集，落 pattern_shadow_signals
+# 影子表（version=s5_deep_z20_v1，物理隔离于下单路径：不进 LIVE_CHANNELS/X4_VERSIONS，
+# 本表不被任何下单代码引用）。+5min 确认即入场（无触价等待）→ entry_state=TOUCHED、
+# 快照 +5min 真实 15m DOWN 报价；结算复用 hm_shadow_detector._settle_pending（目标 15m
+# 根收阴=赢）；本 version 不在 hm 的 ALL_VERSIONS、状态非 WAITING，故不受 hm 入场监控/
+# 重派影响。深档回测 ~91.3%（EV 偏乐观含机械成分，影子前向验证）。
+S5_DEEP_Z5 = -0.0020                                 # 深档阈值：z5=c5_close/anchor−1 ≤ −20bp
+S5_DEEP_VERSION = "s5_deep_z20_v1"
+S5_DEEP_RULE_TEXT = (
+    "S5 深档：S1(bull_exhaust) +5min 回落确认且 z5=c5_close/anchor−1 ≤ −0.0020（−20bp）"
+    " → 押次周期 15m DOWN；+5min 确认即入场（entry_state=TOUCHED），快照 +5min 真实"
+    " 15m DOWN 报价；目标 15m 根收阴（close<open）即赢。回测 ~91.3%（深档 EV 偏乐观"
+    " 含机械成分，影子前向验证）。"
+)
 
 # 交易定价常数 (与 EV 计算一致：费 2%+0.01 溢价，赔率 b≈0.922，打平胜率≈52.0%)
 FEE = 0.02
@@ -1125,6 +1140,54 @@ class FakeBreakoutDetector:
         )
 
         # 邮件推送已挪到结算回读后（_settle_15m，2026-08-28），同主信号路径。
+
+        # ---- S5 深档影子（z5 ≤ −20bp）：落 pattern_shadow_signals，纯影子不下注 ----
+        # 深回落子集单独前向验证；仅 matched（+5min 报价属本目标周期）时落，报价缺失
+        # 无法定标 EV → 保守跳过。z5=c5_close/anchor−1，与回测深档口径同源。
+        z5 = (c5_close / anchor - 1.0) if anchor and anchor > 0 else None
+        if z5 is not None and z5 <= S5_DEEP_Z5 and matched:
+            await self._fire_s5_deep_shadow(next_start, now_ms, z5, q.get("down_price"))
+
+    async def _fire_s5_deep_shadow(
+        self, next_start: int, now_ms: int, z5: float, down_quote: float | None,
+    ) -> None:
+        """S5 深档影子（z5 ≤ −20bp）落 pattern_shadow_signals（version=s5_deep_z20_v1）。
+
+        纯影子，物理隔离于下单路径。+5min 确认即入场 → entry_state=TOUCHED（无触价
+        等待），快照 +5min 真实 15m DOWN 报价；signal_bar_start 用父 S1 周期起点
+        （next_start−900_000）以保 (version, signal_bar_start) 唯一约束，target_bar_start
+        =next_start（结算目标根）。结算复用 hm_shadow_detector._settle_pending（目标根
+        收阴=赢）；本 version 不在 hm 的 ALL_VERSIONS、状态非 WAITING，故不受 hm 入场
+        监控/重派影响。幂等：唯一约束 + 先查后插（每父周期至多一行）。
+        """
+        signal_bar_start = next_start - 900_000  # 父 S1 周期起点（15m）
+        entry_quote = float(down_quote) if down_quote is not None else None
+        async with async_session_factory() as session:
+            exists = (await session.execute(
+                select(PatternShadowSignal.id).where(
+                    PatternShadowSignal.version == S5_DEEP_VERSION,
+                    PatternShadowSignal.signal_bar_start == signal_bar_start,
+                )
+            )).scalar_one_or_none()
+            if exists is not None:
+                return
+            session.add(PatternShadowSignal(
+                version=S5_DEEP_VERSION,
+                rule_text=S5_DEEP_RULE_TEXT,
+                signal_bar_start=signal_bar_start,
+                signal_bar_end=next_start,
+                target_bar_start=next_start,
+                entry_state="TOUCHED",       # +5min 确认即入场，无触价等待
+                touch_ts=now_ms,
+                entry_down_quote=entry_quote,
+                status="PENDING",
+            ))
+            await session.commit()
+        logger.info(
+            "S5 深档影子触发 | 信号根 {} | z5={:+.4%} ≤ −20bp | DOWN 报价 {} | "
+            "回测 ~91.3%（深档 EV 偏乐观，影子前向验证）",
+            signal_bar_start, z5, entry_quote if entry_quote is not None else "N/A",
+        )
 
     async def _send_signal_email(self, signal: FakeBreakoutSignal) -> bool:
         # 邮件时间统一北京时间（2026-08-25 用户要求；此前为 UTC）

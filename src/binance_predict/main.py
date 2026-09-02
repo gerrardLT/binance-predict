@@ -60,6 +60,7 @@ from .services.kline_shadow_detector import KlineShadowDetector
 from .services.misalignment_detector import MisalignmentDetector
 from .services.multi_live_trader import MultiLiveTrader
 from .services.quote_edge_detector import QuoteEdgeDetector
+from .services.reversal_shadow_detector import ReversalShadowDetector
 from .services.trade_settler import TradeSettler
 from .services.llm_service import LLMService
 from .services.pattern_reevaluator import pattern_reevaluator
@@ -149,6 +150,9 @@ kline_shadow_detector: KlineShadowDetector | None = None
 
 # HM 上吊线反弹入场影子检测器全局实例（hm_touch_down_v1：窗内等价位触发，只记录不下注）
 hm_shadow_detector: HmShadowDetector | None = None
+
+# 反转形态影子检测器全局实例（P1/P2：15m 连跌/连涨后弱收盘几何反转，只记录不下注）
+reversal_shadow_detector: ReversalShadowDetector | None = None
 
 # 交易结算器全局实例（P0-2：FILLED 订单结算回填输赢/盈亏，常开）
 trade_settler: TradeSettler | None = None
@@ -1091,7 +1095,7 @@ async def lifespan(app: FastAPI):
     # 归档后处理首个命中报价直接落 SETTLED，攒 2 周线上样本复核回测
     global quote_edge_detector
     if settings.quote_edge_enabled:
-        quote_edge_detector = QuoteEdgeDetector()
+        quote_edge_detector = QuoteEdgeDetector(collector=collector)
         await quote_edge_detector.start()
         logger.info("报价 edge 影子检测器已启动（A 79.9%/EV+0.097，B 24%/EV+0.155，影子模式不下注）")
 
@@ -1116,6 +1120,16 @@ async def lifespan(app: FastAPI):
         )
         await hm_shadow_detector.start()
         logger.info("HM 影子检测器已启动（720d n=46 触价收跌 58.7% vs 隐含 47.1%，探索性发现，影子模式不下注）")
+
+    # 反转形态影子信号（P1/P2，2026-09-03）：15m 连跌4+弱阴收+量正常→押 UP /
+    # 连涨5+弱阳收贴最高→押 DOWN，rev_common 几何口径实时重放，次根收盘按 direction
+    # 结算。只记录不下注，物理隔离于下单路径（与 KREV 共表 kline_shadow_signals，
+    # version 隔离）。默认开关开启，与其他影子一致。
+    global reversal_shadow_detector
+    if settings.reversal_shadow_enabled:
+        reversal_shadow_detector = ReversalShadowDetector(collector=collector)
+        await reversal_shadow_detector.start()
+        logger.info("反转 K线影子检测器已启动（P1 连跌弱阴→UP 62.0% / P2 连涨弱阳→DOWN 62.4%，影子模式不下注）")
 
     # 交易结算器（P0-2）：回读 SentimentWindow 结算 FILLED 订单输赢/盈亏。
     # 无开关常开：行为只读窗口 + 回填结算字段，零资金风险。
@@ -1185,6 +1199,9 @@ async def lifespan(app: FastAPI):
     # 停止 HM 上吊线反弹入场影子检测器
     if hm_shadow_detector is not None:
         await hm_shadow_detector.stop()
+    # 停止反转形态影子检测器
+    if reversal_shadow_detector is not None:
+        await reversal_shadow_detector.stop()
     # 停止交易结算器
     if trade_settler is not None:
         await trade_settler.stop()
@@ -3003,6 +3020,16 @@ SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     # 非预注册，影子期前向验证决定是否保留（审计锚点：scripts/hm_slice_followup_720d.py，
     # 冻结数复核脚本 scripts/hm_v2_freeze_counts_720d.py；硬闸门见 tests/test_hm_shadow_detector.py）
     "hm_touch_down_v2": (0.690, None, "HM上吊线反弹v2: v1+非下跌段∧非低波门禁（720d后验切片 门禁后触发78/触价29 收跌69.0%；下跌段与低波样本负边际被排除，待前向验证）"),
+    # 反转形态 P1/P2（2026-09-03）：基准为 720d/oos 几何口径回测点估计，只钉胜率；
+    # EV 基准留 None（纯 K 线收盘结算无报价，与 KREV 同构）
+    "rev_p1_v1": (0.620, None, "反转P1: 15m连跌4+弱阴收(贴最低)+量正常[1.0,1.5) → 押次根收阳UP（720d 62.0%/oos 63.9%，纯K线中性价）"),
+    "rev_p2_v1": (0.624, None, "反转P2: 15m连涨5+弱阳收(贴最高) → 押次根收阴DOWN（720d 62.4%/oos 61.3%，纯K线中性价）"),
+    # S5 深档（2026-09-03）：S1+5min确认且 z5≤−20bp 深回落子集，落 pattern_shadow_signals，
+    # 记 +5min 真实 DOWN 报价；基准为深档回测点估计（EV 偏乐观含机械成分），影子前向验证
+    "s5_deep_z20_v1": (0.913, None, "S5深档: S1+5min回落确认且z5≤−20bp → 押次周期15m DOWN（回测~91.3%，深档EV偏乐观含机械成分，影子前向验证）"),
+    # 报价动量 v3（2026-09-03）：v1 区间 ∩ 非连涨门禁，落 misalignment_signals，真实报价 EV；
+    # 回测修正未来函数后门禁效应≈0（80.2% vs 连涨76.4%，CI重叠），影子前向验证门禁是否真实有效
+    "quote_momentum_v3": (0.802, None, "报价动量v3: v1(t90~120s q∈[0.69,0.75))∩末收15m非连涨 → 押DOWN（修正未来函数后回测80.2% vs 连涨76.4%，+3.8pp CI重叠，影子前向验证门禁是否真实有效）"),
 }
 # 周期切分点：08-19 00:00 UTC（三根大阳起点）；< 为震荡期（大涨前），≥ 为大涨期
 PUMP_TS_MS = int(datetime(2026, 8, 19, tzinfo=timezone.utc).timestamp() * 1000)
@@ -3145,6 +3172,9 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
         "krev_a_v1", "krev_b_v1",  # K 线反转族（纯影子，2026-08-28：新表 kline_shadow_signals）
         "hm_touch_down_v1",  # HM 上吊线反弹入场（纯影子，2026-09-01：新表 pattern_shadow_signals）
         "hm_touch_down_v2",  # HM v2：v1+非下跌段∧非低波门禁（纯影子，2026-09-01 后验切片）
+        "rev_p1_v1", "rev_p2_v1",  # 反转形态 P1/P2（纯影子，2026-09-03：共表 kline_shadow_signals）
+        "s5_deep_z20_v1",  # S5 深档 z5≤−20bp（纯影子，2026-09-03：共表 pattern_shadow_signals）
+        "quote_momentum_v3",  # 报价动量 v3 非连涨门禁（纯影子，2026-09-03：misalignment_signals）
     ]
     versions += sorted({s.version for s in sh_rows} - set(versions))
     shadow = {}

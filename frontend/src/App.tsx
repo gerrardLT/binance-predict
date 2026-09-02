@@ -4212,6 +4212,10 @@ const SHADOW_META: Record<string, { label: string; color: string }> = {
   krev_b_v1: { label: 'KREV-B 反转→UP', color: '#e377c2' },
   hm_touch_down_v1: { label: 'HM 上吊线反弹→DOWN', color: '#8c564b' },
   hm_touch_down_v2: { label: 'HM 上吊线反弹v2→DOWN', color: '#bcbd22' },
+  rev_p1_v1: { label: 'P1 连跌弱阴反转→UP', color: '#17becf' },
+  rev_p2_v1: { label: 'P2 连涨弱阳反转→DOWN', color: '#ff7f0e' },
+  s5_deep_z20_v1: { label: 'S5深档 z5≤-20bp→DOWN', color: '#7f7f7f' },
+  quote_momentum_v3: { label: 'A 报价动量v3(非连涨)→DOWN', color: '#e6ab02' },
 }
 const SCENE_META: Record<string, { label: string; color: string }> = {
   bull_exhaust: { label: 'S1 多头耗尽→DOWN', color: '#1f77b4' },
@@ -4230,6 +4234,10 @@ const ANALYTICS_EXTRA_DESC: Record<string, string> = {
   hm_touch_down_v1: 'HM 上吊线反弹入场：弱收盘上吊线（15m 小实体+深下影+贴 20 根高位+CLV≤0.75）→ 次 15m 周期内 10 分钟里若先反弹触及开盘价+0.25×ATR，按触及时刻真实报价记录押 DOWN（影子，不下单）。先破 −0.25×ATR、迟到触及或未触及均放弃，仅触及样本进胜率统计。720d 回测触价收跌率 58.7% vs 市场隐含 47.1%（n=46，覆盖率~36%），探索性发现，影子期即前向验证。',
   hm_touch_down_v2: 'HM 上吊线反弹 v2：v1 基础上叠加触发时点门禁——排除下跌段（过去 24h 跌≥1%）与低波环境（ATR 低于近 24h 中位数 80%）。720d 切片分析发现这两类样本负边际（下跌段 41.7% / 低波 25%），门禁后触发 78、触价 29、收跌率 69.0%。属后验切片假设（非预注册），与 v1 并行双行采集，影子期前向验证决定是否保留。',
   legacy: 'pattern_type 为空的历史信号：胜负按 side 映射（high→DOWN 赢 / low→UP 赢），用于对齐早期统计口径。',
+  rev_p1_v1: '反转 P1：15m 连跌 4 根 + 弱阴收盘（贴最低，close_pos≤0.15）+ 成交量正常（[1.0,1.5)×20 根均量）→ 押次根 15m 收阳 UP 的影子信号，仅记录不下单。rev_common 几何口径实时重放，次根收盘按 direction 结算；与 KREV 共表 kline_shadow_signals（version 隔离）。720d 回测胜率 62.0% / oos 63.9%（纯 K 线中性价，EV 不计）。',
+  rev_p2_v1: '反转 P2：15m 连涨 5 根 + 弱阳收盘（贴最高，close_pos≥0.85）→ 押次根 15m 收阴 DOWN 的影子信号，仅记录不下单。rev_common 几何口径实时重放，次根收盘按 direction 结算；与 KREV 共表 kline_shadow_signals（version 隔离）。720d 回测胜率 62.4% / oos 61.3%（纯 K 线中性价，EV 不计）。',
+  s5_deep_z20_v1: 'S5 深档：S1 多头耗尽信号 +5min 回落确认，且回落幅度 z5=c5_close/anchor−1≤−20bp（深档）→ 按 +5min 时刻真实 15m DOWN 报价记录押 DOWN 的影子信号，仅记录不下单，次周期 15m 收阴判赢。落 pattern_shadow_signals（entry_state=TOUCHED，借用 HM 结算器）。720d 回测~91.3%（深档样本 EV 偏乐观、含机械成分），影子期即前向验证。',
+  quote_momentum_v3: '报价动量 v3：在 v1（触发后 90~120s DOWN 报价 q∈[0.69,0.75)）基础上叠加“非连涨”门禁——用最后已收 15m（触发时刻所属 15m 的前一根，严格防未来函数）判定 close[j]≤close[j−1] 才落表 → 押 DOWN 的影子信号，落 misalignment_signals，按报价 edge 结算。回测修正未来函数后 80.2% vs 连涨 76.4%（+3.8pp，CI 重叠、门禁效应≈0），影子用于前向验证门禁是否真实有效。',
 }
 const signalDescFor = (kind: 'scene' | 'shadow', key: string): string => {
   if (ANALYTICS_EXTRA_DESC[key]) return ANALYTICS_EXTRA_DESC[key]
