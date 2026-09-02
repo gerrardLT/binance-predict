@@ -11,6 +11,8 @@ collector.fetch_recent_klines 用 AsyncMock patch。
   q 按 side 取 entry_up/down_15m，缺失不计入）——不读落库期望 EV
 - 周期切分：window_start/signal_time >= PUMP_TS_MS → pump，否则 pre
 - 影子累计曲线按 window_start 升序，win 非空才计入
+- pattern 系（HM/S5）逐笔 EV 未落库：聚合按落库报价兜底现算实现 EV
+  （赢 0.98/q−1 / 输 −1）；kline 系无报价恒空
 - 影子版本 = 冻结基准 ∪ 数据中出现版本（新版本 bench=None 容错）
 - 场景信号过滤 = 排除 SceneParamVersion 中 SHADOW 版本名（ACTIVE 演进名视为正式）；
   端点共 5 次 db.execute（影子行 → KREV 行 → pattern 行 → SHADOW 版本名 → 场景行）
@@ -62,7 +64,8 @@ def _krev_row(**over) -> SimpleNamespace:
 
 def _pattern_row(**over) -> SimpleNamespace:
     """HM 触价影子行替身（pattern_shadow_signals）：仅 TOUCHED 进 SETTLED，
-    direction 恒 DOWN，入场报价=触及时刻 DOWN 真实报价，无逐笔 EV。"""
+    direction 恒 DOWN，入场报价=触及时刻 DOWN 真实报价；逐笔 EV 未落库
+    （聚合兜底按报价现算实现 EV）。"""
     base = dict(
         version="hm_touch_down_v1", window_start=1_000_000_000_000,
         win=True, ev_at_entry=None, entry_down_price=0.52,
@@ -346,28 +349,36 @@ async def test_analytics_krev_merged_from_kline_shadow_table() -> None:
 @pytest.mark.asyncio
 async def test_analytics_pattern_merged_from_pattern_shadow_table() -> None:
     """HM 触价行（pattern_shadow_signals 表）并入影子统计：胜率曲线正常，
-    盈亏平衡按 DOWN 入场报价算（q/0.98 无溢价），EV 恒空（无逐笔落库口径）。"""
+    盈亏平衡按 DOWN 入场报价算（q/0.98 无溢价）；逐笔 EV 未落库 →
+    聚合兜底按报价现算实现 EV（赢 0.98/q−1 / 输 −1），报价缺失不计入。"""
     import binance_predict.main as m
 
     patt = [
         _pattern_row(window_start=1_000, win=True, entry_down_price=0.52),
         _pattern_row(window_start=2_000, win=False, entry_down_price=0.49),
+        # 报价缺失：计胜率但不计 EV（与 kline 系无报价同口径）
+        _pattern_row(window_start=3_000, win=True, entry_down_price=None),
     ]
     db = _make_db([], [], pattern_rows=patt)
     out = await m.get_signals_analytics(db)
 
     hm = out["shadow"]["hm_touch_down_v1"]
-    assert hm["summary"]["n"] == 2
-    assert hm["summary"]["win_rate"] == 0.5
-    assert hm["summary"]["avg_ev"] is None and hm["summary"]["cum_ev"] is None
-    # 盈亏平衡 = 逐笔 DOWN 报价均值 / 0.98（非 x4 系，无溢价）
+    assert hm["summary"]["n"] == 3
+    assert hm["summary"]["win_rate"] == pytest.approx(2 / 3)
+    ev_win = 0.98 / 0.52 - 1.0
+    assert hm["summary"]["avg_ev"] == pytest.approx((ev_win - 1.0) / 2, rel=1e-9)
+    assert hm["summary"]["cum_ev"] == pytest.approx(round(ev_win - 1.0, 4), rel=1e-9)
+    # 盈亏平衡 = 逐笔 DOWN 报价均值 / 0.98（非 x4 系，无溢价；缺失报价不计入）
     assert hm["summary"]["avg_breakeven"] == pytest.approx(
         ((0.52 / 0.98) + (0.49 / 0.98)) / 2, abs=1e-9)
     assert hm["summary"]["bench_winrate"] == 0.587
-    assert [p["cum_wr"] for p in hm["curve"]] == [1.0, 0.5]
+    assert [p["cum_wr"] for p in hm["curve"]] == [1.0, 0.5, round(2 / 3, 4)]
+    # 曲线 cum_ev：赢笔现算 → 输笔 −1 → 缺报价笔持平
+    assert [p["cum_ev"] for p in hm["curve"]] == [
+        round(ev_win, 4), round(ev_win - 1.0, 4), round(ev_win - 1.0, 4)]
     # regime 归因：早于 PUMP_TS_MS → pre
     bv = out["regime"]["by_version"]
-    assert bv["hm_touch_down_v1"]["pre"] == {"n": 2, "wins": 1, "winrate": 0.5}
+    assert bv["hm_touch_down_v1"]["pre"] == {"n": 3, "wins": 2, "winrate": pytest.approx(2 / 3)}
 
 
 def test_shadow_breakeven_x4_family_includes_premium() -> None:
@@ -378,6 +389,25 @@ def test_shadow_breakeven_x4_family_includes_premium() -> None:
     assert m._shadow_breakeven("x4_v2", 0.5) == pytest.approx(0.51 / 0.98, abs=1e-9)
     assert m._shadow_breakeven("quote_momentum_v2", 0.5) == pytest.approx(0.5 / 0.98, abs=1e-9)
     assert m._shadow_breakeven("quote_contrarian_v2", 0.5) == pytest.approx(0.5 / 0.98, abs=1e-9)
+
+
+def test_shadow_realized_ev_caliber() -> None:
+    """实现 EV 兜底口径：赢 0.98/entry−1 / 输 −1；x4 系含溢 0.01；无报价 → None。"""
+    import binance_predict.main as m
+
+    # 赢：无溢价（pattern 系 HM/S5）
+    assert m._shadow_realized_ev("hm_touch_down_v1", True, 0.52) == pytest.approx(
+        0.98 / 0.52 - 1.0, abs=1e-12)
+    assert m._shadow_realized_ev("s5_deep_z20_v1", True, 0.86) == pytest.approx(
+        0.98 / 0.86 - 1.0, abs=1e-12)
+    # 输：恒 −1（与报价无关）
+    assert m._shadow_realized_ev("s5_deep_z20_v1", False, 0.86) == -1.0
+    # x4 系含溢 0.01（与 _shadow_breakeven 同入口口径）
+    assert m._shadow_realized_ev("x4_v1", True, 0.5) == pytest.approx(
+        0.98 / 0.51 - 1.0, abs=1e-12)
+    # 无报价（kline 系 KREV/P1/P2）→ None，不计入 EV 聚合
+    assert m._shadow_realized_ev("krev_a_v1", True, None) is None
+    assert m._shadow_realized_ev("rev_p1_v1", False, None) is None
 
 
 @pytest.mark.asyncio

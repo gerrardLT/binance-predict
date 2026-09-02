@@ -3071,6 +3071,19 @@ def _shadow_breakeven(version: str, q: float) -> float:
     return (q + 0.01) / 0.98 if version.startswith("x4") else q / 0.98
 
 
+def _shadow_realized_ev(version: str, win: bool, q: float | None) -> float | None:
+    """逐笔实现 EV（与各检测器落库 ev_at_entry 同口径）：赢 0.98/entry−1 / 输 −1。
+
+    entry 与 _shadow_breakeven 一致：x4 系含溢 0.01，其余无溢价；无报价（q 空）→ None。
+    供未落库逐笔 EV 的表（pattern_shadow_signals：HM/S5）聚合时兜底现算；
+    kline 系（KREV/P1/P2）无报价恒 None。
+    """
+    if not q:
+        return None
+    entry = q + 0.01 if version.startswith("x4") else q
+    return (0.98 / entry - 1.0) if win else -1.0
+
+
 async def _official_scene_version_filter(db: AsyncSession):
     """正式场景信号的 version 过滤条件：排除 SHADOW 版本名，其余均为正式信号。
 
@@ -3103,7 +3116,8 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
     """信号分析面板聚合端点：口径常量固化在后端（单一事实源）。
 
     - shadow: 影子各版本累计胜率/EV 曲线 + 汇总（含逐笔平均盈亏平衡、回测基准）
-      —— EV 直读落库 ev_at_entry（与审计「逐笔交叉验证零误差」口径同源）
+      —— EV 优先直读落库 ev_at_entry（与审计「逐笔交叉验证零误差」口径同源）；
+      未落库的表（pattern 系 HM/S5）按落库报价兜底现算实现 EV（赢 0.98/q−1 / 输 −1）
     - scene: 各场景（pattern_type）累计胜率曲线 + 汇总（基准=research_win_rates）；
       EV 按审计口径现算（费2%+溢0.01 逐笔实现 EV：赢 0.98/(q+0.01)−1 截断 / 输 −1，
       q 按 side 取 entry_up/down_15m，缺失不计入）——落库 ev_at_entry 是期望 EV 口径，
@@ -3146,7 +3160,8 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
     )).all()
     # HM 上吊线反弹入场（pattern_shadow_signals 表，2026-09-01 并入）：窗内触价入场影子，
     # 结算口径=目标根收阴（押 DOWN），入场报价=触及时刻 DOWN 真实报价；仅 TOUCHED 行
-    # 进 SETTLED（其余入场态无结算不进面板），逐笔 EV 口径暂无（ev 恒 None）。
+    # 进 SETTLED（其余入场态无结算不进面板）。逐笔 EV 未落库（ev 恒 None），
+    # 聚合时按 entry_down_quote 兜底现算实现 EV（_shadow_realized_ev）。
     pattern_rows = (await db.execute(
         sa_select(
             PatternShadowSignal.version,
@@ -3184,10 +3199,14 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
         cum_ev = 0.0
         for i, s in enumerate(g, 1):
             wins += int(bool(s.win))
-            if s.ev_at_entry is not None:
-                evs.append(float(s.ev_at_entry))
-                cum_ev += float(s.ev_at_entry)
             q = s.entry_down_price if s.direction == "DOWN" else s.entry_up_price
+            # EV 优先读落库 ev_at_entry；未落库的表（pattern 系 HM/S5）按落库报价
+            # 兜底现算实现 EV；kline 系无报价仍 None
+            ev = (float(s.ev_at_entry) if s.ev_at_entry is not None
+                  else _shadow_realized_ev(v, bool(s.win), float(q) if q else None))
+            if ev is not None:
+                evs.append(ev)
+                cum_ev += ev
             if q:
                 bes.append(_shadow_breakeven(v, float(q)))
             curve.append({
