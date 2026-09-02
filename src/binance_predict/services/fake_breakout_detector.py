@@ -332,6 +332,9 @@ class FakeBreakoutDetector:
         # 实盘钩子（main 装配后亦可直接注入属性）：正式信号 fire 后回调
         # MultiLiveTrader.on_scene_signal（影子不通知，防重复下单）
         self._on_signal_fired = on_signal_fired
+        # S5 深档实盘钩子（main 装配注入 on_s5_deep_signal）：z5≤−20bp 子集
+        # 通知执行器；影子落表独立于本钩子（物理隔离不变）
+        self._on_s5_deep_fired: Callable[[dict], None] | None = None
 
         self._running = False
         self._task: asyncio.Task | None = None
@@ -851,6 +854,32 @@ class FakeBreakoutDetector:
             logger.warning("场景信号实盘钩子异常（不影响检测循环）| #{} | {}",
                            signal.id, exc)
 
+    def _notify_s5_deep_fired(self, signal: FakeBreakoutSignal,
+                              market_start_15m: int, z5: float,
+                              down_quote: float | None) -> None:
+        """S5 深档实盘钩子（同步接口，fire-and-forget）：z5≤−20bp 子集通知执行器。
+
+        payload：{id, pattern_type, side, market_start_15m, market_end_15m,
+        z5, down_quote}；id = S5 确认信号 id（下单 scene_signal_id 溯源），
+        market_start_15m = 目标 15m 周期起点（与 S5 确认钩子同窗键，互斥组对齐）。
+        异常只告警不抛（与 _notify_signal_fired 同契约）；影子落表独立于本钩子。
+        """
+        if self._on_s5_deep_fired is None:
+            return
+        try:
+            self._on_s5_deep_fired({
+                "id": signal.id,
+                "pattern_type": S5_DEEP_VERSION,
+                "side": "high",               # 深档恒押 DOWN
+                "market_start_15m": market_start_15m,
+                "market_end_15m": market_start_15m + 900_000,
+                "z5": z5,
+                "down_quote": down_quote,
+            })
+        except Exception as exc:
+            logger.warning("S5 深档实盘钩子异常（不影响检测循环）| #{} | {}",
+                           signal.id, exc)
+
     async def _send_signal_email_bg(self, signal_id: int) -> None:
         """后台邮件发送：重新查库拿完整信号，发送成功后回填 email_sent。
 
@@ -1146,7 +1175,13 @@ class FakeBreakoutDetector:
         # 无法定标 EV → 保守跳过。z5=c5_close/anchor−1，与回测深档口径同源。
         z5 = (c5_close / anchor - 1.0) if anchor and anchor > 0 else None
         if z5 is not None and z5 <= S5_DEEP_Z5 and matched:
-            await self._fire_s5_deep_shadow(next_start, now_ms, z5, q.get("down_price"))
+            # 影子落表异常不阻塞实盘钩子（纯记录失败不应吞掉真金下单路径）
+            try:
+                await self._fire_s5_deep_shadow(next_start, now_ms, z5, q.get("down_price"))
+            except Exception as exc:
+                logger.warning("S5 深档影子落表异常（不阻塞实盘钩子）| {}", exc)
+            # 实盘钩子：影子落表与实盘派生各自独立门控（执行器侧按通道开关）
+            self._notify_s5_deep_fired(signal, next_start, z5, q.get("down_price"))
 
     async def _fire_s5_deep_shadow(
         self, next_start: int, now_ms: int, z5: float, down_quote: float | None,

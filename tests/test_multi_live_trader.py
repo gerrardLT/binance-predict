@@ -148,12 +148,12 @@ def _stub_select_db(monkeypatch, rows: list) -> None:
 # ============================================================
 
 def test_parse_defaults_all_off(monkeypatch) -> None:
-    """默认：全 13 通道 OFF、金额/日限取全局默认（用户拍板 2U / 100 单）。"""
+    """默认：全 15 通道 OFF、金额/日限取全局默认（用户拍板 2U / 100 单）。"""
     monkeypatch.setattr(settings, "live_default_amount_usdt", 2.0)
     monkeypatch.setattr(settings, "live_default_max_daily_orders", 100)
     monkeypatch.setattr(settings, "live_channels_json", "")
     cfgs = parse_channel_config()
-    assert len(cfgs) == 13
+    assert len(cfgs) == 15
     assert all(not c.enabled for c in cfgs.values())
     assert all(c.amount_usdt == 2.0 for c in cfgs.values())
     assert all(c.max_daily_orders == 100 for c in cfgs.values())
@@ -228,15 +228,16 @@ def test_parse_non_int_daily_rejected(monkeypatch) -> None:
 
 
 def test_channels_registry_shape() -> None:
-    """注册表形状：13 通道全集、市场周期/方向/护栏与计划表逐项对齐。"""
+    """注册表形状：15 通道全集、市场周期/方向/护栏与计划表逐项对齐。"""
     assert set(LIVE_CHANNELS) == {
         "quote_momentum_v1", "quote_contrarian_v1",
         "quote_momentum_v2", "quote_contrarian_v2",
         "quote_contrarian_v3a", "quote_contrarian_v3b",
-        "quote_contrarian_v4",
+        "quote_contrarian_v4", "quote_momentum_v3",
         "x4_v1", "x4_v2",
         "scene_bull_exhaust", "scene_bull_exhaust_confirm",
         "scene_bear_exhaust", "scene_momentum_fade",
+        "s5_deep_z20_v1",
     }
     by = {ch: s for ch, s in LIVE_CHANNELS.items()}
     assert by["quote_momentum_v1"].market_period == "5m"
@@ -262,6 +263,27 @@ def test_channels_registry_shape() -> None:
     assert by["scene_bull_exhaust_confirm"].auto_max_exec == 0.75
     assert by["scene_bear_exhaust"].auto_max_exec == 0.65
     assert by["scene_momentum_fade"].auto_max_exec == 0.55
+    # 报价动量 v3 非连涨门禁版：v1 冻结区间护栏 + streak 门禁标志（不叠 v2/v3env/regime）
+    qm3 = by["quote_momentum_v3"]
+    assert qm3.family == "quote_edge" and qm3.streak_gate is True
+    assert qm3.v2_guard is None and qm3.v3_env is False and qm3.regime_gate is False
+    assert qm3.auto_max_exec == 0.78
+    assert all(not s.streak_gate for ch, s in by.items()
+               if ch != "quote_momentum_v3")
+    # S5 深档：scene 族 15m 押 DOWN，护栏 0.88（盈亏平衡 0.895 略下方）
+    s5d = by["s5_deep_z20_v1"]
+    assert s5d.family == "scene" and s5d.market_period == "15m"
+    assert s5d.direction == "DOWN" and s5d.auto_max_exec == 0.88
+    # 同窗互斥组：momentum 族三版本一组 / S5 确认与深档一组；其余通道无组
+    from binance_predict.services.live_channels import exclusive_group
+    g_mom = exclusive_group("quote_momentum_v3")
+    assert g_mom == frozenset(
+        {"quote_momentum_v1", "quote_momentum_v2", "quote_momentum_v3"})
+    assert exclusive_group("quote_momentum_v1") is g_mom
+    g_s5 = exclusive_group("s5_deep_z20_v1")
+    assert g_s5 == frozenset({"scene_bull_exhaust_confirm", "s5_deep_z20_v1"})
+    assert exclusive_group("scene_bull_exhaust") is None
+    assert exclusive_group("quote_contrarian_v2") is None
 
 
 def test_scene_pattern_to_channel_mapping() -> None:
@@ -370,21 +392,23 @@ def test_v2_guard_contrarian_threshold() -> None:
 
 @pytest.mark.asyncio
 async def test_v2_gate_blocks_fire_when_missing(monkeypatch) -> None:
-    """v2 集成：区间命中但 BTC 门禁数据缺失 → v2 不开火，v1 不受影响。"""
+    """v2 集成：区间命中但 BTC 门禁数据缺失 → v2 不开火，v1 不受影响；
+    门禁通过的同窗 v1+v2 双命中 → 同窗互斥至多一单成交（v1 先成交占坑）。"""
     fake = _FakeTrader()
     t = _make_trader(monkeypatch, fake,
                      channels=["quote_momentum_v1", "quote_momentum_v2"])
     ts = WINDOW_START + 100_000
     # 门禁数据缺失：v2 不触发，v1（无门禁）照常开火
     assert t.check(WINDOW_START, WINDOW_END, ts, 0.71) == ["quote_momentum_v1"]
-    # 门禁通过（chg=−0.20%）：新窗口 v1+v2 同窗并行双单
+    # 门禁通过（chg=−0.20%）：新窗口 v1+v2 同窗双命中（同步预检都过），
+    # 但互斥组内至多一单成交 → 仅 v1 成交，v2 弃单
     ws2 = WINDOW_START + 300_000
     assert t.check(ws2, ws2 + 300_000, ws2 + 100_000, 0.71,
                    btc_price=9980.0, window_entry_price=10000.0) \
         == ["quote_momentum_v1", "quote_momentum_v2"]
     await _drain(t)
     assert [c["signal_version"] for c in fake.calls] == [
-        "quote_momentum_v1", "quote_momentum_v1", "quote_momentum_v2"]
+        "quote_momentum_v1", "quote_momentum_v1"]
 
 
 @pytest.mark.asyncio
@@ -1027,14 +1051,14 @@ def test_set_channel_daily_over_cap_rejected(monkeypatch) -> None:
 
 
 def test_status_shape(monkeypatch) -> None:
-    """status：13 通道全量、enabled_any/defaults/amount_cap、单通道字段。"""
+    """status：15 通道全量、enabled_any/defaults/amount_cap、单通道字段。"""
     t = _make_trader(monkeypatch, _FakeTrader(), channels=["quote_contrarian_v1"])
     s = t.status()
     assert s["enabled_any"] is True
     assert s["amount_cap"] == 50
     assert s["defaults"]["amount_usdt"] == 2.0
     assert s["defaults"]["max_daily_orders"] == 100
-    assert len(s["channels"]) == 13
+    assert len(s["channels"]) == 15
     by = {c["channel"]: c for c in s["channels"]}
     c = by["quote_contrarian_v1"]
     assert c["enabled"] is True and c["enabled_at_startup"] is True
@@ -2373,3 +2397,232 @@ async def test_detail_prefetch_no_anchor_gives_up(monkeypatch) -> None:
 
     assert await trader._fetch_market_via_detail("15m", MARKET_START_15M) is None
     assert client.detail_tids == []   # 无锚点不扫描，不烧调用预算
+
+
+# ============================================================
+# 组 9：quote_momentum_v3 非连涨门禁 + s5_deep 通道 + 同窗互斥（2026-09-02）
+# ============================================================
+
+V3_STREAK = "quote_momentum_v3"
+S5_DEEP = "s5_deep_z20_v1"
+# _pass_streak_guard ex-ante 红线：bar_start=(quote_ts//900_000−1)*900_000
+_STREAK_BAR = ((WINDOW_START + 100_000) // 900_000 - 1) * 900_000
+
+
+def _k15(close_prev: float, close_bar: float) -> list[dict]:
+    """15m K 线两根：bar_start 前一根 + 末收根（覆盖门禁定位所需）。"""
+    return [
+        {"open_time": _STREAK_BAR - 900_000, "close": close_prev},
+        {"open_time": _STREAK_BAR, "close": close_bar},
+    ]
+
+
+def _deep_sig(sig_id: int = 91) -> dict:
+    """S5 深档钩子 payload 替身（z5≤−20bp 深回落子集）。"""
+    return {"id": sig_id, "pattern_type": S5_DEEP, "side": "high",
+            "market_start_15m": MARKET_START_15M,
+            "market_end_15m": MARKET_START_15M + 900_000,
+            "z5": -0.0025, "down_quote": 0.85}
+
+
+@pytest.mark.asyncio
+async def test_v3_streak_gate_fires_on_pass(monkeypatch) -> None:
+    """v3：非连涨核验通过 → 下单；同窗后续采样不重复派生。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=[V3_STREAK])
+
+    async def _ok(self, channel, quote_ts):
+        return True, "ok"
+
+    monkeypatch.setattr(MultiLiveTrader, "_check_streak", _ok)
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 100_000, 0.71) \
+        == [V3_STREAK]
+    await _drain(t)
+    assert [c["signal_version"] for c in fake.calls] == [V3_STREAK]
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 105_000, 0.72) == []
+    await _drain(t)
+    assert len(fake.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_v3_streak_gate_rejects(monkeypatch) -> None:
+    """v3：连涨 → 同步预检已过、核验弃单；同窗不再重试。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=[V3_STREAK])
+
+    async def _reject(self, channel, quote_ts):
+        return False, "streak_reject"
+
+    monkeypatch.setattr(MultiLiveTrader, "_check_streak", _reject)
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 100_000, 0.71) \
+        == [V3_STREAK]
+    await _drain(t)
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_v3_streak_klines_missing_retry_once(monkeypatch) -> None:
+    """v3：K 线拉取失败 → 延迟重查一次；仍缺失 → 弃单；重查通过 → 下单。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=[V3_STREAK])
+    calls = {"n": 0}
+
+    async def _missing(self, channel, quote_ts):
+        calls["n"] += 1
+        return False, "klines_missing"
+
+    monkeypatch.setattr(MultiLiveTrader, "_check_streak", _missing)
+    monkeypatch.setattr(milt, "STREAK_RETRY_DELAY_S", 0.0)
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 100_000, 0.71) \
+        == [V3_STREAK]
+    await _drain(t)
+    assert calls["n"] == 2 and fake.calls == []
+
+    # 重查通过场景：首次 K 线拉取失败，重试后恢复
+    fake2 = _FakeTrader()
+    t2 = _make_trader(monkeypatch, fake2, channels=[V3_STREAK])
+    attempts = {"n": 0}
+
+    async def _flaky(self, channel, quote_ts):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            return False, "klines_missing"
+        return True, "ok"
+
+    monkeypatch.setattr(MultiLiveTrader, "_check_streak", _flaky)
+    monkeypatch.setattr(milt, "STREAK_RETRY_DELAY_S", 0.0)
+    t2.check(WINDOW_START, WINDOW_END, WINDOW_START + 100_000, 0.71)
+    await _drain(t2)
+    assert attempts["n"] == 2
+    assert [c["signal_version"] for c in fake2.calls] == [V3_STREAK]
+
+
+@pytest.mark.asyncio
+async def test_check_streak_branches(monkeypatch) -> None:
+    """_check_streak：非连涨过 / 连涨拒 / 缺根不可判保守拒 / fetcher 缺失或空
+    保守拒 / 未注册门禁通道拒（与影子 _pass_streak_guard 同口径）。"""
+    t = _make_trader(monkeypatch, _FakeTrader())
+    quote_ts = WINDOW_START + 100_000
+
+    async def _fetch(interval, limit):
+        return _k15(100.0, 99.0)      # close[j] ≤ close[j-1] → 非连涨
+
+    t.kline_fetcher = _fetch
+    assert await t._check_streak(V3_STREAK, quote_ts) == (True, "ok")
+
+    async def _fetch_up(interval, limit):
+        return _k15(100.0, 101.0)     # 连涨 → 拒
+
+    t.kline_fetcher = _fetch_up
+    assert await t._check_streak(V3_STREAK, quote_ts) == (False, "streak_reject")
+
+    async def _fetch_gap(interval, limit):
+        return [{"open_time": _STREAK_BAR, "close": 99.0}]  # 前一根缺失 → 不可判
+
+    t.kline_fetcher = _fetch_gap
+    assert await t._check_streak(V3_STREAK, quote_ts) == (False, "streak_unknown")
+
+    async def _fetch_empty(interval, limit):
+        return []
+
+    t.kline_fetcher = _fetch_empty
+    assert await t._check_streak(V3_STREAK, quote_ts) == (False, "klines_missing")
+
+    t.kline_fetcher = None
+    assert await t._check_streak(V3_STREAK, quote_ts) == (False, "klines_missing")
+    assert await t._check_streak("quote_momentum_v1", quote_ts) \
+        == (False, "no_streak_guard")
+
+
+@pytest.mark.asyncio
+async def test_s5_deep_hook_fires(monkeypatch) -> None:
+    """S5 深档钩子：+5min 确认即 15m 市场押 DOWN，护栏 0.88，scene_signal_id 溯源；同周期防重。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=[S5_DEEP])
+    t.on_s5_deep_signal(_deep_sig())
+    await _drain(t)
+    call = fake.calls[0]
+    assert call["prediction"] == "DOWN"
+    assert call["signal_version"] == S5_DEEP
+    assert call["window_start"] == MARKET_START_15M
+    assert call["market_period"] == "15m"
+    assert call["scene_signal_id"] == 91
+    assert call["max_exec_price"] == 0.88
+    # 同周期重复回调 → 至多一单
+    t.on_s5_deep_signal(_deep_sig(sig_id=92))
+    await _drain(t)
+    assert len(fake.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_s5_deep_disabled_no_fire(monkeypatch) -> None:
+    """S5 深档未启用 → 零下单（影子落表继续，互不干扰）。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=[])
+    t.on_s5_deep_signal(_deep_sig())
+    await _drain(t)
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_exclusive_confirm_filled_blocks_deep(monkeypatch) -> None:
+    """同窗互斥：S5 确认已成交 → 深档同窗弃单（组内每窗至多一单成交）。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=[
+        "scene_bull_exhaust_confirm", S5_DEEP])
+    t.on_scene_signal(_scene_sig("bull_exhaust_confirm", "high", sig_id=77))
+    await _drain(t)
+    t.on_s5_deep_signal(_deep_sig())
+    await _drain(t)
+    assert [c["signal_version"] for c in fake.calls] == [
+        "scene_bull_exhaust_confirm"]
+
+
+@pytest.mark.asyncio
+async def test_exclusive_unfilled_does_not_block(monkeypatch) -> None:
+    """同窗互斥：未成交不占坑——确认单失败后深档同窗照常下单（互补价格带）。"""
+    fake = _FakeTrader(result=_fake_order("FAILED"))
+    t = _make_trader(monkeypatch, fake, channels=[
+        "scene_bull_exhaust_confirm", S5_DEEP])
+    t.on_scene_signal(_scene_sig("bull_exhaust_confirm", "high", sig_id=77))
+    await _drain(t)
+    t.on_s5_deep_signal(_deep_sig())
+    await _drain(t)
+    assert [c["signal_version"] for c in fake.calls] == [
+        "scene_bull_exhaust_confirm", S5_DEEP]
+
+
+@pytest.mark.asyncio
+async def test_exclusive_momentum_same_window_one_fill(monkeypatch) -> None:
+    """同窗互斥：v2/v3 同窗命中，v2 先成交占坑 → v3 弃单（防叠加敞口）。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=[
+        "quote_momentum_v2", V3_STREAK])
+
+    async def _ok(self, channel, quote_ts):
+        return True, "ok"
+
+    monkeypatch.setattr(MultiLiveTrader, "_check_streak", _ok)
+    # v2 min_drop 门禁过（chg −0.2% ≤ −0.10%）；q=0.71 同命中 v1 冻结区间（v2/v3 共享）
+    fired = t.check(WINDOW_START, WINDOW_END, WINDOW_START + 100_000, 0.71,
+                    btc_price=99.8, window_entry_price=100.0)
+    assert sorted(fired) == ["quote_momentum_v2", V3_STREAK]
+    await _drain(t)
+    assert [c["signal_version"] for c in fake.calls] == ["quote_momentum_v2"]
+
+
+@pytest.mark.asyncio
+async def test_exclusive_momentum_v2_blocked_v3_fires(monkeypatch) -> None:
+    """同窗互斥：v2 门禁弃单（BTC 缺失）不占坑 → v3 核验通过下单。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=[
+        "quote_momentum_v2", V3_STREAK])
+
+    async def _ok(self, channel, quote_ts):
+        return True, "ok"
+
+    monkeypatch.setattr(MultiLiveTrader, "_check_streak", _ok)
+    fired = t.check(WINDOW_START, WINDOW_END, WINDOW_START + 100_000, 0.71)
+    assert fired == [V3_STREAK]     # v2 门禁数据缺失，同步预检即排除
+    await _drain(t)
+    assert [c["signal_version"] for c in fake.calls] == [V3_STREAK]

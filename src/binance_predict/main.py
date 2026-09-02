@@ -1027,7 +1027,7 @@ async def lifespan(app: FastAPI):
     logger.info("现货 WS + 预测市场追踪 + 15m边界加速 + 情绪窗口归档 + 健康监控已启动")
 
     # 多通道实盘执行器（MultiLiveTrader，2026-08-24 取代单版本 QuoteEdgeLiveTrader）：
-    # 12 通道各自独立金额/日限/护栏/开关，三族触发（quote_edge 喂价/x4 轮询/场景钩子）；
+    # 15 通道各自独立金额/日限/护栏/开关，三族触发（quote_edge 喂价/x4 轮询/场景钩子）；
     # 无条件装配 + 通道标志位控制开火；配置分层：代码默认 → LIVE_CHANNELS_JSON
     # → DB 覆盖层（toggle 持久化，重启不丢设定）。
     # 构造与邮件闸 resolver 注入必须早于三个检测器 start：is_enabled 只读
@@ -1050,6 +1050,9 @@ async def lifespan(app: FastAPI):
         # 信号邮件推送闸：只推已开实盘开火通道的信号（运行时读 configs，
         # 含 toggle 热调；装配失败时 resolver 保持 None → 一律不推 fail-safe）
         set_live_enabled_resolver(multi_live_trader.is_enabled)
+        # v3 非连涨门禁 K 线源注入（与影子检测器同 collector；未注入时
+        # v3 通道保守不开火，与影子「collector 缺失不落 v3」同口径）
+        multi_live_trader.kline_fetcher = collector.fetch_recent_klines
 
     # 场景信号系统：4h 破位记 pending → 15m 周期收盘确认 → 次周期信号（不下注）
     global fake_breakout_detector
@@ -1150,6 +1153,8 @@ async def lifespan(app: FastAPI):
         # 场景检测关闭时 detector 为 None，场景通道即使开启也无触发源——fail-safe）
         if fake_breakout_detector is not None:
             fake_breakout_detector._on_signal_fired = multi_live_trader.on_scene_signal
+            fake_breakout_detector._on_s5_deep_fired = (
+                multi_live_trader.on_s5_deep_signal)
         _live_status = multi_live_trader.status()
         _enabled = [c["channel"] for c in _live_status["channels"] if c["enabled"]]
         logger.info(

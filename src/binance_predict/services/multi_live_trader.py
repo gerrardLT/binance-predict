@@ -58,6 +58,7 @@ from .live_channels import (
     LIVE_CHANNELS,
     MAX_DAILY_ORDERS_CAP,
     MAX_ORDER_AMOUNT_USDT,
+    exclusive_group,
     parse_channel_config,
     resolve_max_exec,
     scene_pattern_to_channel,
@@ -66,9 +67,11 @@ from .misalignment_detector import DECISION_T_SEC
 from .quote_edge_detector import (
     QUOTE_EDGE_RULES,
     REGIME_GUARDS,
+    STREAK_GUARDS,
     V2_PRICE_GUARDS,
     V3_ENV_GUARDS,
     _pass_regime_guard,
+    _pass_streak_guard,
     _pass_v3_env_guard,
     _prev_window_outcome,
 )
@@ -81,6 +84,8 @@ X4_DECISION_TOLERANCE_MS = 30_000   # 决策点错过容差（超时不追单）
 X4_RECENT_WINDOW_MS = 10 * 60 * 1000  # 只看近期 PENDING（更早的已无意义）
 V3_PREV_RETRY_DELAY_S = 30.0        # 前窗未归档延迟重查（归档在边界+15s，相位抖动余量）
 REGIME_RETRY_DELAY_S = 30.0         # v4 ret24 K 线拉取失败延迟重查（重试后窗内仍可下单）
+STREAK_RETRY_DELAY_S = 5.0          # v3 非连涨 15m K 线拉取失败延迟重查（末收根已归档，短等即可）
+S5_DEEP_CHANNEL = "s5_deep_z20_v1"  # 与 fake_breakout_detector.S5_DEEP_VERSION 同名（对账对齐）
 MARKET_WARMUP_INTERVAL_S = 60.0     # 市场列表后台预热间隔（未来 15m 周期预缓存，2026-08-30）
 
 
@@ -103,9 +108,15 @@ class MultiLiveTrader:
                     f"多通道实盘：通道 {ch} 日限 {cfg.max_daily_orders} 超硬上限"
                     f" {MAX_DAILY_ORDERS_CAP}（配置误写拒绝启动）")
         self._enabled_at_startup = {ch: cfg.enabled for ch, cfg in self._configs.items()}
-        self._tasks: set[asyncio.Task] = set()   # 在途任务（下单/回填/自愈/轮询）
+        self._tasks: set[asyncio.Task] = set()   # 在途任务（下单/核验/回填/自愈/轮询）
         # 余额缓存作废钩子（main 装配区注入：services 层不反向 import main，用回调解耦）
         self._on_balance_change = None
+        # 15m K 线拉取回调（main 装配注入 collector.fetch_recent_klines）；
+        # 未注入 → v3 非连涨门禁保守不开火（与影子「collector 缺失不落 v3」同口径）
+        self.kline_fetcher = None
+        # 同窗互斥槽：市场窗口 → 本窗已成交的互斥组通道（至多一单成交，见 _exec_with_exclusive）
+        self._window_filled: dict[int, set[str]] = {}
+        self._group_locks: dict[tuple[tuple[str, ...], int], asyncio.Lock] = {}
         self._x4_seen: set[int] = set()          # 已调度过的 x4 信号 id（幂等）
         self._healed_total = 0
         self._stopped = False                    # stop 后拒绝派生新下单任务
@@ -142,13 +153,16 @@ class MultiLiveTrader:
             if window_start_ms in cfg.fired:
                 continue
             # v2 用 base(v1) 冻结区间；v3 基于 contrarian v1 区间；
-            # v4 基于 REGIME_GUARDS base 区间（映射，勿复制数值）
+            # v4 基于 REGIME_GUARDS base 区间；v3 非连涨基于 STREAK_GUARDS
+            # base 区间（映射，勿复制数值）
             if ch in V2_PRICE_GUARDS:
                 rule_key = V2_PRICE_GUARDS[ch][0]
             elif spec.v3_env:
                 rule_key = "quote_contrarian_v1"
             elif ch in REGIME_GUARDS:
                 rule_key = REGIME_GUARDS[ch][0]
+            elif ch in STREAK_GUARDS:
+                rule_key = STREAK_GUARDS[ch]
             else:
                 rule_key = ch
             t_lo, t_hi, q_lo, q_hi = QUOTE_EDGE_RULES[rule_key]
@@ -179,6 +193,15 @@ class MultiLiveTrader:
                 # 核验通过才进 _fire_quote_edge，未过/缺失 → 弃单
                 task = asyncio.create_task(
                     self._verify_regime_and_fire(
+                        ch, window_start_ms, window_end_ms, t_rel,
+                        float(down_price), int(ts_ms)),
+                    name=f"live_qe_{ch}_{window_start_ms}",
+                )
+            elif spec.streak_gate:
+                # v3 非连涨门禁需异步 K 线核验（末收 15m，影子/实盘同口径）：
+                # 核验通过才进 _fire_quote_edge，未过/缺失 → 弃单
+                task = asyncio.create_task(
+                    self._verify_streak_and_fire(
                         ch, window_start_ms, window_end_ms, t_rel,
                         float(down_price), int(ts_ms)),
                     name=f"live_qe_{ch}_{window_start_ms}",
@@ -356,6 +379,97 @@ class MultiLiveTrader:
             return False, "env_guard_reject"
         return True, "ok"
 
+    async def _verify_streak_and_fire(self, channel: str, window_start: int,
+                                      window_end: int, t_rel: float,
+                                      down_price: float, quote_ts: int) -> None:
+        """v3 非连涨门禁异步核验 → 通过才走常规 quote_edge 下单链路。
+
+        K 线拉取失败 → 延迟重查一次（瞬时 REST 故障重试后窗内仍可下单）；
+        连涨/不可判 → 仅日志弃单（fired 占位已生效，本窗不再重试）；
+        任何异常只告警不抛（采样循环派生任务的共同契约）。
+        """
+        try:
+            passed, reason = await self._check_streak(channel, quote_ts)
+            if not passed and reason == "klines_missing" and not self._stopped:
+                await asyncio.sleep(STREAK_RETRY_DELAY_S)
+                if not self._stopped:
+                    passed, reason = await self._check_streak(channel, quote_ts)
+            if not passed:
+                logger.info(
+                    "多通道实盘：{} v3 非连涨门禁未过，弃单 | 窗口 {} | 原因={}",
+                    channel, _fmt_win(window_start), reason)
+                return
+            await self._fire_quote_edge(channel, window_start, window_end,
+                                        t_rel, down_price)
+        except Exception as exc:
+            logger.warning("多通道实盘：{} 非连涨核验任务异常 | 窗口 {} | {}",
+                           channel, _fmt_win(window_start), exc)
+
+    async def _check_streak(self, channel: str, quote_ts: int) -> tuple[bool, str]:
+        """v3 非连涨门禁实时版：触发时点「最后一根已收盘 15m」非连涨才过。
+
+        返回 (passed, reason)：no_streak_guard / klines_missing /
+        streak_unknown / streak_reject / ok。复用影子纯函数 _pass_streak_guard
+        （ex-ante bar 定位红线同源：bar_start=(quote_ts//900_000−1)*900_000；
+        缺失/不可判 → 保守不下单，与影子「数据缺失不落 v3」同口径）。
+        """
+        if channel not in STREAK_GUARDS:
+            return False, "no_streak_guard"
+        if self.kline_fetcher is None:
+            return False, "klines_missing"
+        klines = await self.kline_fetcher("15m", 4)
+        if not klines:
+            return False, "klines_missing"
+        ok = _pass_streak_guard(list(klines), quote_ts)
+        if ok is None:
+            return False, "streak_unknown"
+        if not ok:
+            return False, "streak_reject"
+        return True, "ok"
+
+    # ------------------------------------------------------------------
+    # 同窗互斥（互斥组内每窗至多一单成交）
+    # ------------------------------------------------------------------
+
+    def _group_lock(self, grp: frozenset[str], window_start: int) -> asyncio.Lock:
+        """(组, 窗口) 粒度锁：组内同窗下单尝试串行化（不跨窗串行，零额外延迟）。"""
+        key = (tuple(sorted(grp)), window_start)
+        if len(self._group_locks) > 1024:
+            cutoff = time.time() * 1000 - 6 * 3_600_000
+            self._group_locks = {
+                k: v for k, v in self._group_locks.items()
+                if k[1] >= cutoff or k == key}
+        return self._group_locks.setdefault(key, asyncio.Lock())
+
+    async def _exec_with_exclusive(self, channel: str, **trade_kwargs) -> dict | None:
+        """下单 + 同窗互斥槽：互斥组内每市场窗口至多一个通道成交。
+
+        (组, 窗口) 锁串行化组内并发下单尝试：先成交者占槽，组内他通道同窗
+        弃单（防同源通道同窗同向叠加敞口）；未成交（护栏弃单/失败/占位）
+        不占槽，组内互补通道照常下单。不在组的通道直连下单（行为零变化）。
+        窗口键取 kwargs["window_start"]（下单与互斥槽同键）。
+        """
+        grp = exclusive_group(channel)
+        window_start = int(trade_kwargs["window_start"])
+        if grp is None:
+            return await self._trader.execute_signal_trade(**trade_kwargs)
+        async with self._group_lock(grp, window_start):
+            taken = self._window_filled.get(window_start, set()) & grp
+            if taken:
+                logger.info(
+                    "多通道实盘：{} 同窗互斥弃单 | 窗口 {} | 已被 {} 成交",
+                    channel, _fmt_win(window_start), sorted(taken))
+                return None
+            order = await self._trader.execute_signal_trade(**trade_kwargs)
+            if order is not None and order.get("status") == "FILLED":
+                self._window_filled.setdefault(window_start, set()).add(channel)
+                if len(self._window_filled) > 1024:
+                    cutoff = time.time() * 1000 - 6 * 3_600_000
+                    self._window_filled = {
+                        k: v for k, v in self._window_filled.items()
+                        if k >= cutoff}
+            return order
+
     # ------------------------------------------------------------------
     # x4 族：PENDING 信号轮询 → 决策点下单
     # ------------------------------------------------------------------
@@ -479,6 +593,34 @@ class MultiLiveTrader:
         except Exception as exc:
             logger.warning("多通道实盘：场景钩子异常（不影响检测循环）| {}", exc)
 
+    def on_s5_deep_signal(self, sig: dict) -> None:
+        """fake_breakout S5 深档钩子（同步接口，fire-and-forget）。
+
+        payload：{id, market_start_15m, market_end_15m, side, z5, down_quote}
+        （id = S5 确认信号 id，下单 scene_signal_id 溯源）。z5≤−20bp 深回落
+        子集 → s5_deep_z20_v1 通道（+5min 确认即下单，15m 市场）；通道未启用
+        直接返回（影子落表继续，互不干扰）；任何异常只告警不抛
+        （与 on_scene_signal 同契约，绝不阻塞检测循环）。
+        """
+        try:
+            if self._stopped:
+                return  # stop 后拒绝派生新下单任务（与 check/scene 同契约）
+            cfg = self._configs[S5_DEEP_CHANNEL]
+            if not cfg.enabled:
+                return
+            market_start = int(sig["market_start_15m"])
+            if market_start in cfg.fired:
+                return
+            cfg.fired.add(market_start)
+            task = asyncio.create_task(
+                self._fire_scene(S5_DEEP_CHANNEL, sig),
+                name=f"live_scene_{S5_DEEP_CHANNEL}_{market_start}",
+            )
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+        except Exception as exc:
+            logger.warning("多通道实盘：S5 深档钩子异常（不影响检测循环）| {}", exc)
+
     async def _fire_scene(self, channel: str, sig: dict) -> None:
         spec = self._specs[channel]
         cfg = self._configs[channel]
@@ -498,7 +640,8 @@ class MultiLiveTrader:
                 "多通道实盘开火 | {} | 15m 周期开盘押 {} | 周期 {} | 金额 {} | 护栏 {}",
                 channel, prediction, _fmt_win(market_start), cfg.amount_usdt,
                 resolve_max_exec(spec, cfg))
-            order = await self._trader.execute_signal_trade(
+            order = await self._exec_with_exclusive(
+                channel,
                 prediction=prediction,
                 amount_usdt=cfg.amount_usdt,
                 signal_version=channel,
@@ -539,7 +682,8 @@ class MultiLiveTrader:
                 " q={:.3f} | 金额 {} USDT | 执行价上限 {}",
                 channel, win_label, t_rel, down_price, cfg.amount_usdt,
                 resolve_max_exec(spec, cfg))
-            order = await self._trader.execute_signal_trade(
+            order = await self._exec_with_exclusive(
+                channel,
                 prediction="DOWN",
                 amount_usdt=cfg.amount_usdt,
                 signal_version=channel,

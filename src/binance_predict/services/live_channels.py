@@ -40,6 +40,7 @@ class ChannelSpec:
     v2_guard: str | None = None   # quote_edge v2 门禁模式：min_drop | max_rise | None
     v3_env: bool = False          # quote_edge v3 环境门禁（前窗DOWN [+距日高回落]，异步核验）
     regime_gate: bool = False     # quote_edge v4 regime 门禁（ret24≤阈值，K 线异步核验）
+    streak_gate: bool = False     # quote_edge v3 非连涨门禁（末收15m，K 线异步核验）
 
 
 def _qe_guard(version: str) -> float:
@@ -86,6 +87,14 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
         "quote_contrarian_v4", "quote_edge", "5m", "DOWN", _qe_guard("quote_contrarian_v1"),
         "报价反向·下跌周期版", regime_gate=True,
     ),
+    # 报价动量 v3 非连涨门禁版（2026-09-03 影子 → 实盘小金额前向验证）：v1 冻结区间 ∩
+    # 触发时点末收 15m 非连涨（STREAK_GUARDS 异步 K 线核验，缺失/不可判弃单）。
+    # 回测修正未来函数后门禁效应≈0（80.2% vs 连涨 76.4% CI 重叠），实盘验证门禁
+    # 是否真实有效；与 v1/v2 同窗互斥（SAME_WINDOW_EXCLUSIVE，至多一单成交）。
+    "quote_momentum_v3": ChannelSpec(
+        "quote_momentum_v3", "quote_edge", "5m", "DOWN", _qe_guard("quote_momentum_v1"),
+        "报价动量·非连涨门禁版", streak_gate=True,
+    ),
     # --- x4 族（影子 PENDING → 次窗 +150s 决策点，入场价历史偏低）---
     "x4_v1": ChannelSpec("x4_v1", "x4", "5m", "DOWN", 0.45, "情绪错位（收阳押次窗DOWN）"),
     "x4_v2": ChannelSpec("x4_v2", "x4", "5m", "DOWN", 0.50, "情绪错位·平静市门禁版"),
@@ -107,7 +116,34 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     "scene_momentum_fade": ChannelSpec(
         "scene_momentum_fade", "scene", "15m", "DOWN", 0.55, "场景S4 动量衰竭（押DOWN）",
     ),
+    # S5 深档（2026-09-03 影子 → 实盘小金额前向验证）：S5 确认钩子 z5≤−20bp 子集，
+    # 通道名与 fake_breakout_detector.S5_DEEP_VERSION 同名（订单 signal_version 与
+    # 影子版本对账对齐）；+5min 确认即下单（15m 市场）。护栏 0.88：盈亏平衡入场价
+    # = 回测 91.3%×0.98≈0.895 略下方；深档 EV 偏乐观含机械成分，小金额前向验证。
+    # 与 S5 确认通道同窗互斥（SAME_WINDOW_EXCLUSIVE，至多一单成交）。
+    "s5_deep_z20_v1": ChannelSpec(
+        "s5_deep_z20_v1", "scene", "15m", "DOWN", 0.88, "S5深档·深回落门禁版",
+    ),
 }
+
+
+# 同窗互斥组：组内每市场窗口至多一个通道成交（防同源通道同窗同向叠加敞口；
+# 未成交（护栏弃单/失败/占位）不占坑，组内互补通道仍可下单）。
+# - momentum 族 v1/v2/v3 共享 v1 冻结区间、同采样命中时点；
+# - S5 深档与 S5 确认通道同源（+5min 确认钩子）、价格带互补（确认护栏 0.75
+#   自拦深档高报价窗），互斥防未来护栏调高后叠加。
+SAME_WINDOW_EXCLUSIVE: tuple[frozenset[str], ...] = (
+    frozenset({"quote_momentum_v1", "quote_momentum_v2", "quote_momentum_v3"}),
+    frozenset({"scene_bull_exhaust_confirm", "s5_deep_z20_v1"}),
+)
+
+
+def exclusive_group(channel: str) -> frozenset[str] | None:
+    """通道所属同窗互斥组（None = 不与他通道同窗成交限制）。"""
+    for grp in SAME_WINDOW_EXCLUSIVE:
+        if channel in grp:
+            return grp
+    return None
 
 
 @dataclass

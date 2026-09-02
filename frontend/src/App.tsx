@@ -603,6 +603,10 @@ const SIGNAL_INFO: Record<string, { name: string; kind: '实盘' | '影子' | '�
     name: '报价动量·门禁版', kind: '影子', liveOk: true,
     desc: 'v1 区间 + BTC 价格门禁：触发时点 BTC 已低于窗口开盘 ≥0.10%（剔「假恐慌」，真跌段胜率 85% vs 假恐慌段 40%）。实盘已解锁（实时 BTC 喂价门禁），通道护栏 0.78。',
   },
+  quote_momentum_v3: {
+    name: '报价动量·非连涨门禁版', kind: '影子', liveOk: true,
+    desc: 'v1 区间（t90~120s q∈[0.69,0.75)）∩ 触发时点末收 15m 非连涨（close≤前根，严格 ex-ante）。回测修正未来函数后门禁效应≈0（80.2% vs 连涨 76.4%，CI 重叠），小金额实盘前向验证门禁是否真实有效。与 v1/v2 同窗互斥（至多一单成交），通道护栏 0.78。',
+  },
   quote_contrarian_v3a: {
     name: '报价反向·交替环境版', kind: '影子', liveOk: true,
     desc: 'contrarian v1 区间 + v2 价格门禁 + 环境门禁：前窗结算 DOWN（交替环境：前窗跌+本窗涨=V 反弹假冲高）。真实回测 n=85 胜率 31.8%、EV +0.528。实盘已解锁（前窗 outcome 异步 DB 核验，缺失弃单），通道护栏 0.28。',
@@ -638,6 +642,10 @@ const SIGNAL_INFO: Record<string, { name: string; kind: '实盘' | '影子' | '�
   scene_momentum_fade: {
     name: '场景S4 动量衰竭（押DOWN）', kind: '场景', liveOk: true,
     desc: '连阳 ≥3 根 + 光头阳的动量衰竭 → 次周期开盘押 DOWN（胜率 55.4%，盈亏平衡 0.54）。实盘已解锁：15m 市场次周期开盘下单，护栏 0.55。',
+  },
+  s5_deep_z20_v1: {
+    name: 'S5深档·深回落门禁版', kind: '场景', liveOk: true,
+    desc: 'S1 + 5min 回落确认且 z5≤−20bp 的深回落子集 → +5min 确认即押次周期 15m DOWN（回测 ~91.3%，EV 偏乐观含机械成分；盈亏平衡 ~86.7%）。小金额实盘前向验证，护栏 0.88；与 S5 确认通道同窗互斥（至多一单成交）。',
   },
 }
 

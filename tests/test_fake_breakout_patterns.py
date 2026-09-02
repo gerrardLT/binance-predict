@@ -606,3 +606,32 @@ async def test_s5_deep_shadow_none_quote_records_null(monkeypatch) -> None:
     assert len(shadows) == 1
     assert shadows[0].entry_down_quote is None
     assert shadows[0].status == "PENDING"
+
+
+@pytest.mark.asyncio
+async def test_s5_deep_live_hook_survives_shadow_failure(monkeypatch) -> None:
+    """实盘钩子隔离：正常路径影子+钩子双发；影子落表异常不吞实盘钩子
+    （纯记录失败不应阻塞真金下单路径，2026-09-02 审计修复）。"""
+    pm = {"start_date": NEXT_START, "end_date": NEXT_END,
+          "down_price": 0.85, "up_price": 0.14, "updated_ts": NEXT_START + 4_000}
+    session = _S5Session(parent=_s5_parent(), exists=None)
+    det = _mk_s5_detector(monkeypatch, pm, session)
+    hooks: list[dict] = []
+    det._on_s5_deep_fired = hooks.append
+
+    # 正常路径：影子落表 + 实盘钩子双发（payload 契约：同窗键/方向/报价）
+    await det._fire_s5_signal(7, NEXT_START, NEXT_END, c5_close=99.7, anchor=100.0)
+    assert len(hooks) == 1 and len(_shadows(session)) == 1
+    assert hooks[0]["market_start_15m"] == NEXT_START
+    assert hooks[0]["market_end_15m"] == NEXT_START + 900_000
+    assert hooks[0]["side"] == "high"
+    assert hooks[0]["z5"] == pytest.approx(-0.003)
+    assert hooks[0]["down_quote"] == 0.85
+
+    # 影子落表异常：钩子照常触发（隔离生效）
+    async def _boom(*a, **kw):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(det, "_fire_s5_deep_shadow", _boom)
+    await det._fire_s5_signal(8, NEXT_START, NEXT_END, c5_close=99.7, anchor=100.0)
+    assert len(hooks) == 2
