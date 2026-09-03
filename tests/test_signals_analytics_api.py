@@ -356,6 +356,32 @@ async def test_analytics_krev_merged_from_kline_shadow_table() -> None:
 
 
 @pytest.mark.asyncio
+async def test_analytics_kline_row_with_entry_quote_computes_ev() -> None:
+    """K 线族影子落库真实入场报价后（2026-09-03）→ 聚合层按 direction 取对应侧 q 现算真实 EV。
+
+    押 UP 取 entry_up_price、押 DOWN 取 entry_down_price：赢 EV=0.98/q−1、盈亏平衡=q/0.98
+    （无溢价，非 x4 系）。验证旧「kline 系 EV 恒空」已变为真实报价驱动。
+    """
+    import binance_predict.main as m
+
+    krev = [
+        _krev_row(version="nb_zschamp_15m_v1", window_start=1_000, win=True,
+                  entry_up_price=0.55, entry_down_price=0.47, direction="UP"),
+        _krev_row(version="rev_p2_v1", window_start=1_000, win=True,
+                  entry_up_price=0.47, entry_down_price=0.52, direction="DOWN"),
+    ]
+    db = _make_db([], [], krev_rows=krev)
+    out = await m.get_signals_analytics(db)
+    up = out["shadow"]["nb_zschamp_15m_v1"]["summary"]
+    assert up["n"] == 1 and up["win_rate"] == 1.0
+    assert up["avg_ev"] == pytest.approx(0.98 / 0.55 - 1, rel=1e-6)  # 押 UP 取 up_price
+    assert up["cum_ev"] == pytest.approx(round(0.98 / 0.55 - 1, 4), rel=1e-6)
+    assert up["avg_breakeven"] == pytest.approx(0.55 / 0.98, rel=1e-6)
+    dn = out["shadow"]["rev_p2_v1"]["summary"]
+    assert dn["avg_ev"] == pytest.approx(0.98 / 0.52 - 1, rel=1e-6)  # 押 DOWN 取 down_price
+
+
+@pytest.mark.asyncio
 async def test_analytics_pattern_merged_from_pattern_shadow_table() -> None:
     """HM 触价行（pattern_shadow_signals 表）并入影子统计：胜率曲线正常，
     盈亏平衡按 DOWN 入场报价算（q/0.98 无溢价）；逐笔 EV 未落库 →

@@ -25,7 +25,8 @@
     1. 每 60s 轮询；fetch_recent_klines 按币安服务器时间只返回已收盘 K，
        天然规避边界抢跑（无需本地时钟判断）；
     2. 出现新的已收盘 15m 根 → 拉 30 根 15m + 4 根 5m → 全量构建特征矩阵
-       （微秒级）→ 条件求值 → 命中幂等落 PENDING（唯一约束防重）；
+       （微秒级）→ 条件求值 → 命中幂等落 PENDING（唯一约束防重），并快照目标窗
+       开盘后首次轮询的 UP/DOWN 真实报价（entry_up/down_price，供聚合层现算真实 EV）；
     3. 已收盘 15m 根的 open_time 命中某 PENDING 的 target_bar_start →
        回读该根 OHLC 结算 → SETTLED/EXPIRED；
     4. 冷启动回补最近 12 根（幂等）；超时 PENDING → EXPIRED。
@@ -45,6 +46,7 @@ from binance_predict.db.models import KlineShadowSignal
 from binance_predict.discovery.data import Klines
 from binance_predict.discovery.features import build_feature_matrix
 from binance_predict.discovery.hypotheses import condition_mask, parse_condition
+from binance_predict.services.shadow_entry_quote import snapshot_entry_quote
 
 # ---- 冻结口径（来自 output/kline_discovery_15m_720d_v2/discovery_registry.csv，勿动）----
 SHADOW_CONDITIONS = [
@@ -124,8 +126,11 @@ def evaluate_conditions(fm, specs: list[dict], n_tail: int) -> list[dict]:
 class KlineShadowDetector:
     """KREV 影子信号检测器：轮询 15m 收盘 → 条件求值/结算，全程只落表不下注。"""
 
-    def __init__(self, collector) -> None:
+    def __init__(self, collector, pm_15m_latest: dict) -> None:
         self._collector = collector
+        # 目标窗入场报价源（只读共享缓存 _pm_15m_latest）：信号落库时快照目标 15m 窗
+        # UP/DOWN 真实报价（窗口对齐守卫），供聚合层现算真实 EV
+        self._pm_15m = pm_15m_latest
         self._running = False
         self._task: asyncio.Task | None = None
         self._last_evaluated_bar: int | None = None  # 已评估过的最大 15m open_time
@@ -248,16 +253,22 @@ class KlineShadowDetector:
             if col is not None and idx < len(col):
                 val = col[idx]
                 snapshot[feat] = bool(val) if isinstance(val, (bool, np.bool_)) else float(val)
+        target_bar_start = start_ms + BAR_MS_15M
+        # 目标窗入场报价快照（窗口对齐+近开盘守卫；缺失/回补 → None，该笔 EV 不计）
+        up_q, down_q, q_ts = snapshot_entry_quote(self._pm_15m, target_bar_start)
         session.add(KlineShadowSignal(
             version=spec["version"],
             discovery_id=spec["discovery_id"],
             condition_text=spec["condition"],
             timeframe="15m",
             signal_bar_start=start_ms,
-            signal_bar_end=start_ms + BAR_MS_15M,
+            signal_bar_end=target_bar_start,
             direction="UP",
-            target_bar_start=start_ms + BAR_MS_15M,
+            target_bar_start=target_bar_start,
             feature_snapshot=snapshot,
+            entry_up_price=up_q,
+            entry_down_price=down_q,
+            entry_quote_ts=q_ts,
             status="PENDING",
         ))
         return True

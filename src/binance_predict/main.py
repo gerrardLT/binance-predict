@@ -326,6 +326,8 @@ async def _prediction_market_tracker() -> None:
                 "down_price": quote.down_price,
                 "up_chance": quote.up_chance,
                 "down_chance": quote.down_chance,
+                # 报价刷新时刻（ms）：供 K 线族影子入场报价快照的新鲜度/近开盘守卫
+                "updated_ts": aligned_ts,
                 # 周期开盘价（周期锚点结算 P(S5)）：窗口切换时更新的模块级快照
                 "cycle_open_price": _pm_5m_cycle_open_price,
                 "cycle_open_end": _pm_5m_cycle_open_end,
@@ -1112,7 +1114,7 @@ async def lifespan(app: FastAPI):
     # LIVE_CHANNELS）。默认开关关闭，口径保真测试全绿后 .env 显式开启。
     global kline_shadow_detector
     if settings.kline_shadow_enabled:
-        kline_shadow_detector = KlineShadowDetector(collector=collector)
+        kline_shadow_detector = KlineShadowDetector(collector=collector, pm_15m_latest=_pm_15m_latest)
         await kline_shadow_detector.start()
         logger.info("KREV K线影子检测器已启动（720d v2 Top3/Top4 反转做多，holdout 64.2%/63.4%，影子模式不下注）")
 
@@ -1134,7 +1136,7 @@ async def lifespan(app: FastAPI):
     # version 隔离）。默认开关开启，与其他影子一致。
     global reversal_shadow_detector
     if settings.reversal_shadow_enabled:
-        reversal_shadow_detector = ReversalShadowDetector(collector=collector)
+        reversal_shadow_detector = ReversalShadowDetector(collector=collector, pm_15m_latest=_pm_15m_latest)
         await reversal_shadow_detector.start()
         logger.info("反转 K线影子检测器已启动（P1 连跌弱阴→UP 62.0% / P2 连涨弱阳→DOWN 62.4%，影子模式不下注）")
 
@@ -1146,7 +1148,11 @@ async def lifespan(app: FastAPI):
     # 双隔离，各用自己 tf 的 K 线结算）。默认开关开启，与其他影子一致。
     global nextbar_shadow_detector
     if settings.nextbar_shadow_enabled:
-        nextbar_shadow_detector = NextbarShadowDetector(collector=collector)
+        nextbar_shadow_detector = NextbarShadowDetector(
+            collector=collector,
+            pm_15m_latest=_pm_15m_latest,
+            pm_5m_info=_pm_market_info,
+        )
         await nextbar_shadow_detector.start()
         logger.info("nextbar K线影子检测器已启动（15m 冠军次根收阳 58.92% / 5m sma_slope 47.43% regime 依赖，影子模式不下注）")
 
@@ -3032,9 +3038,9 @@ SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     # 深夜门禁 v2：基准为线上情绪窗重放 OOS（F1 优化发现，r6 扩样池；非 K 线代理），
     # 只钉胜率；EV 基准留 None（重放均值与逐笔影子 EV 口径不直比）
     "late_night_contrarian_v2": (0.440, None, "深夜逆势v2: v1+触发时点距日高回落≥0.30%（线上情绪窗重放OOS n=50 胜率44.0% CI[31.2%,57.7%]，盈亏平衡≈27%，剔除段IS wr 0.140/EV负）"),
-    # KREV K 线反转族（2026-08-28）：基准为 720d 发现流水线冻结 holdout（样本外），
-    # 只钉胜率；EV 基准留 None（回测 EV@0.50 为固定价位口径，与 K 线涨跌结算的
-    # 无报价影子不可直比；holdout 参考 EV：A +0.234 / B +0.219）
+    # KREV K 线反转族（2026-08-28；2026-09-03 起落库目标窗真实入场报价）：基准为 720d
+    # 发现流水线冻结 holdout（样本外），只钉胜率；bench EV 留 None（无冻结 EV 回测基准；
+    # 面板 EV/累计 EV 由落库真实报价前向现算，holdout 参考 EV@0.50：A +0.234 / B +0.219）
     "krev_a_v1": (0.642, None, "K线反转A: 距前低≤-0.09ATR+5根高效率阴跌+3子阴齐跌 → 押次根收阳（720d holdout n=137 胜率64.2%，月一致性0.957）"),
     "krev_b_v1": (0.634, None, "K线反转B: 区间贴底+5根高效率阴跌+3子阴齐跌 → 押次根收阳（720d holdout n=134 胜率63.4%）"),
     # HM 上吊线反弹入场族（2026-09-01）：基准为 720d 探索性回测（x=0.25 触及格），
@@ -3044,18 +3050,19 @@ SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     # 非预注册，影子期前向验证决定是否保留（审计锚点：scripts/hm_slice_followup_720d.py，
     # 冻结数复核脚本 scripts/hm_v2_freeze_counts_720d.py；硬闸门见 tests/test_hm_shadow_detector.py）
     "hm_touch_down_v2": (0.690, None, "HM上吊线反弹v2: v1+非下跌段∧非低波门禁（720d后验切片 门禁后触发78/触价29 收跌69.0%；下跌段与低波样本负边际被排除，待前向验证）"),
-    # 反转形态 P1/P2（2026-09-03）：基准为 720d/oos 几何口径回测点估计，只钉胜率；
-    # EV 基准留 None（纯 K 线收盘结算无报价，与 KREV 同构）
-    "rev_p1_v1": (0.620, None, "反转P1: 15m连跌4+弱阴收(贴最低)+量正常[1.0,1.5) → 押次根收阳UP（720d 62.0%/oos 63.9%，纯K线中性价）"),
-    "rev_p2_v1": (0.624, None, "反转P2: 15m连涨5+弱阳收(贴最高) → 押次根收阴DOWN（720d 62.4%/oos 61.3%，纯K线中性价）"),
+    # 反转形态 P1/P2（2026-09-03；同日补目标窗真实入场报价）：基准为 720d/oos 几何口径
+    # 回测点估计，只钉胜率；bench EV 留 None（无冻结 EV 基准；面板 EV 由真实报价前向现算）
+    "rev_p1_v1": (0.620, None, "反转P1: 15m连跌4+弱阴收(贴最低)+量正常[1.0,1.5) → 押次根收阳UP（720d 62.0%/oos 63.9%；EV按目标窗真实报价前向现算）"),
+    "rev_p2_v1": (0.624, None, "反转P2: 15m连涨5+弱阳收(贴最高) → 押次根收阴DOWN（720d 62.4%/oos 61.3%；EV按目标窗真实报价前向现算）"),
     # S5 深档（2026-09-03）：S1+5min确认且 z5≤−20bp 深回落子集，落 pattern_shadow_signals，
     # 记 +5min 真实 DOWN 报价；基准为深档回测点估计（EV 偏乐观含机械成分），影子前向验证
     "s5_deep_z20_v1": (0.913, None, "S5深档: S1+5min回落确认且z5≤−20bp → 押次周期15m DOWN（回测~91.3%，深档EV偏乐观含机械成分，影子前向验证）"),
     # 报价动量 v3（2026-09-03）：v1 区间 ∩ 非连涨门禁，落 misalignment_signals，真实报价 EV；
     # 回测修正未来函数后门禁效应≈0（80.2% vs 连涨76.4%，CI重叠），影子前向验证门禁是否真实有效
     "quote_momentum_v3": (0.802, None, "报价动量v3: v1(t90~120s q∈[0.69,0.75))∩末收15m非连涨 → 押DOWN（修正未来函数后回测80.2% vs 连涨76.4%，+3.8pp CI重叠，影子前向验证门禁是否真实有效）"),
-    # nextbar 族（2026-09-03）：H=1 方向研究冻结条件，落 kline_shadow_signals，次根收阳结算，
-    # 无报价 EV=None（纯 K 线中性价，与 KREV/反转同构）；基准=720d 全样本次根收阳点估计
+    # nextbar 族（2026-09-03）：H=1 方向研究冻结条件，落 kline_shadow_signals，次根收阳结算；
+    # 同日补目标窗真实入场报价 → 面板 EV 前向现算；bench EV 留 None（无冻结基准），
+    # 基准胜率=720d 全样本次根收阳点估计
     "nb_zschamp_15m_v1": (0.5892, None, "nextbar 15m冠军: zscore_10≤-1.651∧zscore_5≤-1.538∧ret_3≤-0.00395 深超卖反转 → 押次根15m收阳UP（converge_registry L3 ROBUST，holdout P(up_1)=61.96% n=368；720d次根收阳58.92%/2006触发，月一致性0.958/wf1.00）"),
     "nb_smaslope_5m_v1": (0.4743, None, "nextbar 5m误定价: sma_slope_atr_5≥1.661 短期动量 → 押次根5m收阳UP（阶段E市场报价钝在q̄0.500而Jul-Aug真实P(UP)=0.534，B⁺ t=1.73未达t>3；720d次根收阳仅47.43%/19597触发=长样本反指，edge依赖regime，影子前向验证是否持续）"),
 }
@@ -3103,8 +3110,9 @@ def _shadow_realized_ev(version: str, win: bool, q: float | None) -> float | Non
     """逐笔实现 EV（与各检测器落库 ev_at_entry 同口径）：赢 0.98/entry−1 / 输 −1。
 
     entry 与 _shadow_breakeven 一致：x4 系含溢 0.01，其余无溢价；无报价（q 空）→ None。
-    供未落库逐笔 EV 的表（pattern_shadow_signals：HM/S5）聚合时兜底现算；
-    kline 系（KREV/P1/P2）无报价恒 None。
+    供未落库逐笔 ev_at_entry 的表聚合时兜底现算：pattern_shadow_signals（HM/S5）按落库
+    报价，kline_shadow_signals（KREV/P1/P2/nextbar）按落库目标窗入场报价（entry_up/down_price）；
+    报价缺失行（如冷启动回补、窗口未对齐）q 空 → None。
     """
     if not q:
         return None
@@ -3170,17 +3178,18 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
         .where(MisalignmentSignal.status == "SETTLED")
         .order_by(MisalignmentSignal.window_start)
     )).all()
-    # KREV（kline_shadow_signals 表，2026-08-28 并入）：K 线反转影子，结算口径为
-    # 次根 K 线涨跌（无报价/无逐笔 EV），列对齐成与上表一致的行结构后合并——
-    # ev/entry 恒 None（前端对应列显示 '—'），direction 读真实列（本族恒 UP）。
+    # KREV/反转/nextbar（kline_shadow_signals 表）：K 线族影子，结算口径为次根 K 线涨跌；
+    # 2026-09-03 起落库目标窗真实入场报价（entry_up/down_price），聚合层按 direction 取
+    # 对应侧 q 现算真实 EV（赢 0.98/q−1 / 输 −1）；报价缺失/冷启动回补行 entry 为 NULL →
+    # 该笔 EV 不计（与旧「纯 K 线无报价」口径兼容）。ev_at_entry 仍未落库（恒 None，兜底现算）。
     krev_rows = (await db.execute(
         sa_select(
             KlineShadowSignal.version,
             KlineShadowSignal.target_bar_start.label("window_start"),
             KlineShadowSignal.win,
             sa_literal(None).label("ev_at_entry"),
-            sa_literal(None).label("entry_down_price"),
-            sa_literal(None).label("entry_up_price"),
+            KlineShadowSignal.entry_down_price.label("entry_down_price"),
+            KlineShadowSignal.entry_up_price.label("entry_up_price"),
             KlineShadowSignal.direction.label("direction"),
         )
         .where(KlineShadowSignal.status == "SETTLED")
@@ -3229,8 +3238,8 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
         for i, s in enumerate(g, 1):
             wins += int(bool(s.win))
             q = s.entry_down_price if s.direction == "DOWN" else s.entry_up_price
-            # EV 优先读落库 ev_at_entry；未落库的表（pattern 系 HM/S5）按落库报价
-            # 兜底现算实现 EV；kline 系无报价仍 None
+            # EV 优先读落库 ev_at_entry；未落库的表（pattern 系 HM/S5、kline 系
+            # KREV/P1/P2/nextbar）按落库报价兜底现算实现 EV；报价缺失行 q 空 → None
             ev = (float(s.ev_at_entry) if s.ev_at_entry is not None
                   else _shadow_realized_ev(v, bool(s.win), float(q) if q else None))
             if ev is not None:

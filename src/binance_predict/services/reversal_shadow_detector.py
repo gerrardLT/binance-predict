@@ -3,10 +3,10 @@
 信号定义（几何口径与 .pytest_tmp/rev_common.compute_features 逐位一致，禁止手抄阈值）：
     rev_p1_v1（P1，15m 连跌4 + 弱阴收 + 量正常 → 押 UP）：
         streak <= -4 AND weak_close_dn AND vol_norm  → 次根 15m 收阳（close>open）即赢
-        720d 回测 62.0% / oos 63.9%（纯 K 线中性价，EV=None）
+        720d 回测 62.0% / oos 63.9%（回测纯 K 线无报价；影子期落目标窗开盘后首次轮询真实报价前向现算 EV）
     rev_p2_v1（P2，15m 连涨5 + 弱阳收贴最高 → 押 DOWN）：
         streak >= +5 AND weak_close_up  → 次根 15m 收阴（close<open）即赢
-        720d 回测 62.4% / oos 61.3%（纯 K 线中性价，EV=None）
+        720d 回测 62.4% / oos 61.3%（回测纯 K 线无报价；影子期落目标窗开盘后首次轮询真实报价前向现算 EV）
 
 口径保真（影子阶段的生命线）：
     几何特征（streak / close_pos / weak_close_dn / weak_close_up / vol_ratio /
@@ -26,7 +26,8 @@ version（rev_p1_v1 / rev_p2_v1），杜绝跨 version 误结算——KREV 硬�
     1. 每 60s 轮询；fetch_recent_klines 按币安服务器时间只返回已收盘 K，
        天然规避边界抢跑（无需本地时钟判断）；
     2. 出现新的已收盘 15m 根 → 拉 40 根 15m → 几何特征求值 → 命中幂等落 PENDING
-       （唯一约束 (version, signal_bar_start) 防重）；
+       （唯一约束 (version, signal_bar_start) 防重），并快照目标窗开盘后首次轮询的
+       UP/DOWN 真实报价（entry_up/down_price，供聚合层现算真实 EV；未对齐/回补 → NULL）；
     3. 已收盘 15m 根的 open_time 命中某 PENDING 的 target_bar_start →
        回读该根 OHLC 按 direction 结算 → SETTLED/EXPIRED；
     4. 冷启动回补最近 12 根（幂等）；超时 PENDING → EXPIRED。
@@ -44,6 +45,7 @@ from sqlalchemy import select as sa_select
 from binance_predict.db.engine import async_session_factory
 from binance_predict.db.models import KlineShadowSignal
 from binance_predict.discovery.data import Klines
+from binance_predict.services.shadow_entry_quote import snapshot_entry_quote
 
 # ---- 冻结口径（几何规则原文，源自 rev_common.compute_features，禁止手抄阈值）----
 # discovery_id：KlineShadowSignal.discovery_id NOT NULL（KREV 用于关联冻结注册表），
@@ -211,8 +213,11 @@ def evaluate_reversals(geo: dict, specs: list[dict], n_tail: int) -> list[dict]:
 class ReversalShadowDetector:
     """P1/P2 反转影子信号检测器：轮询 15m 收盘 → 几何求值/结算，全程只落表不下注。"""
 
-    def __init__(self, collector) -> None:
+    def __init__(self, collector, pm_15m_latest: dict) -> None:
         self._collector = collector
+        # 目标窗入场报价源（只读共享缓存 _pm_15m_latest）：信号落库时快照目标 15m 窗
+        # UP/DOWN 真实报价（窗口对齐守卫），供聚合层现算真实 EV
+        self._pm_15m = pm_15m_latest
         self._running = False
         self._task: asyncio.Task | None = None
         self._last_evaluated_bar: int | None = None  # 已评估过的最大 15m open_time
@@ -332,16 +337,22 @@ class ReversalShadowDetector:
             else:
                 fv = float(val)
                 snapshot[feat] = None if np.isnan(fv) else round(fv, 6)
+        target_bar_start = start_ms + BAR_MS_15M
+        # 目标窗入场报价快照（窗口对齐+近开盘守卫；缺失/回补 → None，该笔 EV 不计）
+        up_q, down_q, q_ts = snapshot_entry_quote(self._pm_15m, target_bar_start)
         session.add(KlineShadowSignal(
             version=spec["version"],
             discovery_id=spec["discovery_id"],
             condition_text=spec["condition_text"],
             timeframe="15m",
             signal_bar_start=start_ms,
-            signal_bar_end=start_ms + BAR_MS_15M,
+            signal_bar_end=target_bar_start,
             direction=spec["direction"],
-            target_bar_start=start_ms + BAR_MS_15M,
+            target_bar_start=target_bar_start,
             feature_snapshot=snapshot,
+            entry_up_price=up_q,
+            entry_down_price=down_q,
+            entry_quote_ts=q_ts,
             status="PENDING",
         ))
         return True

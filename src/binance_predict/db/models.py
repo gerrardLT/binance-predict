@@ -944,6 +944,22 @@ class KlineShadowSignal(Base):
         JSONB, nullable=True,
         comment="触发时特征实际值快照（审计：实时值与离线口径对照）",
     )
+    # 入场报价快照（2026-09-03）：信号落库时刻（目标窗开盘后首次轮询 ~0~60s）从实时
+    # 市场报价缓存快照的目标窗 UP/DOWN 真实报价（窗口对齐+近开盘守卫，缺失/回补为 NULL）。
+    # 使聚合层能按 direction 取对应侧 q 现算真实 EV（赢 0.98/q−1 / 输 −1），替代旧「纯 K 线
+    # 中性价、EV 恒空」口径；KREV/反转/nextbar 三族共用本组列。
+    entry_up_price: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+        comment="目标窗开盘后首次轮询快照的 UP token 报价（押 UP 的入场价；窗口未对齐/缺失为 NULL）",
+    )
+    entry_down_price: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+        comment="同时刻 DOWN token 报价（押 DOWN 的入场价，对称快照；缺失为 NULL）",
+    )
+    entry_quote_ts: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True,
+        comment="入场报价快照时刻（ms）；offset=entry_quote_ts−target_bar_start 可审计入场时点",
+    )
     settle_open: Mapped[float | None] = mapped_column(
         Float, nullable=True, comment="次根开盘价（结算回读）"
     )

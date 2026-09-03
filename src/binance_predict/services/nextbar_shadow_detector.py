@@ -30,7 +30,9 @@
     1. 每 60s 轮询；fetch_recent_klines 按币安服务器时间只返回已收盘 K，天然规避
        边界抢跑（无需本地时钟判断）；
     2. 每个 timeframe（5m/15m）独立：出现新的已收盘根 → 拉 40 根 → 构建特征矩阵
-       （微秒级）→ 条件求值 → 命中幂等落 PENDING（唯一约束 (version, signal_bar_start)）；
+       （微秒级）→ 条件求值 → 命中幂等落 PENDING（唯一约束 (version, signal_bar_start)），
+       并快照目标窗开盘后首次轮询的 UP/DOWN 真实报价（entry_up/down_price，供聚合层
+       现算真实 EV；窗口未对齐/冷启动回补 → NULL 不计）；
     3. 该 timeframe 已收盘根的 open_time 命中某 PENDING 的 target_bar_start →
        回读该根 OHLC 按 direction 结算 → SETTLED/EXPIRED；
     4. 冷启动回补最近 12 根（幂等）；超时 PENDING → EXPIRED。
@@ -50,6 +52,7 @@ from binance_predict.db.models import KlineShadowSignal
 from binance_predict.discovery.data import Klines
 from binance_predict.discovery.features import build_feature_matrix
 from binance_predict.discovery.hypotheses import condition_mask, parse_condition
+from binance_predict.services.shadow_entry_quote import snapshot_entry_quote
 
 # ---- 冻结口径（converge_registry.csv L69 逐字 + 阶段E q0.9 全精度复现，勿手抄渲染值）----
 NEXTBAR_SHADOW_SPECS: list[dict] = [
@@ -137,8 +140,11 @@ def evaluate_conditions(fm, specs: list[dict], n_tail: int) -> list[dict]:
 class NextbarShadowDetector:
     """nextbar 影子信号检测器：轮询 5m/15m 收盘 → 条件求值/结算，全程只落表不下注。"""
 
-    def __init__(self, collector) -> None:
+    def __init__(self, collector, pm_15m_latest: dict, pm_5m_info: dict) -> None:
         self._collector = collector
+        # 目标窗入场报价源（只读共享缓存）：15m→_pm_15m_latest / 5m→_pm_market_info，
+        # 信号落库时按 timeframe 取对应缓存快照 UP/DOWN 真实报价（窗口对齐守卫）
+        self._pm_by_tf: dict[str, dict] = {"5m": pm_5m_info, "15m": pm_15m_latest}
         self._running = False
         self._task: asyncio.Task | None = None
         # 每个 timeframe 独立记录已评估的最大 open_time（5m/15m 收盘节奏不同）
@@ -269,16 +275,24 @@ class NextbarShadowDetector:
             if col is not None and idx < len(col):
                 fv = float(col[idx])
                 snapshot[feat] = None if np.isnan(fv) else round(fv, 6)
+        target_bar_start = start_ms + bar_ms
+        # 目标窗入场报价快照（窗口对齐+近开盘守卫；缺失/回补 → None，该笔 EV 不计）
+        up_q, down_q, q_ts = snapshot_entry_quote(
+            self._pm_by_tf.get(spec["timeframe"]), target_bar_start
+        )
         session.add(KlineShadowSignal(
             version=spec["version"],
             discovery_id=spec["discovery_id"],
             condition_text=spec["condition"],
             timeframe=spec["timeframe"],
             signal_bar_start=start_ms,
-            signal_bar_end=start_ms + bar_ms,
+            signal_bar_end=target_bar_start,
             direction=spec["direction"],
-            target_bar_start=start_ms + bar_ms,
+            target_bar_start=target_bar_start,
             feature_snapshot=snapshot,
+            entry_up_price=up_q,
+            entry_down_price=down_q,
+            entry_quote_ts=q_ts,
             status="PENDING",
         ))
         return True

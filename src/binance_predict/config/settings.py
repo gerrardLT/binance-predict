@@ -349,7 +349,7 @@ class Settings(BaseSettings):
     # (贴最高)→押次根收阴 DOWN（P2）。rev_common 几何口径实时重放，次根收盘按 direction
     # 结算；与 KREV 共表 kline_shadow_signals（version 隔离，各自只认自己的 version 结算）。
     # 只记录不下注，物理隔离于下单路径（不进 X4_VERSIONS/LIVE_CHANNELS）。720d 回测
-    # P1 62.0%/oos 63.9%、P2 62.4%/oos 61.3%（纯 K 线中性价，EV=None）。默认开启：与其他
+    # P1 62.0%/oos 63.9%、P2 62.4%/oos 61.3%（回测纯 K 线无报价；影子期落目标窗真实报价前向现算 EV）。默认开启：与其他
     # 影子信号一致，部署即生效；仅作紧急停用制动力，正常情况下无需触碰。
     reversal_shadow_enabled: bool = True
 

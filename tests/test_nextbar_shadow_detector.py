@@ -238,7 +238,7 @@ async def test_settle_win_on_green_next_bar(monkeypatch) -> None:
     target = 1_700_000_000_000 // 900_000 * 900_000 + 40 * 900_000
     session = _FakeSession(rows=[_pending("15m", target)])
     monkeypatch.setattr(nsd, "async_session_factory", lambda: _FakeSessionCtx(session))
-    d = NextbarShadowDetector(collector=None)
+    d = NextbarShadowDetector(collector=None, pm_15m_latest={}, pm_5m_info={})
     closed = [{"open_time": target, "open": 100.0, "high": 102.0,
                "low": 99.5, "close": 101.5, "volume": 1.0}]
     await d._settle_pending("15m", closed)
@@ -254,7 +254,7 @@ async def test_settle_lose_on_red_next_bar(monkeypatch) -> None:
     target = 1_700_000_000_000 // 300_000 * 300_000 + 40 * 300_000
     session = _FakeSession(rows=[_pending("5m", target)])
     monkeypatch.setattr(nsd, "async_session_factory", lambda: _FakeSessionCtx(session))
-    d = NextbarShadowDetector(collector=None)
+    d = NextbarShadowDetector(collector=None, pm_15m_latest={}, pm_5m_info={})
     closed = [{"open_time": target, "open": 100.0, "high": 100.5,
                "low": 98.5, "close": 99.0, "volume": 1.0}]
     await d._settle_pending("5m", closed)
@@ -268,7 +268,7 @@ async def test_settle_noise_expired(monkeypatch) -> None:
     target = 1_700_000_000_000 // 900_000 * 900_000 + 40 * 900_000
     session = _FakeSession(rows=[_pending("15m", target)])
     monkeypatch.setattr(nsd, "async_session_factory", lambda: _FakeSessionCtx(session))
-    d = NextbarShadowDetector(collector=None)
+    d = NextbarShadowDetector(collector=None, pm_15m_latest={}, pm_5m_info={})
     closed = [{"open_time": target, "open": 100.0, "high": 100.5,
                "low": 99.5, "close": 100.0, "volume": 1.0}]
     await d._settle_pending("15m", closed)
@@ -281,12 +281,70 @@ async def test_record_signal_idempotent(monkeypatch) -> None:
     """已存在 (version, signal_bar_start) → 不重复落行。"""
     session = _FakeSession(scalar=123)  # 存在性查询命中
     monkeypatch.setattr(nsd, "async_session_factory", lambda: _FakeSessionCtx(session))
-    d = NextbarShadowDetector(collector=None)
+    d = NextbarShadowDetector(collector=None, pm_15m_latest={}, pm_5m_info={})
     spec = d._specs[0]  # 15m 冠军
     rows = _flat_rows("15m")
     fm = build_feature_matrix(_to_klines(rows, 900_000), 900_000)
     added = await d._record_signal(session, spec, rows[-1], fm, len(rows) - 1)
     assert added is False and session.added == []
+
+
+@pytest.mark.asyncio
+async def test_record_signal_captures_aligned_entry_quote(monkeypatch) -> None:
+    """目标窗对齐的实时报价缓存 → _record_signal 落库 entry_up/down_price + entry_quote_ts。"""
+    session = _FakeSession(scalar=None)  # 不存在 → 落行
+    monkeypatch.setattr(nsd, "async_session_factory", lambda: _FakeSessionCtx(session))
+    rows = _flat_rows("15m")
+    sig_bar = rows[-1]
+    target = int(sig_bar["open_time"]) + 900_000
+    cache = {"start_date": target, "up_price": 0.57, "down_price": 0.45,
+             "updated_ts": target + 38_000}  # 开盘后 38s，近开盘守卫内
+    d = NextbarShadowDetector(collector=None, pm_15m_latest=cache, pm_5m_info={})
+    fm = build_feature_matrix(_to_klines(rows, 900_000), 900_000)
+    added = await d._record_signal(session, d._specs[0], sig_bar, fm, len(rows) - 1)
+    assert added is True and len(session.added) == 1
+    row = session.added[0]
+    assert row.entry_up_price == 0.57 and row.entry_down_price == 0.45
+    assert row.entry_quote_ts == target + 38_000
+
+
+@pytest.mark.asyncio
+async def test_record_signal_captures_5m_entry_quote(monkeypatch) -> None:
+    """5m 信号按 timeframe 路由到 pm_5m_info 缓存快照（验证双 tf 报价源选择）。"""
+    session = _FakeSession(scalar=None)
+    monkeypatch.setattr(nsd, "async_session_factory", lambda: _FakeSessionCtx(session))
+    rows = _flat_rows("5m")
+    sig_bar = rows[-1]
+    target = int(sig_bar["open_time"]) + 300_000
+    cache5 = {"start_date": target, "up_price": 0.51, "down_price": 0.50,
+              "updated_ts": target + 20_000}
+    d = NextbarShadowDetector(collector=None, pm_15m_latest={}, pm_5m_info=cache5)
+    spec5 = next(s for s in d._specs if s["timeframe"] == "5m")
+    fm = build_feature_matrix(_to_klines(rows, 300_000), 300_000)
+    added = await d._record_signal(session, spec5, sig_bar, fm, len(rows) - 1)
+    assert added is True
+    row = session.added[0]
+    assert row.timeframe == "5m" and row.entry_up_price == 0.51
+    assert row.entry_quote_ts == target + 20_000
+
+
+@pytest.mark.asyncio
+async def test_record_signal_skips_misaligned_quote(monkeypatch) -> None:
+    """缓存窗口与目标窗不对齐（冷启动回补/停在下一窗）→ entry 报价留空，EV 不计（保守）。"""
+    session = _FakeSession(scalar=None)
+    monkeypatch.setattr(nsd, "async_session_factory", lambda: _FakeSessionCtx(session))
+    rows = _flat_rows("15m")
+    sig_bar = rows[-1]
+    target = int(sig_bar["open_time"]) + 900_000
+    cache = {"start_date": target + 900_000, "up_price": 0.57, "down_price": 0.45,
+             "updated_ts": target + 38_000}  # 缓存停在下一窗 → 不对齐
+    d = NextbarShadowDetector(collector=None, pm_15m_latest=cache, pm_5m_info={})
+    fm = build_feature_matrix(_to_klines(rows, 900_000), 900_000)
+    added = await d._record_signal(session, d._specs[0], sig_bar, fm, len(rows) - 1)
+    assert added is True
+    row = session.added[0]
+    assert row.entry_up_price is None and row.entry_down_price is None
+    assert row.entry_quote_ts is None
 
 
 @pytest.mark.asyncio
@@ -296,7 +354,7 @@ async def test_expire_stale_pending(monkeypatch) -> None:
     old = int(_time.time() * 1000) - 10 * 3_600_000
     session = _FakeSession(rows=[_pending("15m", old)])
     monkeypatch.setattr(nsd, "async_session_factory", lambda: _FakeSessionCtx(session))
-    d = NextbarShadowDetector(collector=None)
+    d = NextbarShadowDetector(collector=None, pm_15m_latest={}, pm_5m_info={})
     await d._expire_stale_pending("15m")
     assert session.rows[0].status == "EXPIRED" and session.committed
 

@@ -326,7 +326,7 @@ async def test_settle_p1_win_on_green(monkeypatch) -> None:
     """P1（direction=UP）：次根收阳 → SETTLED win=True。"""
     session = _FakeSession(rows=[_pending("rev_p1_v1", "UP", _TARGET)])
     monkeypatch.setattr(rsd, "async_session_factory", lambda: _FakeSessionCtx(session))
-    d = ReversalShadowDetector(collector=None)
+    d = ReversalShadowDetector(collector=None, pm_15m_latest={})
     closed = [{"open_time": _TARGET, "open": 100.0, "high": 102.0, "low": 99.5, "close": 101.5, "volume": 1.0}]
     await d._settle_pending(closed)
     sig = session.rows[0]
@@ -339,7 +339,7 @@ async def test_settle_p1_lose_on_red(monkeypatch) -> None:
     """P1（UP）：次根收阴 → win=False。"""
     session = _FakeSession(rows=[_pending("rev_p1_v1", "UP", _TARGET)])
     monkeypatch.setattr(rsd, "async_session_factory", lambda: _FakeSessionCtx(session))
-    d = ReversalShadowDetector(collector=None)
+    d = ReversalShadowDetector(collector=None, pm_15m_latest={})
     closed = [{"open_time": _TARGET, "open": 100.0, "high": 100.5, "low": 98.5, "close": 99.0, "volume": 1.0}]
     await d._settle_pending(closed)
     assert session.rows[0].win is False and session.rows[0].settle_outcome == "DOWN"
@@ -350,7 +350,7 @@ async def test_settle_p2_win_on_red(monkeypatch) -> None:
     """P2（direction=DOWN）：次根收阴 → win=True（KREV 硬编码 UP 会误判，此处必须按 direction）。"""
     session = _FakeSession(rows=[_pending("rev_p2_v1", "DOWN", _TARGET)])
     monkeypatch.setattr(rsd, "async_session_factory", lambda: _FakeSessionCtx(session))
-    d = ReversalShadowDetector(collector=None)
+    d = ReversalShadowDetector(collector=None, pm_15m_latest={})
     closed = [{"open_time": _TARGET, "open": 100.0, "high": 100.5, "low": 98.5, "close": 99.0, "volume": 1.0}]
     await d._settle_pending(closed)
     sig = session.rows[0]
@@ -362,7 +362,7 @@ async def test_settle_p2_lose_on_green(monkeypatch) -> None:
     """P2（DOWN）：次根收阳 → win=False（防跨 version 污染的关键反例）。"""
     session = _FakeSession(rows=[_pending("rev_p2_v1", "DOWN", _TARGET)])
     monkeypatch.setattr(rsd, "async_session_factory", lambda: _FakeSessionCtx(session))
-    d = ReversalShadowDetector(collector=None)
+    d = ReversalShadowDetector(collector=None, pm_15m_latest={})
     closed = [{"open_time": _TARGET, "open": 100.0, "high": 102.0, "low": 99.5, "close": 101.5, "volume": 1.0}]
     await d._settle_pending(closed)
     assert session.rows[0].win is False and session.rows[0].settle_outcome == "UP"
@@ -373,7 +373,7 @@ async def test_settle_noise_expired(monkeypatch) -> None:
     """次根平盘（c==o）→ NOISE → EXPIRED，win=None（不进胜率统计）。"""
     session = _FakeSession(rows=[_pending("rev_p1_v1", "UP", _TARGET)])
     monkeypatch.setattr(rsd, "async_session_factory", lambda: _FakeSessionCtx(session))
-    d = ReversalShadowDetector(collector=None)
+    d = ReversalShadowDetector(collector=None, pm_15m_latest={})
     closed = [{"open_time": _TARGET, "open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0, "volume": 1.0}]
     await d._settle_pending(closed)
     sig = session.rows[0]
@@ -385,7 +385,7 @@ async def test_record_signal_fields(monkeypatch) -> None:
     """不存在 → 落 PENDING，字段/快照正确（discovery_id 占位、direction、target=次根）。"""
     session = _FakeSession(scalar=None)
     monkeypatch.setattr(rsd, "async_session_factory", lambda: _FakeSessionCtx(session))
-    d = ReversalShadowDetector(collector=None)
+    d = ReversalShadowDetector(collector=None, pm_15m_latest={})
     rows = _p1_rows()
     geo = _geo(rows)
     added = await d._record_signal(session, P1, rows[11], geo, 11)
@@ -404,7 +404,7 @@ async def test_record_signal_idempotent(monkeypatch) -> None:
     """已存在 (version, signal_bar_start) → 不重复落行。"""
     session = _FakeSession(scalar=123)
     monkeypatch.setattr(rsd, "async_session_factory", lambda: _FakeSessionCtx(session))
-    d = ReversalShadowDetector(collector=None)
+    d = ReversalShadowDetector(collector=None, pm_15m_latest={})
     rows = _p1_rows()
     geo = _geo(rows)
     added = await d._record_signal(session, P1, rows[11], geo, 11)
@@ -418,7 +418,7 @@ async def test_expire_stale_pending(monkeypatch) -> None:
     old = int(_time.time() * 1000) - 10 * 3_600_000
     session = _FakeSession(rows=[_pending("rev_p1_v1", "UP", old)])
     monkeypatch.setattr(rsd, "async_session_factory", lambda: _FakeSessionCtx(session))
-    d = ReversalShadowDetector(collector=None)
+    d = ReversalShadowDetector(collector=None, pm_15m_latest={})
     await d._expire_stale_pending()
     assert session.rows[0].status == "EXPIRED" and session.committed
 
@@ -429,7 +429,7 @@ async def test_backscan_records_and_advances_cursor(monkeypatch) -> None:
     rows = _p1_rows(n=rsd.WARMUP_BARS)
     session = _FakeSession(rows=[], scalar=None)
     monkeypatch.setattr(rsd, "async_session_factory", lambda: _FakeSessionCtx(session))
-    d = ReversalShadowDetector(collector=_FakeCollector(rows))
+    d = ReversalShadowDetector(collector=_FakeCollector(rows), pm_15m_latest={})
     await d._backscan()
     assert len(session.added) == 1
     assert session.added[0].version == "rev_p1_v1"

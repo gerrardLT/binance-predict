@@ -238,7 +238,7 @@ async def test_settle_win_on_green_next_bar(monkeypatch) -> None:
     target = 1_700_000_000_000 // 900_000 * 900_000 + 40 * 900_000
     session = _FakeSession(rows=[_pending(target)])
     monkeypatch.setattr(ksd, "async_session_factory", lambda: _FakeSessionCtx(session))
-    d = KlineShadowDetector(collector=None)
+    d = KlineShadowDetector(collector=None, pm_15m_latest={})
     closed = [{"open_time": target, "open": 100.0, "high": 102.0,
                "low": 99.5, "close": 101.5, "volume": 1.0}]
     await d._settle_pending(closed)
@@ -253,7 +253,7 @@ async def test_settle_lose_on_red_next_bar(monkeypatch) -> None:
     target = 1_700_000_000_000 // 900_000 * 900_000 + 40 * 900_000
     session = _FakeSession(rows=[_pending(target)])
     monkeypatch.setattr(ksd, "async_session_factory", lambda: _FakeSessionCtx(session))
-    d = KlineShadowDetector(collector=None)
+    d = KlineShadowDetector(collector=None, pm_15m_latest={})
     closed = [{"open_time": target, "open": 100.0, "high": 100.5,
                "low": 98.5, "close": 99.0, "volume": 1.0}]
     await d._settle_pending(closed)
@@ -267,7 +267,7 @@ async def test_settle_noise_expired(monkeypatch) -> None:
     target = 1_700_000_000_000 // 900_000 * 900_000 + 40 * 900_000
     session = _FakeSession(rows=[_pending(target)])
     monkeypatch.setattr(ksd, "async_session_factory", lambda: _FakeSessionCtx(session))
-    d = KlineShadowDetector(collector=None)
+    d = KlineShadowDetector(collector=None, pm_15m_latest={})
     closed = [{"open_time": target, "open": 100.0, "high": 100.5,
                "low": 99.5, "close": 100.0, "volume": 1.0}]
     await d._settle_pending(closed)
@@ -280,7 +280,7 @@ async def test_record_signal_idempotent(monkeypatch) -> None:
     """已存在 (version, signal_bar_start) → 不重复落行。"""
     session = _FakeSession(scalar=123)  # 存在性查询命中
     monkeypatch.setattr(ksd, "async_session_factory", lambda: _FakeSessionCtx(session))
-    d = KlineShadowDetector(collector=None)
+    d = KlineShadowDetector(collector=None, pm_15m_latest={})
     spec = d._specs[0]
     rows = _flat_then_drop_rows()
     fm = build_feature_matrix(_to_klines(rows, 900_000), 900_000)
@@ -295,7 +295,7 @@ async def test_expire_stale_pending(monkeypatch) -> None:
     old = int(_time.time() * 1000) - 10 * 3_600_000
     session = _FakeSession(rows=[_pending(old)])
     monkeypatch.setattr(ksd, "async_session_factory", lambda: _FakeSessionCtx(session))
-    d = KlineShadowDetector(collector=None)
+    d = KlineShadowDetector(collector=None, pm_15m_latest={})
     await d._expire_stale_pending()
     assert session.rows[0].status == "EXPIRED" and session.committed
 
