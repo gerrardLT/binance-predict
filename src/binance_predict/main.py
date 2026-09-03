@@ -3041,8 +3041,8 @@ SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     # KREV K 线反转族（2026-08-28；2026-09-03 起落库目标窗真实入场报价）：基准为 720d
     # 发现流水线冻结 holdout（样本外），只钉胜率；bench EV 留 None（无冻结 EV 回测基准；
     # 面板 EV/累计 EV 由落库真实报价前向现算，holdout 参考 EV@0.50：A +0.234 / B +0.219）
-    "krev_a_v1": (0.642, None, "K线反转A: 距前低≤-0.09ATR+5根高效率阴跌+3子阴齐跌 → 押次根收阳（720d holdout n=137 胜率64.2%，月一致性0.957）"),
-    "krev_b_v1": (0.634, None, "K线反转B: 区间贴底+5根高效率阴跌+3子阴齐跌 → 押次根收阳（720d holdout n=134 胜率63.4%）"),
+    "krev_a_v1": (0.642, None, "K线反转A: 距前低≤-0.09ATR+5根高效率阴跌+3子阴齐跌 → 押次根收阳（720d holdout n=137 胜率64.2%，月一致性0.957；EV按目标窗真实报价前向现算）"),
+    "krev_b_v1": (0.634, None, "K线反转B: 区间贴底+5根高效率阴跌+3子阴齐跌 → 押次根收阳（720d holdout n=134 胜率63.4%；EV按目标窗真实报价前向现算）"),
     # HM 上吊线反弹入场族（2026-09-01）：基准为 720d 探索性回测（x=0.25 触及格），
     # 只钉胜率；EV 基准留 None（回测基准=市场隐含代理，与逐触价影子报价口径不直比）
     "hm_touch_down_v1": (0.587, None, "HM上吊线反弹入场: 弱收盘上吊线→次15m周期反弹触及+0.25×ATR→押收跌（720d n=46 触价口径收跌58.7% vs 隐含47.1%，覆盖率~36%，探索性发现待前向验证）"),
@@ -3063,8 +3063,8 @@ SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     # nextbar 族（2026-09-03）：H=1 方向研究冻结条件，落 kline_shadow_signals，次根收阳结算；
     # 同日补目标窗真实入场报价 → 面板 EV 前向现算；bench EV 留 None（无冻结基准），
     # 基准胜率=720d 全样本次根收阳点估计
-    "nb_zschamp_15m_v1": (0.5892, None, "nextbar 15m冠军: zscore_10≤-1.651∧zscore_5≤-1.538∧ret_3≤-0.00395 深超卖反转 → 押次根15m收阳UP（converge_registry L3 ROBUST，holdout P(up_1)=61.96% n=368；720d次根收阳58.92%/2006触发，月一致性0.958/wf1.00）"),
-    "nb_smaslope_5m_v1": (0.4743, None, "nextbar 5m误定价: sma_slope_atr_5≥1.661 短期动量 → 押次根5m收阳UP（阶段E市场报价钝在q̄0.500而Jul-Aug真实P(UP)=0.534，B⁺ t=1.73未达t>3；720d次根收阳仅47.43%/19597触发=长样本反指，edge依赖regime，影子前向验证是否持续）"),
+    "nb_zschamp_15m_v1": (0.5892, None, "nextbar 15m冠军: zscore_10≤-1.651∧zscore_5≤-1.538∧ret_3≤-0.00395 深超卖反转 → 押次根15m收阳UP（converge_registry L3 ROBUST，holdout P(up_1)=61.96% n=368；720d次根收阳58.92%/2006触发，月一致性0.958/wf1.00；EV按目标窗真实报价前向现算）"),
+    "nb_smaslope_5m_v1": (0.4743, None, "nextbar 5m误定价: sma_slope_atr_5≥1.661 短期动量 → 押次根5m收阳UP（阶段E市场报价钝在q̄0.500而Jul-Aug真实P(UP)=0.534，B⁺ t=1.73未达t>3；720d次根收阳仅47.43%/19597触发=长样本反指，edge依赖regime，影子前向验证是否持续；EV按目标窗真实报价前向现算）"),
 }
 # 周期切分点：08-19 00:00 UTC（三根大阳起点）；< 为震荡期（大涨前），≥ 为大涨期
 PUMP_TS_MS = int(datetime(2026, 8, 19, tzinfo=timezone.utc).timestamp() * 1000)
