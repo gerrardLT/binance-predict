@@ -260,7 +260,8 @@ async def test_analytics_empty_db() -> None:
         "quote_contrarian_v3a", "quote_contrarian_v3b", "quote_contrarian_v4",
         "late_night_contrarian_v1", "late_night_contrarian_v2",
         "krev_a_v1", "krev_b_v1", "hm_touch_down_v1", "hm_touch_down_v2",
-        "rev_p1_v1", "rev_p2_v1", "s5_deep_z20_v1", "quote_momentum_v3"}
+        "rev_p1_v1", "rev_p2_v1", "nb_zschamp_15m_v1", "nb_smaslope_5m_v1",
+        "s5_deep_z20_v1", "quote_momentum_v3"}
     for v, blk in out["shadow"].items():
         assert blk["summary"]["n"] == 0
         assert blk["summary"]["win_rate"] is None
@@ -310,6 +311,14 @@ async def test_analytics_empty_db() -> None:
     qm3 = out["shadow"]["quote_momentum_v3"]["summary"]
     assert qm3["bench_winrate"] == 0.802 and qm3["bench_ev"] is None
     assert qm3["desc"].startswith("报价动量v3")
+    # nextbar 族（共表 kline_shadow_signals，15m+5m 双 tf）：720d 次根收阳点估计只钉胜率，
+    # EV 基准留 None（纯 K 线收盘结算无报价，与 KREV/反转同构）
+    nb15 = out["shadow"]["nb_zschamp_15m_v1"]["summary"]
+    assert nb15["bench_winrate"] == 0.5892 and nb15["bench_ev"] is None
+    assert nb15["desc"].startswith("nextbar 15m冠军")
+    nb5 = out["shadow"]["nb_smaslope_5m_v1"]["summary"]
+    assert nb5["bench_winrate"] == 0.4743 and nb5["bench_ev"] is None
+    assert nb5["desc"].startswith("nextbar 5m误定价")
     assert out["scene"] == {}
     assert out["regime"]["phases"] == {}
     assert out["regime"]["by_version"] == {}

@@ -353,6 +353,19 @@ class Settings(BaseSettings):
     # 影子信号一致，部署即生效；仅作紧急停用制动力，正常情况下无需触碰。
     reversal_shadow_enabled: bool = True
 
+    # --- 下一根 K 线方向影子信号（nextbar 族，2026-09-03）---
+    # H=1 方向研究冻结条件实时重放：15m 冠军（zscore_10+zscore_5+ret_3 深超卖反转，
+    # converge_registry L3 ROBUST，holdout P(up_1)=61.96%）押次根 15m 收阳 UP；5m 误定价
+    # 候选（sma_slope_atr_5≥1.66 动量，阶段E市场报价钝在 0.50）押次根 5m 收阳 UP。
+    # build_feature_matrix（k5=None，本族无 path3）+ condition_mask 执行冻结条件原文，
+    # 口径与 720d 回测逐位一致；与 KREV/反转共表 kline_shadow_signals（version+timeframe
+    # 双隔离，各用自己 tf 的 K 线结算，防 5m 次根错结 15m 信号）。只记录不下注，物理
+    # 隔离于下单路径（不进 X4_VERSIONS/LIVE_CHANNELS）。720d 次根收阳：15m 冠军 58.92%
+    # （2006 触发）稳健；5m sma_slope 仅 47.43%（19597 触发，edge 依赖 Jul-Aug regime、
+    # 长样本反指），影子期即前向验证动量误定价是否持续。默认开启：与其他影子信号一致，
+    # 部署即生效；仅作紧急停用制动力，正常情况下无需触碰。
+    nextbar_shadow_enabled: bool = True
+
     # --- 多通道实盘（MultiLiveTrader，2026-08-24，取代旧单版本 quote_edge 实盘字段）---
     # 12 通道（quote_edge v1/v2/v3 × contrarian 系 + momentum × 2 + x4 × 2 + 场景 S1/S5/S2/S4）
     # 可同时开启；每通道独立金额/日限/护栏，通道静态描述见 services/live_channels.py。

@@ -59,6 +59,7 @@ from .services.hm_shadow_detector import HmShadowDetector
 from .services.kline_shadow_detector import KlineShadowDetector
 from .services.misalignment_detector import MisalignmentDetector
 from .services.multi_live_trader import MultiLiveTrader
+from .services.nextbar_shadow_detector import NextbarShadowDetector
 from .services.quote_edge_detector import QuoteEdgeDetector
 from .services.reversal_shadow_detector import ReversalShadowDetector
 from .services.trade_settler import TradeSettler
@@ -153,6 +154,9 @@ hm_shadow_detector: HmShadowDetector | None = None
 
 # 反转形态影子检测器全局实例（P1/P2：15m 连跌/连涨后弱收盘几何反转，只记录不下注）
 reversal_shadow_detector: ReversalShadowDetector | None = None
+
+# 下一根 K 线方向影子检测器全局实例（nextbar 族：15m 冠军 + 5m sma_slope 误定价候选，只记录不下注）
+nextbar_shadow_detector: NextbarShadowDetector | None = None
 
 # 交易结算器全局实例（P0-2：FILLED 订单结算回填输赢/盈亏，常开）
 trade_settler: TradeSettler | None = None
@@ -1134,6 +1138,18 @@ async def lifespan(app: FastAPI):
         await reversal_shadow_detector.start()
         logger.info("反转 K线影子检测器已启动（P1 连跌弱阴→UP 62.0% / P2 连涨弱阳→DOWN 62.4%，影子模式不下注）")
 
+    # 下一根 K 线方向影子信号（nextbar 族，2026-09-03）：H=1 方向研究冻结条件实时重放——
+    # 15m 冠军（zscore_10+zscore_5+ret_3 深超卖反转，holdout P(up_1)=61.96%）押次根 15m
+    # 收阳 UP；5m sma_slope≥1.66 动量误定价候选押次根 5m 收阳 UP。build_feature_matrix
+    # （k5=None）+ condition_mask 执行冻结条件原文，次根收盘按 direction 结算；只记录
+    # 不下注，物理隔离于下单路径（与 KREV/反转共表 kline_shadow_signals，version+timeframe
+    # 双隔离，各用自己 tf 的 K 线结算）。默认开关开启，与其他影子一致。
+    global nextbar_shadow_detector
+    if settings.nextbar_shadow_enabled:
+        nextbar_shadow_detector = NextbarShadowDetector(collector=collector)
+        await nextbar_shadow_detector.start()
+        logger.info("nextbar K线影子检测器已启动（15m 冠军次根收阳 58.92% / 5m sma_slope 47.43% regime 依赖，影子模式不下注）")
+
     # 交易结算器（P0-2）：回读 SentimentWindow 结算 FILLED 订单输赢/盈亏。
     # 无开关常开：行为只读窗口 + 回填结算字段，零资金风险。
     global trade_settler
@@ -1207,6 +1223,9 @@ async def lifespan(app: FastAPI):
     # 停止反转形态影子检测器
     if reversal_shadow_detector is not None:
         await reversal_shadow_detector.stop()
+    # 停止下一根 K 线方向影子检测器
+    if nextbar_shadow_detector is not None:
+        await nextbar_shadow_detector.stop()
     # 停止交易结算器
     if trade_settler is not None:
         await trade_settler.stop()
@@ -3035,6 +3054,10 @@ SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     # 报价动量 v3（2026-09-03）：v1 区间 ∩ 非连涨门禁，落 misalignment_signals，真实报价 EV；
     # 回测修正未来函数后门禁效应≈0（80.2% vs 连涨76.4%，CI重叠），影子前向验证门禁是否真实有效
     "quote_momentum_v3": (0.802, None, "报价动量v3: v1(t90~120s q∈[0.69,0.75))∩末收15m非连涨 → 押DOWN（修正未来函数后回测80.2% vs 连涨76.4%，+3.8pp CI重叠，影子前向验证门禁是否真实有效）"),
+    # nextbar 族（2026-09-03）：H=1 方向研究冻结条件，落 kline_shadow_signals，次根收阳结算，
+    # 无报价 EV=None（纯 K 线中性价，与 KREV/反转同构）；基准=720d 全样本次根收阳点估计
+    "nb_zschamp_15m_v1": (0.5892, None, "nextbar 15m冠军: zscore_10≤-1.651∧zscore_5≤-1.538∧ret_3≤-0.00395 深超卖反转 → 押次根15m收阳UP（converge_registry L3 ROBUST，holdout P(up_1)=61.96% n=368；720d次根收阳58.92%/2006触发，月一致性0.958/wf1.00）"),
+    "nb_smaslope_5m_v1": (0.4743, None, "nextbar 5m误定价: sma_slope_atr_5≥1.661 短期动量 → 押次根5m收阳UP（阶段E市场报价钝在q̄0.500而Jul-Aug真实P(UP)=0.534，B⁺ t=1.73未达t>3；720d次根收阳仅47.43%/19597触发=长样本反指，edge依赖regime，影子前向验证是否持续）"),
 }
 # 周期切分点：08-19 00:00 UTC（三根大阳起点）；< 为震荡期（大涨前），≥ 为大涨期
 PUMP_TS_MS = int(datetime(2026, 8, 19, tzinfo=timezone.utc).timestamp() * 1000)
@@ -3193,6 +3216,7 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
         "hm_touch_down_v1",  # HM 上吊线反弹入场（纯影子，2026-09-01：新表 pattern_shadow_signals）
         "hm_touch_down_v2",  # HM v2：v1+非下跌段∧非低波门禁（纯影子，2026-09-01 后验切片）
         "rev_p1_v1", "rev_p2_v1",  # 反转形态 P1/P2（纯影子，2026-09-03：共表 kline_shadow_signals）
+        "nb_zschamp_15m_v1", "nb_smaslope_5m_v1",  # nextbar 族（纯影子，2026-09-03：共表 kline_shadow_signals，15m+5m 双 tf）
         "s5_deep_z20_v1",  # S5 深档 z5≤−20bp（纯影子，2026-09-03：共表 pattern_shadow_signals）
         "quote_momentum_v3",  # 报价动量 v3 非连涨门禁（纯影子，2026-09-03：misalignment_signals）
     ]

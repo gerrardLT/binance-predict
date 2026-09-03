@@ -4224,6 +4224,8 @@ const SHADOW_META: Record<string, { label: string; color: string }> = {
   rev_p2_v1: { label: 'P2 连涨弱阳反转→DOWN', color: '#ff7f0e' },
   s5_deep_z20_v1: { label: 'S5深档 z5≤-20bp→DOWN', color: '#7f7f7f' },
   quote_momentum_v3: { label: 'A 报价动量v3(非连涨)→DOWN', color: '#e6ab02' },
+  nb_zschamp_15m_v1: { label: 'nextbar 15m冠军 深超卖→UP', color: '#08519c' },
+  nb_smaslope_5m_v1: { label: 'nextbar 5m动量误定价→UP', color: '#a63603' },
 }
 const SCENE_META: Record<string, { label: string; color: string }> = {
   bull_exhaust: { label: 'S1 多头耗尽→DOWN', color: '#1f77b4' },
@@ -4246,6 +4248,8 @@ const ANALYTICS_EXTRA_DESC: Record<string, string> = {
   rev_p2_v1: '反转 P2：15m 连涨 5 根 + 弱阳收盘（贴最高，close_pos≥0.85）→ 押次根 15m 收阴 DOWN 的影子信号，仅记录不下单。rev_common 几何口径实时重放，次根收盘按 direction 结算；与 KREV 共表 kline_shadow_signals（version 隔离）。720d 回测胜率 62.4% / oos 61.3%（纯 K 线中性价，EV 不计）。',
   s5_deep_z20_v1: 'S5 深档：S1 多头耗尽信号 +5min 回落确认，且回落幅度 z5=c5_close/anchor−1≤−20bp（深档）→ 按 +5min 时刻真实 15m DOWN 报价记录押 DOWN 的影子信号，仅记录不下单，次周期 15m 收阴判赢。落 pattern_shadow_signals（entry_state=TOUCHED，借用 HM 结算器）。720d 回测~91.3%（深档样本 EV 偏乐观、含机械成分），影子期即前向验证。',
   quote_momentum_v3: '报价动量 v3：在 v1（触发后 90~120s DOWN 报价 q∈[0.69,0.75)）基础上叠加“非连涨”门禁——用最后已收 15m（触发时刻所属 15m 的前一根，严格防未来函数）判定 close[j]≤close[j−1] 才落表 → 押 DOWN 的影子信号，落 misalignment_signals，按报价 edge 结算。回测修正未来函数后 80.2% vs 连涨 76.4%（+3.8pp，CI 重叠、门禁效应≈0），影子用于前向验证门禁是否真实有效。',
+  nb_zschamp_15m_v1: 'nextbar 15m冠军：zscore_10≤-1.651 ∧ zscore_5≤-1.538 ∧ ret_3≤-0.00395（深超卖+急跌+卖盘衰竭）→ 押次根 15m 收阳 UP 的影子信号，仅记录不下单。源自 H=1 方向研究 converge_registry L3 ROBUST（holdout P(up_1)=61.96% n=368，月一致性 0.958 / walk-forward 1.00）；build_feature_matrix+condition_mask 实时重放冻结条件原文，与 KREV/反转共表 kline_shadow_signals（version+timeframe 隔离）。720d 次根收阳 58.92%（2006 触发，纯 K 线中性价，EV 不计）。',
+  nb_smaslope_5m_v1: 'nextbar 5m误定价：sma_slope_atr_5≥1.661（5 根 SMA 陡峭上行/短期动量）→ 押次根 5m 收阳 UP 的影子信号，仅记录不下单。源自阶段E误定价扫描——市场报价钝在 q̄0.500 而 Jul-Aug 真实 P(UP)=0.534（B⁺ 逐笔 EV t=1.73 未达 t>3 门槛）。注意 720d 全样本次根收阳仅 47.43%（19597 触发，长样本反指），edge 依赖 Jul-Aug regime；影子期前向验证动量误定价是否持续，非背书。',
 }
 const signalDescFor = (kind: 'scene' | 'shadow', key: string): string => {
   if (ANALYTICS_EXTRA_DESC[key]) return ANALYTICS_EXTRA_DESC[key]
