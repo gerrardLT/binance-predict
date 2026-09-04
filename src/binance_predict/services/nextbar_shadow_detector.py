@@ -53,6 +53,7 @@ from binance_predict.discovery.data import Klines
 from binance_predict.discovery.features import build_feature_matrix
 from binance_predict.discovery.hypotheses import condition_mask, parse_condition
 from binance_predict.services.shadow_entry_quote import snapshot_entry_quote
+from binance_predict.services.shadow_version_gate import shadow_gate
 
 # ---- 冻结口径（converge_registry.csv L69 逐字 + 阶段E q0.9 全精度复现，勿手抄渲染值）----
 NEXTBAR_SHADOW_SPECS: list[dict] = [
@@ -259,6 +260,8 @@ class NextbarShadowDetector:
 
     async def _record_signal(self, session, spec: dict, bar: dict, fm, idx: int) -> bool:
         """幂等落 PENDING：唯一约束 (version, signal_bar_start) + 先查后插。"""
+        if not shadow_gate.is_enabled(spec["version"]):
+            return False  # 手动下线：停止采集新信号（历史数据保留）
         start_ms = int(bar["open_time"])
         bar_ms = BAR_MS[spec["timeframe"]]
         exists = (await session.execute(

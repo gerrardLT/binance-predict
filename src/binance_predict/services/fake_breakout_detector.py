@@ -76,6 +76,7 @@ from .data_collector import BinanceDataCollector
 from .live_channels import scene_pattern_to_channel
 from .scene_params import DEFAULT_SCENE_PARAMS, SceneParams
 from .signal_notify import TZ_BJT, has_scene_filled_order, is_live_enabled
+from .shadow_version_gate import shadow_gate
 
 # 超宽限阈值：到期后超过此宽限未结算的信号转 klines 精确补结算路径
 # （周期锚点口径下 P(S)/P(E) 均为历史时点，klines 必然可得，停机无损）
@@ -1195,6 +1196,8 @@ class FakeBreakoutDetector:
         收阴=赢）；本 version 不在 hm 的 ALL_VERSIONS、状态非 WAITING，故不受 hm 入场
         监控/重派影响。幂等：唯一约束 + 先查后插（每父周期至多一行）。
         """
+        if not shadow_gate.is_enabled(S5_DEEP_VERSION):
+            return  # 手动下线：停止采集新信号（历史保留；实盘钩子不受影响）
         signal_bar_start = next_start - 900_000  # 父 S1 周期起点（15m）
         entry_quote = float(down_quote) if down_quote is not None else None
         async with async_session_factory() as session:

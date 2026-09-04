@@ -47,6 +47,7 @@ from binance_predict.discovery.data import Klines
 from binance_predict.discovery.features import build_feature_matrix
 from binance_predict.discovery.hypotheses import condition_mask, parse_condition
 from binance_predict.services.shadow_entry_quote import snapshot_entry_quote
+from binance_predict.services.shadow_version_gate import shadow_gate
 
 # ---- 冻结口径（来自 output/kline_discovery_15m_720d_v2/discovery_registry.csv，勿动）----
 SHADOW_CONDITIONS = [
@@ -238,6 +239,8 @@ class KlineShadowDetector:
 
     async def _record_signal(self, session, spec: dict, bar: dict, fm, idx: int) -> bool:
         """幂等落 PENDING：唯一约束 (version, signal_bar_start) + 先查后插。"""
+        if not shadow_gate.is_enabled(spec["version"]):
+            return False  # 手动下线：停止采集新信号（历史数据保留）
         start_ms = int(bar["open_time"])
         exists = (await session.execute(
             sa_select(KlineShadowSignal.id).where(

@@ -46,6 +46,7 @@ from binance_predict.db.engine import async_session_factory
 from binance_predict.db.models import KlineShadowSignal
 from binance_predict.discovery.data import Klines
 from binance_predict.services.shadow_entry_quote import snapshot_entry_quote
+from binance_predict.services.shadow_version_gate import shadow_gate
 
 # ---- 冻结口径（几何规则原文，源自 rev_common.compute_features，禁止手抄阈值）----
 # discovery_id：KlineShadowSignal.discovery_id NOT NULL（KREV 用于关联冻结注册表），
@@ -320,6 +321,8 @@ class ReversalShadowDetector:
 
     async def _record_signal(self, session, spec: dict, bar: dict, geo: dict, idx: int) -> bool:
         """幂等落 PENDING：唯一约束 (version, signal_bar_start) + 先查后插。"""
+        if not shadow_gate.is_enabled(spec["version"]):
+            return False  # 手动下线：停止采集新信号（历史数据保留）
         start_ms = int(bar["open_time"])
         exists = (await session.execute(
             sa_select(KlineShadowSignal.id).where(

@@ -36,6 +36,7 @@ from sqlalchemy import select as sa_select
 
 from binance_predict.db.engine import async_session_factory
 from binance_predict.db.models import MisalignmentSignal, SentimentWindow
+from binance_predict.services.shadow_version_gate import shadow_gate
 from .signal_notify import (
     fire_signal_email, fmt_bjt, has_live_filled_order, is_fresh_signal, is_live_enabled,
 )
@@ -243,7 +244,7 @@ class MisalignmentDetector:
                     MisalignmentSignal.window_start == start_ms,
                 )
             )
-            if dup.first() is None:
+            if dup.first() is None and shadow_gate.is_enabled("x4_v1"):
                 session.add(MisalignmentSignal(
                     version="x4_v1",
                     window_start=start_ms,
@@ -274,6 +275,8 @@ class MisalignmentDetector:
             )
             if dup2.first() is not None:
                 return
+            if not shadow_gate.is_enabled(X4_V2_VERSION):
+                return  # 手动下线：停止采集新信号（历史数据保留）
             past1h = await _past_1h_chg_pct(session, w)
             if past1h is None or abs(past1h) >= X4_V2_PAST1H_MAX_ABS_PCT:
                 return  # 单边市/门禁数据缺失 → v2 不触发（v1 不受影响）

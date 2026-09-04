@@ -323,6 +323,22 @@ class ToggleLiveRequest(BaseModel):
     )
 
 
+class ToggleShadowRequest(BaseModel):
+    """POST /api/shadow/toggle（影子信号版本手动下线/上线，2026-09-04）。
+
+    下线=检测器停止采集该版本新信号+面板置灰；历史已落库信号不受影响
+    （下线≠删数据）。持久化到 shadow_version_overrides（重启不丢），
+    删行即回落默认在线。版本白名单=SHADOW_BENCH。
+    """
+
+    version: str = Field(
+        description="影子版本名（SHADOW_BENCH 白名单内，如 hm_touch_down_v1 / combo_p1_v1）"
+    )
+    enabled: bool = Field(
+        description="在线=True（采集+面板正常）/ 下线=False（停采集+面板置灰，历史保留）"
+    )
+
+
 class RedeemRequest(BaseModel):
     """POST /api/prediction/redeem（领取获胜 token 奖金，batch-redeem）。
 

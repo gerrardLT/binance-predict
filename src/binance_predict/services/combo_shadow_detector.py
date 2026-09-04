@@ -49,6 +49,7 @@ from sqlalchemy import select as sa_select
 from binance_predict.db.engine import async_session_factory
 from binance_predict.db.models import KlineShadowSignal
 from binance_predict.services.shadow_entry_quote import snapshot_entry_quote
+from binance_predict.services.shadow_version_gate import shadow_gate
 
 # ---- 冻结口径（mr_freeze_bench.py：720d body_bp P80 全精度，勿手抄渲染值）----
 BIG_BODY_BP = 23.46330248119974  # |c-o|/open*1e4 ≥ 此值 = 大实体（研究美元P80冻结版）
@@ -358,6 +359,8 @@ class ComboShadowDetector:
 
     async def _record_signal(self, session, spec: dict, bar: dict, values: dict, idx: int) -> bool:
         """幂等落 PENDING：唯一约束 (version, signal_bar_start) + 先查后插。"""
+        if not shadow_gate.is_enabled(spec["version"]):
+            return False  # 手动下线：停止采集新信号（历史数据保留）
         start_ms = int(bar["open_time"])
         exists = (await session.execute(
             sa_select(KlineShadowSignal.id).where(

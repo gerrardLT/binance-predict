@@ -93,6 +93,7 @@ from sqlalchemy import select as sa_select
 
 from binance_predict.db.engine import async_session_factory
 from binance_predict.db.models import MisalignmentSignal, SentimentWindow
+from binance_predict.services.shadow_version_gate import shadow_gate
 from .btc_regime import regime_feed
 from .signal_notify import (
     fire_signal_email, fmt_bjt, has_live_filled_order, is_fresh_signal, is_live_enabled,
@@ -569,6 +570,8 @@ class QuoteEdgeDetector:
                             )
                         if _pass_streak_guard(streak_klines, quote_ts) is not True:
                             continue  # 门禁未过/数据缺失 → v3 不落（v1 不受影响）
+                    if not shadow_gate.is_enabled(version):
+                        continue  # 手动下线：停止采集该版本（历史数据保留）
                     dup = await session.execute(
                         sa_select(MisalignmentSignal.id).where(
                             MisalignmentSignal.version == version,

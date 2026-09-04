@@ -1245,3 +1245,27 @@ class LiveChannelOverride(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now(),
         comment="最后一次 toggle 生效时刻（配置变更审计）"
     )
+
+
+class ShadowVersionOverride(Base):
+    """影子信号版本的运行时开关覆盖层（前端手动下线/上线，重启不丢）。
+
+    语义：表中有行且 enabled=False → 该版本下线（检测器停止采集新信号、
+    面板置灰）；无行 → 默认在线（回落 settings/代码默认，部署零影响）。
+    删行即恢复默认。与 LiveChannelOverride 同构（影子版，默认值相反：
+    影子默认在线）；历史已落库信号不受影响（下线≠删数据）。
+    """
+    __tablename__ = "shadow_version_overrides"
+
+    version: Mapped[str] = mapped_column(
+        String(24), primary_key=True,
+        comment="影子版本名（SHADOW_BENCH 白名单，如 hm_touch_down_v1 / combo_p1_v1）"
+    )
+    enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True,
+        comment="在线=True（默认，采集+面板正常）/ 下线=False（停采集+面板置灰）"
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+        comment="最后一次 toggle 时刻（审计）"
+    )

@@ -53,6 +53,7 @@ from binance_predict.db.models import PatternShadowSignal
 from binance_predict.discovery.data import Klines
 from binance_predict.discovery.features import atr_series
 from binance_predict.services import clock_sync
+from binance_predict.services.shadow_version_gate import shadow_gate
 
 VERSION = "hm_touch_down_v1"
 VERSION2 = "hm_touch_down_v2"
@@ -347,6 +348,8 @@ class HmShadowDetector:
     async def _record_signal(self, session, bar: dict, atr_val: float, clv_val: float,
                              version: str = VERSION, rule_text: str = RULE_TEXT) -> bool:
         """幂等落 PENDING：唯一约束 (version, signal_bar_start) + 先查后插。"""
+        if not shadow_gate.is_enabled(version):
+            return False  # 手动下线：停止采集新信号（历史数据保留；S5 深档结算不受影响）
         start_ms = int(bar["open_time"])
         exists = (await session.execute(
             sa_select(PatternShadowSignal.id).where(

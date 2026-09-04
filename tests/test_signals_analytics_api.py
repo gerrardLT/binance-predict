@@ -332,6 +332,8 @@ async def test_analytics_empty_db() -> None:
         cb = out["shadow"][ver]["summary"]
         assert cb["bench_winrate"] == bwr and cb["bench_ev"] is None
         assert cb["desc"].startswith(dpre)
+    # 影子开关状态（2026-09-04 前端手动下线能力）：gate 无覆盖行 → 默认全在线
+    assert all(blk["summary"]["enabled"] is True for blk in out["shadow"].values())
     assert out["scene"] == {}
     assert out["regime"]["phases"] == {}
     assert out["regime"]["by_version"] == {}

@@ -278,6 +278,8 @@ interface ShadowVersionBlock {
     n: number; win_rate: number | null; avg_ev: number | null; cum_ev: number | null
     avg_breakeven: number | null; bench_winrate: number | null; bench_ev: number | null
     desc: string
+    // 影子开关（2026-09-04 前端手动下线能力）：下线=停采集+置灰，历史保留
+    enabled?: boolean
   }
   curve: AnalyticsCurvePoint[]
 }
@@ -460,6 +462,13 @@ const api = {
   getBtcKlines: (interval: string, limit: number) =>
     authFetch(`/api/chart/btc-klines?interval=${interval}&limit=${limit}`).then(r => r.json()),
   getSignalsAnalytics: () => authFetch('/api/signals/analytics').then(r => r.json()),
+  // 影子版本手动下线/上线（2026-09-04）：下线=停采集新信号+面板置灰，历史数据保留
+  toggleShadow: (version: string, enabled: boolean) =>
+    authFetch('/api/shadow/toggle', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ version, enabled }),
+    }).then(r => r.json()),
   getPatternCompare: () => authFetch('/api/agent/patterns/compare').then(r => r.json()),
   getPatternBacktestRuns: (patternId: number, limit = 30) =>
     authFetch(`/api/agent/patterns/backtest-runs?pattern_id=${patternId}&limit=${limit}`).then(r => r.json()),
@@ -4516,6 +4525,7 @@ function SignalAnalyticsTab() {
                 <thead>
                   <tr className="border-b border-gray-200 text-gray-500">
                     <th className="py-1 px-2 text-left">版本</th>
+                    <th className="py-1 px-2 text-center">状态</th>
                     <th className="py-1 px-2 text-right">n</th>
                     <th className="py-1 px-2 text-right">胜率</th>
                     <th className="py-1 px-2 text-right">盈亏平衡</th>
@@ -4530,13 +4540,30 @@ function SignalAnalyticsTab() {
                     const s = analytics.shadow[k].summary
                     // bench 可空（后端动态发现的新版本无冻结基准），双非空才计算偏离
                     const dev = s.win_rate != null && s.bench_winrate != null ? s.win_rate - s.bench_winrate : null
+                    // enabled 缺失（旧后端）视为在线，与 gate 默认语义一致
+                    const online = s.enabled !== false
                     return (
-                      <tr key={k} className="border-b border-gray-100 hover:bg-gray-50">
+                      <tr key={k} className={`border-b border-gray-100 hover:bg-gray-50 ${online ? '' : 'opacity-45'}`}>
                         <td className="py-1 px-2 font-medium" style={{ color: m.color }} title={s.desc}>
                           <span className="inline-flex items-center gap-1">
                             {m.label}
                             {signalDescFor('shadow', k) && <HelpHint text={`${k}：${signalDescFor('shadow', k)}`} />}
                           </span>
+                        </td>
+                        <td className="py-1 px-2 text-center">
+                          <button
+                            onClick={async () => { await api.toggleShadow(k, !online); load() }}
+                            className={`px-1.5 py-0.5 rounded text-[10px] font-medium border transition ${
+                              online
+                                ? 'text-green-700 border-green-300 bg-green-50 hover:bg-green-100'
+                                : 'text-gray-500 border-gray-300 bg-gray-50 hover:bg-gray-100'
+                            }`}
+                            title={online
+                              ? '点击下线：停止采集新信号（历史数据保留，曲线照常显示已有样本）'
+                              : '点击上线：恢复采集新信号'}
+                          >
+                            {online ? '在线' : '已下线'}
+                          </button>
                         </td>
                         <td className="py-1 px-2 text-right font-mono">{s.n}</td>
                         <td className="py-1 px-2 text-right font-mono font-bold">{pct1(s.win_rate)}</td>

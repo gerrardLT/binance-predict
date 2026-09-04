@@ -54,6 +54,7 @@ from .models.schemas import (
     TransferInboundRequest,
     TransferOutboundRequest,
     ToggleLiveRequest,
+    ToggleShadowRequest,
 )
 from .services.agent_scheduler import AgentScheduler
 from .services.combo_shadow_detector import ComboShadowDetector
@@ -66,6 +67,7 @@ from .services.multi_live_trader import MultiLiveTrader
 from .services.nextbar_shadow_detector import NextbarShadowDetector
 from .services.quote_edge_detector import QuoteEdgeDetector
 from .services.reversal_shadow_detector import ReversalShadowDetector
+from .services.shadow_version_gate import shadow_gate
 from .services.trade_settler import TradeSettler
 from .services.llm_service import LLMService
 from .services.pattern_reevaluator import pattern_reevaluator
@@ -1067,6 +1069,10 @@ async def lifespan(app: FastAPI):
         # v3 通道保守不开火，与影子「collector 缺失不落 v3」同口径）
         multi_live_trader.kline_fetcher = collector.fetch_recent_klines
 
+    # 影子版本开关 gate（前端手动下线能力）：先于所有影子检测器启动，保证首轮
+    # 落库判定可用；DB 故障保守全在线（fail-safe，不停采集）。
+    await shadow_gate.start()
+
     # 场景信号系统：4h 破位记 pending → 15m 周期收盘确认 → 次周期信号（不下注）
     global fake_breakout_detector
     if settings.fake_breakout_enabled:
@@ -1258,6 +1264,8 @@ async def lifespan(app: FastAPI):
     # 停止组合条件影子检测器
     if combo_shadow_detector is not None:
         await combo_shadow_detector.stop()
+    # 停止影子版本开关 gate（所有影子检测器已停，最后收后台刷新任务）
+    await shadow_gate.stop()
     # 停止交易结算器
     if trade_settler is not None:
         await trade_settler.stop()
@@ -2246,6 +2254,31 @@ async def live_toggle(
             f" 护栏 {_ch['max_exec_price']}）"
         ),
         "status": _status,
+    }
+
+
+@app.post("/api/shadow/toggle")
+async def shadow_toggle(
+    req: ToggleShadowRequest,
+    _: None = Depends(_require_auth),
+):
+    """手动下线/上线影子信号版本（2026-09-04：前端影子管理能力）。
+
+    下线=各检测器停止采集该版本新信号（落库前 gate 拦截）+面板置灰；
+    历史已落库信号不受影响（下线≠删数据，曲线照常显示已有样本）。
+    白名单=SHADOW_BENCH；持久化 shadow_version_overrides（重启不丢），
+    gate 缓存本进程立即生效，多 worker 靠 60s TTL 收敛。
+    """
+    if req.version not in SHADOW_BENCH:
+        raise HTTPException(status_code=422, detail=f"未知影子版本: {req.version}")
+    await shadow_gate.set_enabled(req.version, req.enabled)
+    return {
+        "message": (
+            f"影子版本 {req.version} 已{'上线' if req.enabled else '下线'}"
+            f"（{'恢复采集新信号' if req.enabled else '停止采集新信号，历史数据保留'}）"
+        ),
+        "version": req.version,
+        "enabled": req.enabled,
     }
 
 
@@ -3297,6 +3330,8 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
                 "cum_ev": round(cum_ev, 4) if evs else None,
                 "avg_breakeven": sum(bes) / len(bes) if bes else None,
                 "bench_winrate": bwr, "bench_ev": bev, "desc": desc,
+                # 影子开关状态（前端手动下线能力）：下线版本置灰+可重新上线
+                "enabled": shadow_gate.is_enabled(v),
             },
             "curve": curve[-_CURVE_MAX_POINTS:],
         }
