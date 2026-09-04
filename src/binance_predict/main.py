@@ -1,15 +1,18 @@
 """
-BTC 5min LLM 预测系统 V3 - FastAPI 主应用
+BTC 预测市场多通道实盘 + 影子信号系统 - FastAPI 主应用
 
 系统入口文件，负责：
-1. 初始化服务（数据采集、情绪Agent Loop、交易执行）
-2. 管理应用生命周期（lifespan）：启动AgentScheduler驱动的四阶段闭环
+1. 初始化服务（数据采集、多通道实盘执行器、影子检测器、交易结算）
+2. 管理应用生命周期（lifespan）：装配并启动 MultiLiveTrader（15 通道实盘）
+   + 多个影子检测器（KREV/HM/反转/nextbar/X4/报价 edge，只记录不下注）
+   + 场景检测器（FakeBreakoutDetector）；AgentScheduler 四阶段闭环仅在
+   agent_loop_enabled=True 时启动（2026-08-16 起默认退役）
 3. 注册 API 路由
 
-核心引擎：情绪曲线自进化 Agent Loop（SentimentAgent + AgentScheduler），
-由预测市场采样(_prediction_market_tracker)/归档(_sentiment_window_archiver)
-事件驱动，全自动运转。概率动量分析（MomentumService）作为独立备选方案，
-仅支持手动触发，不参与自动决策。
+核心引擎：MultiLiveTrader 多通道实盘执行器（真单），三族触发——quote_edge
+（5m 报价区间命中）/ x4（错位影子 PENDING 轮询）/ scene（假突破钩子）。
+情绪窗口归档器持续运行，作为场景信号的 4h 位势数据源。概率动量分析
+（MomentumService）为手动接口，不参与自动决策。
 """
 
 from __future__ import annotations
@@ -161,7 +164,7 @@ nextbar_shadow_detector: NextbarShadowDetector | None = None
 # 交易结算器全局实例（P0-2：FILLED 订单结算回填输赢/盈亏，常开）
 trade_settler: TradeSettler | None = None
 
-# 多通道实盘执行器全局实例（MultiLiveTrader：12 通道三族触发，
+# 多通道实盘执行器全局实例（MultiLiveTrader：15 通道三族触发，
 # 通道开关/金额/日限各自独立，启动回落 LIVE_CHANNELS_JSON，默认全关）
 multi_live_trader: MultiLiveTrader | None = None
 
@@ -1257,8 +1260,8 @@ async def lifespan(app: FastAPI):
 # ============================================================
 
 app = FastAPI(
-    title="BTC 5min LLM 预测系统 V3",
-    description="LLM 驱动的 BTC 5 分钟方向预测，支持用户自定义规则注入",
+    title="BTC 预测市场多通道实盘 + 影子信号系统",
+    description="多通道实盘执行（MultiLiveTrader 15 通道）+ 影子信号检测 + 场景信号；情绪 Agent Loop 已退役",
     version="3.0.0",
     lifespan=lifespan,
 )

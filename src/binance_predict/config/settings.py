@@ -367,7 +367,7 @@ class Settings(BaseSettings):
     nextbar_shadow_enabled: bool = True
 
     # --- 多通道实盘（MultiLiveTrader，2026-08-24，取代旧单版本 quote_edge 实盘字段）---
-    # 12 通道（quote_edge v1/v2/v3 × contrarian 系 + momentum × 2 + x4 × 2 + 场景 S1/S5/S2/S4）
+    # 15 通道（quote_edge 族 8：contrarian v1/v2/v3a/v3b/v4 + momentum v1/v2/v3；x4 × 2；场景 5：S1/S2/S4/S5 + s5_deep）
     # 可同时开启；每通道独立金额/日限/护栏，通道静态描述见 services/live_channels.py。
     # 每通道每窗至多一单（内存 + DB 唯一约束双保险）。
     # 每通道默认单注（USDT，硬上限 50 拒启，同旧哲学：不靠自律靠拒启）

@@ -1352,7 +1352,7 @@ interface PnlCurveData {
   total: { settled_count: number; total_pnl: number; win_rate: number | null }
 }
 
-// 通道曲线色板（按 total_pnl 排序后的顺序取色，最多 12 通道）
+// 通道曲线色板（按 total_pnl 排序后取色；12 色，通道数 >12 时按 idx % 12 循环复用）
 const PNL_COLORS = ['#2563eb', '#16a34a', '#dc2626', '#9333ea', '#ea580c',
   '#0d9488', '#d946ef', '#6366f1', '#ca8a04', '#059669', '#e11d48', '#0284c7']
 

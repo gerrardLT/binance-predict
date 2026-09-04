@@ -1,5 +1,7 @@
 # 运行安全与死代码清理 Implementation Plan
 
+> ⚠️ **历史文档（2026-07-10，已被超越）**：本计划针对当时的「Agent Loop 架构」，该架构已于 2026-08-16 退役（`agent_loop_enabled=False`）；当前主线为多通道实盘（`MultiLiveTrader`）+ 影子信号检测器 + 场景信号。本文保留作历史记录，不代表当前实现——现状见根目录 `README.md` 与 `AGENTS.md`。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 默认禁止 Agent 自动下单，并移除路径 A 遗留代码、依赖和配置，使测试与文档反映当前 Agent Loop 架构。

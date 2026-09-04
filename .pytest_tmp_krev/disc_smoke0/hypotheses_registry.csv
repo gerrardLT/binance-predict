@@ -1,3 +1,0 @@
-id,round,family,atoms,expect,target_family,mechanism,pre_reg_hash,status,death_cause
-R1-ATOMS,R1,atomized,,,,,,1003 个原子进入 L1 漏斗,
-R3-T1,,冒烟,doji == True AND inside_bar == True,down,reversal,test,39d01e9741948e90,WEAK,holdout 未确认

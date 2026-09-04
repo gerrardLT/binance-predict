@@ -1,6 +1,6 @@
 """多通道实盘执行器（MultiLiveTrader，2026-08-24 取代单版本 QuoteEdgeLiveTrader）。
 
-13 通道（通道注册表见 live_channels.py）可同时开启，每通道独立
+15 通道（通道注册表见 live_channels.py）可同时开启，每通道独立
 金额/日限/护栏/开关；通道 ID 与影子信号版本名对齐（订单 signal_version
 直接用通道名，实盘 vs 影子对账天然一致）。三族触发机制并存：
 

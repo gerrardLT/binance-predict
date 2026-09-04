@@ -16,12 +16,12 @@ BTC 预测市场（Binance Prediction）自动化交易系统。**真金实盘�
 
 ## 架构
 
-- `src/binance_predict/main.py` — FastAPI 路由与启动装配（超大单文件 ~3900 行；新增端点按既有分块注释风格就近插入）
+- `src/binance_predict/main.py` — FastAPI 路由与启动装配（超大单文件 ~4150 行；新增端点按既有分块注释风格就近插入）
 - `src/binance_predict/services/` — 业务核心：
   - `prediction_trading.py` — 下单链路：占位→报价→护栏→币安下单→落库
   - `multi_live_trader.py` — 多通道实盘调度；**通道注册表的口径源是 `live_channels.py`**
   - `quote_edge_detector.py` — 5m 窗口报价边缘检测
-- `frontend/src/App.tsx` — 前端唯一源文件（~4100 行，React 19 + Tailwind + recharts）；新组件进此文件，沿用「分块注释 + 就近放置」格局
+- `frontend/src/App.tsx` — 前端唯一源文件（~4700 行，React 19 + Tailwind + recharts）；新组件进此文件，沿用「分块注释 + 就近放置」格局
 - `tests/` — pytest + pytest-asyncio；实盘链路测试模式参照 `tests/test_multi_live_trader.py` 的 `_make_real_trader(monkeypatch)` 替身
 - `alembic/versions/` — DB 迁移；`scripts/` — 一次性/评估脚本（非运行时依赖）
 - `output/`、`logs/`、`.pytest_tmp/` — 运行产物与工作草稿区，不清理、不提交
