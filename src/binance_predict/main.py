@@ -3070,6 +3070,70 @@ async def get_prediction_market_chart_15m(
     }
 
 
+@app.get("/api/chart/prediction-market/samples")
+async def get_prediction_market_samples(
+    period: str = "5m",
+    since: int = 0,
+    limit: int = 400,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    历史采样导出（研究只读）：按 period 从 prediction_market_samples 查真实报价 + 量能。
+
+    与 /api/chart/prediction-market/15m 同源同翻页协议，差异：
+      - period 可选 5m | 15m（默认 5m）——补上此前只有 15m 能导出的缺口；
+      - points 额外含 participants / trade_volume（量能维度，供「报价欠反应 × 量能」
+        研究区分真吸收 vs 低流动性），字段与 5m 内存图表 /api/chart/prediction-market 对齐；
+      - 采样表实际保留约 3 周（非旧注释所说的 1 小时），since>0 时正序翻页，
+        配合响应 oldest_ts 可遍历全量历史。
+
+    纯 SELECT、无副作用；不改动任何既有端点的响应结构。
+    """
+    from sqlalchemy import asc as sa_asc, desc as sa_desc, select as sa_select
+
+    period = period if period in ("5m", "15m") else "5m"
+    limit = max(1, min(limit, 50_000))
+
+    def _pt(s: PredictionMarketSample) -> dict:
+        return {
+            "timestamp": s.timestamp,
+            "up_price": s.up_price,
+            "down_price": s.down_price,
+            "up_pct": s.up_pct,
+            "down_pct": s.down_pct,
+            "participants": s.participants,
+            "trade_volume": s.trade_volume,
+            "btc_price": s.btc_price,
+        }
+
+    if since > 0:
+        stmt = (
+            sa_select(PredictionMarketSample)
+            .where(PredictionMarketSample.market_period == period)
+            .where(PredictionMarketSample.timestamp >= since)
+            .order_by(sa_asc(PredictionMarketSample.timestamp))
+            .limit(limit)
+        )
+        rows = (await db.execute(stmt)).scalars().all()
+        points = [_pt(s) for s in rows]
+    else:
+        stmt = (
+            sa_select(PredictionMarketSample)
+            .where(PredictionMarketSample.market_period == period)
+            .order_by(sa_desc(PredictionMarketSample.timestamp))
+            .limit(limit)
+        )
+        rows = (await db.execute(stmt)).scalars().all()
+        points = [_pt(s) for s in reversed(rows)]
+    return {
+        "symbol": settings.symbol,
+        "period": period,
+        "poll_interval_sec": 15,
+        "points": points,
+        "oldest_ts": points[0]["timestamp"] if points else None,
+    }
+
+
 # ============================================================
 # 信号分析面板 API（胜率曲线 × BTC K线 × 周期归因）
 # 口径与 scripts/local_shadow_full_analysis.py、local_scene_signal_full_analysis.py
