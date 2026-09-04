@@ -4226,6 +4226,11 @@ const SHADOW_META: Record<string, { label: string; color: string }> = {
   quote_momentum_v3: { label: 'A 报价动量v3(非连涨)→DOWN', color: '#e6ab02' },
   nb_zschamp_15m_v1: { label: 'nextbar 15m冠军 深超卖→UP', color: '#08519c' },
   nb_smaslope_5m_v1: { label: 'nextbar 5m动量误定价→UP', color: '#a63603' },
+  combo_p1_v1: { label: 'combo P1 周末连阳过热→DOWN', color: '#393b79' },
+  combo_p2_v1: { label: 'combo P2 周末大阳→DOWN', color: '#637939' },
+  combo_p3_v1: { label: 'combo P3 贴高美盘→DOWN', color: '#8c6d31' },
+  combo_p4_v1: { label: 'combo P4 周末超卖→UP', color: '#843c39' },
+  combo_p5_v1: { label: 'combo P5 光脚超卖→UP', color: '#7b4173' },
 }
 const SCENE_META: Record<string, { label: string; color: string }> = {
   bull_exhaust: { label: 'S1 多头耗尽→DOWN', color: '#1f77b4' },
@@ -4250,6 +4255,11 @@ const ANALYTICS_EXTRA_DESC: Record<string, string> = {
   quote_momentum_v3: '报价动量 v3：在 v1（触发后 90~120s DOWN 报价 q∈[0.69,0.75)）基础上叠加“非连涨”门禁——用最后已收 15m（触发时刻所属 15m 的前一根，严格防未来函数）判定 close[j]≤close[j−1] 才落表 → 押 DOWN 的影子信号，落 misalignment_signals，按报价 edge 结算。回测修正未来函数后 80.2% vs 连涨 76.4%（+3.8pp，CI 重叠、门禁效应≈0），影子用于前向验证门禁是否真实有效。',
   nb_zschamp_15m_v1: 'nextbar 15m冠军：zscore_10≤-1.651 ∧ zscore_5≤-1.538 ∧ ret_3≤-0.00395（深超卖+急跌+卖盘衰竭）→ 押次根 15m 收阳 UP 的影子信号，仅记录不下单。源自 H=1 方向研究 converge_registry L3 ROBUST（holdout P(up_1)=61.96% n=368，月一致性 0.958 / walk-forward 1.00）；build_feature_matrix+condition_mask 实时重放冻结条件原文，与 KREV/反转共表 kline_shadow_signals（version+timeframe 隔离）。720d 次根收阳 58.92%（2006 触发，EV 按目标窗开盘后首次轮询的真实报价前向现算：赢 0.98/q−1 / 输 −1）。',
   nb_smaslope_5m_v1: 'nextbar 5m误定价：sma_slope_atr_5≥1.661（5 根 SMA 陡峭上行/短期动量）→ 押次根 5m 收阳 UP 的影子信号，仅记录不下单。源自阶段E误定价扫描——市场报价钝在 q̄0.500 而 Jul-Aug 真实 P(UP)=0.534（B⁺ 逐笔 EV t=1.73 未达 t>3 门槛）。注意 720d 全样本次根收阳仅 47.43%（19597 触发，长样本反指），edge 依赖 Jul-Aug regime；影子期前向验证动量误定价是否持续，非背书。EV 按目标窗开盘后首次轮询的真实报价前向现算：赢 0.98/q−1 / 输 −1。',
+  combo_p1_v1: 'combo 组合 P1：连阳 3 根以上 ∧ 周末（UTC）∧ EMA20 乖离≥+0.3%（短线过热）→ 押次根 15m 收阴 DOWN 的影子信号，仅记录不下单。源自 45 维条件大搜索（720d 三三组合全扫）+ 1443 天样本外考试 + 50 次置换检验三重过滤后存活的“真层”——胜率来自时间×动量维度而非 K 线形态。720d n=490 胜率 63.9% / 样本外 n=1588 胜率 60.6%；EV 按目标窗开盘后首次轮询的真实报价前向现算：赢 0.98/q−1 / 输 −1。',
+  combo_p2_v1: 'combo 组合 P2：大实体（body_bp≥23.46，研究美元 P80 的冻结口径）∧ 连阳 3 根以上 ∧ 周末 → 押次根 15m 收阴 DOWN 的影子信号，仅记录不下单。P1 的加强版（实体更大）。720d n=206 胜率 66.5% / 样本外 n=957 胜率 60.5%；EV 按目标窗开盘后首次轮询的真实报价前向现算：赢 0.98/q−1 / 输 −1。',
+  combo_p3_v1: 'combo 组合 P3：贴 1 天高点（≤0.1%）∧ 美盘时段（UTC 16 点后）∧ 7 天涨≥4%（高位+中期动量衰减）→ 押次根 15m 收阴 DOWN 的影子信号，仅记录不下单。45 维大搜索存活组合（不依赖周末）。720d n=176 胜率 68.2% / 样本外 n=212 胜率 59.4%；EV 按目标窗开盘后首次轮询的真实报价前向现算：赢 0.98/q−1 / 输 −1。',
+  combo_p4_v1: 'combo 组合 P4：收低位（收盘在整根 K 线 1/4 以下）∧ 周末 ∧ RSI14≤25（超卖）→ 押次根 15m 收阳 UP 的影子信号，仅记录不下单。周末超卖反弹组合，与 P1 方向相反（对照组）。720d n=322 胜率 62.7% / 样本外 n=459 胜率 63.6%；EV 按目标窗开盘后首次轮询的真实报价前向现算：赢 0.98/q−1 / 输 −1。',
+  combo_p5_v1: 'combo 组合 P5：近光脚（下影≤5%）∧ 周末 ∧ RSI14≤25 → 押次根 15m 收阳 UP 的影子信号，仅记录不下单。P4 同簇的严格版（无下影=更干净的超卖），与 P4 并行采集、影子期用实数据对比两口径孰优。720d n=131 胜率 68.7% / 样本外 n=142 胜率 64.8%；EV 按目标窗开盘后首次轮询的真实报价前向现算：赢 0.98/q−1 / 输 −1。',
 }
 const signalDescFor = (kind: 'scene' | 'shadow', key: string): string => {
   if (ANALYTICS_EXTRA_DESC[key]) return ANALYTICS_EXTRA_DESC[key]

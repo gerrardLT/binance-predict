@@ -366,6 +366,18 @@ class Settings(BaseSettings):
     # 部署即生效；仅作紧急停用制动力，正常情况下无需触碰。
     nextbar_shadow_enabled: bool = True
 
+    # --- 组合条件影子信号（combo 族，2026-09-04）---
+    # 45 维条件大搜索（grand_search_v2：720d 三三组合扫描）+ 1443 天样本外考试
+    # （2020-10~2024-09）+ 50 次置换检验三重过滤后存活的 5 个组合实时重放：
+    # P1 连阳3+∧周末∧EMA20乖离≥+0.3%、P2 大实体(body_bp≥23.46 冻结)∧连阳3+∧周末、
+    # P3 贴1天高∧美盘∧7d涨≥4%（均押次根 15m 收阴 DOWN）；P4 收低位∧周末∧RSI14≤25、
+    # P5 近光脚∧周末∧RSI14≤25（均押次根 15m 收阳 UP）。自包含特征与研究口径逐字
+    # 一致（硬闸门测试重放 720d 触发计数 490/206/176/322/131），轻探测轮询仅新收盘根
+    # 拉 700 根。只记录不下注，物理隔离于下单路径（不进 X4_VERSIONS/LIVE_CHANNELS）。
+    # 720d 胜率 62.7~68.7% / oos 59.4~64.8%，影子期即前向验证。默认开启：与其他
+    # 影子信号一致，部署即生效；仅作紧急停用制动力，正常情况下无需触碰。
+    combo_shadow_enabled: bool = True
+
     # --- 多通道实盘（MultiLiveTrader，2026-08-24，取代旧单版本 quote_edge 实盘字段）---
     # 15 通道（quote_edge 族 8：contrarian v1/v2/v3a/v3b/v4 + momentum v1/v2/v3；x4 × 2；场景 5：S1/S2/S4/S5 + s5_deep）
     # 可同时开启；每通道独立金额/日限/护栏，通道静态描述见 services/live_channels.py。

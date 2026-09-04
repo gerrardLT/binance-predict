@@ -4,7 +4,7 @@ BTC 预测市场多通道实盘 + 影子信号系统 - FastAPI 主应用
 系统入口文件，负责：
 1. 初始化服务（数据采集、多通道实盘执行器、影子检测器、交易结算）
 2. 管理应用生命周期（lifespan）：装配并启动 MultiLiveTrader（15 通道实盘）
-   + 多个影子检测器（KREV/HM/反转/nextbar/X4/报价 edge，只记录不下注）
+   + 多个影子检测器（KREV/HM/反转/nextbar/combo/X4/报价 edge，只记录不下注）
    + 场景检测器（FakeBreakoutDetector）；AgentScheduler 四阶段闭环仅在
    agent_loop_enabled=True 时启动（2026-08-16 起默认退役）
 3. 注册 API 路由
@@ -56,6 +56,7 @@ from .models.schemas import (
     ToggleLiveRequest,
 )
 from .services.agent_scheduler import AgentScheduler
+from .services.combo_shadow_detector import ComboShadowDetector
 from .services.data_collector import BinanceDataCollector
 from .services.fake_breakout_detector import FakeBreakoutDetector
 from .services.hm_shadow_detector import HmShadowDetector
@@ -160,6 +161,9 @@ reversal_shadow_detector: ReversalShadowDetector | None = None
 
 # 下一根 K 线方向影子检测器全局实例（nextbar 族：15m 冠军 + 5m sma_slope 误定价候选，只记录不下注）
 nextbar_shadow_detector: NextbarShadowDetector | None = None
+
+# 组合条件影子检测器全局实例（combo 族：45 维大搜索存活 5 组合，只记录不下注）
+combo_shadow_detector: ComboShadowDetector | None = None
 
 # 交易结算器全局实例（P0-2：FILLED 订单结算回填输赢/盈亏，常开）
 trade_settler: TradeSettler | None = None
@@ -1159,6 +1163,22 @@ async def lifespan(app: FastAPI):
         await nextbar_shadow_detector.start()
         logger.info("nextbar K线影子检测器已启动（15m 冠军次根收阳 58.92% / 5m sma_slope 47.43% regime 依赖，影子模式不下注）")
 
+    # 组合条件影子信号（combo 族，2026-09-04）：45 维条件大搜索（grand_search_v2）
+    # + 1443 天样本外考试 + 50 次置换检验存活 5 组合实时重放——P1 连阳3+∧周末∧乖离
+    # ≥+0.3%、P2 大实体(bp冻结)∧连阳3+∧周末、P3 贴1天高∧美盘∧7d涨≥4%（押次根
+    # 15m 收阴 DOWN）；P4 收低位∧周末∧RSI14≤25、P5 近光脚∧周末∧RSI14≤25（押次根
+    # 15m 收阳 UP）。自包含特征与研究口径逐字一致（硬闸门测试重放 720d 触发计数），
+    # 轻探测轮询仅新收盘根拉 700 根；次根收盘按 direction 结算。只记录不下注，与
+    # KREV/反转/nextbar 共表 kline_shadow_signals（version 隔离）。默认开关开启。
+    global combo_shadow_detector
+    if settings.combo_shadow_enabled:
+        combo_shadow_detector = ComboShadowDetector(
+            collector=collector,
+            pm_15m_latest=_pm_15m_latest,
+        )
+        await combo_shadow_detector.start()
+        logger.info("combo 组合影子检测器已启动（5 组合 3DOWN/2UP，720d 62.7~68.7% / oos 59.4~64.8%，影子模式不下注）")
+
     # 交易结算器（P0-2）：回读 SentimentWindow 结算 FILLED 订单输赢/盈亏。
     # 无开关常开：行为只读窗口 + 回填结算字段，零资金风险。
     global trade_settler
@@ -1235,6 +1255,9 @@ async def lifespan(app: FastAPI):
     # 停止下一根 K 线方向影子检测器
     if nextbar_shadow_detector is not None:
         await nextbar_shadow_detector.stop()
+    # 停止组合条件影子检测器
+    if combo_shadow_detector is not None:
+        await combo_shadow_detector.stop()
     # 停止交易结算器
     if trade_settler is not None:
         await trade_settler.stop()
@@ -3068,6 +3091,15 @@ SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     # 基准胜率=720d 全样本次根收阳点估计
     "nb_zschamp_15m_v1": (0.5892, None, "nextbar 15m冠军: zscore_10≤-1.651∧zscore_5≤-1.538∧ret_3≤-0.00395 深超卖反转 → 押次根15m收阳UP（converge_registry L3 ROBUST，holdout P(up_1)=61.96% n=368；720d次根收阳58.92%/2006触发，月一致性0.958/wf1.00；EV按目标窗真实报价前向现算）"),
     "nb_smaslope_5m_v1": (0.4743, None, "nextbar 5m误定价: sma_slope_atr_5≥1.661 短期动量 → 押次根5m收阳UP（阶段E市场报价钝在q̄0.500而Jul-Aug真实P(UP)=0.534，B⁺ t=1.73未达t>3；720d次根收阳仅47.43%/19597触发=长样本反指，edge依赖regime，影子前向验证是否持续；EV按目标窗真实报价前向现算）"),
+    # combo 组合族（2026-09-04）：45 维条件大搜索（grand_search_v2，720d 三三组合扫描）
+    # + 1443 天样本外考试 + 50 次置换检验三重过滤存活 5 组合，落 kline_shadow_signals，
+    # 次根收盘按 direction 结算（DOWN收阴赢/UP收阳赢）；基准胜率=720d 冻结口径点估计、
+    # oos=2020-10~2024-09 样本外（bench EV 留 None 无冻结基准，面板 EV 前向现算）
+    "combo_p1_v1": (0.639, None, "combo组合P1: 连阳3+∧周末∧EMA20乖离≥+0.3% → 押次根15m收阴DOWN（720d n=490 63.9%/oos n=1588 60.6%；时间×动量维度组合非K线形态，45维搜索存活真层；EV按目标窗真实报价前向现算）"),
+    "combo_p2_v1": (0.665, None, "combo组合P2: 大实体(body_bp≥23.46)∧连阳3+∧周末 → 押次根15m收阴DOWN（720d n=206 66.5%/oos n=957 60.5%；大实体为研究美元P80的bp冻结口径；EV按目标窗真实报价前向现算）"),
+    "combo_p3_v1": (0.682, None, "combo组合P3: 贴1天高∧美盘(UTC h≥16)∧7d涨≥4% → 押次根15m收阴DOWN（720d n=176 68.2%/oos n=212 59.4%；高位+美盘时段+中期动量衰减；EV按目标窗真实报价前向现算）"),
+    "combo_p4_v1": (0.627, None, "combo组合P4: 收低位(pos≤0.25)∧周末∧RSI14≤25 → 押次根15m收阳UP（720d n=322 62.7%/oos n=459 63.6%；周末超卖反弹；EV按目标窗真实报价前向现算）"),
+    "combo_p5_v1": (0.687, None, "combo组合P5: 近光脚∧周末∧RSI14≤25 → 押次根15m收阳UP（720d n=131 68.7%/oos n=142 64.8%；P4同簇严格版（下影≤5%），影子期实数据对比两口径；EV按目标窗真实报价前向现算）"),
 }
 # 周期切分点：08-19 00:00 UTC（三根大阳起点）；< 为震荡期（大涨前），≥ 为大涨期
 PUMP_TS_MS = int(datetime(2026, 8, 19, tzinfo=timezone.utc).timestamp() * 1000)
@@ -3114,7 +3146,7 @@ def _shadow_realized_ev(version: str, win: bool, q: float | None) -> float | Non
 
     entry 与 _shadow_breakeven 一致：x4 系含溢 0.01，其余无溢价；无报价（q 空）→ None。
     供未落库逐笔 ev_at_entry 的表聚合时兜底现算：pattern_shadow_signals（HM/S5）按落库
-    报价，kline_shadow_signals（KREV/P1/P2/nextbar）按落库目标窗入场报价（entry_up/down_price）；
+    报价，kline_shadow_signals（KREV/P1/P2/nextbar/combo）按落库目标窗入场报价（entry_up/down_price）；
     报价缺失行（如冷启动回补、窗口未对齐）q 空 → None。
     """
     if not q:
@@ -3181,7 +3213,7 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
         .where(MisalignmentSignal.status == "SETTLED")
         .order_by(MisalignmentSignal.window_start)
     )).all()
-    # KREV/反转/nextbar（kline_shadow_signals 表）：K 线族影子，结算口径为次根 K 线涨跌；
+    # KREV/反转/nextbar/combo（kline_shadow_signals 表）：K 线族影子，结算口径为次根 K 线涨跌；
     # 2026-09-03 起落库目标窗真实入场报价（entry_up/down_price），聚合层按 direction 取
     # 对应侧 q 现算真实 EV（赢 0.98/q−1 / 输 −1）；报价缺失/冷启动回补行 entry 为 NULL →
     # 该笔 EV 不计（与旧「纯 K 线无报价」口径兼容）。ev_at_entry 仍未落库（恒 None，兜底现算）。
@@ -3229,6 +3261,7 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
         "hm_touch_down_v2",  # HM v2：v1+非下跌段∧非低波门禁（纯影子，2026-09-01 后验切片）
         "rev_p1_v1", "rev_p2_v1",  # 反转形态 P1/P2（纯影子，2026-09-03：共表 kline_shadow_signals）
         "nb_zschamp_15m_v1", "nb_smaslope_5m_v1",  # nextbar 族（纯影子，2026-09-03：共表 kline_shadow_signals，15m+5m 双 tf）
+        "combo_p1_v1", "combo_p2_v1", "combo_p3_v1", "combo_p4_v1", "combo_p5_v1",  # combo 组合族（纯影子，2026-09-04：共表 kline_shadow_signals，5 组合 3DOWN/2UP）
         "s5_deep_z20_v1",  # S5 深档 z5≤−20bp（纯影子，2026-09-03：共表 pattern_shadow_signals）
         "quote_momentum_v3",  # 报价动量 v3 非连涨门禁（纯影子，2026-09-03：misalignment_signals）
     ]
@@ -3242,7 +3275,7 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
             wins += int(bool(s.win))
             q = s.entry_down_price if s.direction == "DOWN" else s.entry_up_price
             # EV 优先读落库 ev_at_entry；未落库的表（pattern 系 HM/S5、kline 系
-            # KREV/P1/P2/nextbar）按落库报价兜底现算实现 EV；报价缺失行 q 空 → None
+            # KREV/P1/P2/nextbar/combo）按落库报价兜底现算实现 EV；报价缺失行 q 空 → None
             ev = (float(s.ev_at_entry) if s.ev_at_entry is not None
                   else _shadow_realized_ev(v, bool(s.win), float(q) if q else None))
             if ev is not None:

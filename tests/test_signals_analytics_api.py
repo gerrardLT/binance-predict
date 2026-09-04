@@ -261,6 +261,7 @@ async def test_analytics_empty_db() -> None:
         "late_night_contrarian_v1", "late_night_contrarian_v2",
         "krev_a_v1", "krev_b_v1", "hm_touch_down_v1", "hm_touch_down_v2",
         "rev_p1_v1", "rev_p2_v1", "nb_zschamp_15m_v1", "nb_smaslope_5m_v1",
+        "combo_p1_v1", "combo_p2_v1", "combo_p3_v1", "combo_p4_v1", "combo_p5_v1",
         "s5_deep_z20_v1", "quote_momentum_v3"}
     for v, blk in out["shadow"].items():
         assert blk["summary"]["n"] == 0
@@ -319,6 +320,18 @@ async def test_analytics_empty_db() -> None:
     nb5 = out["shadow"]["nb_smaslope_5m_v1"]["summary"]
     assert nb5["bench_winrate"] == 0.4743 and nb5["bench_ev"] is None
     assert nb5["desc"].startswith("nextbar 5m误定价")
+    # combo 组合族（共表 kline_shadow_signals）：720d 冻结口径点估计只钉胜率，
+    # EV 基准留 None（纯 K 线收盘结算无报价，与 KREV/反转/nextbar 同构）
+    for ver, bwr, dpre in (
+        ("combo_p1_v1", 0.639, "combo组合P1"),
+        ("combo_p2_v1", 0.665, "combo组合P2"),
+        ("combo_p3_v1", 0.682, "combo组合P3"),
+        ("combo_p4_v1", 0.627, "combo组合P4"),
+        ("combo_p5_v1", 0.687, "combo组合P5"),
+    ):
+        cb = out["shadow"][ver]["summary"]
+        assert cb["bench_winrate"] == bwr and cb["bench_ev"] is None
+        assert cb["desc"].startswith(dpre)
     assert out["scene"] == {}
     assert out["regime"]["phases"] == {}
     assert out["regime"]["by_version"] == {}

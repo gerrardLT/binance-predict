@@ -5,9 +5,9 @@ output/klines_{15m,5m}_720d.csv（缺失时 skip，CI 无产物不阻塞）。
 
 硬闸门口径来源（.pytest_tmp/freeze_nb_thresholds.py 全精度复现，禁止手抄渲染值）：
     15m 冠军 zscore_10≤-1.65079327 ∧ zscore_5≤-1.53756693 ∧ ret_3≤-0.0039526084
-        → 720d 全样本触发 2006 / 69119（converge_registry.csv L69 ROBUST）
+        → 720d 全样本触发 2003 / 69119（converge_registry.csv L69 ROBUST）
     5m sma_slope_atr_5≥1.6605556162359245（阶段E 7月发现段 q0.9）
-        → 720d 全样本触发 19597 / 207359
+        → 720d 全样本触发 19618 / 207359
 检测器实时路径用 build_feature_matrix(k5=None) + condition_mask，本测试证明其
 复现上述计数（口径与离线冻结逐位一致），且 40 根短窗末根特征 == 全量矩阵同位值。
 """
@@ -37,9 +37,12 @@ CSV_15M = ROOT / "output" / "klines_15m_720d.csv"
 CSV_5M = ROOT / "output" / "klines_5m_720d.csv"
 
 # 冻结全样本触发计数（freeze_nb_thresholds.py 复现，与检测器 condition_mask 路径对齐）
+# 2026-09-04 重冻结（沿用 KREV 2026-09-01 先例）：720d K 线产物刷新至 2026-09-04，
+# 窗口平移计数按当前窗口重放复核；性能基准（胜率 58.92%/47.43%）仍锚定原发现注册表，
+# 不随窗口滑动重算。
 FULL_TRIGGER_COUNTS = {
-    "nb_zschamp_15m_v1": 2006,    # 15m 冠军：720d 全量触发根数
-    "nb_smaslope_5m_v1": 19597,   # 5m sma_slope≥1.6605556162359245：720d 全量触发根数
+    "nb_zschamp_15m_v1": 2003,    # 15m 冠军：720d 全量触发根数
+    "nb_smaslope_5m_v1": 19618,   # 5m sma_slope≥1.6605556162359245：720d 全量触发根数
 }
 
 
