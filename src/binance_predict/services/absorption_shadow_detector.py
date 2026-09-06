@@ -42,11 +42,13 @@
        标定 k/b/门 → 评估 signal → 命中且结算可判 → 直接落 SETTLED（无 PENDING 阶段）；
     4. 幂等：(version, window_start) 唯一约束防重；shadow_gate.is_enabled 落表前拦截。
 
-影子纪律：只记录不下注、不占风控配额、不注册 LIVE_CHANNELS、不进 X4_VERSIONS，本表
-    （absorption_shadow_signals）不被任何下单代码引用（物理隔离）。无实盘通道 → 不推邮件。
-    攒 2~3 周真实前向样本、核对触发分布与 SHADOW_BENCH 基准一致后，人工 promote 才谈上线。
-    重启：预热重填缓冲 + 水位推进到最新，从部署点前向攒样本（宕机期窗只入缓冲不落表，
-    前向样本轻微缺失属可接受口径，非正确性问题）。
+影子纪律（2026-09-06 promote 后更新）：影子落表与实盘下单解耦——影子仍只记录不下注；
+    实盘通道 absorption_follow_td120_v1/td150_v1 已注册 LIVE_CHANNELS，由 MultiLiveTrader
+    采样循环内联判定（窗开快照 + TD 秒双快照，标定快照经 live_calibration() 只读暴露，
+    与本检测器滚动缓冲同源同口径），通道 enabled 由 toggle 管，与影子 gate 互不影响。
+    本表（absorption_shadow_signals）仍不被任何下单代码引用（实盘对账走
+    signal_version+window_start）。重启：预热重填缓冲 + 水位推进到最新，从部署点前向
+    攒样本（宕机期窗只入缓冲不落表，前向样本轻微缺失属可接受口径，非正确性问题）。
 """
 from __future__ import annotations
 
@@ -237,6 +239,8 @@ class AbsorptionShadowDetector:
     → 命中直接落 SETTLED（归档后处理，无 PENDING 阶段）。
 
     双 variant（TD120/TD150）各维护独立 deque 缓冲 [(start_ms, btc_move, up_move)]。
+    实盘侧（2026-09-06 promote）：最新标定快照经 live_calibration() 只读暴露给
+    MultiLiveTrader 采样循环内联判定（归档后处理无法直接钩子，采样循环同源口径补位）。
     """
 
     def __init__(self, collector=None) -> None:
@@ -246,6 +250,9 @@ class AbsorptionShadowDetector:
         self._last_window_end: int | None = None       # 已处理过的最大窗口 end_time（水位）
         self._trigger_count = 0
         self._buffers: dict[str, deque] = {v: deque() for v in ABSORPTION_SPECS}
+        # 实盘标定快照：version → (k, b, 位移门, 欠反应门)（与该版本最新一次影子
+        # 落表行同值，对账一致；预热后全量标定一次，此后随滚动标定刷新）
+        self._live_calib: dict[str, tuple[float, float, float, float]] = {}
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -257,6 +264,7 @@ class AbsorptionShadowDetector:
         self._running = True
         try:
             await self._warmup()
+            self._refresh_live_calib()
         except Exception as exc:
             logger.warning("吸收影子：预热标定缓冲失败（忽略，循环内自愈）| {}", exc)
         self._task = asyncio.create_task(self._loop(), name="absorption_shadow_detector")
@@ -362,6 +370,29 @@ class AbsorptionShadowDetector:
             self._buffers[version].append((start, ext["btc_move"], ext["up_move"]))
 
     # ------------------------------------------------------------------
+    # 实盘标定快照（2026-09-06 promote：MultiLiveTrader 内联判定用）
+    # ------------------------------------------------------------------
+
+    def _refresh_live_calib(self) -> None:
+        """全量标定一次实盘快照（start 预热后调用；此后随 _process_window 滚动刷新）。
+
+        缓冲已按 trailing 14d 逐出，全量标定 ≈ 「当前活跃窗之前」的 ex-ante 口径；
+        样本不足（<MIN_CALIB）→ 不写快照（live_calibration 返回 None → 实盘不开火）。
+        """
+        for version, buf in self._buffers.items():
+            fitted = _calibrate([(bm, um) for (_s, bm, um) in buf])
+            if fitted is not None:
+                self._live_calib[version] = fitted
+
+    def live_calibration(self, version: str) -> tuple[float, float, float, float] | None:
+        """实盘通道用最新标定快照 (k, b, 位移门, 欠反应门)；None=标定缺失/缓冲不足。
+
+        纯内存只读，供 MultiLiveTrader.check() 采样循环同步调用（不阻塞、不碰 DB）；
+        值与该版本最新一次影子落表行的 k/b/disp_gate/under_gate 完全同源（对账一致）。
+        """
+        return self._live_calib.get(version)
+
+    # ------------------------------------------------------------------
     # 核心：单窗口处理（滚动标定 → 评估 signal → 落 SETTLED）
     # ------------------------------------------------------------------
 
@@ -387,6 +418,7 @@ class AbsorptionShadowDetector:
                     fitted = _calibrate(calib)
                     if fitted is None:
                         continue                        # 缓冲不足/退化：保守不落表
+                    self._live_calib[version] = fitted  # 实盘快照与影子落表行同值
                     k, b, disp_gate, under_gate = fitted
                     btc_move, up_move = ext["btc_move"], ext["up_move"]
                     if abs(btc_move) < disp_gate:

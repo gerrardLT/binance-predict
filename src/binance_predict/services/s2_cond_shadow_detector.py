@@ -25,8 +25,10 @@ version 结算/过期（S2_COND_VERSIONS 严格隔离，不碰 nb_/combo_/krev_/
 镜像 hm_shadow_detector._finalize_entry 同款守卫。S5 已在 +5min(300s) 验证 _pm_15m 该
 时点窗口对齐可靠。
 
-影子纪律：只记录不下注、不注册 LIVE_CHANNELS、不进 X4_VERSIONS，本表不被任何下单代码
-引用（物理隔离）。攒 2~3 周真实前向样本复核后人工 promote 才可上线。重启**不回补入场**
+影子纪律（2026-09-06 promote 后更新）：影子落表与实盘下单解耦——影子仍只记录不下注
+（不占风控配额），实盘通道 s2_cond_t4_v1/s2_cond_t5d_v1 已注册 LIVE_CHANNELS，由
+_on_live_fire 钩子驱动 MultiLiveTrader 真单（通道 enabled 由 toggle 管，与影子 gate
+互不影响：影子下线只停采集，实盘照常；实盘关停影子照常落表）。重启**不回补入场**
 （同 S5-deep）；已落 PENDING 行由轮询 _settle_pending 结算，重启安全。
 """
 from __future__ import annotations
@@ -114,6 +116,9 @@ class S2CondShadowDetector:
         self._watched: set[int] = set()          # 已派生确认任务的 next_start（去重）
         self._trigger_count = 0
         self._settle_count = 0
+        # 实盘开火钩子（main 装配注入 multi_live_trader.on_s2_cond_signal；
+        # 未注入 = 纯影子模式，只落表不下注）
+        self._on_live_fire = None
 
     # ------------------------------------------------------------------
     # 实盘 S2 钩子（同步接口，fire-and-forget；main 装配 fake_breakout._on_s2_cond）
@@ -147,6 +152,27 @@ class S2CondShadowDetector:
     # 入场确认（延迟任务：t=4 判 A、t=5 判 B，命中快照报价并落 PENDING）
     # ------------------------------------------------------------------
 
+    def _dispatch_live(self, version: str, next_start: int, next_end: int,
+                       parent_id, up: float | None) -> None:
+        """实盘开火分派（2026-09-06 promote）：判定命中即回调 MultiLiveTrader。
+
+        与影子 gate 解耦（影子下线只停落表，实盘由 trader 侧通道 enabled 管）；
+        钩子未装配 = 纯影子模式直接跳过；异常只告警不抛（不阻断影子落表）。
+        """
+        hook = self._on_live_fire
+        if hook is None:
+            return
+        try:
+            hook({
+                "version": version,
+                "market_start_15m": next_start,
+                "market_end_15m": next_end,
+                "parent_id": parent_id,
+                "up_quote": up,
+            })
+        except Exception as exc:
+            logger.warning("S2 条件单：实盘开火分派异常（不影响影子采集）| {}", exc)
+
     async def _confirm_entry(self, parent_id, next_start: int, next_end: int) -> None:
         """睡到窗内 t=4/t=5，回读 1m K 判价，命中则快照 UP 报价并落影子行。
 
@@ -164,6 +190,8 @@ class S2CondShadowDetector:
             px4 = self._bar_close(bars4.get(PX4_OFFSET_MS))
             if open_px is not None and px4 is not None and judge_t4(open_px, px4):
                 up, down, ts = self._snapshot_up_quote(next_start)
+                # 先分派实盘（独立于影子 gate），再落影子行（gate 管采集）
+                self._dispatch_live(VAR_T4, next_start, next_end, parent_id, up)
                 await self._record(VAR_T4, DISCOVERY_ID_T4, RULE_TEXT_T4,
                                    next_start, open_px, px4, up, down, ts, parent_id)
 
@@ -176,6 +204,8 @@ class S2CondShadowDetector:
             px5 = self._bar_close(bars5.get(PX5_OFFSET_MS))
             if open_px is not None and px5 is not None and judge_t5d(open_px, px5):
                 up, down, ts = self._snapshot_up_quote(next_start)
+                # 先分派实盘（独立于影子 gate），再落影子行（gate 管采集）
+                self._dispatch_live(VAR_T5D, next_start, next_end, parent_id, up)
                 await self._record(VAR_T5D, DISCOVERY_ID_T5D, RULE_TEXT_T5D,
                                    next_start, open_px, px5, up, down, ts, parent_id)
         except asyncio.CancelledError:
@@ -414,9 +444,9 @@ class S2CondShadowDetector:
             logger.warning("S2 条件单影子：冷启动结算失败（忽略，循环内自愈）| {}", exc)
         self._task = asyncio.create_task(self._loop(), name="s2_cond_shadow_detector")
         logger.info(
-            "S2 条件单影子检测器启动 | {} | 实盘 S2(bear_exhaust) 派生窗内 t=4/t=5 条件确认 "
+            "S2 条件单检测器启动 | {} | 实盘 S2(bear_exhaust) 派生窗内 t=4/t=5 条件确认 "
             "→ 押 UP（720d 触发 1069/643，价-only 胜率 38.9%/44.8%；低买 UP 正 EV 来自入场价，"
-            "真实 EV 前向现算）（影子模式：只记录不下注）",
+            "真实 EV 前向现算）（影子落表 + 实盘通道已注册，开火由 trader 侧 enabled 管）",
             "/".join(S2_COND_VERSIONS),
         )
 

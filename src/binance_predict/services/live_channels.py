@@ -1,16 +1,24 @@
 """多通道实盘注册表（MultiLiveTrader 的静态描述层 + 配置解析，纯函数无 DB）。
 
 通道 ID 与影子信号版本名对齐（订单 signal_version 直接用通道名，对账/统计天然一致）。
-三族触发机制（由 MultiLiveTrader 分别驱动，见 multi_live_trader.py）：
+六族触发机制（由 MultiLiveTrader 分别驱动，见 multi_live_trader.py）：
 - quote_edge：5m 采样循环喂价 → 窗内报价区间命中（v2 附加 BTC 门禁，实时喂价解锁；
   v3 环境门禁版再叠加前窗 DOWN/距日高回落，异步 DB 核验后下单）；
 - x4：轮询 misalignment_signals PENDING → 次窗 +150s 决策点下单；
-- scene：fake_breakout_detector fire 钩子 → 次周期开盘下单（15m 市场）。
+- scene：fake_breakout_detector fire 钩子 → 次周期开盘下单（15m 市场）；
+- s2_cond：S2CondShadowDetector 实时判价钩子（实盘 S2 派生窗内 t=4/t=5 1m 收盘<周期开盘）
+  → 当刻真单押 UP（15m 市场，次周期中段入场）；
+- nextbar：NextbarShadowDetector 新根收盘钩子 → 次根 5m 市场开盘后 90s 内下单押 UP；
+- absorption：5m 采样循环喂价内联判定（窗开快照 + TD 秒双快照，标定来自
+  AbsorptionShadowDetector 滚动缓冲）→ 跟随 BTC 位移方向押注（动态 UP/DOWN，5m 市场）。
 
 护栏数值依据：盈亏平衡入场价 entry* = wr×(1−FEE)（干净口径历史胜率）：
 S1 wr64.4%→0.63 / S5 78.5%→0.77 / S2 53.6%→0.525 / S4 55.4%→0.54 /
 x4_v1 41.2%→0.40 / x4_v2 45.3%→0.44，护栏设在平衡价附近或略下方。
 S2 真实 UP 报价常在 0.79+（跌态无折扣），护栏 0.55 会保护性弃单——正确行为（EV 保护）。
+2026-09-06 影子 promote 三族（护栏同口径）：s2_cond_t4 38.9%→0.38 / s2_cond_t5d
+44.8%→0.44 / nb_smaslope_5m 47.43%→0.46 / absorption_td120 79.8%→0.78 /
+absorption_td150 88.5%→0.86。
 所有护栏可被 LIVE_CHANNELS_JSON 按通道覆盖。
 """
 from __future__ import annotations
@@ -34,9 +42,10 @@ class ChannelSpec:
     """通道静态描述（冻结，运行时不可变）。"""
 
     channel: str
-    family: str                   # quote_edge | x4 | scene
+    family: str                   # quote_edge | x4 | scene | s2_cond | nextbar | absorption
     market_period: str            # 5m | 15m
-    direction: str                # 典型下单方向（scene 族实际由信号 side 决定）
+    direction: str                # 典型下单方向（scene/s2_cond 族由信号 side 决定；
+                                  # absorption 族由 BTC 位移符号动态决定，此处为基准方向）
     auto_max_exec: float          # 默认执行价护栏（可被配置覆盖）
     display_name: str
     v2_guard: str | None = None   # quote_edge v2 门禁模式：min_drop | max_rise | None
@@ -86,6 +95,41 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     # 与 S5 确认通道同窗互斥（SAME_WINDOW_EXCLUSIVE，至多一单成交）。
     "s5_deep_z20_v1": ChannelSpec(
         "s5_deep_z20_v1", "scene", "15m", "DOWN", 0.88, "S5深档·深回落门禁版",
+    ),
+    # --- s2_cond 族（2026-09-06 影子 promote）：S2CondShadowDetector 实时判价钩子，
+    # 实盘 S2(bear_exhaust) 派生窗内 t=4/t=5 判 1m 收盘<周期开盘 → 当刻真单押 UP
+    # （15m 市场次周期中段入场）。正 EV 来自低买入场价而非胜率（720d 冻结：t4 触发
+    # 1069/2176=49.1% 价-only 胜率 38.9%；t5 剔深 643/2176=29.5% 胜率 44.8%；
+    # 报价表研究 EV +0.237/+0.283 属乐观上界，真实 EV 前向现算）。
+    # 护栏 = 价-only 胜率平衡价（wr×0.98）略下方；真实报价均值 ~0.30，护栏只拦贵单。
+    # 两版同源同目标周期 → 同窗互斥（至多一单成交，弃单不占槽）。
+    "s2_cond_t4_v1": ChannelSpec(
+        "s2_cond_t4_v1", "s2_cond", "15m", "UP", 0.38, "S2条件t=4价<开（押UP）",
+    ),
+    "s2_cond_t5d_v1": ChannelSpec(
+        "s2_cond_t5d_v1", "s2_cond", "15m", "UP", 0.44, "S2条件t=5剔深（押UP）",
+    ),
+    # --- nextbar 族（2026-09-06 影子 promote）：NextbarShadowDetector 新根收盘钩子，
+    # 冻结条件 sma_slope_atr_5≥1.6606 → 次根 5m 市场押 UP（目标窗开盘后 90s 内）。
+    # ⚠ 研究原文自评：720d 次根收阳仅 47.43%（长样本反指），edge 依赖 Jul-Aug regime，
+    # record-only 科学仪器非背书——用户拍板小额前向验证。护栏 0.46 = 平衡价略下方，
+    # 只在 UP 便宜（市场看衰而条件看涨）时成交，成交率低是保命设计非 bug。
+    "nb_smaslope_5m_v1": ChannelSpec(
+        "nb_smaslope_5m_v1", "nextbar", "5m", "UP", 0.46, "nextbar 5m动量误定价（押UP）",
+    ),
+    # --- absorption 族（2026-09-06 影子 promote）：采样循环喂价内联判定（窗开快照 +
+    # TD 秒实时双快照），标定 k/b/位移门/欠反应门复用 AbsorptionShadowDetector 滚动
+    # 缓冲（同一采样 feed 同基）。跟随 BTC 位移方向（动态 UP/DOWN，当前 5m 市场中段
+    # 入场）。真实价复核：TD150 real EV +0.105 CI[+0.050,+0.165]、TD120 +0.065
+    # CI[+0.006,+0.123]；价-only 胜率 79.8%/88.5% → 平衡价 0.782/0.867 略下方。
+    # 两版同窗同假设 → 同窗互斥。
+    "absorption_follow_td120_v1": ChannelSpec(
+        "absorption_follow_td120_v1", "absorption", "5m", "UP", 0.78,
+        "吸收跟随TD120欠反应→顺势",
+    ),
+    "absorption_follow_td150_v1": ChannelSpec(
+        "absorption_follow_td150_v1", "absorption", "5m", "UP", 0.86,
+        "吸收跟随TD150欠反应→顺势",
     ),
 }
 
@@ -145,6 +189,12 @@ RETIRED_CHANNELS: frozenset[str] = frozenset(RETIRED_CHANNEL_SPECS)
 # RETIRED_SAME_WINDOW_EXCLUSIVE，仅留作机制测试 fixture）。
 SAME_WINDOW_EXCLUSIVE: tuple[frozenset[str], ...] = (
     frozenset({"scene_bull_exhaust_confirm", "s5_deep_z20_v1"}),
+    # S2 条件单双变体同源（同一实盘 S2 事件、同一目标周期；t=4/t=5 判价高度重叠），
+    # 防同事件双成交叠加敞口（2026-09-06 promote）。
+    frozenset({"s2_cond_t4_v1", "s2_cond_t5d_v1"}),
+    # 吸收跟随双变体同窗同假设（TD120/TD150 只是判定时点不同，欠反应状态连续），
+    # 防同窗双成交（2026-09-06 promote）。
+    frozenset({"absorption_follow_td120_v1", "absorption_follow_td150_v1"}),
 )
 
 # 退役的同窗互斥组（不参与生产判定：exclusive_group 只读 SAME_WINDOW_EXCLUSIVE）

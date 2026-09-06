@@ -1,8 +1,8 @@
 """多通道实盘执行器（MultiLiveTrader，2026-08-24 取代单版本 QuoteEdgeLiveTrader）。
 
-7 通道（通道注册表见 live_channels.py；2026-09-04 退役 8 通道后）可同时开启，每通道独立
+12 通道（通道注册表见 live_channels.py；2026-09-04 退役 8 通道、2026-09-06 影子 promote 5 通道后）可同时开启，每通道独立
 金额/日限/护栏/开关；通道 ID 与影子信号版本名对齐（订单 signal_version
-直接用通道名，实盘 vs 影子对账天然一致）。三族触发机制并存：
+直接用通道名，实盘 vs 影子对账天然一致）。六族触发机制并存：
 
 1. quote_edge 族（5m 市场）：5m 采样循环喂价 → 窗内 DOWN 报价首次进入
    所绑版本规则区间 → 真单押 DOWN（区间复用 QUOTE_EDGE_RULES 冻结口径）。
@@ -20,6 +20,13 @@
 3. scene 族（15m 市场）：fake_breakout_detector fire 钩子回调 →
    次周期开盘真单（S1/S4/S5 押 DOWN，S2 押 UP；S5 为 +5min 确认后回调），
    订单落 scene_signal_id 直接关联场景信号行（结算走 FakeBreakoutSignal）。
+4. s2_cond 族（15m 市场，2026-09-06 promote）：S2CondShadowDetector 实时判价钩子
+   （实盘 S2 派生窗内 t=4/t=5 判 1m 收盘<周期开盘）→ 当刻真单押 UP（次周期中段入场）。
+5. nextbar 族（5m 市场，2026-09-06 promote）：NextbarShadowDetector 新根收盘钩子 →
+   次根开盘后 90s 内真单押 UP（时间窗守卫天然排除冷启动回补）。
+6. absorption 族（5m 市场，2026-09-06 promote）：采样循环 check() 内联判定（窗开快照
+   + TD 秒双快照，标定复用 AbsorptionShadowDetector 滚动缓冲）→ 跟随 BTC 位移方向真单。
+   （kline/absorption 影子信号无订单 signal_id 关联列，对账走 signal_version+window_start。）
 
 安全护栏（继承旧执行器全部教训）：
 1. 每通道每窗至多一单：内存 fired 集合 + 先占位后下单（place_order 前先插
@@ -36,6 +43,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -53,6 +61,7 @@ from binance_predict.db.models import (
     TradeOrderModel,
 )
 
+from .absorption_shadow_detector import ABSORPTION_SPECS
 from .btc_regime import regime_feed
 from .live_channels import (
     LIVE_CHANNELS,
@@ -89,6 +98,9 @@ REGIME_RETRY_DELAY_S = 30.0         # v4 ret24 K 线拉取失败延迟重查（�
 STREAK_RETRY_DELAY_S = 5.0          # v3 非连涨 15m K 线拉取失败延迟重查（末收根已归档，短等即可）
 S5_DEEP_CHANNEL = "s5_deep_z20_v1"  # 与 fake_breakout_detector.S5_DEEP_VERSION 同名（对账对齐）
 MARKET_WARMUP_INTERVAL_S = 60.0     # 市场列表后台预热间隔（未来 15m 周期预缓存，2026-08-30）
+ABS_LIVE_JUDGE_GRACE_S = 90.0       # absorption 判定新鲜度：t_rel 超 TD+此值 → 本窗放弃
+                                    # （重启/中途启用后的在途窗，当前价已非 TD 时刻价，
+                                    # 与影子 ≤TD 末点口径不成立 → 保守不下注）
 
 
 class MultiLiveTrader:
@@ -116,6 +128,12 @@ class MultiLiveTrader:
         # 15m K 线拉取回调（main 装配注入 collector.fetch_recent_klines）；
         # 未注入 → v3 非连涨门禁保守不开火（与影子「collector 缺失不落 v3」同口径）
         self.kline_fetcher = None
+        # 吸收/欠反应跟随标定源（main 装配注入 AbsorptionShadowDetector 实例；
+        # 未注入 → absorption 族通道保守不开火，与 kline_fetcher 同 fail-safe 模式）
+        self.absorption_calibrator = None
+        # absorption 窗开快照：window_start → (up_open, btc_open)（本窗首个有效采样建立，
+        # 超 2h 修剪；窗开快照缺失 → TD 判定跳过，与影子「特征不可算不评估」同口径）
+        self._abs_open: dict[int, tuple[float, float]] = {}
         # 同窗互斥槽：市场窗口 → 本窗已成交的互斥组通道（至多一单成交，见 _exec_with_exclusive）
         self._window_filled: dict[int, set[str]] = {}
         self._group_locks: dict[tuple[tuple[str, ...], int], asyncio.Lock] = {}
@@ -132,7 +150,9 @@ class MultiLiveTrader:
               ts_ms: int, down_price: float | None,
               btc_price: float | None = None,
               window_entry_price: float | None = None,
-              window_btc_curve: list | None = None) -> list[str]:
+              window_btc_curve: list | None = None,
+              up_price: float | None = None,
+              up_open: float | None = None) -> list[str]:
         """每次 5m 采样调用一次；返回本轮开火的通道名列表。
 
         纯内存快速路径（不阻塞采样循环）；命中通道派生下单任务。
@@ -141,13 +161,18 @@ class MultiLiveTrader:
         v3 环境门禁需要 window_btc_curve（本窗已采样的 BTC 时序，
         [{"t": ms, "v": price}, ...]）并入日高口径（与影子对齐）；
         缺失时回落到更保守口径（仅归档曲线+触发点）。
+        absorption 族需要 up_price（当前采样 UP 报价）+ up_open（本窗归档首个
+        有效 UP 采样价，窗开基准，与影子 _first(up_p) 同源）+ btc_price +
+        window_entry_price，任一缺失 → 不判定（fail-safe，向后兼容旧调用方）。
         """
-        if self._stopped or down_price is None:
+        if self._stopped:
             return []
         t_rel = (ts_ms - window_start_ms) / 1000.0
         fired: list[str] = []
         for ch, spec in self._specs.items():
-            if spec.family != "quote_edge":
+            # down_price 仅 quote_edge 族需要（absorption 族只依赖 up_price，
+            # DOWN 报价缺失不应连带跳过 absorption 判定）
+            if spec.family != "quote_edge" or down_price is None:
                 continue
             cfg = self._configs[ch]
             if not cfg.enabled:
@@ -214,6 +239,72 @@ class MultiLiveTrader:
                                           t_rel, float(down_price)),
                     name=f"live_qe_{ch}_{window_start_ms}",
                 )
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+            fired.append(ch)
+
+        # ---- absorption 族（2026-09-06 promote）：喂价内联判定，逐通道独立时点 ----
+        # 窗开快照：(up_open, btc_open) = (本窗归档首个有效 UP 采样价, 窗开 BTC)；
+        # TD 秒后首个采样执行判定（与研究 ≤TD 末点相差一个采样间隔，属实时重放
+        # 可接受偏差，严格 ex-ante 无未来数据；超 TD+90s 判定点过期 → 本窗放弃）。
+        # 标定缺失/缓冲不足 → 不开火（fail-safe）；门未过不占 fired（TD+90s 内
+        # 后续采样持续判，门过了仍可触发）。
+        calibrator = self.absorption_calibrator
+        for ch, spec in self._specs.items():
+            if spec.family != "absorption":
+                continue
+            cfg = self._configs[ch]
+            if not cfg.enabled or window_start_ms in cfg.fired:
+                continue
+            if up_price is None or not btc_price or not window_entry_price:
+                continue                     # 喂价缺 UP/BTC 基准 → 不判定
+            if window_start_ms not in self._abs_open:
+                # 窗开基准必须用 up_open（main 从 _pm_history 取本窗首个有效 UP
+                # 采样，与影子 _first(up_p) 同源）。拿不到（本窗尚无 UP 报价入库）
+                # → 本窗跳过，绝不用当前 up_price 兜底：中途建快照（冷启动/通道
+                # 中途启用）时 up_move≈0 会让 under≈k·|btc_move| 虚高必过欠反应
+                # 门 → 伪开火下真单。
+                if up_open is None:
+                    continue
+                if len(self._abs_open) > 64:
+                    cutoff = ts_ms - 2 * 3_600_000
+                    self._abs_open = {
+                        k: v for k, v in self._abs_open.items() if k >= cutoff}
+                self._abs_open[window_start_ms] = (
+                    float(up_open), float(window_entry_price))
+                continue                     # 快照刚建立，TD 判定等后续采样
+            td_s = ABSORPTION_SPECS.get(ch)
+            if td_s is None or t_rel < float(td_s):
+                continue                     # 未到判定时点
+            if t_rel > float(td_s) + ABS_LIVE_JUDGE_GRACE_S:
+                continue                     # 判定新鲜度过期（重启/中途启用后的在途
+                                             # 窗）：当前价已非 TD 时刻价，与影子
+                                             # ≤TD 末点口径不成立 → 本窗放弃
+            fitted = (calibrator.live_calibration(ch)
+                      if calibrator is not None else None)
+            if fitted is None:
+                continue                     # 标定缺失/缓冲不足 → 保守不开火
+            k, b, disp_gate, under_gate = fitted
+            up_open, btc_open = self._abs_open[window_start_ms]
+            if btc_open <= 0:
+                continue
+            btc_move = (float(btc_price) - btc_open) / btc_open * 1e4      # bp
+            up_move = (float(up_price) - up_open) * 100.0                  # pp（real 基）
+            if btc_move == 0.0:
+                continue
+            # 冻结口径（absorption_shadow_detector._process_window 同源，勿改符号）：
+            # under = −sign(btc_move)·(up_move − (k·btc_move + b))，>0 = 报价欠反应/粘滞
+            resid = up_move - (k * btc_move + b)
+            under = -math.copysign(1.0, btc_move) * resid
+            if abs(btc_move) < disp_gate or under < under_gate:
+                continue                     # 位移门/欠反应门未过
+            prediction = "UP" if btc_move > 0 else "DOWN"   # follow：顺 btc 补涨
+            cfg.fired.add(window_start_ms)
+            task = asyncio.create_task(
+                self._fire_absorption(ch, window_start_ms, prediction,
+                                      t_rel, float(up_price), btc_move, under),
+                name=f"live_abs_{ch}_{window_start_ms}",
+            )
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
             fired.append(ch)
@@ -662,6 +753,172 @@ class MultiLiveTrader:
         except Exception as exc:
             logger.warning("多通道实盘：场景下单任务异常 | {} | {} | {}",
                            channel, _fmt_win(market_start), exc)
+
+    # ------------------------------------------------------------------
+    # s2_cond / nextbar / absorption 族（2026-09-06 影子 promote）
+    # ------------------------------------------------------------------
+
+    def _hook_gate(self, channel: str, family: str, window_start: int) -> bool:
+        """钩子公共门禁（同步）：stop/白名单/族匹配/启用/同窗去重。
+
+        通过后已占位 cfg.fired（调用方直接 create_task 下单任务）；
+        通道未启用直接返回（影子检测继续落表，互不干扰）。
+        """
+        if self._stopped:
+            return False  # stop 后拒绝派生新下单任务（与 check/scene 同契约）
+        spec = self._specs.get(channel)
+        if spec is None or spec.family != family:
+            return False  # 未注册/族不符（检测器与注册表版本错位时静默跳过）
+        cfg = self._configs[channel]
+        if not cfg.enabled:
+            return False
+        if window_start in cfg.fired:
+            return False
+        cfg.fired.add(window_start)
+        return True
+
+    def on_s2_cond_signal(self, sig: dict) -> None:
+        """S2CondShadowDetector 实时判价钩子（同步接口，fire-and-forget）。
+
+        payload：{version, market_start_15m, market_end_15m, parent_id, up_quote}。
+        market = 目标周期（次周期）市场窗口；判价命中即当刻下单（与影子入场
+        快照同刻）。任何异常只告警不抛（绝不阻塞检测循环——同 scene 钩子契约）。
+        """
+        try:
+            channel = str(sig.get("version") or "")
+            market_start = int(sig["market_start_15m"])
+            if not self._hook_gate(channel, "s2_cond", market_start):
+                return
+            task = asyncio.create_task(
+                self._fire_s2_cond(channel, sig),
+                name=f"live_s2cond_{channel}_{market_start}",
+            )
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+        except Exception as exc:
+            logger.warning("多通道实盘：S2 条件单钩子异常（不影响检测循环）| {}", exc)
+
+    def on_nextbar_signal(self, sig: dict) -> None:
+        """NextbarShadowDetector 新根收盘钩子（同步接口，fire-and-forget）。
+
+        payload：{version, market_start, market_end, direction, signal_bar_start}。
+        market = 目标根（次根）市场窗口；时间窗守卫（检测器侧 ≤90s）已排除
+        冷启动回补。任何异常只告警不抛（同 scene 钩子契约）。
+        """
+        try:
+            channel = str(sig.get("version") or "")
+            market_start = int(sig["market_start"])
+            if not self._hook_gate(channel, "nextbar", market_start):
+                return
+            task = asyncio.create_task(
+                self._fire_nextbar(channel, sig),
+                name=f"live_nextbar_{channel}_{market_start}",
+            )
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+        except Exception as exc:
+            logger.warning("多通道实盘：nextbar 钩子异常（不影响检测循环）| {}", exc)
+
+    async def _fire_s2_cond(self, channel: str, sig: dict) -> None:
+        spec = self._specs[channel]
+        cfg = self._configs[channel]
+        market_start = int(sig["market_start_15m"])
+        # 判价命中（次周期内 1m 收盘<周期开盘）→ 押 UP 收阳（研究冻结方向，恒 UP）
+        prediction = "UP"
+        try:
+            filled_today = await self._count_filled_today(channel)
+            if filled_today >= cfg.max_daily_orders:
+                logger.warning(
+                    "多通道实盘：{} 日单量护栏停火 | 周期 {} | 今日已成交 {} ≥ {}",
+                    channel, _fmt_win(market_start), filled_today, cfg.max_daily_orders)
+                return
+            if await self._has_attempt(channel, market_start):
+                return
+            logger.info(
+                "多通道实盘开火 | {} | S2条件判价命中押 {} | 周期 {} | 金额 {} | 护栏 {} | 父信号 #{}",
+                channel, prediction, _fmt_win(market_start), cfg.amount_usdt,
+                resolve_max_exec(spec, cfg), sig.get("parent_id"))
+            order = await self._exec_with_exclusive(
+                channel,
+                prediction=prediction,
+                amount_usdt=cfg.amount_usdt,
+                signal_version=channel,
+                window_start=market_start,
+                max_exec_price=resolve_max_exec(spec, cfg),
+                market_period="15m",
+            )
+            await self._after_fill(order, channel, cfg)
+            # kline 影子信号无订单 signal_id 关联列，对账走 signal_version+window_start
+        except Exception as exc:
+            logger.warning("多通道实盘：S2 条件单下单任务异常 | {} | {} | {}",
+                           channel, _fmt_win(market_start), exc)
+
+    async def _fire_nextbar(self, channel: str, sig: dict) -> None:
+        spec = self._specs[channel]
+        cfg = self._configs[channel]
+        market_start = int(sig["market_start"])
+        prediction = str(sig.get("direction") or spec.direction)  # 冻结方向（本族恒 UP）
+        try:
+            filled_today = await self._count_filled_today(channel)
+            if filled_today >= cfg.max_daily_orders:
+                logger.warning(
+                    "多通道实盘：{} 日单量护栏停火 | 窗口 {} | 今日已成交 {} ≥ {}",
+                    channel, _fmt_win(market_start), filled_today, cfg.max_daily_orders)
+                return
+            if await self._has_attempt(channel, market_start):
+                return
+            logger.info(
+                "多通道实盘开火 | {} | nextbar 新根命中押 {} | 窗口 {} | 金额 {} | 护栏 {}",
+                channel, prediction, _fmt_win(market_start), cfg.amount_usdt,
+                resolve_max_exec(spec, cfg))
+            order = await self._exec_with_exclusive(
+                channel,
+                prediction=prediction,
+                amount_usdt=cfg.amount_usdt,
+                signal_version=channel,
+                window_start=market_start,
+                max_exec_price=resolve_max_exec(spec, cfg),
+                market_period=spec.market_period,
+            )
+            await self._after_fill(order, channel, cfg)
+        except Exception as exc:
+            logger.warning("多通道实盘：nextbar 下单任务异常 | {} | {} | {}",
+                           channel, _fmt_win(market_start), exc)
+
+    async def _fire_absorption(self, channel: str, window_start: int,
+                               prediction: str, t_rel: float,
+                               up_price: float, btc_move: float,
+                               under: float) -> None:
+        spec = self._specs[channel]
+        cfg = self._configs[channel]
+        win_label = _fmt_win(window_start)
+        try:
+            filled_today = await self._count_filled_today(channel)
+            if filled_today >= cfg.max_daily_orders:
+                logger.warning(
+                    "多通道实盘：{} 日单量护栏停火 | 窗口 {} | 今日已成交 {} ≥ {}",
+                    channel, win_label, filled_today, cfg.max_daily_orders)
+                return
+            if await self._has_attempt(channel, window_start):
+                return
+            logger.info(
+                "多通道实盘开火 | {} | 吸收跟随押 {} | 窗口 {} | t=+{:.0f}s up={:.3f}"
+                " btc_move={:+.1f}bp under={:+.2f}pp | 金额 {} | 护栏 {}",
+                channel, prediction, win_label, t_rel, up_price, btc_move, under,
+                cfg.amount_usdt, resolve_max_exec(spec, cfg))
+            order = await self._exec_with_exclusive(
+                channel,
+                prediction=prediction,
+                amount_usdt=cfg.amount_usdt,
+                signal_version=channel,
+                window_start=window_start,
+                max_exec_price=resolve_max_exec(spec, cfg),
+                market_period="5m",
+            )
+            await self._after_fill(order, channel, cfg)
+        except Exception as exc:
+            logger.warning("多通道实盘：吸收跟随下单任务异常 | {} | {} | {}",
+                           channel, win_label, exc)
 
     # ------------------------------------------------------------------
     # 下单主流程（quote_edge 族）

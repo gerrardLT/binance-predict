@@ -595,14 +595,18 @@ def test_status_shape() -> None:
 # ============================================================
 
 def test_versions_isolated_from_trading_path() -> None:
-    """影子纪律：version 不进 X4 下单白名单 / 不注册实盘通道 / 非退役（默认在线采集）。"""
+    """影子纪律：不进 X4 下单白名单 / 非退役（影子默认在线采集）。
+
+    2026-09-06 promote：TD120/TD150 已注册 LIVE_CHANNELS（护栏 0.78/0.86），
+    影子落表与实盘下单并存（影子下线≠实盘下线，实盘开关走通道配置）。
+    """
     from binance_predict.services.live_channels import LIVE_CHANNELS
     from binance_predict.services.multi_live_trader import X4_VERSIONS
     from binance_predict.services.shadow_version_gate import RETIRED_VERSIONS
     for v in ABSORPTION_SPECS:
         assert v not in X4_VERSIONS, f"{v} 不得进入 X4 下单白名单"
-        assert v not in LIVE_CHANNELS, f"{v} 不得注册实盘通道"
-        assert v not in RETIRED_VERSIONS, f"{v} 非退役版本（应默认在线采集）"
+        assert v in LIVE_CHANNELS, f"{v} 应已 promote 注册实盘通道"
+        assert v not in RETIRED_VERSIONS, f"{v} 非退役版本（影子应默认在线采集）"
 
 
 def test_settings_default_on() -> None:

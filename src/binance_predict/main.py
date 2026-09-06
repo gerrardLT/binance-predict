@@ -523,6 +523,10 @@ async def _prediction_market_tracker() -> None:
                 # （窗口开盘快照）——均为现有变量，零新采样成本。
                 # v3 日高喂价：window_btc_curve 从 _pm_history 提取本窗 BTC 时序
                 # （含本点），供 v3b 日高口径与影子对齐（影子含本窗 ≤quote_ts 点）。
+                # absorption 喂价（2026-09-06 promote）：up_price（本点 UP 报价）+
+                # up_open（_pm_history 本窗首个有效 UP 采样，窗开基准，与影子
+                # _first(up_p) 同源；窗口切换 clear + 冷启动 DB 回读保证是本窗点）+
+                # _window_entry_price 作 btc_open（TD 秒实时双快照判定）。
                 if multi_live_trader is not None and _current_window_end is not None:
                     multi_live_trader.check(
                         int(_current_window_end) - 300_000,
@@ -535,6 +539,10 @@ async def _prediction_market_tracker() -> None:
                             {"t": p["timestamp"], "v": p["btc_price"]}
                             for p in _pm_history if p.get("btc_price")
                         ],
+                        up_price=up_price,
+                        up_open=next(
+                            (p["up_price"] for p in _pm_history
+                             if p.get("up_price") is not None), None),
                     )
 
         except asyncio.CancelledError:
@@ -1168,12 +1176,14 @@ async def lifespan(app: FastAPI):
         await reversal_shadow_detector.start()
         logger.info("反转 K线影子检测器已启动（P1 连跌弱阴→UP 62.0% / P2 连涨弱阳→DOWN 62.4%，影子模式不下注）")
 
-    # 下一根 K 线方向影子信号（nextbar 族，2026-09-03）：H=1 方向研究冻结条件实时重放——
-    # 15m 冠军（zscore_10+zscore_5+ret_3 深超卖反转，holdout P(up_1)=61.96%）押次根 15m
-    # 收阳 UP；5m sma_slope≥1.66 动量误定价候选押次根 5m 收阳 UP。build_feature_matrix
-    # （k5=None）+ condition_mask 执行冻结条件原文，次根收盘按 direction 结算；只记录
-    # 不下注，物理隔离于下单路径（与 KREV/反转共表 kline_shadow_signals，version+timeframe
-    # 双隔离，各用自己 tf 的 K 线结算）。默认开关开启，与其他影子一致。
+    # 下一根 K 线方向影子信号（nextbar 族，2026-09-03；2026-09-06 promote）：H=1 方向
+    # 研究冻结条件实时重放——15m 冠军（zscore_10+zscore_5+ret_3 深超卖反转，holdout
+    # P(up_1)=61.96%）押次根 15m 收阳 UP；5m sma_slope≥1.66 动量误定价候选押次根 5m
+    # 收阳 UP。build_feature_matrix（k5=None）+ condition_mask 执行冻结条件原文，次根
+    # 收盘按 direction 结算。影子仍只记录不下注；实盘通道 nb_smaslope_5m_v1 已注册
+    # LIVE_CHANNELS，目标根开盘 ≤90s 的新鲜命中经 _on_live_fire 钩子驱动真单（冷启动
+    # 回补天然排除；与 KREV/反转共表 kline_shadow_signals，version+timeframe 双隔离，
+    # 各用自己 tf 的 K 线结算）。默认开关开启，与其他影子一致。
     global nextbar_shadow_detector
     if settings.nextbar_shadow_enabled:
         nextbar_shadow_detector = NextbarShadowDetector(
@@ -1182,7 +1192,7 @@ async def lifespan(app: FastAPI):
             pm_5m_info=_pm_market_info,
         )
         await nextbar_shadow_detector.start()
-        logger.info("nextbar K线影子检测器已启动（15m 冠军次根收阳 58.92% / 5m sma_slope 47.43% regime 依赖，影子模式不下注）")
+        logger.info("nextbar K线影子检测器已启动（15m 冠军次根收阳 58.92% / 5m sma_slope 47.43% regime 依赖；影子落表 + 实盘钩子已挂，开火由 trader 侧 enabled 管）")
 
     # 组合条件影子信号（combo 族，2026-09-04）：45 维条件大搜索（grand_search_v2）
     # + 1443 天样本外考试 + 50 次置换检验存活 5 组合实时重放——P1 连阳3+∧周末∧乖离
@@ -1200,23 +1210,26 @@ async def lifespan(app: FastAPI):
         await combo_shadow_detector.start()
         logger.info("combo 组合影子检测器已启动（5 组合 3DOWN/2UP，720d 62.7~68.7% / oos 59.4~64.8%，影子模式不下注）")
 
-    # 吸收/欠反应跟随影子信号（absorption_follow_v1 族，2026-09-04）：5m 窗内报价对
-    # BTC 位移「欠反应」（知情者吸筹脚印）→ 跟随 btc 方向补涨押注的影子重放。双 variant
-    # （TD=120/150）各维护独立 trailing 14 天滚动标定缓冲（k/b/位移门 p50/欠反应门 p80，
-    # 严格 ex-ante），归档后处理直接落 SETTLED。只记录不下注，物理隔离于下单路径（落专用
-    # 表 absorption_shadow_signals，不进 X4_VERSIONS/LIVE_CHANNELS）。默认开关开启。
+    # 吸收/欠反应跟随影子信号（absorption_follow_v1 族，2026-09-04；2026-09-06 promote）：
+    # 5m 窗内报价对 BTC 位移「欠反应」（知情者吸筹脚印）→ 跟随 btc 方向补涨押注的影子
+    # 重放。双 variant（TD=120/150）各维护独立 trailing 14 天滚动标定缓冲（k/b/位移门
+    # p50/欠反应门 p80，严格 ex-ante），归档后处理直接落 SETTLED。影子仍只记录不下注；
+    # 实盘通道 td120/td150 已注册 LIVE_CHANNELS，由 MultiLiveTrader 采样循环内联判定
+    # （窗开快照 + TD 秒双快照，标定快照经 live_calibration() 只读暴露，同源同口径），
+    # 影子下线只停采集、实盘照常。默认开关开启。
     global absorption_shadow_detector
     if settings.absorption_shadow_enabled:
         absorption_shadow_detector = AbsorptionShadowDetector()
         await absorption_shadow_detector.start()
-        logger.info("吸收影子检测器已启动（TD120/TD150 双 variant trailing 14d 滚动标定，RECENT real EV +0.052/+0.105，影子模式不下注）")
+        logger.info("吸收影子检测器已启动（TD120/TD150 双 variant trailing 14d 滚动标定，RECENT real EV +0.052/+0.105；影子落表 + 实盘标定快照已就绪，开火由 trader 侧 enabled 管）")
 
-    # S2 条件单影子信号（s2_cond 族，2026-09-06）：实盘 S2(bear_exhaust，破 4h 支撑+收阴+
-    # 放量) 派生——次周期窗内 t=4(+240s) 价<开盘（全深度）/ t=5(+300s) 0<回落<15bp（剔深）
-    # 两版条件确认 → 押次周期 15m UP，落 kline_shadow_signals（与 KREV/反转/nextbar/combo
-    # 共表、version 严格隔离结算）。入场快照真实 15m UP 报价（窗口对齐+龄守卫），真实 EV
-    # 前向现算（研究 EV 属报价表乐观上界）。只记录不下注，物理隔离于下单路径（不进
-    # X4_VERSIONS/LIVE_CHANNELS）。默认开关开启，与其他影子一致。
+    # S2 条件单影子信号（s2_cond 族，2026-09-06 promote）：实盘 S2(bear_exhaust，破 4h
+    # 支撑+收阴+放量) 派生——次周期窗内 t=4(+240s) 价<开盘（全深度）/ t=5(+300s) 0<回落
+    # <15bp（剔深）两版条件确认 → 押次周期 15m UP，落 kline_shadow_signals（与
+    # KREV/反转/nextbar/combo 共表、version 严格隔离结算）。入场快照真实 15m UP 报价
+    # （窗口对齐+龄守卫），真实 EV 前向现算（研究 EV 属报价表乐观上界）。影子仍只记录
+    # 不下注；实盘通道 s2_cond_t4_v1/t5d_v1 已注册 LIVE_CHANNELS，判定命中即经
+    # _on_live_fire 钩子驱动真单（与影子 gate 互不影响）。默认开关开启，与其他影子一致。
     global s2_cond_shadow_detector
     if settings.s2_cond_shadow_enabled:
         s2_cond_shadow_detector = S2CondShadowDetector(
@@ -1224,9 +1237,9 @@ async def lifespan(app: FastAPI):
             pm_15m_latest=_pm_15m_latest,
         )
         await s2_cond_shadow_detector.start()
-        logger.info("S2 条件单影子检测器已启动（t=4 价<开 38.9% / t=5 剔深 44.8%，720d 触发 1069/643，低买 UP 正 EV 来自入场价，影子模式不下注）")
-        # 钩子装配独立于 multi_live_trader（影子物理隔离于下单路径：即便实盘执行器装配
-        # 失败/未启用，S2 影子仍从每个实盘 bear_exhaust 派生采集前向样本）
+        logger.info("S2 条件单影子检测器已启动（t=4 价<开 38.9% / t=5 剔深 44.8%，720d 触发 1069/643，低买 UP 正 EV 来自入场价；影子落表 + 实盘钩子已挂，开火由 trader 侧 enabled 管）")
+        # S2 派生源装配独立于 multi_live_trader（即便实盘执行器装配失败/未启用，
+        # S2 影子仍从每个实盘 bear_exhaust 派生采集前向样本）
         if fake_breakout_detector is not None:
             fake_breakout_detector._on_s2_cond = s2_cond_shadow_detector.on_s2_signal
 
@@ -1251,10 +1264,22 @@ async def lifespan(app: FastAPI):
             fake_breakout_detector._on_signal_fired = multi_live_trader.on_scene_signal
             fake_breakout_detector._on_s5_deep_fired = (
                 multi_live_trader.on_s5_deep_signal)
+        # 影子 promote 实盘钩子（2026-09-06）：s2_cond 判价命中 / nextbar 新根命中 →
+        # 真单（各检测器内钩子独立于影子 gate；影子检测关闭 = 钩子保持 None 纯影子，
+        # 通道即使开启也无触发源——fail-safe 同 scene 族）
+        if s2_cond_shadow_detector is not None:
+            s2_cond_shadow_detector._on_live_fire = multi_live_trader.on_s2_cond_signal
+        if nextbar_shadow_detector is not None:
+            nextbar_shadow_detector._on_live_fire = multi_live_trader.on_nextbar_signal
+        # absorption 标定源注入：check() 内联判定读最新标定快照
+        # （检测器关闭/未注入 → absorption 通道保守不开火，fail-safe 同 kline_fetcher）
+        multi_live_trader.absorption_calibrator = absorption_shadow_detector
         _live_status = multi_live_trader.status()
         _enabled = [c["channel"] for c in _live_status["channels"] if c["enabled"]]
         logger.info(
-            "多通道实盘执行器已加载（真单！）| 通道 {}/{} 启用 {} | 默认 {} USDT/单",
+            "多通道实盘执行器已加载（真单！）| 通道 {}/{} 启用 {} | 默认 {} USDT/单"
+            " | 2026-09-06 promote：s2_cond t4/t5d、nextbar smaslope、absorption"
+            " td120/td150（默认全 OFF，面板「加入实盘通道」开启）",
             len(_enabled), len(_live_status["channels"]),
             _enabled or "（无，toggle 可开）",
             _live_status["defaults"]["amount_usdt"],
@@ -3517,6 +3542,15 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
         "s2_cond_t4_v1", "s2_cond_t5d_v1",  # S2 条件单族（纯影子，2026-09-06：实盘 bear_exhaust 派生窗内 t=4/t=5 判价→押 UP，共表 kline_shadow_signals version 隔离）
     ]
     versions += sorted({s.version for s in sh_rows} - set(versions))
+    # 影子版本 → 实盘通道状态（version==通道名，2026-09-06 promote 后 12 通道；
+    # 一次 status_async 拉全量按 channel 建索引，执行器未装配/查询失败 → 空表兜底）
+    live_by_ch: dict[str, dict] = {}
+    if multi_live_trader is not None:
+        try:
+            _live_st = await multi_live_trader.status_async()
+            live_by_ch = {c["channel"]: c for c in _live_st["channels"]}
+        except Exception as exc:
+            logger.warning("信号分析：实盘通道状态查询失败 | {}", exc)
     shadow = {}
     for v in versions:
         g = [s for s in sh_rows if s.version == v and s.win is not None]
@@ -3552,6 +3586,17 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
                 # retired=永久退役（代码级硬闸，toggle 拒改，前端不可点开关）
                 "enabled": shadow_gate.is_enabled(v),
                 "retired": shadow_gate.is_retired(v),
+                # 实盘通道状态（version==通道名时非 None，前端「实盘」列按钮数据源）：
+                # enabled=下单开关、amount/max_daily/max_exec=确认弹窗展示的护栏三件套
+                "live_channel": (
+                    {
+                        "enabled": _lc["enabled"],
+                        "amount_usdt": _lc["amount_usdt"],
+                        "max_daily_orders": _lc["max_daily_orders"],
+                        "max_exec_price": _lc["max_exec_price"],
+                    }
+                    if (_lc := live_by_ch.get(v)) is not None else None
+                ),
             },
             "curve": curve[-_CURVE_MAX_POINTS:],
         }

@@ -98,11 +98,11 @@ class _FakeTrader:
 def _with_retired(monkeypatch):
     """把已退役通道 spec 注回注册表（机制类用例的 fixture 源）。
 
-    2026-09-04 退役 8 通道后 LIVE_CHANNELS 只剩 7 个在线通道，quote_edge 族
-    仅存 quote_contrarian_v2 一个——「多通道同窗独立开火」/「v2 门禁双模式」/
-    「v3 环境门禁」/「regime」/「streak」/「同窗互斥」这些机制无法只用在线
-    通道构造。机制代码仍在生产（由 ChannelSpec 标志位驱动，未来新通道可再启用），
-    故用退役 spec 当 fixture 继续覆盖；生产注册表本身保持 7 通道不变。
+    2026-09-04 退役 8 通道、2026-09-06 影子 promote 5 通道后 LIVE_CHANNELS 共
+    12 个在线通道，quote_edge 族仅存 quote_contrarian_v2 一个——「多通道同窗
+    独立开火」/「v2 门禁双模式」/「v3 环境门禁」/「regime」/「streak」/「同窗
+    互斥」这些机制无法只用在线通道构造。机制代码仍在生产（由 ChannelSpec 标志
+    位驱动），故用退役 spec 当 fixture 继续覆盖；生产注册表现 12 通道。
     """
     merged = {**RETIRED_CHANNEL_SPECS, **LIVE_CHANNELS}
     monkeypatch.setattr(lc, "LIVE_CHANNELS", merged)
@@ -180,12 +180,12 @@ def _stub_select_db(monkeypatch, rows: list) -> None:
 # ============================================================
 
 def test_parse_defaults_all_off(monkeypatch) -> None:
-    """默认：全 7 在线通道 OFF、金额/日限取全局默认（用户拍板 2U / 100 单）。"""
+    """默认：全 12 在线通道 OFF、金额/日限取全局默认（用户拍板 2U / 100 单）。"""
     monkeypatch.setattr(settings, "live_default_amount_usdt", 2.0)
     monkeypatch.setattr(settings, "live_default_max_daily_orders", 100)
     monkeypatch.setattr(settings, "live_channels_json", "")
     cfgs = parse_channel_config()
-    assert len(cfgs) == 7
+    assert len(cfgs) == 12
     assert all(not c.enabled for c in cfgs.values())
     assert all(c.amount_usdt == 2.0 for c in cfgs.values())
     assert all(c.max_daily_orders == 100 for c in cfgs.values())
@@ -278,13 +278,17 @@ def test_parse_non_int_daily_rejected(monkeypatch) -> None:
 
 
 def test_channels_registry_shape() -> None:
-    """注册表形状（2026-09-04 退役 8 通道后）：7 在线 + 8 退役，两者不交。"""
+    """注册表形状（2026-09-06 影子 promote 5 通道后）：12 在线 + 8 退役，两者不交。"""
     assert set(LIVE_CHANNELS) == {
         "quote_contrarian_v2",
         "x4_v2",
         "scene_bull_exhaust", "scene_bull_exhaust_confirm",
         "scene_bear_exhaust", "scene_momentum_fade",
         "s5_deep_z20_v1",
+        # 2026-09-06 影子 promote 三族（默认全 OFF，面板/配置开启）
+        "s2_cond_t4_v1", "s2_cond_t5d_v1",
+        "nb_smaslope_5m_v1",
+        "absorption_follow_td120_v1", "absorption_follow_td150_v1",
     }
     assert set(RETIRED_CHANNELS) == {
         "quote_momentum_v1", "quote_contrarian_v1",
@@ -311,15 +315,33 @@ def test_channels_registry_shape() -> None:
     s5d = by["s5_deep_z20_v1"]
     assert s5d.family == "scene" and s5d.market_period == "15m"
     assert s5d.direction == "DOWN" and s5d.auto_max_exec == 0.88
+    # promote 三族（2026-09-06）：周期/族/护栏逐项对齐决定表（护栏 = 价-only
+    # 胜率 wr×0.98 平衡价略下方；absorption spec 基准 UP，实际方向由 BTC 位移符号
+    # 动态决定）
+    for ch, period, fam, guard in (
+        ("s2_cond_t4_v1", "15m", "s2_cond", 0.38),
+        ("s2_cond_t5d_v1", "15m", "s2_cond", 0.44),
+        ("nb_smaslope_5m_v1", "5m", "nextbar", 0.46),
+        ("absorption_follow_td120_v1", "5m", "absorption", 0.78),
+        ("absorption_follow_td150_v1", "5m", "absorption", 0.86),
+    ):
+        spec = by[ch]
+        assert spec.market_period == period and spec.family == fam
+        assert spec.auto_max_exec == guard
     # 在线通道一律不带门禁标志（v3_env/regime/streak 仅退役 spec 使用；
     # 机制代码保留，未来新通道可再启用）
     assert all(not s.v3_env and not s.regime_gate and not s.streak_gate
                for s in LIVE_CHANNELS.values())
     assert all(s.v2_guard in (None, "max_rise") for s in LIVE_CHANNELS.values())
-    # 同窗互斥组：仅剩 S5 确认与深档一组；momentum 组随三成员全退役而移除
+    # 同窗互斥组：S5 组（既有）+ promote 新增 s2_cond/absorption 双变体两组；
+    # momentum 组随三成员全退役而移除
     from binance_predict.services.live_channels import exclusive_group
     g_s5 = exclusive_group("s5_deep_z20_v1")
     assert g_s5 == frozenset({"scene_bull_exhaust_confirm", "s5_deep_z20_v1"})
+    assert exclusive_group("s2_cond_t4_v1") == frozenset(
+        {"s2_cond_t4_v1", "s2_cond_t5d_v1"})
+    assert exclusive_group("absorption_follow_td150_v1") == frozenset(
+        {"absorption_follow_td120_v1", "absorption_follow_td150_v1"})
     assert exclusive_group("scene_bull_exhaust") is None
     assert exclusive_group("quote_contrarian_v2") is None
     assert exclusive_group("quote_momentum_v3") is None   # 退役组不参与生产判定
@@ -1080,6 +1102,318 @@ async def test_scene_unknown_pattern_and_bad_payload_swallowed(monkeypatch) -> N
 
 
 # ============================================================
+# 组 6b：影子 promote 三族钩子（s2_cond / nextbar / absorption，2026-09-06）
+# ============================================================
+
+def _s2_cond_sig(version: str = "s2_cond_t4_v1", parent_id: int | None = 9) -> dict:
+    """S2CondShadowDetector._dispatch_live payload 替身。"""
+    return {
+        "version": version,
+        "market_start_15m": MARKET_START_15M,
+        "market_end_15m": MARKET_START_15M + 900_000,
+        "parent_id": parent_id,
+        "up_quote": 0.42,
+    }
+
+
+def _nextbar_sig(version: str = "nb_smaslope_5m_v1") -> dict:
+    """NextbarShadowDetector._dispatch_live payload 替身（目标根 = WINDOW_START）。"""
+    return {
+        "version": version,
+        "market_start": WINDOW_START,
+        "market_end": WINDOW_START + 300_000,
+        "direction": "UP",
+        "signal_bar_start": WINDOW_START - 300_000,
+    }
+
+
+class _FakeCalibrator:
+    """absorption_calibrator 替身：live_calibration 返回预设快照（None=标定缺失）。"""
+
+    def __init__(self, fit: tuple | None):
+        self._fit = fit
+
+    def live_calibration(self, version: str):
+        return self._fit
+
+
+@pytest.mark.asyncio
+async def test_s2_cond_hook_fires_15m_up(monkeypatch) -> None:
+    """s2_cond 钩子：判价命中 → 15m 市场押 UP（冻结方向恒 UP），护栏取 spec。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["s2_cond_t4_v1"])
+    t.on_s2_cond_signal(_s2_cond_sig("s2_cond_t4_v1"))
+    await _drain(t)
+    assert len(fake.calls) == 1
+    call = fake.calls[0]
+    assert call["signal_version"] == "s2_cond_t4_v1"
+    assert call["prediction"] == "UP"
+    assert call["market_period"] == "15m"
+    assert call["window_start"] == MARKET_START_15M
+    assert call["max_exec_price"] == 0.38      # spec.auto_max_exec（38.9%×0.98 略下方）
+    assert call["amount_usdt"] == 2.0
+
+
+@pytest.mark.asyncio
+async def test_s2_cond_disabled_and_stopped_no_fire(monkeypatch) -> None:
+    """s2_cond：通道关 / stopped → 零下单（影子采集照常，互不干扰）。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=[])
+    t.on_s2_cond_signal(_s2_cond_sig())
+    await _drain(t)
+    assert fake.calls == []
+    fake2 = _FakeTrader()
+    t2 = _make_trader(monkeypatch, fake2, channels=["s2_cond_t4_v1"])
+    t2._stopped = True
+    t2.on_s2_cond_signal(_s2_cond_sig())
+    await _drain(t2)
+    assert fake2.calls == []
+
+
+@pytest.mark.asyncio
+async def test_s2_cond_same_market_dedup(monkeypatch) -> None:
+    """同一 S2 事件重复回调 → 每周期至多一单（内存 fired 防重）。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["s2_cond_t4_v1"])
+    t.on_s2_cond_signal(_s2_cond_sig(parent_id=1))
+    t.on_s2_cond_signal(_s2_cond_sig(parent_id=2))
+    await _drain(t)
+    assert len(fake.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_s2_cond_exclusive_t4_fill_blocks_t5d(monkeypatch) -> None:
+    """同窗互斥：t4 成交占坑 → t5d 同窗拒单（同一 S2 事件至多一单成交）。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake,
+                     channels=["s2_cond_t4_v1", "s2_cond_t5d_v1"])
+    t.on_s2_cond_signal(_s2_cond_sig("s2_cond_t4_v1"))
+    await _drain(t)
+    assert [c["signal_version"] for c in fake.calls] == ["s2_cond_t4_v1"]
+    t.on_s2_cond_signal(_s2_cond_sig("s2_cond_t5d_v1"))
+    await _drain(t)
+    assert [c["signal_version"] for c in fake.calls] == ["s2_cond_t4_v1"]
+
+
+@pytest.mark.asyncio
+async def test_s2_cond_exclusive_reject_keeps_slot_free(monkeypatch) -> None:
+    """同窗互斥：t4 弃单（非 FILLED）不占坑 → t5d 同窗仍可下单（互补重试）。"""
+    fake = _FakeTrader(result=_fake_order(status="REJECTED",
+                                          error_message="exec_price_guard",
+                                          signal_version="s2_cond_t4_v1"))
+    t = _make_trader(monkeypatch, fake,
+                     channels=["s2_cond_t4_v1", "s2_cond_t5d_v1"])
+    t.on_s2_cond_signal(_s2_cond_sig("s2_cond_t4_v1"))
+    await _drain(t)
+    t.on_s2_cond_signal(_s2_cond_sig("s2_cond_t5d_v1"))
+    await _drain(t)
+    assert [c["signal_version"] for c in fake.calls] == [
+        "s2_cond_t4_v1", "s2_cond_t5d_v1"]
+
+
+@pytest.mark.asyncio
+async def test_nextbar_hook_fires_5m(monkeypatch) -> None:
+    """nextbar 钩子：新根命中 → 5m 市场押 UP（direction 透传），护栏 0.46。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["nb_smaslope_5m_v1"])
+    t.on_nextbar_signal(_nextbar_sig())
+    await _drain(t)
+    assert len(fake.calls) == 1
+    call = fake.calls[0]
+    assert call["signal_version"] == "nb_smaslope_5m_v1"
+    assert call["prediction"] == "UP"
+    assert call["market_period"] == "5m"
+    assert call["window_start"] == WINDOW_START
+    assert call["max_exec_price"] == 0.46
+
+
+@pytest.mark.asyncio
+async def test_nextbar_disabled_and_stopped_no_fire(monkeypatch) -> None:
+    """nextbar：通道关 / stopped → 零下单（冷启动回补由检测器侧时间窗守卫排除）。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=[])
+    t.on_nextbar_signal(_nextbar_sig())
+    await _drain(t)
+    assert fake.calls == []
+    fake2 = _FakeTrader()
+    t2 = _make_trader(monkeypatch, fake2, channels=["nb_smaslope_5m_v1"])
+    t2._stopped = True
+    t2.on_nextbar_signal(_nextbar_sig())
+    await _drain(t2)
+    assert fake2.calls == []
+
+
+@pytest.mark.asyncio
+async def test_absorption_td_not_reached_no_fire(monkeypatch) -> None:
+    """absorption：TD 未到不判定；首个采样只建窗开快照。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["absorption_follow_td120_v1"])
+    t.absorption_calibrator = _FakeCalibrator((2.0, 0.0, 10.0, 0.5))
+    # 首采样建快照（不判定）
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 5_000, 0.5,
+                   btc_price=100.0, window_entry_price=100.0, up_price=0.50,
+                   up_open=0.50) == []
+    # TD=120s 前不判定
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 60_000, 0.5,
+                   btc_price=100.3, window_entry_price=100.0, up_price=0.505) == []
+    await _drain(t)
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_absorption_missing_calibration_no_fire(monkeypatch) -> None:
+    """absorption：标定源未注入 / live_calibration None → 保守不开火（fail-safe）。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["absorption_follow_td120_v1"])
+    t.check(WINDOW_START, WINDOW_END, WINDOW_START + 5_000, 0.5,
+            btc_price=100.0, window_entry_price=100.0, up_price=0.50,
+            up_open=0.50)
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 130_000, 0.5,
+                   btc_price=100.3, window_entry_price=100.0, up_price=0.505) == []
+    await _drain(t)
+    assert fake.calls == []
+    # 标定源在册但返回 None（缓冲 <MIN_CALIB）→ 同样不开火
+    t.absorption_calibrator = _FakeCalibrator(None)
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 135_000, 0.5,
+                   btc_price=100.3, window_entry_price=100.0, up_price=0.505) == []
+    await _drain(t)
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_absorption_fires_up_when_btc_up(monkeypatch) -> None:
+    """absorption：过位移门+欠反应门 → 开火押 UP（follow 补涨），护栏 0.78。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["absorption_follow_td120_v1"])
+    t.absorption_calibrator = _FakeCalibrator((2.0, 0.0, 10.0, 0.5))
+    t.check(WINDOW_START, WINDOW_END, WINDOW_START + 5_000, 0.5,
+            btc_price=100.0, window_entry_price=100.0, up_price=0.50,
+            up_open=0.50)
+    # TD 后：btc +30bp（过位移门 10bp）、UP 报价粘滞 under=+59.5pp（过欠反应门 0.5）
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 130_000, 0.5,
+                   btc_price=100.3, window_entry_price=100.0, up_price=0.505) \
+        == ["absorption_follow_td120_v1"]
+    await _drain(t)
+    call = fake.calls[0]
+    assert call["signal_version"] == "absorption_follow_td120_v1"
+    assert call["prediction"] == "UP"
+    assert call["market_period"] == "5m"
+    assert call["window_start"] == WINDOW_START
+    assert call["max_exec_price"] == 0.78
+    assert call["amount_usdt"] == 2.0
+
+
+@pytest.mark.asyncio
+async def test_absorption_fires_down_when_btc_down(monkeypatch) -> None:
+    """absorption：btc 跌（btc_move<0）过门 → 押 DOWN（方向随 btc_move 符号）。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["absorption_follow_td120_v1"])
+    t.absorption_calibrator = _FakeCalibrator((2.0, 0.0, 10.0, 0.5))
+    t.check(WINDOW_START, WINDOW_END, WINDOW_START + 5_000, 0.5,
+            btc_price=100.0, window_entry_price=100.0, up_price=0.50,
+            up_open=0.50)
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 130_000, 0.5,
+                   btc_price=99.7, window_entry_price=100.0, up_price=0.505) \
+        == ["absorption_follow_td120_v1"]
+    await _drain(t)
+    assert fake.calls[0]["prediction"] == "DOWN"
+
+
+@pytest.mark.asyncio
+async def test_absorption_exclusive_td120_fill_blocks_td150(monkeypatch) -> None:
+    """absorption 同窗互斥：td120 成交占坑 → td150 同窗同步开火但下单被拒。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=[
+        "absorption_follow_td120_v1", "absorption_follow_td150_v1"])
+    t.absorption_calibrator = _FakeCalibrator((2.0, 0.0, 10.0, 0.5))
+    t.check(WINDOW_START, WINDOW_END, WINDOW_START + 5_000, 0.5,
+            btc_price=100.0, window_entry_price=100.0, up_price=0.50,
+            up_open=0.50)
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 130_000, 0.5,
+                   btc_price=100.3, window_entry_price=100.0, up_price=0.505) \
+        == ["absorption_follow_td120_v1"]
+    await _drain(t)
+    assert [c["signal_version"] for c in fake.calls] == [
+        "absorption_follow_td120_v1"]
+    # TD150 时点：门照过、fired 占位生效（同步开火），但互斥槽拒单（td120 已成交）
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 160_000, 0.5,
+                   btc_price=100.3, window_entry_price=100.0, up_price=0.505) \
+        == ["absorption_follow_td150_v1"]
+    await _drain(t)
+    assert [c["signal_version"] for c in fake.calls] == [
+        "absorption_follow_td120_v1"]
+
+
+@pytest.mark.asyncio
+async def test_absorption_midwindow_no_up_open_no_fire(monkeypatch) -> None:
+    """absorption 中途建快照防线：拿不到窗开 up_open（冷启动/中途启用且本窗
+    尚无 UP 报价入库）→ 本窗跳过，绝不用当前 up_price 当基准伪开火。
+
+    回归 2026-09-06 审计 Critical：中途基准 up_move≈0 → under≈k·|btc_move|
+    虚高必过欠反应门 → 在途窗口伪开火下真单。
+    """
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["absorption_follow_td120_v1"])
+    t.absorption_calibrator = _FakeCalibrator((2.0, 0.0, 10.0, 0.5))
+    # t=200s 中途首采样（up_open 缺失）：不建快照、不判定
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 200_000, 0.5,
+                   btc_price=100.0, window_entry_price=100.0,
+                   up_price=0.50) == []
+    # 后续采样数学上门必过（up_move≈0 → under=+59.95pp），仍不得开火
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 215_000, 0.5,
+                   btc_price=100.3, window_entry_price=100.0,
+                   up_price=0.5005) == []
+    await _drain(t)
+    assert fake.calls == []
+    assert WINDOW_START not in t._abs_open
+
+
+@pytest.mark.asyncio
+async def test_absorption_midwindow_enable_uses_window_open_basis(monkeypatch) -> None:
+    """absorption 中途启用通道：up_open 由 main 从 _pm_history 传入（本窗归档
+    首个有效 UP 采样，与影子 _first(up_p) 同源）→ 基准正确，在途窗口仍可判定。
+
+    t=130s 启用后首采样建快照（up_open=0.50 窗开价、up_price=0.505 当前价），
+    t=145s 判定：up_move=+0.5pp、btc_move=+30bp → under=+59.5pp 过门 → 开火
+    （证明修复不损失在途窗口，且基准是窗开价而非中途价）。
+    """
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["absorption_follow_td120_v1"])
+    t.absorption_calibrator = _FakeCalibrator((2.0, 0.0, 10.0, 0.5))
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 130_000, 0.5,
+                   btc_price=100.3, window_entry_price=100.0, up_price=0.505,
+                   up_open=0.50) == []          # 快照刚建立，判定等后续采样
+    assert t._abs_open[WINDOW_START] == (0.50, 100.0)   # 基准=窗开价非中途价
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 145_000, 0.5,
+                   btc_price=100.3, window_entry_price=100.0, up_price=0.505,
+                   up_open=0.50) == ["absorption_follow_td120_v1"]
+    await _drain(t)
+    assert fake.calls[0]["prediction"] == "UP"
+
+
+@pytest.mark.asyncio
+async def test_absorption_stale_judge_window_skipped(monkeypatch) -> None:
+    """absorption 判定新鲜度：t_rel 超 TD+90s（重启后在途窗）→ 本窗放弃。
+
+    当前价已非 TD 时刻价，与影子 ≤TD 末点口径不成立；即使数学过门也不下注
+    （口径漂移防御，与中途建快照防线互补）。
+    """
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["absorption_follow_td120_v1"])
+    t.absorption_calibrator = _FakeCalibrator((2.0, 0.0, 10.0, 0.5))
+    # t=5s 建快照（up_open 正确），随后进程「重启」错过判定点，t=250s 才恢复采样
+    t.check(WINDOW_START, WINDOW_END, WINDOW_START + 5_000, 0.5,
+            btc_price=100.0, window_entry_price=100.0, up_price=0.50,
+            up_open=0.50)
+    # 250s > TD120+90s：up_move=+0.05pp、under=+59.95pp 数学过门，但口径过期
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 250_000, 0.5,
+                   btc_price=100.3, window_entry_price=100.0, up_price=0.5005,
+                   up_open=0.50) == []
+    await _drain(t)
+    assert fake.calls == []
+
+
+# ============================================================
 # 组 7：set_channel 热调 / status / toggle 端点
 # ============================================================
 
@@ -1111,14 +1445,14 @@ def test_set_channel_daily_over_cap_rejected(monkeypatch) -> None:
 
 
 def test_status_shape(monkeypatch) -> None:
-    """status：15 通道全量、enabled_any/defaults/amount_cap、单通道字段。"""
+    """status：20 通道全量（12 在线 + 8 退役 fixture）、enabled_any/defaults/amount_cap、单通道字段。"""
     t = _make_trader(monkeypatch, _FakeTrader(), channels=["quote_contrarian_v1"])
     s = t.status()
     assert s["enabled_any"] is True
     assert s["amount_cap"] == 50
     assert s["defaults"]["amount_usdt"] == 2.0
     assert s["defaults"]["max_daily_orders"] == 100
-    assert len(s["channels"]) == 15
+    assert len(s["channels"]) == 20
     by = {c["channel"]: c for c in s["channels"]}
     c = by["quote_contrarian_v1"]
     assert c["enabled"] is True and c["enabled_at_startup"] is True

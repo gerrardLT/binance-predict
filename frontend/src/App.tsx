@@ -283,6 +283,11 @@ interface ShadowVersionBlock {
     // 永久退役（2026-09-04）：后端 shadow_version_gate.RETIRED_VERSIONS 硬闸，
     // 不可逆——开关置灰不可点（toggle API 也会 422 拒），但 bench 基准与历史曲线保留
     retired?: boolean
+    // 实盘通道状态（2026-09-06 promote）：version==通道名时后端下发护栏三件套，
+    // 「实盘」列按钮据此渲染；null=该影子族未注册实盘通道（置灰不可点）
+    live_channel?: {
+      enabled: boolean; amount_usdt: number; max_daily_orders: number; max_exec_price: number
+    } | null
   }
   curve: AnalyticsCurvePoint[]
 }
@@ -661,6 +666,27 @@ const SIGNAL_INFO: Record<string, { name: string; kind: '实盘' | '影子' | '�
   s5_deep_z20_v1: {
     name: 'S5深档·深回落门禁版', kind: '场景', liveOk: true,
     desc: 'S1 + 5min 回落确认且 z5≤−20bp 的深回落子集 → +5min 确认即押次周期 15m DOWN（回测 ~91.3%，EV 偏乐观含机械成分；盈亏平衡 ~86.7%）。小金额实盘前向验证，护栏 0.88；与 S5 确认通道同窗互斥（至多一单成交）。',
+  },
+  // ---- 2026-09-06 影子 promote 5 通道（口径源：services/live_channels.py + 各检测器冻结研究口径）----
+  s2_cond_t4_v1: {
+    name: 'S2条件单·t4价<开（押UP）', kind: '影子', liveOk: true,
+    desc: '实盘 S2（bear_exhaust，破 4h 支撑+收阴+放量）派生：次周期 t=4(+240s) 1m 收盘 < 周期开盘（全深度回落）→ 当刻买 UP 押次周期 15m 收阳（价跌时 UP 变便宜，低买 UP 的正 EV 来自入场价而非胜率，真实 EV 由生产报价前向现算）。720d 触发 1069/2176（49.1%，1.48/天），价-only 胜率 38.9%；通道护栏 0.38（38.9%×0.98 平衡价略下方）。与 t5 剔深同窗互斥（至多一单成交）。',
+  },
+  s2_cond_t5d_v1: {
+    name: 'S2条件单·t5剔深（押UP）', kind: '影子', liveOk: true,
+    desc: '实盘 S2（bear_exhaust）派生：次周期 t=5(+300s) 0<回落<15bp（中度回落剔深，排除已深跌的接刀窗）→ 当刻买 UP 押次周期 15m 收阳。720d 触发 643/2176（29.5%，0.89/天），价-only 胜率 44.8%；通道护栏 0.44（44.8%×0.98）。与 t4 价<开同窗互斥（至多一单成交）。',
+  },
+  nb_smaslope_5m_v1: {
+    name: 'nextbar 5m动量误定价（押UP）', kind: '影子', liveOk: true,
+    desc: '5m sma_slope_atr_5 ≥ 1.66（动量急升）→ 押次根 5m 收阳 UP。研究自评：720d 次根收阳仅 47.43%（长样本反指），edge 依赖 7-8 月 regime——record-only 科学仪器非背书，影子期前向验证「动量误定价」是否持续。护栏 0.46（47.43%×0.98 下方）刻意只放行 UP 便宜窗，成交少是保命设计。仅目标根开盘 ≤90s 内的新鲜命中下单（冷启动回补天然排除）。',
+  },
+  absorption_follow_td120_v1: {
+    name: '吸收跟随·TD120（随BTC方向）', kind: '影子', liveOk: true,
+    desc: '5m 窗内 BTC 明显位移而 UP 报价欠跟随（粘滞=知情者顶住人群吸筹的脚印）→ 跟随 BTC 位移方向下注（btc 涨押 UP/跌押 DOWN）。窗开 120s 双快照判定；滚动 14 天标定（弹性 k/位移门 p50/欠反应门 p80，严格 ex-ante，与影子同源）。真实价复核 RECENT EV +0.065 CI[+0.006,+0.123]（胜率 79.8%）；护栏 0.78（79.8%×0.98 下方）。与 TD150 同窗互斥（至多一单成交）。',
+  },
+  absorption_follow_td150_v1: {
+    name: '吸收跟随·TD150（随BTC方向）', kind: '影子', liveOk: true,
+    desc: '同 TD120 机制，TD=窗开 150s（多给 30s 让报价反应，触发更少、欠反应更纯）。真实价复核 RECENT EV +0.105 CI[+0.050,+0.165]（胜率 88.5%）；护栏 0.86（88.5%×0.98 下方）。与 TD120 同窗互斥（至多一单成交）。',
   },
 }
 
@@ -1773,7 +1799,7 @@ function LiveTradeTab() {
     const next = !ch.enabled
     if (next) {
       if (!window.confirm(
-        `确认开启通道实盘？\n通道: ${name}（${ch.channel}）\n每单 ${String(ch.amount_usdt)} USDT | 执行价护栏 ${String(ch.max_exec_price)} | 日限 ${String(ch.max_daily_orders)} 单\n\n命中信号将下真实订单（真金白银）；重启后回落 LIVE_CHANNELS_JSON 配置。`)) return
+        `确认开启通道实盘？\n通道: ${name}（${ch.channel}）\n每单 ${String(ch.amount_usdt)} USDT | 执行价护栏 ${String(ch.max_exec_price)} | 日限 ${String(ch.max_daily_orders)} 单\n\n命中信号将下真实订单（真金白银）；设定写入 DB 重启后保持（仅持久化失败时回落 LIVE_CHANNELS_JSON）。`)) return
     } else {
       if (!window.confirm(
         `确认关闭通道实盘？\n通道: ${name}（${ch.channel}）\n（不取消在途任务，只阻止该通道新单派生）`)) return
@@ -4562,6 +4588,7 @@ function SignalAnalyticsTab() {
                   <tr className="border-b border-gray-200 text-gray-500">
                     <th className="py-1 px-2 text-left">版本</th>
                     <th className="py-1 px-2 text-center">状态</th>
+                    <th className="py-1 px-2 text-center">实盘</th>
                     <th className="py-1 px-2 text-right">n</th>
                     <th className="py-1 px-2 text-right">胜率</th>
                     <th className="py-1 px-2 text-right">盈亏平衡</th>
@@ -4580,6 +4607,9 @@ function SignalAnalyticsTab() {
                     const online = s.enabled !== false
                     // retired 缺失（旧后端）视为未退役；退役是不可逆硬闸，优先级高于 enabled
                     const retired = s.retired === true
+                    // 实盘通道（2026-09-06 promote）：version==通道名时后端下发护栏三件套；
+                    // 已退役行不渲染按钮（通道即便历史上注册过也已随版本硬闸失效）
+                    const live = retired ? null : (s.live_channel ?? null)
                     return (
                       <tr key={k} className={`border-b border-gray-100 hover:bg-gray-50 ${online ? '' : 'opacity-45'}`}>
                         <td className="py-1 px-2 font-medium" style={{ color: m.color }} title={s.desc}>
@@ -4608,6 +4638,42 @@ function SignalAnalyticsTab() {
                           >
                             {online ? '在线' : '已下线'}
                           </button>
+                          )}
+                        </td>
+                        <td className="py-1 px-2 text-center">
+                          {live ? (
+                            <button
+                              onClick={async () => {
+                                const next = !live.enabled
+                                if (next) {
+                                  if (!window.confirm(
+                                    `确认开启通道实盘？\n通道: ${SIGNAL_INFO[k]?.name ?? k}（${k}）\n每单 ${String(live.amount_usdt)} USDT | 执行价护栏 ${String(live.max_exec_price)} | 日限 ${String(live.max_daily_orders)} 单\n\n命中信号将下真实订单（真金白银）；设定写入 DB 重启后保持（仅持久化失败时回落 LIVE_CHANNELS_JSON）。`)) return
+                                } else {
+                                  if (!window.confirm(
+                                    `确认关闭通道实盘？\n通道: ${SIGNAL_INFO[k]?.name ?? k}（${k}）\n（不取消在途任务，只阻止该通道新单派生）`)) return
+                                }
+                                try {
+                                  const res = await api.postLiveChannel(k, next)
+                                  if (res?.error) alert(`切换失败: ${String(res.error)}`)
+                                  load()
+                                } catch (e) {
+                                  alert(`请求失败: ${(e as Error).message}`)
+                                }
+                              }}
+                              className={`px-1.5 py-0.5 rounded text-[10px] font-medium border transition ${
+                                live.enabled
+                                  ? 'text-green-700 border-green-300 bg-green-50 hover:bg-green-100'
+                                  : 'text-gray-500 border-gray-300 bg-gray-50 hover:bg-gray-100'
+                              }`}
+                              title={live.enabled ? '实盘下单中，点击关闭该通道（影子采集不受影响）' : '点击开启实盘下单（真金白银；影子采集不受影响）'}
+                            >
+                              {live.enabled ? '实盘中' : '加入实盘'}
+                            </button>
+                          ) : (
+                            <span className="inline-flex items-center gap-0.5 text-gray-300">
+                              —
+                              <HelpHint text="该影子族未注册实盘通道（不下注）；实盘化需在 services/live_channels.py 注册同名 ChannelSpec 并重启" />
+                            </span>
                           )}
                         </td>
                         <td className="py-1 px-2 text-right font-mono">{s.n}</td>

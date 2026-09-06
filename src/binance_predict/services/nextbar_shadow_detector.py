@@ -23,8 +23,10 @@
 自己 timeframe 的 version，且用本 timeframe 的 K 线结算——15m bar 起点同时也是某
 5m bar 起点，若跨 timeframe 混用会用 5m 次根 close 错结 15m 信号，故按 tf 严格隔离。
 
-影子纪律：只记录不下注、不注册 LIVE_CHANNELS、不进 X4_VERSIONS，本表不被任何下单
-代码引用（物理隔离）。攒 2~3 周真实样本复核后人工 promote 才可上线。
+影子纪律（2026-09-06 promote 后更新）：影子落表与实盘下单解耦——影子仍只记录不下注；
+实盘通道 nb_smaslope_5m_v1 已注册 LIVE_CHANNELS，由 _on_live_fire 钩子驱动
+MultiLiveTrader 真单（仅目标根开盘 ≤90s 的新鲜命中开火，冷启动回补天然排除；
+通道 enabled 由 toggle 管，与影子 gate 互不影响）。
 
 数据流：
     1. 每 60s 轮询；fetch_recent_klines 按币安服务器时间只返回已收盘 K，天然规避
@@ -91,8 +93,11 @@ POLL_INTERVAL = 60.0            # 轮询间隔（秒）
 # zscore_10 需 10 根。40 根足够 warmup + 12 根回补余量（末根特征与全量矩阵逐位一致）。
 WARMUP_BARS = 40
 BACKSCAN_BARS = 12              # 冷启动/追赶回补根数
-# 目标根起点后仍未结算的超时兜底：5m 次根应在 ~10min 内结算，给 1h；15m 与 KREV 同 4h。
+# 目标根起点后仍未结算的超时兑底：5m 次根应在 ~10min 内结算，给 1h；15m 与 KREV 同 4h。
 PENDING_EXPIRE_MS = {"5m": 3_600_000, "15m": 4 * 3_600_000}
+# 实盘开火时间窗：目标根开盘后 ≤90s 内的命中才开火（研究入场口径=目标窗开盘后首次
+# 轮询快照，≤60s 轮询节奏 + 余量；冷启动回补的历史根全部超窗排除，严格 ex-ante）
+NEXTBAR_LIVE_MAX_LAG_MS = 90_000
 
 
 def _to_klines(rows: list[dict], bar_ms: int) -> Klines:
@@ -139,7 +144,7 @@ def evaluate_conditions(fm, specs: list[dict], n_tail: int) -> list[dict]:
 
 
 class NextbarShadowDetector:
-    """nextbar 影子信号检测器：轮询 5m/15m 收盘 → 条件求值/结算，全程只落表不下注。"""
+    """nextbar 影子信号检测器：轮询 5m/15m 收盘 → 条件求值/结算；影子落表 + 实盘开火分派。"""
 
     def __init__(self, collector, pm_15m_latest: dict, pm_5m_info: dict) -> None:
         self._collector = collector
@@ -154,6 +159,9 @@ class NextbarShadowDetector:
         self._settle_count = 0
         # 条件预解析（冻结原文 → 原子片段），启动时一次性暴露格式错误
         self._specs = [{**s, "parts": parse_condition(s["condition"])} for s in NEXTBAR_SHADOW_SPECS]
+        # 实盘开火钩子（main 装配注入 multi_live_trader.on_nextbar_signal；
+        # 未注入 = 纯影子模式，只落表不下注）
+        self._on_live_fire = None
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -169,8 +177,9 @@ class NextbarShadowDetector:
             logger.warning("nextbar 影子：冷启动回补失败（忽略，循环内自愈）| {}", exc)
         self._task = asyncio.create_task(self._loop(), name="nextbar_shadow_detector")
         logger.info(
-            "nextbar K线影子检测器启动 | {} | 冻结条件原文求值（15m 冠军 720d 次根收阳 "
-            "58.92% / 5m sma_slope 47.43% regime 依赖）（影子模式：只记录不下注）",
+            "nextbar K线检测器启动 | {} | 冻结条件原文求值（15m 冠军 720d 次根收阳 "
+            "58.92% / 5m sma_slope 47.43% regime 依赖）（影子落表 + 实盘通道已注册，"
+            "开火由 trader 侧 enabled 管）",
             "/".join(NEXTBAR_VERSIONS),
         )
 
@@ -245,23 +254,45 @@ class NextbarShadowDetector:
         hits = evaluate_conditions(fm, specs_tf, n_tail)
         if not hits:
             return
+        live_payloads: list[dict] = []
         async with async_session_factory() as session:
             added = 0
             last_bar = None
             for hit in hits:
                 bar = closed[hit["idx"]]
                 last_bar = bar
-                if await self._record_signal(session, hit["spec"], bar, fm, hit["idx"]):
+                if await self._record_signal(session, hit["spec"], bar, fm,
+                                             hit["idx"], live_payloads):
                     added += 1
             if added:
                 await session.commit()
                 self._trigger_count += added
                 logger.info("nextbar 影子触发 +{} | {} | 信号根 {}", added, tf, int(last_bar["open_time"]))
+        self._dispatch_live(live_payloads)
 
-    async def _record_signal(self, session, spec: dict, bar: dict, fm, idx: int) -> bool:
-        """幂等落 PENDING：唯一约束 (version, signal_bar_start) + 先查后插。"""
-        if not shadow_gate.is_enabled(spec["version"]):
-            return False  # 手动下线：停止采集新信号（历史数据保留）
+    def _dispatch_live(self, payloads: list[dict]) -> None:
+        """实盘开火分派（2026-09-06 promote）：落表事务后逐条回调 MultiLiveTrader。
+
+        与影子 gate 解耦（影子下线只停落表，实盘由 trader 侧通道 enabled 管）；
+        钩子未装配 = 纯影子模式直接跳过；异常只告警不抛（不阻断影子采集）。
+        """
+        hook = self._on_live_fire
+        if hook is None or not payloads:
+            return
+        for p in payloads:
+            try:
+                hook(p)
+            except Exception as exc:
+                logger.warning("nextbar：实盘开火分派异常（不影响影子采集）| {}", exc)
+
+    async def _record_signal(self, session, spec: dict, bar: dict, fm, idx: int,
+                             live_payloads: list[dict] | None = None) -> bool:
+        """幂等落 PENDING + 实盘开火收集（先查后插）。
+
+        实盘钩子与影子 gate 解耦（2026-09-06 promote）：新鲜命中（目标根开盘
+        ≤NEXTBAR_LIVE_MAX_LAG_MS）先收 payload，gate 关闭只停落表不停开火。
+        返回 True=新信号已入 session（commit 后由调用方分派开火）。
+        """
         start_ms = int(bar["open_time"])
         bar_ms = BAR_MS[spec["timeframe"]]
         exists = (await session.execute(
@@ -272,6 +303,20 @@ class NextbarShadowDetector:
         )).scalar_one_or_none()
         if exists is not None:
             return False
+        target_bar_start = start_ms + bar_ms
+        # 实盘开火收集：仅目标根刚开盘的新鲜命中；幂等重跑/冷启动回补的历史根超窗排除
+        if live_payloads is not None and (
+                0 <= int(time.time() * 1000) - target_bar_start
+                <= NEXTBAR_LIVE_MAX_LAG_MS):
+            live_payloads.append({
+                "version": spec["version"],
+                "market_start": target_bar_start,
+                "market_end": target_bar_start + bar_ms,
+                "direction": spec["direction"],
+                "signal_bar_start": start_ms,
+            })
+        if not shadow_gate.is_enabled(spec["version"]):
+            return False  # 手动下线：停止采集新信号（开火已收集，历史数据保留）
         snapshot: dict = {}
         for feat in spec["snapshot_features"]:
             col = fm.cols.get(feat)
