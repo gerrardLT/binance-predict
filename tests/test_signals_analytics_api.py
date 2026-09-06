@@ -15,7 +15,7 @@ collector.fetch_recent_klines 用 AsyncMock patch。
   （赢 0.98/q−1 / 输 −1）；kline 系无报价恒空
 - 影子版本 = 冻结基准 ∪ 数据中出现版本（新版本 bench=None 容错）
 - 场景信号过滤 = 排除 SceneParamVersion 中 SHADOW 版本名（ACTIVE 演进名视为正式）；
-  端点共 5 次 db.execute（影子行 → KREV 行 → pattern 行 → SHADOW 版本名 → 场景行）
+  端点共 6 次 db.execute（影子行 → KREV 行 → pattern 行 → absorption 行 → SHADOW 版本名 → 场景行）
 - K 线缓存键 = interval:档位（limit 归档到固定档），上游失败 10s 负缓存
 """
 
@@ -75,17 +75,31 @@ def _pattern_row(**over) -> SimpleNamespace:
     return SimpleNamespace(**base)
 
 
-def _make_db(shadow_rows, scene_rows, krev_rows=(), pattern_rows=()) -> AsyncMock:
+def _absorption_row(**over) -> SimpleNamespace:
+    """absorption 影子行替身（absorption_shadow_signals）：ev_at_entry 已落库（real 基，
+    聚合直读非兜底现算）；direction 决定入场报价侧（UP→entry_up_price / DOWN→entry_down_price）。"""
+    base = dict(
+        version="absorption_follow_td120_v1", window_start=1_000_000_000_000,
+        win=True, ev_at_entry=0.3, entry_down_price=None,
+        entry_up_price=0.48, direction="UP",
+    )
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def _make_db(shadow_rows, scene_rows, krev_rows=(), pattern_rows=(),
+             absorption_rows=()) -> AsyncMock:
     db = AsyncMock()
-    r1, r2, r3, r4, r5 = (MagicMock() for _ in range(5))
+    r1, r2, r3, r4, r5, r6 = (MagicMock() for _ in range(6))
     # 端点用指定列 SELECT，结果直接 .all()（不再 .scalars()）；
-    # 5 次查询顺序：影子行 → KREV 行 → pattern 行 → SceneParamVersion SHADOW 版本名（默认空）→ 场景行
+    # 6 次查询顺序：影子行 → KREV 行 → pattern 行 → absorption 行 → SceneParamVersion SHADOW 版本名（默认空）→ 场景行
     r1.all.return_value = shadow_rows
     r2.all.return_value = krev_rows
     r3.all.return_value = pattern_rows
-    r4.all.return_value = []
-    r5.all.return_value = scene_rows
-    db.execute = AsyncMock(side_effect=[r1, r2, r3, r4, r5])
+    r4.all.return_value = absorption_rows
+    r5.all.return_value = []
+    r6.all.return_value = scene_rows
+    db.execute = AsyncMock(side_effect=[r1, r2, r3, r4, r5, r6])
     return db
 
 
@@ -262,7 +276,9 @@ async def test_analytics_empty_db() -> None:
         "krev_a_v1", "krev_b_v1", "hm_touch_down_v1", "hm_touch_down_v2",
         "rev_p1_v1", "rev_p2_v1", "nb_zschamp_15m_v1", "nb_smaslope_5m_v1",
         "combo_p1_v1", "combo_p2_v1", "combo_p3_v1", "combo_p4_v1", "combo_p5_v1",
-        "s5_deep_z20_v1", "quote_momentum_v3"}
+        "s5_deep_z20_v1", "quote_momentum_v3",
+        "absorption_follow_td120_v1", "absorption_follow_td150_v1",
+        "s2_cond_t4_v1", "s2_cond_t5d_v1"}
     for v, blk in out["shadow"].items():
         assert blk["summary"]["n"] == 0
         assert blk["summary"]["win_rate"] is None
@@ -332,8 +348,31 @@ async def test_analytics_empty_db() -> None:
         cb = out["shadow"][ver]["summary"]
         assert cb["bench_winrate"] == bwr and cb["bench_ev"] is None
         assert cb["desc"].startswith(dpre)
-    # 影子开关状态（2026-09-04 前端手动下线能力）：gate 无覆盖行 → 默认全在线
-    assert all(blk["summary"]["enabled"] is True for blk in out["shadow"].values())
+    # S2 条件单族（共表 kline_shadow_signals）：基准只钉 720d 冻结「价-only」胜率（硬数字，
+    # 审计锚点 scripts/s2_cond_freeze_counts_720d.py）；EV 基准留 None——报价表研究 EV
+    # (+0.237/+0.283) 属乐观上界，真实 EV 由生产报价前向现算（低买 UP 的正 EV 来自入场价）
+    for ver, bwr, dpre in (
+        ("s2_cond_t4_v1", 0.389, "S2条件t=4"),
+        ("s2_cond_t5d_v1", 0.448, "S2条件t=5剔深"),
+    ):
+        sc = out["shadow"][ver]["summary"]
+        assert sc["bench_winrate"] == bwr and sc["bench_ev"] is None
+        assert sc["desc"].startswith(dpre)
+    # 影子开关状态（2026-09-04 前端手动下线能力）：gate 无覆盖行 → 非退役版默认全在线；
+    # 退役版（RETIRED_VERSIONS）恒下线且 retired=True（代码级硬闸，不受 DB 覆盖行影响，
+    # toggle API 拒改）；面板仍保留退役版历史曲线与 bench 基准（退役≠删数据）。
+    from binance_predict.services.shadow_version_gate import RETIRED_VERSIONS
+    for ver, blk in out["shadow"].items():
+        s = blk["summary"]
+        if ver in RETIRED_VERSIONS:
+            assert s["enabled"] is False and s["retired"] is True
+        else:
+            assert s["enabled"] is True and s["retired"] is False
+    assert {v for v, b in out["shadow"].items()
+            if b["summary"]["retired"]} == set(RETIRED_VERSIONS)
+    # 退役版仍带冻结 bench 基准与说明（审计可追溯）
+    assert out["shadow"]["x4_v1"]["summary"]["bench_winrate"] == 0.635
+    assert out["shadow"]["quote_contrarian_v4"]["summary"]["desc"].startswith("逆势v4")
     assert out["scene"] == {}
     assert out["regime"]["phases"] == {}
     assert out["regime"]["by_version"] == {}
@@ -429,6 +468,43 @@ async def test_analytics_pattern_merged_from_pattern_shadow_table() -> None:
     # regime 归因：早于 PUMP_TS_MS → pre
     bv = out["regime"]["by_version"]
     assert bv["hm_touch_down_v1"]["pre"] == {"n": 3, "wins": 2, "winrate": pytest.approx(2 / 3)}
+
+
+@pytest.mark.asyncio
+async def test_analytics_absorption_merged_from_shadow_table() -> None:
+    """absorption 行（absorption_shadow_signals 表，第4 UNION 分支）并入影子统计：
+    ev_at_entry 已落库 → 聚合直读（非兜底现算）；盈亏平衡按 direction 侧入场报价
+    （q/0.98 无溢价）；两 variant 各自成组，bench 取 real 基冻结基准（0.798/0.052、0.885/0.105）。"""
+    import binance_predict.main as m
+
+    ev_up = 0.98 / 0.48 - 1.0
+    abs_rows = [
+        _absorption_row(version="absorption_follow_td120_v1", window_start=1_000,
+                        win=True, ev_at_entry=ev_up, direction="UP", entry_up_price=0.48),
+        _absorption_row(version="absorption_follow_td120_v1", window_start=2_000,
+                        win=False, ev_at_entry=-1.0, direction="UP", entry_up_price=0.50),
+        _absorption_row(version="absorption_follow_td150_v1", window_start=1_500,
+                        win=True, ev_at_entry=0.98 / 0.52 - 1.0,
+                        direction="DOWN", entry_down_price=0.52),
+    ]
+    db = _make_db([], [], absorption_rows=abs_rows)
+    out = await m.get_signals_analytics(db)
+
+    a120 = out["shadow"]["absorption_follow_td120_v1"]
+    assert a120["summary"]["n"] == 2 and a120["summary"]["win_rate"] == pytest.approx(0.5)
+    # ev_at_entry 直读：avg=(赢笔 ev_up + 输笔 −1)/2
+    assert a120["summary"]["avg_ev"] == pytest.approx((ev_up - 1.0) / 2, rel=1e-9)
+    assert a120["summary"]["cum_ev"] == pytest.approx(round(ev_up - 1.0, 4), rel=1e-9)
+    # 盈亏平衡：UP 侧报价均值 / 0.98（非 x4 系，无溢价）
+    assert a120["summary"]["avg_breakeven"] == pytest.approx(
+        ((0.48 / 0.98) + (0.50 / 0.98)) / 2, abs=1e-9)
+    assert a120["summary"]["bench_winrate"] == 0.798 and a120["summary"]["bench_ev"] == 0.052
+
+    a150 = out["shadow"]["absorption_follow_td150_v1"]
+    assert a150["summary"]["n"] == 1 and a150["summary"]["win_rate"] == 1.0
+    # DOWN 侧报价 → 盈亏平衡 0.52/0.98；bench 取 td150 real 基
+    assert a150["summary"]["avg_breakeven"] == pytest.approx(0.52 / 0.98, abs=1e-9)
+    assert a150["summary"]["bench_winrate"] == 0.885 and a150["summary"]["bench_ev"] == 0.105
 
 
 def test_shadow_breakeven_x4_family_includes_premium() -> None:

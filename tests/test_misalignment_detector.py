@@ -6,9 +6,11 @@
 - 结算：PENDING 目标匹配次窗 → SETTLED（win/报价/EV 回填）；NOISE → EXPIRED
 - 报价：≤150s 最晚点；real 优先 / chance proxy 回退 / 缺失 NULL
 - EV：赢 0.98/(p+0.01)−1（截断 [0.01,0.99]）/ 输 −1
-- 幂等：同窗口重复触发被唯一约束查询拦下（v1/v2 独立）
-- x4_v2 平静市门禁：|past1h|<0.5% 双落；单边市/缺基准只落 v1；
-  v1 幂等命中不再阻断 v2 判定（幂等键 per-version）
+- 幂等：同窗口重复触发被唯一约束查询拦下（幂等键 per-version）
+- x4_v2 平静市门禁：|past1h|<0.5% 才落；单边市/缺基准 → 整窗零信号
+- 2026-09-04 退役：x4_v1 已入 shadow_version_gate.RETIRED_VERSIONS（被 x4_v2
+  严格支配），基础判定不再单独落行；本文件用例一律按「只有 x4_v2」断言。
+  存量 x4_v1 PENDING 行仍照常结算（结算路径不看版本闸）。
 """
 
 from __future__ import annotations
@@ -175,13 +177,34 @@ async def _run_process(det_win, pending_sigs=(), dup_rows=None, dup2_rows=None,
 
 @pytest.mark.asyncio
 async def test_trigger_on_up_window_with_low_end_pct() -> None:
-    """收阳 & end≤40 → 落 PENDING 信号。"""
-    session, added = await _run_process(_win(100 * MIN, "UP"))
+    """收阳 & end≤40（+ 平静市门禁通过）→ 落 PENDING 信号（x4_v2）。
+
+    2026-09-04：x4_v1 已永久退役（被 x4_v2 严格支配：v2 = v1 触发集纯子集
+    + 平静市门禁），同样的触发几何现在只有过门禁才产生信号。
+    """
+    start = 100 * MIN
+    session, added = await _run_process(
+        _win(start, "UP", entry_price=100.0), past1h_price=100.2)
     assert len(added) == 1
     sig = added[0]
-    assert sig.version == "x4_v1" and sig.direction == "DOWN"
+    assert sig.version == "x4_v2" and sig.direction == "DOWN"
     assert sig.end_pct == 38.0 and sig.status == "PENDING"
-    assert sig.target_window_start == 105 * MIN  # 次窗 = 本窗 end
+    assert sig.target_window_start == start + 5 * MIN  # 次窗 = 本窗 end
+
+
+@pytest.mark.asyncio
+async def test_x4_v1_retired_never_recorded() -> None:
+    """x4_v1 永久退役：满足 v1 触发几何（甚至门禁也过）也不再落 v1 行。"""
+    from binance_predict.services.shadow_version_gate import (
+        RETIRED_VERSIONS, shadow_gate,
+    )
+    assert "x4_v1" in RETIRED_VERSIONS
+    assert shadow_gate.is_retired("x4_v1") is True
+    assert shadow_gate.is_enabled("x4_v1") is False   # 硬闸，覆盖行也拗不动
+    session, added = await _run_process(
+        _win(100 * MIN, "UP", entry_price=100.0), past1h_price=100.2)
+    assert not [s for s in added if s.version == "x4_v1"]
+    assert [s.version for s in added] == ["x4_v2"]
 
 
 @pytest.mark.asyncio
@@ -196,7 +219,7 @@ async def test_no_trigger_on_down_or_high_end() -> None:
 
 @pytest.mark.asyncio
 async def test_no_duplicate_on_same_window() -> None:
-    """幂等：唯一约束预查询命中 → 不再 add。"""
+    """幂等：唯一约束预查询命中 → 不再 add（v1 退役后全窗零新增）。"""
     session, added = await _run_process(_win(100 * MIN, "UP"), dup_rows=[123])
     assert added == []
 
@@ -207,46 +230,46 @@ async def test_no_duplicate_on_same_window() -> None:
 
 @pytest.mark.asyncio
 async def test_v2_triggers_in_calm_market() -> None:
-    """平静市（past1h ≈ −0.2%）：v1 + v2 双落 PENDING，target 同次窗。"""
+    """平静市（past1h ≈ −0.2%）：落 x4_v2 PENDING（x4_v1 已退役不再双落）。"""
     start = 100 * MIN
     session, added = await _run_process(
         _win(start, "UP", entry_price=100.0), past1h_price=100.2,
     )
-    assert [s.version for s in added] == ["x4_v1", "x4_v2"]
-    v2 = added[1]
+    assert [s.version for s in added] == ["x4_v2"]
+    v2 = added[0]
     assert v2.end_pct == 38.0 and v2.status == "PENDING"
-    assert v2.target_window_start == start + 5 * MIN  # 与 v1 同目标次窗
+    assert v2.target_window_start == start + 5 * MIN
 
 
 @pytest.mark.asyncio
 async def test_v2_skipped_in_trendy_market() -> None:
-    """单边市（past1h 涨 1.0% ≥ 0.5%）→ 只落 v1。"""
+    """单边市（past1h 涨 1.0% ≥ 0.5%）→ v2 不落（v1 退役后整窗零信号）。"""
     session, added = await _run_process(
         _win(100 * MIN, "UP", entry_price=101.0), past1h_price=100.0,
     )
-    assert [s.version for s in added] == ["x4_v1"]
+    assert added == []
 
 
 @pytest.mark.asyncio
 async def test_v2_skipped_when_past1h_missing() -> None:
-    """门禁数据缺失（无 1h 前基准窗）→ 保守只落 v1。"""
+    """门禁数据缺失（无 1h 前基准窗）→ 保守不落（v1 退役后整窗零信号）。"""
     session, added = await _run_process(_win(100 * MIN, "UP", entry_price=100.0))
-    assert [s.version for s in added] == ["x4_v1"]
+    assert added == []
 
 
 @pytest.mark.asyncio
-async def test_v2_dup_skipped_independently() -> None:
-    """v2 幂等独立：v2 已存在 → 不重复落（v1 照常）。"""
+async def test_v2_dup_skipped() -> None:
+    """v2 幂等：v2 已存在 → 不重复落（v1 退役后整窗零新增）。"""
     session, added = await _run_process(
         _win(100 * MIN, "UP", entry_price=100.0),
         dup2_rows=[456], past1h_price=100.2,
     )
-    assert [s.version for s in added] == ["x4_v1"]
+    assert added == []
 
 
 @pytest.mark.asyncio
 async def test_v2_triggers_even_when_v1_dup_exists() -> None:
-    """v1 已存在（重复处理）→ v2 仍独立判定落表（幂等键 per-version）。"""
+    """v1 幂等行命中（历史存量）→ 不阻断 v2 判定（幂等键 per-version）。"""
     session, added = await _run_process(
         _win(100 * MIN, "UP", entry_price=100.0),
         dup_rows=[123], past1h_price=100.2,

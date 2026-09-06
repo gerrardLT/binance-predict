@@ -61,6 +61,27 @@ _BATCH_REDEEM_PATH = "/sapi/v1/w3w/wallet/prediction/batch-redeem"
 # 同槽位立即重新报价重试，重试轮滑点放宽到护栏全空间（成交价仍不破护栏）。
 MAX_FOK_RETRIES = 2
 
+# 币安订单终态集合（P0，2026-09-04）：除 FILLED/FAILED 外，EXPIRED/CANCELLED
+# 同样是不可再变的终态——旧实现只认 FILLED/FAILED，遇到 EXPIRED 会一直轮询到
+# 超时返回 None，既丢掉终态信息又让 FOK 重试路径短路。
+TERMINAL_ORDER_STATUSES = frozenset({"FILLED", "FAILED", "EXPIRED", "CANCELLED"})
+# 可重试的非成交终态（FOK 未吃到深度 → 同槽位重新报价再试）
+RETRYABLE_ORDER_STATUSES = frozenset({"FAILED", "EXPIRED", "CANCELLED"})
+
+# 终态回查轮询窗口（P0，2026-09-04 生产实证订单 id=285）：币安 createTime →
+# terminalTime 相隔 2.967s，旧参数 attempts=3/delay=1.0 总窗口仅 ≈2.4s（差 471ms）
+# → 返回 None → 落 PENDING，且重试条件 `confirmed is not None` 短路，FOK 重试
+# 一次都没跑。常规轮询 5×1.5s 覆盖 ≈6s；仍未命中再深轮询 3×3.0s 兜底 ≈6s。
+CONFIRM_ATTEMPTS = 5
+CONFIRM_DELAY_S = 1.5
+CONFIRM_DEEP_ATTEMPTS = 3
+CONFIRM_DEEP_DELAY_S = 3.0
+
+# 下单前余额预检（P1，2026-09-04）：手工单/划转把 CeDeFi 可用余额打穿后，
+# 币安要到报价阶段才回 -9000「Please ensure your account has enough USDT.」，
+# 文案泛化难归因（当日 12:45 信号废单实证）。低于告警线打 ERROR 日志（不拦单）。
+LOW_BALANCE_ALERT_USDT = 10.0
+
 
 class BinancePredictionTrader:
     """
@@ -629,7 +650,8 @@ class BinancePredictionTrader:
         return [data]
 
     async def confirm_order_status(
-        self, order_id: str | None, attempts: int = 3, delay: float = 1.0,
+        self, order_id: str | None,
+        attempts: int = CONFIRM_ATTEMPTS, delay: float = CONFIRM_DELAY_S,
     ) -> dict | None:
         """回查刚下单订单的币安侧终态：命中订单历史行 dict / None。
 
@@ -642,6 +664,10 @@ class BinancePredictionTrader:
         2026-08-28 语义变更：返回值由终态 str 改为命中的历史行 dict（终态取
         row["status"]，另含 price/filledUsdtAmount 等），顺手把历史行的实际
         成交价带回落库侧（execute_trade/execute_signal_trade 回填 quote_json）。
+
+        2026-09-04 修正（P0）：① 终态集合扩到 EXPIRED/CANCELLED（旧实现只认
+        FILLED/FAILED，EXPIRED 单会轮询到超时后误报 None）；② 默认轮询窗口
+        由 ≈2.4s 放宽到 ≈6s（生产实证币安 2.967s 才翻 FAILED，差 471ms）。
         """
         if not order_id:
             return None
@@ -653,11 +679,58 @@ class BinancePredictionTrader:
                         o.get("orderId"), o.get("vendorOrderId"),
                     ):
                         status = o.get("status")
-                        if status in ("FILLED", "FAILED"):
+                        if status in TERMINAL_ORDER_STATUSES:
                             return o
             if i < attempts - 1:
                 await asyncio.sleep(delay)
         return None
+
+    async def _confirm_with_backfill(self, order_id: str | None) -> dict | None:
+        """两轮终态回查（P0）：常规轮询（≈6s）未命中 → 深轮询（再≈6s）兜底。
+
+        为何不能直接把 None 当「未成交」：旧代码重试入口写成
+        `while (order_result and confirmed is not None and ...)`，None 时整个条件
+        短路，FOK 重试一次都不执行（2026-09-04 id=285 生产实证：本应重试的单
+        直接落 PENDING，13 分钟后才被对账订正为 FAILED）。
+        两轮仍 None → 返回 None，调用方落 PENDING 交对账（不伪造成交）。
+        """
+        row = await self.confirm_order_status(order_id)
+        if row is not None:
+            return row
+        logger.warning("订单终态常规轮询未命中，转深轮询兜底 | orderId={}", order_id)
+        return await self.confirm_order_status(
+            order_id, attempts=CONFIRM_DEEP_ATTEMPTS, delay=CONFIRM_DEEP_DELAY_S)
+
+    async def _preflight_balance(self, amount_usdt: float) -> tuple[bool, float | None, str]:
+        """下单前 CeDeFi 可用余额预检（P1）。
+
+        返回 (可下单?, 可用余额, 不可下单原因)。余额查询失败/字段缺失 →
+        保守放行（None）：预检是护栏不是闸门，查询通道故障不应成为停掉
+        实盘的理由（与影子 gate 「DB 故障保守全在线」同口径）。
+        低于 LOW_BALANCE_ALERT_USDT 时打 ERROR 日志告警（仍放行本单）。
+        """
+        try:
+            bal = await self.fetch_prediction_wallet_balance()
+        except Exception as exc:
+            logger.warning("余额预检异常（保守放行）| {}", exc)
+            return True, None, ""
+        free = (bal or {}).get("usdt_free")
+        if free is None:
+            logger.warning("余额预检：可用余额字段缺失（保守放行）| {}", bal)
+            return True, None, ""
+        try:
+            free = float(free)
+        except (TypeError, ValueError):
+            return True, None, ""
+        if free < amount_usdt:
+            return False, free, (
+                f"预测钱包可用余额不足：{free:.4f} USDT < 下单额 {amount_usdt} USDT"
+                "（未提交币安，防 -9000 废单）")
+        if free < LOW_BALANCE_ALERT_USDT:
+            logger.error(
+                "⚠️ 预测钱包低余额告警 | 可用 {:.4f} USDT < 告警线 {} USDT | 本单 {} USDT",
+                free, LOW_BALANCE_ALERT_USDT, amount_usdt)
+        return True, free, ""
 
     @staticmethod
     def _merge_fill_into_quote(quote: dict, fill_row: dict) -> dict:
@@ -1375,9 +1448,24 @@ class BinancePredictionTrader:
                     pending, "FAILED", direction=prediction,
                     error_message=f"未找到 {market_period} 市场 {prediction} 方向的 token")
 
+            # P1 余额预检：手工单/划转把 CeDeFi 可用余额打穿时，币安要到报价
+            # 阶段才回 -9000，文案泛化难归因（2026-09-04 12:45 生产实证）。
+            # 预检不过即弃单（未提交币安，不产生废单）；查询失败保守放行。
+            bal_ok, bal_free, bal_why = await self._preflight_balance(amount_usdt)
+            if not bal_ok:
+                logger.error("信号实盘：余额预检未过，弃单 | signal={} | window={} | {}",
+                             signal_version, window_start, bal_why)
+                return await self._update_signal_order(
+                    pending, "FAILED", direction=prediction,
+                    error_message=f"余额预检弃单 | {bal_why}")
+
             quote = await self.get_quote(token_id, "BUY", amount_usdt=amount_usdt)
             if not quote:
                 detail = self.last_api_error or "无详情（网络异常？）"
+                # 错误分类（P1）：-9000 是币安的余额不足文案，预检放行但下单时
+                # 余额被并发手工单抽走时会走到这里，归因文案直接点名余额。
+                if "-9000" in detail or "enough USDT" in detail:
+                    detail = f"余额不足（币安 -9000）| {detail}"
                 return await self._update_signal_order(
                     pending, "FAILED", direction=prediction,
                     error_message=f"获取报价失败 | {detail}",
@@ -1411,9 +1499,11 @@ class BinancePredictionTrader:
                     error_message="下单失败", quote_json=quote)
 
             # 币安侧终态回查（FOK 受理后仍可能翻转 FAILED；防幽灵成交，
-            # 2026-08 对账发现 2 笔本地 FILLED 而币安 filled=0）
+            # 2026-08 对账发现 2 笔本地 FILLED 而币安 filled=0）。
+            # P0：两轮轮询（≈6s + 深轮询≈6s），消除旧 2.4s 窗口差 471ms 返回
+            # None 导致 FOK 重试短路的竞态。
             order_id = order_result.get("orderId")
-            confirmed = await self.confirm_order_status(order_id)
+            confirmed = await self._confirm_with_backfill(order_id)
 
             # FOK 未成交即时重试（成交率改进，2026-08-30 S1 实证）：15m 开盘瞬间
             # 盘口极薄（成交量仅 $37 量级），首轮保守滑点常吃不满护栏以内的 ask
@@ -1423,12 +1513,13 @@ class BinancePredictionTrader:
             # 复用同一 PENDING 占位，每窗一单/防重/日单量语义全部不变。
             retries = 0
             while (order_result and confirmed is not None
-                   and confirmed.get("status") == "FAILED"
+                   and confirmed.get("status") in RETRYABLE_ORDER_STATUSES
                    and retries < MAX_FOK_RETRIES):
                 retries += 1
                 logger.warning(
-                    "信号实盘：FOK 未成交，同槽位重试 {}/{} | signal={} | window={} | orderId={}",
-                    retries, MAX_FOK_RETRIES, signal_version, window_start, order_id)
+                    "信号实盘：FOK 未成交（币安终态 {}），同槽位重试 {}/{} | signal={} | window={} | orderId={}",
+                    confirmed.get("status"), retries, MAX_FOK_RETRIES,
+                    signal_version, window_start, order_id)
                 retry_quote = await self.get_quote(token_id, "BUY", amount_usdt=amount_usdt)
                 if not retry_quote:
                     break  # 重新报价失败 → 保持 FOK 失败终态，不伪报
@@ -1456,13 +1547,15 @@ class BinancePredictionTrader:
                     break  # 重试单提交失败 → 保持 FOK 失败终态
                 quote, order_result = retry_quote, retry_result
                 order_id = order_result.get("orderId")
-                confirmed = await self.confirm_order_status(order_id)
+                confirmed = await self._confirm_with_backfill(order_id)
 
-            if confirmed is not None and confirmed.get("status") == "FAILED":
+            if confirmed is not None and confirmed.get("status") in RETRYABLE_ORDER_STATUSES:
                 return await self._update_signal_order(
                     pending, "FAILED", direction=prediction, token_id=token_id,
                     order_id=order_id, quote_json=quote,
-                    error_message=f"币安侧订单终态 FAILED（FOK 未成交，已重试 {retries} 次）")
+                    error_message=(
+                        f"币安侧订单终态 {confirmed.get('status')}"
+                        f"（FOK 未成交，已重试 {retries} 次）"))
 
             # FILLED → 落成交（quote_json 回填实际成交均价，2026-08-28）；
             # 暂未确认 → 保持 PENDING 交 sync-binance 对账

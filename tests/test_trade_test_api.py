@@ -9,6 +9,9 @@ POST /api/trade/test（main.manual_trade_test）。
 - order=None（key 未配/钱包失败/同窗已有测试单）→ error 提示
 - FILLED → 关键字段回显（status/order_id/average_price）
 - FAILED（如未找到 token/报价失败）→ status=FAILED + error_message 透传
+
+另覆盖 P2c：_order_price_kind 判定订单均价口径（'fill' 成交均价 /
+'quote' 报价委托价 / None 无价），供 /api/trades/recent 下发 price_kind。
 """
 
 from __future__ import annotations
@@ -193,6 +196,7 @@ async def test_recent_trades_fields_and_limit() -> None:
     assert o["status"] == "FAILED"
     assert o["market_period"] == "5m"  # 下注市场周期（前端「目标周期」列依据）
     assert o["average_price"] == 0.5
+    assert o["price_kind"] == "quote"  # P2c：FAILED 单的均价是报价，必须标注
     assert o["direction"] is None      # 旧数据无 direction：透传 null
     assert o["settled_at"] is None     # 未结算 → null
     assert o["redeemed_at"] is None    # 未领取 → null（新字段透传）
@@ -211,6 +215,74 @@ async def test_recent_trades_empty() -> None:
 
     out = await m.get_recent_trades(limit=20, _=None, db=db)
     assert out["orders"] == []
+
+
+# ============================================================
+# _order_price_kind（P2c：均价列口径判定 'fill' | 'quote' | None）
+# ============================================================
+
+def _row(status: str, qj: dict | None) -> SimpleNamespace:
+    return SimpleNamespace(status=status, quote_json=qj)
+
+
+def test_price_kind_fill_via_confirm_merge() -> None:
+    """①下单回路终态回查 _merge_fill_into_quote 回填 → 成交均价。"""
+    import binance_predict.main as m
+
+    assert m._order_price_kind(_row("FILLED", {
+        "averagePrice": 0.22, "fillSource": "binance_history_confirm",
+    })) == "fill"
+
+
+def test_price_kind_fill_via_reconcile_sync() -> None:
+    """②对账回填且币安侧终态 FILLED → 成交均价。"""
+    import binance_predict.main as m
+
+    assert m._order_price_kind(_row("FILLED", {
+        "averagePrice": 0.35, "source": "binance_history_sync",
+        "binanceOrderStatus": "FILLED",
+    })) == "fill"
+
+
+def test_price_kind_quote_for_failed_orders() -> None:
+    """FAILED 单即使带 averagePrice 也是报价（线上真实样本 #285=0.53 / #286=0.88）。
+
+    FOK 未成交时 filledUsdtAmount=0 但 price 仍有值，当成交均价读会误判盈亏。
+    """
+    import binance_predict.main as m
+
+    for qj in ({"averagePrice": 0.53},
+               {"averagePrice": 0.88, "source": "binance_history_sync",
+                "binanceOrderStatus": "FAILED"}):
+        assert m._order_price_kind(_row("FAILED", qj)) == "quote"
+
+
+def test_price_kind_quote_when_reconcile_says_not_filled() -> None:
+    """对账来源但币安侧终态非 FILLED（EXPIRED/CANCELLED）→ 仍按报价。"""
+    import binance_predict.main as m
+
+    for st in ("EXPIRED", "CANCELLED", "FAILED"):
+        assert m._order_price_kind(_row("FILLED", {
+            "averagePrice": 0.4, "source": "binance_history_sync",
+            "binanceOrderStatus": st,
+        })) == "quote"
+
+
+def test_price_kind_quote_without_fill_proof() -> None:
+    """无任一成交证明（含 PENDING 待确认单）→ 保守标报价，不假装是成交价。"""
+    import binance_predict.main as m
+
+    assert m._order_price_kind(_row("FILLED", {"averagePrice": 0.5})) == "quote"
+    assert m._order_price_kind(_row("PENDING", {"averagePrice": 0.5})) == "quote"
+
+
+def test_price_kind_none_when_no_price() -> None:
+    """无价（护栏弃单未取到报价 / quote_json 缺失或为 None）→ None，前端展示 '--'。"""
+    import binance_predict.main as m
+
+    assert m._order_price_kind(_row("FAILED", {"averagePrice": None})) is None
+    assert m._order_price_kind(_row("FAILED", {})) is None
+    assert m._order_price_kind(_row("FAILED", None)) is None
 
 
 # ============================================================
@@ -786,10 +858,12 @@ async def test_sync_binance_backfills_pending_rows(monkeypatch) -> None:
 
     matched = SimpleNamespace(
         id=7, window_start=1_787_418_600_000, status="PENDING",
-        order_id=None, amount_in="0", quote_json=None, error_message=None)
+        order_id=None, amount_in="0", quote_json=None, error_message=None,
+        market_period="5m")
     unmatched = SimpleNamespace(
         id=9, window_start=1_787_419_200_000, status="PENDING",
-        order_id=None, amount_in="0", quote_json=None, error_message=None)
+        order_id=None, amount_in="0", quote_json=None, error_message=None,
+        market_period="5m")
 
     db = AsyncMock()
     result = MagicMock()
@@ -812,8 +886,169 @@ async def test_sync_binance_backfills_pending_rows(monkeypatch) -> None:
     assert matched.amount_in == str(10 ** 18)
     assert matched.quote_json["averagePrice"] == 0.55
     assert matched.quote_json["source"] == "binance_history_sync"
+    assert matched.error_message is None   # P2a：FILLED 行不携归因文案
     assert unmatched.status == "PENDING"  # 无对应币安订单 → 不动
     db.commit.assert_awaited_once()
+
+
+def _sync_harness(monkeypatch, history: list[dict], rows: list):
+    """对账测试公用桩：钉 API 凭据 + 币安历史 + 本地行，返回 db 替身。
+
+    db.execute 第一次给 PENDING 行、第二次给 FILLED 行（幽灵订正/部分成交
+    订正两段查询），两段共用同一 rows 列表时自行按需拆分。
+    """
+    import binance_predict.main as m
+
+    monkeypatch.setattr(m.prediction_trader, "_api_key", "k")
+    monkeypatch.setattr(m.prediction_trader, "_wallet_address", "0xW")
+
+    async def _history(limit=100):
+        return history
+
+    monkeypatch.setattr(m.prediction_trader, "query_order_history", _history)
+
+    r_pending = MagicMock()
+    r_pending.scalars.return_value.all.return_value = rows
+    r_filled = MagicMock()
+    r_filled.scalars.return_value.all.return_value = []
+    db = AsyncMock()
+    db.execute = AsyncMock(side_effect=[r_pending, r_filled])
+
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def _factory():
+        yield db
+
+    monkeypatch.setattr(m, "async_session_factory", _factory)
+    return m, db
+
+
+def _pending_row(rid: int, ws: int, period: str | None) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=rid, window_start=ws, status="PENDING", order_id=None,
+        amount_in="0", quote_json=None, error_message=None,
+        market_period=period)
+
+
+@pytest.mark.asyncio
+async def test_sync_binance_period_scoped_no_cross_match(monkeypatch) -> None:
+    """P2b：5m 与 15m 窗口起始秒重合时不得串号（各自回填自己的订单）。
+
+    生产币安历史实测 12 个窗口秒两周期并存；旧代码 by_window 只用
+    window_start 做 key，后写覆盖先写 → 15m 的 PENDING 行可能被 5m 订单回填。
+    """
+    ws = 1_787_418_600_000
+    sec = ws // 1000
+    history = [
+        {"orderId": "B-5M", "slug": f"btc-updown-5m-{sec}",
+         "status": "FILLED", "filledUsdtAmount": "2", "price": "0.61"},
+        # 15m 行故意放在后面（旧代码会被它覆盖 5m 行）
+        {"orderId": "B-15M", "slug": f"btc-updown-15m-{sec}",
+         "status": "FAILED", "filledUsdtAmount": "0", "price": "0.53"},
+    ]
+    row5 = _pending_row(11, ws, "5m")
+    row15 = _pending_row(12, ws, "15m")
+    m, db = _sync_harness(monkeypatch, history, [row5, row15])
+
+    out = await m.sync_binance_orders(_=None)
+
+    assert out["synced"] == 2
+    assert row5.order_id == "B-5M" and row5.status == "FILLED"
+    assert row15.order_id == "B-15M" and row15.status == "FAILED"
+    assert row5.quote_json["averagePrice"] == 0.61
+    assert row15.quote_json["averagePrice"] == 0.53
+    db.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_sync_binance_null_period_ambiguous_skipped(monkeypatch) -> None:
+    """P2b：旧数据 market_period 为 NULL 且该窗口秒两周期并存 → 宁可不猜，
+    保持 PENDING（错误回填比不回填危害大：会把 15m 单归到 5m 统计里）。"""
+    ws = 1_787_418_600_000
+    sec = ws // 1000
+    history = [
+        {"orderId": "B-5M", "slug": f"btc-updown-5m-{sec}",
+         "status": "FILLED", "filledUsdtAmount": "2", "price": "0.61"},
+        {"orderId": "B-15M", "slug": f"btc-updown-15m-{sec}",
+         "status": "FILLED", "filledUsdtAmount": "3", "price": "0.55"},
+    ]
+    legacy = _pending_row(13, ws, None)
+    m, _db = _sync_harness(monkeypatch, history, [legacy])
+
+    out = await m.sync_binance_orders(_=None)
+
+    assert out["synced"] == 0
+    assert legacy.status == "PENDING" and legacy.order_id is None
+
+
+@pytest.mark.asyncio
+async def test_sync_binance_null_period_single_candidate_backfilled(monkeypatch) -> None:
+    """P2b：旧数据 market_period 为 NULL 但窗口秒只有一个候选 → 仍回填
+    （向后兼容：退役前落库的历史 PENDING 行不因新口径而永久卡住）。"""
+    ws = 1_787_418_600_000
+    history = [{"orderId": "B-5M", "slug": f"btc-updown-5m-{ws // 1000}",
+                "status": "FILLED", "filledUsdtAmount": "2", "price": "0.61"}]
+    legacy = _pending_row(14, ws, None)
+    m, _db = _sync_harness(monkeypatch, history, [legacy])
+
+    out = await m.sync_binance_orders(_=None)
+
+    assert out["synced"] == 1
+    assert legacy.status == "FILLED" and legacy.order_id == "B-5M"
+
+
+@pytest.mark.asyncio
+async def test_sync_binance_failed_row_gets_error_message(monkeypatch) -> None:
+    """P2a：对账判 FAILED 且零成交 → 补写归因文案（旧代码置 None，
+    前端「说明」列空白无法区分 FOK 空成交 / 其他终态）；均价仍为报价。"""
+    ws = 1_787_418_600_000
+    history = [{"orderId": "B-F", "slug": f"btc-updown-15m-{ws // 1000}",
+                "status": "FAILED", "filledUsdtAmount": "0", "price": "0.53"}]
+    row = _pending_row(15, ws, "15m")
+    m, _db = _sync_harness(monkeypatch, history, [row])
+
+    await m.sync_binance_orders(_=None)
+
+    assert row.status == "FAILED"
+    assert row.amount_in == "0"
+    assert "FOK 未成交" in row.error_message
+    assert "filledUsdtAmount=0" in row.error_message
+    # 未成交时币安仍给 price（报价/委托价）——前端据此标注为「报价」
+    assert row.quote_json["averagePrice"] == 0.53
+    assert row.quote_json["binanceOrderStatus"] == "FAILED"
+
+
+@pytest.mark.asyncio
+async def test_sync_binance_expired_row_error_message(monkeypatch) -> None:
+    """P2a：EXPIRED 等非 FAILED 终态也要写入真实终态名（不得笼统归为 FAILED）。"""
+    ws = 1_787_418_600_000
+    history = [{"orderId": "B-E", "slug": f"btc-updown-5m-{ws // 1000}",
+                "status": "EXPIRED", "filledUsdtAmount": "0", "price": "0.44"}]
+    row = _pending_row(16, ws, "5m")
+    m, _db = _sync_harness(monkeypatch, history, [row])
+
+    await m.sync_binance_orders(_=None)
+
+    assert row.status == "FAILED"       # 本地只有 FILLED/FAILED 两终态
+    assert "EXPIRED" in row.error_message
+
+
+@pytest.mark.asyncio
+async def test_sync_binance_non_filled_with_partial_error_message(monkeypatch) -> None:
+    """P2a：非 FILLED 但已有成交额 → 文案区分「按未成交处理」（与零成交不同）。"""
+    ws = 1_787_418_600_000
+    history = [{"orderId": "B-P", "slug": f"btc-updown-5m-{ws // 1000}",
+                "status": "FAILED", "filledUsdtAmount": "1.5", "price": "0.50"}]
+    row = _pending_row(17, ws, "5m")
+    m, _db = _sync_harness(monkeypatch, history, [row])
+
+    await m.sync_binance_orders(_=None)
+
+    assert row.status == "FAILED"
+    assert row.amount_in == str(int(1.5 * 10 ** 18))
+    assert "按未成交处理" in row.error_message
+    assert "1.5" in row.error_message
 
 
 # ============================================================

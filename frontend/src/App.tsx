@@ -280,6 +280,9 @@ interface ShadowVersionBlock {
     desc: string
     // 影子开关（2026-09-04 前端手动下线能力）：下线=停采集+置灰，历史保留
     enabled?: boolean
+    // 永久退役（2026-09-04）：后端 shadow_version_gate.RETIRED_VERSIONS 硬闸，
+    // 不可逆——开关置灰不可点（toggle API 也会 422 拒），但 bench 基准与历史曲线保留
+    retired?: boolean
   }
   curve: AnalyticsCurvePoint[]
 }
@@ -595,42 +598,45 @@ function HelpHint({ text }: { text: string }) {
 // 线上信号通道说明（口径源：services/live_channels.py 注册表 + quote_edge_detector 冻结规则）
 // 2026-08-24 多通道实盘改造：全部通道支持实盘下单（liveOk），各自独立金额/日限/护栏，
 // 通道运行状态（开关/金额/日限/护栏/今日成交）来自后端 multi_live_trader.status_async()。
-const SIGNAL_INFO: Record<string, { name: string; kind: '实盘' | '影子' | '场景'; desc: string; liveOk?: boolean }> = {
+// 2026-09-04 退役 8 通道（retired）：已从 live_channels.LIVE_CHANNELS 与
+// shadow_version_gate.RETIRED_VERSIONS 移除，不再开火/不再采集。条目必须保留：
+// 历史订单行仍带这些 signal_version，删了会让订单表退回成裸版本串。
+const SIGNAL_INFO: Record<string, { name: string; kind: '实盘' | '影子' | '场景'; desc: string; liveOk?: boolean; retired?: boolean }> = {
   quote_contrarian_v1: {
-    name: '报价反向（B格逆势）', kind: '实盘', liveOk: true,
-    desc: '5 分钟窗口开始后 45~60 秒内，DOWN token 报价首次跌入 [0.15, 0.25)（明显便宜）时买入 DOWN。低胜率高赔付：回测胜率 24%、EV +0.155（赢一次约赚 4 倍）。通道护栏 0.28（区间上界+0.03），每窗至多一单。',
+    name: '报价反向（B格逆势）', kind: '实盘', liveOk: true, retired: true,
+    desc: '【2026-09-04 已退役：被 quote_contrarian_v2 严格支配（v2 = v1 触发集纯子集 + BTC 门禁）】5 分钟窗口开始后 45~60 秒内，DOWN token 报价首次跌入 [0.15, 0.25)（明显便宜）时买入 DOWN。低胜率高赔付：回测胜率 24%、EV +0.155（赢一次约赚 4 倍）。通道护栏 0.28（区间上界+0.03），每窗至多一单。',
   },
   quote_momentum_v1: {
-    name: '报价动量（A格顺势）', kind: '影子', liveOk: true,
-    desc: '5 分钟窗口 90~120 秒内，DOWN token 报价首次进入 [0.69, 0.75)（强势确认）时押 DOWN。回测胜率 79.9%、EV +0.097。通道护栏 0.78，每窗至多一单。',
+    name: '报价动量（A格顺势）', kind: '影子', liveOk: true, retired: true,
+    desc: '【2026-09-04 已退役：「深折价顺势」假设被前向数据证伪】5 分钟窗口 90~120 秒内，DOWN token 报价首次进入 [0.69, 0.75)（强势确认）时押 DOWN。回测胜率 79.9%、EV +0.097。通道护栏 0.78，每窗至多一单。',
   },
   quote_contrarian_v2: {
     name: '报价反向·门禁版', kind: '影子', liveOk: true,
-    desc: 'v1 区间 + BTC 价格门禁：触发时点 BTC 未高于窗口开盘 ≥0.10%（只接「假冲高」，归因显示平盘窗贡献 86% 利润）。实盘已解锁（实时 BTC 喂价门禁），通道护栏 0.28。',
+    desc: 'v1 区间 + BTC 价格门禁：触发时点 BTC 未高于窗口开盘 ≥0.10%（只接「假冲高」，归因显示平盘窗贡献 86% 利润）。实盘已解锁（实时 BTC 喂价门禁），通道护栏 0.28。注：触发区间仍引用已退役 v1 的冻结回测口径（QUOTE_EDGE_RULES 是口径事实源，整体保留）。',
   },
   quote_momentum_v2: {
-    name: '报价动量·门禁版', kind: '影子', liveOk: true,
-    desc: 'v1 区间 + BTC 价格门禁：触发时点 BTC 已低于窗口开盘 ≥0.10%（剔「假恐慌」，真跌段胜率 85% vs 假恐慌段 40%）。实盘已解锁（实时 BTC 喂价门禁），通道护栏 0.78。',
+    name: '报价动量·门禁版', kind: '影子', liveOk: true, retired: true,
+    desc: '【2026-09-04 已退役：随 momentum 族整体下线】v1 区间 + BTC 价格门禁：触发时点 BTC 已低于窗口开盘 ≥0.10%（剔「假恐慌」，真跌段胜率 85% vs 假恐慌段 40%）。实盘已解锁（实时 BTC 喂价门禁），通道护栏 0.78。',
   },
   quote_momentum_v3: {
-    name: '报价动量·非连涨门禁版', kind: '影子', liveOk: true,
-    desc: 'v1 区间（t90~120s q∈[0.69,0.75)）∩ 触发时点末收 15m 非连涨（close≤前根，严格 ex-ante）。回测修正未来函数后门禁效应≈0（80.2% vs 连涨 76.4%，CI 重叠），小金额实盘前向验证门禁是否真实有效。与 v1/v2 同窗互斥（至多一单成交），通道护栏 0.78。',
+    name: '报价动量·非连涨门禁版', kind: '影子', liveOk: true, retired: true,
+    desc: '【2026-09-04 已退役：修正未来函数后门禁效应≈0（+3.8pp，CI 重叠），不值得占实盘额度】v1 区间（t90~120s q∈[0.69,0.75)）∩ 触发时点末收 15m 非连涨（close≤前根，严格 ex-ante）。回测 80.2% vs 连涨 76.4%。与 v1/v2 同窗互斥（至多一单成交），通道护栏 0.78。',
   },
   quote_contrarian_v3a: {
-    name: '报价反向·交替环境版', kind: '影子', liveOk: true,
-    desc: 'contrarian v1 区间 + v2 价格门禁 + 环境门禁：前窗结算 DOWN（交替环境：前窗跌+本窗涨=V 反弹假冲高）。真实回测 n=85 胜率 31.8%、EV +0.528。实盘已解锁（前窗 outcome 异步 DB 核验，缺失弃单），通道护栏 0.28。',
+    name: '报价反向·交替环境版', kind: '影子', liveOk: true, retired: true,
+    desc: '【2026-09-04 已退役：环境门禁未兑现，被 contrarian_v2 支配】contrarian v1 区间 + v2 价格门禁 + 环境门禁：前窗结算 DOWN（交替环境：前窗跌+本窗涨=V 反弹假冲高）。真实回测 n=85 胜率 31.8%、EV +0.528。实盘已解锁（前窗 outcome 异步 DB 核验，缺失弃单），通道护栏 0.28。',
   },
   quote_contrarian_v3b: {
-    name: '报价反向·日高回落版', kind: '影子', liveOk: true,
-    desc: 'v3a + 触发时点 BTC 距当日高点回落 ≥0.30%（含边界，震荡日冲高更易衰竭）。真实回测 n=65 胜率 33.8%、EV +0.646（单笔 EV 最优）。实盘已解锁（日高异步 DB 核验，缺失弃单），通道护栏 0.28。',
+    name: '报价反向·日高回落版', kind: '影子', liveOk: true, retired: true,
+    desc: '【2026-09-04 已退役：同 v3a，门禁未兑现】v3a + 触发时点 BTC 距当日高点回落 ≥0.30%（含边界，震荡日冲高更易衰竭）。真实回测 n=65 胜率 33.8%、EV +0.646（单笔 EV 最优）。实盘已解锁（日高异步 DB 核验，缺失弃单），通道护栏 0.28。',
   },
   quote_contrarian_v4: {
-    name: '报价反向·下跌周期版', kind: '影子', liveOk: true,
-    desc: 'contrarian v1 区间 + regime 门禁：触发时点过去 24h BTC 收益 ≤ −1.0%（含边界，只在下跌周期开火）。62 天真实订单簿回测：down 段 n=413 胜率 30.3%、EV +0.372（CI 下界过盈亏平衡线），up/range 段 EV≈0——正边际集中在下跌周期。5m K 线严格 ex-ante 口径（影子/实盘同源，缺失保守弃单），每窗至多一单，通道护栏 0.28。',
+    name: '报价反向·下跌周期版', kind: '影子', liveOk: true, retired: true,
+    desc: '【2026-09-04 已退役：regime 门禁未兑现，被 contrarian_v2 支配】contrarian v1 区间 + regime 门禁：触发时点过去 24h BTC 收益 ≤ −1.0%（含边界，只在下跌周期开火）。62 天真实订单簿回测：down 段 n=413 胜率 30.3%、EV +0.372（CI 下界过盈亏平衡线），up/range 段 EV≈0——正边际集中在下跌周期。5m K 线严格 ex-ante 口径（影子/实盘同源，缺失保守弃单），每窗至多一单，通道护栏 0.28。',
   },
   x4_v1: {
-    name: '情绪错位（收阳押次窗DOWN）', kind: '影子', liveOk: true,
-    desc: '本窗收阳但 15m 市场收尾情绪 ≤40 的错位 → 次窗 +150s 决策点押 DOWN（回测合并胜率 63.5%、EV +0.254）。实盘已解锁：PENDING 信号轮询→决策点下单，护栏 0.45，错过决策点不追单。',
+    name: '情绪错位（收阳押次窗DOWN）', kind: '影子', liveOk: true, retired: true,
+    desc: '【2026-09-04 已退役：被 x4_v2 严格支配（v2 = v1 触发集纯子集 + 平静市门禁）】本窗收阳但 15m 市场收尾情绪 ≤40 的错位 → 次窗 +150s 决策点押 DOWN（回测合并胜率 63.5%、EV +0.254）。实盘已解锁：PENDING 信号轮询→决策点下单，护栏 0.45，错过决策点不追单。',
   },
   x4_v2: {
     name: '情绪错位·平静市门禁版', kind: '影子', liveOk: true,
@@ -996,7 +1002,7 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
               <th className="py-1 pr-2">方向</th>
               <th className="py-1 pr-2">状态</th>
               <th className="py-1 pr-2">结果</th>
-              <th className="py-1 pr-2">均价</th>
+              <th className="py-1 pr-2" title="币安实际成交均价；标「报价」的是下单时的报价/委托价（失败单 FOK 未成交，filledUsdtAmount=0 但币安仍回 price），不是成交价，不能用来核对盈亏">均价</th>
               <th className="py-1 pr-2">金额 (USDT)</th>
               <th className="py-1 pr-2">盈亏</th>
               <th className="py-1">说明</th>
@@ -1028,7 +1034,13 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
                   {info ? (
                     <span className="inline-flex items-center gap-1">
                       <span className="text-gray-800">{info.name}</span>
-                      <HelpHint text={`${ver}（${info.kind}）：${info.desc}`} />
+                      {info.retired && (
+                        <span
+                          className="px-1 py-0.5 rounded text-[9px] font-bold bg-gray-100 text-gray-500 border border-gray-200 shrink-0"
+                          title="该通道已于 2026-09-04 永久退役（不再开火）；本行为历史订单，保留可追溯"
+                        >已退役</span>
+                      )}
+                      <HelpHint text={`${ver}（${info.kind}${info.retired ? '·已退役' : ''}）：${info.desc}`} />
                     </span>
                   ) : (
                     <span className="font-mono text-gray-700">{ver || '--'}</span>
@@ -1055,7 +1067,21 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
                         ? <span className="px-1.5 py-0.5 rounded font-bold bg-gray-100 text-gray-600">{String(o.settle_outcome)}</span>
                         : <span className="text-gray-400">--</span>}
                 </td>
-                <td className="py-1.5 pr-2 font-mono">{o.average_price != null ? String(o.average_price) : '--'}</td>
+                <td className="py-1.5 pr-2 font-mono">
+                  {o.average_price != null ? (
+                    <span className="inline-flex items-center gap-1">
+                      {String(o.average_price)}
+                      {/* P2c：后端 price_kind 判定口径——非成交均价时必须标出来，
+                          否则失败单的报价会被误读为「按这个价买到了」 */}
+                      {o.price_kind === 'quote' && (
+                        <span
+                          className="px-1 py-0.5 rounded text-[9px] font-bold bg-amber-50 text-amber-700 border border-amber-200"
+                          title="报价/委托价，非成交均价：本单未成交（FOK 未吃满/护栏弃单/待对账），不能用来核对盈亏"
+                        >报价</span>
+                      )}
+                    </span>
+                  ) : '--'}
+                </td>
                 <td className="py-1.5 pr-2 font-mono">
                   {o.amount_in != null && Number(o.amount_in) > 0 ? (Number(o.amount_in) / 1e18).toFixed(2) : '--'}
                 </td>
@@ -4240,6 +4266,10 @@ const SHADOW_META: Record<string, { label: string; color: string }> = {
   combo_p3_v1: { label: 'combo P3 贴高美盘→DOWN', color: '#8c6d31' },
   combo_p4_v1: { label: 'combo P4 周末超卖→UP', color: '#843c39' },
   combo_p5_v1: { label: 'combo P5 光脚超卖→UP', color: '#7b4173' },
+  absorption_follow_td120_v1: { label: '吸收跟随 TD120 欠反应→顺势', color: '#1b9e77' },
+  absorption_follow_td150_v1: { label: '吸收跟随 TD150 欠反应→顺势', color: '#e7298a' },
+  s2_cond_t4_v1: { label: 'S2条件 t=4价<开→UP', color: '#c0392b' },
+  s2_cond_t5d_v1: { label: 'S2条件 t=5剔深→UP', color: '#e67e22' },
 }
 const SCENE_META: Record<string, { label: string; color: string }> = {
   bull_exhaust: { label: 'S1 多头耗尽→DOWN', color: '#1f77b4' },
@@ -4250,18 +4280,20 @@ const SCENE_META: Record<string, { label: string; color: string }> = {
   // 同语义，审计脚本对其「一律 DOWN」的简化口径在 side=low 时不同）
   legacy: { label: 'legacy 历史信号', color: '#7f7f7f' },
 }
-// 分析面板版本/场景的详细解释：优先取 SIGNAL_INFO（场景键加 scene_ 前缀），
-// 未收录的（KREV / 历史 legacy）在此补写；后端动态发现的新版本回退展示原始键名。
+// 分析面板版本/场景的详细解释：优先取 ANALYTICS_EXTRA_DESC（SIGNAL_INFO 未收录的影子版本），
+// 其次 SIGNAL_INFO（场景键加 scene_ 前缀）；后端动态发现的新版本回退展示原始键名。
+// 2026-09-04 退役的纯影子版本（hm_touch_down_v1/v2、quote_momentum_v3）在此前置
+// 【已退役：理由】，与 SIGNAL_INFO 的口径一致——说明保留供审计，但不得让人误以为还在采集。
 const ANALYTICS_EXTRA_DESC: Record<string, string> = {
   krev_a_v1: 'K 线反转 A：5m K 线反转形态（看跌衰竭形态）→ 押 UP 的影子信号，仅记录不下单。',
   krev_b_v1: 'K 线反转 B：5m K 线反转形态变体（下影线反转）→ 押 UP 的影子信号，仅记录不下单。',
-  hm_touch_down_v1: 'HM 上吊线反弹入场：弱收盘上吊线（15m 小实体+深下影+贴 20 根高位+CLV≤0.75）→ 次 15m 周期内 10 分钟里若先反弹触及开盘价+0.25×ATR，按触及时刻真实报价记录押 DOWN（影子，不下单）。先破 −0.25×ATR、迟到触及或未触及均放弃，仅触及样本进胜率统计。720d 回测触价收跌率 58.7% vs 市场隐含 47.1%（n=46，覆盖率~36%），探索性发现，影子期即前向验证。',
-  hm_touch_down_v2: 'HM 上吊线反弹 v2：v1 基础上叠加触发时点门禁——排除下跌段（过去 24h 跌≥1%）与低波环境（ATR 低于近 24h 中位数 80%）。720d 切片分析发现这两类样本负边际（下跌段 41.7% / 低波 25%），门禁后触发 78、触价 29、收跌率 69.0%。属后验切片假设（非预注册），与 v1 并行双行采集，影子期前向验证决定是否保留。',
+  hm_touch_down_v1: '【2026-09-04 已退役：信息速率≈0（720d 触发 0.04~0.06 次/天，凑满 n=100 需 4~7 年），影子期无统计意义】HM 上吊线反弹入场：弱收盘上吊线（15m 小实体+深下影+贴 20 根高位+CLV≤0.75）→ 次 15m 周期内 10 分钟里若先反弹触及开盘价+0.25×ATR，按触及时刻真实报价记录押 DOWN（影子，不下单）。先破 −0.25×ATR、迟到触及或未触及均放弃，仅触及样本进胜率统计。720d 回测触价收跌率 58.7% vs 市场隐含 47.1%（n=46，覆盖率~36%），探索性发现，影子期即前向验证。',
+  hm_touch_down_v2: '【2026-09-04 已退役：同 v1，720d 门禁后触发仅 78 次，信息速率不足以前向验证】HM 上吊线反弹 v2：v1 基础上叠加触发时点门禁——排除下跌段（过去 24h 跌≥1%）与低波环境（ATR 低于近 24h 中位数 80%）。720d 切片分析发现这两类样本负边际（下跌段 41.7% / 低波 25%），门禁后触发 78、触价 29、收跌率 69.0%。属后验切片假设（非预注册），与 v1 并行双行采集，影子期前向验证决定是否保留。',
   legacy: 'pattern_type 为空的历史信号：胜负按 side 映射（high→DOWN 赢 / low→UP 赢），用于对齐早期统计口径。',
   rev_p1_v1: '反转 P1：15m 连跌 4 根 + 弱阴收盘（贴最低，close_pos≤0.15）+ 成交量正常（[1.0,1.5)×20 根均量）→ 押次根 15m 收阳 UP 的影子信号，仅记录不下单。rev_common 几何口径实时重放，次根收盘按 direction 结算；与 KREV 共表 kline_shadow_signals（version 隔离）。720d 回测胜率 62.0% / oos 63.9%（EV 按目标窗开盘后首次轮询的真实报价前向现算：赢 0.98/q−1 / 输 −1）。',
   rev_p2_v1: '反转 P2：15m 连涨 5 根 + 弱阳收盘（贴最高，close_pos≥0.85）→ 押次根 15m 收阴 DOWN 的影子信号，仅记录不下单。rev_common 几何口径实时重放，次根收盘按 direction 结算；与 KREV 共表 kline_shadow_signals（version 隔离）。720d 回测胜率 62.4% / oos 61.3%（EV 按目标窗开盘后首次轮询的真实报价前向现算：赢 0.98/q−1 / 输 −1）。',
   s5_deep_z20_v1: 'S5 深档：S1 多头耗尽信号 +5min 回落确认，且回落幅度 z5=c5_close/anchor−1≤−20bp（深档）→ 按 +5min 时刻真实 15m DOWN 报价记录押 DOWN 的影子信号，仅记录不下单，次周期 15m 收阴判赢。落 pattern_shadow_signals（entry_state=TOUCHED，借用 HM 结算器）。720d 回测~91.3%（深档样本 EV 偏乐观、含机械成分），影子期即前向验证。',
-  quote_momentum_v3: '报价动量 v3：在 v1（触发后 90~120s DOWN 报价 q∈[0.69,0.75)）基础上叠加“非连涨”门禁——用最后已收 15m（触发时刻所属 15m 的前一根，严格防未来函数）判定 close[j]≤close[j−1] 才落表 → 押 DOWN 的影子信号，落 misalignment_signals，按报价 edge 结算。回测修正未来函数后 80.2% vs 连涨 76.4%（+3.8pp，CI 重叠、门禁效应≈0），影子用于前向验证门禁是否真实有效。',
+  quote_momentum_v3: '【2026-09-04 已退役：修正未来函数后门禁效应≈0（+3.8pp，CI 重叠），不值得占实盘额度；随 momentum 族整体下线】报价动量 v3：在 v1（触发后 90~120s DOWN 报价 q∈[0.69,0.75)）基础上叠加“非连涨”门禁——用最后已收 15m（触发时刻所属 15m 的前一根，严格防未来函数）判定 close[j]≤close[j−1] 才落表 → 押 DOWN 的影子信号，落 misalignment_signals，按报价 edge 结算。回测修正未来函数后 80.2% vs 连涨 76.4%（+3.8pp，CI 重叠、门禁效应≈0），影子用于前向验证门禁是否真实有效。',
   nb_zschamp_15m_v1: 'nextbar 15m冠军：zscore_10≤-1.651 ∧ zscore_5≤-1.538 ∧ ret_3≤-0.00395（深超卖+急跌+卖盘衰竭）→ 押次根 15m 收阳 UP 的影子信号，仅记录不下单。源自 H=1 方向研究 converge_registry L3 ROBUST（holdout P(up_1)=61.96% n=368，月一致性 0.958 / walk-forward 1.00）；build_feature_matrix+condition_mask 实时重放冻结条件原文，与 KREV/反转共表 kline_shadow_signals（version+timeframe 隔离）。720d 次根收阳 58.92%（2006 触发，EV 按目标窗开盘后首次轮询的真实报价前向现算：赢 0.98/q−1 / 输 −1）。',
   nb_smaslope_5m_v1: 'nextbar 5m误定价：sma_slope_atr_5≥1.661（5 根 SMA 陡峭上行/短期动量）→ 押次根 5m 收阳 UP 的影子信号，仅记录不下单。源自阶段E误定价扫描——市场报价钝在 q̄0.500 而 Jul-Aug 真实 P(UP)=0.534（B⁺ 逐笔 EV t=1.73 未达 t>3 门槛）。注意 720d 全样本次根收阳仅 47.43%（19597 触发，长样本反指），edge 依赖 Jul-Aug regime；影子期前向验证动量误定价是否持续，非背书。EV 按目标窗开盘后首次轮询的真实报价前向现算：赢 0.98/q−1 / 输 −1。',
   combo_p1_v1: 'combo 组合 P1：连阳 3 根以上 ∧ 周末（UTC）∧ EMA20 乖离≥+0.3%（短线过热）→ 押次根 15m 收阴 DOWN 的影子信号，仅记录不下单。源自 45 维条件大搜索（720d 三三组合全扫）+ 1443 天样本外考试 + 50 次置换检验三重过滤后存活的“真层”——胜率来自时间×动量维度而非 K 线形态。720d n=490 胜率 63.9% / 样本外 n=1588 胜率 60.6%；EV 按目标窗开盘后首次轮询的真实报价前向现算：赢 0.98/q−1 / 输 −1。',
@@ -4269,6 +4301,10 @@ const ANALYTICS_EXTRA_DESC: Record<string, string> = {
   combo_p3_v1: 'combo 组合 P3：贴 1 天高点（≤0.1%）∧ 美盘时段（UTC 16 点后）∧ 7 天涨≥4%（高位+中期动量衰减）→ 押次根 15m 收阴 DOWN 的影子信号，仅记录不下单。45 维大搜索存活组合（不依赖周末）。720d n=176 胜率 68.2% / 样本外 n=212 胜率 59.4%；EV 按目标窗开盘后首次轮询的真实报价前向现算：赢 0.98/q−1 / 输 −1。',
   combo_p4_v1: 'combo 组合 P4：收低位（收盘在整根 K 线 1/4 以下）∧ 周末 ∧ RSI14≤25（超卖）→ 押次根 15m 收阳 UP 的影子信号，仅记录不下单。周末超卖反弹组合，与 P1 方向相反（对照组）。720d n=322 胜率 62.7% / 样本外 n=459 胜率 63.6%；EV 按目标窗开盘后首次轮询的真实报价前向现算：赢 0.98/q−1 / 输 −1。',
   combo_p5_v1: 'combo 组合 P5：近光脚（下影≤5%）∧ 周末 ∧ RSI14≤25 → 押次根 15m 收阳 UP 的影子信号，仅记录不下单。P4 同簇的严格版（无下影=更干净的超卖），与 P4 并行采集、影子期用实数据对比两口径孰优。720d n=131 胜率 68.7% / 样本外 n=142 胜率 64.8%；EV 按目标窗开盘后首次轮询的真实报价前向现算：赢 0.98/q−1 / 输 −1。',
+  absorption_follow_td120_v1: '吸收跟随 TD120：5m 窗开 120s 决策点（严格 ex-ante 只读 ≤TD 采样），BTC 有明显位移（|btc_move|≥滚动 p50 位移门）而 UP token 真实报价「欠反应」（under=−sign(btc_move)·(up_move−(k·btc_move+b))≥滚动 p80 欠反应门，即报价粘滞/犹豫=知情者顶住人群吸筹的脚印）→ 顺 BTC 方向押（涨押 UP / 跌押 DOWN）的影子信号，仅记录不下单，次周期结算判赢。弹性 k 与两门禁用 trailing ~14 天缓冲严格 ex-ante 滚动标定（k 强 regime 依赖，本窗评估后才入缓冲）。落专用表 absorption_shadow_signals，与 TD150 变体前向 A/B 并行采集；Δvol/Δpar 为 soft 记录维度（不作门）。真实价复核 RECENT real n=397 命中 79.8% / EV +0.052（CI[-0.008,+0.112] 单看不显著）、FULL real n=1050 EV +0.089 CI✓；EV 按 TD 真实 token 报价前向现算：赢 0.98/q−1 / 输 −1。',
+  absorption_follow_td150_v1: '吸收跟随 TD150：同 TD120 口径（欠反应跟随、双向顺势、trailing ~14 天滚动标定 k/门禁），但决策点延至窗开 150s（给报价更多时间暴露粘滞）。落专用表 absorption_shadow_signals，与 TD120 变体前向 A/B 并行采集。真实价复核 RECENT real n=399 命中 88.5% / EV +0.105（CI[+0.050,+0.165]✓，双 variant 中最稳健）、FULL real n=1083 EV +0.099 CI✓；EV 按 TD 真实 token 报价前向现算：赢 0.98/q−1 / 输 −1。',
+  s2_cond_t4_v1: 'S2 条件单 t=4：由实盘 S2（空头耗尽 bear_exhaust：破 4h 支撑 + 收阴 + 放量）信号派生 → 次周期窗内等到 t=4（开盘后 240s），若该时刻 1m 收盘价 < 次周期开盘价（全深度回落，不设上界），按当时真实 15m UP 报价记录押次周期 15m 收阳 UP 的影子信号，仅记录不下单。研究结论：S2 开盘即买 UP 的 EV≈−0.042 不赚钱，等 t=4 价跌时 UP token 变便宜、低买 UP 的正 EV 来自入场价而非胜率。落 kline_shadow_signals（与 KREV/反转/nextbar/combo 共表、version 严格隔离结算，免迁移）。720d 触发 1069/2176（49.1%，1.48 次/天），价-only 胜率 38.9%；EV 按目标窗真实 15m UP 报价前向现算：赢 0.98/q−1 / 输 −1（报价表研究 EV +0.237 属乐观上界，不作基准）。',
+  s2_cond_t5d_v1: 'S2 条件单 t=5 剔深：同由实盘 S2（bear_exhaust）派生 → 次周期窗内等到 t=5（开盘后 300s），若回落深度 0 < ln(开盘/px5) < 15bp（中度回落、剔除过深样本），按当时真实 15m UP 报价记录押次周期 15m 收阳 UP 的影子信号，仅记录不下单。剔深版单均优于 t=4 全深度（过深回落常伴随趋势性下破，剔掉后质量更高）。落 kline_shadow_signals（共表、version 严格隔离结算，免迁移）。720d 触发 643/2176（29.5%，0.89 次/天），价-only 胜率 44.8%；EV 按目标窗真实 15m UP 报价前向现算：赢 0.98/q−1 / 输 −1（报价表研究 EV +0.283 属乐观上界，不作基准）。',
 }
 const signalDescFor = (kind: 'scene' | 'shadow', key: string): string => {
   if (ANALYTICS_EXTRA_DESC[key]) return ANALYTICS_EXTRA_DESC[key]
@@ -4516,8 +4552,8 @@ function SignalAnalyticsTab() {
         )}
       </Card>
 
-      {/* 影子三版本 */}
-      <Card title="影子信号（x4 / momentum / contrarian / KREV K线反转）：累计胜率 vs 回测基准 vs 盈亏平衡">
+      {/* 影子全版本（含已退役版的历史曲线；momentum 族 / contrarian v1系 / x4_v1 / HM 族 已于 2026-09-04 退役） */}
+      <Card title="影子信号（在线 + 已退役历史）：累计胜率 vs 回测基准 vs 盈亏平衡">
         {analytics && (
           <>
             <div className="overflow-x-auto mb-3">
@@ -4542,6 +4578,8 @@ function SignalAnalyticsTab() {
                     const dev = s.win_rate != null && s.bench_winrate != null ? s.win_rate - s.bench_winrate : null
                     // enabled 缺失（旧后端）视为在线，与 gate 默认语义一致
                     const online = s.enabled !== false
+                    // retired 缺失（旧后端）视为未退役；退役是不可逆硬闸，优先级高于 enabled
+                    const retired = s.retired === true
                     return (
                       <tr key={k} className={`border-b border-gray-100 hover:bg-gray-50 ${online ? '' : 'opacity-45'}`}>
                         <td className="py-1 px-2 font-medium" style={{ color: m.color }} title={s.desc}>
@@ -4551,6 +4589,12 @@ function SignalAnalyticsTab() {
                           </span>
                         </td>
                         <td className="py-1 px-2 text-center">
+                          {retired ? (
+                            <span
+                              className="px-1.5 py-0.5 rounded text-[10px] font-medium border border-gray-300 bg-gray-100 text-gray-500 cursor-not-allowed"
+                              title="已永久退役（2026-09-04）：代码级硬闸停发，不可重新上线；冻结 bench 基准与历史曲线仍保留供审计"
+                            >已退役</span>
+                          ) : (
                           <button
                             onClick={async () => { await api.toggleShadow(k, !online); load() }}
                             className={`px-1.5 py-0.5 rounded text-[10px] font-medium border transition ${
@@ -4564,6 +4608,7 @@ function SignalAnalyticsTab() {
                           >
                             {online ? '在线' : '已下线'}
                           </button>
+                          )}
                         </td>
                         <td className="py-1 px-2 text-right font-mono">{s.n}</td>
                         <td className="py-1 px-2 text-right font-mono font-bold">{pct1(s.win_rate)}</td>
@@ -4611,6 +4656,7 @@ function SignalAnalyticsTab() {
             </ResponsiveContainer>
             <div className="text-[10px] text-gray-400 mt-1">
               实线=线上累计胜率；同色虚线=回测冻结基准；同色点线=逐版本平均盈亏平衡（x4 含溢价 0.01 口径，其余无溢价）。
+              标「已退役」的版本为 2026-09-04 永久下线（代码级硬闸停发，不可重新上线；冻结 bench 基准与历史曲线保留供审计），不再产生新样本，曲线末端即最后采集点。
             </div>
           </>
         )}

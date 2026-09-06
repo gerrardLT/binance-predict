@@ -18,7 +18,23 @@ import pytest
 
 from binance_predict.db.models import MisalignmentSignal, SentimentWindow
 from binance_predict.services import quote_edge_detector as qed
+from binance_predict.services import shadow_version_gate as svg
 from binance_predict.services.quote_edge_detector import QuoteEdgeDetector
+
+
+@pytest.fixture(autouse=True)
+def _unretire_versions(monkeypatch):
+    """本模块测的是 QUOTE_EDGE_RULES 冻结区间与各门禁的落库语义。
+
+    2026-09-04 退役 11 个影子版本后，shadow_gate.is_enabled() 对退役版本恒
+    False，会把本模块对 v1/v2/v3a/v3b/v4/深夜/非连涨 的落库断言全部打空。
+    但这些规则语义仍是生产事实源：在线的 quote_contrarian_v2 /
+    late_night_contrarian_v2 的触发区间与护栏全部派生自 v1 冻结条目，
+    QUOTE_EDGE_RULES / V2_PRICE_GUARDS / V3_ENV_GUARDS / REGIME_GUARDS /
+    STREAK_GUARDS / LN_DD_GUARDS 一概未动。这里把退役名单临时置空，让规则
+    语义继续被覆盖；退役闸门本身由 test_shadow_version_gate.py 专项断言。
+    """
+    monkeypatch.setattr(svg, "RETIRED_VERSIONS", frozenset())
 
 # 纯函数测试专用传参（非生产口径；生产表为 QUOTE_EDGE_RULES，A 格 t∈[90,120)）
 A_RULE = (90.0, 210.0, 0.69, 0.75)

@@ -3,7 +3,8 @@ BTC 预测市场多通道实盘 + 影子信号系统 - FastAPI 主应用
 
 系统入口文件，负责：
 1. 初始化服务（数据采集、多通道实盘执行器、影子检测器、交易结算）
-2. 管理应用生命周期（lifespan）：装配并启动 MultiLiveTrader（15 通道实盘）
+2. 管理应用生命周期（lifespan）：装配并启动 MultiLiveTrader（7 通道实盘，
+   2026-09-04 退役 8 通道后；口径源 live_channels.LIVE_CHANNELS）
    + 多个影子检测器（KREV/HM/反转/nextbar/combo/X4/报价 edge，只记录不下注）
    + 场景检测器（FakeBreakoutDetector）；AgentScheduler 四阶段闭环仅在
    agent_loop_enabled=True 时启动（2026-08-16 起默认退役）
@@ -56,6 +57,7 @@ from .models.schemas import (
     ToggleLiveRequest,
     ToggleShadowRequest,
 )
+from .services.absorption_shadow_detector import AbsorptionShadowDetector
 from .services.agent_scheduler import AgentScheduler
 from .services.combo_shadow_detector import ComboShadowDetector
 from .services.data_collector import BinanceDataCollector
@@ -67,6 +69,7 @@ from .services.multi_live_trader import MultiLiveTrader
 from .services.nextbar_shadow_detector import NextbarShadowDetector
 from .services.quote_edge_detector import QuoteEdgeDetector
 from .services.reversal_shadow_detector import ReversalShadowDetector
+from .services.s2_cond_shadow_detector import S2CondShadowDetector
 from .services.shadow_version_gate import shadow_gate
 from .services.trade_settler import TradeSettler
 from .services.llm_service import LLMService
@@ -167,10 +170,19 @@ nextbar_shadow_detector: NextbarShadowDetector | None = None
 # 组合条件影子检测器全局实例（combo 族：45 维大搜索存活 5 组合，只记录不下注）
 combo_shadow_detector: ComboShadowDetector | None = None
 
+# 吸收/欠反应跟随影子检测器全局实例（absorption_follow_v1 族：TD120/150 双 variant
+# trailing 14d 滚动标定，报价对 BTC 位移欠反应→跟随补涨，只记录不下注）
+absorption_shadow_detector: AbsorptionShadowDetector | None = None
+
+# S2 条件单影子检测器全局实例（s2_cond_t4_v1/s2_cond_t5d_v1 族：实盘 S2(bear_exhaust)
+# 派生窗内 t=4/t=5 判价条件确认 → 押次周期 UP，落 kline_shadow_signals version 隔离，
+# 只记录不下注）
+s2_cond_shadow_detector: S2CondShadowDetector | None = None
+
 # 交易结算器全局实例（P0-2：FILLED 订单结算回填输赢/盈亏，常开）
 trade_settler: TradeSettler | None = None
 
-# 多通道实盘执行器全局实例（MultiLiveTrader：15 通道三族触发，
+# 多通道实盘执行器全局实例（MultiLiveTrader：7 通道三族触发，
 # 通道开关/金额/日限各自独立，启动回落 LIVE_CHANNELS_JSON，默认全关）
 multi_live_trader: MultiLiveTrader | None = None
 
@@ -1042,7 +1054,7 @@ async def lifespan(app: FastAPI):
     logger.info("现货 WS + 预测市场追踪 + 15m边界加速 + 情绪窗口归档 + 健康监控已启动")
 
     # 多通道实盘执行器（MultiLiveTrader，2026-08-24 取代单版本 QuoteEdgeLiveTrader）：
-    # 15 通道各自独立金额/日限/护栏/开关，三族触发（quote_edge 喂价/x4 轮询/场景钩子）；
+    # 7 通道各自独立金额/日限/护栏/开关，三族触发（quote_edge 喂价/x4 轮询/场景钩子）；
     # 无条件装配 + 通道标志位控制开火；配置分层：代码默认 → LIVE_CHANNELS_JSON
     # → DB 覆盖层（toggle 持久化，重启不丢设定）。
     # 构造与邮件闸 resolver 注入必须早于三个检测器 start：is_enabled 只读
@@ -1134,6 +1146,9 @@ async def lifespan(app: FastAPI):
     # HM 上吊线反弹入场影子信号（2026-09-01）：弱收盘上吊线 → 次 15m 周期内
     # 等反弹触及 +0.25×ATR（2s 轮询 mid 裁决）→ 记录押 DOWN 的虚拟入场。
     # 只记录不下注，物理隔离于下单路径（新表不进 X4_VERSIONS/LIVE_CHANNELS）。
+    # 2026-09-04：hm_touch_down_v1/v2 双版本已永久退役（RETIRED_VERSIONS 硬闸，
+    # 信息速率≈0）——检测器仍启动，但只为把存量 PENDING/WAITING 行裁决入场
+    # 并结算/过期（结算路径不看版本闸）；新触发一律零落库、不派 2s 轮询监控。
     global hm_shadow_detector
     if settings.hm_shadow_enabled:
         hm_shadow_detector = HmShadowDetector(
@@ -1141,7 +1156,7 @@ async def lifespan(app: FastAPI):
             pm_15m_latest=_pm_15m_latest,
         )
         await hm_shadow_detector.start()
-        logger.info("HM 影子检测器已启动（720d n=46 触价收跌 58.7% vs 隐含 47.1%，探索性发现，影子模式不下注）")
+        logger.info("HM 影子检测器已启动（hm_touch_down_v1/v2 已于 2026-09-04 退役：停发新信号，仅结算存量行）")
 
     # 反转形态影子信号（P1/P2，2026-09-03）：15m 连跌4+弱阴收+量正常→押 UP /
     # 连涨5+弱阳收贴最高→押 DOWN，rev_common 几何口径实时重放，次根收盘按 direction
@@ -1184,6 +1199,36 @@ async def lifespan(app: FastAPI):
         )
         await combo_shadow_detector.start()
         logger.info("combo 组合影子检测器已启动（5 组合 3DOWN/2UP，720d 62.7~68.7% / oos 59.4~64.8%，影子模式不下注）")
+
+    # 吸收/欠反应跟随影子信号（absorption_follow_v1 族，2026-09-04）：5m 窗内报价对
+    # BTC 位移「欠反应」（知情者吸筹脚印）→ 跟随 btc 方向补涨押注的影子重放。双 variant
+    # （TD=120/150）各维护独立 trailing 14 天滚动标定缓冲（k/b/位移门 p50/欠反应门 p80，
+    # 严格 ex-ante），归档后处理直接落 SETTLED。只记录不下注，物理隔离于下单路径（落专用
+    # 表 absorption_shadow_signals，不进 X4_VERSIONS/LIVE_CHANNELS）。默认开关开启。
+    global absorption_shadow_detector
+    if settings.absorption_shadow_enabled:
+        absorption_shadow_detector = AbsorptionShadowDetector()
+        await absorption_shadow_detector.start()
+        logger.info("吸收影子检测器已启动（TD120/TD150 双 variant trailing 14d 滚动标定，RECENT real EV +0.052/+0.105，影子模式不下注）")
+
+    # S2 条件单影子信号（s2_cond 族，2026-09-06）：实盘 S2(bear_exhaust，破 4h 支撑+收阴+
+    # 放量) 派生——次周期窗内 t=4(+240s) 价<开盘（全深度）/ t=5(+300s) 0<回落<15bp（剔深）
+    # 两版条件确认 → 押次周期 15m UP，落 kline_shadow_signals（与 KREV/反转/nextbar/combo
+    # 共表、version 严格隔离结算）。入场快照真实 15m UP 报价（窗口对齐+龄守卫），真实 EV
+    # 前向现算（研究 EV 属报价表乐观上界）。只记录不下注，物理隔离于下单路径（不进
+    # X4_VERSIONS/LIVE_CHANNELS）。默认开关开启，与其他影子一致。
+    global s2_cond_shadow_detector
+    if settings.s2_cond_shadow_enabled:
+        s2_cond_shadow_detector = S2CondShadowDetector(
+            collector=collector,
+            pm_15m_latest=_pm_15m_latest,
+        )
+        await s2_cond_shadow_detector.start()
+        logger.info("S2 条件单影子检测器已启动（t=4 价<开 38.9% / t=5 剔深 44.8%，720d 触发 1069/643，低买 UP 正 EV 来自入场价，影子模式不下注）")
+        # 钩子装配独立于 multi_live_trader（影子物理隔离于下单路径：即便实盘执行器装配
+        # 失败/未启用，S2 影子仍从每个实盘 bear_exhaust 派生采集前向样本）
+        if fake_breakout_detector is not None:
+            fake_breakout_detector._on_s2_cond = s2_cond_shadow_detector.on_s2_signal
 
     # 交易结算器（P0-2）：回读 SentimentWindow 结算 FILLED 订单输赢/盈亏。
     # 无开关常开：行为只读窗口 + 回填结算字段，零资金风险。
@@ -1264,6 +1309,12 @@ async def lifespan(app: FastAPI):
     # 停止组合条件影子检测器
     if combo_shadow_detector is not None:
         await combo_shadow_detector.stop()
+    # 停止吸收/欠反应跟随影子检测器
+    if absorption_shadow_detector is not None:
+        await absorption_shadow_detector.stop()
+    # 停止 S2 条件单影子检测器
+    if s2_cond_shadow_detector is not None:
+        await s2_cond_shadow_detector.stop()
     # 停止影子版本开关 gate（所有影子检测器已停，最后收后台刷新任务）
     await shadow_gate.stop()
     # 停止交易结算器
@@ -1292,7 +1343,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="BTC 预测市场多通道实盘 + 影子信号系统",
-    description="多通道实盘执行（MultiLiveTrader 15 通道）+ 影子信号检测 + 场景信号；情绪 Agent Loop 已退役",
+    description="多通道实盘执行（MultiLiveTrader，通道数口径源 live_channels.LIVE_CHANNELS）"
+                "+ 影子信号检测 + 场景信号；情绪 Agent Loop 已退役",
     version="3.0.0",
     lifespan=lifespan,
 )
@@ -1951,6 +2003,30 @@ async def get_latest_trade(
     }
 
 
+def _order_price_kind(o) -> str | None:
+    """判定订单行 average_price 的口径：'fill' | 'quote' | None（P2c）。
+
+    只有两个来源能证明是币安实际成交均价：
+      ① 下单回路终态回查后 _merge_fill_into_quote 回填
+         → quote_json.fillSource == 'binance_history_confirm'
+      ② 对账回填（_sync_binance_orders_impl）且币安侧终态为 FILLED
+         → quote_json.source == 'binance_history_sync' 且 binanceOrderStatus == 'FILLED'
+    其余一律 'quote'：护栏弃单带的报价、FOK 未成交单、对账判失败单、
+    PENDING 待确认单——它们的 averagePrice 均为报价/委托价而非成交价。
+    无价时返回 None（前端展示 '--'，不需标注）。
+    """
+    qj = o.quote_json or {}
+    if qj.get("averagePrice") is None:
+        return None
+    if o.status == "FILLED" and (
+        qj.get("fillSource") == "binance_history_confirm"
+        or (qj.get("source") == "binance_history_sync"
+            and qj.get("binanceOrderStatus") == "FILLED")
+    ):
+        return "fill"
+    return "quote"
+
+
 @app.get("/api/trades/recent")
 async def get_recent_trades(
     limit: int = 20,
@@ -1980,6 +2056,11 @@ async def get_recent_trades(
                 "token_id": o.token_id,
                 "amount_in": o.amount_in,
                 "average_price": (o.quote_json or {}).get("averagePrice"),
+                # P2c：均价列口径标注（'fill'=币安实际成交均价 / 'quote'=报价委托价）。
+                # FAILED、PENDING 单的 averagePrice 是报价：FOK 未成交时
+                # filledUsdtAmount=0 但 price 仍有值，当成交均价读会误以为
+                # 「按这个价买到了」（2026-09-04 id=285 归因时踩到）。
+                "price_kind": _order_price_kind(o),
                 "direction": o.direction,
                 "settle_outcome": o.settle_outcome,
                 "win": o.win,
@@ -2266,11 +2347,17 @@ async def shadow_toggle(
 
     下线=各检测器停止采集该版本新信号（落库前 gate 拦截）+面板置灰；
     历史已落库信号不受影响（下线≠删数据，曲线照常显示已有样本）。
-    白名单=SHADOW_BENCH；持久化 shadow_version_overrides（重启不丢），
-    gate 缓存本进程立即生效，多 worker 靠 60s TTL 收敛。
+    白名单=SHADOW_BENCH 减去 RETIRED_VERSIONS（永久退役版不可再上线）；
+    持久化 shadow_version_overrides（重启不丢），gate 缓存本进程立即生效，
+    多 worker 靠 60s TTL 收敛。
     """
     if req.version not in SHADOW_BENCH:
         raise HTTPException(status_code=422, detail=f"未知影子版本: {req.version}")
+    if shadow_gate.is_retired(req.version):
+        # 退役不可逆：已证伪/被支配的版本不接受重新上线（前端同步置灰不可点）
+        raise HTTPException(
+            status_code=422,
+            detail=f"影子版本 {req.version} 已永久退役，不可再上线（历史数据仍可在面板查看）")
     await shadow_gate.set_enabled(req.version, req.enabled)
     return {
         "message": (
@@ -2622,7 +2709,11 @@ async def _sync_binance_orders_impl() -> dict:
         return {"error": prediction_trader.last_api_error or "查询失败", "synced": 0}
 
     # slug 末尾即窗口起始秒（如 btc-updown-5m-1787418600）
-    by_window: dict[int, dict] = {}
+    # key 带市场周期（P2b）：5m 与 15m 市场的窗口起始秒会重合（生产币安历史
+    # 实测 12 个窗口秒两周期并存），只用 window_start 做 key 时后写覆盖先写，
+    # 15m 的 PENDING 行可能被 5m 订单行回填（串号）。
+    by_window: dict[tuple[int, str], dict] = {}
+    by_window_any: dict[int, list[dict]] = {}   # 本地行 market_period 为 NULL（旧数据）时的候选
     by_orderid: dict[str, dict] = {}
     for o in history:
         if not isinstance(o, dict):
@@ -2631,7 +2722,13 @@ async def _sync_binance_orders_impl() -> dict:
             by_orderid[str(o["orderId"])] = o
         m = re.search(r"-(\d{10})$", o.get("slug") or "")
         if m:
-            by_window[int(m.group(1)) * 1000] = o
+            ws = int(m.group(1)) * 1000
+            # 周期口径复用 _classify_period（先判 15m，因 '15m' 含 '5m' 子串）；
+            # 币安历史行用 marketTopicTitle（非 title），这里映射后传入。
+            per = prediction_trader._classify_period(
+                {"title": o.get("marketTopicTitle"), "slug": o.get("slug")}) or ""
+            by_window[(ws, per)] = o
+            by_window_any.setdefault(ws, []).append(o)
 
     synced: list[dict] = []
     amount_corrected: list[dict] = []
@@ -2642,19 +2739,40 @@ async def _sync_binance_orders_impl() -> dict:
         )
         rows = (await db.execute(stmt)).scalars().all()
         for row in rows:
-            bo = by_window.get(row.window_start)
+            period = row.market_period or ""
+            bo = by_window.get((row.window_start, period))
+            if bo is None and not period:
+                # 旧数据无 market_period：仅当该窗口秒只有一个周期的订单行时才回填；
+                # 5m/15m 并存时宁可不猜（保持 PENDING，下轮对账或人工处理）。
+                cands = by_window_any.get(row.window_start) or []
+                bo = cands[0] if len(cands) == 1 else None
             if not bo:
                 continue
             filled = Decimal(str(bo.get("filledUsdtAmount") or "0"))
-            row.status = "FILLED" if bo.get("status") == "FILLED" else "FAILED"
+            bo_status = str(bo.get("status") or "")
+            row.status = "FILLED" if bo_status == "FILLED" else "FAILED"
             row.order_id = bo.get("orderId")
             row.amount_in = str(int(filled * (10 ** 18)))
             row.quote_json = {
+                # ⚠ price 是币安订单行的报价/委托价，非成交均价（FOK 未成交时
+                # filledUsdtAmount=0 但 price 仍有值）——前端已标注为「报价」。
                 "averagePrice": float(bo.get("price") or 0),
                 "filledShareQty": bo.get("filledShareQty"),
+                "binanceOrderStatus": bo_status,
                 "source": "binance_history_sync",
             }
-            row.error_message = None
+            # P2a：失败单补写归因文案（旧代码置 None → 前端「说明」列空白，
+            # 无法区分 FOK 空成交 / 部分成交 / 其他终态）
+            if row.status == "FILLED":
+                row.error_message = None
+            elif filled <= 0:
+                row.error_message = (
+                    f"对账订正：币安侧订单终态 {bo_status or 'UNKNOWN'}"
+                    "（FOK 未成交，filledUsdtAmount=0）")
+            else:
+                row.error_message = (
+                    f"对账订正：币安侧订单终态 {bo_status or 'UNKNOWN'}"
+                    f"（非 FILLED 但已有成交 {filled} USDT，按未成交处理）")
             synced.append({
                 "id": row.id, "window_start": row.window_start,
                 "status": row.status, "order_id": row.order_id,
@@ -3197,6 +3315,21 @@ SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     "combo_p3_v1": (0.682, None, "combo组合P3: 贴1天高∧美盘(UTC h≥16)∧7d涨≥4% → 押次根15m收阴DOWN（720d n=176 68.2%/oos n=212 59.4%；高位+美盘时段+中期动量衰减；EV按目标窗真实报价前向现算）"),
     "combo_p4_v1": (0.627, None, "combo组合P4: 收低位(pos≤0.25)∧周末∧RSI14≤25 → 押次根15m收阳UP（720d n=322 62.7%/oos n=459 63.6%；周末超卖反弹；EV按目标窗真实报价前向现算）"),
     "combo_p5_v1": (0.687, None, "combo组合P5: 近光脚∧周末∧RSI14≤25 → 押次根15m收阳UP（720d n=131 68.7%/oos n=142 64.8%；P4同簇严格版（下影≤5%），影子期实数据对比两口径；EV按目标窗真实报价前向现算）"),
+    # absorption_follow_v1 族（2026-09-04）：报价对 BTC 位移欠反应→跟随补涨，落专用表
+    # absorption_shadow_signals，TD 时刻真实 token 价入场、按本窗 outcome 结算（归档后处理
+    # 直接落 SETTLED，ev_at_entry 已落库直读）。信号基=real（up_move 用真实 up_price 残差，
+    # 端到端诚实口径）。基准=真实价复核 RECENT(08-19→09-04) real pooled 点估计
+    # （.pytest_tmp/absorption_realprice.py，2026-09-04；命门已关：裸 pct−真实价乐观偏差
+    # ±0.001）；trailing 14d 滚动标定为生产口径（研究用静态 70/30 disc-OOS 切分）。
+    "absorption_follow_td120_v1": (0.798, 0.052, "吸收跟随TD120: 5m窗开120s报价对BTC位移欠反应(under≥p80∩|btc_move|≥p50)→跟随btc补涨(涨押UP/跌押DOWN)（真实价复核RECENT real n=397 命中79.8%/EV+0.052 CI[-0.008,+0.112]~单看不显著、FULL real n=1050 EV+0.089 CI✓；trailing14d滚动标定k；EV按TD真实token价前向现算）"),
+    "absorption_follow_td150_v1": (0.885, 0.105, "吸收跟随TD150: 同TD120口径但判定延至窗开150s（真实价复核RECENT real n=399 命中88.5%/EV+0.105 CI[+0.050,+0.165]✓，双variant最稳健、FULL real n=1083 EV+0.099 CI✓；trailing14d滚动标定k；EV按TD真实token价前向现算）"),
+    # S2 条件单族（2026-09-06）：实盘 S2(bear_exhaust) 派生窗内 t=4/t=5 判价条件确认 →
+    # 押次周期 15m UP，落 kline_shadow_signals（version 隔离），入场快照真实 15m UP 报价。
+    # 基准胜率=720d 冻结「价-only」硬数字（审计锚点 scripts/s2_cond_freeze_counts_720d.py，
+    # 复现触发 1069/643）；bench EV 留 None——研究 EV(+0.237/+0.283)属报价表口径乐观上界，
+    # 真实 EV 由生产报价前向现算（低买 UP 的正 EV 来自入场价而非胜率）
+    "s2_cond_t4_v1": (0.389, None, "S2条件t=4: 实盘S2(bear_exhaust,破4h支撑+收阴+放量)派生→次周期t=4(+240s)1m收盘<周期开盘(全深度回落)→押次周期15m UP(收阳赢)（720d触发1069/2176=49.1%/1.48天,价-only胜率38.9%；开盘即买EV≈−0.042不赚钱,等t=4低买UP正EV来自入场价；真实EV前向现算,报价表研究EV+0.237属乐观上界）"),
+    "s2_cond_t5d_v1": (0.448, None, "S2条件t=5剔深: 同S2派生→次周期t=5(+300s)0<ln(开盘/px5)<15bp(中度回落剔深)→押次周期15m UP(收阳赢)（720d触发643/2176=29.5%/0.89天,价-only胜率44.8%；剔深单均优于t=4全深度；真实EV前向现算,报价表研究EV+0.283属乐观上界）"),
 }
 # 周期切分点：08-19 00:00 UTC（三根大阳起点）；< 为震荡期（大涨前），≥ 为大涨期
 PUMP_TS_MS = int(datetime(2026, 8, 19, tzinfo=timezone.utc).timestamp() * 1000)
@@ -3296,7 +3429,9 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
     """
     from sqlalchemy import literal as sa_literal, select as sa_select
 
-    from .db.models import KlineShadowSignal, MisalignmentSignal, PatternShadowSignal
+    from .db.models import (
+        AbsorptionShadowSignal, KlineShadowSignal, MisalignmentSignal, PatternShadowSignal,
+    )
     from .services.fake_breakout_detector import RESEARCH_WIN_RATES
 
     # ---- 影子信号：全量 SETTLED 升序（仅取所需列，避免整行 ORM 实体化）----
@@ -3344,7 +3479,24 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
         .where(PatternShadowSignal.status == "SETTLED")
         .order_by(PatternShadowSignal.target_bar_start)
     )).all()
-    sh_rows = list(sh_rows) + list(krev_rows) + list(pattern_rows)
+    # absorption_follow_v1 族（absorption_shadow_signals 表，2026-09-04 并入）：5m 窗内报价
+    # 对 BTC 位移欠反应 → 跟随 btc 补涨的影子重放，TD 时刻真实 token 价入场、按本窗 outcome
+    # 结算（归档后处理直接落 SETTLED）。逐笔 ev_at_entry 已落库（真实价口径），聚合直读；
+    # entry_up/down_price 按 direction 取对应侧 q 供盈亏平衡/兜底现算。
+    absorption_rows = (await db.execute(
+        sa_select(
+            AbsorptionShadowSignal.version,
+            AbsorptionShadowSignal.window_start,
+            AbsorptionShadowSignal.win,
+            AbsorptionShadowSignal.ev_at_entry,
+            AbsorptionShadowSignal.entry_down_price,
+            AbsorptionShadowSignal.entry_up_price,
+            AbsorptionShadowSignal.direction,
+        )
+        .where(AbsorptionShadowSignal.status == "SETTLED")
+        .order_by(AbsorptionShadowSignal.window_start)
+    )).all()
+    sh_rows = list(sh_rows) + list(krev_rows) + list(pattern_rows) + list(absorption_rows)
     # 版本 = 冻结基准已知版本 ∪ 数据中出现的版本（新版本缺基准不崩，bench 为 None）
     versions = [
         "x4_v1", "quote_momentum_v1", "quote_contrarian_v1",
@@ -3361,6 +3513,8 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
         "combo_p1_v1", "combo_p2_v1", "combo_p3_v1", "combo_p4_v1", "combo_p5_v1",  # combo 组合族（纯影子，2026-09-04：共表 kline_shadow_signals，5 组合 3DOWN/2UP）
         "s5_deep_z20_v1",  # S5 深档 z5≤−20bp（纯影子，2026-09-03：共表 pattern_shadow_signals）
         "quote_momentum_v3",  # 报价动量 v3 非连涨门禁（纯影子，2026-09-03：misalignment_signals）
+        "absorption_follow_td120_v1", "absorption_follow_td150_v1",  # 吸收/欠反应跟随族（纯影子，2026-09-04：专用表 absorption_shadow_signals，TD120/150 双 variant 滚动标定）
+        "s2_cond_t4_v1", "s2_cond_t5d_v1",  # S2 条件单族（纯影子，2026-09-06：实盘 bear_exhaust 派生窗内 t=4/t=5 判价→押 UP，共表 kline_shadow_signals version 隔离）
     ]
     versions += sorted({s.version for s in sh_rows} - set(versions))
     shadow = {}
@@ -3394,8 +3548,10 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
                 "cum_ev": round(cum_ev, 4) if evs else None,
                 "avg_breakeven": sum(bes) / len(bes) if bes else None,
                 "bench_winrate": bwr, "bench_ev": bev, "desc": desc,
-                # 影子开关状态（前端手动下线能力）：下线版本置灰+可重新上线
+                # 影子开关状态（前端手动下线能力）：下线版本置灰+可重新上线；
+                # retired=永久退役（代码级硬闸，toggle 拒改，前端不可点开关）
                 "enabled": shadow_gate.is_enabled(v),
+                "retired": shadow_gate.is_retired(v),
             },
             "curve": curve[-_CURVE_MAX_POINTS:],
         }

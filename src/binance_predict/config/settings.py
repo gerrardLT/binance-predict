@@ -337,11 +337,15 @@ class Settings(BaseSettings):
     kline_shadow_email_enabled: bool = False
 
     # --- HM 上吊线反弹入场影子信号（hm_touch_down_v1 / v2，2026-09-01）---
+    # ⚠ 2026-09-04 双版本已永久退役（shadow_version_gate.RETIRED_VERSIONS，信息速率≈0：
+    # 720d 触发 0.04~0.06 次/天，凑满 n=100 需 4~7 年）：硬闸停发新信号。
+    # 本开关仍默认 True：检测器不再落新行，但存量 PENDING/WAITING 行的入场
+    # 裁决与结算/过期不看版本闸——关掉会留下一批永不结算的历史行。
     # 弱收盘上吊线 → 次 15m 周期内等反弹触及 +0.25×ATR（2s 轮询 mid 裁决）
     # → 记录押 DOWN 的影子虚拟入场（快照触及时刻真实报价）。只记录不下注，
     # 与下单路径物理隔离。720d 触价收跌 58.7% vs 隐含 47.1%（n=46，p≈0.06，
-    # 探索性发现，影子期即前向验证）。v2 = v1+非下跌段∧非低波门禁（720d 后验
-    # 切片 触发78/触价29/收跌69.0%），双行并行采集。开关仅作紧急停用制动力。
+    # 探索性发现）。v2 = v1+非下跌段∧非低波门禁（720d 后验切片 触发78/触价29/
+    # 收跌69.0%）。
     hm_shadow_enabled: bool = True
 
     # --- 反转形态影子信号（P1/P2 族，2026-09-03）---
@@ -378,18 +382,45 @@ class Settings(BaseSettings):
     # 影子信号一致，部署即生效；仅作紧急停用制动力，正常情况下无需触碰。
     combo_shadow_enabled: bool = True
 
+    # --- 吸收/欠反应跟随影子信号（absorption_follow_v1 族，2026-09-04）---
+    # 5m 窗内报价对 BTC 位移「欠反应」（知情者吸筹脚印）→ 跟随 btc 方向补涨押注的影子
+    # 重放。双 variant（TD=120/150）各维护独立 trailing 14 天滚动标定缓冲（k/b/位移门
+    # p50/欠反应门 p80，严格 ex-ante）。信号基=real（up_move 用真实 up_price 残差）；真实价
+    # 复核命门已关（裸 pct−真实价乐观偏差 ±0.001，RECENT TD150 real EV +0.105
+    # CI[+0.050,+0.165]✓、TD120 real +0.052 CI 跨 0）。落专用表 absorption_shadow_signals，
+    # 只记录不下注，物理隔离于下单路径（不进 X4_VERSIONS/LIVE_CHANNELS）。默认开启：与其他
+    # 影子信号一致，部署即生效；仅作紧急停用制动力，正常情况下无需触碰。
+    absorption_shadow_enabled: bool = True
+
+    # --- S2 条件单影子信号（s2_cond 族，2026-09-06）---
+    # 研究结论落地：S2（bear_exhaust，破 4h 支撑+收阴+放量）开盘即买 UP 的 EV≈−0.042
+    # 不赚钱；等次周期窗内 t=4/t=5 判价的条件单更优（价跌时 UP token 变便宜，低买 UP 的
+    # 正 EV 来自入场价而非胜率）。两版均由实盘 S2 信号派生（复用 fake_breakout 检测口径，
+    # 单一事实源），均押次周期 15m UP（收阳赢）：t=4 价<开盘全深度（s2_cond_t4_v1，720d
+    # 触发 1069/49.1%/1.48 天，价-only 胜率 38.9%）、t=5 剔深 0<ln(开盘/px5)<15bp
+    # （s2_cond_t5d_v1，720d 触发 643/29.5%/0.89 天，胜率 44.8%）。入场快照真实 15m UP
+    # 报价，落 kline_shadow_signals（与 KREV/反转/nextbar/combo 共表、version 严格隔离结算，
+    # 免迁移），真实 EV 前向现算。审计锚点 scripts/s2_cond_freeze_counts_720d.py。只记录
+    # 不下注，物理隔离于下单路径（不进 X4_VERSIONS/LIVE_CHANNELS）。默认开启：与其他影子
+    # 信号一致，部署即生效；仅作紧急停用制动力，正常情况下无需触碰。
+    s2_cond_shadow_enabled: bool = True
+
     # --- 多通道实盘（MultiLiveTrader，2026-08-24，取代旧单版本 quote_edge 实盘字段）---
-    # 15 通道（quote_edge 族 8：contrarian v1/v2/v3a/v3b/v4 + momentum v1/v2/v3；x4 × 2；场景 5：S1/S2/S4/S5 + s5_deep）
+    # 7 通道（quote_edge 族 1：contrarian_v2；x4 × 1：x4_v2；场景 5：S1/S2/S4/S5 + s5_deep）
     # 可同时开启；每通道独立金额/日限/护栏，通道静态描述见 services/live_channels.py。
+    # 2026-09-04 退役 8 通道（momentum v1/v2/v3、contrarian v1/v3a/v3b/v4、x4_v1），
+    # 退役名单 live_channels.RETIRED_CHANNELS：不再装配也不可 toggle 上线，
+    # 但配置（env JSON / DB 覆盖行）里残留退役名只告警跳过、不拒启。
     # 每通道每窗至多一单（内存 + DB 唯一约束双保险）。
     # 每通道默认单注（USDT，硬上限 50 拒启，同旧哲学：不靠自律靠拒启）
     live_default_amount_usdt: float = 2.0
     # 每通道默认日单量护栏：当日该通道 FILLED 达上限后停火（用户拍板：各自 100）
     live_default_max_daily_orders: int = 100
-    # 启动时通道覆盖配置（JSON 字符串，重启保持开启集——解决旧模式每次部署重置 OFF）：
-    # {"quote_contrarian_v1":{"enabled":true,"amount_usdt":2.0,"max_daily_orders":100,"max_exec_price":0.28},...}
+    # 启动时通道覆盖配置（JSON 字符串）——三层配置的中间层：
+    # 代码默认 → 本变量 → DB live_channel_overrides（前端 toggle/热调持久化，优先级最高）。
+    # {"quote_contrarian_v2":{"enabled":true,"amount_usdt":2.0,"max_daily_orders":100,"max_exec_price":0.28},...}
     # 未知通道/金额超限/非法值 → MultiLiveTrader 构造抛 ValueError 拒绝装配（fail fast）。
-    # 运行时 toggle/金额热调为内存态，重启回落本配置。
+    # 运行时设定重启不丢（存 DB）；删 DB 覆盖行才回落到本层。
     live_channels_json: str = ""
 
     # --- 场景研究（LLM 研究员，M2 2026-08-16）---

@@ -18,6 +18,8 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 
+from loguru import logger
+
 from binance_predict.config.settings import settings
 
 from .quote_edge_detector import QUOTE_EDGE_RULES
@@ -50,53 +52,14 @@ def _qe_guard(version: str) -> float:
 
 LIVE_CHANNELS: dict[str, ChannelSpec] = {
     # --- quote_edge 族（5m 窗内报价触发，区间引用 QUOTE_EDGE_RULES 冻结口径）---
-    "quote_momentum_v1": ChannelSpec(
-        "quote_momentum_v1", "quote_edge", "5m", "DOWN", _qe_guard("quote_momentum_v1"),
-        "报价动量（A格顺势）",
-    ),
-    "quote_contrarian_v1": ChannelSpec(
-        "quote_contrarian_v1", "quote_edge", "5m", "DOWN", _qe_guard("quote_contrarian_v1"),
-        "报价反向（B格逆势）",
-    ),
-    # v2 门禁版：v1 区间 + BTC 门禁（chg≤−0.10% / chg<+0.10%，阈值引用 V2_PRICE_GUARDS）
-    "quote_momentum_v2": ChannelSpec(
-        "quote_momentum_v2", "quote_edge", "5m", "DOWN", _qe_guard("quote_momentum_v1"),
-        "报价动量·门禁版", v2_guard="min_drop",
-    ),
+    # v2 门禁版：contrarian v1 冻结区间 + BTC 门禁（chg<+0.10%，阈值引用 V2_PRICE_GUARDS）
+    # ⚠ 区间/护栏仍派生自已退役的 quote_contrarian_v1 冻结条目（QUOTE_EDGE_RULES
+    # 是回测口径事实源，整体保留）；退役只停「v1 自身作为通道/影子版本」。
     "quote_contrarian_v2": ChannelSpec(
         "quote_contrarian_v2", "quote_edge", "5m", "DOWN", _qe_guard("quote_contrarian_v1"),
         "报价反向·门禁版", v2_guard="max_rise",
     ),
-    # v3 环境门禁版：contrarian v1 区间 + v2 价格门禁 + 环境门禁
-    # （前窗 DOWN / 距日高回落≥0.30%，口径引用 quote_edge_detector.V3_ENV_GUARDS，
-    # 实时核验走异步 DB 查询，见 MultiLiveTrader._pass_live_v3_guard）
-    "quote_contrarian_v3a": ChannelSpec(
-        "quote_contrarian_v3a", "quote_edge", "5m", "DOWN", _qe_guard("quote_contrarian_v1"),
-        "报价反向·交替环境版", v2_guard="max_rise", v3_env=True,
-    ),
-    "quote_contrarian_v3b": ChannelSpec(
-        "quote_contrarian_v3b", "quote_edge", "5m", "DOWN", _qe_guard("quote_contrarian_v1"),
-        "报价反向·日高回落版", v2_guard="max_rise", v3_env=True,
-    ),
-    # v4 regime 门禁版：contrarian v1 区间 + ret24 ≤ −1.0% 门禁（触发时点过去
-    # 24h BTC 收益，5m K 线 ex-ante 口径，阈值引用 quote_edge_detector.
-    # REGIME_GUARDS，实时核验走 btc_regime.regime_feed 异步缓存，见
-    # MultiLiveTrader._check_regime）。回测依据（Predexon 真实订单簿 62 天）：
-    # down 段 wr 30.3% EV+0.372（CI 下界过盈亏平衡线），up/range 段 EV≈0。
-    "quote_contrarian_v4": ChannelSpec(
-        "quote_contrarian_v4", "quote_edge", "5m", "DOWN", _qe_guard("quote_contrarian_v1"),
-        "报价反向·下跌周期版", regime_gate=True,
-    ),
-    # 报价动量 v3 非连涨门禁版（2026-09-03 影子 → 实盘小金额前向验证）：v1 冻结区间 ∩
-    # 触发时点末收 15m 非连涨（STREAK_GUARDS 异步 K 线核验，缺失/不可判弃单）。
-    # 回测修正未来函数后门禁效应≈0（80.2% vs 连涨 76.4% CI 重叠），实盘验证门禁
-    # 是否真实有效；与 v1/v2 同窗互斥（SAME_WINDOW_EXCLUSIVE，至多一单成交）。
-    "quote_momentum_v3": ChannelSpec(
-        "quote_momentum_v3", "quote_edge", "5m", "DOWN", _qe_guard("quote_momentum_v1"),
-        "报价动量·非连涨门禁版", streak_gate=True,
-    ),
     # --- x4 族（影子 PENDING → 次窗 +150s 决策点，入场价历史偏低）---
-    "x4_v1": ChannelSpec("x4_v1", "x4", "5m", "DOWN", 0.45, "情绪错位（收阳押次窗DOWN）"),
     "x4_v2": ChannelSpec("x4_v2", "x4", "5m", "DOWN", 0.50, "情绪错位·平静市门禁版"),
     # --- 场景族（15m 市场次周期开盘入场；S5 为 +5min 确认入场）---
     # S1 护栏 0.70：2026-08-30 盘口数据校准（原 0.60 拍脑袋值）——
@@ -127,14 +90,66 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# 已退役通道（2026-09-04 用户拍板「信号直接不要了」）：不在 LIVE_CHANNELS
+# → 执行器不装配、不可 toggle 上线、status 不列出。spec 本体保留在此处，
+# 两个用途：① parse_channel_config 对 LIVE_CHANNELS_JSON / live_channel_overrides
+# 里残留的退役通道名做「告警跳过」而非 raise（防生产配置引用退役名导致
+# 整个实盘执行器装配失败静默全停）；② 机制类单测的 fixture 源（v3_env /
+# regime_gate / streak_gate / 同窗互斥 等门禁机制代码仍在，用退役 spec 驱动）。
+# 退役依据同 shadow_version_gate.RETIRED_VERSIONS（两处名单必须一致）。
+# ---------------------------------------------------------------------------
+RETIRED_CHANNEL_SPECS: dict[str, ChannelSpec] = {
+    # A1 momentum 族：「深折价顺势」假设被前向数据证伪
+    "quote_momentum_v1": ChannelSpec(
+        "quote_momentum_v1", "quote_edge", "5m", "DOWN", _qe_guard("quote_momentum_v1"),
+        "报价动量（A格顺势）",
+    ),
+    "quote_momentum_v2": ChannelSpec(
+        "quote_momentum_v2", "quote_edge", "5m", "DOWN", _qe_guard("quote_momentum_v1"),
+        "报价动量·门禁版", v2_guard="min_drop",
+    ),
+    "quote_momentum_v3": ChannelSpec(
+        "quote_momentum_v3", "quote_edge", "5m", "DOWN", _qe_guard("quote_momentum_v1"),
+        "报价动量·非连涨门禁版", streak_gate=True,
+    ),
+    # A2 被同名 v2 严格支配（v2 = v1 触发集纯子集 + 门禁）
+    "quote_contrarian_v1": ChannelSpec(
+        "quote_contrarian_v1", "quote_edge", "5m", "DOWN", _qe_guard("quote_contrarian_v1"),
+        "报价反向（B格逆势）",
+    ),
+    "x4_v1": ChannelSpec("x4_v1", "x4", "5m", "DOWN", 0.45, "情绪错位（收阳押次窗DOWN）"),
+    # B 档：门禁未兑现，被 contrarian_v2 支配
+    "quote_contrarian_v3a": ChannelSpec(
+        "quote_contrarian_v3a", "quote_edge", "5m", "DOWN", _qe_guard("quote_contrarian_v1"),
+        "报价反向·交替环境版", v2_guard="max_rise", v3_env=True,
+    ),
+    "quote_contrarian_v3b": ChannelSpec(
+        "quote_contrarian_v3b", "quote_edge", "5m", "DOWN", _qe_guard("quote_contrarian_v1"),
+        "报价反向·日高回落版", v2_guard="max_rise", v3_env=True,
+    ),
+    "quote_contrarian_v4": ChannelSpec(
+        "quote_contrarian_v4", "quote_edge", "5m", "DOWN", _qe_guard("quote_contrarian_v1"),
+        "报价反向·下跌周期版", regime_gate=True,
+    ),
+}
+
+RETIRED_CHANNELS: frozenset[str] = frozenset(RETIRED_CHANNEL_SPECS)
+
+
 # 同窗互斥组：组内每市场窗口至多一个通道成交（防同源通道同窗同向叠加敞口；
 # 未成交（护栏弃单/失败/占位）不占坑，组内互补通道仍可下单）。
-# - momentum 族 v1/v2/v3 共享 v1 冻结区间、同采样命中时点；
 # - S5 深档与 S5 确认通道同源（+5min 确认钩子）、价格带互补（确认护栏 0.75
 #   自拦深档高报价窗），互斥防未来护栏调高后叠加。
+# momentum 族 v1/v2/v3 互斥组已随三成员全退役而移除（见
+# RETIRED_SAME_WINDOW_EXCLUSIVE，仅留作机制测试 fixture）。
 SAME_WINDOW_EXCLUSIVE: tuple[frozenset[str], ...] = (
-    frozenset({"quote_momentum_v1", "quote_momentum_v2", "quote_momentum_v3"}),
     frozenset({"scene_bull_exhaust_confirm", "s5_deep_z20_v1"}),
+)
+
+# 退役的同窗互斥组（不参与生产判定：exclusive_group 只读 SAME_WINDOW_EXCLUSIVE）
+RETIRED_SAME_WINDOW_EXCLUSIVE: tuple[frozenset[str], ...] = (
+    frozenset({"quote_momentum_v1", "quote_momentum_v2", "quote_momentum_v3"}),
 )
 
 
@@ -190,6 +205,12 @@ def parse_channel_config() -> dict[str, ChannelConfig]:
 
     for ch, ov in overrides.items():
         if ch not in LIVE_CHANNELS:
+            if ch in RETIRED_CHANNELS:
+                # 退役通道在配置里残留（env JSON / DB 覆盖行）：告警跳过而非 raise。
+                # 若这里 raise，main 装配只捕 ValueError 后会把 multi_live_trader
+                # 置 None → 整个实盘（含保留通道）静默全停。拼写错误仍走下方 raise。
+                logger.warning("多通道实盘：配置中的退役通道已忽略 | {}", ch)
+                continue
             raise ValueError(
                 f"多通道实盘：未知通道 {ch!r}（白名单 {list(LIVE_CHANNELS)}）")
         if ov is None:

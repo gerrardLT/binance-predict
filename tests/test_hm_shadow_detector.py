@@ -2,6 +2,13 @@
 
 不触网络/真实 DB：collector/session 全用替身；口径保真测试依赖
 output/klines_15m_720d.csv（缺失时 skip，CI 无产物不阻塞）。
+
+2026-09-04：hm_touch_down_v1/v2 已永久退役（shadow_version_gate.RETIRED_VERSIONS，
+信息速率≈0），生产路径零落库。本文件分两类用例：
+  ① 机制回归（落库/幂等/v2 环境门禁/冻结字段）——用 _unretire() 临时摘掉退役
+     名单驱动真实代码（不 patch is_enabled 本体，被测函数仍是真身）；
+  ② 退役事实（文件末尾）——不摘名单，断言硬闸下零落库。
+检测器仍默认启动：存量 PENDING/WAITING 行的入场裁决与结算/过期不看版本闸。
 """
 from __future__ import annotations
 
@@ -248,9 +255,22 @@ def test_v2_gate_insufficient_history_blocked() -> None:
     assert bool(v2_gate_mask(kl, atr).any()) is False
 
 
+def _unretire(monkeypatch) -> None:
+    """机制回归专用：临时清空 RETIRED_VERSIONS，让真实 is_enabled() 放行 HM 双版本。
+
+    只摘退役名单、不 patch 闸本体：形态触发→幂等查询→落库→v2 环境门禁
+    走的是生产同一条代码路径。退役事实由文件末尾 test_hm_versions_are_retired /
+    test_record_signal_blocked_by_retirement 独立锁住（那边不摘名单）。
+    """
+    from binance_predict.services import shadow_version_gate as svg
+    monkeypatch.setattr(svg, "RETIRED_VERSIONS", frozenset())
+    assert svg.shadow_gate.is_enabled(VERSION) is True   # 前置：摘名单确实生效
+
+
 @pytest.mark.asyncio
 async def test_evaluate_new_bars_dual_rows_when_gate_passes(monkeypatch) -> None:
     """形态触发 ∩ 门禁通过 → 同信号根双行落库（v1 基准 + v2 过滤版）。"""
+    _unretire(monkeypatch)
     rows = _hm_rows(n_base=120)
     _append_hm_bar(rows, o=100.0, c=99.991, h=100.005, l=99.97)
     session = _FakeSession(scalar=None)  # 两个版本存在性查询均未命中
@@ -270,6 +290,7 @@ async def test_evaluate_new_bars_single_row_when_gate_blocked(monkeypatch) -> No
     用下跌段而非低波做拦截源：低波压缩会连带改变 ATR，几何触发条件全按
     ATR 缩放，会破坏形态构造；改 96 根前收盘只动 ret24，几何条件不受影响。
     """
+    _unretire(monkeypatch)
     rows = _hm_rows(n_base=120)
     rows[24]["close"] = 101.5  # 末根下标 120；120−96=24 → ret24 ≈ −1.49% ≤ −1%
     _append_hm_bar(rows, o=100.0, c=99.991, h=100.005, l=99.97)
@@ -439,6 +460,7 @@ async def test_non_touched_expires_without_settlement(monkeypatch) -> None:
 @pytest.mark.asyncio
 async def test_record_signal_idempotent(monkeypatch) -> None:
     """已存在 (version, signal_bar_start) → 不重复落行。"""
+    _unretire(monkeypatch)
     session = _FakeSession(scalar=123)  # 存在性查询命中
     d = _detector()
     bar = {"open_time": T0, "open": 100.0, "close": 99.97}
@@ -449,6 +471,7 @@ async def test_record_signal_idempotent(monkeypatch) -> None:
 @pytest.mark.asyncio
 async def test_record_signal_inserts_frozen_fields(monkeypatch) -> None:
     """新信号落库：版本/规则原文/唯一键字段齐全，入场态 WAITING。"""
+    _unretire(monkeypatch)
     session = _FakeSession(scalar=None)
     d = _detector()
     bar = {"open_time": T0, "open": 100.0, "close": 99.97}
@@ -661,6 +684,61 @@ def test_rule_text_frozen_constants() -> None:
 
 
 def test_settings_default_on() -> None:
-    """默认开启：零资金风险（只记录不下注、新表物理隔离），开关仅作紧急制动力。"""
+    """默认仍开启（2026-09-04 双版本退役后）：检测器不再落新行（硬闸），
+    但仍负责把存量 PENDING/WAITING 行裁决入场并结算/过期——关掉会留下一批
+    永不结算的历史行。零资金风险（只记录不下注、新表物理隔离）。
+    """
     from binance_predict.config.settings import settings
     assert settings.hm_shadow_enabled is True
+
+
+# ============================================================
+# 永久退役（2026-09-04）：硬闸停发，机制代码保留供结算历史行
+# ============================================================
+
+def test_hm_versions_are_retired() -> None:
+    """HM 双版本均在退役名单（信息速率≈0：720d 触发 0.04~0.06 次/天）。"""
+    from binance_predict.services.shadow_version_gate import (
+        RETIRED_VERSIONS, shadow_gate,
+    )
+    for v in (VERSION, VERSION2):
+        assert v in RETIRED_VERSIONS
+        assert shadow_gate.is_retired(v) is True
+        assert shadow_gate.is_enabled(v) is False
+    # 覆盖行误写 enabled=True 也拦不住（退役优先级高于 DB）
+    shadow_gate._overrides[VERSION] = True
+    try:
+        assert shadow_gate.is_enabled(VERSION) is False
+    finally:
+        shadow_gate._overrides.pop(VERSION, None)
+
+
+@pytest.mark.asyncio
+async def test_record_signal_blocked_by_retirement() -> None:
+    """退役硬闸：_record_signal 直接 False，不查存在性、不落行。"""
+    session = _FakeSession(scalar=None)   # 存在性查询未命中：若无闸本会落行
+    d = _detector()
+    bar = {"open_time": T0, "open": 100.0, "close": 99.97}
+    for version in (VERSION, VERSION2):
+        added = await d._record_signal(session, bar, atr_val=0.1, clv_val=0.3,
+                                       version=version)
+        assert added is False
+    assert session.added == []
+
+
+@pytest.mark.asyncio
+async def test_evaluate_new_bars_records_nothing_after_retirement(monkeypatch) -> None:
+    """端到端：形态触发 + v2 环境门禁也过，退役后仍零落库、不派入场监控。"""
+    rows = _hm_rows(n_base=120)
+    _append_hm_bar(rows, o=100.0, c=99.991, h=100.005, l=99.97)
+    kl_chk, atr_chk = _kl(rows)
+    assert bool(detect_weak_hm(kl_chk, atr_chk)[-1]) is True   # 前置：形态确实触发
+    assert bool(v2_gate_mask(kl_chk, atr_chk)[-1]) is True     # 前置：门禁也通过
+    session = _FakeSession(scalar=None)
+    monkeypatch.setattr(hsd, "async_session_factory", lambda: _FakeSessionCtx(session))
+    d = _detector()
+    spawned: list[tuple] = []
+    d._spawn_watcher = lambda *a: spawned.append(a)  # type: ignore[method-assign]
+    await d._evaluate_new_bars(rows)
+    assert session.added == []
+    assert spawned == []          # 不落行就不该派 2s 轮询监控（白耗资源）

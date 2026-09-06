@@ -1090,6 +1090,119 @@ class PatternShadowSignal(Base):
 
 
 # ============================================================
+# 吸收/欠反应跟随影子信号表（absorption_follow_v1 族，2026-09-04）
+# ============================================================
+
+class AbsorptionShadowSignal(Base):
+    """吸收/欠反应跟随影子信号（absorption_follow_v1 族）：5m 窗内报价对 BTC 位移
+    「欠反应」（有人犹豫/知情者吸筹）→ 跟随 btc 方向补涨押注的影子重放。
+
+    冻结口径（.pytest_tmp/absorption_realprice.py 真实价复核，2026-09-04；规则冻结勿动）：
+      窗开 TD 秒后（严格 ex-ante，只读 ≤TD 采样点）——
+        btc_move=(btc@TD−open)/open×1e4 bp、up_move=(up_price@TD−open)×100 pp（real 基）；
+      滚动 trailing ~14 天缓冲（只用当前窗之前的窗）标定：
+        k,b=polyfit(btc_move,up_move)、位移门=p50(|btc_move|)、欠反应门=p80(under)，
+        under=−sign(btc_move)·(up_move−(k·btc_move+b))（>0=欠反应/粘滞）；
+      signal=|btc_move|≥位移门 ∩ under≥欠反应门 → follow 双向（btc涨押UP/跌押DOWN）。
+      双 variant：TD=120（absorption_follow_td120_v1）/ TD=150（absorption_follow_td150_v1），
+      各维护独立缓冲+独立标定。Δvol/Δpar 为 soft 记录维度（不作门，供前向分层分析）。
+      命门已关（真实价复核）：裸 pct−真实价乐观偏差 ±0.001，RECENT TD150 real EV +0.105
+      CI[+0.050,+0.165]✓；边缘温和（非小样本高估的 +0.16~0.37）。
+    归档后处理（同 quote_edge_detector）：窗已结算 → 直接落 SETTLED，无 PENDING 阶段。
+    只记录不下注，物理隔离于下单路径（本表不被任何下单代码引用，不进 X4_VERSIONS/LIVE_CHANNELS）。
+    """
+    __tablename__ = "absorption_shadow_signals"
+    __table_args__ = (
+        UniqueConstraint("version", "window_start", name="uq_abs_version_window"),
+        Index("ix_abs_status", "status"),
+        Index("ix_abs_window_start", "window_start"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    version: Mapped[str] = mapped_column(
+        String(32), nullable=False,
+        comment="信号口径版本：absorption_follow_td120_v1 / absorption_follow_td150_v1",
+    )
+    window_start: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, comment="触发窗（5m 情绪窗）start_time（ms）"
+    )
+    window_end: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, comment="触发窗 end_time（ms）"
+    )
+    td: Mapped[int] = mapped_column(
+        Integer, nullable=False, comment="判定时点（窗开后秒）：120 / 150"
+    )
+    direction: Mapped[str] = mapped_column(
+        String(4), nullable=False, comment="follow 押注方向：btc涨→UP / btc跌→DOWN"
+    )
+    # ---- 滚动标定快照（trailing ~14 天，严格 ex-ante；审计口径保真）----
+    k: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="标定弹性 k（pp/bp）：up_move ≈ k·btc_move + b"
+    )
+    b: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="标定截距 b（pp）"
+    )
+    disp_gate: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="位移门 = 标定缓冲 p50(|btc_move|)（bp）"
+    )
+    under_gate: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="欠反应门 = 标定缓冲 p80(under)（pp，过位移门子集）"
+    )
+    calib_n: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment="标定缓冲样本窗数（trailing ~14 天，ex-ante）"
+    )
+    # ---- 特征快照（TD 时刻，real 基）----
+    btc_move_bp: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="BTC 位移 (btc@TD−open)/open×1e4（bp）"
+    )
+    up_move_pp: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="UP 真实价位移 (up_price@TD−open)×100（pp）"
+    )
+    resid_pp: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="残差 resid = up_move − (k·btc_move + b)（pp）"
+    )
+    under_pp: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="欠反应 under = −sign(btc_move)·resid（pp，≥under_gate 触发）"
+    )
+    dvol: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="Δtrade_volume（@TD−open，soft 记录维度，不作门）"
+    )
+    dpar: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="Δparticipants（@TD−open，soft 记录维度，不作门）"
+    )
+    # ---- 入场报价（TD 时刻真实 token 价，与 quote_edge 同口径）----
+    entry_up_price: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="TD 时刻 UP token 真实价（押 UP 的入场价）"
+    )
+    entry_down_price: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="TD 时刻 DOWN token 真实价（押 DOWN 的入场价）"
+    )
+    entry_quote_ts: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, comment="入场报价采样时刻（ms，≤TD 最晚点）"
+    )
+    entry_quote_kind: Mapped[str | None] = mapped_column(
+        String(8), nullable=True, comment="报价来源：real（token 价）/ NULL（缺失不落表）"
+    )
+    # ---- 结算（归档后处理，窗已结算）----
+    settle_outcome: Mapped[str | None] = mapped_column(
+        String(10), nullable=True, comment="触发窗结算方向 UP | DOWN"
+    )
+    win: Mapped[bool | None] = mapped_column(
+        Boolean, nullable=True, comment="follow 命中 = 窗 outcome == direction"
+    )
+    ev_at_entry: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="单注 EV（真实价口径）：赢 0.98/q−1 / 输 −1（费 2% 无溢价）"
+    )
+    status: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="SETTLED", server_default="SETTLED",
+        comment="SETTLED（归档后处理落表即结算，无 PENDING 阶段）",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+# ============================================================
 # 模式回测快照表（每个模式每次回测的完整记录，支撑无限进化与前后对比）
 # ============================================================
 

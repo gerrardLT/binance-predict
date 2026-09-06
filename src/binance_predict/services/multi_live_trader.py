@@ -1,6 +1,6 @@
 """多通道实盘执行器（MultiLiveTrader，2026-08-24 取代单版本 QuoteEdgeLiveTrader）。
 
-15 通道（通道注册表见 live_channels.py）可同时开启，每通道独立
+7 通道（通道注册表见 live_channels.py；2026-09-04 退役 8 通道后）可同时开启，每通道独立
 金额/日限/护栏/开关；通道 ID 与影子信号版本名对齐（订单 signal_version
 直接用通道名，实盘 vs 影子对账天然一致）。三族触发机制并存：
 
@@ -76,7 +76,9 @@ from .quote_edge_detector import (
     _prev_window_outcome,
 )
 
-X4_VERSIONS = ("x4_v1", "x4_v2")
+# x4 轮询只拉在线通道的版本（x4_v1 已于 2026-09-04 退役，不在 _specs 里；
+# 若仍拉它的 PENDING 行，_fire_x4 会因找不到 spec 而白跑一趟）。
+X4_VERSIONS = ("x4_v2",)
 SIGNAL_BACKFILL_DELAY_MS = 180_000  # 窗口结束后 180s 回读影子信号（归档+结算已就绪）
 HEAL_INTERVAL_S = 300.0             # signal_id 自愈扫描间隔（重启/延迟不丢对账）
 X4_POLL_INTERVAL_S = 30.0           # x4 PENDING 信号轮询间隔
@@ -527,6 +529,11 @@ class MultiLiveTrader:
         decision_ms = target_start + int(DECISION_T_SEC * 1000)
         if self._stopped or now_ms > decision_ms + X4_DECISION_TOLERANCE_MS:
             return  # 停机/睡过头（GC 卡顿）：不追
+        # 防御：退役/未装配的版本不在此查表里（X4_VERSIONS 已收敛，但 DB 里可能
+        # 还有历史 PENDING 行）——跳过而非 KeyError 让任务异常告警刷日志。
+        if version not in self._configs or version not in self._specs:
+            logger.warning("多通道实盘：x4 版本 {} 不在通道注册表（已退役？），跳过", version)
+            return
         cfg = self._configs[version]
         if not cfg.enabled:
             return

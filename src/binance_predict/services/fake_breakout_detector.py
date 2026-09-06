@@ -336,6 +336,9 @@ class FakeBreakoutDetector:
         # S5 深档实盘钩子（main 装配注入 on_s5_deep_signal）：z5≤−20bp 子集
         # 通知执行器；影子落表独立于本钩子（物理隔离不变）
         self._on_s5_deep_fired: Callable[[dict], None] | None = None
+        # S2 条件单影子钩子（main 装配注入 S2CondShadowDetector.on_s2_signal）：
+        # 实盘 bear_exhaust 派生窗内 t=4/t=5 条件确认影子（只记录不下注，物理隔离）
+        self._on_s2_cond: Callable[[dict], None] | None = None
 
         self._running = False
         self._task: asyncio.Task | None = None
@@ -812,6 +815,12 @@ class FakeBreakoutDetector:
                 name=f"fbs_s5_{signal.id}",
             )
 
+        # S2 条件单影子（2026-09-06）：仅正式 bear_exhaust 信号派生——窗内 t=4/t=5
+        # 判价条件确认 → 押次周期 UP，落 kline_shadow_signals（纯影子，物理隔离于下单
+        # 路径；从每个实盘 bear_exhaust 派生以最大化前向样本，不受 scene 通道门禁）
+        if not shadow and pattern_type == "bear_exhaust":
+            self._notify_s2_cond(signal.id, next_start, next_end)
+
         direction = "DOWN" if side == "high" else "UP"
         scene_channel = scene_pattern_to_channel(pattern_type)
         email_blocked = (  # 结算是否推邮件的预判（推送已挪到结算回读后）
@@ -880,6 +889,28 @@ class FakeBreakoutDetector:
         except Exception as exc:
             logger.warning("S5 深档实盘钩子异常（不影响检测循环）| #{} | {}",
                            signal.id, exc)
+
+    def _notify_s2_cond(self, signal_id: int, next_start: int, next_end: int) -> None:
+        """S2 条件单影子钩子（同步接口，fire-and-forget）：实盘 bear_exhaust 派生影子。
+
+        payload：{id, pattern_type:"bear_exhaust", market_start_15m, market_end_15m}
+        （id = 父 S2 信号 id，影子行 feature_snapshot.parent_id 溯源；market_start_15m =
+        目标次周期起点 = 入场&结算窗）。回调 S2CondShadowDetector.on_s2_signal（内部按
+        next_start 去重后 spawn 延迟确认任务）。异常只告警不抛（与 _notify_signal_fired
+        同契约，绝不阻塞检测循环）；影子落表独立于下单路径（物理隔离不变）。
+        """
+        if self._on_s2_cond is None:
+            return
+        try:
+            self._on_s2_cond({
+                "id": signal_id,
+                "pattern_type": "bear_exhaust",
+                "market_start_15m": next_start,
+                "market_end_15m": next_end,
+            })
+        except Exception as exc:
+            logger.warning("S2 条件单影子钩子异常（不影响检测循环）| #{} | {}",
+                           signal_id, exc)
 
     async def _send_signal_email_bg(self, signal_id: int) -> None:
         """后台邮件发送：重新查库拿完整信号，发送成功后回填 email_sent。

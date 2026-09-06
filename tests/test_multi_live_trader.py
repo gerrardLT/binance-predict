@@ -28,19 +28,33 @@ from unittest.mock import MagicMock
 import pytest
 from sqlalchemy import Select, Update
 
+import binance_predict.services.live_channels as lc
 import binance_predict.services.multi_live_trader as milt
+import binance_predict.services.prediction_trading as pt
 import binance_predict.services.trade_settler as ts_mod
 from binance_predict.config.settings import settings
 from binance_predict.db.models import FakeBreakoutSignal, TradeOrderModel
 from binance_predict.services.live_channels import (
     LIVE_CHANNELS,
+    RETIRED_CHANNEL_SPECS,
+    RETIRED_CHANNELS,
+    RETIRED_SAME_WINDOW_EXCLUSIVE,
     ChannelConfig,
     parse_channel_config,
     resolve_max_exec,
     scene_pattern_to_channel,
 )
 from binance_predict.services.multi_live_trader import MultiLiveTrader
-from binance_predict.services.prediction_trading import BinancePredictionTrader
+from binance_predict.services.prediction_trading import (
+    CONFIRM_ATTEMPTS,
+    CONFIRM_DELAY_S,
+    CONFIRM_DEEP_ATTEMPTS,
+    CONFIRM_DEEP_DELAY_S,
+    LOW_BALANCE_ALERT_USDT,
+    RETRYABLE_ORDER_STATUSES,
+    TERMINAL_ORDER_STATUSES,
+    BinancePredictionTrader,
+)
 from binance_predict.services.quote_edge_detector import (
     QUOTE_EDGE_RULES,
     REGIME_GUARDS,
@@ -81,10 +95,28 @@ class _FakeTrader:
         return self.result
 
 
+def _with_retired(monkeypatch):
+    """把已退役通道 spec 注回注册表（机制类用例的 fixture 源）。
+
+    2026-09-04 退役 8 通道后 LIVE_CHANNELS 只剩 7 个在线通道，quote_edge 族
+    仅存 quote_contrarian_v2 一个——「多通道同窗独立开火」/「v2 门禁双模式」/
+    「v3 环境门禁」/「regime」/「streak」/「同窗互斥」这些机制无法只用在线
+    通道构造。机制代码仍在生产（由 ChannelSpec 标志位驱动，未来新通道可再启用），
+    故用退役 spec 当 fixture 继续覆盖；生产注册表本身保持 7 通道不变。
+    """
+    merged = {**RETIRED_CHANNEL_SPECS, **LIVE_CHANNELS}
+    monkeypatch.setattr(lc, "LIVE_CHANNELS", merged)
+    monkeypatch.setattr(milt, "LIVE_CHANNELS", merged)
+    monkeypatch.setattr(lc, "SAME_WINDOW_EXCLUSIVE",
+                        lc.SAME_WINDOW_EXCLUSIVE + RETIRED_SAME_WINDOW_EXCLUSIVE)
+    return merged
+
+
 def _make_trader(monkeypatch, trader: _FakeTrader,
                  channels: list[str] | None = None,
                  overrides: dict | None = None) -> MultiLiveTrader:
     """构造执行器：live_channels_json 启用指定通道；DB 访问全部置空。"""
+    _with_retired(monkeypatch)
     monkeypatch.setattr(settings, "live_default_amount_usdt", 2.0)
     monkeypatch.setattr(settings, "live_default_max_daily_orders", 100)
     monkeypatch.setattr(settings, "live_channels_json", "")
@@ -148,12 +180,12 @@ def _stub_select_db(monkeypatch, rows: list) -> None:
 # ============================================================
 
 def test_parse_defaults_all_off(monkeypatch) -> None:
-    """默认：全 15 通道 OFF、金额/日限取全局默认（用户拍板 2U / 100 单）。"""
+    """默认：全 7 在线通道 OFF、金额/日限取全局默认（用户拍板 2U / 100 单）。"""
     monkeypatch.setattr(settings, "live_default_amount_usdt", 2.0)
     monkeypatch.setattr(settings, "live_default_max_daily_orders", 100)
     monkeypatch.setattr(settings, "live_channels_json", "")
     cfgs = parse_channel_config()
-    assert len(cfgs) == 15
+    assert len(cfgs) == 7
     assert all(not c.enabled for c in cfgs.values())
     assert all(c.amount_usdt == 2.0 for c in cfgs.values())
     assert all(c.max_daily_orders == 100 for c in cfgs.values())
@@ -163,16 +195,16 @@ def test_parse_defaults_all_off(monkeypatch) -> None:
 def test_parse_overrides_applied(monkeypatch) -> None:
     """JSON 覆盖：enabled/金额/日限/护栏逐通道生效，未提及通道保持默认。"""
     monkeypatch.setattr(settings, "live_channels_json", json.dumps({
-        "x4_v1": {"enabled": True, "amount_usdt": 1.0,
+        "x4_v2": {"enabled": True, "amount_usdt": 1.0,
                   "max_daily_orders": 50, "max_exec_price": 0.48},
-        "quote_contrarian_v1": {"enabled": True},
+        "quote_contrarian_v2": {"enabled": True},
     }))
     cfgs = parse_channel_config()
-    x4 = cfgs["x4_v1"]
+    x4 = cfgs["x4_v2"]
     assert x4.enabled and x4.amount_usdt == 1.0
     assert x4.max_daily_orders == 50 and x4.max_exec_price == 0.48
-    assert cfgs["quote_contrarian_v1"].enabled is True
-    assert cfgs["quote_momentum_v1"].enabled is False   # 未提及通道不受影响
+    assert cfgs["quote_contrarian_v2"].enabled is True
+    assert cfgs["scene_bull_exhaust"].enabled is False   # 未提及通道不受影响
 
 
 def test_parse_unknown_channel_rejected(monkeypatch) -> None:
@@ -182,24 +214,42 @@ def test_parse_unknown_channel_rejected(monkeypatch) -> None:
         parse_channel_config()
 
 
+def test_parse_retired_channel_skipped_not_raise(monkeypatch) -> None:
+    """退役通道在 LIVE_CHANNELS_JSON 里残留 → 告警跳过，不 raise（部署阻断防护）。
+
+    若这里 raise，main 装配只捕 ValueError 后会把 multi_live_trader 置 None，
+    整个实盘（含 7 个保留通道）静默全停——生产 env JSON 内容不可见，退役前
+    必须先排掉这个雷。未知拼写错误仍必须 raise（不丢防护）。
+    """
+    monkeypatch.setattr(settings, "live_channels_json", json.dumps({
+        "x4_v1": {"enabled": True, "amount_usdt": 5.0},   # 退役：忽略
+        "quote_momentum_v3": {"enabled": True},           # 退役：忽略
+        "x4_v2": {"enabled": True, "amount_usdt": 3.0},   # 在线：正常生效
+    }))
+    cfgs = parse_channel_config()
+    assert set(cfgs) == set(LIVE_CHANNELS)          # 退役通道不入配置表
+    assert "x4_v1" not in cfgs and "quote_momentum_v3" not in cfgs
+    assert cfgs["x4_v2"].enabled is True and cfgs["x4_v2"].amount_usdt == 3.0
+
+
 def test_parse_amount_over_cap_rejected(monkeypatch) -> None:
     """金额超 50 硬上限 → 拒启（配置误写不靠自律）。"""
     monkeypatch.setattr(settings, "live_channels_json",
-                        json.dumps({"x4_v1": {"amount_usdt": 51.0}}))
+                        json.dumps({"x4_v2": {"amount_usdt": 51.0}}))
     with pytest.raises(ValueError, match="超界"):
         parse_channel_config()
 
 
 def test_parse_daily_over_cap_rejected(monkeypatch) -> None:
     monkeypatch.setattr(settings, "live_channels_json",
-                        json.dumps({"x4_v1": {"max_daily_orders": 501}}))
+                        json.dumps({"x4_v2": {"max_daily_orders": 501}}))
     with pytest.raises(ValueError, match="日限"):
         parse_channel_config()
 
 
 def test_parse_bad_exec_price_rejected(monkeypatch) -> None:
     monkeypatch.setattr(settings, "live_channels_json",
-                        json.dumps({"x4_v1": {"max_exec_price": 1.5}}))
+                        json.dumps({"x4_v2": {"max_exec_price": 1.5}}))
     with pytest.raises(ValueError, match="护栏"):
         parse_channel_config()
 
@@ -214,7 +264,7 @@ def test_parse_null_amount_rejected(monkeypatch) -> None:
     """amount_usdt=null → 归一为 ValueError（若放 TypeError 穿透 lifespan
     会拖垮整个服务启动，违背“非法配置拒启但不拒服务”契约）。"""
     monkeypatch.setattr(settings, "live_channels_json",
-                        json.dumps({"x4_v1": {"amount_usdt": None}}))
+                        json.dumps({"x4_v2": {"amount_usdt": None}}))
     with pytest.raises(ValueError, match="amount_usdt 非法"):
         parse_channel_config()
 
@@ -222,39 +272,33 @@ def test_parse_null_amount_rejected(monkeypatch) -> None:
 def test_parse_non_int_daily_rejected(monkeypatch) -> None:
     """max_daily_orders 非整数（2.5）→ ValueError（防 int() 静默截断成 2）。"""
     monkeypatch.setattr(settings, "live_channels_json",
-                        json.dumps({"x4_v1": {"max_daily_orders": 2.5}}))
+                        json.dumps({"x4_v2": {"max_daily_orders": 2.5}}))
     with pytest.raises(ValueError, match="需为整数"):
         parse_channel_config()
 
 
 def test_channels_registry_shape() -> None:
-    """注册表形状：15 通道全集、市场周期/方向/护栏与计划表逐项对齐。"""
+    """注册表形状（2026-09-04 退役 8 通道后）：7 在线 + 8 退役，两者不交。"""
     assert set(LIVE_CHANNELS) == {
-        "quote_momentum_v1", "quote_contrarian_v1",
-        "quote_momentum_v2", "quote_contrarian_v2",
-        "quote_contrarian_v3a", "quote_contrarian_v3b",
-        "quote_contrarian_v4", "quote_momentum_v3",
-        "x4_v1", "x4_v2",
+        "quote_contrarian_v2",
+        "x4_v2",
         "scene_bull_exhaust", "scene_bull_exhaust_confirm",
         "scene_bear_exhaust", "scene_momentum_fade",
         "s5_deep_z20_v1",
     }
-    by = {ch: s for ch, s in LIVE_CHANNELS.items()}
-    assert by["quote_momentum_v1"].market_period == "5m"
-    assert by["quote_momentum_v1"].auto_max_exec == 0.78
-    assert by["quote_contrarian_v1"].auto_max_exec == 0.28
-    assert by["quote_momentum_v2"].v2_guard == "min_drop"
+    assert set(RETIRED_CHANNELS) == {
+        "quote_momentum_v1", "quote_contrarian_v1",
+        "quote_momentum_v2",
+        "quote_contrarian_v3a", "quote_contrarian_v3b",
+        "quote_contrarian_v4", "quote_momentum_v3",
+        "x4_v1",
+    }
+    assert not (set(LIVE_CHANNELS) & set(RETIRED_CHANNELS))
+    by = {**RETIRED_CHANNEL_SPECS, **LIVE_CHANNELS}
+    # 在线通道：市场周期/方向/护栏逐项对齐
+    assert by["quote_contrarian_v2"].market_period == "5m"
     assert by["quote_contrarian_v2"].v2_guard == "max_rise"
-    # v3 环境门禁版：contrarian v1 区间护栏 + v2 价格门禁 + 环境门禁标志
-    for ch in ("quote_contrarian_v3a", "quote_contrarian_v3b"):
-        assert by[ch].family == "quote_edge"
-        assert by[ch].v2_guard == "max_rise"
-        assert by[ch].v3_env is True
-        assert by[ch].auto_max_exec == 0.28
-    assert by["quote_contrarian_v3a"].v3_env is True
-    assert all(not s.v3_env for ch, s in by.items()
-               if ch not in ("quote_contrarian_v3a", "quote_contrarian_v3b"))
-    assert by["x4_v1"].auto_max_exec == 0.45
+    assert by["quote_contrarian_v2"].auto_max_exec == 0.28
     assert by["x4_v2"].auto_max_exec == 0.50
     assert all(by[ch].market_period == "15m" for ch in
                ("scene_bull_exhaust", "scene_bull_exhaust_confirm",
@@ -263,27 +307,37 @@ def test_channels_registry_shape() -> None:
     assert by["scene_bull_exhaust_confirm"].auto_max_exec == 0.75
     assert by["scene_bear_exhaust"].auto_max_exec == 0.65
     assert by["scene_momentum_fade"].auto_max_exec == 0.55
-    # 报价动量 v3 非连涨门禁版：v1 冻结区间护栏 + streak 门禁标志（不叠 v2/v3env/regime）
-    qm3 = by["quote_momentum_v3"]
-    assert qm3.family == "quote_edge" and qm3.streak_gate is True
-    assert qm3.v2_guard is None and qm3.v3_env is False and qm3.regime_gate is False
-    assert qm3.auto_max_exec == 0.78
-    assert all(not s.streak_gate for ch, s in by.items()
-               if ch != "quote_momentum_v3")
     # S5 深档：scene 族 15m 押 DOWN，护栏 0.88（盈亏平衡 0.895 略下方）
     s5d = by["s5_deep_z20_v1"]
     assert s5d.family == "scene" and s5d.market_period == "15m"
     assert s5d.direction == "DOWN" and s5d.auto_max_exec == 0.88
-    # 同窗互斥组：momentum 族三版本一组 / S5 确认与深档一组；其余通道无组
+    # 在线通道一律不带门禁标志（v3_env/regime/streak 仅退役 spec 使用；
+    # 机制代码保留，未来新通道可再启用）
+    assert all(not s.v3_env and not s.regime_gate and not s.streak_gate
+               for s in LIVE_CHANNELS.values())
+    assert all(s.v2_guard in (None, "max_rise") for s in LIVE_CHANNELS.values())
+    # 同窗互斥组：仅剩 S5 确认与深档一组；momentum 组随三成员全退役而移除
     from binance_predict.services.live_channels import exclusive_group
-    g_mom = exclusive_group("quote_momentum_v3")
-    assert g_mom == frozenset(
-        {"quote_momentum_v1", "quote_momentum_v2", "quote_momentum_v3"})
-    assert exclusive_group("quote_momentum_v1") is g_mom
     g_s5 = exclusive_group("s5_deep_z20_v1")
     assert g_s5 == frozenset({"scene_bull_exhaust_confirm", "s5_deep_z20_v1"})
     assert exclusive_group("scene_bull_exhaust") is None
     assert exclusive_group("quote_contrarian_v2") is None
+    assert exclusive_group("quote_momentum_v3") is None   # 退役组不参与生产判定
+    assert RETIRED_SAME_WINDOW_EXCLUSIVE == (
+        frozenset({"quote_momentum_v1", "quote_momentum_v2", "quote_momentum_v3"}),)
+
+
+def test_retired_channel_specs_match_retired_versions() -> None:
+    """两处退役名单必须一致（live_channels.RETIRED_CHANNELS ⊆
+    shadow_version_gate.RETIRED_VERSIONS）：通道退役了影子版本也必须退役，
+    否则出现「影子还在采、实盘不可交易」的半退役态。
+    反向不要求包含：late_night_contrarian_v1 / hm_touch_down_v1/v2 是纯影子
+    版本，本就无实盘通道。
+    """
+    from binance_predict.services.shadow_version_gate import RETIRED_VERSIONS
+    assert RETIRED_CHANNELS <= RETIRED_VERSIONS
+    assert RETIRED_VERSIONS - RETIRED_CHANNELS == {
+        "late_night_contrarian_v1", "hm_touch_down_v1", "hm_touch_down_v2"}
 
 
 def test_scene_pattern_to_channel_mapping() -> None:
@@ -619,8 +673,14 @@ V4_VERSION = "quote_contrarian_v4"
 
 
 def test_v4_channel_registration() -> None:
-    """v4 通道注册完整性：LIVE_CHANNELS/REGIME_GUARDS/QUOTE_EDGE_RULES 三方对齐。"""
-    spec = LIVE_CHANNELS[V4_VERSION]
+    """v4 退役 spec 完整性：RETIRED_CHANNEL_SPECS/REGIME_GUARDS/QUOTE_EDGE_RULES 三方对齐。
+
+    v4 通道已于 2026-09-04 退役（不在 LIVE_CHANNELS），但门禁机制代码与冻结
+    回测口径仍在生产（regime_feed / REGIME_GUARDS / QUOTE_EDGE_RULES 未动），
+    三方对齐关系继续钉住。
+    """
+    assert V4_VERSION in RETIRED_CHANNELS and V4_VERSION not in LIVE_CHANNELS
+    spec = RETIRED_CHANNEL_SPECS[V4_VERSION]
     assert spec.family == "quote_edge" and spec.regime_gate is True
     assert spec.v2_guard is None and spec.v3_env is False   # v4 不叠加 v2/v3 门禁
     base, thr = REGIME_GUARDS[V4_VERSION]
@@ -1380,10 +1440,18 @@ def _make_real_trader(monkeypatch, with_15m: bool = True) -> BinancePredictionTr
     # 默认币安侧终态回查为 FILLED（组 8 各用例聚焦下单分流逻辑；
     # 幽灵成交/待对账路径有独立用例覆盖）。
     # 2026-08-28 confirm_order_status 返回命中历史行 dict（status 取终态）。
-    async def _confirm(_oid, attempts=3, delay=1.0):
+    # 签名与 P0 后的常量对齐（attempts/delay 默认值已放宽）。
+    async def _confirm(_oid, attempts=CONFIRM_ATTEMPTS, delay=CONFIRM_DELAY_S):
         return {"orderId": _oid, "status": "FILLED", "price": "0.55"}
 
     monkeypatch.setattr(trader, "confirm_order_status", _confirm)
+
+    # 余额预检默认放行（P1 新增）。不 stub 会因 _api_key="k" 真去签币安
+    # balance 端点（单测触网红线）；余额不足/低余额告警有组 9 独立用例覆盖。
+    async def _bal(_amount_usdt):
+        return True, 1000.0, ""
+
+    monkeypatch.setattr(trader, "_preflight_balance", _bal)
     return trader
 
 
@@ -2626,3 +2694,426 @@ async def test_exclusive_momentum_v2_blocked_v3_fires(monkeypatch) -> None:
     assert fired == [V3_STREAK]     # v2 门禁数据缺失，同步预检即排除
     await _drain(t)
     assert [c["signal_version"] for c in fake.calls] == [V3_STREAK]
+
+
+# ============================================================
+# 组 9：P0 终态回查竞态（confirm_order_status / _confirm_with_backfill）
+# 生产实证 id=285（2026-09-04 13:00）：币安 createTime→terminalTime 耗时
+# 2.967s，旧轮询窗口 3×1.0s≈2.4s 差 471ms 返回 None → 落 PENDING 且
+# FOK 重试入口因 `confirmed is not None` 短路，一次重试都没跑。
+# ============================================================
+
+def _bare_trader() -> BinancePredictionTrader:
+    """不预置任何桩的 trader（终态回查/余额预检类用例自行按需 stub）。"""
+    t = BinancePredictionTrader()
+    t._api_key = "k"
+    t._api_secret = "s"
+    t._wallet_address = "0xWALLET"
+    t._wallet_id = "WID"
+    return t
+
+
+def test_confirm_terminal_status_set() -> None:
+    """终态集合形状：EXPIRED/CANCELLED 已纳入；可重试集为终态真子集且不含 FILLED。"""
+    assert TERMINAL_ORDER_STATUSES == {"FILLED", "FAILED", "EXPIRED", "CANCELLED"}
+    assert RETRYABLE_ORDER_STATUSES == {"FAILED", "EXPIRED", "CANCELLED"}
+    assert RETRYABLE_ORDER_STATUSES < TERMINAL_ORDER_STATUSES
+
+
+def test_confirm_poll_window_covers_production_latency() -> None:
+    """常量守卫：轮询窗口必须覆盖生产实测 2.967s 终态延迟并留足余量。
+
+    防回退：若将来有人把 attempts/delay 改回旧值（窗口 <2.967s），id=285
+    那类竞态会静默复发（表现为偏尔 PENDING 卡单），此处直接拦下。
+    """
+    regular = (CONFIRM_ATTEMPTS - 1) * CONFIRM_DELAY_S
+    deep = (CONFIRM_DEEP_ATTEMPTS - 1) * CONFIRM_DEEP_DELAY_S
+    assert regular >= 6.0, f"常规轮询窗口 {regular}s 不足（生产 2.967s + 余量）"
+    assert deep >= 6.0, f"深轮询窗口 {deep}s 不足"
+    assert regular + deep >= 12.0          # 两轮兜底总窗口
+
+
+@pytest.mark.asyncio
+async def test_confirm_terminal_includes_expired_cancelled(monkeypatch) -> None:
+    """EXPIRED/CANCELLED 也是终态 → 首轮即命中（旧实现会轮询到超时误报 None）。"""
+    trader = _bare_trader()
+    for st in sorted(TERMINAL_ORDER_STATUSES):
+        async def _hist(limit=20, _st=st):
+            return [{"orderId": "O-1", "status": _st, "price": "0.53"}]
+
+        monkeypatch.setattr(trader, "query_order_history", _hist)
+        row = await trader.confirm_order_status("O-1", attempts=1)
+        assert row is not None and row["status"] == st, f"{st} 应立即判为终态"
+
+
+@pytest.mark.asyncio
+async def test_confirm_non_terminal_keeps_polling(monkeypatch) -> None:
+    """反例：NEW 等非终态不得提前返回（继续轮询到超时 → None，不伪造终态）。"""
+    trader = _bare_trader()
+    polls: list[int] = []
+
+    async def _hist(limit=20):
+        polls.append(limit)
+        return [{"orderId": "O-1", "status": "NEW"}]
+
+    monkeypatch.setattr(trader, "query_order_history", _hist)
+    assert await trader.confirm_order_status("O-1", attempts=3, delay=0.0) is None
+    assert len(polls) == 3                 # 每轮都查，不提前退出
+
+    polls.clear()
+    assert await trader.confirm_order_status(None, attempts=3, delay=0.0) is None
+    assert polls == []                     # orderId 为空 → 不发请求
+
+
+@pytest.mark.asyncio
+async def test_confirm_slow_terminal_caught_by_widened_window(monkeypatch) -> None:
+    """竞态回归：终态在第 4 轮才出现 → 新窗口（5 轮）命中；旧窗口（3 轮）必漏。"""
+    trader = _bare_trader()
+    n = {"i": 0}
+
+    async def _hist(limit=20):
+        n["i"] += 1
+        if n["i"] < 4:                     # 前 3 轮币安侧仍 NEW（旧窗口在此放弃）
+            return [{"orderId": "O-1", "status": "NEW"}]
+        return [{"orderId": "O-1", "status": "FAILED", "price": "0.53"}]
+
+    monkeypatch.setattr(trader, "query_order_history", _hist)
+    row = await trader.confirm_order_status(
+        "O-1", attempts=CONFIRM_ATTEMPTS, delay=0.0)
+    assert row is not None and row["status"] == "FAILED"
+    assert n["i"] == 4
+
+    # 旧口径（3 轮）在同一序列下必然漏 → 证明放宽是必要的，不是无意义加大
+    n["i"] = 0
+    assert await trader.confirm_order_status("O-1", attempts=3, delay=0.0) is None
+
+
+@pytest.mark.asyncio
+async def test_confirm_with_backfill_falls_back_to_deep_poll(monkeypatch) -> None:
+    """常规轮询未命中 → 自动转深轮询（参数用 DEEP 常量）兜底命中。"""
+    trader = _bare_trader()
+    seen: list[tuple[int, float]] = []
+    calls = {"i": 0}
+
+    async def _confirm(oid, attempts=CONFIRM_ATTEMPTS, delay=CONFIRM_DELAY_S):
+        seen.append((attempts, delay))
+        calls["i"] += 1
+        return None if calls["i"] == 1 else {"orderId": oid, "status": "FAILED"}
+
+    monkeypatch.setattr(trader, "confirm_order_status", _confirm)
+    row = await trader._confirm_with_backfill("O-9")
+    assert row["status"] == "FAILED"
+    assert seen == [(CONFIRM_ATTEMPTS, CONFIRM_DELAY_S),
+                    (CONFIRM_DEEP_ATTEMPTS, CONFIRM_DEEP_DELAY_S)]
+
+
+@pytest.mark.asyncio
+async def test_confirm_with_backfill_short_circuits_on_hit(monkeypatch) -> None:
+    """常规轮询已命中 → 不进深轮询（不白多等 ≈6s 拖慢下单回路）。"""
+    trader = _bare_trader()
+    seen: list[tuple[int, float]] = []
+
+    async def _confirm(oid, attempts=CONFIRM_ATTEMPTS, delay=CONFIRM_DELAY_S):
+        seen.append((attempts, delay))
+        return {"orderId": oid, "status": "FILLED"}
+
+    monkeypatch.setattr(trader, "confirm_order_status", _confirm)
+    assert (await trader._confirm_with_backfill("O-9"))["status"] == "FILLED"
+    assert seen == [(CONFIRM_ATTEMPTS, CONFIRM_DELAY_S)]
+
+
+@pytest.mark.asyncio
+async def test_confirm_with_backfill_two_rounds_none(monkeypatch) -> None:
+    """两轮都未命中 → None（调用方落 PENDING 交对账，不伪造成交）。"""
+    trader = _bare_trader()
+    calls: list[int] = []
+
+    async def _confirm(oid, attempts=CONFIRM_ATTEMPTS, delay=CONFIRM_DELAY_S):
+        calls.append(attempts)
+        return None
+
+    monkeypatch.setattr(trader, "confirm_order_status", _confirm)
+    assert await trader._confirm_with_backfill("O-9") is None
+    assert calls == [CONFIRM_ATTEMPTS, CONFIRM_DEEP_ATTEMPTS]
+
+
+def _exec_stubs(monkeypatch, trader, updates: list, *,
+                quote=None, place=None, confirm=None, balance=None,
+                quote_calls: list | None = None,
+                place_calls: list | None = None) -> None:
+    """execute_signal_trade 公用桩（组 9/10 共用）：占位/更新/报价/下单/回查/预检。"""
+    async def _reserve(_v, _ws, direction=None, market_period="5m",
+                       scene_signal_id=None):
+        return _pending_order()
+
+    async def _update(order, status, **kwargs):
+        updates.append((status, kwargs))
+        return {**order, "status": status, **kwargs}
+
+    async def _quote(_token, _side, amount_usdt=None):
+        if quote_calls is not None:
+            quote_calls.append(amount_usdt)
+        return ({"averagePrice": 0.55, "amountIn": "5", "amountOut": "9",
+                 "quoteId": "Q1"} if quote is None else
+                (quote.pop(0) if isinstance(quote, list) else quote))
+
+    async def _place(_q, slippage_bps=1200):
+        if place_calls is not None:
+            place_calls.append((_q.get("quoteId"), slippage_bps))
+        return {"orderId": "ORD-1"} if place is None else (
+            place.pop(0) if isinstance(place, list) else place)
+
+    async def _confirm(_oid, attempts=CONFIRM_ATTEMPTS, delay=CONFIRM_DELAY_S):
+        return {"orderId": _oid, "status": "FILLED", "price": "0.55"} if confirm is None \
+            else (confirm.pop(0) if isinstance(confirm, list) else confirm)
+
+    async def _bal(_amount_usdt):
+        return (True, 1000.0, "") if balance is None else balance
+
+    monkeypatch.setattr(trader, "_reserve_order_slot", _reserve)
+    monkeypatch.setattr(trader, "_update_signal_order", _update)
+    monkeypatch.setattr(trader, "get_quote", _quote)
+    monkeypatch.setattr(trader, "place_order", _place)
+    monkeypatch.setattr(trader, "confirm_order_status", _confirm)
+    monkeypatch.setattr(trader, "_preflight_balance", _bal)
+
+
+@pytest.mark.asyncio
+async def test_signal_trade_expired_terminal_enters_retry_path(monkeypatch) -> None:
+    """P0：EXPIRED 纳入可重试终态 → 走 FOK 重试（与 FAILED 同路径）；
+    仍 EXPIRED 则 FAILED 并在归因文案里点名真实终态（不再笼统写 FAILED）。"""
+    trader = _make_real_trader(monkeypatch)
+    updates: list[tuple] = []
+    place_calls: list[tuple] = []
+    _exec_stubs(monkeypatch, trader, updates, place_calls=place_calls,
+                confirm={"orderId": "ORD-1", "status": "EXPIRED"})
+
+    order = await trader.execute_signal_trade(
+        "DOWN", 5.0, "quote_contrarian_v2", WINDOW_START, max_exec_price=0.78)
+    assert order["status"] == "FAILED"
+    assert len(place_calls) == 3            # 首次 + 2 次重试
+    msg = updates[0][1]["error_message"]
+    assert "EXPIRED" in msg and "已重试 2 次" in msg
+
+
+@pytest.mark.asyncio
+async def test_signal_trade_cancelled_terminal_enters_retry_path(monkeypatch) -> None:
+    """P0：CANCELLED 同样纳入可重试终态（边界：三个非 FILLED 终态行为一致）。"""
+    trader = _make_real_trader(monkeypatch)
+    updates: list[tuple] = []
+    place_calls: list[tuple] = []
+    _exec_stubs(monkeypatch, trader, updates, place_calls=place_calls,
+                confirm={"orderId": "ORD-1", "status": "CANCELLED"})
+
+    order = await trader.execute_signal_trade(
+        "DOWN", 5.0, "quote_contrarian_v2", WINDOW_START, max_exec_price=0.78)
+    assert order["status"] == "FAILED"
+    assert len(place_calls) == 3
+    assert "CANCELLED" in updates[0][1]["error_message"]
+
+
+@pytest.mark.asyncio
+async def test_signal_trade_deep_poll_recovers_retry_path(monkeypatch) -> None:
+    """P0 端到端：常规轮询未命中（币安慢终态）→ 深轮询兜底拿到 FAILED →
+    FOK 重试路径恢复执行（旧实现此处直接落 PENDING，13 分钟后才被对账订正）。"""
+    trader = _make_real_trader(monkeypatch)
+    updates: list[tuple] = []
+    place_calls: list[tuple] = []
+    rounds = {"i": 0}
+
+    async def _confirm(oid, attempts=CONFIRM_ATTEMPTS, delay=CONFIRM_DELAY_S):
+        rounds["i"] += 1
+        # 第 1 轮（首次单常规）未命中；第 2 轮（首次单深轮询）拿到 FAILED；
+        # 重试单两轮均 FILLED。
+        if rounds["i"] == 1:
+            return None
+        if rounds["i"] == 2:
+            assert (attempts, delay) == (CONFIRM_DEEP_ATTEMPTS, CONFIRM_DEEP_DELAY_S)
+            return {"orderId": oid, "status": "FAILED"}
+        return {"orderId": oid, "status": "FILLED", "price": "0.55"}
+
+    _exec_stubs(monkeypatch, trader, updates, place_calls=place_calls,
+                place=[{"orderId": "ORD-SLOW"}, {"orderId": "ORD-RETRY"}])
+    monkeypatch.setattr(trader, "confirm_order_status", _confirm)
+
+    order = await trader.execute_signal_trade(
+        "DOWN", 5.0, "quote_contrarian_v2", WINDOW_START, max_exec_price=0.78)
+    assert order["status"] == "FILLED"
+    assert order["order_id"] == "ORD-RETRY"      # 落库为重试单
+    assert len(place_calls) == 2                 # 重试路径确实被执行
+
+
+@pytest.mark.asyncio
+async def test_signal_trade_unconfirmed_never_retries(monkeypatch) -> None:
+    """两轮回查都 None → 落 PENDING 且绝不重试：终态未知时重复下单可能双花，
+    必须交对账判定（深轮询只降低 None 概率，不改变 None 的保守语义）。"""
+    trader = _make_real_trader(monkeypatch)
+    updates: list[tuple] = []
+    place_calls: list[tuple] = []
+    quote_calls: list[float] = []
+    _exec_stubs(monkeypatch, trader, updates, place_calls=place_calls,
+                quote_calls=quote_calls, confirm=None)
+
+    async def _confirm_none(_oid, attempts=CONFIRM_ATTEMPTS, delay=CONFIRM_DELAY_S):
+        return None
+
+    monkeypatch.setattr(trader, "confirm_order_status", _confirm_none)
+
+    order = await trader.execute_signal_trade(
+        "DOWN", 5.0, "quote_contrarian_v2", WINDOW_START, max_exec_price=0.78)
+    assert order["status"] == "PENDING"
+    assert len(place_calls) == 1 and len(quote_calls) == 1
+
+
+# ============================================================
+# 组 10：P1 资金安全（下单前余额预检 + 低余额告警 + 错误分类）
+# 背景：用户在币安 App 手工下单把 CeDeFi 可用余额打穿（账户总资产看着够），
+# 币安要到报价阶段才回 -9000，文案泛化难归因（2026-09-04 12:45 生产实证）。
+# ============================================================
+
+class _FakeLogger:
+    """loguru 替身：只记录 error/warning 文案（低余额告警断言用）。"""
+
+    def __init__(self) -> None:
+        self.errors: list[str] = []
+        self.warnings: list[str] = []
+
+    def _fmt(self, msg, args) -> str:
+        try:
+            return msg.format(*args) if args else str(msg)
+        except (IndexError, KeyError):
+            return str(msg)
+
+    def error(self, msg, *a) -> None:
+        self.errors.append(self._fmt(msg, a))
+
+    def warning(self, msg, *a) -> None:
+        self.warnings.append(self._fmt(msg, a))
+
+    def info(self, msg, *a) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_preflight_balance_insufficient_blocks(monkeypatch) -> None:
+    """可用余额 < 下单额 → 拒单 + 可归因文案（未提交币安，防 -9000 废单）。"""
+    trader = _bare_trader()
+
+    async def _bal(wallet=None):
+        return {"usdt_free": "1.2345"}
+
+    monkeypatch.setattr(trader, "fetch_prediction_wallet_balance", _bal)
+    ok, free, why = await trader._preflight_balance(2.0)
+    assert ok is False and free == 1.2345
+    assert "余额不足" in why and "1.2345" in why and "-9000" in why
+
+    # 贴线边界：可用 == 下单额 → 放行（只拦「不够」，不预留缓冲：
+    # 硬性预留会在余额刚好够时白停实盘，用户选定的防护档位是预检+告警）
+    async def _bal_exact(wallet=None):
+        return {"usdt_free": 2.0}
+
+    monkeypatch.setattr(trader, "fetch_prediction_wallet_balance", _bal_exact)
+    assert await trader._preflight_balance(2.0) == (True, 2.0, "")
+
+
+@pytest.mark.asyncio
+async def test_preflight_balance_low_alert_still_places(monkeypatch) -> None:
+    """余额够本单但低于告警线 → 放行 + ERROR 告警（提前发现资金被抽走）。"""
+    trader = _bare_trader()
+    log = _FakeLogger()
+    monkeypatch.setattr(pt, "logger", log)
+
+    async def _bal(wallet=None):
+        return {"usdt_free": LOW_BALANCE_ALERT_USDT - 0.5}
+
+    monkeypatch.setattr(trader, "fetch_prediction_wallet_balance", _bal)
+    ok, free, why = await trader._preflight_balance(2.0)
+    assert ok is True and why == ""
+    assert free == LOW_BALANCE_ALERT_USDT - 0.5
+    assert any("低余额告警" in e for e in log.errors), log.errors
+
+    # 反例：余额高于告警线 → 不告警（否则每单刷 ERROR，告警失效）
+    log.errors.clear()
+
+    async def _bal_hi(wallet=None):
+        return {"usdt_free": LOW_BALANCE_ALERT_USDT + 1}
+
+    monkeypatch.setattr(trader, "fetch_prediction_wallet_balance", _bal_hi)
+    assert (await trader._preflight_balance(2.0))[0] is True
+    assert log.errors == []
+
+
+@pytest.mark.asyncio
+async def test_preflight_balance_query_failure_conservative(monkeypatch) -> None:
+    """查询异常 / 字段缺失 / 非数值 → 保守放行（预检是护栏不是闸门：
+    查询通道故障不应停掉实盘，与影子 gate「DB 故障保守全在线」同口径）。"""
+    trader = _bare_trader()
+
+    async def _boom(wallet=None):
+        raise RuntimeError("balance endpoint down")
+
+    async def _empty(wallet=None):
+        return {}
+
+    async def _bad(wallet=None):
+        return {"usdt_free": "not-a-number"}
+
+    for stub in (_boom, _empty, _bad):
+        monkeypatch.setattr(trader, "fetch_prediction_wallet_balance", stub)
+        assert await trader._preflight_balance(2.0) == (True, None, "")
+
+
+@pytest.mark.asyncio
+async def test_signal_trade_balance_precheck_blocks_before_quote(monkeypatch) -> None:
+    """预检不过 → 弃单发生在取报价之前（不产生币安废单，占位行落 FAILED 带归因）。"""
+    trader = _make_real_trader(monkeypatch)
+    updates: list[tuple] = []
+    quote_calls: list[float] = []
+    place_calls: list[tuple] = []
+    _exec_stubs(
+        monkeypatch, trader, updates, quote_calls=quote_calls,
+        place_calls=place_calls,
+        balance=(False, 0.4242,
+                 "预测钱包可用余额不足：0.4242 USDT < 下单额 5.0 USDT"
+                 "（未提交币安，防 -9000 废单）"))
+
+    order = await trader.execute_signal_trade(
+        "DOWN", 5.0, "quote_contrarian_v2", WINDOW_START, max_exec_price=0.78)
+    assert order["status"] == "FAILED"
+    assert quote_calls == [] and place_calls == []   # 未取报价、未下单
+    msg = updates[0][1]["error_message"]
+    assert "余额预检弃单" in msg and "0.4242" in msg
+
+
+@pytest.mark.asyncio
+async def test_signal_trade_quote_error_classifies_insufficient_balance(
+        monkeypatch) -> None:
+    """错误分类：报价阶段币安回 -9000（预检后被并发手工单抽走余额）→
+    归因文案直接点名余额不足，不再只有泛化「获取报价失败」。"""
+    trader = _make_real_trader(monkeypatch)
+    updates: list[tuple] = []
+    _exec_stubs(monkeypatch, trader, updates, quote=None)
+
+    async def _quote_9000(_token, _side, amount_usdt=None):
+        trader.last_api_error = (
+            'HTTP 400: {"code":-9000,"msg":"You don\'t have enough USDT"}')
+        return None
+
+    monkeypatch.setattr(trader, "get_quote", _quote_9000)
+    order = await trader.execute_signal_trade(
+        "DOWN", 5.0, "quote_contrarian_v2", WINDOW_START, max_exec_price=0.78)
+    assert order["status"] == "FAILED"
+    msg = updates[-1][1]["error_message"]
+    assert "余额不足（币安 -9000）" in msg and "获取报价失败" in msg
+
+    # 反例：非余额类错误不加余额前缀（避免误归因把服务端故障当资金问题）
+    async def _quote_500(_token, _side, amount_usdt=None):
+        trader.last_api_error = "HTTP 500: internal error"
+        return None
+
+    monkeypatch.setattr(trader, "get_quote", _quote_500)
+    order2 = await trader.execute_signal_trade(
+        "DOWN", 5.0, "quote_contrarian_v2", WINDOW_START, max_exec_price=0.78)
+    assert order2["status"] == "FAILED"
+    msg2 = updates[-1][1]["error_message"]
+    assert "余额不足" not in msg2 and "HTTP 500" in msg2

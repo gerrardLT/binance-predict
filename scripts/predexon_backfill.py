@@ -62,9 +62,15 @@ def get(path, params, key=None, timeout=40):
         time.sleep(1.05)  # 免费档 1 rps
         N_REQ[0] += 1
         if code == 200:
-            return json.loads(body)
-        if code == 0 or code in (429, 500, 502, 503):
+            try:
+                return json.loads(body)
+            except json.JSONDecodeError:
+                # 高并发下连接被中途重置 → 200 但 body 截断；归入退避重试
+                time.sleep(2 ** (attempt + 1))
+                continue
+        if code == 0 or code in (403, 429, 500, 502, 503):
             # 500=上游冷查失败（重试必中缓存，短退避）；429=限速（指数退避）
+            # 403=高并发下瞬时限流（实测 67/68 key 单独验证均有效，归入退避重试）
             time.sleep(0.5 if code == 500 else 2 ** (attempt + 1))
             continue
         raise RuntimeError(f"HTTP {code}: {body[:200]}")
@@ -154,7 +160,7 @@ def main():
     if not todo:
         print("本批次无可回填市场（全部已完成或范围外）")
         return
-    n_workers = max(1, min(len(KEYS), 16))
+    n_workers = max(1, min(len(KEYS), 48))
     est_min = len(todo) * 1.05 / 60 / n_workers
     print(f"待回填 {len(todo)} 市场（{args.start} ~ {args.end or 'now'}），"
           f"已完成 {len(done)}，{n_workers} key 并发，预计 ~{est_min:.0f} 分钟")
