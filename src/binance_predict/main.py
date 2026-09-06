@@ -3,15 +3,18 @@ BTC 预测市场多通道实盘 + 影子信号系统 - FastAPI 主应用
 
 系统入口文件，负责：
 1. 初始化服务（数据采集、多通道实盘执行器、影子检测器、交易结算）
-2. 管理应用生命周期（lifespan）：装配并启动 MultiLiveTrader（7 通道实盘，
-   2026-09-04 退役 8 通道后；口径源 live_channels.LIVE_CHANNELS）
+2. 管理应用生命周期（lifespan）：装配并启动 MultiLiveTrader（13 通道实盘，
+   2026-09-04 退役 8 通道、2026-09-06 影子 promote 5 通道 + x4_v3 并行注册后；口径源
+   live_channels.LIVE_CHANNELS）
    + 多个影子检测器（KREV/HM/反转/nextbar/combo/X4/报价 edge，只记录不下注）
    + 场景检测器（FakeBreakoutDetector）；AgentScheduler 四阶段闭环仅在
    agent_loop_enabled=True 时启动（2026-08-16 起默认退役）
 3. 注册 API 路由
 
-核心引擎：MultiLiveTrader 多通道实盘执行器（真单），三族触发——quote_edge
-（5m 报价区间命中）/ x4（错位影子 PENDING 轮询）/ scene（假突破钩子）。
+核心引擎：MultiLiveTrader 多通道实盘执行器（真单），六族触发——quote_edge
+（5m 报价区间命中）/ x4（错位影子 PENDING 轮询）/ scene（假突破钩子）/
+s2_cond（窗口内条件价触发）/ nextbar（下一根 bar 确认入场）/
+absorption（UP 报价对 BTC 位移欠反应）。
 情绪窗口归档器持续运行，作为场景信号的 4h 位势数据源。概率动量分析
 （MomentumService）为手动接口，不参与自动决策。
 """
@@ -3291,6 +3294,10 @@ SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     "quote_momentum_v1": (0.799, 0.097, "顺势: 深折价方向同窗押注"),
     "quote_contrarian_v1": (0.240, 0.155, "逆势: 赔率型，胜率低赔率高"),
     "x4_v2": (0.553, 0.211, "错位v2: v1+|past1h|<0.5%平静市（真实回测 n=94 胜率55.3%，盲验段30笔66.7%）"),
+    # x4_v3 基准为 report6 C3 保留段（白名单[0,0.2)∪[0.3,0.4)+past4h/past24h 双趋势门禁，
+    # .pytest_tmp/x4v2_analysis/report6.txt）：只钉胜率；bench EV 留 None（回测 ev+1.629
+    # 属研究口径 n=40 CI 宽，影子 EV 由真实报价前向现算）
+    "x4_v3": (0.425, None, "错位v3: v2+双趋势门禁(4h急跌/24h过热拦)+下单层入场价白名单[0,0.2)∪[0.3,0.4)（report6 C3保留段 n=40 胜率42.5%；与 v2 同窗并行对比，实盘默认 OFF）"),
     "quote_momentum_v2": (0.750, 0.019, "顺势v2: v1+触发时已跌≥0.10%（真实回测 n=24 胜率75.0%，小样本CI宽）"),
     "quote_contrarian_v2": (0.258, 0.235, "逆势v2: v1+触发时未涨≥0.10%（真实回测 n=155 胜率25.8%）"),
     "quote_contrarian_v3a": (0.318, 0.528, "逆势v3a: v2+前窗DOWN交替环境（真实回测 n=85 胜率31.8%）"),
@@ -3526,6 +3533,7 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
     versions = [
         "x4_v1", "quote_momentum_v1", "quote_contrarian_v1",
         "x4_v2", "quote_momentum_v2", "quote_contrarian_v2",  # v2 门禁版（部署即入面板）
+        "x4_v3",  # 错位v3 趋势过滤版（v2+双趋势门禁+入场价白名单，2026-09-06，实盘默认 OFF 可 toggle）
         "quote_contrarian_v3a", "quote_contrarian_v3b",  # v3 环境门禁版（可选实盘通道，默认 OFF）
         "quote_contrarian_v4",  # v4 regime 门禁版（下跌周期，默认 OFF）
         "late_night_contrarian_v1",  # 深夜时段变体（纯影子，2026-08-26）
@@ -3542,7 +3550,7 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
         "s2_cond_t4_v1", "s2_cond_t5d_v1",  # S2 条件单族（纯影子，2026-09-06：实盘 bear_exhaust 派生窗内 t=4/t=5 判价→押 UP，共表 kline_shadow_signals version 隔离）
     ]
     versions += sorted({s.version for s in sh_rows} - set(versions))
-    # 影子版本 → 实盘通道状态（version==通道名，2026-09-06 promote 后 12 通道；
+    # 影子版本 → 实盘通道状态（version==通道名，2026-09-06 promote + x4_v3 注册后 13 通道；
     # 一次 status_async 拉全量按 channel 建索引，执行器未装配/查询失败 → 空表兜底）
     live_by_ch: dict[str, dict] = {}
     if multi_live_trader is not None:

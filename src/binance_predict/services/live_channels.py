@@ -19,6 +19,9 @@ S2 真实 UP 报价常在 0.79+（跌态无折扣），护栏 0.55 会保护性�
 2026-09-06 影子 promote 三族（护栏同口径）：s2_cond_t4 38.9%→0.38 / s2_cond_t5d
 44.8%→0.44 / nb_smaslope_5m 47.43%→0.46 / absorption_td120 79.8%→0.78 /
 absorption_td150 88.5%→0.86。
+2026-09-06 x4_v3 趋势过滤版：下单层入场价白名单 [0,0.2)∪[0.3,0.4) 为主护栏
+（超带弃单，研究冻结口径不进运行时覆盖项），0.50 兜底护栏与 x4_v2 相同——
+保持 v2/v3 唯一差异只有拦截规则。
 所有护栏可被 LIVE_CHANNELS_JSON 按通道覆盖。
 """
 from __future__ import annotations
@@ -52,6 +55,10 @@ class ChannelSpec:
     v3_env: bool = False          # quote_edge v3 环境门禁（前窗DOWN [+距日高回落]，异步核验）
     regime_gate: bool = False     # quote_edge v4 regime 门禁（ret24≤阈值，K 线异步核验）
     streak_gate: bool = False     # quote_edge v3 非连涨门禁（末收15m，K 线异步核验）
+    entry_band_whitelist: tuple[tuple[float, float], ...] | None = None
+    # 下单层入场价白名单（x4_v3）：决策点真实成交均价须落在任一 [lo,hi) 区间，
+    # 否则 FAILED 弃单（prediction_trading 报价后检查，含 FOK 重试轮复检）。
+    # None = 不启用（既有通道零影响）；研究冻结口径，不进 parse_channel_config 可覆盖项。
 
 
 def _qe_guard(version: str) -> float:
@@ -70,6 +77,12 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     ),
     # --- x4 族（影子 PENDING → 次窗 +150s 决策点，入场价历史偏低）---
     "x4_v2": ChannelSpec("x4_v2", "x4", "5m", "DOWN", 0.50, "情绪错位·平静市门禁版"),
+    # x4_v3：v2 门禁 + 双趋势门禁（检测层）+ 入场价白名单（下单层，主护栏上界 0.4）；
+    # 0.50 为第二道防线（与 v2 相同，保持 v2/v3 唯一差异只有拦截规则）。实盘默认 OFF。
+    "x4_v3": ChannelSpec(
+        "x4_v3", "x4", "5m", "DOWN", 0.50, "情绪错位·趋势过滤版",
+        entry_band_whitelist=((0.0, 0.2), (0.3, 0.4)),
+    ),
     # --- 场景族（15m 市场次周期开盘入场；S5 为 +5min 确认入场）---
     # S1 护栏 0.70：2026-08-30 盘口数据校准（原 0.60 拍脑袋值）——
     # 41 个已结算信号中入场价 >=0.60 的 8 个胜率 75%（> 放行区间 61%），

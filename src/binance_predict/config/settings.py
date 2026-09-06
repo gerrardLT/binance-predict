@@ -406,7 +406,9 @@ class Settings(BaseSettings):
     s2_cond_shadow_enabled: bool = True
 
     # --- 多通道实盘（MultiLiveTrader，2026-08-24，取代旧单版本 quote_edge 实盘字段）---
-    # 7 通道（quote_edge 族 1：contrarian_v2；x4 × 1：x4_v2；场景 5：S1/S2/S4/S5 + s5_deep）
+    # 13 通道（quote_edge 族 1：contrarian_v2；x4 × 2：x4_v2/x4_v3；
+    # 场景 5：S1/S2/S4/S5 + s5_deep；2026-09-06 影子 promote 5：
+    # s2_cond_t4/t5d、nb_smaslope_5m、absorption_follow_td120/150）
     # 可同时开启；每通道独立金额/日限/护栏，通道静态描述见 services/live_channels.py。
     # 2026-09-04 退役 8 通道（momentum v1/v2/v3、contrarian v1/v3a/v3b/v4、x4_v1），
     # 退役名单 live_channels.RETIRED_CHANNELS：不再装配也不可 toggle 上线，

@@ -98,11 +98,12 @@ class _FakeTrader:
 def _with_retired(monkeypatch):
     """把已退役通道 spec 注回注册表（机制类用例的 fixture 源）。
 
-    2026-09-04 退役 8 通道、2026-09-06 影子 promote 5 通道后 LIVE_CHANNELS 共
-    12 个在线通道，quote_edge 族仅存 quote_contrarian_v2 一个——「多通道同窗
-    独立开火」/「v2 门禁双模式」/「v3 环境门禁」/「regime」/「streak」/「同窗
-    互斥」这些机制无法只用在线通道构造。机制代码仍在生产（由 ChannelSpec 标志
-    位驱动），故用退役 spec 当 fixture 继续覆盖；生产注册表现 12 通道。
+    2026-09-04 退役 8 通道、2026-09-06 影子 promote 5 通道 + x4_v3 并行注册后
+    LIVE_CHANNELS 共 13 个在线通道，quote_edge 族仅存 quote_contrarian_v2 一个
+    ——「多通道同窗独立开火」/「v2 门禁双模式」/「v3 环境门禁」/「regime」/
+    「streak」/「同窗互斥」这些机制无法只用在线通道构造。机制代码仍在生产
+    （由 ChannelSpec 标志位驱动），故用退役 spec 当 fixture 继续覆盖；
+    生产注册表现 13 通道。
     """
     merged = {**RETIRED_CHANNEL_SPECS, **LIVE_CHANNELS}
     monkeypatch.setattr(lc, "LIVE_CHANNELS", merged)
@@ -180,12 +181,12 @@ def _stub_select_db(monkeypatch, rows: list) -> None:
 # ============================================================
 
 def test_parse_defaults_all_off(monkeypatch) -> None:
-    """默认：全 12 在线通道 OFF、金额/日限取全局默认（用户拍板 2U / 100 单）。"""
+    """默认：全 13 在线通道 OFF、金额/日限取全局默认（用户拍板 2U / 100 单）。"""
     monkeypatch.setattr(settings, "live_default_amount_usdt", 2.0)
     monkeypatch.setattr(settings, "live_default_max_daily_orders", 100)
     monkeypatch.setattr(settings, "live_channels_json", "")
     cfgs = parse_channel_config()
-    assert len(cfgs) == 12
+    assert len(cfgs) == 13
     assert all(not c.enabled for c in cfgs.values())
     assert all(c.amount_usdt == 2.0 for c in cfgs.values())
     assert all(c.max_daily_orders == 100 for c in cfgs.values())
@@ -278,10 +279,11 @@ def test_parse_non_int_daily_rejected(monkeypatch) -> None:
 
 
 def test_channels_registry_shape() -> None:
-    """注册表形状（2026-09-06 影子 promote 5 通道后）：12 在线 + 8 退役，两者不交。"""
+    """注册表形状（2026-09-06 x4_v3 并行注册后）：13 在线 + 8 退役，两者不交。"""
     assert set(LIVE_CHANNELS) == {
         "quote_contrarian_v2",
         "x4_v2",
+        "x4_v3",
         "scene_bull_exhaust", "scene_bull_exhaust_confirm",
         "scene_bear_exhaust", "scene_momentum_fade",
         "s5_deep_z20_v1",
@@ -997,6 +999,25 @@ async def test_x4_fill_links_signal_id(monkeypatch) -> None:
     assert link_calls == [("x4_v1", target, 504)]
 
 
+@pytest.mark.asyncio
+async def test_x4_poll_passes_v3_whitelist(monkeypatch) -> None:
+    """x4_v3 PENDING 轮询 → 下单 kwargs 透传入场价白名单（ChannelSpec 声明式）。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["x4_v3"])
+    now_ms = int(time.time() * 1000)
+    target = now_ms - 155_000
+    _stub_select_db(monkeypatch, [(601, "x4_v3", target)])
+
+    await t._x4_poll_once()
+    await _drain(t)
+    assert len(fake.calls) == 1
+    call = fake.calls[0]
+    assert call["signal_version"] == "x4_v3"
+    assert call["entry_band_whitelist"] == ((0.0, 0.2), (0.3, 0.4))
+    assert call["max_exec_price"] == 0.50
+    assert call["market_period"] == "5m"
+
+
 # ============================================================
 # 组 6：场景钩子（fake_breakout fire → 15m 市场下单）
 # ============================================================
@@ -1445,14 +1466,14 @@ def test_set_channel_daily_over_cap_rejected(monkeypatch) -> None:
 
 
 def test_status_shape(monkeypatch) -> None:
-    """status：20 通道全量（12 在线 + 8 退役 fixture）、enabled_any/defaults/amount_cap、单通道字段。"""
+    """status：21 通道全量（13 在线 + 8 退役 fixture）、enabled_any/defaults/amount_cap、单通道字段。"""
     t = _make_trader(monkeypatch, _FakeTrader(), channels=["quote_contrarian_v1"])
     s = t.status()
     assert s["enabled_any"] is True
     assert s["amount_cap"] == 50
     assert s["defaults"]["amount_usdt"] == 2.0
     assert s["defaults"]["max_daily_orders"] == 100
-    assert len(s["channels"]) == 20
+    assert len(s["channels"]) == 21
     by = {c["channel"]: c for c in s["channels"]}
     c = by["quote_contrarian_v1"]
     assert c["enabled"] is True and c["enabled_at_startup"] is True
@@ -2428,6 +2449,144 @@ async def test_signal_trade_fok_retry_guardrail_rejects_retry_quote(monkeypatch)
     assert place_calls == ["Q1"]  # 护栏复检拦下重试单，未下第二单
     assert "重试执行价护栏弃单" in updates[0][1]["error_message"]
     assert updates[0][1]["order_id"] == "ORD-1"  # 首次单 orderId 保留供对账追溯
+
+
+# ------------------------------------------------------------
+# 入场价白名单（x4_v3 下单层主护栏，entry_band_whitelist 透传）
+# ------------------------------------------------------------
+
+_V3_BANDS = ((0.0, 0.2), (0.3, 0.4))   # 与 live_channels x4_v3 冻结口径一致
+
+
+def _stub_whitelist_trade(monkeypatch, trader, quotes, confirms):
+    """白名单用例替身装配：报价依次弹出、下单/币安回查按表，返回 (updates, place_calls)。"""
+    updates: list[tuple] = []
+    place_calls: list[str] = []
+
+    async def _reserve(_v, _ws, direction=None, market_period="5m",
+                       scene_signal_id=None):
+        return _pending_order()
+
+    async def _update(order, status, **kwargs):
+        updates.append((status, kwargs))
+        return {**order, "status": status, **kwargs}
+
+    async def _quote(_token, _side, amount_usdt=None):
+        return quotes.pop(0)
+
+    async def _place(_q, slippage_bps=1200):
+        place_calls.append(_q["quoteId"])
+        return {"orderId": "ORD-1"}
+
+    async def _confirm(_oid, attempts=3, delay=1.0):
+        return next(c for c in confirms if c["orderId"] == _oid)
+
+    monkeypatch.setattr(trader, "_reserve_order_slot", _reserve)
+    monkeypatch.setattr(trader, "_update_signal_order", _update)
+    monkeypatch.setattr(trader, "get_quote", _quote)
+    monkeypatch.setattr(trader, "place_order", _place)
+    monkeypatch.setattr(trader, "confirm_order_status", _confirm)
+    return updates, place_calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("avg,inside", [
+    (0.05, True),    # [0, 0.2) 带内
+    (0.19, True),    # 上界内侧（左闭右开）
+    (0.20, False),   # 上界贴线（0.2 不含）
+    (0.25, False),   # 两带间隙
+    (0.30, True),    # 第二带下界（左闭）
+    (0.40, False),   # 第二带上界贴线
+    (0.49, False),   # 护栏内但带外
+])
+async def test_signal_trade_whitelist_band_matrix(monkeypatch, avg, inside) -> None:
+    """x4_v3 白名单边界矩阵：[0,0.2)∪[0.3,0.4)，带外弃单且币安零请求。"""
+    trader = _make_real_trader(monkeypatch)
+    updates, place_calls = _stub_whitelist_trade(
+        monkeypatch, trader,
+        quotes=[{"averagePrice": avg, "amountIn": "5", "amountOut": "10",
+                 "quoteId": "Q1"}],
+        confirms=[{"orderId": "ORD-1", "status": "FILLED", "price": "0.55"}])
+    order = await trader.execute_signal_trade(
+        "DOWN", 5.0, "x4_v3", WINDOW_START, max_exec_price=0.50,
+        market_period="5m", entry_band_whitelist=_V3_BANDS)
+    if inside:
+        assert order["status"] == "FILLED"
+        assert place_calls == ["Q1"]
+    else:
+        assert order["status"] == "FAILED"
+        assert "入场价白名单弃单" in updates[0][1]["error_message"]
+        assert place_calls == []   # 下单前拦截：不向币安提交
+
+
+@pytest.mark.asyncio
+async def test_signal_trade_whitelist_guardrail_precedes_band(monkeypatch) -> None:
+    """avg=0.50 贴护栏线：执行价护栏先拦（文案护栏非白名单），白名单不触达。"""
+    trader = _make_real_trader(monkeypatch)
+    updates, place_calls = _stub_whitelist_trade(
+        monkeypatch, trader,
+        quotes=[{"averagePrice": 0.50, "amountIn": "5", "amountOut": "10",
+                 "quoteId": "Q1"}],
+        confirms=[])
+    order = await trader.execute_signal_trade(
+        "DOWN", 5.0, "x4_v3", WINDOW_START, max_exec_price=0.50,
+        market_period="5m", entry_band_whitelist=_V3_BANDS)
+    assert order["status"] == "FAILED"
+    assert "执行价护栏弃单" in updates[0][1]["error_message"]
+    assert place_calls == []
+
+
+@pytest.mark.asyncio
+async def test_signal_trade_whitelist_nonpositive_avg_failsafe(monkeypatch) -> None:
+    """avg=0（无护栏时）→ 白名单 fail-safe 恒 False 弃单（纯函数独立防线）。"""
+    trader = _make_real_trader(monkeypatch)
+    updates, place_calls = _stub_whitelist_trade(
+        monkeypatch, trader,
+        quotes=[{"averagePrice": 0, "amountIn": "5", "amountOut": "10",
+                 "quoteId": "Q1"}],
+        confirms=[])
+    order = await trader.execute_signal_trade(
+        "DOWN", 5.0, "x4_v3", WINDOW_START,      # max_exec_price=None：护栏整段跳过
+        market_period="5m", entry_band_whitelist=_V3_BANDS)
+    assert order["status"] == "FAILED"
+    assert "入场价白名单弃单" in updates[0][1]["error_message"]
+    assert place_calls == []
+
+
+@pytest.mark.asyncio
+async def test_signal_trade_fok_retry_whitelist_rechecks_retry_quote(monkeypatch) -> None:
+    """首报 0.19 过白名单 → FOK 未成交；重试报价 0.22 跳出带 → 复检拦，不下第二单。"""
+    trader = _make_real_trader(monkeypatch)
+    updates, place_calls = _stub_whitelist_trade(
+        monkeypatch, trader,
+        quotes=[
+            {"averagePrice": 0.19, "amountIn": "5", "amountOut": "10", "quoteId": "Q1"},
+            {"averagePrice": 0.22, "amountIn": "5", "amountOut": "9", "quoteId": "Q2"},
+        ],
+        confirms=[{"orderId": "ORD-1", "status": "FAILED"}])
+    order = await trader.execute_signal_trade(
+        "DOWN", 5.0, "x4_v3", WINDOW_START, max_exec_price=0.50,
+        market_period="5m", entry_band_whitelist=_V3_BANDS)
+    assert order["status"] == "FAILED"
+    assert "重试入场价白名单弃单" in updates[0][1]["error_message"]
+    assert place_calls == ["Q1"]                  # 复检拦下重试单
+    assert updates[0][1]["order_id"] == "ORD-1"   # 首单 id 保留供对账追溯
+
+
+@pytest.mark.asyncio
+async def test_signal_trade_whitelist_none_keeps_legacy_behavior(monkeypatch) -> None:
+    """bands=None（x4_v2 等未配置通道）恒 True：0.25 不在 v3 带内也照常成交。"""
+    trader = _make_real_trader(monkeypatch)
+    updates, place_calls = _stub_whitelist_trade(
+        monkeypatch, trader,
+        quotes=[{"averagePrice": 0.25, "amountIn": "5", "amountOut": "10",
+                 "quoteId": "Q1"}],
+        confirms=[{"orderId": "ORD-1", "status": "FILLED", "price": "0.25"}])
+    order = await trader.execute_signal_trade(
+        "DOWN", 5.0, "x4_v2", WINDOW_START, max_exec_price=0.50,
+        market_period="5m")   # 不传 entry_band_whitelist（默认 None）
+    assert order["status"] == "FILLED"
+    assert place_calls == ["Q1"]
 
 
 @pytest.mark.asyncio

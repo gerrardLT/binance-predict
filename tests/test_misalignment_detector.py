@@ -8,6 +8,8 @@
 - EV：赢 0.98/(p+0.01)−1（截断 [0.01,0.99]）/ 输 −1
 - 幂等：同窗口重复触发被唯一约束查询拦下（幂等键 per-version）
 - x4_v2 平静市门禁：|past1h|<0.5% 才落；单边市/缺基准 → 整窗零信号
+- x4_v3 双趋势门禁（2026-09-06）：v2 全条件 + past4h<−1% / past24h≥2% 拦
+  （regime_feed.ret_at 打桩；下单层入场价白名单见 test_multi_live_trader）
 - 2026-09-04 退役：x4_v1 已入 shadow_version_gate.RETIRED_VERSIONS（被 x4_v2
   严格支配），基础判定不再单独落行；本文件用例一律按「只有 x4_v2」断言。
   存量 x4_v1 PENDING 行仍照常结算（结算路径不看版本闸）。
@@ -151,9 +153,16 @@ def _sig(window_start: int, status: str = "PENDING") -> SimpleNamespace:
 
 
 async def _run_process(det_win, pending_sigs=(), dup_rows=None, dup2_rows=None,
-                      past1h_price=None) -> tuple[MagicMock, list]:
-    """跑 _process_window：session.execute 按调用序返回
-    （结算查询→v1幂等→v2幂等→past1h 基准查询）。"""
+                      past1h_price=None, dup3_rows=None, past1h_v3_price=None,
+                      ret4h=None, ret24h=None, x4_v3_enabled=True) -> tuple[MagicMock, list]:
+    """跑 _process_window：session.execute 按调用序返回。
+
+    完整路径（v3 未短路）：结算查询→v1幂等→v3幂等→v3 past1h→v2幂等→v2 past1h
+    （6 项）；v3 短路（v3 幂等命中 / 开关关——gate 检查在 dup3 查询之后）
+    不查 v3 past1h，序列缩短为 5 项。
+    regime_feed.ret_at 一律打桩（防既有用例真触网）：ret4h/ret24h 默认 None
+    （门禁数据缺失 → v3 保守不落），既有 v2 用例断言零改动。
+    """
     det = MisalignmentDetector()
     added: list = []
     session = MagicMock()
@@ -161,16 +170,29 @@ async def _run_process(det_win, pending_sigs=(), dup_rows=None, dup2_rows=None,
     settle_result.scalars.return_value.all.return_value = list(pending_sigs)
     dup_result = MagicMock()
     dup_result.first.return_value = (dup_rows or [None])[0]
+    dup3_result = MagicMock()
+    dup3_result.first.return_value = (dup3_rows or [None])[0]
     dup2_result = MagicMock()
     dup2_result.first.return_value = (dup2_rows or [None])[0]
+    past1h_v3_result = MagicMock()
+    past1h_v3_result.scalar_one_or_none.return_value = (
+        past1h_v3_price if past1h_v3_price is not None else past1h_price)
     past1h_result = MagicMock()
     past1h_result.scalar_one_or_none.return_value = past1h_price  # None=无基准窗 / 1h 前价格
-    session.execute = AsyncMock(
-        side_effect=[settle_result, dup_result, dup2_result, past1h_result])
+    v3_checks_past1h = dup3_rows is None and x4_v3_enabled
+    session.execute = AsyncMock(side_effect=[
+        settle_result, dup_result, dup3_result]
+        + ([past1h_v3_result] if v3_checks_past1h else [])
+        + [dup2_result, past1h_result])
     session.add = MagicMock(side_effect=added.append)
     session.commit = AsyncMock()
+
+    async def fake_ret_at(ts_ms, bars):
+        return ret4h if bars == md.X4_V3_PAST4H_BARS else ret24h
+
     factory = MagicMock(return_value=_FakeSessionCtx(session))
-    with patch.object(md, "async_session_factory", factory):
+    with patch.object(md, "regime_feed", SimpleNamespace(ret_at=fake_ret_at)), \
+            patch.object(md, "async_session_factory", factory):
         await det._process_window(det_win)
     return session, added
 
@@ -274,6 +296,111 @@ async def test_v2_triggers_even_when_v1_dup_exists() -> None:
         _win(100 * MIN, "UP", entry_price=100.0),
         dup_rows=[123], past1h_price=100.2,
     )
+    assert [s.version for s in added] == ["x4_v2"]
+
+
+# ============================================================
+# x4_v3 双趋势门禁（v2 全条件 + past4h<−1% / past24h≥2% 拦截）
+# ============================================================
+
+_V3_PASS = dict(ret4h=0.001, ret24h=-0.005)
+"""v3 双门禁通过基线：4h 微涨 +0.1% / 24h 微跌 −0.5%（配 past1h_price=100.2 平静市）。"""
+
+
+@pytest.mark.asyncio
+async def test_x4_v3_triggers_alongside_v2() -> None:
+    """双门禁通过 → v3 与 v2 同窗双落，v3 在前（锁死插入点：v1 后、v2 前）。"""
+    start = 100 * MIN
+    session, added = await _run_process(
+        _win(start, "UP", entry_price=100.0), past1h_price=100.2, **_V3_PASS)
+    assert [s.version for s in added] == ["x4_v3", "x4_v2"]
+    v3 = added[0]
+    assert v3.direction == "DOWN" and v3.outcome_base == "UP"
+    assert v3.end_pct == 38.0 and v3.status == "PENDING"
+    assert v3.target_window_start == start + 5 * MIN
+
+
+@pytest.mark.asyncio
+async def test_x4_v3_blocked_by_panic_4h() -> None:
+    """past4h = −1.01% < −1% 急跌 → v3 拦，v2 照常（两规则独立不联动）。"""
+    session, added = await _run_process(
+        _win(100 * MIN, "UP", entry_price=100.0), past1h_price=100.2,
+        ret4h=-0.0101, ret24h=-0.005)
+    assert [s.version for s in added] == ["x4_v2"]
+
+
+@pytest.mark.asyncio
+async def test_x4_v3_allows_4h_exactly_at_minus_one() -> None:
+    """past4h 恰 −1.00%：严格小于才拦 → 放行（−0.01×100==−1.0 浮点精确）。"""
+    session, added = await _run_process(
+        _win(100 * MIN, "UP", entry_price=100.0), past1h_price=100.2,
+        ret4h=-0.01, ret24h=-0.005)
+    assert [s.version for s in added] == ["x4_v3", "x4_v2"]
+
+
+@pytest.mark.asyncio
+async def test_x4_v3_blocked_by_overheated_24h() -> None:
+    """past24h = +2.01% ≥ +2% 过热 → v3 拦，v2 照常。"""
+    session, added = await _run_process(
+        _win(100 * MIN, "UP", entry_price=100.0), past1h_price=100.2,
+        ret4h=0.001, ret24h=0.0201)
+    assert [s.version for s in added] == ["x4_v2"]
+
+
+@pytest.mark.asyncio
+async def test_x4_v3_blocked_at_exactly_plus_two_24h() -> None:
+    """past24h 恰 +2.00%：≥ 含贴线 → 拦（0.02×100==2.0 浮点精确）。"""
+    session, added = await _run_process(
+        _win(100 * MIN, "UP", entry_price=100.0), past1h_price=100.2,
+        ret4h=0.001, ret24h=0.02)
+    assert [s.version for s in added] == ["x4_v2"]
+
+
+@pytest.mark.asyncio
+async def test_x4_v3_allows_24h_below_boundary() -> None:
+    """past24h = +1.99%（阈值下方）→ 放行。"""
+    session, added = await _run_process(
+        _win(100 * MIN, "UP", entry_price=100.0), past1h_price=100.2,
+        ret4h=0.001, ret24h=0.0199)
+    assert [s.version for s in added] == ["x4_v3", "x4_v2"]
+
+
+@pytest.mark.asyncio
+async def test_x4_v3_missing_regime_data_records_nothing() -> None:
+    """ret_at None（K 线缺失/陈旧）→ v3 保守不落（数据缺失≠规则拦截），v2 照常。"""
+    session, added = await _run_process(
+        _win(100 * MIN, "UP", entry_price=100.0), past1h_price=100.2)
+    assert [s.version for s in added] == ["x4_v2"]
+
+
+@pytest.mark.asyncio
+async def test_x4_v3_independent_of_v2_dup() -> None:
+    """v2 幂等命中不阻断 v3（幂等键 per-version）：同窗 v3 仍落。"""
+    session, added = await _run_process(
+        _win(100 * MIN, "UP", entry_price=100.0), past1h_price=100.2,
+        dup2_rows=[456], **_V3_PASS)
+    assert [s.version for s in added] == ["x4_v3"]
+
+
+@pytest.mark.asyncio
+async def test_x4_v2_independent_of_v3_dup() -> None:
+    """v3 幂等命中只跳过 v3 自身（自包含 helper，return 不外泄）：v2 照常落。"""
+    session, added = await _run_process(
+        _win(100 * MIN, "UP", entry_price=100.0), past1h_price=100.2,
+        dup3_rows=[789], **_V3_PASS)
+    assert [s.version for s in added] == ["x4_v2"]
+
+
+@pytest.mark.asyncio
+async def test_x4_v3_disabled_by_shadow_gate(monkeypatch) -> None:
+    """x4_v3 开关关 → 只跳过 v3（v1 退役 / v2 评估不受影响）。"""
+    real_enabled = md.shadow_gate.is_enabled
+    monkeypatch.setattr(
+        md.shadow_gate, "is_enabled",
+        lambda v: False if v == md.X4_V3_VERSION else real_enabled(v))
+    session, added = await _run_process(
+        _win(100 * MIN, "UP", entry_price=100.0),
+        past1h_price=100.2, x4_v3_enabled=False)
     assert [s.version for s in added] == ["x4_v2"]
 
 

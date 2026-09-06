@@ -24,6 +24,16 @@ x4_v2 平静市门禁版（2026-08-22 5m 粒度归因落地，只加不改；v1 
     entry_price，严格 ex-ante）。归因依据（51 笔已结算 x4_v1）：平静市段
     wr 57.6%/EV+9.70 vs 单边段 wr 23%/EV−13.8；门禁数据缺失 → v2 不触发。
     结算通道与 v1 完全共用（PENDING → 次窗归档结算，版本无关）。
+
+x4_v3 趋势过滤版（2026-09-06 C3 拦截规则落地，只加不改；v1/v2 冻结口径原样）：
+    触发条件 = v2 全部条件 + 双趋势门禁（触发时点 past4h<−1% 急跌拦 /
+    past24h≥+2% 过热拦；regime_feed 5m K 线口径，锚点 = 触发窗起点，
+    严格 ex-ante）+ 下单层入场价白名单 [0,0.2)∪[0.3,0.4)（白名单在
+    prediction_trading 经 ChannelSpec 透传，超带弃单）。依据：
+    .pytest_tmp/x4v2_analysis/report6.txt（C3 保留段全期 n=40 wr 42.5%
+    ev+1.629）。门禁数据缺失 → v3 不触发（同 v2 past1h None 语义）。
+    触发块插在 v1 块结束与 v2 块开始之间（v2 块 3 处提前 return 会静默
+    跳过其后的代码），helper 全部提前 return 自包含、绝不泄露到主流程。
 """
 from __future__ import annotations
 
@@ -37,6 +47,7 @@ from sqlalchemy import select as sa_select
 from binance_predict.db.engine import async_session_factory
 from binance_predict.db.models import MisalignmentSignal, SentimentWindow
 from binance_predict.services.shadow_version_gate import shadow_gate
+from .btc_regime import regime_feed
 from .signal_notify import (
     fire_signal_email, fmt_bjt, has_live_filled_order, is_fresh_signal, is_live_enabled,
 )
@@ -58,6 +69,18 @@ X4_V2_VERSION = "x4_v2"
 X4_V2_PAST1H_MAX_ABS_PCT = 0.5   # |过去 1h 涨幅| 上限（%）
 X4_V2_LOOKBACK_MS = 3_600_000    # 回看 1h
 X4_V2_TOL_MS = 600_000           # 历史窗 start_time 容差 ±10min（兜数据缺口）
+
+# ---- x4_v3 趋势过滤版（2026-09-06 C3 拦截规则落地，只加不改；v1/v2 冻结口径原样）----
+# 触发条件 = v2 全部条件 + 双趋势门禁（regime_feed 5m K 线口径，锚点=触发窗起点）：
+# past4h < −1%（48 根）急跌不接刀；past24h ≥ +2%（288 根）过热不追空。
+# 归因依据 .pytest_tmp/x4v2_analysis/report6.txt：past4h<−1% 段 6 笔全输、
+# past24h≥2% 段 EV−0.39；C3 保留段全期 n=40 wr 42.5% ev+1.629。
+# 下单层另有入场价白名单（live_channels.ChannelSpec.entry_band_whitelist 透传）。
+X4_V3_VERSION = "x4_v3"
+X4_V3_PAST4H_BARS = 48       # 4h / 5m
+X4_V3_PAST4H_MIN_PCT = -1.0  # past4h 低于此阈值（%）拦截；= −1.00 放行（严格小于才拦）
+X4_V3_PAST24H_BARS = 288     # 24h / 5m
+X4_V3_PAST24H_MAX_PCT = 2.0  # past24h 高于等于此阈值（%）拦截
 
 
 def _window_open_price(w: SentimentWindow) -> float | None:
@@ -222,6 +245,71 @@ class MisalignmentDetector:
             self._last_window_end = max(self._last_window_end or 0, int(w.end_time))
 
     # ------------------------------------------------------------------
+    # x4_v3：v2 条件全同 + 双趋势门禁（自包含 helper，提前 return 不外泄）
+    # ------------------------------------------------------------------
+
+    async def _maybe_spawn_x4_v3(
+        self, session, w: SentimentWindow,
+        start_ms: int, end_ms: int, end_pct: float,
+    ) -> None:
+        """x4_v3 触发块：v2 全部条件 + past4h/past24h 双趋势门禁 → 独立落 PENDING。
+
+        自包含纪律：所有提前 return 封在本方法内，绝不泄露到 _process_window
+        （v3 幂等/开关/门禁不过只跳过 v3 自身，v1/v2 评估不受影响）。
+        调用点在 v1 块结束与 v2 块开始之间——v2 块 3 处提前 return 会静默跳过
+        其后的代码，v3 若插在 v2 之后，v2 已触发窗（v3 主场景）会被漏掉。
+        """
+        dup3 = await session.execute(
+            sa_select(MisalignmentSignal.id).where(
+                MisalignmentSignal.version == X4_V3_VERSION,
+                MisalignmentSignal.window_start == start_ms,
+            )
+        )
+        if dup3.first() is not None:
+            return  # v3 幂等命中：只跳过 v3，不影响 v2
+        if not shadow_gate.is_enabled(X4_V3_VERSION):
+            return  # 手动下线：停止采集新信号（历史数据保留）
+        past1h = await _past_1h_chg_pct(session, w)
+        if past1h is None or abs(past1h) >= X4_V2_PAST1H_MAX_ABS_PCT:
+            return  # 单边市/门禁数据缺失 → v3 不触发（与 v2 同语义）
+        # 双趋势门禁（regime_feed 5m K 线口径，锚点 = 触发窗起点，见 spec design.md）：
+        # ret_at 返回小数，×100 转百分比后比较；数据缺失 None → 不触发。
+        ret4h = await regime_feed.ret_at(int(w.start_time), X4_V3_PAST4H_BARS)
+        ret24h = await regime_feed.ret_at(int(w.start_time), X4_V3_PAST24H_BARS)
+        # 本模块 logger 是标准 logging（非 loguru）：占位符只能 f-string 预拼，
+        # {} 风格 args 会在 format 时抛 TypeError（WARNING 级在 pytest 捕获下炸测试）
+        ts_str = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).strftime("%m-%d %H:%M")
+        if ret4h is None or ret24h is None:
+            logger.warning(
+                f"X4v3 门禁数据缺失不触发（非规则拦截）| 窗口 {ts_str} "
+                f"| ret4h={ret4h} ret24h={ret24h}"
+            )
+            return
+        if ret4h * 100.0 < X4_V3_PAST4H_MIN_PCT or ret24h * 100.0 >= X4_V3_PAST24H_MAX_PCT:
+            logger.info(
+                f"X4v3 趋势门禁拦截 | 窗口 {ts_str} | ret4h={ret4h * 100.0:+.2f}% "
+                f"ret24h={ret24h * 100.0:+.2f}%（急跌/过热不触发）"
+            )
+            return
+        session.add(MisalignmentSignal(
+            version=X4_V3_VERSION,
+            window_start=start_ms,
+            window_end=end_ms,
+            end_pct=end_pct,
+            outcome_base="UP",
+            direction="DOWN",
+            target_window_start=end_ms,
+            status="PENDING",
+        ))
+        await session.commit()
+        self._trigger_count += 1
+        logger.info(
+            f"X4v3 影子触发 | 窗口 {ts_str} | end_pct={end_pct:.1f} "
+            f"past1h={past1h:+.2f}% ret4h={ret4h * 100.0:+.2f}% "
+            f"ret24h={ret24h * 100.0:+.2f}% → 押次窗 DOWN（目标 {end_ms}）"
+        )
+
+    # ------------------------------------------------------------------
     # 核心：单窗口处理（触发判定 + 目标结算）
     # ------------------------------------------------------------------
 
@@ -265,6 +353,10 @@ class MisalignmentDetector:
                 )
                 # 邮件推送已挪到结算回读后（_settle_pending_for，2026-08-28）：
                 # 落表预告改为结算复盘，且只推实盘已成交的信号（FILLED 闸）。
+
+            # --- x4_v3：v2 条件全同 + 双趋势门禁（必须先于 v2 评估：v2 块 3 处
+            #     提前 return 会静默跳过其后的代码；自包含 helper 不外泄 return）---
+            await self._maybe_spawn_x4_v3(session, w, start_ms, end_ms, end_pct)
 
             # --- x4_v2：v1 条件全同 + 平静市门禁（独立幂等/独立 commit，只加不改）---
             dup2 = await session.execute(

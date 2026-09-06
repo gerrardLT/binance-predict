@@ -2,8 +2,9 @@
 
 口径（与 Part 3 Predexon 长周期回测逐位对齐；v4 采用严格 ex-ante 版）：
     i = bisect_right(opens, ts) − 1（触发时点所在 5m K）
-    ret24 = closes[i−1] / closes[i−1−288] − 1
-    —— 前一根**已收盘** 5m close vs 其前 288 根（24h）close。
+    ret_at(ts, bars) = closes[i−1] / closes[i−1−bars] − 1（泛化回看：
+    bars=288 即 24h 版 ret24，bars=48 即 x4_v3 的 4h 门禁）
+    —— 前一根**已收盘** 5m close vs 其前 bars 根 close。
     为什么用 i−1：触发发生在窗内 45~60s，触发时点所在 K 尚未收盘，其 close
     是未来数据（Part 3 回测 orig 口径 closes[i] 的未来函数已由
     .pytest_tmp/predexon_bt_followup.py 量化修正）；前一根 K 的 close 在触发
@@ -45,22 +46,31 @@ class BtcRegimeFeed:
         self._lock = asyncio.Lock()
         self._last_error: str | None = None
 
-    async def ret24_at(self, ts_ms: int) -> float | None:
-        """触发时点过去 24h 收益（严格 ex-ante 口径）；数据不可用 → None。"""
+    async def ret_at(self, ts_ms: int, bars: int) -> float | None:
+        """触发时点过去 bars 根 5m K 收益（严格 ex-ante 口径）；数据不可用 → None。
+
+        泛化版（ret24_at 的实现体）：bars=288 → 24h（v4 regime 门禁）、
+        bars=48 → 4h（x4_v3 趋势门禁）。锚点语义见模块 docstring：
+        ts=触发窗起点时 i=触发窗，closes[i−1] 即触发窗开盘价。
+        """
         await self._ensure_fresh()
         if (not self._opens
                 or time.monotonic() - self._fetched_at > STALE_MAX_S):
             # 冷启动失败 / 刷新连续失败超陈旧度上限 → 保守 None
-            # （实盘重查后弃单、影子不落；陈旧 ret24 可能误放行/错标样本）
+            # （实盘重查后弃单、影子不落；陈旧 ret 可能误放行/错标样本）
             return None
         i = bisect.bisect_right(self._opens, ts_ms) - 1
-        # i−1−288 ≥ 0 且基准价合法；样本不足说明缓存刚冷启动或数据源残缺 → 保守 None
-        if i < RET24_BARS + 1:
+        # i−1−bars ≥ 0 且基准价合法；样本不足说明缓存刚冷启动或数据源残缺 → 保守 None
+        if i < bars + 1:
             return None
-        base = self._closes[i - 1 - RET24_BARS]
+        base = self._closes[i - 1 - bars]
         if base <= 0:
             return None
         return self._closes[i - 1] / base - 1.0
+
+    async def ret24_at(self, ts_ms: int) -> float | None:
+        """触发时点过去 24h 收益（ret_at 288 根薄包装，既有调用方零改动）。"""
+        return await self.ret_at(ts_ms, RET24_BARS)
 
     async def _ensure_fresh(self) -> None:
         """TTL 缓存 + 锁内单飞：并发首个调用刷新，其余直接读。"""

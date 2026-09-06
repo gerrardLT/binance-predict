@@ -83,6 +83,22 @@ CONFIRM_DEEP_DELAY_S = 3.0
 LOW_BALANCE_ALERT_USDT = 10.0
 
 
+def in_entry_band_whitelist(
+    avg_price: float, bands: tuple[tuple[float, float], ...] | None,
+) -> bool:
+    """下单层入场价白名单（版本无关纯函数，x4_v3 经 ChannelSpec 透传使用）。
+
+    bands=None（未配置）恒 True——既有通道零影响；avg_price ≤ 0（报价解析
+    失败）恒 False（fail-safe 弃单）；判定区间 [lo, hi) 左闭右开：
+    0.19 放 / 0.20 拦 / 0.30 放 / 0.40 拦（x4_v3 冻结口径）。
+    """
+    if bands is None:
+        return True
+    if avg_price <= 0:
+        return False
+    return any(lo <= avg_price < hi for lo, hi in bands)
+
+
 class BinancePredictionTrader:
     """
     Binance 预测市场交易服务
@@ -1320,6 +1336,7 @@ class BinancePredictionTrader:
         max_exec_price: float | None = None,
         market_period: str = "5m",
         scene_signal_id: int | None = None,
+        entry_band_whitelist: tuple[tuple[float, float], ...] | None = None,
     ) -> dict | None:
         """
         信号驱动实盘专用通道（多通道 LIVE：quote_edge/x4 用 5m，场景用 15m）：
@@ -1339,6 +1356,10 @@ class BinancePredictionTrader:
         4. market_period 分流（'5m'|'15m'）：15m 场景订单用 15m 市场 token
            （结算走 FakeBreakoutSignal，trade_settler 按 market_period 分流）；
            scene_signal_id 与占位同事务落库（下单即关联场景信号行，无需回填）。
+        5. 入场价白名单（entry_band_whitelist 非 None 时，x4_v3）：报价后、下单前
+           检查 averagePrice 须落在任一 [lo,hi) 区间，超带弃单；FOK 重试轮换价
+           后必须复检（重试新报价同样过白名单）。版本无关纯检查
+           （in_entry_band_whitelist），无 signal_version 硬编码。
         钱已出去而落库/更新失败时记 CRITICAL 日志，可追溯、不静默降级。
         """
         if not self._api_key or not self._api_secret:
@@ -1484,6 +1505,15 @@ class BinancePredictionTrader:
                     error_message=f"执行价护栏弃单 | averagePrice={avg_price} >= {max_exec_price}（贴线无滑点空间）",
                     quote_json=quote)
 
+            # 入场价白名单（x4_v3 下单层主护栏）：报价后、下单前检查——白名单依赖
+            # 决策点才可知的成交均价，与执行价护栏相互独立（白名单过、护栏超 →
+            # 仍弃单；反之亦然）。avg≤0 已被纯函数 fail-safe 拦截。
+            if not in_entry_band_whitelist(avg_price, entry_band_whitelist):
+                return await self._update_signal_order(
+                    pending, "FAILED", direction=prediction,
+                    error_message=f"入场价白名单弃单 | averagePrice={avg_price} 不在 {entry_band_whitelist}",
+                    quote_json=quote)
+
             # 动态滑点收紧（CodeReview Medium#2）：FOK 成交价不得突破护栏价，
             # 否则 slippageBps=1200 会让 0.78 的护栏形同虚设（最高可成交 ~0.87）。
             # 首轮保守（≤1200bps）；FOK 未成交后的重试轮放宽到护栏全空间（见下）。
@@ -1537,6 +1567,15 @@ class BinancePredictionTrader:
                         error_message=(
                             f"重试执行价护栏弃单 | averagePrice={retry_avg} "
                             f">= {max_exec_price}（贴线无滑点空间）"))
+                # 白名单复检：重试换价必须重查（首检只看首报价，重试新报价可能
+                # 跳出白名单带——跳过复检会绕过 x4_v3 主护栏）。
+                if not in_entry_band_whitelist(retry_avg, entry_band_whitelist):
+                    return await self._update_signal_order(
+                        pending, "FAILED", direction=prediction, token_id=token_id,
+                        order_id=order_id, quote_json=retry_quote,
+                        error_message=(
+                            f"重试入场价白名单弃单 | averagePrice={retry_avg} "
+                            f"不在 {entry_band_whitelist}"))
                 # 重试轮滑点 = 护栏全空间（不再钳 1200）；必须 ≥1（币安拒收 0，-1102）
                 retry_slippage = 1200
                 if max_exec_price is not None and retry_avg > 0:

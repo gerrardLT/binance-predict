@@ -1,6 +1,6 @@
 """多通道实盘执行器（MultiLiveTrader，2026-08-24 取代单版本 QuoteEdgeLiveTrader）。
 
-12 通道（通道注册表见 live_channels.py；2026-09-04 退役 8 通道、2026-09-06 影子 promote 5 通道后）可同时开启，每通道独立
+13 通道（通道注册表见 live_channels.py；2026-09-04 退役 8 通道、2026-09-06 影子 promote 5 通道 + x4_v3 并行注册后）可同时开启，每通道独立
 金额/日限/护栏/开关；通道 ID 与影子信号版本名对齐（订单 signal_version
 直接用通道名，实盘 vs 影子对账天然一致）。六族触发机制并存：
 
@@ -87,7 +87,7 @@ from .quote_edge_detector import (
 
 # x4 轮询只拉在线通道的版本（x4_v1 已于 2026-09-04 退役，不在 _specs 里；
 # 若仍拉它的 PENDING 行，_fire_x4 会因找不到 spec 而白跑一趟）。
-X4_VERSIONS = ("x4_v2",)
+X4_VERSIONS = ("x4_v2", "x4_v3")  # x4_v3：v2 并行对比版（双趋势门禁+入场价白名单，2026-09-06）
 SIGNAL_BACKFILL_DELAY_MS = 180_000  # 窗口结束后 180s 回读影子信号（归档+结算已就绪）
 HEAL_INTERVAL_S = 300.0             # signal_id 自愈扫描间隔（重启/延迟不丢对账）
 X4_POLL_INTERVAL_S = 30.0           # x4 PENDING 信号轮询间隔
@@ -649,6 +649,7 @@ class MultiLiveTrader:
                 window_start=target_start,
                 max_exec_price=resolve_max_exec(spec, cfg),
                 market_period="5m",
+                entry_band_whitelist=spec.entry_band_whitelist,
             )
             await self._after_fill(order, version, cfg)
             if order is not None and order.get("status") == "FILLED":
