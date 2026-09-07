@@ -1,52 +1,112 @@
 @import "tailwindcss";
 
-/* ============ atoms.dev design tokens ============
-   来源：docs/research/atoms-dev-c15a3ca0/zh-d83abd2e/DESIGN_TOKENS.md
-   通过 @theme 重映射，现有 Tailwind 工具类自动获得 atoms 风格：
-   - font-sans/mono → IBM Plex 家族
-   - rounded-xl → 16px（atoms radius-card）
-   - rounded-2xl → 24px（atoms radius-panel）
-   - brand → #4267FF（atoms --brand） */
-@theme {
-  --font-sans:
-    "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system,
-    "Segoe UI", Roboto, "Noto Sans", "PingFang SC", "Microsoft YaHei",
-    sans-serif;
-  --font-mono: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+/* ==========================================================================
+   binance-predict 实盘监控台 — Design Token 层
+   契约源：DESIGN.md（31 color / 5 typography / 4 radius / motion）
+           .impeccable/design.json（tonal ramp，暗色值由此派生）
+   视觉语言：atoms.dev（docs/research/atoms-dev-c15a3ca0/zh-d83abd2e/）
+   --------------------------------------------------------------------------
+   架构：
+     1. :root           → 规范 token（唯一事实源，暗色在此覆写）
+     2. @theme inline   → 把 token 桥接成 Tailwind 工具类（bg-brand / text-ink-55 …）
+                          用 inline 让工具类直接引用 var(--token)，
+                          因此暗色覆写 :root 即可全局生效，无需 dark: 变体
+     3. @layer components → .ds-* 组件片段（与 design.json 的 CSS 逐字对应）
+     4. @layer utilities   → .num / .unit / .t-* 读数辅助类
 
-  --color-brand: #4267ff;
-  --color-brand-hover: #2f54eb;
-  --color-brand-soft: #e4e9ff;
-
-  --radius-xl: 1rem;
-  --radius-2xl: 1.5rem;
-}
+   命名映射（DESIGN.md token 名 → Tailwind 工具类名）：
+     bg-base    → canvas    （--color-base 会与既有 text-base 字号工具类冲突）
+     bg-surface → card
+     bg-sunken  → sunken
+     border     → line      （border-border 不可读）
+     border-soft→ line-soft
+   语义色另补 *-hover 档（取自 design.json tonal ramp），否则
+   bg-positive + hover:bg-positive 会让按钮悬停反馈塌缩。
+   ========================================================================== */
 
 :root {
-  --text: rgba(12, 12, 12, 0.55);
-  --text-h: rgba(12, 12, 12, 0.95);
-  --bg: #f6f6f6;
-  --border: #e5e7eb;
-  --code-bg: #f0f0f1;
-  --accent: #4267ff;
-  --accent-bg: rgba(66, 103, 255, 0.08);
-  --accent-border: rgba(66, 103, 255, 0.4);
-  --social-bg: rgba(240, 240, 241, 0.5);
-  --shadow:
-    rgba(0, 0, 0, 0.1) 0 10px 15px -3px, rgba(0, 0, 0, 0.05) 0 4px 6px -2px;
+  /* ---- Primary：唯一强调色 + 反白浮层 ---- */
+  --brand: #4267ff;
+  --brand-hover: #2f54eb;
+  --brand-soft: #e4e9ff;
+  --ink-black: #0c0c0c; /* 次级按钮 / tooltip 底：靠反白而非阴影脱离层级 */
+  --on-ink: rgba(255, 255, 255, 0.95); /* ink-black 之上的文字 */
 
-  --sans:
-    "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system,
-    "Segoe UI", Roboto, "Noto Sans", "PingFang SC", "Microsoft YaHei",
-    sans-serif;
-  --heading: var(--sans);
-  --mono: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+  /* ---- Neutral：四级墨色，无第五级（No-Fourth-Gray Rule） ---- */
+  --ink-95: rgba(12, 12, 12, 0.95); /* 标题 / 选中项 / 关键数值 */
+  --ink-80: rgba(12, 12, 12, 0.8); /* 正文 */
+  --ink-55: rgba(12, 12, 12, 0.55); /* 次要文本 / 未选中 tab / 表头 / 单位 */
+  --ink-40: rgba(12, 12, 12, 0.4); /* 占位符 / 禁用 / 空数据的 — */
 
-  font: 18px/145% var(--sans);
+  /* ---- Neutral：三档明度（Three-Tone Rule） ---- */
+  --canvas: #f6f6f6; /* 页面底 */
+  --card: #ffffff; /* 卡片 / 表格容器 / 输入框 */
+  --sunken: #f0f0f1; /* 内嵌小块 / 代码 / 中性徽章底 */
+  --sunken-hover: #dcdcdf; /* 中性按钮悬停：比 sunken 深一档（bg-base ramp idx5） */
+  --line: #e5e7eb; /* 卡片与输入框描边 */
+  --line-soft: #f0f0f1; /* 卡片内分隔线、图表网格 */
+
+  /* ---- Semantic：映射冻结（Semantic Freeze Rule），改的是色值不是含义 ----
+     每色两档：canonical + hover。
+     hover 取自 design.json tonal ramp 深一档（亮色模式），与 --brand-hover 同一推导逻辑。
+     缺了 hover 档会让 bg-positive/hover:bg-positive 这类按钮的悬停反馈塌缩。 */
+  --positive: #34a853; /* 涨 / 盈利 / 健康 / 实盘 */
+  --positive-hover: #22753c;
+  --positive-soft: rgba(52, 168, 83, 0.1);
+  --positive-soft-hover: rgba(52, 168, 83, 0.18);
+  --negative: #d64545; /* 跌 / 亏损 / 异常。本系统唯一自增色，按与 positive 同明度同饱和度推导 */
+  --negative-hover: #a32c2c;
+  --negative-soft: rgba(214, 69, 69, 0.1);
+  --warning: #e8a33d; /* 待定 / 演进中 */
+  --warning-hover: #a8762a;
+  --warning-soft: rgba(232, 163, 61, 0.12);
+  --violet: #b57edc; /* 影子信号 */
+  --violet-hover: #7c4ea3;
+  --violet-soft: rgba(181, 126, 220, 0.12);
+  --indigo: #7c86d8; /* 场景信号 */
+  --indigo-hover: #4e58af;
+  --indigo-soft: rgba(124, 134, 216, 0.12);
+  --teal: #4fa8a0; /* 仅 PY_CLUSTER 徽章与次级动作，取自 chart-7 */
+  --teal-hover: #3d8a82;
+
+  /* ---- Chart：十色环，第 11 条起复用色相 + strokeDasharray（Eleven-Series Rule） ---- */
+  --chart-1: #4267ff;
+  --chart-2: #34a853;
+  --chart-3: #e8a33d;
+  --chart-4: #b57edc;
+  --chart-5: #7c86d8;
+  --chart-6: #d96c8e;
+  --chart-7: #4fa8a0;
+  --chart-8: #a8763e;
+  --chart-9: #8a9a5b;
+  --chart-10: #6e7a8a;
+  --chart-dash: 5 3; /* 第 11 条起的虚线样式，recharts strokeDasharray 用 */
+
+  /* ---- Elevation：本系统不使用阴影（Flat-By-Default Rule） ---- */
+  --overlay: rgba(12, 12, 12, 0.4); /* 模态遮罩。遮罩是层级手段，不是阴影 */
+
+  /* ---- Typography ---- */
+  --font-stack-sans:
+    "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+    Roboto, "Noto Sans", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-stack-mono: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+
+  /* ---- Motion（design.json extensions.motion） ---- */
+  --ease-standard: cubic-bezier(0.4, 0, 0.2, 1); /* atoms 实测按钮通用曲线 */
+  --duration-control: 0.2s; /* 按钮/tab/链接/输入框的 color·bg·border 过渡 */
+  --duration-reveal: 0.35s; /* 首次进入视口淡入，不回放 */
+
+  /* --shadow 已停止消费（DESIGN.md「Elevation & Depth」）。
+     保留定义仅为避免未知引用断裂，任何组件不得再使用 box-shadow。 */
+  --shadow: none;
+
+  /* ---- 基础字号 18px：已知且被用户明确保留的偏差（atoms body 为 14px/21px）。
+     不动它以限制回归面；组件文本多数用显式尺寸覆盖。 ---- */
+  font: 18px/145% var(--font-stack-sans);
   letter-spacing: 0.18px;
   color-scheme: light dark;
-  color: var(--text);
-  background: var(--bg);
+  color: var(--ink-55);
+  background: var(--canvas);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -57,33 +117,162 @@
   }
 }
 
-/* 暗色模式：atoms.dev 源站无暗色，沿用宿主原值（字体/圆角仍随 @theme） */
+/* ==========================================================================
+   暗色模式
+   此前是坏的：App.tsx 里 0 个 dark: 变体 + 532 处写死浅色灰阶。
+   修复机制 = 全部走 token，在此一处重映射。
+   色值取自 design.json 的 tonal ramp：语义色统一取 ramp[4]（浅一档）保证暗底对比，
+   brand 取 ramp[5]。反白浮层在暗色下继续「反白」——ink-black 变亮、on-ink 变暗，
+   守的是规则（浮层与页面反向）而不是字面值。
+   ========================================================================== */
 @media (prefers-color-scheme: dark) {
   :root {
-    --text: #9ca3af;
-    --text-h: #f3f4f6;
-    --bg: #16171d;
-    --border: #2e303a;
-    --code-bg: #1f2028;
-    --accent: #7c96ff;
-    --accent-bg: rgba(124, 150, 255, 0.15);
-    --accent-border: rgba(124, 150, 255, 0.5);
-    --social-bg: rgba(47, 48, 58, 0.5);
-    --shadow:
-      rgba(0, 0, 0, 0.4) 0 10px 15px -3px, rgba(0, 0, 0, 0.25) 0 4px 6px -2px;
-  }
+    --brand: #7c93ff;
+    --brand-hover: #b3c0ff;
+    --brand-soft: rgba(124, 147, 255, 0.16);
+    --ink-black: #f6f6f6;
+    --on-ink: rgba(12, 12, 12, 0.95);
 
-  #social .button-icon {
-    filter: invert(1) brightness(2);
+    --ink-95: rgba(255, 255, 255, 0.95);
+    --ink-80: rgba(255, 255, 255, 0.8);
+    --ink-55: rgba(255, 255, 255, 0.55);
+    --ink-40: rgba(255, 255, 255, 0.4);
+
+    --canvas: #16171d;
+    --card: #1e1f26;
+    --sunken: #121318;
+    --sunken-hover: #1c1d24;
+    --line: #2e303a;
+    --line-soft: #23242c;
+
+    --positive: #5bbe75;
+    --positive-hover: #8ad49c;
+    --positive-soft: rgba(91, 190, 117, 0.16);
+    --positive-soft-hover: rgba(91, 190, 117, 0.26);
+    --negative: #e07171;
+    --negative-hover: #eb9d9d;
+    --negative-soft: rgba(224, 113, 113, 0.16);
+    --warning: #eeb868;
+    --warning-hover: #f4ce93;
+    --warning-soft: rgba(238, 184, 104, 0.18);
+    --violet: #c69be5;
+    --violet-hover: #d7b8ed;
+    --violet-soft: rgba(198, 155, 229, 0.18);
+    --indigo: #99a1e3;
+    --indigo-hover: #b6bced;
+    --indigo-soft: rgba(153, 161, 227, 0.18);
+    --teal: #6fc0b8;
+    --teal-hover: #8acfc7;
+
+    --chart-1: #7c93ff;
+    --chart-2: #5bbe75;
+    --chart-3: #eeb868;
+    --chart-4: #c69be5;
+    --chart-5: #99a1e3;
+    --chart-6: #e58fa9;
+    --chart-7: #6fc0b8;
+    --chart-8: #c09160;
+    --chart-9: #a3b278;
+    --chart-10: #8a96a6;
+
+    --overlay: rgba(0, 0, 0, 0.6);
   }
 }
 
+/* ==========================================================================
+   Tailwind 桥接
+   ========================================================================== */
+@theme inline {
+  /* 字体 */
+  --font-sans: var(--font-stack-sans);
+  --font-mono: var(--font-stack-mono);
+
+  /* 颜色 → bg-* / text-* / border-* / fill-* / stroke-* */
+  --color-brand: var(--brand);
+  --color-brand-hover: var(--brand-hover);
+  --color-brand-soft: var(--brand-soft);
+  --color-ink-black: var(--ink-black);
+  --color-on-ink: var(--on-ink);
+
+  --color-ink-95: var(--ink-95);
+  --color-ink-80: var(--ink-80);
+  --color-ink-55: var(--ink-55);
+  --color-ink-40: var(--ink-40);
+
+  --color-canvas: var(--canvas);
+  --color-card: var(--card);
+  --color-sunken: var(--sunken);
+  --color-sunken-hover: var(--sunken-hover);
+  --color-line: var(--line);
+  --color-line-soft: var(--line-soft);
+
+  --color-positive: var(--positive);
+  --color-positive-hover: var(--positive-hover);
+  --color-positive-soft: var(--positive-soft);
+  --color-positive-soft-hover: var(--positive-soft-hover);
+  --color-negative: var(--negative);
+  --color-negative-hover: var(--negative-hover);
+  --color-negative-soft: var(--negative-soft);
+  --color-warning: var(--warning);
+  --color-warning-hover: var(--warning-hover);
+  --color-warning-soft: var(--warning-soft);
+  --color-violet: var(--violet);
+  --color-violet-hover: var(--violet-hover);
+  --color-violet-soft: var(--violet-soft);
+  --color-indigo: var(--indigo);
+  --color-indigo-hover: var(--indigo-hover);
+  --color-indigo-soft: var(--indigo-soft);
+  --color-teal: var(--teal);
+  --color-teal-hover: var(--teal-hover);
+
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-chart-6: var(--chart-6);
+  --color-chart-7: var(--chart-7);
+  --color-chart-8: var(--chart-8);
+  --color-chart-9: var(--chart-9);
+  --color-chart-10: var(--chart-10);
+
+  --color-overlay: var(--overlay);
+
+  /* 圆角：只有四档（pill / panel / card / sm） */
+  --radius-pill: 9999px;
+  --radius-panel: 1.5rem; /* 24px */
+  --radius-card: 1rem; /* 16px */
+  --radius-sm: 0.5rem; /* 8px */
+
+  /* stock 圆角名重映射守卫 —— 让偏离规格的圆角无法用 stock 类名表达。
+     Tailwind 默认 xs=2 / sm=4 / md=6 / lg=8 / xl=12 / 2xl=16 / 3xl=24px，
+     其中 2·4·6·12 都不在 atoms 四档内；只删别名会让默认值回归，
+     日后写一个 rounded-xl 就静默拿到 12px。这里全部收敛到四档： */
+  --radius-xs: var(--radius-sm);
+  --radius-md: var(--radius-sm);
+  --radius-lg: var(--radius-sm);
+  --radius-xl: var(--radius-card);
+  --radius-2xl: var(--radius-panel);
+  --radius-3xl: var(--radius-panel);
+
+  /* 过渡 */
+  --ease-standard: var(--ease-standard);
+  --default-transition-timing-function: var(--ease-standard);
+  --default-transition-duration: var(--duration-control);
+}
+
+/* ==========================================================================
+   布局
+   ========================================================================== */
+
+/* 原为 width: 1126px + text-align: center —— 落地页遗留。
+   固定宽度在窄屏溢出、在宽屏浪费；全局居中对仪表盘是错的
+   （表格 / KV 行 / 日志都需要左对齐，代码里已有 69 处 text-center|text-left 在对抗它）。 */
 #root {
-  width: 1126px;
-  max-width: 100%;
+  width: 100%;
+  max-width: 1126px;
   margin: 0 auto;
-  text-align: center;
-  border-inline: 1px solid var(--border);
+  border-inline: 1px solid var(--line);
   min-height: 100svh;
   display: flex;
   flex-direction: column;
@@ -94,46 +283,459 @@ body {
   margin: 0;
 }
 
-h1,
-h2 {
-  font-family: var(--heading);
-  font-weight: 600;
-  color: var(--text-h);
-}
-
+/* h1 / h2 对齐 typography 角色，清掉脚手架的 56px 落地页标题值 */
 h1 {
-  font-size: 56px;
-  letter-spacing: -1.68px;
-  margin: 32px 0;
-  @media (max-width: 1024px) {
-    font-size: 36px;
-    margin: 20px 0;
-  }
-}
-h2 {
+  font-family: var(--font-stack-sans);
   font-size: 24px;
-  line-height: 118%;
+  font-weight: 600;
+  line-height: 1.18;
   letter-spacing: -0.24px;
-  margin: 0 0 8px;
+  color: var(--ink-95);
+  margin: 0;
+
   @media (max-width: 1024px) {
     font-size: 20px;
   }
 }
+
+h2 {
+  font-family: var(--font-stack-sans);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.4;
+  letter-spacing: 0;
+  color: var(--ink-95);
+  margin: 0;
+}
+
 p {
   margin: 0;
 }
 
-code,
-.counter {
-  font-family: var(--mono);
+code {
+  font-family: var(--font-stack-mono);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
   display: inline-flex;
-  border-radius: 4px;
-  color: var(--text-h);
+  border-radius: var(--radius-sm);
+  padding: 4px 8px;
+  background: var(--sunken);
+  color: var(--ink-95);
 }
 
-code {
-  font-size: 15px;
-  line-height: 135%;
-  padding: 4px 8px;
-  background: var(--code-bg);
+/* ==========================================================================
+   组件片段 —— 与 .impeccable/design.json 的 components[].css 逐字对应
+   放在 @layer components，Tailwind 工具类仍可覆盖
+   ========================================================================== */
+@layer components {
+  /* ---- Buttons：pill，区域内唯一主动作用 primary（One Blue Rule） ---- */
+  .ds-btn-primary,
+  .ds-btn-dark,
+  .ds-btn-ghost {
+    font-family: var(--font-stack-sans);
+    font-size: 14px;
+    font-weight: 500;
+    line-height: 24px;
+    padding: 6px 16px;
+    border-radius: var(--radius-pill);
+    cursor: pointer;
+    transition:
+      color var(--duration-control) var(--ease-standard),
+      background-color var(--duration-control) var(--ease-standard),
+      border-color var(--duration-control) var(--ease-standard);
+  }
+
+  .ds-btn-primary {
+    background: var(--brand);
+    color: #fff;
+    border: none;
+  }
+  .ds-btn-primary:hover {
+    background: var(--brand-hover);
+  }
+  .ds-btn-primary:focus-visible {
+    outline: none;
+    box-shadow:
+      0 0 0 2px var(--card),
+      0 0 0 4px var(--brand-soft);
+  }
+  .ds-btn-primary:disabled {
+    background: var(--sunken);
+    color: var(--ink-40);
+    cursor: not-allowed;
+  }
+
+  .ds-btn-dark {
+    background: var(--ink-black);
+    color: var(--on-ink);
+    border: 1px solid var(--ink-55);
+  }
+  .ds-btn-dark:hover {
+    background: var(--ink-95);
+  }
+  .ds-btn-dark:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px var(--ink-40);
+  }
+
+  .ds-btn-ghost {
+    background: transparent;
+    color: var(--ink-95);
+    border: none;
+  }
+  .ds-btn-ghost:hover {
+    color: var(--ink-55); /* atoms nav 链接实测行为：hover = 降低文本不透明度至 0.55 */
+  }
+  .ds-btn-ghost:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px var(--brand-soft);
+  }
+
+  /* ---- Tabs：选中态白底墨 95，不用蓝色填充（One Blue Rule） ---- */
+  .ds-tabs {
+    display: flex;
+    gap: 4px;
+    padding: 4px;
+    background: var(--canvas);
+    border-radius: var(--radius-pill);
+  }
+  .ds-tab {
+    background: transparent;
+    color: var(--ink-55);
+    font-family: var(--font-stack-sans);
+    font-size: 14px;
+    font-weight: 500;
+    line-height: 24px;
+    padding: 6px 16px;
+    border: none;
+    border-radius: var(--radius-pill);
+    cursor: pointer;
+    transition:
+      color var(--duration-control) var(--ease-standard),
+      background-color var(--duration-control) var(--ease-standard);
+  }
+  .ds-tab:hover {
+    color: var(--ink-40);
+  }
+  .ds-tab:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px var(--brand-soft);
+  }
+  .ds-tab-active,
+  .ds-tab-active:hover {
+    background: var(--card);
+    color: var(--ink-95);
+  }
+
+  /* ---- Card：完全平坦，无阴影、无 hover 态（Flat-By-Default Rule） ---- */
+  .ds-card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-card);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .ds-card-head {
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--line-soft);
+    flex-shrink: 0;
+  }
+  .ds-card-title {
+    margin: 0;
+    font-family: var(--font-stack-sans);
+    font-size: 14px;
+    font-weight: 600;
+    line-height: 1.4;
+    color: var(--ink-95);
+  }
+  .ds-card-body {
+    padding: 16px;
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+  }
+
+  /* ---- Badges：pill + 语义色浅底 + 同色字，无边框 ---- */
+  .ds-badge {
+    display: inline-block;
+    font-family: var(--font-stack-sans);
+    font-size: 11px;
+    font-weight: 500;
+    line-height: 1.4;
+    letter-spacing: 0.1px;
+    padding: 2px 8px;
+    border-radius: var(--radius-pill);
+    white-space: nowrap;
+  }
+  .ds-badge-up {
+    background: var(--positive-soft);
+    color: var(--positive);
+  }
+  .ds-badge-down {
+    background: var(--negative-soft);
+    color: var(--negative);
+  }
+  .ds-badge-warn {
+    background: var(--warning-soft);
+    color: var(--warning);
+  }
+  .ds-badge-violet {
+    background: var(--violet-soft);
+    color: var(--violet);
+  }
+  .ds-badge-indigo {
+    background: var(--indigo-soft);
+    color: var(--indigo);
+  }
+  .ds-badge-teal {
+    background: color-mix(in srgb, var(--teal) 12%, transparent);
+    color: var(--teal);
+  }
+  .ds-badge-neutral {
+    background: var(--sunken);
+    color: var(--ink-55);
+  }
+
+  /* ---- Numeric Readout：Tabular Numerals Rule + Unit Recede Rule ---- */
+  .ds-readout {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .ds-readout-label {
+    font-family: var(--font-stack-sans);
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.1px;
+    color: var(--ink-55);
+  }
+  .ds-readout-value {
+    font-family: var(--font-stack-mono);
+    font-size: 20px;
+    font-weight: 500;
+    line-height: 1.2;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink-95);
+  }
+  .ds-readout-unit {
+    margin-left: 2px;
+    font-size: 13px;
+    color: var(--ink-55);
+  }
+  .ds-pos {
+    color: var(--positive);
+  }
+  .ds-neg {
+    color: var(--negative);
+  }
+
+  /* ---- Help Hint：反白气泡，无阴影；键盘必须可触发 ---- */
+  .ds-hint {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+  }
+  .ds-hint-trigger {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 14px;
+    height: 14px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-pill);
+    font-family: var(--font-stack-sans);
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 1;
+    color: var(--ink-55);
+    cursor: help;
+    user-select: none;
+    transition:
+      color var(--duration-control) var(--ease-standard),
+      border-color var(--duration-control) var(--ease-standard);
+  }
+  .ds-hint-trigger:hover,
+  .ds-hint-trigger:focus-visible {
+    color: var(--ink-95);
+    border-color: var(--ink-40);
+    outline: none;
+  }
+  .ds-hint-bubble {
+    position: absolute;
+    right: 0;
+    bottom: 100%;
+    margin-bottom: 6px;
+    width: 288px;
+    padding: 8px 12px;
+    background: var(--ink-black);
+    color: var(--on-ink);
+    border-radius: var(--radius-sm);
+    font-family: var(--font-stack-sans);
+    font-size: 13px;
+    line-height: 1.6;
+    text-align: left;
+    white-space: normal;
+    opacity: 0;
+    visibility: hidden;
+    transition:
+      opacity var(--duration-control) var(--ease-standard),
+      visibility var(--duration-control);
+    z-index: 30;
+  }
+  .ds-hint:hover .ds-hint-bubble,
+  .ds-hint:focus-within .ds-hint-bubble {
+    opacity: 1;
+    visibility: visible;
+  }
+
+  /* ---- Input：focus 用品牌蓝描边 + brand-soft 外环，不发光不阴影 ---- */
+  .ds-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .ds-field-label {
+    font-family: var(--font-stack-sans);
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.1px;
+    color: var(--ink-55);
+  }
+  .ds-input {
+    background: var(--card);
+    color: var(--ink-95);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    padding: 6px 12px;
+    font-family: var(--font-stack-sans);
+    font-size: 14px;
+    line-height: 21px;
+    transition:
+      border-color var(--duration-control) var(--ease-standard),
+      box-shadow var(--duration-control) var(--ease-standard);
+  }
+  .ds-input::placeholder {
+    color: var(--ink-40);
+  }
+  .ds-input:hover {
+    border-color: var(--ink-40);
+  }
+  .ds-input:focus {
+    outline: none;
+    border-color: var(--brand);
+    box-shadow: 0 0 0 2px var(--brand-soft);
+  }
+  .ds-input:disabled {
+    background: var(--sunken);
+    color: var(--ink-40);
+    cursor: not-allowed;
+  }
+  .ds-input-error,
+  .ds-input-error:focus {
+    border-color: var(--negative);
+    box-shadow: none;
+  }
+  .ds-input-numeric {
+    font-family: var(--font-stack-mono);
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+  }
+  /* 紧凑尺寸修饰：只覆写几何，颜色/边框/focus/disabled 全部继承 .ds-input。
+     用于实盘通道行等密集列表——标准 6px 12px 内边距会让 13 个通道行整体撑高溢出。
+     组合用法：ds-input ds-input-sm ds-input-numeric */
+  .ds-input-sm {
+    padding: 2px 6px;
+    font-size: 11px;
+    line-height: 1.4;
+  }
+}
+
+/* ==========================================================================
+   读数辅助工具类
+   ========================================================================== */
+@layer utilities {
+  /* Tabular Numerals Rule 的落地开关。
+     现有 119 处 font-mono 由此一次性获得等宽数字对齐，
+     此前全项目只有 1 处 tabular-nums —— 比例字体下 +7.11 与 +160.04 宽度不同，
+     同一列无法对齐，操盘者必须逐行重读小数点位置。 */
+  .font-mono {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* 数值最小改造单元：等宽 + tnum，不改字号不改颜色，
+     用于给既有 font-sans 的数字就地加上对齐能力 */
+  .num {
+    font-family: var(--font-stack-mono);
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1;
+  }
+
+  /* Unit Recede Rule：单位是注释，不是内容 */
+  .unit {
+    margin-left: 2px;
+    color: var(--ink-55);
+    font-size: 0.85em;
+  }
+
+  /* Typography 五角色 */
+  .t-headline {
+    font-family: var(--font-stack-sans);
+    font-size: 24px;
+    font-weight: 600;
+    line-height: 1.18;
+    letter-spacing: -0.24px;
+    color: var(--ink-95);
+
+    @media (max-width: 1024px) {
+      font-size: 20px;
+    }
+  }
+  .t-title {
+    font-family: var(--font-stack-sans);
+    font-size: 14px;
+    font-weight: 600;
+    line-height: 1.4;
+    color: var(--ink-95);
+  }
+  .t-body {
+    font-family: var(--font-stack-sans);
+    font-size: 14px;
+    font-weight: 400;
+    line-height: 21px;
+    color: var(--ink-80);
+  }
+  .t-label {
+    font-family: var(--font-stack-sans);
+    font-size: 11px;
+    font-weight: 500;
+    line-height: 1.4;
+    letter-spacing: 0.1px;
+    color: var(--ink-55);
+  }
+  .t-numeric {
+    font-family: var(--font-stack-mono);
+    font-size: 13px;
+    font-weight: 500;
+    line-height: 1.4;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink-95);
+  }
+}
+
+/* ==========================================================================
+   ban-ambient（design.json motion[3]）
+   禁止无限循环动画 / marquee / 呼吸 / shimmer / 发光脉冲。
+   轮询驱动的数据面板中，持续动效会与数据刷新竞争注意力。
+   此处兜住系统偏好；代码层不得新增 @keyframes 循环动画。
+   ========================================================================== */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
