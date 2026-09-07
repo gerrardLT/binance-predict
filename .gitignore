@@ -35,6 +35,8 @@ online_shadow_now*.json
 
 # 本地密钥与运行配置
 .env
+# 交易私钥片段列表（pk_...，逗号分隔单行），绝不可入库
+.env.valid_keys
 
 # Playwright / 浏览器测试日志
 .playwright-cli/
