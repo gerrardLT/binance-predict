@@ -413,9 +413,12 @@ def test_settings_default_on():
 
 
 def test_specs_self_consistent():
-    """spec 自洽：三 version 合法、不超 DB 列宽 String(32)，冻结常数正确。"""
+    """spec 自洽：九 version 合法（G0/G1/G3+6G7）、不超 DB 列宽 String(32)，冻结常数正确。"""
     assert set(v for v, _ in FIRSTHIT_SPECS) == {
-        "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1"
+        "firsthit_down_v1",
+        "firsthit_down_body_v1", "firsthit_down_chg_v1",
+        "firsthit_down_g7_v1", "g7_streak_v1", "g7_wick20_v1",
+        "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",
     }
     for v, name in FIRSTHIT_SPECS:
         assert len(v) <= 32, f"{v} 超出 DB 列宽 String(32)"
@@ -425,16 +428,21 @@ def test_specs_self_consistent():
 
 
 def test_shadow_bench_registered():
-    """三 version 已登记进 main.SHADOW_BENCH（analytics 面板 + toggle 白名单的唯一事实源）。
-    
+    """G0/G1/G3 已登记进 main.SHADOW_BENCH（analytics 面板 + toggle 白名单的唯一事实源）。
+
     离线研究结论（local_shape_scan_v2.py v2）：
       G0 基底：calib EV+0.21 CI[+0.06,+0.34]
       G1：calib EV+1.44 CI[+0.56,+2.42] → confirm +1.59 CI[+0.35,+2.91]
       G3：calib EV+0.39 CI[+0.14,+0.65] → confirm +0.97 CI[+0.40,+1.62]
     （确认段已被离线研究用尽 → 本表只攒部署点后样本，SHADOW_BENCH 存历史回溯均值作为基线）
+
+    注：G7 系列为科学假设优化衍生版本，未预注册到 SHADOW_BENCH（基准由影子前向现算）。
     """
-    # FIRSTHIT_SPECS = [(ver1, name1), (ver2, name2), (ver3, name3)] → zip(*specs)[0] = (ver1, ver2, ver3)
-    g0, g1, g3 = list(zip(*FIRSTHIT_SPECS))[0]
+    # FIRSTHIT_SPECS 前 3 个为原始 G0/G1/G3，检查它们在 SHADOW_BENCH
+    g0, g1, g3 = FIRSTHIT_SPECS[0][0], FIRSTHIT_SPECS[1][0], FIRSTHIT_SPECS[2][0]
+    assert g0 == "firsthit_down_v1"
+    assert g1 == "firsthit_down_body_v1"
+    assert g3 == "firsthit_down_chg_v1"
     assert g0 in SHADOW_BENCH
     assert g1 in SHADOW_BENCH
     assert g3 in SHADOW_BENCH

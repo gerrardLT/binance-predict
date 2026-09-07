@@ -1,0 +1,247 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-09-06T16:40:00Z",
+  "title": "Design System: binance-predict 实盘监控台",
+  "extensions": {
+    "colorMeta": {
+      "brand": {
+        "role": "primary",
+        "displayName": "Atoms 品牌蓝",
+        "canonical": "#4267FF",
+        "tonalRamp": ["#0B1B4D", "#142C7A", "#1F3FA8", "#2F54EB", "#4267FF", "#7C93FF", "#B3C0FF", "#E4E9FF"]
+      },
+      "ink-black": {
+        "role": "neutral",
+        "displayName": "墨黑",
+        "canonical": "#0C0C0C",
+        "tonalRamp": ["#0C0C0C", "#232324", "#3A3A3C", "#55555A", "#7A7A80", "#A3A3A8", "#D0D0D3", "#F6F6F6"]
+      },
+      "positive": {
+        "role": "semantic",
+        "displayName": "涨/盈利绿",
+        "canonical": "#34A853",
+        "tonalRamp": ["#0E3318", "#17522A", "#22753C", "#34A853", "#5BBE75", "#8AD49C", "#BCE9C7", "#EAF7EE"]
+      },
+      "negative": {
+        "role": "semantic",
+        "displayName": "跌/亏损红",
+        "canonical": "#D64545",
+        "tonalRamp": ["#451212", "#6E1D1D", "#A32C2C", "#D64545", "#E07171", "#EB9D9D", "#F5C9C9", "#FCEEEE"]
+      },
+      "warning": {
+        "role": "semantic",
+        "displayName": "待定琥珀",
+        "canonical": "#E8A33D",
+        "tonalRamp": ["#4A3110", "#75501A", "#A8762A", "#E8A33D", "#EEB868", "#F4CE93", "#F9E3BE", "#FDF6EA"]
+      },
+      "violet": {
+        "role": "semantic",
+        "displayName": "影子紫",
+        "canonical": "#B57EDC",
+        "tonalRamp": ["#38234A", "#573673", "#7C4EA3", "#B57EDC", "#C69BE5", "#D7B8ED", "#E8D5F5", "#F7F1FC"]
+      },
+      "indigo": {
+        "role": "semantic",
+        "displayName": "场景靛蓝",
+        "canonical": "#7C86D8",
+        "tonalRamp": ["#21264F", "#343B7C", "#4E58AF", "#7C86D8", "#99A1E3", "#B6BCED", "#D3D6F6", "#F0F1FC"]
+      },
+      "bg-base": {
+        "role": "neutral",
+        "displayName": "底灰",
+        "canonical": "#F6F6F6",
+        "tonalRamp": ["#16171D", "#2E303A", "#5A5C66", "#8E9099", "#BCBDC2", "#DCDCDF", "#F0F0F1", "#F6F6F6"]
+      }
+    },
+    "typographyMeta": {
+      "headline": { "displayName": "Headline", "purpose": "tab 内一级区块标题。≤1024px 降为 20px。" },
+      "title": { "displayName": "Title", "purpose": "卡片标题（Card 的 h2）。界面里最常见的标题层级。" },
+      "body": { "displayName": "Body", "purpose": "正文、表格单元格、说明文字。" },
+      "label": { "displayName": "Label", "purpose": "徽章文字、表头、字段名、单位。" },
+      "numeric": { "displayName": "Numeric", "purpose": "金额、价格、胜率、盈亏、EV、时间戳。等宽 + tabular-nums，保证纵向对齐。" }
+    },
+    "shadows": [],
+    "motion": [
+      {
+        "name": "ease-standard",
+        "value": "cubic-bezier(0.4, 0, 0.2, 1)",
+        "purpose": "atoms 实测的按钮通用过渡曲线（BEHAVIORS.md:57）。所有状态变化共用。"
+      },
+      {
+        "name": "duration-control",
+        "value": "0.2s",
+        "purpose": "按钮/tab/链接/输入框的 color、background-color、border-color 过渡时长。atoms 实测值。"
+      },
+      {
+        "name": "duration-reveal",
+        "value": "0.35s",
+        "purpose": "首次进入视口的淡入（opacity 0→1），不回放。atoms .transitionnode.fade 的实测区间为 300–500ms，取中值。"
+      },
+      {
+        "name": "ban-ambient",
+        "value": "none",
+        "purpose": "禁止无限循环动画、marquee、呼吸、shimmer、发光脉冲。轮询驱动的数据面板中，持续动效会与数据刷新竞争注意力。"
+      }
+    ],
+    "breakpoints": [
+      { "name": "md", "value": "768px" },
+      { "name": "lg", "value": "1024px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "区域内唯一的主动作：登录、同步、提交测试单、领取。一屏内蓝色块不超过 3 处（One Blue Rule）。",
+      "html": "<button class=\"ds-btn-primary\">同步币安订单</button>",
+      "css": ".ds-btn-primary { background: #4267FF; color: #fff; font-family: 'IBM Plex Sans', 'PingFang SC', 'Microsoft YaHei', sans-serif; font-size: 14px; font-weight: 500; line-height: 24px; padding: 6px 16px; border: none; border-radius: 9999px; cursor: pointer; transition: color 0.2s cubic-bezier(0.4,0,0.2,1), background-color 0.2s cubic-bezier(0.4,0,0.2,1), border-color 0.2s cubic-bezier(0.4,0,0.2,1); } .ds-btn-primary:hover { background: #2F54EB; } .ds-btn-primary:focus-visible { outline: none; box-shadow: 0 0 0 2px #fff, 0 0 0 4px #E4E9FF; } .ds-btn-primary:disabled { background: #F0F0F1; color: rgba(12,12,12,0.40); cursor: not-allowed; }"
+    },
+    {
+      "name": "Dark Button",
+      "kind": "button",
+      "refersTo": "button-dark",
+      "description": "次级但需要分量的动作。atoms 的黑底按钮形态。",
+      "html": "<button class=\"ds-btn-dark\">导出 CSV</button>",
+      "css": ".ds-btn-dark { background: #0C0C0C; color: rgba(255,255,255,0.95); font-family: 'IBM Plex Sans', 'PingFang SC', 'Microsoft YaHei', sans-serif; font-size: 14px; font-weight: 500; line-height: 24px; padding: 6px 16px; border: 1px solid rgba(12,12,12,0.55); border-radius: 9999px; cursor: pointer; transition: color 0.2s cubic-bezier(0.4,0,0.2,1), background-color 0.2s cubic-bezier(0.4,0,0.2,1); } .ds-btn-dark:hover { background: #232324; } .ds-btn-dark:focus-visible { outline: none; box-shadow: 0 0 0 2px #fff, 0 0 0 4px rgba(12,12,12,0.40); }"
+    },
+    {
+      "name": "Ghost Button",
+      "kind": "button",
+      "refersTo": "button-ghost",
+      "description": "最轻的动作。hover 行为取自 atoms nav 链接实测：文本不透明度降到 0.55。",
+      "html": "<button class=\"ds-btn-ghost\">取消</button>",
+      "css": ".ds-btn-ghost { background: transparent; color: rgba(12,12,12,0.95); font-family: 'IBM Plex Sans', 'PingFang SC', 'Microsoft YaHei', sans-serif; font-size: 14px; font-weight: 500; line-height: 24px; padding: 6px 16px; border: none; border-radius: 9999px; cursor: pointer; transition: color 0.2s cubic-bezier(0.4,0,0.2,1); } .ds-btn-ghost:hover { color: rgba(12,12,12,0.55); } .ds-btn-ghost:focus-visible { outline: none; box-shadow: 0 0 0 2px #E4E9FF; }"
+    },
+    {
+      "name": "Tab Bar",
+      "kind": "nav",
+      "refersTo": "tab-item-active",
+      "description": "五个 tab 的主导航。选中态用白底而非蓝色填充——白底在灰底上已足够清楚，且守住 One Blue Rule。",
+      "html": "<nav class=\"ds-tabs\"><button class=\"ds-tab ds-tab-active\">实盘交易</button><button class=\"ds-tab\">信号分析</button><button class=\"ds-tab\">运行监控</button></nav>",
+      "css": ".ds-tabs { display: flex; gap: 4px; padding: 4px; background: #F6F6F6; border-radius: 9999px; } .ds-tab { background: transparent; color: rgba(12,12,12,0.55); font-family: 'IBM Plex Sans', 'PingFang SC', 'Microsoft YaHei', sans-serif; font-size: 14px; font-weight: 500; line-height: 24px; padding: 6px 16px; border: none; border-radius: 9999px; cursor: pointer; transition: color 0.2s cubic-bezier(0.4,0,0.2,1), background-color 0.2s cubic-bezier(0.4,0,0.2,1); } .ds-tab:hover { color: rgba(12,12,12,0.40); } .ds-tab-active { background: #FFFFFF; color: rgba(12,12,12,0.95); } .ds-tab-active:hover { color: rgba(12,12,12,0.95); } .ds-tab:focus-visible { outline: none; box-shadow: 0 0 0 2px #E4E9FF; }"
+    },
+    {
+      "name": "Card",
+      "kind": "card",
+      "refersTo": "card",
+      "description": "界面最主要的容器。完全平坦：无阴影、无 hover 态（atoms 实测卡片 hover 前后计算样式完全一致）。深度只靠白面浮在灰底上。",
+      "html": "<section class=\"ds-card\"><header class=\"ds-card-head\"><h2 class=\"ds-card-title\">通道盈亏曲线</h2></header><div class=\"ds-card-body\">内容</div></section>",
+      "css": ".ds-card { background: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 16px; display: flex; flex-direction: column; overflow: hidden; } .ds-card-head { padding: 8px 16px; border-bottom: 1px solid #F0F0F1; flex-shrink: 0; } .ds-card-title { margin: 0; font-family: 'IBM Plex Sans', 'PingFang SC', 'Microsoft YaHei', sans-serif; font-size: 14px; font-weight: 600; line-height: 1.4; color: rgba(12,12,12,0.95); } .ds-card-body { padding: 16px; flex: 1 1 auto; min-height: 0; overflow: auto; }"
+    },
+    {
+      "name": "Direction Badge",
+      "kind": "chip",
+      "refersTo": "badge-up",
+      "description": "UP/DOWN 方向徽章。语义色映射冻结（Semantic Freeze Rule）：UP=绿、DOWN=红。箭头与文字必须保留，语义色不能是唯一信息通道。",
+      "html": "<span class=\"ds-badge ds-badge-up\">↑ 看涨</span> <span class=\"ds-badge ds-badge-down\">↓ 看跌</span> <span class=\"ds-badge ds-badge-neutral\">⊘ 不交易</span>",
+      "css": ".ds-badge { display: inline-block; font-family: 'IBM Plex Sans', 'PingFang SC', 'Microsoft YaHei', sans-serif; font-size: 11px; font-weight: 500; line-height: 1.4; letter-spacing: 0.1px; padding: 2px 8px; border-radius: 9999px; white-space: nowrap; } .ds-badge-up { background: rgba(52,168,83,0.10); color: #34A853; } .ds-badge-down { background: rgba(214,69,69,0.10); color: #D64545; } .ds-badge-neutral { background: #F0F0F1; color: rgba(12,12,12,0.55); }"
+    },
+    {
+      "name": "Numeric Readout",
+      "kind": "custom",
+      "refersTo": "numeric",
+      "description": "金额/胜率/盈亏的标准读数形态。等宽 + tabular-nums 保证纵向对齐（Tabular Numerals Rule）；单位退到墨 55 且小一档（Unit Recede Rule）。",
+      "html": "<div class=\"ds-readout\"><span class=\"ds-readout-label\">累计净利</span><span class=\"ds-readout-value ds-pos\">+153.83<span class=\"ds-readout-unit\">U</span></span></div>",
+      "css": ".ds-readout { display: flex; flex-direction: column; gap: 4px; } .ds-readout-label { font-family: 'IBM Plex Sans', 'PingFang SC', 'Microsoft YaHei', sans-serif; font-size: 11px; font-weight: 500; letter-spacing: 0.1px; color: rgba(12,12,12,0.55); } .ds-readout-value { font-family: 'IBM Plex Mono', ui-monospace, Consolas, monospace; font-size: 20px; font-weight: 500; line-height: 1.2; font-variant-numeric: tabular-nums; color: rgba(12,12,12,0.95); } .ds-readout-unit { margin-left: 2px; font-size: 13px; color: rgba(12,12,12,0.55); } .ds-pos { color: #34A853; } .ds-neg { color: #D64545; }"
+    },
+    {
+      "name": "Help Hint Tooltip",
+      "kind": "custom",
+      "refersTo": "tooltip",
+      "description": "AGENTS.md 要求保留的 ? 悬浮解释。浮层靠 ink-black 反白脱离页面层级，不用阴影。必须保留键盘可触发（tabIndex + focus-within）。",
+      "html": "<span class=\"ds-hint\"><span class=\"ds-hint-trigger\" tabindex=\"0\">?</span><span class=\"ds-hint-bubble\">x4_v2 情绪错位·平静市门禁版：5m 窗口收阳且 end_pct≤40、过去 1 小时波动 &lt;0.5% 时，押次窗 DOWN。</span></span>",
+      "css": ".ds-hint { position: relative; display: inline-flex; align-items: center; } .ds-hint-trigger { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; border: 1px solid #E5E7EB; border-radius: 9999px; font-family: 'IBM Plex Sans', 'PingFang SC', 'Microsoft YaHei', sans-serif; font-size: 11px; font-weight: 700; line-height: 1; color: rgba(12,12,12,0.55); cursor: help; user-select: none; transition: color 0.2s cubic-bezier(0.4,0,0.2,1), border-color 0.2s cubic-bezier(0.4,0,0.2,1); } .ds-hint-trigger:hover, .ds-hint-trigger:focus-visible { color: rgba(12,12,12,0.95); border-color: rgba(12,12,12,0.40); outline: none; } .ds-hint-bubble { position: absolute; right: 0; bottom: 100%; margin-bottom: 6px; width: 288px; padding: 8px 12px; background: #0C0C0C; color: rgba(255,255,255,0.95); border-radius: 8px; font-family: 'IBM Plex Sans', 'PingFang SC', 'Microsoft YaHei', sans-serif; font-size: 13px; line-height: 1.6; text-align: left; white-space: normal; opacity: 0; visibility: hidden; transition: opacity 0.2s cubic-bezier(0.4,0,0.2,1), visibility 0.2s; z-index: 30; } .ds-hint:hover .ds-hint-bubble, .ds-hint:focus-within .ds-hint-bubble { opacity: 1; visibility: visible; }"
+    },
+    {
+      "name": "Input",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "数值输入（金额、护栏、日限）用等宽右对齐。focus 用品牌蓝描边 + brand-soft 外环，不用发光不用阴影。",
+      "html": "<label class=\"ds-field\"><span class=\"ds-field-label\">单笔金额 (USDT)</span><input class=\"ds-input ds-input-numeric\" value=\"10.0\" /></label>",
+      "css": ".ds-field { display: flex; flex-direction: column; gap: 4px; } .ds-field-label { font-family: 'IBM Plex Sans', 'PingFang SC', 'Microsoft YaHei', sans-serif; font-size: 11px; font-weight: 500; letter-spacing: 0.1px; color: rgba(12,12,12,0.55); } .ds-input { background: #FFFFFF; color: rgba(12,12,12,0.95); border: 1px solid #E5E7EB; border-radius: 8px; padding: 6px 12px; font-family: 'IBM Plex Sans', 'PingFang SC', 'Microsoft YaHei', sans-serif; font-size: 14px; line-height: 21px; transition: border-color 0.2s cubic-bezier(0.4,0,0.2,1), box-shadow 0.2s cubic-bezier(0.4,0,0.2,1); } .ds-input::placeholder { color: rgba(12,12,12,0.40); } .ds-input:hover { border-color: rgba(12,12,12,0.40); } .ds-input:focus { outline: none; border-color: #4267FF; box-shadow: 0 0 0 2px #E4E9FF; } .ds-input:disabled { background: #F0F0F1; color: rgba(12,12,12,0.40); cursor: not-allowed; } .ds-input-numeric { font-family: 'IBM Plex Mono', ui-monospace, Consolas, monospace; font-variant-numeric: tabular-nums; text-align: right; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "静默仪表盘 The Quiet Instrument",
+    "overview": "这是一台读数仪器，不是一块营销版面。它的价值全部在于让操盘者在几秒内准确读到「系统现在在做什么、赚还是亏、有没有异常」，因此视觉系统的任务是消除一切与读数无关的东西，而不是增添吸引力。\n\n设计语言来自 atoms.dev（2026-08-22 由用户确认绑定）。atoms 的语言本质是克制的：浅灰底 #F6F6F6、纯白面、三级墨色、唯一一个品牌蓝 #4267FF、pill 形按钮、16/24px 圆角，以及实测确认的卡片无阴影、无 hover 态。这套语言天然适合 Operate 模式：它不制造视觉噪音，把注意力让给内容。\n\n本系统在这套语言上叠加一条自己的纪律：所有数值走等宽字体。一个显示金额、胜率、价格、盈亏的界面，数字必须纵向对齐才可比读；比例字体下 +7.11 与 +160.04 的字符宽度不同，会破坏扫读。IBM Plex Mono 本来就是 atoms 语言的一部分，这里把它提升为数值的主字体。",
+    "keyCharacteristics": [
+      "完全平坦：无阴影、无渐变、无玻璃拟态、无发光边缘。深度只靠白面/灰底的色调分层传达",
+      "三级墨色承担全部文字层级，不引入第四级灰",
+      "品牌蓝是唯一的强调色，只用于「可操作」与「当前选中」",
+      "语义色（涨跌/盈亏/状态）是事实层，映射固定不可翻转",
+      "数值一律等宽；文字一律 IBM Plex Sans + 显式中文回退栈",
+      "卡片静止：hover 不改变卡片本身，只有可点击元素有过渡"
+    ],
+    "rules": [
+      {
+        "name": "The One Blue Rule",
+        "body": "品牌蓝 #4267FF 只出现在两类地方：可操作元素（按钮、链接、可点击行）与当前选中态（active tab、选中筛选项）。一屏之内蓝色块不超过 3 处。蓝色一旦用于装饰或强调普通文本，它就失去了「这里能点」的含义。",
+        "section": "colors"
+      },
+      {
+        "name": "The Semantic Freeze Rule",
+        "body": "UP=绿、DOWN=红、盈=绿、亏=红、实盘=绿、影子=紫、场景=蓝——这些映射是事实层，任何视觉改造都不得翻转或重新分配。改的是色值（饱和度/明度对齐 atoms），不是含义。",
+        "section": "colors"
+      },
+      {
+        "name": "The No-Fourth-Gray Rule",
+        "body": "文字层级只有墨 95 / 80 / 55 / 40 四级，不再有第五级。原实现里 text-gray-300..900 七级灰阶是随手取值的结果，收敛到四级后层级关系反而更清楚。",
+        "section": "colors"
+      },
+      {
+        "name": "The Eleven-Series Rule",
+        "body": "第 11 条及以后的曲线不新增颜色，而是复用 chart-1..10 并以 strokeOpacity 0.55 + strokeWidth 1.5 区分（前十条为 1 / 2）。2026-09-07 修订：原方案是叠加 strokeDasharray=\"5 3\"，但 dash 在影子图/场景图里已是语义通道（虚线 5 4=回测冻结基准、点线 1 3=盈亏平衡），叠加会让第 11 条主曲线与基准线不可区分。配套要求：表格侧的版本名与图例圆点必须同序淡化，否则图表与表格对不上号。",
+        "section": "colors"
+      },
+      {
+        "name": "The Tabular Numerals Rule",
+        "body": "任何会被纵向比读的数字——金额、价格、胜率、pnl、EV、样本量、时间戳——必须用 IBM Plex Mono 并开启 font-variant-numeric: tabular-nums。理由不是美学：比例字体下同一列的数字无法对齐，操盘者必须逐行重读小数点位置。",
+        "section": "typography"
+      },
+      {
+        "name": "The Unit Recede Rule",
+        "body": "单位（U、%、USDT、单）用墨 55、比数值小一档，且与数值之间留 2px。数值是内容，单位是注释。",
+        "section": "typography"
+      },
+      {
+        "name": "The Heading Air Rule",
+        "body": "标题上方的空间必须大于下方。标题属于它引导的那段内容，不属于上一段。",
+        "section": "layout"
+      },
+      {
+        "name": "The Flat-By-Default Rule",
+        "body": "表面静止时一律平坦。没有任何元素因为 hover、focus 或数据更新而获得阴影或位移。",
+        "section": "elevation"
+      },
+      {
+        "name": "The Three-Tone Rule",
+        "body": "深度只有三个明度档：底灰 / 面白 / 凹陷灰。需要第四层时，说明信息结构有问题，应该重新分组而不是再加一层。",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do 所有颜色走 CSS 变量 token（--color-* / --ink-* / --bg-* / --border-*），使暗色模式能在一处统一重映射。这是修复暗色模式的唯一途径——当前 App.tsx 里 0 个 dark: 变体、533 处写死浅色灰阶，暗色下必然破碎",
+      "Do 用四级墨色（95/80/55/40）表达文字层级，不用 Tailwind 的 gray-300..900",
+      "Do 所有纵向比读的数字用 IBM Plex Mono + tabular-nums",
+      "Do 保留徽章里的箭头/文字冗余（↑ 看涨），让语义色不是唯一信息通道",
+      "Do 保留 HelpHint 的 tabIndex={0} + group-focus-within，键盘可触发",
+      "Do 卡片保持静止：无 hover 阴影、无 hover 位移、无 hover 边框变色",
+      "Do 中文回退栈显式写全 \"PingFang SC\", \"Microsoft YaHei\"",
+      "Do 新组件继续写进 frontend/src/App.tsx，沿用「分块注释 + 就近放置」格局（用户已确认本次不拆目录）"
+    ],
+    "donts": [
+      "Don't 使用 shadow-sm / shadow-xl / 任何 box-shadow。本系统完全平坦",
+      "Don't 翻转语义色映射（UP 绿 / DOWN 红 / 实盘 绿 / 影子 紫 / 场景 蓝）。这是事实层",
+      "Don't 用品牌蓝做装饰、强调普通文本、或作图表的主色序列。蓝色只表示「可操作」与「当前选中」，一屏不超过 3 处",
+      "Don't 引入第四级灰或第五级墨色",
+      "Don't 使用 rounded（4px）与 rounded-md（6px）。圆角只有 pill / 24 / 16 / 8 四档",
+      "Don't 迁移 atoms.dev 的任何营销组件（pricing / FAQ / final-CTA / trust-logos / footer / hero-chat / ai-team-carousel）。用户 2026-08-22 明确排除",
+      "Don't 改 SHADOW_META / SCENE_META 的 label 字段。dataKey 就是 label，改了会同时改曲线与图例",
+      "Don't 删除 SIGNAL_INFO 里已退役通道的条目。历史订单行仍带这些 signal_version",
+      "Don't 添加无限循环动画、环境动效、marquee、呼吸效果。轮询驱动的数据面板中持续动效会与数据刷新竞争注意力",
+      "Don't 用渐变、玻璃拟态（backdrop-filter）、发光边缘",
+      "Don't 改动基础字号（:root 18px）。这是用户明确保留的偏差，动它会把回归面扩大到每一个面板"
+    ]
+  }
+}

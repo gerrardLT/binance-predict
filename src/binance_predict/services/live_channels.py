@@ -166,6 +166,33 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
         "firsthit_down_chg_v1", "firsthit", "5m", "DOWN", 0.09,
         "首触G3偏离 chg≤+2.82bp（押DOWN）",
     ),
+    # G7 族（2026-09-08 影子+实盘接入）：G7 纯组合基底及 5 个科学变体
+    # 护栏设置依据：回测中均值触发价约 0.068~0.075，盈亏平衡平衡价 wr*0.98（胜率 18%~24% 对应 0.17~0.23）；
+    # 取值保持极度保守（只吃深折价优质单）：基底 0.10；streak 0.10；wick20 0.12；strict 0.12；q05 0.05；t270 0.10。
+    "firsthit_down_g7_v1": ChannelSpec(
+        "firsthit_down_g7_v1", "firsthit", "5m", "DOWN", 0.10,
+        "首触G7基底 body_r≤0.35∧wick=1（押DOWN）",
+    ),
+    "g7_streak_v1": ChannelSpec(
+        "g7_streak_v1", "firsthit", "5m", "DOWN", 0.10,
+        "首触G7+非强连阳 streak_up≤1（押DOWN）",
+    ),
+    "g7_wick20_v1": ChannelSpec(
+        "g7_wick20_v1", "firsthit", "5m", "DOWN", 0.12,
+        "首触G7+长上影 upper_wick≥2bp（押DOWN）",
+    ),
+    "g7_strict_v1": ChannelSpec(
+        "g7_strict_v1", "firsthit", "5m", "DOWN", 0.12,
+        "首触G7严格版 streak≤1∧wick≥1.5bp（押DOWN）",
+    ),
+    "g7_q05_v1": ChannelSpec(
+        "g7_q05_v1", "firsthit", "5m", "DOWN", 0.05,
+        "首触G7+深折价 q≤0.05（押DOWN）",
+    ),
+    "g7_t270_v1": ChannelSpec(
+        "g7_t270_v1", "firsthit", "5m", "DOWN", 0.10,
+        "首触G7+非极晚 t≤270s（押DOWN）",
+    ),
 }
 
 

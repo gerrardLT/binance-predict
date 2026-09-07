@@ -724,6 +724,42 @@ const SIGNAL_INFO: Record<string, { name: string; kind: '实盘' | '影子' | '�
     name: '吸收跟随·TD150（随BTC方向）', kind: '影子', liveOk: true,
     desc: '同 TD120 机制，TD=窗开 150s（多给 30s 让报价反应，触发更少、欠反应更纯）。真实价复核 RECENT EV +0.105 CI[+0.050,+0.165]（胜率 88.5%）；护栏 0.86（88.5%×0.98 下方）。与 TD120 同窗互斥（至多一单成交）。',
   },
+  firsthit_down_v1: {
+    name: '首触G0基底（押DOWN）', kind: '影子', liveOk: true,
+    desc: '5m 窗内 DOWN 报价首次进入 (0.005,0.1] → 买 DOWN；实时重放本窗完整历史，只认真实第一触。默认关闭；开启后每通道每窗至多一单。G0/G1/G3 为用户确认的独立下单通道，同窗三门全中且全开启时最多 3 单。执行价护栏 0.08，实际成交均价高于护栏弃单，不追价。',
+  },
+  firsthit_down_body_v1: {
+    name: '首触G1小实体（押DOWN）', kind: '影子', liveOk: true,
+    desc: 'G0 + body_r≤0.35（首触前 BTC 路径归一实体小，震荡而非单边跑出去）。默认关闭；与 G0/G3 独立下单，不做跨版本互斥，每通道每窗至多一单。执行价护栏 0.12，实际成交均价高于护栏弃单。confirm 段已 burned，护栏非前向胜率背书。',
+  },
+  firsthit_down_chg_v1: {
+    name: '首触G3偏离（押DOWN）', kind: '影子', liveOk: true,
+    desc: 'G0 + chg≤+2.82bp（首触时 BTC 相对窗开盘涨幅有限，深折价更像报价错杀而非信息驱动）。默认关闭；与 G0/G1 独立下单，不做跨版本互斥，每通道每窗至多一单。执行价护栏 0.09，实际成交均价高于护栏弃单。confirm 段已 burned，护栏非前向胜率背书。',
+  },
+  firsthit_down_g7_v1: {
+    name: '首触G7基底（押DOWN）', kind: '影子', liveOk: true,
+    desc: 'G0 + 小实体(body_r≤0.35) ∧ 上影拒绝(wick01=1)。40d 全量回测胜率 19%~20%，EV +1.98~+2.34（FDR q=0.0002）。默认关闭，执行价护栏 0.10，每通道每窗至多一单。',
+  },
+  g7_streak_v1: {
+    name: '首触G7+非强连阳（押DOWN）', kind: '影子', liveOk: true,
+    desc: 'G7 组合 + 前驱 5m 连阳≤1 根（排除多头单边大势逆势送命）。回测胜率 18.2%~20.0%，日均 5.1 单，FDR q=0.0004。默认关闭，执行价护栏 0.10，每通道每窗至多一单。',
+  },
+  g7_wick20_v1: {
+    name: '首触G7+长上影（押DOWN）', kind: '影子', liveOk: true,
+    desc: 'G7 组合 + 上影线长度≥2.0bp（密集高位拒绝）。回测胜率 17.8%~24.1%，EV +1.84~+3.06。默认关闭，执行价护栏 0.12，每通道每窗至多一单。',
+  },
+  g7_strict_v1: {
+    name: '首触G7严格版（押DOWN）', kind: '影子', liveOk: true,
+    desc: 'G7 组合 + streak≤1 ∧ upper_wick≥1.5bp。双重强化，回测胜率 20.8%~23.0%，EV +2.68~+3.27。默认关闭，执行价护栏 0.12，每通道每窗至多一单。',
+  },
+  g7_q05_v1: {
+    name: '首触G7+深折价（押DOWN）', kind: '影子', liveOk: true,
+    desc: 'G7 组合 + 进场报价 q≤0.05（极端赔率凸性档）。回测单注 EV +4.10~+5.77。默认关闭，执行价护栏 0.05，每通道每窗至多一单。',
+  },
+  g7_t270_v1: {
+    name: '首触G7+非极晚（押DOWN）', kind: '影子', liveOk: true,
+    desc: 'G7 组合 + 触发时刻 t≤270s（保留均值回归扩散时间窗口）。回测胜率 27.9%~30.4%，EV +3.08~+4.41。默认关闭，执行价护栏 0.10，每通道每窗至多一单。',
+  },
 }
 
 /* ==========================================================================
@@ -4334,10 +4370,16 @@ const SHADOW_META: Record<string, { label: string; color: string }> = {
   absorption_follow_td150_v1: { label: '吸收跟随 TD150 欠反应→顺势', color: 'var(--chart-10)' },
   s2_cond_t4_v1: { label: 'S2条件 t=4价<开→UP', color: 'var(--chart-1)' },
   s2_cond_t5d_v1: { label: 'S2条件 t=5剔深→UP', color: 'var(--chart-2)' },
-  // 2026-09-07 首触反转族（专用表 firsthit_shadow_signals，纯影子不下注）
+  // 2026-09-07/08 首触反转族（专用表 firsthit_shadow_signals，影子+实盘通道）
   firsthit_down_v1: { label: '首触G0 基底 q∈(0.005,0.1]→DOWN', color: 'var(--chart-3)' },
   firsthit_down_body_v1: { label: '首触G1 body_r≤0.35→DOWN', color: 'var(--chart-4)' },
   firsthit_down_chg_v1: { label: '首触G3 chg≤+2.82bp→DOWN', color: 'var(--chart-5)' },
+  firsthit_down_g7_v1: { label: '首触G7 基底 body≤0.35∧wick=1→DOWN', color: 'var(--chart-6)' },
+  g7_streak_v1: { label: '首触G7 非强连阳 streak≤1→DOWN', color: 'var(--chart-7)' },
+  g7_wick20_v1: { label: '首触G7 长上影 wick≥2bp→DOWN', color: 'var(--chart-8)' },
+  g7_strict_v1: { label: '首触G7 严格版 streak≤1∧wick≥1.5bp→DOWN', color: 'var(--chart-9)' },
+  g7_q05_v1: { label: '首触G7 深折价 q≤0.05→DOWN', color: 'var(--chart-10)' },
+  g7_t270_v1: { label: '首触G7 非极晚 t≤270s→DOWN', color: 'var(--chart-1)' },
 }
 /* 场景曲线色 = chart-1..5。
    注意：label 是 recharts 的 dataKey 本身，改 label 会同时改曲线与图例（AGENTS.md 明示），
@@ -4379,6 +4421,12 @@ const ANALYTICS_EXTRA_DESC: Record<string, string> = {
   firsthit_down_v1: '首触反转 G0 基底（对照组）：5m 窗内 DOWN token 报价**首次**进入 (0.005, 0.1]（深折价，市场判定几乎不会跌）的采样点 → 按该时刻真实报价买 DOWN，押注最终结算 DOWN =「反转」的影子信号，仅记录不下单。触发时刻特征严格 ex-ante（只读 ≤触发时刻采样）：chg_bps（BTC 相对开盘涨跌）、body_r（|btc@触−开盘|/路径 max−min 归一实体）、npts（路径采样点数，<8 整窗不落表=路径太稀疏特征不可信）。落专用表 firsthit_shadow_signals，G1/G3 为 G0 的纯子集（同表 version 隔离、全特征落库，交叉门 G4=body∧chg 可事后重构）。44d 回测基底 EV +0.22（日聚类 CI[+0.10,+0.35]），EV 按逐事件真实触发价现算：赢 0.98/q−1 / 输 −1（禁用任何均值/分位代理）。预注册裁决（4 周前向）：若 G0 前向 EV 日聚类 CI **上界** < 0 → DOWN 侧 edge 消失，整族否决重来。',
   firsthit_down_body_v1: '首触反转 G1 小实体：G0 基底 + body_r ≤ 0.35 门禁（触发时刻 BTC 相对开盘的净位移只占窗内路径振幅的 ≤35%，即价格来回震荡而非单边跑出去）→ 按首触时刻真实 DOWN 报价买 DOWN 的影子信号，仅记录不下单。研究口径：45 维条件扫描中 body_r≤0.35 是唯一扛住 FDR 多重校正的形态门（q=0.007，logit 控 t+t² 后 β=+1.28 p=0.000），排除时间分段混淆。严格 ex-ante 时间切分两段考试：calib EV +1.44 → confirm EV +1.59（两段日聚类 CI 下界均 > 0）。落专用表 firsthit_shadow_signals（G0 纯子集，version 隔离），EV 逐事件真实触发价现算：赢 0.98/q−1 / 输 −1。预注册裁决（4 周前向）：通过 = 前向触发率 P ≥ 12% 且 EV 日聚类 CI 下界 > 0。',
   firsthit_down_chg_v1: '首触反转 G3 价格偏离：G0 基底 + chg_bps ≤ +2.82bp 门禁（触发时刻 BTC 相对窗开盘涨幅不超过 +2.82 个基点，即深折价并非由 BTC 真涨造成，属报价错杀而非信息驱动）→ 按首触时刻真实 DOWN 报价买 DOWN 的影子信号，仅记录不下单。研究口径：logit 控 t+t² 后 β=+0.07 p=0.000（chg 越低反转概率越高，单调）。严格 ex-ante 时间切分两段考试：calib EV +0.39 → confirm EV +0.97（confirm 段更强但样本少）。落专用表 firsthit_shadow_signals（G0 纯子集，version 隔离），EV 逐事件真实触发价现算：赢 0.98/q−1 / 输 −1。预注册裁决（4 周前向）：通过 = 前向触发率 P ≥ 10% 且 EV 日聚类 CI 下界 > 0。',
+  firsthit_down_g7_v1: '首触反转 G7 基底：G0 基底 + body_r≤0.35（小实体）∧ wick01=1.0（上影拒绝），捕捉冲高受阻回落反转。40d 全量回测 Calib 胜率 18.8% (EV +2.34)，Confirm 盲测 20.0% (EV +1.98，CI[+0.45,+3.46])，FDR q=0.0002。日均 ~6.5 单。落专用表 firsthit_shadow_signals。实盘护栏 0.10。',
+  g7_streak_v1: '首触反转 G7 非强连阳：G7 组合 + 排除大级别连续多头单边（前驱 5m 连阳数 streak_up≤1 根）。回测 Calib 胜率 20.0% (EV +2.86)，Confirm 胜率 18.2% (EV +1.92，CI[+0.45,+3.30])，FDR q=0.0004，日均 5.1 单。落专用表 firsthit_shadow_signals。实盘护栏 0.10。',
+  g7_wick20_v1: '首触反转 G7 长上影：G7 组合 + 显著上影线拒绝 upper_wick_bps≥2.0bp。多头更深力竭，回测 Confirm 胜率 24.1% (EV +3.06，CI[+0.94,+5.09])，FDR q=0.0304，日均 ~3.2 单。落专用表 firsthit_shadow_signals。实盘护栏 0.12。',
+  g7_strict_v1: '首触反转 G7 严格版：G7 组合 + streak_up≤1 ∧ upper_wick_bps≥1.5bp。双重质量门，回测 Calib 胜率 23.0% (EV +3.27)，Confirm 胜率 20.8% (EV +2.68，CI[+0.68,+4.51])，FDR q=0.0030，日均 ~2.9 单。落专用表 firsthit_shadow_signals。实盘护栏 0.12。',
+  g7_q05_v1: '首触反转 G7 深折价：G7 组合 + 进场报价 q≤0.05（极端凸性赔率档，单注赢付 >18.6x）。回测单注 EV +4.10~+5.77，日均 ~1.3 单。落专用表 firsthit_shadow_signals。实盘护栏 0.05。',
+  g7_t270_v1: '首触反转 G7 非极晚：G7 组合 + 触发时刻 t≤270s（排除最后 30s 缺乏均值回归扩散时间的毒瘤窗）。回测 Confirm 胜率 30.4% (EV +3.08)，FDR q=0.0002，日均 ~2.1 单。落专用表 firsthit_shadow_signals。实盘护栏 0.10。',
 }
 const signalDescFor = (kind: 'scene' | 'shadow', key: string): string => {
   if (ANALYTICS_EXTRA_DESC[key]) return ANALYTICS_EXTRA_DESC[key]

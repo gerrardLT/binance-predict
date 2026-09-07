@@ -181,12 +181,12 @@ def _stub_select_db(monkeypatch, rows: list) -> None:
 # ============================================================
 
 def test_parse_defaults_all_off(monkeypatch) -> None:
-    """默认：全 16 在线通道 OFF、金额/日限取全局默认（用户拍板 2U / 100 单）。"""
+    """默认：全 22 在线通道 OFF、金额/日限取全局默认（用户拍板 2U / 100 单）。"""
     monkeypatch.setattr(settings, "live_default_amount_usdt", 2.0)
     monkeypatch.setattr(settings, "live_default_max_daily_orders", 100)
     monkeypatch.setattr(settings, "live_channels_json", "")
     cfgs = parse_channel_config()
-    assert len(cfgs) == 16
+    assert len(cfgs) == 22
     assert all(not c.enabled for c in cfgs.values())
     assert all(c.amount_usdt == 2.0 for c in cfgs.values())
     assert all(c.max_daily_orders == 100 for c in cfgs.values())
@@ -279,7 +279,7 @@ def test_parse_non_int_daily_rejected(monkeypatch) -> None:
 
 
 def test_channels_registry_shape() -> None:
-    """注册表形状（2026-09-07 firsthit G0/G1/G3 注册后）：16 在线 + 8 退役，两者不交。"""
+    """注册表形状（2026-09-08 firsthit G7 系列注册后）：22 在线 + 8 退役，两者不交。"""
     assert set(LIVE_CHANNELS) == {
         "quote_contrarian_v2",
         "x4_v2",
@@ -293,6 +293,9 @@ def test_channels_registry_shape() -> None:
         "absorption_follow_td120_v1", "absorption_follow_td150_v1",
         # 2026-09-07 firsthit 三通道（默认全 OFF，用户确认独立下单）
         "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1",
+        # 2026-09-08 firsthit G7 系列六通道（默认全 OFF，用户确认独立下单）
+        "firsthit_down_g7_v1", "g7_streak_v1", "g7_wick20_v1",
+        "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",
     }
     assert set(RETIRED_CHANNELS) == {
         "quote_momentum_v1", "quote_contrarian_v1",
@@ -1631,6 +1634,71 @@ async def test_firsthit_does_not_look_ahead_past_current_sample(monkeypatch) -> 
     assert fake.calls[0]["prediction"] == "DOWN"
 
 
+@pytest.mark.asyncio
+async def test_firsthit_g7_series_all_fire(monkeypatch) -> None:
+    """G7 纯组合基底及 5 个变体在满足条件时均能正确开火，独立下单，参数符合护栏。"""
+    fake = _FakeTrader()
+    g7_channels = [
+        "firsthit_down_g7_v1", "g7_streak_v1", "g7_wick20_v1",
+        "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",
+    ]
+    t = _make_trader(monkeypatch, fake, channels=g7_channels)
+
+    # 模拟满足所有 G7 条件的采样：
+    # 1. q=0.04 (<=0.05，满足 q05);
+    # 2. t=120s (<=270s，满足 t270);
+    # 3. body_r=0.20 (<=0.35);
+    # 4. wick01=1.0 且 upper_wick_bps=2.5bp (>=2.0bp, 满足 wick20 和 strict);
+    # 5. npts >= 8.
+    dn_p = _firsthit_down_curve(trigger_q=0.04, npts=20, trigger_idx=8)
+    btc_p = [{"t": WINDOW_START, "v": 100.0}]
+    for i in range(1, 20):
+        ts = WINDOW_START + i * 15_000
+        if i <= 5:
+            v = 100.0 - i * 0.01  # 最低 99.95
+        elif i == 6:
+            v = 100.05           # 冲高留上影 (cum_hi = 100.05, 相对 100.0 涨 5bp)
+        elif i == 8:
+            v = 100.02           # 触发点 (upper_wick = 100.05 - 100.02 = 0.03 -> 3bp >= 2bp)
+        else:
+            v = 100.01
+        btc_p.append({"t": ts, "v": v})
+
+    # mock session 查前驱连阳返回 0 连阳（满足 streak_up <= 1）
+    class _DummySession:
+        async def execute(self, stmt):
+            res = MagicMock()
+            res.scalars.return_value.all.return_value = [-0.001]  # 前窗收阴 -> streak_up = 0
+            return res
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    import binance_predict.services.multi_live_trader as mlt_mod
+    monkeypatch.setattr(mlt_mod, "async_session_factory", lambda: _DummySession())
+
+    REL_T_SEC = 120
+    fired = t.check(WINDOW_START, WINDOW_END, WINDOW_START + REL_T_SEC * 1000,
+                    down_price=0.04, btc_price=100.02,
+                    window_entry_price=100.0,
+                    window_btc_curve=btc_p, window_down_curve=dn_p)
+    assert set(fired) == set(g7_channels)
+    await _drain(t)
+
+    assert len(fake.calls) == 6
+    called_channels = [c["signal_version"] for c in fake.calls]
+    assert set(called_channels) == set(g7_channels)
+    # 验证各通道护栏
+    guards = {c["signal_version"]: c.get("max_exec_price") for c in fake.calls}
+    assert guards["firsthit_down_g7_v1"] == 0.10
+    assert guards["g7_streak_v1"] == 0.10
+    assert guards["g7_wick20_v1"] == 0.12
+    assert guards["g7_strict_v1"] == 0.12
+    assert guards["g7_q05_v1"] == 0.05
+    assert guards["g7_t270_v1"] == 0.10
+
+
 # ============================================================
 # 组 7：set_channel 热调 / status / toggle 端点
 # ============================================================
@@ -1663,14 +1731,14 @@ def test_set_channel_daily_over_cap_rejected(monkeypatch) -> None:
 
 
 def test_status_shape(monkeypatch) -> None:
-    """status：24 通道全量（16 在线 + 8 退役 fixture）、enabled_any/defaults/amount_cap、单通道字段。"""
+    """status：30 通道全量（22 在线 + 8 退役 fixture）、enabled_any/defaults/amount_cap、单通道字段。"""
     t = _make_trader(monkeypatch, _FakeTrader(), channels=["quote_contrarian_v1"])
     s = t.status()
     assert s["enabled_any"] is True
     assert s["amount_cap"] == 50
     assert s["defaults"]["amount_usdt"] == 2.0
     assert s["defaults"]["max_daily_orders"] == 100
-    assert len(s["channels"]) == 24   # 新增 firsthit G0/G1/G3
+    assert len(s["channels"]) == 30   # 既有 24 + 新增 G7 系列 6 通道
     by = {c["channel"]: c for c in s["channels"]}
     c = by["quote_contrarian_v1"]
     assert c["enabled"] is True and c["enabled_at_startup"] is True

@@ -45,11 +45,17 @@ from binance_predict.db.engine import async_session_factory
 from binance_predict.db.models import FirstHitShadowSignal, SentimentWindow
 from binance_predict.services.shadow_version_gate import shadow_gate
 
-# ---- 冻结口径（local_shape_scan_v2.py v2，勿动）----
+# ---- 冻结口径（local_shape_scan_v2.py / G7 系列扫描）----
 FIRSTHIT_SPECS: list[tuple[str, str]] = [
     ("firsthit_down_v1", "G0 基底（全部首触）"),
     ("firsthit_down_body_v1", "G1 小实体 body_r≤0.35"),
     ("firsthit_down_chg_v1", "G3 价格偏离 chg≤+2.82bp"),
+    ("firsthit_down_g7_v1", "G7 纯组合基底 body_r≤0.35∧wick=1"),
+    ("g7_streak_v1", "G7+非强连阳 streak_up≤1"),
+    ("g7_wick20_v1", "G7+长上影 upper_wick≥2.0bp"),
+    ("g7_strict_v1", "G7严格版 streak_up≤1∧upper_wick≥1.5bp"),
+    ("g7_q05_v1", "G7+深折价 q≤0.05"),
+    ("g7_t270_v1", "G7+非极晚 t≤270s"),
 ]
 Q_LO, Q_HI = 0.005, 0.1      # 首触报价区间 (0.005, 0.1]
 BODY_R_GATE = 0.35           # G1 门：路径归一实体 ≤ 0.35
@@ -133,21 +139,22 @@ def extract_firsthit_features(
     pts = [bo] + pre
     btc_trig = pre[-1]                                 # 触发时刻 btc = ≤触发 的最后一点
 
-    # 特征（与 local_shape_scan_v2.py 同式）
+    # 特征（与 local_shape_scan_v2.py / comprehensive_firsthit_backtest.py 同式）
     chg_bps = (btc_trig / bo - 1.0) * 1e4
     cum_hi, cum_lo = max(pts), min(pts)
     rng = cum_hi - cum_lo
     if rng > 1e-9:
         body_r = abs(btc_trig - bo) / rng
         wick01 = 1.0 if cum_hi > max(btc_trig, bo) + 1e-9 else 0.0
+        upper_wick_bps = (cum_hi - max(btc_trig, bo)) / bo * 1e4
         rng_bps = rng / bo * 1e4
     else:
-        body_r, wick01, rng_bps = 0.0, 0.0, 0.0
+        body_r, wick01, upper_wick_bps, rng_bps = 0.0, 0.0, 0.0, 0.0
 
     return dict(
         q=q, trigger_ts=trigger_ts, td_sec=int((trigger_ts - start) / 1000),
-        chg_bps=chg_bps, body_r=body_r, wick01=wick01, rng_bps=rng_bps,
-        npts=npts, dvol=None, dpar=None,
+        chg_bps=chg_bps, body_r=body_r, wick01=wick01, upper_wick_bps=upper_wick_bps,
+        rng_bps=rng_bps, npts=npts, dvol=None, dpar=None,
     )
 
 
@@ -190,14 +197,40 @@ def _extract(w: SentimentWindow) -> dict | None:
     return ext
 
 
-def _gate_of(version: str, ext: dict) -> bool:
-    """version → 落表门（G0 恒真；G1 body；G3 chg）。特征缺失（None）不落。"""
+def _gate_of(version: str, ext: dict, streak_up: int | None = None) -> bool:
+    """version → 落表门（G0 恒真；G1 body；G3 chg；G7 及各变体）。特征缺失（None）不落。"""
     if version == "firsthit_down_v1":
         return True
     if version == "firsthit_down_body_v1":
         return ext["body_r"] is not None and ext["body_r"] <= BODY_R_GATE
     if version == "firsthit_down_chg_v1":
         return ext["chg_bps"] is not None and ext["chg_bps"] <= CHG_BPS_GATE
+
+    # G7 基准条件：小实体 + 上影拒绝
+    is_g7 = (
+        ext["body_r"] is not None and ext["body_r"] <= BODY_R_GATE
+        and ext.get("wick01") == 1.0
+    )
+    if not is_g7:
+        return False
+
+    if version == "firsthit_down_g7_v1":
+        return True
+    if version == "g7_streak_v1":
+        # 非强连阳：streak_up <= 1（streak_up 为 None 时若调用方未提供则不放行）
+        return streak_up is not None and streak_up <= 1
+    if version == "g7_wick20_v1":
+        return ext.get("upper_wick_bps") is not None and ext["upper_wick_bps"] >= 2.0
+    if version == "g7_strict_v1":
+        return (
+            streak_up is not None and streak_up <= 1
+            and ext.get("upper_wick_bps") is not None and ext["upper_wick_bps"] >= 1.5
+        )
+    if version == "g7_q05_v1":
+        return ext.get("q") is not None and ext["q"] <= 0.05
+    if version == "g7_t270_v1":
+        return ext.get("td_sec") is not None and ext["td_sec"] <= 270
+
     return False
 
 
@@ -334,11 +367,33 @@ class FirstHitShadowDetector:
         q = ext["q"]
         ev = _ev_at_entry(win, q)                      # 逐事件真实触发价，禁均值/pct 代理
 
+        # 计算前驱 5m 连续阳线数（用于 g7_streak_v1 / g7_strict_v1）
+        streak_up = 0
+        try:
+            L_ms = 300_000
+            async with async_session_factory() as session:
+                prev_wins = (await session.execute(
+                    sa_select(SentimentWindow.actual_return)
+                    .where(
+                        SentimentWindow.start_time >= start_ms - 4 * L_ms,
+                        SentimentWindow.start_time < start_ms,
+                    )
+                    .order_by(SentimentWindow.start_time.desc())
+                )).scalars().all()
+                for ret_val in prev_wins:
+                    if ret_val is not None and float(ret_val) > 0:
+                        streak_up += 1
+                    else:
+                        break
+        except Exception as exc:
+            logger.warning("首触影子：查询前驱连阳失败 | window {} | {}", start_ms, exc)
+            streak_up = None
+
         async with async_session_factory() as session:
             # per-version 独立 commit：单 version 落表失败不回滚、不影响其他 version。
             for version, _name in FIRSTHIT_SPECS:
                 try:
-                    if not _gate_of(version, ext):
+                    if not _gate_of(version, ext, streak_up=streak_up):
                         continue                        # 门未命中：不落表
                     if not shadow_gate.is_enabled(version):
                         continue                        # 手动下线：停止采集该版本（历史保留）

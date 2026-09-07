@@ -321,11 +321,11 @@ class MultiLiveTrader:
             task.add_done_callback(self._tasks.discard)
             fired.append(ch)
 
-        # ---- firsthit 族（2026-09-07 promote）：喂价内联重放本窗真实首触 ----
+        # ---- firsthit 族（2026-09-07 promote / 2026-09-08 G7扩容）：喂价内联重放本窗真实首触 ----
         # 必须用完整 window_down_curve/window_btc_curve 找第一个入区点，而不是把
         # 当前采样当首触；否则部署重启或通道中途开启后，第二次入区会被误判为
         # 首次触价。特征/门调用 firsthit_shadow_detector 纯函数，影子与实盘同源。
-        # 三通道按用户确认独立下单，不加入同窗互斥；每通道自身 fired 防重。
+        # 各通道按用户确认独立下单，不加入同窗互斥；每通道自身 fired 防重。
         if window_down_curve and window_btc_curve and window_entry_price:
             ext = extract_firsthit_features(
                 window_start_ms, float(window_entry_price),
@@ -339,16 +339,27 @@ class MultiLiveTrader:
                     cfg = self._configs[ch]
                     if not cfg.enabled or window_start_ms in cfg.fired:
                         continue
-                    if not firsthit_gate_of(ch, ext):
-                        continue
-                    cfg.fired.add(window_start_ms)
-                    task = asyncio.create_task(
-                        self._fire_firsthit(ch, window_start_ms, ext),
-                        name=f"live_firsthit_{ch}_{window_start_ms}",
-                    )
-                    self._tasks.add(task)
-                    task.add_done_callback(self._tasks.discard)
-                    fired.append(ch)
+                    if ch in ("g7_streak_v1", "g7_strict_v1"):
+                        # 需要前驱 5m 连阳核验的通道：派生异步任务核验并开火
+                        cfg.fired.add(window_start_ms)
+                        task = asyncio.create_task(
+                            self._verify_firsthit_streak_and_fire(ch, window_start_ms, ext),
+                            name=f"live_firsthit_streak_{ch}_{window_start_ms}",
+                        )
+                        self._tasks.add(task)
+                        task.add_done_callback(self._tasks.discard)
+                        fired.append(ch)
+                    else:
+                        if not firsthit_gate_of(ch, ext):
+                            continue
+                        cfg.fired.add(window_start_ms)
+                        task = asyncio.create_task(
+                            self._fire_firsthit(ch, window_start_ms, ext),
+                            name=f"live_firsthit_{ch}_{window_start_ms}",
+                        )
+                        self._tasks.add(task)
+                        task.add_done_callback(self._tasks.discard)
+                        fired.append(ch)
         return fired
 
     @staticmethod
@@ -994,6 +1005,35 @@ class MultiLiveTrader:
             await self._after_fill(order, channel, cfg)
         except Exception as exc:
             logger.warning("多通道实盘：首触下单任务异常 | {} | {} | {}",
+                           channel, win_label, exc)
+
+    async def _verify_firsthit_streak_and_fire(self, channel: str, window_start: int, ext: dict) -> None:
+        """firsthit 异步连阳核验任务：g7_streak_v1 / g7_strict_v1 通道查前驱 5m 连阳后开火。"""
+        win_label = _fmt_win(window_start)
+        try:
+            streak_up = 0
+            L_ms = 300_000
+            async with async_session_factory() as session:
+                prev_wins = (await session.execute(
+                    sa_select(SentimentWindow.actual_return)
+                    .where(
+                        SentimentWindow.start_time >= window_start - 4 * L_ms,
+                        SentimentWindow.start_time < window_start,
+                    )
+                    .order_by(SentimentWindow.start_time.desc())
+                )).scalars().all()
+                for ret_val in prev_wins:
+                    if ret_val is not None and float(ret_val) > 0:
+                        streak_up += 1
+                    else:
+                        break
+            if not firsthit_gate_of(channel, ext, streak_up=streak_up):
+                logger.info("多通道实盘：{} 连阳门禁未过(streak={})，弃单 | 窗口 {}",
+                            channel, streak_up, win_label)
+                return
+            await self._fire_firsthit(channel, window_start, ext)
+        except Exception as exc:
+            logger.warning("多通道实盘：首触连阳核验任务异常 | {} | {} | {}",
                            channel, win_label, exc)
 
     # ------------------------------------------------------------------
