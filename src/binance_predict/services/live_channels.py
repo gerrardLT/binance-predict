@@ -1,7 +1,7 @@
 """多通道实盘注册表（MultiLiveTrader 的静态描述层 + 配置解析，纯函数无 DB）。
 
 通道 ID 与影子信号版本名对齐（订单 signal_version 直接用通道名，对账/统计天然一致）。
-六族触发机制（由 MultiLiveTrader 分别驱动，见 multi_live_trader.py）：
+七族触发机制（由 MultiLiveTrader 分别驱动，见 multi_live_trader.py）：
 - quote_edge：5m 采样循环喂价 → 窗内报价区间命中（v2 附加 BTC 门禁，实时喂价解锁；
   v3 环境门禁版再叠加前窗 DOWN/距日高回落，异步 DB 核验后下单）；
 - x4：轮询 misalignment_signals PENDING → 次窗 +150s 决策点下单；
@@ -11,6 +11,8 @@
 - nextbar：NextbarShadowDetector 新根收盘钩子 → 次根 5m 市场开盘后 90s 内下单押 UP；
 - absorption：5m 采样循环喂价内联判定（窗开快照 + TD 秒双快照，标定来自
   AbsorptionShadowDetector 滚动缓冲）→ 跟随 BTC 位移方向押注（动态 UP/DOWN，5m 市场）。
+- firsthit：5m 采样循环按本窗完整历史重放 DOWN 首次进入 (0.005,0.1] 的触发点，
+  复用 firsthit_shadow_detector 的特征/门纯函数 → 命中后买 DOWN（5m 市场）。
 
 护栏数值依据：盈亏平衡入场价 entry* = wr×(1−FEE)（干净口径历史胜率）：
 S1 wr64.4%→0.63 / S5 78.5%→0.77 / S2 53.6%→0.525 / S4 55.4%→0.54 /
@@ -143,6 +145,26 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     "absorption_follow_td150_v1": ChannelSpec(
         "absorption_follow_td150_v1", "absorption", "5m", "UP", 0.86,
         "吸收跟随TD150欠反应→顺势",
+    ),
+    # --- firsthit 族（2026-09-07 影子 promote）：5m 采样循环按本窗完整历史重放
+    # DOWN 首次进入 (0.005,0.1] 的触发点，命中后买 DOWN。三个 version 共用
+    # firsthit_shadow_detector.extract_firsthit_features / _gate_of，保证实盘与
+    # 影子口径同源。用户确认三通道各自独立下单，不加入 SAME_WINDOW_EXCLUSIVE：
+    # 同窗三门全中且全开启时最多 3 单（2U×3=6U）；每通道每窗仍至多一单。
+    # 护栏为保守成交上限，不代表前向胜率背书：G0 用研究价-only 胜率 8.9%×0.98≈0.087
+    # 下方 0.08；G1/G3 的 confirm 段已 burned，分别按冻结研究口径保守取 0.12/0.09。
+    # 触发后实际成交均价高于护栏弃单，不追价。
+    "firsthit_down_v1": ChannelSpec(
+        "firsthit_down_v1", "firsthit", "5m", "DOWN", 0.08,
+        "首触G0基底 q∈(0.005,0.1]（押DOWN）",
+    ),
+    "firsthit_down_body_v1": ChannelSpec(
+        "firsthit_down_body_v1", "firsthit", "5m", "DOWN", 0.12,
+        "首触G1小实体 body_r≤0.35（押DOWN）",
+    ),
+    "firsthit_down_chg_v1": ChannelSpec(
+        "firsthit_down_chg_v1", "firsthit", "5m", "DOWN", 0.09,
+        "首触G3偏离 chg≤+2.82bp（押DOWN）",
     ),
 }
 

@@ -43,6 +43,7 @@ from binance_predict.services.firsthit_shadow_detector import (
     _gate_of,
     _outcome_of,
     _ser,
+    extract_firsthit_features,
 )
 
 START = 1_700_000_000_000 // 300_000 * 300_000   # 对齐 5m 整点
@@ -238,6 +239,42 @@ def test_extract_missing_btc_open_returns_none():
     """开盘 BTC 基准缺失（entry_price≤0 且 btc 曲线空）→ None"""
     w = _seed_window(npts=20, trigger_q=0.07, bo=0.0)
     assert _extract(w) is None
+
+
+def test_extract_firsthit_features_matches_shadow_extract():
+    """纯函数与归档 _extract 同源：同窗口特征一致，soft vol/par 由 _extract 补齐。"""
+    w = _seed_window(npts=20, trigger_q=0.07)
+    ext_shadow = _extract(w)
+    ext_pure = extract_firsthit_features(
+        int(w.start_time), float(w.entry_price),
+        w.curve_down_price, w.curve_btc_price)
+    assert ext_shadow is not None and ext_pure is not None
+    for key in ("q", "trigger_ts", "td_sec", "chg_bps", "body_r", "wick01",
+                "rng_bps", "npts"):
+        assert ext_pure[key] == pytest.approx(ext_shadow[key])
+    assert ext_pure["dvol"] is None and ext_pure["dpar"] is None
+    # _seed_window 的 vol/par 曲线两点时间戳是 START 和 trigger_ts=START+120_000，
+    # 但 btc/down 曲线最后一个点时间戳是 START+119_985（step 整除余数），
+    # _at_le(vol, 119985) 读到开盘点 → dvol=1000−1000=0。soft 维度不是门，不影响实盘。
+    assert ext_shadow["dvol"] == pytest.approx(0.0)
+    assert ext_shadow["dpar"] == pytest.approx(0.0)
+
+
+def test_extract_firsthit_features_max_trigger_ts_is_ex_ante():
+    """max_trigger_ts 防未来函数：只认 ≤当前采样时刻的真实第一触。"""
+    down_curve = [
+        {"t": START, "v": 0.50},
+        {"t": START + 15_000, "v": 0.30},
+        {"t": START + 30_000, "v": 0.08},   # 首次入区 ∈ (0.005, 0.1]
+    ]
+    # btc_curve 需要在 START+30_000 之前至少 8 个点（MIN_PTS），采样间隔 3_750ms
+    btc_curve = [{"t": START + i * 3_750, "v": 100.0 + i * 0.01} for i in range(9)]
+    assert extract_firsthit_features(
+        START, 100.0, down_curve, btc_curve, max_trigger_ts=START + 15_000) is None
+    ext = extract_firsthit_features(
+        START, 100.0, down_curve, btc_curve, max_trigger_ts=START + 30_000)
+    assert ext is not None and ext["q"] == pytest.approx(0.08)
+    assert ext["trigger_ts"] == START + 30_000
 
 
 # ============================================================

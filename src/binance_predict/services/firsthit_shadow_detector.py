@@ -85,19 +85,29 @@ def _ser(curve: list | None) -> list[dict]:
     )
 
 
-def _extract(w: SentimentWindow) -> dict | None:
-    """抽取单窗首触特征（严格 ex-ante，只读 ≤触发时刻采样）。
+def extract_firsthit_features(
+    window_start: int,
+    btc_open: float | None,
+    down_curve: list | None,
+    btc_curve: list | None,
+    *,
+    max_trigger_ts: int | None = None,
+) -> dict | None:
+    """首触特征纯函数：归档影子与实时实盘共用，防止两套公式漂移。
 
     返回 None 的情形：无首触 / 开盘基准缺失 / 触发时刻无 btc / npts < MIN_PTS。
-    样本集定义与 local_shape_scan_v2.py 主分析（npts≥8 子集）完全一致。
+    max_trigger_ts 用于实时重放：只看 ≤ 当前采样时刻的历史，避免用未来报价判定。
     """
-    start = int(w.start_time)
-    dn_p = _ser(getattr(w, "curve_down_price", None))
-    btc = _ser(getattr(w, "curve_btc_price", None))
+    start = int(window_start)
+    dn_p = _ser(down_curve)
+    btc = _ser(btc_curve)
 
     # 首触：升序采样中第一个 down_price ∈ (Q_LO, Q_HI] 的点
     trig = None
     for p in dn_p:
+        ts = int(p["t"])
+        if max_trigger_ts is not None and ts > int(max_trigger_ts):
+            break
         v = float(p["v"])
         if Q_LO < v <= Q_HI:
             trig = p
@@ -107,9 +117,9 @@ def _extract(w: SentimentWindow) -> dict | None:
     q = float(trig["v"])
     trigger_ts = int(trig["t"])
 
-    # 开盘 BTC 基准：entry_price 优先，回退 btc 曲线首点（同 absorption/quote_edge 口径）
-    ep = getattr(w, "entry_price", None)
-    bo = float(ep) if (ep is not None and float(ep) > 0) else (float(btc[0]["v"]) if btc else None)
+    # 开盘 BTC 基准：调用方优先提供 entry_price，缺失时回退 btc 曲线首点
+    bo = float(btc_open) if (btc_open is not None and float(btc_open) > 0) else (
+        float(btc[0]["v"]) if btc else None)
     if not bo or bo <= 0:
         return None
 
@@ -134,9 +144,33 @@ def _extract(w: SentimentWindow) -> dict | None:
     else:
         body_r, wick01, rng_bps = 0.0, 0.0, 0.0
 
+    return dict(
+        q=q, trigger_ts=trigger_ts, td_sec=int((trigger_ts - start) / 1000),
+        chg_bps=chg_bps, body_r=body_r, wick01=wick01, rng_bps=rng_bps,
+        npts=npts, dvol=None, dpar=None,
+    )
+
+
+def _extract(w: SentimentWindow) -> dict | None:
+    """抽取单窗首触特征（严格 ex-ante，只读 ≤触发时刻采样）。
+
+    返回 None 的情形：无首触 / 开盘基准缺失 / 触发时刻无 btc / npts < MIN_PTS。
+    样本集定义与 local_shape_scan_v2.py 主分析（npts≥8 子集）完全一致。
+    """
+    btc = _ser(getattr(w, "curve_btc_price", None))
+    ep = getattr(w, "entry_price", None)
+    btc_open = float(ep) if (ep is not None and float(ep) > 0) else (
+        float(btc[0]["v"]) if btc else None)
+    ext = extract_firsthit_features(
+        int(w.start_time), btc_open,
+        getattr(w, "curve_down_price", None), btc)
+    if ext is None:
+        return None
+
     # Δvol / Δpar（soft 记录维度，不作门）
     vol = _ser(getattr(w, "curve_trade_volume", None))
     par = _ser(getattr(w, "curve_participants", None))
+    trigger_ts = int(ext["trigger_ts"])
 
     def _at_le(pts_: list[dict], ts: int) -> float | None:
         best = None
@@ -151,14 +185,9 @@ def _extract(w: SentimentWindow) -> dict | None:
     vol_d = _at_le(vol, trigger_ts)
     par_o = float(par[0]["v"]) if par else None
     par_d = _at_le(par, trigger_ts)
-    dvol = (vol_d - vol_o) if (vol_o is not None and vol_d is not None) else None
-    dpar = (par_d - par_o) if (par_o is not None and par_d is not None) else None
-
-    return dict(
-        q=q, trigger_ts=trigger_ts, td_sec=int((trigger_ts - start) / 1000),
-        chg_bps=chg_bps, body_r=body_r, wick01=wick01, rng_bps=rng_bps,
-        npts=npts, dvol=dvol, dpar=dpar,
-    )
+    ext["dvol"] = (vol_d - vol_o) if (vol_o is not None and vol_d is not None) else None
+    ext["dpar"] = (par_d - par_o) if (par_o is not None and par_d is not None) else None
+    return ext
 
 
 def _gate_of(version: str, ext: dict) -> bool:

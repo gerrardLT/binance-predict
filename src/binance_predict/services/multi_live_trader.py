@@ -1,8 +1,8 @@
 """多通道实盘执行器（MultiLiveTrader，2026-08-24 取代单版本 QuoteEdgeLiveTrader）。
 
-13 通道（通道注册表见 live_channels.py；2026-09-04 退役 8 通道、2026-09-06 影子 promote 5 通道 + x4_v3 并行注册后）可同时开启，每通道独立
+16 通道（通道注册表见 live_channels.py；2026-09-04 退役 8 通道、2026-09-06 影子 promote 5 通道 + x4_v3 并行注册、2026-09-07 firsthit 三通道 promote 后）可同时开启，每通道独立
 金额/日限/护栏/开关；通道 ID 与影子信号版本名对齐（订单 signal_version
-直接用通道名，实盘 vs 影子对账天然一致）。六族触发机制并存：
+直接用通道名，实盘 vs 影子对账天然一致）。七族触发机制并存：
 
 1. quote_edge 族（5m 市场）：5m 采样循环喂价 → 窗内 DOWN 报价首次进入
    所绑版本规则区间 → 真单押 DOWN（区间复用 QUOTE_EDGE_RULES 冻结口径）。
@@ -27,6 +27,10 @@
 6. absorption 族（5m 市场，2026-09-06 promote）：采样循环 check() 内联判定（窗开快照
    + TD 秒双快照，标定复用 AbsorptionShadowDetector 滚动缓冲）→ 跟随 BTC 位移方向真单。
    （kline/absorption 影子信号无订单 signal_id 关联列，对账走 signal_version+window_start。）
+7. firsthit 族（5m 市场，2026-09-07 promote）：采样循环 check() 按本窗完整 DOWN/BTC
+   历史重放首次进入 (0.005,0.1] 的触发点，复用 firsthit_shadow_detector 的纯特征/门
+   函数 → 命中后真单押 DOWN。三通道按用户确认各自独立下单，不做跨版本同窗互斥；
+   每通道每窗仍至多一单。
 
 安全护栏（继承旧执行器全部教训）：
 1. 每通道每窗至多一单：内存 fired 集合 + 先占位后下单（place_order 前先插
@@ -63,6 +67,11 @@ from binance_predict.db.models import (
 
 from .absorption_shadow_detector import ABSORPTION_SPECS
 from .btc_regime import regime_feed
+from .firsthit_shadow_detector import (
+    FIRSTHIT_SPECS,
+    extract_firsthit_features,
+    _gate_of as firsthit_gate_of,
+)
 from .live_channels import (
     LIVE_CHANNELS,
     MAX_DAILY_ORDERS_CAP,
@@ -152,7 +161,8 @@ class MultiLiveTrader:
               window_entry_price: float | None = None,
               window_btc_curve: list | None = None,
               up_price: float | None = None,
-              up_open: float | None = None) -> list[str]:
+              up_open: float | None = None,
+              window_down_curve: list | None = None) -> list[str]:
         """每次 5m 采样调用一次；返回本轮开火的通道名列表。
 
         纯内存快速路径（不阻塞采样循环）；命中通道派生下单任务。
@@ -164,6 +174,8 @@ class MultiLiveTrader:
         absorption 族需要 up_price（当前采样 UP 报价）+ up_open（本窗归档首个
         有效 UP 采样价，窗开基准，与影子 _first(up_p) 同源）+ btc_price +
         window_entry_price，任一缺失 → 不判定（fail-safe，向后兼容旧调用方）。
+        firsthit 族需要 window_down_curve + window_btc_curve + window_entry_price，
+        用本窗完整历史重放真实第一触；缺数据或 npts<8 → 不开火（向后兼容旧调用方）。
         """
         if self._stopped:
             return []
@@ -308,6 +320,35 @@ class MultiLiveTrader:
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
             fired.append(ch)
+
+        # ---- firsthit 族（2026-09-07 promote）：喂价内联重放本窗真实首触 ----
+        # 必须用完整 window_down_curve/window_btc_curve 找第一个入区点，而不是把
+        # 当前采样当首触；否则部署重启或通道中途开启后，第二次入区会被误判为
+        # 首次触价。特征/门调用 firsthit_shadow_detector 纯函数，影子与实盘同源。
+        # 三通道按用户确认独立下单，不加入同窗互斥；每通道自身 fired 防重。
+        if window_down_curve and window_btc_curve and window_entry_price:
+            ext = extract_firsthit_features(
+                window_start_ms, float(window_entry_price),
+                window_down_curve, window_btc_curve,
+                max_trigger_ts=int(ts_ms),
+            )
+            if ext is not None:
+                for ch, spec in self._specs.items():
+                    if spec.family != "firsthit":
+                        continue
+                    cfg = self._configs[ch]
+                    if not cfg.enabled or window_start_ms in cfg.fired:
+                        continue
+                    if not firsthit_gate_of(ch, ext):
+                        continue
+                    cfg.fired.add(window_start_ms)
+                    task = asyncio.create_task(
+                        self._fire_firsthit(ch, window_start_ms, ext),
+                        name=f"live_firsthit_{ch}_{window_start_ms}",
+                    )
+                    self._tasks.add(task)
+                    task.add_done_callback(self._tasks.discard)
+                    fired.append(ch)
         return fired
 
     @staticmethod
@@ -919,6 +960,40 @@ class MultiLiveTrader:
             await self._after_fill(order, channel, cfg)
         except Exception as exc:
             logger.warning("多通道实盘：吸收跟随下单任务异常 | {} | {} | {}",
+                           channel, win_label, exc)
+
+    async def _fire_firsthit(self, channel: str, window_start: int, ext: dict) -> None:
+        """firsthit 下单任务：5m 市场买 DOWN，复用统一护栏/日限/防重链路。"""
+        spec = self._specs[channel]
+        cfg = self._configs[channel]
+        win_label = _fmt_win(window_start)
+        try:
+            filled_today = await self._count_filled_today(channel)
+            if filled_today >= cfg.max_daily_orders:
+                logger.warning(
+                    "多通道实盘：{} 日单量护栏停火 | 窗口 {} | 今日已成交 {} ≥ {}",
+                    channel, win_label, filled_today, cfg.max_daily_orders)
+                return
+            if await self._has_attempt(channel, window_start):
+                return
+            logger.info(
+                "多通道实盘开火 | {} | 首触反转押 DOWN | 窗口 {} | t=+{}s q={:.4f}"
+                " chg={:+.2f}bp body_r={:.3f} npts={} | 金额 {} | 护栏 {}",
+                channel, win_label, ext.get("td_sec"), ext.get("q"),
+                ext.get("chg_bps"), ext.get("body_r"), ext.get("npts"),
+                cfg.amount_usdt, resolve_max_exec(spec, cfg))
+            order = await self._exec_with_exclusive(
+                channel,
+                prediction="DOWN",
+                amount_usdt=cfg.amount_usdt,
+                signal_version=channel,
+                window_start=window_start,
+                max_exec_price=resolve_max_exec(spec, cfg),
+                market_period="5m",
+            )
+            await self._after_fill(order, channel, cfg)
+        except Exception as exc:
+            logger.warning("多通道实盘：首触下单任务异常 | {} | {} | {}",
                            channel, win_label, exc)
 
     # ------------------------------------------------------------------

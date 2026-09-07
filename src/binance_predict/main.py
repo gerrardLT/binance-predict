@@ -552,6 +552,10 @@ async def _prediction_market_tracker() -> None:
                         up_open=next(
                             (p["up_price"] for p in _pm_history
                              if p.get("up_price") is not None), None),
+                        window_down_curve=[
+                            {"t": p["timestamp"], "v": p["down_price"]}
+                            for p in _pm_history if p.get("down_price") is not None
+                        ],
                     )
 
         except asyncio.CancelledError:
