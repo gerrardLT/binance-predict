@@ -392,6 +392,18 @@ class Settings(BaseSettings):
     # 影子信号一致，部署即生效；仅作紧急停用制动力，正常情况下无需触碰。
     absorption_shadow_enabled: bool = True
 
+    # --- 5m DOWN 首触反转影子信号（firsthit_down 族，2026-09-07）---
+    # 研究结论落地：5m 窗内 DOWN token 报价**首次**进入 (0.005,0.1] → 以该报价买 DOWN 的
+    # 前向重放。三 version 同表隔离：G0 基底（calib EV+0.21 CI[+0.06,+0.34]）/ _body_v1
+    # （G1 body_r≤0.35，FDR q=0.007，logit β=+1.28 p=0.000，calib→confirm EV 两段 CI
+    # 下界>0）/ _chg_v1（G3 chg≤+2.82bp，logit β=+0.07 p=0.000）。归档后处理落 SETTLED
+    # （无 PENDING）；EV=0.98/q−1 逐事件真实触发价；路径质量 npts≥8。历史回测口径见
+    # scripts/local_shape_scan_v2.py（方法论修正版：t 混杂校正/路径质量分层/FDR）；确认段
+    # 已被离线研究用尽 → 本表只攒部署点之后的前向样本，4 周后按预注册标准裁决（G1 P≥12%
+    # 且 EV 日聚类 CI 下界>0 为通过；G0 EV CI 上界<0 为整体否决）。影子只记录不下注，物理
+    # 隔离下单路径。
+    firsthit_shadow_enabled: bool = True
+
     # --- S2 条件单影子信号（s2_cond 族，2026-09-06）---
     # 研究结论落地：S2（bear_exhaust，破 4h 支撑+收阴+放量）开盘即买 UP 的 EV≈−0.042
     # 不赚钱；等次周期窗内 t=4/t=5 判价的条件单更优（价跌时 UP token 变便宜，低买 UP 的

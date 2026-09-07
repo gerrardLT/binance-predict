@@ -65,6 +65,7 @@ from .services.agent_scheduler import AgentScheduler
 from .services.combo_shadow_detector import ComboShadowDetector
 from .services.data_collector import BinanceDataCollector
 from .services.fake_breakout_detector import FakeBreakoutDetector
+from .services.firsthit_shadow_detector import FirstHitShadowDetector
 from .services.hm_shadow_detector import HmShadowDetector
 from .services.kline_shadow_detector import KlineShadowDetector
 from .services.misalignment_detector import MisalignmentDetector
@@ -181,6 +182,11 @@ absorption_shadow_detector: AbsorptionShadowDetector | None = None
 # 派生窗内 t=4/t=5 判价条件确认 → 押次周期 UP，落 kline_shadow_signals version 隔离，
 # 只记录不下注）
 s2_cond_shadow_detector: S2CondShadowDetector | None = None
+
+# 5m DOWN 首触反转影子检测器全局实例（firsthit_down_v1/_body_v1/_chg_v1 三 version：
+# G0 基底 / G1 body_r≤0.35 / G3 chg≤+2.82bp，归档后处理落 SETTLED，只记录不下注，
+# 前向验证 4 周——通过标准见 detector docstring 预注册）
+firsthit_shadow_detector: FirstHitShadowDetector | None = None
 
 # 交易结算器全局实例（P0-2：FILLED 订单结算回填输赢/盈亏，常开）
 trade_settler: TradeSettler | None = None
@@ -1246,6 +1252,22 @@ async def lifespan(app: FastAPI):
         if fake_breakout_detector is not None:
             fake_breakout_detector._on_s2_cond = s2_cond_shadow_detector.on_s2_signal
 
+    # 5m DOWN 首触反转影子信号（firsthit_down 族，2026-09-07）：窗内 DOWN 报价首次
+    # 进入 (0.005,0.1] → 以该报价买 DOWN 的前向重放。三 version 同表隔离：
+    # firsthit_down_v1 基底（G0，calib EV+0.21 CI[+0.06,+0.34]）/ _body_v1（G1
+    # body_r≤0.35，FDR q=0.007，calib EV+1.44→confirm +1.59 两段 CI 下界>0）/
+    # _chg_v1（G3 chg≤+2.82bp，calib EV+0.39→confirm +0.97）。归档后处理落
+    # SETTLED（无 PENDING）；EV=0.98/q−1 逐事件真实触发价；路径质量 npts≥8。
+    # 历史回测口径见 scripts/local_shape_scan_v2.py（方法论修正版：t 混杂校正/
+    # 路径质量分层/FDR）；confirm 段已被离线研究用尽 → 本表只攒部署点之后的
+    # 前向样本，4 周后按预注册标准裁决（G1 P≥12% 且 EV 日聚类 CI 下界>0 为通过；
+    # G0 EV CI 上界<0 为整体否决）。影子只记录不下注，物理隔离下单路径。
+    global firsthit_shadow_detector
+    if settings.firsthit_shadow_enabled:
+        firsthit_shadow_detector = FirstHitShadowDetector()
+        await firsthit_shadow_detector.start()
+        logger.info("首触反转影子检测器已启动（G0 基底 / G1 body_r≤0.35 / G3 chg≤+2.82bp 三 version；前向验证 4 周，通过标准已预注册；影子只记录不下注）")
+
     # 交易结算器（P0-2）：回读 SentimentWindow 结算 FILLED 订单输赢/盈亏。
     # 无开关常开：行为只读窗口 + 回填结算字段，零资金风险。
     global trade_settler
@@ -1343,6 +1365,9 @@ async def lifespan(app: FastAPI):
     # 停止 S2 条件单影子检测器
     if s2_cond_shadow_detector is not None:
         await s2_cond_shadow_detector.stop()
+    # 停止 5m DOWN 首触反转影子检测器
+    if firsthit_shadow_detector is not None:
+        await firsthit_shadow_detector.stop()
     # 停止影子版本开关 gate（所有影子检测器已停，最后收后台刷新任务）
     await shadow_gate.stop()
     # 停止交易结算器
@@ -3355,6 +3380,17 @@ SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     # ±0.001）；trailing 14d 滚动标定为生产口径（研究用静态 70/30 disc-OOS 切分）。
     "absorption_follow_td120_v1": (0.798, 0.052, "吸收跟随TD120: 5m窗开120s报价对BTC位移欠反应(under≥p80∩|btc_move|≥p50)→跟随btc补涨(涨押UP/跌押DOWN)（真实价复核RECENT real n=397 命中79.8%/EV+0.052 CI[-0.008,+0.112]~单看不显著、FULL real n=1050 EV+0.089 CI✓；trailing14d滚动标定k；EV按TD真实token价前向现算）"),
     "absorption_follow_td150_v1": (0.885, 0.105, "吸收跟随TD150: 同TD120口径但判定延至窗开150s（真实价复核RECENT real n=399 命中88.5%/EV+0.105 CI[+0.050,+0.165]✓，双variant最稳健、FULL real n=1083 EV+0.099 CI✓；trailing14d滚动标定k；EV按TD真实token价前向现算）"),
+    # 首触反转族（firsthit_down 族，2026-09-07）：5m 窗内 DOWN 报价首次进入 (0.005,0.1] → 以该报价买 DOWN。
+    # 三 version 同表隔离：G0 基底 / G1 body_r≤0.35（FDR q=0.007，calib→confirm EV 两段 CI 下界>0）/
+    # G3 chg_bps≤+2.82bp（logit β=+0.07 p=0.000）。归档后处理落 SETTLED；npts≥8 路径质量门；
+    # EV=0.98/q−1 / 输 −1（费 2% 无溢价，逐事件真实触发价）。历史回测口径见
+    # scripts/local_shape_scan_v2.py（方法论修正版：t 混杂校正/路径质量分层/FDR）；confirm 段
+    # 已被离线研究用尽 → 本表只攒部署点后样本，4 周后按预注册标准裁决（G1 P≥12% 且 EV 日聚类
+    # CI 下界>0 为通过；G0 EV CI 上界<0 为整体否决）。bench 只留说明（胜率/EV None：
+    # 回测基准属离线研究口径，前向现算才是裁决依据）。
+    "firsthit_down_v1": (None, None, "首触基底G0: 5m窗内DOWN首次进入(0.005,0.1]→买DOWN（44d回测EV+0.22 CI[+0.10,+0.35]；前向现算裁决）"),
+    "firsthit_down_body_v1": (None, None, "首触体貌G1: G0+body_r≤0.35（FDR q=0.007，calib EV+1.44→confirm +1.59 两段CI下界>0；前向现算裁决）"),
+    "firsthit_down_chg_v1": (None, None, "首触偏离G3: G0+chg≤+2.82bp（logit β=+0.07 p=0.000，calib EV+0.39→confirm +0.97；前向现算裁决）"),
     # S2 条件单族（2026-09-06）：实盘 S2(bear_exhaust) 派生窗内 t=4/t=5 判价条件确认 →
     # 押次周期 15m UP，落 kline_shadow_signals（version 隔离），入场快照真实 15m UP 报价。
     # 基准胜率=720d 冻结「价-only」硬数字（审计锚点 scripts/s2_cond_freeze_counts_720d.py，
@@ -3462,7 +3498,8 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
     from sqlalchemy import literal as sa_literal, select as sa_select
 
     from .db.models import (
-        AbsorptionShadowSignal, KlineShadowSignal, MisalignmentSignal, PatternShadowSignal,
+        AbsorptionShadowSignal, FirstHitShadowSignal, KlineShadowSignal,
+        MisalignmentSignal, PatternShadowSignal,
     )
     from .services.fake_breakout_detector import RESEARCH_WIN_RATES
 
@@ -3529,6 +3566,24 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
         .order_by(AbsorptionShadowSignal.window_start)
     )).all()
     sh_rows = list(sh_rows) + list(krev_rows) + list(pattern_rows) + list(absorption_rows)
+    # firsthit_down 族（firsthit_shadow_signals 表，2026-09-07 并入）：5m 窗内 DOWN 报价首次
+    # 进入 (0.005,0.1] → 以该报价买 DOWN 的前向重放。三 version（G0 基底 / G1 body_r≤0.35 /
+    # G3 chg≤+2.82bp）同表隔离；归档后处理直接落 SETTLED（无 PENDING）；npts≥8 路径质量门；
+    # 逐笔 ev_at_entry 已落库（真实触发价口径），聚合直读；direction 恒 DOWN。
+    firsthit_rows = (await db.execute(
+        sa_select(
+            FirstHitShadowSignal.version,
+            FirstHitShadowSignal.window_start,
+            FirstHitShadowSignal.win,
+            FirstHitShadowSignal.ev_at_entry,
+            FirstHitShadowSignal.entry_down_price,
+            sa_literal(None).label("entry_up_price"),
+            sa_literal("DOWN").label("direction"),
+        )
+        .where(FirstHitShadowSignal.status == "SETTLED")
+        .order_by(FirstHitShadowSignal.window_start)
+    )).all()
+    sh_rows = sh_rows + list(firsthit_rows)
     # 版本 = 冻结基准已知版本 ∪ 数据中出现的版本（新版本缺基准不崩，bench 为 None）
     versions = [
         "x4_v1", "quote_momentum_v1", "quote_contrarian_v1",
@@ -3548,6 +3603,7 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
         "quote_momentum_v3",  # 报价动量 v3 非连涨门禁（纯影子，2026-09-03：misalignment_signals）
         "absorption_follow_td120_v1", "absorption_follow_td150_v1",  # 吸收/欠反应跟随族（纯影子，2026-09-04：专用表 absorption_shadow_signals，TD120/150 双 variant 滚动标定）
         "s2_cond_t4_v1", "s2_cond_t5d_v1",  # S2 条件单族（纯影子，2026-09-06：实盘 bear_exhaust 派生窗内 t=4/t=5 判价→押 UP，共表 kline_shadow_signals version 隔离）
+        "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1",  # 首触反转族（纯影子，2026-09-07：专用表 firsthit_shadow_signals，G0 基底 / G1 body_r≤0.35 / G3 chg≤+2.82bp，前向验证 4 周）
     ]
     versions += sorted({s.version for s in sh_rows} - set(versions))
     # 影子版本 → 实盘通道状态（version==通道名，2026-09-06 promote + x4_v3 注册后 13 通道；

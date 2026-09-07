@@ -1,0 +1,370 @@
+"""5m DOWN 首触反转影子检测器（firsthit_down 族，2026-09-07）。
+
+信号定义（冻结自 scripts/local_shape_scan_v2.py 方法论修正版，规则冻结勿动）：
+    触发：5m 窗内 DOWN token 报价**首次**进入 (0.005, 0.1] 的采样点
+          → 以该报价买 DOWN（押注 DOWN 最终结算获胜 =「反转」）。
+    特征（触发时刻可见，严格 ex-ante，只读 ≤触发时刻的采样）：
+        chg_bps = (btc@触 − 开盘)/开盘×1e4     开盘 = entry_price 优先，回退 btc 曲线首点
+        body_r  = |btc@触 − 开盘| / (路径 max−min)   路径 = 开盘 + t≤触发 的全部 btc 采样
+        wick01  = 路径高点 > max(btc@触, 开盘) ? 1 : 0（soft，供 G6/G7 事后重构）
+        rng_bps = (路径 max−min)/开盘×1e4      （soft）
+        npts    = t≤触发 的 btc 采样点数；npts < 8 → 整窗不落表（v2 主分析口径，
+                  触发前路径太稀疏的特征不可信）
+    三 version 同表隔离（G1/G3 ⊂ G0；全特征落库，G4=body∧chg 等交叉门事后重构）：
+        firsthit_down_v1       G0 基底（全部首触，对照组）
+        firsthit_down_body_v1  G1：body_r ≤ 0.35（FDR q=0.007，logit β=+1.28 p=0.000）
+        firsthit_down_chg_v1   G3：chg_bps ≤ +2.82（logit β=+0.07 p=0.000）
+
+    EV（本检测器的生命线，逐事件真实触发价，禁用任何均值/pct 代理）：
+        win  → 0.98/q − 1     （费 2% 无溢价，与 absorption/quote_edge._ev_at_entry 同源）
+        lose → −1.0
+
+数据流（归档后处理，同 absorption_shadow_detector / quote_edge_detector）：
+    1. 启动预热：分块载入 trailing 14 天已归档 SentimentWindow，只推进水位不落表
+       （历史样本由离线研究覆盖，影子只从部署点前向攒样本——与吸收影子同取舍）；
+    2. 每 60s 轮询新归档窗（end_time > 水位，升序 limit 12）；
+    3. 逐窗：算首触特征 → 结算可判（outcome UP/DOWN）→ 逐 version 评估门 →
+       shadow_gate 拦截 + (version, window_start) 幂等 → 落 SETTLED（无 PENDING）。
+
+影子纪律：只记录不下注，物理隔离于下单路径（本表不被任何下单代码引用，
+不进 X4_VERSIONS/LIVE_CHANNELS）。前向裁决标准（预注册，4 周）：
+    G1 通过 = 前向 P ≥ 12% 且 EV 日聚类 CI 下界 > 0；
+    G3 通过 = 前向 P ≥ 10% 且 EV 日聚类 CI 下界 > 0；
+    整体否决 = G0 前向 EV 日聚类 CI 上界 < 0（DOWN 侧 edge 消失，全部重来）。
+"""
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, timezone
+
+from loguru import logger
+from sqlalchemy import func as sa_func
+from sqlalchemy import select as sa_select
+
+from binance_predict.db.engine import async_session_factory
+from binance_predict.db.models import FirstHitShadowSignal, SentimentWindow
+from binance_predict.services.shadow_version_gate import shadow_gate
+
+# ---- 冻结口径（local_shape_scan_v2.py v2，勿动）----
+FIRSTHIT_SPECS: list[tuple[str, str]] = [
+    ("firsthit_down_v1", "G0 基底（全部首触）"),
+    ("firsthit_down_body_v1", "G1 小实体 body_r≤0.35"),
+    ("firsthit_down_chg_v1", "G3 价格偏离 chg≤+2.82bp"),
+]
+Q_LO, Q_HI = 0.005, 0.1      # 首触报价区间 (0.005, 0.1]
+BODY_R_GATE = 0.35           # G1 门：路径归一实体 ≤ 0.35
+CHG_BPS_GATE = 2.82          # G3 门：BTC 相对开盘涨幅 ≤ +2.82 bp
+MIN_PTS = 8                  # 路径质量门：触发前 btc 采样点数 ≥ 8（v2 主分析口径）
+
+FEE_RET = 0.98               # EV = 赢 0.98/q−1 / 输 −1（费 2%，无溢价，回测口径）
+POLL_INTERVAL = 60.0         # 轮询间隔（秒）
+BACKSCAN_WINDOWS = 12        # 主循环单次拉取的新归档窗数（1 小时）
+WARMUP_DAYS = 14             # 预热水位回看跨度（只推进水位不落表）
+WARMUP_MS = WARMUP_DAYS * 86_400_000
+WARMUP_BATCH = 500           # 预热分块载入批大小（限制 JSONB 曲线峰值内存）
+
+
+def _ev_at_entry(win: bool, price: float) -> float:
+    """单注 EV（回测口径，无溢价）：赢 0.98/q−1 / 输 −1。逐事件真实触发价。"""
+    return (FEE_RET / price - 1.0) if win else -1.0
+
+
+def _outcome_of(w: SentimentWindow) -> str | None:
+    """可判定的结算方向：actual_return None/0 → None（与 absorption/quote_edge 同口径）。"""
+    ret = w.actual_return
+    if ret is None or float(ret) == 0.0:
+        return None
+    return w.outcome if (w.outcome or "") in ("UP", "DOWN") else None
+
+
+def _ser(curve: list | None) -> list[dict]:
+    """清洗 + 按 t 升序：只保留 t/v 均非空的采样点（同 absorption._ser 口径）。"""
+    return sorted(
+        [p for p in (curve or []) if p.get("t") is not None and p.get("v") is not None],
+        key=lambda p: int(p["t"]),
+    )
+
+
+def _extract(w: SentimentWindow) -> dict | None:
+    """抽取单窗首触特征（严格 ex-ante，只读 ≤触发时刻采样）。
+
+    返回 None 的情形：无首触 / 开盘基准缺失 / 触发时刻无 btc / npts < MIN_PTS。
+    样本集定义与 local_shape_scan_v2.py 主分析（npts≥8 子集）完全一致。
+    """
+    start = int(w.start_time)
+    dn_p = _ser(getattr(w, "curve_down_price", None))
+    btc = _ser(getattr(w, "curve_btc_price", None))
+
+    # 首触：升序采样中第一个 down_price ∈ (Q_LO, Q_HI] 的点
+    trig = None
+    for p in dn_p:
+        v = float(p["v"])
+        if Q_LO < v <= Q_HI:
+            trig = p
+            break
+    if trig is None:
+        return None
+    q = float(trig["v"])
+    trigger_ts = int(trig["t"])
+
+    # 开盘 BTC 基准：entry_price 优先，回退 btc 曲线首点（同 absorption/quote_edge 口径）
+    ep = getattr(w, "entry_price", None)
+    bo = float(ep) if (ep is not None and float(ep) > 0) else (float(btc[0]["v"]) if btc else None)
+    if not bo or bo <= 0:
+        return None
+
+    # 触发前路径：开盘 + t≤trigger_ts 的全部 btc 采样（严格 ex-ante）
+    pre = [float(p["v"]) for p in btc if int(p["t"]) <= trigger_ts]
+    npts = len(pre)
+    if npts < MIN_PTS:
+        return None                                    # 路径质量门（v2 主分析口径）
+    if pre[-1] <= 0:
+        return None
+    pts = [bo] + pre
+    btc_trig = pre[-1]                                 # 触发时刻 btc = ≤触发 的最后一点
+
+    # 特征（与 local_shape_scan_v2.py 同式）
+    chg_bps = (btc_trig / bo - 1.0) * 1e4
+    cum_hi, cum_lo = max(pts), min(pts)
+    rng = cum_hi - cum_lo
+    if rng > 1e-9:
+        body_r = abs(btc_trig - bo) / rng
+        wick01 = 1.0 if cum_hi > max(btc_trig, bo) + 1e-9 else 0.0
+        rng_bps = rng / bo * 1e4
+    else:
+        body_r, wick01, rng_bps = 0.0, 0.0, 0.0
+
+    # Δvol / Δpar（soft 记录维度，不作门）
+    vol = _ser(getattr(w, "curve_trade_volume", None))
+    par = _ser(getattr(w, "curve_participants", None))
+
+    def _at_le(pts_: list[dict], ts: int) -> float | None:
+        best = None
+        for p in pts_:
+            if int(p["t"]) <= ts:
+                best = float(p["v"])
+            else:
+                break
+        return best
+
+    vol_o = float(vol[0]["v"]) if vol else None
+    vol_d = _at_le(vol, trigger_ts)
+    par_o = float(par[0]["v"]) if par else None
+    par_d = _at_le(par, trigger_ts)
+    dvol = (vol_d - vol_o) if (vol_o is not None and vol_d is not None) else None
+    dpar = (par_d - par_o) if (par_o is not None and par_d is not None) else None
+
+    return dict(
+        q=q, trigger_ts=trigger_ts, td_sec=int((trigger_ts - start) / 1000),
+        chg_bps=chg_bps, body_r=body_r, wick01=wick01, rng_bps=rng_bps,
+        npts=npts, dvol=dvol, dpar=dpar,
+    )
+
+
+def _gate_of(version: str, ext: dict) -> bool:
+    """version → 落表门（G0 恒真；G1 body；G3 chg）。特征缺失（None）不落。"""
+    if version == "firsthit_down_v1":
+        return True
+    if version == "firsthit_down_body_v1":
+        return ext["body_r"] is not None and ext["body_r"] <= BODY_R_GATE
+    if version == "firsthit_down_chg_v1":
+        return ext["chg_bps"] is not None and ext["chg_bps"] <= CHG_BPS_GATE
+    return False
+
+
+class FirstHitShadowDetector:
+    """5m DOWN 首触反转影子检测器：轮询新归档窗 → 首触特征 → 三 version 门 → 落 SETTLED。
+
+    归档后处理（同 absorption/quote_edge）：窗已结算才处理，插行即 SETTLED，无 PENDING。
+    """
+
+    def __init__(self, collector=None) -> None:
+        self._collector = collector  # 兼容启动装配签名；本检测器全部数据取自 ORM 曲线，未使用
+        self._running = False
+        self._task: asyncio.Task | None = None
+        self._last_window_end: int | None = None       # 已处理过的最大窗口 end_time（水位）
+        self._trigger_counts: dict[str, int] = {v: 0 for v, _ in FIRSTHIT_SPECS}
+
+    # ------------------------------------------------------------------
+    # 生命周期
+    # ------------------------------------------------------------------
+
+    async def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        try:
+            await self._warmup()
+        except Exception as exc:
+            logger.warning("首触影子：预热失败（忽略，循环内自愈）| {}", exc)
+        self._task = asyncio.create_task(self._loop(), name="firsthit_shadow_detector")
+        logger.info(
+            "首触反转影子检测器启动 | {} | 门: G1 body_r≤{} G3 chg≤{:+.2f}bp | 路径质量 npts≥{}"
+            " | EV=0.98/q−1（费 2%，逐事件真实触发价，影子只记录不下注）",
+            {v: n for v, n in FIRSTHIT_SPECS}, BODY_R_GATE, CHG_BPS_GATE, MIN_PTS,
+        )
+
+    async def stop(self) -> None:
+        self._running = False
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        self._task = None
+        logger.info("首触影子检测器已停止 | 触发 {}", self._trigger_counts)
+
+    # ------------------------------------------------------------------
+    # 主循环
+    # ------------------------------------------------------------------
+
+    async def _loop(self) -> None:
+        while self._running:
+            try:
+                await self._poll_once()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning("首触影子：循环异常 | {} | {}", type(exc).__name__, exc)
+            try:
+                await asyncio.sleep(POLL_INTERVAL)
+            except asyncio.CancelledError:
+                break
+
+    async def _poll_once(self) -> None:
+        stmt = (
+            sa_select(SentimentWindow)
+            .where(SentimentWindow.end_time > (self._last_window_end or 0))
+            .order_by(SentimentWindow.end_time.asc())
+            .limit(BACKSCAN_WINDOWS)
+        )
+        async with async_session_factory() as session:
+            wins = (await session.execute(stmt)).scalars().all()
+        for w in wins:
+            try:
+                await self._process_window(w)
+            except Exception as exc:
+                logger.warning("首触影子：窗口处理失败 | window {} | {}",
+                               getattr(w, "start_time", None), exc)
+            self._last_window_end = max(self._last_window_end or 0, int(w.end_time))
+
+    # ------------------------------------------------------------------
+    # 预热：分块载入 trailing 14 天已归档窗，只推进水位不落表
+    # ------------------------------------------------------------------
+
+    async def _warmup(self) -> None:
+        async with async_session_factory() as session:
+            latest_end = (await session.execute(
+                sa_select(sa_func.max(SentimentWindow.end_time))
+            )).scalar_one_or_none()
+        if latest_end is None:
+            logger.warning("首触影子：无归档窗口，跳过预热（水位 0，循环内自愈）")
+            return
+        floor = int(latest_end) - WARMUP_MS
+        last_end = floor
+        total = 0
+        while True:
+            async with async_session_factory() as session:
+                batch = (await session.execute(
+                    sa_select(SentimentWindow.end_time)
+                    .where(SentimentWindow.end_time > last_end)
+                    .order_by(SentimentWindow.end_time.asc())
+                    .limit(WARMUP_BATCH)
+                )).scalars().all()
+            if not batch:
+                break
+            total += len(batch)
+            last_end = max(int(b) for b in batch)
+            if len(batch) < WARMUP_BATCH:
+                break
+        # 水位推进到最新：主循环只处理新归档窗（历史样本由离线研究覆盖，
+        # 影子从部署点前向攒样本——与吸收影子同取舍）
+        self._last_window_end = last_end
+        logger.info(
+            "首触影子：预热完成，扫描 {} 窗（trailing {}d）推进水位到 {}（预热窗不落表，"
+            "历史样本由 scripts/local_shape_scan_v2.py 离线研究覆盖）",
+            total, WARMUP_DAYS, datetime.fromtimestamp(last_end / 1000, tz=timezone.utc)
+            .strftime("%m-%d %H:%M"),
+        )
+
+    # ------------------------------------------------------------------
+    # 核心：单窗口处理（首触特征 → 结算 → 三 version 门 → 落 SETTLED）
+    # ------------------------------------------------------------------
+
+    async def _process_window(self, w: SentimentWindow) -> None:
+        outcome = _outcome_of(w)
+        if outcome is None:
+            return                                     # NOISE/缺结算：胜负不可判，不产生信号
+        start_ms, end_ms = int(w.start_time), int(w.end_time)
+        ext = _extract(w)
+        if ext is None:
+            return                                     # 无首触/路径质量不足：整窗不落表
+
+        win = outcome == "DOWN"                        # 买 DOWN：窗结算 DOWN 即赢
+        q = ext["q"]
+        ev = _ev_at_entry(win, q)                      # 逐事件真实触发价，禁均值/pct 代理
+
+        async with async_session_factory() as session:
+            # per-version 独立 commit：单 version 落表失败不回滚、不影响其他 version。
+            for version, _name in FIRSTHIT_SPECS:
+                try:
+                    if not _gate_of(version, ext):
+                        continue                        # 门未命中：不落表
+                    if not shadow_gate.is_enabled(version):
+                        continue                        # 手动下线：停止采集该版本（历史保留）
+                    dup = await session.execute(
+                        sa_select(FirstHitShadowSignal.id).where(
+                            FirstHitShadowSignal.version == version,
+                            FirstHitShadowSignal.window_start == start_ms,
+                        )
+                    )
+                    if dup.first() is not None:
+                        continue                        # 幂等：(version, window_start) 已存在
+                    session.add(FirstHitShadowSignal(
+                        version=version,
+                        window_start=start_ms,
+                        window_end=end_ms,
+                        trigger_ts=ext["trigger_ts"],
+                        td_sec=ext["td_sec"],
+                        entry_down_price=q,
+                        chg_bps=ext["chg_bps"],
+                        body_r=ext["body_r"],
+                        wick01=ext["wick01"],
+                        rng_bps=ext["rng_bps"],
+                        npts=ext["npts"],
+                        dvol=ext["dvol"],
+                        dpar=ext["dpar"],
+                        settle_outcome=outcome,
+                        win=win,
+                        ev_at_entry=ev,
+                        status="SETTLED",
+                    ))
+                    await session.commit()
+                    self._trigger_counts[version] = self._trigger_counts.get(version, 0) + 1
+                    logger.info(
+                        "首触影子触发+结算 | {} | 窗口 {} | t={}s q={:.3f} chg={:+.2f}bp"
+                        " body_r={:.3f} → 买DOWN | win={} ev={:+.3f} | npts={}",
+                        version,
+                        datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)
+                        .strftime("%m-%d %H:%M"),
+                        ext["td_sec"], q, ext["chg_bps"], ext["body_r"], win, ev, ext["npts"],
+                    )
+                except Exception as exc:
+                    await session.rollback()
+                    logger.warning("首触影子：version {} 落表失败 | window {} | {}",
+                                   version, start_ms, exc)
+
+    # ------------------------------------------------------------------
+    # 状态（status API 用）
+    # ------------------------------------------------------------------
+
+    def status(self) -> dict:
+        return {
+            "running": self._running,
+            "versions": {v: shadow_gate.is_enabled(v) for v, _ in FIRSTHIT_SPECS},
+            "triggers": dict(self._trigger_counts),
+            "last_window_end": self._last_window_end,
+            "gates": {"q_range": [Q_LO, Q_HI], "body_r": BODY_R_GATE,
+                      "chg_bps": CHG_BPS_GATE, "min_pts": MIN_PTS},
+        }

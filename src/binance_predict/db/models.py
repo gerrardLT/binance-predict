@@ -1203,6 +1203,99 @@ class AbsorptionShadowSignal(Base):
 
 
 # ============================================================
+# 5m DOWN 首触反转影子信号表（firsthit_down 族，2026-09-07）
+# ============================================================
+
+class FirstHitShadowSignal(Base):
+    """5m DOWN 首触反转影子信号（firsthit_down 族）。
+
+    冻结口径（scripts/local_shape_scan_v2.py 方法论修正版，2026-09-07；规则冻结勿动）：
+      触发：5m 窗内 DOWN token 报价**首次**进入 (0.005, 0.1] 的采样点 → 以该报价买 DOWN。
+      特征（触发时刻可见，严格 ex-ante，只读 ≤触发点采样）：
+        chg_bps = (btc@触 − 开盘)/开盘×1e4（开盘 = entry_price 优先，回退曲线首点）
+        body_r  = |btc@触 − 开盘| / (触发前路径 max−min)（路径归一实体）
+        wick01  = 路径高点 > max(btc@触, 开盘) 的二元变量（供事后重构 G6/G7，不作门）
+        npts    = 触发前 btc 采样点数（路径质量；<8 的窗不落表 = v2 主分析口径）
+      三 version 同表隔离（G1/G3 为 G0 子集，事后可重构 G4 等交叉门）：
+        firsthit_down_v1       G0 基底（全部首触，对照组）
+        firsthit_down_body_v1  G1：body_r ≤ 0.35（FDR q=0.007，logit β=+1.28 p=0.000）
+        firsthit_down_chg_v1   G3：chg_bps ≤ +2.82（logit β=+0.07 p=0.000）
+      EV = 赢 0.98/q−1 / 输 −1（费 2% 无溢价，逐事件真实触发价，禁用均值/pct 代理）。
+      归档后处理（同 absorption/quote_edge）：窗已结算 → 直接落 SETTLED，无 PENDING。
+      只记录不下注，物理隔离于下单路径（本表不被任何下单代码引用，不进 X4_VERSIONS/LIVE_CHANNELS）。
+      前向裁决标准（预注册，4 周）：G1 通过 = P≥12% 且 EV 日聚类 CI 下界>0；
+      整体否决 = G0 EV 日聚类 CI 上界<0（DOWN 侧 edge 消失）。
+    """
+    __tablename__ = "firsthit_shadow_signals"
+    __table_args__ = (
+        UniqueConstraint("version", "window_start", name="uq_firsthit_version_window"),
+        Index("ix_firsthit_status", "status"),
+        Index("ix_firsthit_window_start", "window_start"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    version: Mapped[str] = mapped_column(
+        String(32), nullable=False,
+        comment="firsthit_down_v1 / firsthit_down_body_v1 / firsthit_down_chg_v1",
+    )
+    window_start: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, comment="触发窗（5m 情绪窗）start_time（ms）"
+    )
+    window_end: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, comment="触发窗 end_time（ms）"
+    )
+    trigger_ts: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, comment="首触采样时刻（ms，DOWN 首次进入 (0.005,0.1]）"
+    )
+    td_sec: Mapped[int] = mapped_column(
+        Integer, nullable=False, comment="首触距窗开秒数"
+    )
+    # ---- 特征快照（触发时刻，供事后重构交叉门，不作门）----
+    entry_down_price: Mapped[float] = mapped_column(
+        Float, nullable=False, comment="首触 DOWN token 真实报价 q（EV 的入场价）"
+    )
+    chg_bps: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="BTC 相对开盘涨跌 (btc@触−开盘)/开盘×1e4（bp）"
+    )
+    body_r: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="路径归一实体 |btc@触−开盘|/(触发前路径 max−min)"
+    )
+    wick01: Mapped[int | None] = mapped_column(
+        Float, nullable=True, comment="上影二元（路径高点>max(btc@触,开盘)=1，供 G6/G7 重构）"
+    )
+    rng_bps: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="触发前路径振幅 (max−min)/开盘×1e4（bp）"
+    )
+    npts: Mapped[int] = mapped_column(
+        Integer, nullable=False, comment="触发前 btc 采样点数（≥8 才落表 = v2 主分析口径）"
+    )
+    dvol: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="Δtrade_volume（@触−open，soft 记录维度，不作门）"
+    )
+    dpar: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="Δparticipants（@触−open，soft 记录维度，不作门）"
+    )
+    # ---- 结算（归档后处理，窗已结算）----
+    settle_outcome: Mapped[str | None] = mapped_column(
+        String(10), nullable=True, comment="触发窗结算方向 UP | DOWN"
+    )
+    win: Mapped[bool | None] = mapped_column(
+        Boolean, nullable=True, comment="买 DOWN 命中 = 窗 outcome == DOWN"
+    )
+    ev_at_entry: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+        comment="单注 EV（真实触发价口径）：赢 0.98/q−1 / 输 −1（费 2% 无溢价）",
+    )
+    status: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="SETTLED", server_default="SETTLED",
+        comment="SETTLED（归档后处理落表即结算，无 PENDING 阶段）",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+# ============================================================
 # 模式回测快照表（每个模式每次回测的完整记录，支撑无限进化与前后对比）
 # ============================================================
 
