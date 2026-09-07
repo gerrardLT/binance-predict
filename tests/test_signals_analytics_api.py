@@ -15,7 +15,7 @@ collector.fetch_recent_klines 用 AsyncMock patch。
   （赢 0.98/q−1 / 输 −1）；kline 系无报价恒空
 - 影子版本 = 冻结基准 ∪ 数据中出现版本（新版本 bench=None 容错）
 - 场景信号过滤 = 排除 SceneParamVersion 中 SHADOW 版本名（ACTIVE 演进名视为正式）；
-  端点共 6 次 db.execute（影子行 → KREV 行 → pattern 行 → absorption 行 → SHADOW 版本名 → 场景行）
+  端点共 7 次 db.execute（影子行 → KREV 行 → pattern 行 → absorption 行 → firsthit 行 → SHADOW 版本名 → 场景行）
 - K 线缓存键 = interval:档位（limit 归档到固定档），上游失败 10s 负缓存
 """
 
@@ -88,18 +88,21 @@ def _absorption_row(**over) -> SimpleNamespace:
 
 
 def _make_db(shadow_rows, scene_rows, krev_rows=(), pattern_rows=(),
-             absorption_rows=()) -> AsyncMock:
+             absorption_rows=(), firsthit_rows=()) -> AsyncMock:
     db = AsyncMock()
-    r1, r2, r3, r4, r5, r6 = (MagicMock() for _ in range(6))
+    r1, r2, r3, r4, r5, r6, r7 = (MagicMock() for _ in range(7))
     # 端点用指定列 SELECT，结果直接 .all()（不再 .scalars()）；
-    # 6 次查询顺序：影子行 → KREV 行 → pattern 行 → absorption 行 → SceneParamVersion SHADOW 版本名（默认空）→ 场景行
+    # 7 次查询顺序（2026-09-07 新增 firsthit）：
+    #   影子行 → KREV 行 → pattern 行 → absorption 行 → firsthit 行 →
+    #   SceneParamVersion SHADOW 版本名（默认空）→ 场景行
     r1.all.return_value = shadow_rows
     r2.all.return_value = krev_rows
     r3.all.return_value = pattern_rows
     r4.all.return_value = absorption_rows
-    r5.all.return_value = []
-    r6.all.return_value = scene_rows
-    db.execute = AsyncMock(side_effect=[r1, r2, r3, r4, r5, r6])
+    r5.all.return_value = firsthit_rows
+    r6.all.return_value = []
+    r7.all.return_value = scene_rows
+    db.execute = AsyncMock(side_effect=[r1, r2, r3, r4, r5, r6, r7])
     return db
 
 
@@ -278,7 +281,9 @@ async def test_analytics_empty_db() -> None:
         "combo_p1_v1", "combo_p2_v1", "combo_p3_v1", "combo_p4_v1", "combo_p5_v1",
         "s5_deep_z20_v1", "quote_momentum_v3",
         "absorption_follow_td120_v1", "absorption_follow_td150_v1",
-        "s2_cond_t4_v1", "s2_cond_t5d_v1"}
+        "s2_cond_t4_v1", "s2_cond_t5d_v1",
+        "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1",
+    }
     for v, blk in out["shadow"].items():
         assert blk["summary"]["n"] == 0
         assert blk["summary"]["win_rate"] is None
