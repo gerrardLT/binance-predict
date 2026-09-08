@@ -174,6 +174,8 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     # ⚠️ 功效警告（见 .pytest_tmp/firsthit_optimization_evidence_v2.md D3）：G4 calib EV(+1.03)
     #   与前向 CI 半宽(≈1.08)几乎相等 → 即使真实效应等于 calib 估计，前向通过概率仅 ≈50%。
     #   预期它大概率 FAIL 时应延长观察期而非直接否决。
+    # ⚠️ 研究账本 Phase 0（2026-09-08）政策替换 ΔV：G4 vs G1 = −0.062（显著负）——
+    #   用户知情后仍拍板维持实盘（线上已开启下单），前向影子+实盘双重验证裁决。
     "firsthit_down_g4_v1": ChannelSpec(
         "firsthit_down_g4_v1", "firsthit", "5m", "DOWN", 0.12,
         "首触G4交互门 chg≤2.82∧body≤0.35（押DOWN）",
@@ -181,6 +183,8 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     # G7 族（2026-09-08 影子+实盘接入）：G7 纯组合基底及 5 个科学变体
     # 护栏设置依据：回测中均值触发价约 0.068~0.075，盈亏平衡平衡价 wr*0.98（胜率 18%~24% 对应 0.17~0.23）；
     # 取值保持极度保守（只吃深折价优质单）：基底 0.10；streak 0.10；wick20 0.12；strict 0.12；q05 0.05；t270 0.10。
+    # ⚠️ 研究账本 Phase 0（2026-09-08）政策替换 ΔV：G7 vs G1 ≈0、g7strict vs g7streak −0.055
+    #   （显著负）——用户知情后仍拍板维持实盘（线上已开启下单），前向验证裁决。
     "firsthit_down_g7_v1": ChannelSpec(
         "firsthit_down_g7_v1", "firsthit", "5m", "DOWN", 0.10,
         "首触G7基底 body_r≤0.35∧wick=1（押DOWN）",

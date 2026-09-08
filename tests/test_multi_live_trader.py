@@ -279,7 +279,7 @@ def test_parse_non_int_daily_rejected(monkeypatch) -> None:
 
 
 def test_channels_registry_shape() -> None:
-    """注册表形状（2026-09-08 firsthit G4+G7 系列注册后）：23 在线 + 8 退役，两者不交。"""
+    """注册表形状（2026-09-08 firsthit G4+G7 系注册后）：23 在线 + 8 退役，两者不交。"""
     assert set(LIVE_CHANNELS) == {
         "quote_contrarian_v2",
         "x4_v2",
@@ -1997,6 +1997,10 @@ async def test_live_pnl_curve_endpoint(monkeypatch) -> None:
     assert out["total"]["settled_count"] == 3
     assert out["total"]["total_pnl"] == 3.5
     assert out["total"]["win_rate"] == round(2 / 3, 4)
+    # 口径自描述字段（2026-09-08 审计）：前端展示口径的事实源
+    assert out["scope"]["filter"] == "LIVE_CHANNELS ∩ FILLED ∩ win≠NULL ∩ pnl≠NULL"
+    assert "manual_test" in out["scope"]["excludes"]
+    assert "fund-flow" in out["scope"]["note"]
 
     by = {c["channel"]: c for c in out["channels"]}
     # 排序：quote_contrarian_v1(+2.0) 在 scene_bull_exhaust(+1.5) 前

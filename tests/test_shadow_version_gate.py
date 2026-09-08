@@ -274,13 +274,13 @@ async def test_shadow_toggle_api_rejects_retired_version() -> None:
 
 
 def test_retired_versions_cover_all_retired_channels() -> None:
-    """退役名单与实盘通道退役名单对齐（RETIRED_CHANNELS ⊆ RETIRED_VERSIONS）。
-
-    差集只能是纯影子版本（本就无实盘通道）；若将来新增退役通道漏登记，
-    该断言会立即报错，防止「通道删了但影子还在采」的半成品状态。
+    """两处退役名单必须一致（live_channels.RETIRED_CHANNELS ⊆
+    shadow_version_gate.RETIRED_VERSIONS）：通道退役了影子版本也必须退役，
+    否则出现「影子还在采、实盘不可交易」的半退役态。
+    反向不要求包含：late_night_contrarian_v1 / hm_touch_down_v1/v2 是纯影子
+    版本，本就无实盘通道。
     """
     from binance_predict.services.live_channels import RETIRED_CHANNELS
-
     assert RETIRED_CHANNELS <= svg.RETIRED_VERSIONS
     assert svg.RETIRED_VERSIONS - RETIRED_CHANNELS == {
         "late_night_contrarian_v1", "hm_touch_down_v1", "hm_touch_down_v2"}

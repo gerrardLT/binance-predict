@@ -1363,7 +1363,7 @@ function FundsFlowCard({ orders }: { orders: Record<string, unknown>[] }) {
             >{x.label}</button>
           ))}
         </div>
-        <span className="text-[10px] text-ink-55">划转记录不入库，此处仅含下注/结算流水（回流=本金+盈亏）{fundOrders.length > 0 ? ` · 全量 ${fundOrders.length} 单` : ''}</span>
+        <span className="text-[10px] text-ink-55">划转记录不入库，此处仅含下注/结算流水（回流=本金+盈亏）{fundOrders.length > 0 ? ` · 全量 ${fundOrders.length} 单` : ''} · 口径=全量订单（含退役通道历史与 NOISE·EXPIRED），与「盈利趋势」面板不同，勿直接对比</span>
       </div>
       <div className="flex flex-wrap gap-2 mb-3 text-xs">
         <div className={statBox}>
@@ -1569,7 +1569,8 @@ function PnlCurveCard() {
           </label>
         </div>
         <span className="text-[10px] text-ink-55">
-          口径：已结算成交单（本地估算 pnl，赢=股数−成本，输=−投入）；胜率趋势=截至该笔的滚动胜率；每 30s 刷新
+          口径：当前注册实盘通道的已结算成交单（本地估算 pnl，赢=股数−成本，输=−投入）；
+          不含 manual_test / 已退役通道历史 / NOISE·EXPIRED / 失败未成交——与「资金变化」面板的全量订单口径不同，勿直接对比；胜率趋势=截至该笔的滚动胜率；每 30s 刷新
         </span>
       </div>
       {allChans.length === 0 ? (

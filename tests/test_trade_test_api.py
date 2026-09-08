@@ -1477,3 +1477,29 @@ async def test_sync_binance_downgrades_ghost_filled(monkeypatch) -> None:
     assert out["synced"] == 1
     assert out["details"][0]["corrected"] == "ghost_filled"
     db.commit.assert_awaited_once()
+
+
+# ============================================================
+# 危险端点删除回归（2026-09-08 审计 P0#3）：POST /api/trades/sync-status
+# ============================================================
+
+def test_sync_status_endpoint_removed() -> None:
+    """sync-status 路由必须不存在（2026-09-08 审计后删除）。
+
+    背景：该端点的 PnL 公式不看 win、忽略 filledShareQty/费用、
+    averagePrice<=0 时返回 -amount、异常返回固定 -1.0，且在 session
+    关闭后修改 detached ORM 并 commit——被调用即可能错误改写 PnL。
+    审计取证（logs/grep 0 命中）确认生产从未调用，属 latent risk，
+    故直接删除路由与 _calculate_pnl_from_binance。若未来需要类似
+    对账能力，必须走 _sync_binance_orders_impl 同一实现。
+    """
+    import binance_predict.main as m
+
+    paths = {getattr(r, "path", None) for r in m.app.routes}
+    assert "/api/trades/sync-status" not in paths
+    # 错误公式函数一并删除，防复活
+    assert not hasattr(m, "_calculate_pnl_from_binance")
+    assert not hasattr(m, "sync_order_status_from_binance")
+    # 主对账路径仍在（未被误删）
+    assert hasattr(m, "_sync_binance_orders_impl")
+    assert "/api/trades/sync-binance" in paths
