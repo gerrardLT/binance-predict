@@ -1024,9 +1024,11 @@ function TestTradeFab({ quote, remainSec, urgent, wallet, refresh }: {
   )
 }
 
-// 最近订单卡片（页面主区展示，2026-08-28 用户要求回归页面；
+// 订单记录卡片（页面主区展示，2026-08-28 用户要求回归页面；
 // 2026-08-29：加状态/通道/方向筛选 + 通道中文化与解释 + 分页；
-// 2026-08-29：加「目标周期」列——window_start + market_period 展示真正下注的窗口时段）
+// 2026-08-29：加「目标周期」列——window_start + market_period 展示真正下注的窗口时段；
+// 2026-09-08：失败单从主列表剥离，改双 Tab（最近订单 / 失败订单）——
+// 失败单 amount_in=0、token_id=""、均价是报价不是成交价，混在主列表里会污染盈亏阅读）
 const ORDERS_PAGE_SIZE = 20
 
 function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
@@ -1035,15 +1037,21 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
   syncResult: Record<string, unknown> | null
   onSyncBinance: () => void
 }) {
+  const [orderTab, setOrderTab] = useState<'active' | 'failed'>('active')
   const [fStatus, setFStatus] = useState('ALL')
   const [fChannel, setFChannel] = useState('ALL')
   const [fDirection, setFDirection] = useState('ALL')
   const [page, setPage] = useState(1)
 
+  // 失败单严格分流：主 Tab 只留非 FAILED（FILLED / PENDING / 未知状态都在），失败 Tab 只留 FAILED
+  const activeOrders = orders.filter(o => String(o.status ?? '') !== 'FAILED')
+  const failedOrders = orders.filter(o => String(o.status ?? '') === 'FAILED')
+  const base = orderTab === 'active' ? activeOrders : failedOrders
+
   const channels = Array.from(new Set(
-    orders.map(o => String(o.signal_version ?? '')).filter(v => v && v !== '--'))).sort()
-  const filtered = orders.filter(o => {
-    if (fStatus !== 'ALL' && String(o.status ?? '') !== fStatus) return false
+    base.map(o => String(o.signal_version ?? '')).filter(v => v && v !== '--'))).sort()
+  const filtered = base.filter(o => {
+    if (orderTab === 'active' && fStatus !== 'ALL' && String(o.status ?? '') !== fStatus) return false
     if (fChannel !== 'ALL' && String(o.signal_version ?? '') !== fChannel) return false
     if (fDirection !== 'ALL' && String(o.direction ?? '') !== fDirection) return false
     return true
@@ -1056,20 +1064,127 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
   const selectCls = 'px-1.5 py-0.5 border border-line rounded-sm text-xs text-ink-80 bg-card'
   // 分页：筛选变化时回到第 1 页；超出范围时钳位（避免删数据后空白页）
   useEffect(() => { setPage(1) }, [fStatus, fChannel, fDirection])
+  // 切 Tab 必须清筛选：否则主 Tab 选的 FILLED 会让失败 Tab 直接空白
+  useEffect(() => {
+    setFStatus('ALL'); setFChannel('ALL'); setFDirection('ALL'); setPage(1)
+  }, [orderTab])
   const totalPages = Math.max(1, Math.ceil(filtered.length / ORDERS_PAGE_SIZE))
   const safePage = Math.min(page, totalPages)
   const pageRows = filtered.slice((safePage - 1) * ORDERS_PAGE_SIZE, safePage * ORDERS_PAGE_SIZE)
 
+  const tabBtn = (t: 'active' | 'failed', label: string, count: number) => (
+    <button
+      onClick={() => setOrderTab(t)}
+      className={`px-3 py-1 text-xs font-semibold rounded-sm border transition ${orderTab === t ? 'bg-brand text-white border-brand' : 'bg-card text-ink-80 border-line hover:border-brand'}`}
+    >{label} ({count})</button>
+  )
+
+  // 两张表共用的 4 个单元格（时间/目标周期/通道/方向）
+  const cellTime = (o: Record<string, unknown>) => (
+    <td className="py-1.5 pr-2 text-ink-80 whitespace-nowrap num">
+      {o.created_at ? new Date(String(o.created_at)).toLocaleString() : '--'}
+    </td>
+  )
+  const cellPeriod = (o: Record<string, unknown>) => (
+    <td className="py-1.5 pr-2 whitespace-nowrap">
+      {typeof o.window_start === 'number' ? (() => {
+        const ws = o.window_start as number
+        const durMin = o.market_period === '15m' ? 15 : 5
+        const hhmm = (ms: number) => new Date(ms).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+        return (
+          <span className="font-mono text-ink-80" title={`下注窗口：${new Date(ws).toLocaleString()} ~ ${new Date(ws + durMin * 60_000).toLocaleString()}`}>
+            {hhmm(ws)}–{hhmm(ws + durMin * 60_000)}
+            <span className="ml-1 px-1 rounded-pill bg-sunken text-ink-55">{durMin}m</span>
+          </span>
+        )
+      })() : <span className="text-ink-55">--</span>}
+    </td>
+  )
+  const cellChannel = (o: Record<string, unknown>) => {
+    const ver = String(o.signal_version ?? '')
+    const info = SIGNAL_INFO[ver]
+    return (
+      <td className="py-1.5 pr-2">
+        {info ? (
+          <span className="inline-flex items-center gap-1">
+            <span className="text-ink-95">{info.name}</span>
+            {info.retired && (
+              <span
+                className="px-1 py-0.5 rounded-pill text-[9px] font-bold bg-sunken text-ink-55 border border-line shrink-0"
+                title="该通道已于 2026-09-04 永久退役（不再开火）；本行为历史订单，保留可追溯"
+              >已退役</span>
+            )}
+            <HelpHint text={`${ver}（${info.kind}${info.retired ? '·已退役' : ''}）：${info.desc}`} />
+          </span>
+        ) : (
+          <span className="font-mono text-ink-80">{ver || '--'}</span>
+        )}
+      </td>
+    )
+  }
+  const cellDirection = (o: Record<string, unknown>) => (
+    <td className="py-1.5 pr-2">
+      {o.direction === 'UP'
+        ? <span className="px-1.5 py-0.5 rounded-pill font-bold bg-positive-soft text-positive">UP</span>
+        : o.direction === 'DOWN'
+          ? <span className="px-1.5 py-0.5 rounded-pill font-bold bg-negative-soft text-negative">DOWN</span>
+          : <span className="text-ink-55">--</span>}
+    </td>
+  )
+  // 报价单元格：price_kind==='quote' 时必须挂黄色「报价」徽章，
+  // 否则失败单的委托价会被误读成「按这个价买到了」（P2c 口径）
+  const cellQuotePrice = (o: Record<string, unknown>) => (
+    <td className="py-1.5 pr-2 font-mono">
+      {o.average_price != null ? (
+        <span className="inline-flex items-center gap-1">
+          {String(o.average_price)}
+          {o.price_kind === 'quote' && (
+            <span
+              className="px-1 py-0.5 rounded-pill text-[9px] font-bold bg-warning-soft text-warning border border-warning"
+              title="报价/委托价，非成交均价：本单未成交（FOK 未吃满/护栏弃单/待对账），不能用来核对盈亏"
+            >报价</span>
+          )}
+        </span>
+      ) : '--'}
+    </td>
+  )
+
+  const pager = filtered.length > ORDERS_PAGE_SIZE && (
+    <div className="flex items-center justify-end gap-1 mt-2 text-xs">
+      <button
+        disabled={safePage <= 1} onClick={() => setPage(safePage - 1)}
+        className="px-2 py-0.5 rounded-pill border border-line bg-card text-ink-80 disabled:opacity-40"
+      >上一页</button>
+      {Array.from({ length: totalPages }, (_, i) => i + 1).map(n => (
+        <button
+          key={n} onClick={() => setPage(n)}
+          className={`px-2 py-0.5 rounded-pill border ${n === safePage ? 'bg-brand text-white border-brand' : 'bg-card text-ink-80 border-line hover:border-brand'}`}
+        >{n}</button>
+      ))}
+      <button
+        disabled={safePage >= totalPages} onClick={() => setPage(safePage + 1)}
+        className="px-2 py-0.5 rounded-pill border border-line bg-card text-ink-80 disabled:opacity-40"
+      >下一页</button>
+      <span className="text-ink-55 ml-1">每页 {ORDERS_PAGE_SIZE} 条</span>
+    </div>
+  )
+
   return (
-    <Card title="最近订单">
+    <Card title="订单记录">
+      <div className="flex items-center gap-2 mb-2">
+        {tabBtn('active', '最近订单', activeOrders.length)}
+        {tabBtn('failed', '失败订单', failedOrders.length)}
+        <HelpHint text="失败单（FAILED）已从主列表剥离：这类单未提交成功或未成交，amount_in=0、均价只是委托报价，混在一起会污染盈亏阅读" />
+      </div>
       <div className="flex items-center justify-between mb-2 gap-2 flex-wrap">
         <div className="flex items-center gap-1.5 flex-wrap">
-          <select value={fStatus} onChange={e => setFStatus(e.target.value)} className={selectCls} title="按订单状态筛选">
-            <option value="ALL">全部状态</option>
-            <option value="FILLED">已成交 FILLED</option>
-            <option value="FAILED">失败 FAILED</option>
-            <option value="PENDING">待定 PENDING</option>
-          </select>
+          {orderTab === 'active' && (
+            <select value={fStatus} onChange={e => setFStatus(e.target.value)} className={selectCls} title="按订单状态筛选">
+              <option value="ALL">全部状态</option>
+              <option value="FILLED">已成交 FILLED</option>
+              <option value="PENDING">待定 PENDING</option>
+            </select>
+          )}
           <select value={fChannel} onChange={e => setFChannel(e.target.value)} className={selectCls} title="按信号通道筛选">
             <option value="ALL">全部通道</option>
             {channels.map(v => (
@@ -1087,7 +1202,7 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
               className="px-1.5 py-0.5 text-xs text-brand hover:underline"
             >清除筛选</button>
           )}
-          <span className="text-xs text-ink-55">{filtered.length}/{orders.length} 条（每 15s 自动刷新）</span>
+          <span className="text-xs text-ink-55">{filtered.length}/{base.length} 条（每 15s 自动刷新）</span>
         </div>
         <div className="flex items-center gap-2">
           {syncResult && (
@@ -1104,8 +1219,12 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
         </div>
       </div>
       {filtered.length === 0 ? (
-        <p className="text-sm text-ink-55">{orders.length === 0 ? '暂无订单记录' : '当前筛选条件下无订单'}</p>
-      ) : (
+        <p className="text-sm text-ink-55">
+          {base.length === 0
+            ? (orderTab === 'active' ? '暂无订单记录' : '暂无失败订单')
+            : (orderTab === 'active' ? '当前筛选条件下无订单' : '当前筛选条件下无失败订单')}
+        </p>
+      ) : orderTab === 'active' ? (
         <>
         <table className="w-full text-xs">
           <thead>
@@ -1116,7 +1235,7 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
               <th className="py-1 pr-2">方向</th>
               <th className="py-1 pr-2">状态</th>
               <th className="py-1 pr-2">结果</th>
-              <th className="py-1 pr-2" title="币安实际成交均价；标「报价」的是下单时的报价/委托价（失败单 FOK 未成交，filledUsdtAmount=0 但币安仍回 price），不是成交价，不能用来核对盈亏">均价</th>
+              <th className="py-1 pr-2" title="币安实际成交均价；标「报价」的是下单时的报价/委托价（PENDING 未成交/护栏弃单时 filledUsdtAmount=0 但币安仍回 price），不是成交价，不能用来核对盈亏">均价</th>
               <th className="py-1 pr-2">金额 (USDT)</th>
               <th className="py-1 pr-2">盈亏</th>
               <th className="py-1">说明</th>
@@ -1124,49 +1243,12 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
           </thead>
           <tbody>
             {pageRows.map(o => {
-              const ver = String(o.signal_version ?? '')
-              const info = SIGNAL_INFO[ver]
               return (
               <tr key={String(o.id)} className="border-b border-line-soft">
-                <td className="py-1.5 pr-2 text-ink-80 whitespace-nowrap num">
-                  {o.created_at ? new Date(String(o.created_at)).toLocaleString() : '--'}
-                </td>
-                <td className="py-1.5 pr-2 whitespace-nowrap">
-                  {typeof o.window_start === 'number' ? (() => {
-                    const ws = o.window_start as number
-                    const durMin = o.market_period === '15m' ? 15 : 5
-                    const hhmm = (ms: number) => new Date(ms).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
-                    return (
-                      <span className="font-mono text-ink-80" title={`下注窗口：${new Date(ws).toLocaleString()} ~ ${new Date(ws + durMin * 60_000).toLocaleString()}`}>
-                        {hhmm(ws)}–{hhmm(ws + durMin * 60_000)}
-                        <span className="ml-1 px-1 rounded-pill bg-sunken text-ink-55">{durMin}m</span>
-                      </span>
-                    )
-                  })() : <span className="text-ink-55">--</span>}
-                </td>
-                <td className="py-1.5 pr-2">
-                  {info ? (
-                    <span className="inline-flex items-center gap-1">
-                      <span className="text-ink-95">{info.name}</span>
-                      {info.retired && (
-                        <span
-                          className="px-1 py-0.5 rounded-pill text-[9px] font-bold bg-sunken text-ink-55 border border-line shrink-0"
-                          title="该通道已于 2026-09-04 永久退役（不再开火）；本行为历史订单，保留可追溯"
-                        >已退役</span>
-                      )}
-                      <HelpHint text={`${ver}（${info.kind}${info.retired ? '·已退役' : ''}）：${info.desc}`} />
-                    </span>
-                  ) : (
-                    <span className="font-mono text-ink-80">{ver || '--'}</span>
-                  )}
-                </td>
-                <td className="py-1.5 pr-2">
-                  {o.direction === 'UP'
-                    ? <span className="px-1.5 py-0.5 rounded-pill font-bold bg-positive-soft text-positive">UP</span>
-                    : o.direction === 'DOWN'
-                      ? <span className="px-1.5 py-0.5 rounded-pill font-bold bg-negative-soft text-negative">DOWN</span>
-                      : <span className="text-ink-55">--</span>}
-                </td>
+                {cellTime(o)}
+                {cellPeriod(o)}
+                {cellChannel(o)}
+                {cellDirection(o)}
                 <td className="py-1.5 pr-2">
                   <span className={`px-1.5 py-0.5 rounded-pill font-bold ${o.status === 'FILLED' ? 'bg-positive-soft text-positive' : o.status === 'FAILED' ? 'bg-negative-soft text-negative' : 'bg-sunken text-ink-80'}`}>
                     {o.status === 'FILLED' ? '已成交' : o.status === 'FAILED' ? '失败' : o.status === 'PENDING' ? '待定' : String(o.status)}
@@ -1181,21 +1263,7 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
                         ? <span className="px-1.5 py-0.5 rounded-pill font-bold bg-sunken text-ink-80">{String(o.settle_outcome)}</span>
                         : <span className="text-ink-55">--</span>}
                 </td>
-                <td className="py-1.5 pr-2 font-mono">
-                  {o.average_price != null ? (
-                    <span className="inline-flex items-center gap-1">
-                      {String(o.average_price)}
-                      {/* P2c：后端 price_kind 判定口径——非成交均价时必须标出来，
-                          否则失败单的报价会被误读为「按这个价买到了」 */}
-                      {o.price_kind === 'quote' && (
-                        <span
-                          className="px-1 py-0.5 rounded-pill text-[9px] font-bold bg-warning-soft text-warning border border-warning"
-                          title="报价/委托价，非成交均价：本单未成交（FOK 未吃满/护栏弃单/待对账），不能用来核对盈亏"
-                        >报价</span>
-                      )}
-                    </span>
-                  ) : '--'}
-                </td>
+                {cellQuotePrice(o)}
                 <td className="py-1.5 pr-2 font-mono">
                   {o.amount_in != null && Number(o.amount_in) > 0 ? (Number(o.amount_in) / 1e18).toFixed(2) : '--'}
                 </td>
@@ -1221,25 +1289,48 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
             </tfoot>
           )}
         </table>
-        {filtered.length > ORDERS_PAGE_SIZE && (
-          <div className="flex items-center justify-end gap-1 mt-2 text-xs">
-            <button
-              disabled={safePage <= 1} onClick={() => setPage(safePage - 1)}
-              className="px-2 py-0.5 rounded-pill border border-line bg-card text-ink-80 disabled:opacity-40"
-            >上一页</button>
-            {Array.from({ length: totalPages }, (_, i) => i + 1).map(n => (
-              <button
-                key={n} onClick={() => setPage(n)}
-                className={`px-2 py-0.5 rounded-pill border ${n === safePage ? 'bg-brand text-white border-brand' : 'bg-card text-ink-80 border-line hover:border-brand'}`}
-              >{n}</button>
-            ))}
-            <button
-              disabled={safePage >= totalPages} onClick={() => setPage(safePage + 1)}
-              className="px-2 py-0.5 rounded-pill border border-line bg-card text-ink-80 disabled:opacity-40"
-            >下一页</button>
-            <span className="text-ink-55 ml-1">每页 {ORDERS_PAGE_SIZE} 条</span>
-          </div>
-        )}
+        {pager}
+        </>
+      ) : (
+        <>
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="text-left text-ink-55 border-b border-line-soft">
+              <th className="py-1 pr-2">时间</th>
+              <th className="py-1 pr-2" title="本单真正下注的市场周期时段（window_start 起，5m/15m 窗口）">目标周期</th>
+              <th className="py-1 pr-2">通道</th>
+              <th className="py-1 pr-2">方向</th>
+              <th className="py-1 pr-2" title="下单时的报价/委托价（失败单 FOK 未成交，filledUsdtAmount=0 但币安仍回 price），不是成交价">触发报价</th>
+              <th className="py-1 pr-2" title="计划投入金额；失败单未提交到币安时落库为 0，显示 --">计划金额</th>
+              <th className="py-1">
+                <span className="inline-flex items-center gap-1">失败原因
+                  <HelpHint text="error_message 可能是泛化文案（如「下单失败」），真实拒单原因（护栏弃单 / 币安错误码 -1102 等）要看后端 place_order 层日志" />
+                </span>
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            {pageRows.map(o => {
+              const msg = String(o.error_message ?? '')
+              return (
+                <tr key={String(o.id)} className="border-b border-line-soft">
+                  {cellTime(o)}
+                  {cellPeriod(o)}
+                  {cellChannel(o)}
+                  {cellDirection(o)}
+                  {cellQuotePrice(o)}
+                  <td className="py-1.5 pr-2 font-mono">
+                    {o.amount_in != null && Number(o.amount_in) > 0 ? (Number(o.amount_in) / 1e18).toFixed(2) : '--'}
+                  </td>
+                  <td className="py-1.5 text-ink-55 max-w-[320px] truncate" title={msg || undefined}>
+                    {msg || '--'}
+                  </td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+        {pager}
         </>
       )}
     </Card>
