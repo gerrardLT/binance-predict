@@ -102,6 +102,11 @@ jobs:
             docker compose -f docker-compose.prod.yml exec -T db \
               sh -c "psql -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -v ON_ERROR_STOP=1 -c \"SELECT signal_version, count(*) AS total, sum(CASE WHEN status = 'FILLED' THEN 1 ELSE 0 END) AS filled FROM trade_orders GROUP BY 1 ORDER BY 1;\""
 
+            # 打包成单个 tar.gz（scp 拉单文件，避开 glob/strip 组合的空归档坑）
+            tar -czf /tmp/trade_cleanup.tar.gz -C /tmp trade_cleanup_backup
+            ls -la /tmp/trade_cleanup.tar.gz
+            md5sum /tmp/trade_cleanup.tar.gz
+
       # ---------- 2. 备份拉回 runner 并存 artifact ----------
       - name: Pull backup to runner
         uses: appleboy/scp-action@v1
@@ -110,9 +115,16 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           port: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
-          source: "/tmp/trade_cleanup_backup/*"
-          target: "trade_cleanup_backup"
-          strip_components: 2
+          source: "/tmp/trade_cleanup.tar.gz"
+          target: "."
+
+      - name: Extract backup
+        run: |
+          ls -la trade_cleanup.tar.gz
+          md5sum trade_cleanup.tar.gz
+          tar -xzf trade_cleanup.tar.gz
+          ls -la trade_cleanup_backup/
+          wc -l trade_cleanup_backup/trade_orders_backup.csv
 
       - name: Upload backup artifact
         uses: actions/upload-artifact@v4
@@ -121,6 +133,7 @@ jobs:
           path: trade_cleanup_backup/
           retention-days: 30
           if-no-files-found: error
+          overwrite: true
 
       # ---------- 3. 在 runner 上统计（不碰生产） ----------
       - name: Compute keep/delete stats
@@ -243,8 +256,8 @@ jobs:
             fi
             echo "VERIFIED: T0 前的白名单外订单已全部删除。"
 
-      # ---------- 7. 清理 VPS 临时目录（无论成败） ----------
-      - name: Cleanup remote temp dir
+      # ---------- 7. 清理 VPS 临时文件（无论成败） ----------
+      - name: Cleanup remote temp files
         if: always()
         uses: appleboy/ssh-action@v1
         with:
@@ -252,4 +265,4 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           port: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
-          script: rm -rf /tmp/trade_cleanup_backup
+          script: rm -rf /tmp/trade_cleanup_backup /tmp/trade_cleanup.tar.gz
