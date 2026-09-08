@@ -2155,12 +2155,14 @@ async def get_recent_trades(
                 "price_kind": _order_price_kind(o),
                 "direction": o.direction,
                 "settle_outcome": o.settle_outcome,
+                "settle_price": getattr(o, "settle_price", None),
                 "win": o.win,
                 "pnl": o.pnl,
                 "settled_at": o.settled_at.isoformat() if o.settled_at else None,
                 "redeemed_at": o.redeemed_at.isoformat() if o.redeemed_at else None,
                 "error_message": o.error_message,
                 "created_at": o.created_at.isoformat() if o.created_at else None,
+                "quote_json": getattr(o, "quote_json", None),
             }
             for o in orders
         ]

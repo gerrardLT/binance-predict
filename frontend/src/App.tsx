@@ -812,15 +812,25 @@ interface LiveOrderMarker {
   market_period: string
   channel: string
   channelName: string
+  channelDesc?: string
+  channelKind?: '实盘' | '影子' | '场景'
   direction: string
   status: string
+  orderId: string | null
+  tokenId: string | null
   averagePrice: number | null
   priceKind: string | null
   amountUsdt: number | null
+  settleOutcome: string | null
+  settlePrice: number | null
   win: boolean | null
   pnl: number | null
+  returnPct: number | null
+  settledAt: string | null
+  redeemedAt: string | null
   errorMessage: string | null
   btcPrice: number | null
+  shares: number | null
 }
 
 interface BtcKlinePoint extends BtcKline {
@@ -1015,6 +1025,10 @@ function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[
       const stat = String(o.status ?? '')
       const avgP = typeof o.average_price === 'number' ? o.average_price : null
       const amt = o.amount_in != null && Number(o.amount_in) > 0 ? Number(o.amount_in) / 1e18 : null
+      const pnlVal = typeof o.pnl === 'number' ? o.pnl : null
+      const returnPct = (amt != null && amt > 0 && pnlVal != null) ? (pnlVal / amt) * 100 : null
+      const qj = (o.quote_json && typeof o.quote_json === 'object') ? (o.quote_json as Record<string, unknown>) : null
+      const filledShares = qj?.filledShareQty != null ? Number(qj.filledShareQty) : null
 
       list.push({
         id: o.id as (string | number),
@@ -1023,15 +1037,25 @@ function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[
         market_period: per,
         channel: ver,
         channelName: info?.name ?? ver,
+        channelDesc: info?.desc,
+        channelKind: info?.kind,
         direction: dir,
         status: stat,
+        orderId: o.order_id ? String(o.order_id) : null,
+        tokenId: o.token_id ? String(o.token_id) : null,
         averagePrice: avgP,
         priceKind: (o.price_kind as string | null) ?? null,
         amountUsdt: amt,
+        settleOutcome: o.settle_outcome ? String(o.settle_outcome) : null,
+        settlePrice: typeof o.settle_price === 'number' ? o.settle_price : null,
         win: typeof o.win === 'boolean' ? o.win : null,
-        pnl: typeof o.pnl === 'number' ? o.pnl : null,
+        pnl: pnlVal,
+        returnPct,
+        settledAt: o.settled_at ? String(o.settled_at) : null,
+        redeemedAt: o.redeemed_at ? String(o.redeemed_at) : null,
         errorMessage: (o.error_message as string | null) ?? null,
         btcPrice: nearestBtc,
+        shares: filledShares,
       })
     }
     return list
@@ -1074,63 +1098,164 @@ function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[
           </div>
         </div>
 
-        {/* 悬浮/固定下单点详情面板 */}
-        <div className={`mb-2 min-h-[32px] px-3 py-1.5 rounded-sm border text-xs flex items-center justify-between flex-wrap gap-2 transition-colors ${
-          pinnedMarker ? 'bg-brand-soft/40 border-brand' : 'bg-sunken border-line'
+        {/* 悬浮/固定下单点详情面板（升级全维度指标卡） */}
+        <div className={`mb-2 px-3 py-2.5 rounded-sm border text-xs transition-all ${
+          pinnedMarker ? 'bg-brand-soft/50 border-brand' : activeMarker ? 'bg-card border-brand/40' : 'bg-sunken border-line'
         }`}>
           {activeMarker ? (
-            <div className="flex items-center gap-3 flex-wrap">
-              <span className="font-mono text-ink-55">{new Date(activeMarker.time).toLocaleTimeString()}</span>
-              <span className="font-semibold text-ink-95">#{String(activeMarker.id)} {activeMarker.channelName}</span>
-              <span className={`px-1.5 py-0.2 rounded-pill font-bold ${activeMarker.direction === 'UP' ? 'bg-positive-soft text-positive' : 'bg-negative-soft text-negative'}`}>
-                {activeMarker.direction}
-              </span>
-              <span className="font-mono">
-                {activeMarker.status === 'FILLED' ? (
-                  <span className="text-positive font-semibold">已成交</span>
-                ) : activeMarker.status === 'FAILED' ? (
-                  <span className="text-negative font-semibold">失败</span>
-                ) : (
-                  <span className="text-ink-80">待定</span>
-                )}
-              </span>
-              <span className="text-ink-80 font-mono">
-                均价: {activeMarker.averagePrice != null ? activeMarker.averagePrice.toFixed(2) : '--'}
-                {activeMarker.priceKind === 'quote' && <span className="text-[10px] text-warning ml-0.5">(报价)</span>}
-              </span>
-              <span className="text-ink-80 font-mono">
-                金额: {activeMarker.amountUsdt != null ? `${activeMarker.amountUsdt.toFixed(2)}U` : '--'}
-              </span>
-              <span className="font-mono font-bold">
-                {activeMarker.win === true ? (
-                  <span className="text-positive">赢 (+{activeMarker.pnl != null ? activeMarker.pnl.toFixed(2) : '0.00'}U)</span>
-                ) : activeMarker.win === false ? (
-                  <span className="text-negative">输 ({activeMarker.pnl != null ? activeMarker.pnl.toFixed(2) : '-'}U)</span>
-                ) : (
-                  <span className="text-ink-55">未结算</span>
-                )}
-              </span>
-              {activeMarker.btcPrice != null && (
-                <span className="text-ink-55 font-mono text-[11px]">
-                  对应 BTC: ${activeMarker.btcPrice.toLocaleString()}
-                </span>
-              )}
-              {activeMarker.errorMessage && (
-                <span className="text-negative text-[11px] truncate max-w-[240px]" title={activeMarker.errorMessage}>
-                  原因: {activeMarker.errorMessage}
-                </span>
-              )}
-              {pinnedMarker && (
-                <button
-                  onClick={(e) => { e.stopPropagation(); setPinnedMarker(null) }}
-                  className="text-[11px] text-brand hover:underline font-semibold ml-auto"
-                >
-                  [解除固定]
-                </button>
+            <div className="space-y-2">
+              {/* 顶部状态条：ID、通道分类、方向、状态、目标时段与操作 */}
+              <div className="flex items-center justify-between gap-2 flex-wrap border-b border-line-soft pb-1.5">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="font-mono font-bold text-ink-95">#{String(activeMarker.id)}</span>
+                  {activeMarker.channelKind && (
+                    <span className={`ds-badge ${SIGNAL_KIND_BADGE[activeMarker.channelKind] || 'ds-badge-neutral'}`}>
+                      {activeMarker.channelKind}
+                    </span>
+                  )}
+                  <span className="font-semibold text-ink-95">{activeMarker.channelName}</span>
+                  <span className="font-mono text-ink-55 text-[11px]">({activeMarker.channel})</span>
+                  <span className={`px-2 py-0.5 rounded-pill font-bold ${
+                    activeMarker.direction === 'UP' ? 'bg-positive-soft text-positive' : 'bg-negative-soft text-negative'
+                  }`}>
+                    {activeMarker.direction === 'UP' ? '↑ UP 看涨' : '↓ DOWN 看跌'}
+                  </span>
+                  <span className="font-mono">
+                    {activeMarker.status === 'FILLED' ? (
+                      <span className="px-1.5 py-0.5 rounded-pill font-semibold bg-positive-soft text-positive border border-positive/30">已成交 FILLED</span>
+                    ) : activeMarker.status === 'FAILED' ? (
+                      <span className="px-1.5 py-0.5 rounded-pill font-semibold bg-negative-soft text-negative border border-negative/30">失败 FAILED</span>
+                    ) : (
+                      <span className="px-1.5 py-0.5 rounded-pill font-semibold bg-sunken text-ink-80">待定 PENDING</span>
+                    )}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2 ml-auto">
+                  {pinnedMarker ? (
+                    <button
+                      onClick={(e) => { e.stopPropagation(); setPinnedMarker(null) }}
+                      className="text-[11px] text-brand hover:underline font-semibold bg-card px-2 py-0.5 rounded-pill border border-brand"
+                    >
+                      ✓ 常驻锁定中 [点击解除]
+                    </button>
+                  ) : (
+                    <span className="text-[11px] text-ink-55">点击圆点可锁定详情</span>
+                  )}
+                </div>
+              </div>
+
+              {/* 指标卡矩阵：窗口、金额与均价、结算与收益、订单号等 */}
+              <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-x-4 gap-y-2 text-[11px]">
+                <div>
+                  <div className="text-ink-55">下单时点 / 窗口</div>
+                  <div className="font-mono text-ink-95 font-medium mt-0.5">
+                    {new Date(activeMarker.time).toLocaleTimeString()}
+                    {activeMarker.window_start > 0 && (
+                      <span className="text-ink-55 ml-1 text-[10px]" title={`目标窗口起点: ${new Date(activeMarker.window_start).toLocaleTimeString()}`}>
+                        ({hhmm(activeMarker.window_start)}–{hhmm(activeMarker.window_start + (activeMarker.market_period === '15m' ? 15 : 5) * 60_000)})
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                <div>
+                  <div className="text-ink-55">下注金额 / 周期</div>
+                  <div className="font-mono text-ink-95 font-medium mt-0.5">
+                    {activeMarker.amountUsdt != null ? (
+                      <span className="font-bold">{activeMarker.amountUsdt.toFixed(2)} USDT</span>
+                    ) : '--'}
+                    <span className="ml-1 px-1 rounded-pill bg-sunken text-ink-55 text-[10px]">{activeMarker.market_period}</span>
+                  </div>
+                </div>
+
+                <div>
+                  <div className="text-ink-55 flex items-center gap-1">
+                    <span>均价 / 股数</span>
+                    {activeMarker.priceKind === 'quote' && (
+                      <span className="px-1 py-0.2 rounded-pill text-[9px] font-bold bg-warning-soft text-warning border border-warning">报价</span>
+                    )}
+                  </div>
+                  <div className="font-mono text-ink-95 font-medium mt-0.5">
+                    {activeMarker.averagePrice != null ? activeMarker.averagePrice.toFixed(2) : '--'}
+                    {activeMarker.shares != null && (
+                      <span className="text-ink-55 ml-1 text-[10px]">({activeMarker.shares.toFixed(2)} 股)</span>
+                    )}
+                  </div>
+                </div>
+
+                <div>
+                  <div className="text-ink-55">结算状态 / 盈亏</div>
+                  <div className="font-mono font-medium mt-0.5">
+                    {activeMarker.win === true ? (
+                      <span className="text-positive font-bold">
+                        赢 (+{activeMarker.pnl != null ? activeMarker.pnl.toFixed(2) : '0.00'}U)
+                        {activeMarker.returnPct != null && (
+                          <span className="text-[10px] ml-1">+{activeMarker.returnPct.toFixed(1)}%</span>
+                        )}
+                      </span>
+                    ) : activeMarker.win === false ? (
+                      <span className="text-negative font-bold">
+                        输 ({activeMarker.pnl != null ? activeMarker.pnl.toFixed(2) : '-'}U)
+                        {activeMarker.returnPct != null && (
+                          <span className="text-[10px] ml-1">{activeMarker.returnPct.toFixed(1)}%</span>
+                        )}
+                      </span>
+                    ) : activeMarker.settleOutcome != null ? (
+                      <span className="text-ink-80 font-bold">{activeMarker.settleOutcome}</span>
+                    ) : (
+                      <span className="text-ink-55">待结算</span>
+                    )}
+                  </div>
+                </div>
+
+                <div>
+                  <div className="text-ink-55">入场时 BTC 对应价</div>
+                  <div className="font-mono text-ink-95 font-medium mt-0.5">
+                    {activeMarker.btcPrice != null ? `$${activeMarker.btcPrice.toLocaleString()}` : '--'}
+                    {activeMarker.settlePrice != null && (
+                      <span className="text-ink-55 ml-1 text-[10px]" title="结算参考价">
+                        (结:${activeMarker.settlePrice.toLocaleString()})
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                <div>
+                  <div className="text-ink-55">币安单号 / 领奖状态</div>
+                  <div className="font-mono text-ink-80 mt-0.5 truncate" title={activeMarker.orderId ?? '--'}>
+                    {activeMarker.orderId ? `${activeMarker.orderId.slice(0, 10)}…` : '--'}
+                    {activeMarker.redeemedAt ? (
+                      <span className="text-positive text-[10px] ml-1">✓已领奖</span>
+                    ) : activeMarker.win ? (
+                      <span className="text-warning text-[10px] ml-1">待领奖</span>
+                    ) : null}
+                  </div>
+                </div>
+              </div>
+
+              {/* 异常原因或策略说明 */}
+              {(activeMarker.errorMessage || activeMarker.channelDesc) && (
+                <div className="pt-1 border-t border-line-soft flex items-center gap-2 flex-wrap text-[11px]">
+                  {activeMarker.errorMessage ? (
+                    <div className="text-negative flex items-center gap-1 font-mono">
+                      <span className="font-bold">失败原因:</span>
+                      <span>{activeMarker.errorMessage}</span>
+                    </div>
+                  ) : activeMarker.channelDesc ? (
+                    <div className="text-ink-55 line-clamp-1">
+                      <span className="font-medium text-ink-80">通道策略: </span>
+                      {activeMarker.channelDesc}
+                    </div>
+                  ) : null}
+                </div>
               )}
             </div>
           ) : (
-            <span className="text-ink-55 text-[11px]">鼠标移动到图表上的订单圆点可查看下单细节，点击圆点可常驻锁定详情</span>
+            <span className="text-ink-55 text-[11px] flex items-center gap-2">
+              <span>💡 鼠标悬浮在图表上的订单圆点可查看包含入场时段、方向、均价、实际成交、盈亏与 BTC 走势的完整下单明细</span>
+              <span className="text-ink-40">|</span>
+              <span>点击圆点可常驻锁定详情</span>
+            </span>
           )}
         </div>
 
