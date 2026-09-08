@@ -108,15 +108,24 @@ jobs:
             md5sum /tmp/trade_cleanup.tar.gz
 
       # ---------- 2. 备份拉回 runner 并存 artifact ----------
-      - name: Pull backup to runner
-        uses: appleboy/scp-action@v1
-        with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key: ${{ secrets.VPS_SSH_KEY }}
-          port: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
-          source: "/tmp/trade_cleanup.tar.gz"
-          target: "."
+      # 注意：appleboy/scp-action 只支持 runner→远端 上传，不支持下载。
+      # 此处用原生 scp 从 VPS 拉取（密钥经 secrets 注入临时文件）。
+      - name: Pull backup to runner (scp download)
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" | tr -d '\r' > ~/.ssh/vps_key
+          chmod 600 ~/.ssh/vps_key
+          PORT="${VPS_PORT:-22}"
+          [ -n "$PORT" ] || PORT=22
+          scp -i ~/.ssh/vps_key -P "$PORT" \
+            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "${VPS_USER}@${VPS_HOST}:/tmp/trade_cleanup.tar.gz" ./trade_cleanup.tar.gz
+          ls -la ./trade_cleanup.tar.gz
 
       - name: Extract backup
         run: |
