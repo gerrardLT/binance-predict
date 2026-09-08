@@ -803,11 +803,30 @@ function Card({ title, children, className = '' }: { title: string; children: Re
 // 实盘 Tab（账户状态 + 人工测试单 + 订单历史，2026-08-22）
 // ============================================================
 
-// 实盘对照图：BTC K 线（5m/15m）× 预测市场情绪曲线（UP/DOWN 报价，15s 采样）
-function LiveChartCard() {
+// 实盘对照图：BTC K 线（5m/15m）× 预测市场情绪曲线（UP/DOWN 报价）× 实盘订单下单点标记
+interface LiveOrderMarker {
+  id: string | number
+  time: number
+  window_start: number
+  market_period: string
+  channel: string
+  channelName: string
+  direction: string
+  status: string
+  averagePrice: number | null
+  priceKind: string | null
+  amountUsdt: number | null
+  win: boolean | null
+  pnl: number | null
+  errorMessage: string | null
+  btcPrice: number | null
+}
+
+function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[] }) {
   const [p, setP] = useState<'5m' | '15m'>('5m')
   const [klines, setKlines] = useState<BtcKline[]>([])
   const [points, setPoints] = useState<PMPoint[]>([])
+  const [hoveredMarker, setHoveredMarker] = useState<LiveOrderMarker | null>(null)
 
   const load = useCallback(() => {
     api.getBtcKlines(p, 96).then(k => {
@@ -822,65 +841,283 @@ function LiveChartCard() {
 
   useEffect(() => { load() }, [load])
   useEffect(() => {
-    const t = setInterval(load, 30_000)
+    const t = setInterval(load, 20_000)
     return () => clearInterval(t)
   }, [load])
 
   const hhmm = (t: number) =>
     new Date(t).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
 
+  // 提取图表时间范围
+  const klineMinTime = klines.length > 0 ? klines[0].open_time : 0
+  const klineMaxTime = klines.length > 0 ? klines[klines.length - 1].open_time + (p === '15m' ? 15 : 5) * 60_000 : 0
+
+  // 将 orders 映射为图表上的点
+  const orderMarkers: LiveOrderMarker[] = useMemo(() => {
+    if (!orders || orders.length === 0 || klines.length === 0) return []
+    const list: LiveOrderMarker[] = []
+    for (const o of orders) {
+      const per = String(o.market_period ?? '5m')
+      if (per !== p) continue
+
+      const ws = typeof o.window_start === 'number' ? o.window_start : 0
+      const createdAt = o.created_at ? new Date(String(o.created_at)).getTime() : ws
+      const t = createdAt || ws
+      if (!t || t < klineMinTime - 15 * 60_000 || t > klineMaxTime + 15 * 60_000) continue
+
+      // 寻找最靠近该时间点的 K 线收盘价
+      let nearestBtc: number | null = null
+      let minDiff = Infinity
+      for (const k of klines) {
+        const diff = Math.abs(k.open_time - t)
+        if (diff < minDiff) {
+          minDiff = diff
+          nearestBtc = k.close
+        }
+      }
+
+      const ver = String(o.signal_version ?? '')
+      const info = SIGNAL_INFO[ver]
+      const dir = String(o.direction ?? '')
+      const stat = String(o.status ?? '')
+      const avgP = typeof o.average_price === 'number' ? o.average_price : null
+      const amt = o.amount_in != null && Number(o.amount_in) > 0 ? Number(o.amount_in) / 1e18 : null
+
+      list.push({
+        id: o.id as (string | number),
+        time: t,
+        window_start: ws,
+        market_period: per,
+        channel: ver,
+        channelName: info?.name ?? ver,
+        direction: dir,
+        status: stat,
+        averagePrice: avgP,
+        priceKind: (o.price_kind as string | null) ?? null,
+        amountUsdt: amt,
+        win: typeof o.win === 'boolean' ? o.win : null,
+        pnl: typeof o.pnl === 'number' ? o.pnl : null,
+        errorMessage: (o.error_message as string | null) ?? null,
+        btcPrice: nearestBtc,
+      })
+    }
+    return list
+  }, [orders, klines, p, klineMinTime, klineMaxTime])
+
   return (
     <div className="lg:col-span-2">
-      <Card title={`BTC K 线 × 市场情绪对照（${p}，30s 刷新）`}>
-        <div className="flex items-center gap-3 mb-2 text-xs flex-wrap">
-          {(['5m', '15m'] as const).map(iv => (
-            <button key={iv} onClick={() => setP(iv)}
-              className={`px-2.5 py-0.5 rounded-sm border transition ${
-                p === iv ? 'bg-brand text-white border-brand' : 'bg-card text-ink-80 border-line hover:border-brand'
-              }`}>{iv}</button>
-          ))}
-          <span className="text-ink-55">
-            <span className="text-positive">— UP 报价</span> · <span className="text-negative">— DOWN 报价</span> · <span className="text-ink-80">— BTC 收盘</span>（情绪 = 预测市场报价，15s 采样）
-          </span>
+      <Card title={`实盘行情 × 报价走势 × 下单点对照（${p}，20s 自动刷新）`}>
+        <div className="flex items-center justify-between mb-3 text-xs flex-wrap gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
+            {(['5m', '15m'] as const).map(iv => (
+              <button key={iv} onClick={() => setP(iv)}
+                className={`px-3 py-1 rounded-sm border font-semibold transition ${
+                  p === iv ? 'bg-brand text-white border-brand' : 'bg-card text-ink-80 border-line hover:border-brand'
+                }`}>{iv} 周期</button>
+            ))}
+            <span className="text-ink-55 text-[11px] ml-1">
+              <span className="text-positive font-semibold">— UP 报价</span> · <span className="text-negative font-semibold">— DOWN 报价</span> · <span className="text-ink-95 font-semibold">— BTC 价格</span>
+            </span>
+          </div>
+          <div className="flex items-center gap-2 text-[11px] text-ink-55 flex-wrap">
+            <span className="inline-flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded-full bg-positive inline-block" /> UP 成交
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded-full bg-negative inline-block" /> DOWN 成交
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded-full border border-warning bg-card inline-block" /> 失败单
+            </span>
+            <span className="text-ink-40">|</span>
+            <span>图表范围内共 {orderMarkers.length} 笔订单点（悬浮查看详情）</span>
+          </div>
         </div>
+
+        {/* 悬浮下单点详情提示条 */}
+        <div className="mb-2 min-h-[30px] px-3 py-1.5 bg-sunken rounded-sm border border-line text-xs flex items-center justify-between flex-wrap gap-2">
+          {hoveredMarker ? (
+            <div className="flex items-center gap-3 flex-wrap">
+              <span className="font-mono text-ink-55">{new Date(hoveredMarker.time).toLocaleTimeString()}</span>
+              <span className="font-semibold text-ink-95">#{String(hoveredMarker.id)} {hoveredMarker.channelName}</span>
+              <span className={`px-1.5 py-0.2 rounded-pill font-bold ${hoveredMarker.direction === 'UP' ? 'bg-positive-soft text-positive' : 'bg-negative-soft text-negative'}`}>
+                {hoveredMarker.direction}
+              </span>
+              <span className="font-mono">
+                {hoveredMarker.status === 'FILLED' ? (
+                  <span className="text-positive font-semibold">已成交</span>
+                ) : hoveredMarker.status === 'FAILED' ? (
+                  <span className="text-negative font-semibold">失败</span>
+                ) : (
+                  <span className="text-ink-80">待定</span>
+                )}
+              </span>
+              <span className="text-ink-80 font-mono">
+                均价: {hoveredMarker.averagePrice != null ? hoveredMarker.averagePrice.toFixed(2) : '--'}
+                {hoveredMarker.priceKind === 'quote' && <span className="text-[10px] text-warning ml-0.5">(报价)</span>}
+              </span>
+              <span className="text-ink-80 font-mono">
+                金额: {hoveredMarker.amountUsdt != null ? `${hoveredMarker.amountUsdt.toFixed(2)}U` : '--'}
+              </span>
+              <span className="font-mono font-bold">
+                {hoveredMarker.win === true ? (
+                  <span className="text-positive">赢 (+{hoveredMarker.pnl != null ? hoveredMarker.pnl.toFixed(2) : '0.00'}U)</span>
+                ) : hoveredMarker.win === false ? (
+                  <span className="text-negative">输 ({hoveredMarker.pnl != null ? hoveredMarker.pnl.toFixed(2) : '-'}U)</span>
+                ) : (
+                  <span className="text-ink-55">未结算</span>
+                )}
+              </span>
+              {hoveredMarker.errorMessage && (
+                <span className="text-ink-55 text-[11px] truncate max-w-[200px]" title={hoveredMarker.errorMessage}>
+                  {hoveredMarker.errorMessage}
+                </span>
+              )}
+            </div>
+          ) : (
+            <span className="text-ink-55 text-[11px]">鼠标移动到图表上的订单圆点可查看下单细节，双图时刻垂直对齐</span>
+          )}
+        </div>
+
         <div className="space-y-3">
-          {klines.length > 0 ? (
-            <ResponsiveContainer width="100%" height={170}>
-              <LineChart data={klines.map(k => ({ t: k.open_time, close: k.close }))}
-                margin={{ top: 6, right: 12, left: 0, bottom: 0 }}>
-                <CartesianGrid stroke="var(--line-soft)" />
-                <XAxis dataKey="t" type="number" domain={['dataMin', 'dataMax']} scale="time"
-                  tickFormatter={hhmm} tick={{ fontSize: 11, fill: 'var(--ink-55)', fontFamily: 'var(--font-stack-mono)' }} stroke="var(--ink-55)" />
-                <YAxis domain={['auto', 'auto']} tick={{ fontSize: 11, fill: 'var(--ink-55)', fontFamily: 'var(--font-stack-mono)' }} stroke="var(--ink-55)" width={64}
-                  tickFormatter={(v: number) => v.toLocaleString()} />
-                <Tooltip contentStyle={TOOLTIP_STYLE} labelStyle={TOOLTIP_LABEL_STYLE} itemStyle={TOOLTIP_ITEM_STYLE}
-                  labelFormatter={t => new Date(t as number).toLocaleString('zh-CN')}
-                  formatter={v => [typeof v === 'number' ? v.toLocaleString() : '--', 'BTC 收盘']} />
-                <Line dataKey="close" stroke="var(--ink-80)" dot={false} strokeWidth={1.6} isAnimationActive={false} />
-              </LineChart>
-            </ResponsiveContainer>
-          ) : (
-            <div className="text-xs text-ink-55 h-10 flex items-center">K 线加载中…（{p}）</div>
-          )}
-          {points.length > 1 ? (
-            <ResponsiveContainer width="100%" height={130}>
-              <LineChart data={points.map(pt => ({ t: pt.timestamp, up: pt.up_price, down: pt.down_price }))}
-                margin={{ top: 6, right: 12, left: 0, bottom: 0 }}>
-                <CartesianGrid stroke="var(--line-soft)" />
-                <XAxis dataKey="t" type="number" domain={['dataMin', 'dataMax']} scale="time"
-                  tickFormatter={hhmm} tick={{ fontSize: 11, fill: 'var(--ink-55)', fontFamily: 'var(--font-stack-mono)' }} stroke="var(--ink-55)" />
-                <YAxis domain={[0, 1]} tick={{ fontSize: 11, fill: 'var(--ink-55)', fontFamily: 'var(--font-stack-mono)' }} stroke="var(--ink-55)" width={64}
-                  tickFormatter={(v: number) => v.toFixed(2)} />
-                <Tooltip contentStyle={TOOLTIP_STYLE} labelStyle={TOOLTIP_LABEL_STYLE} itemStyle={TOOLTIP_ITEM_STYLE}
-                  labelFormatter={t => new Date(t as number).toLocaleString('zh-CN')}
-                  formatter={(v, name) => [typeof v === 'number' ? v.toFixed(3) : '--', name === 'up' ? 'UP' : 'DOWN']} />
-                <Line dataKey="up" stroke="var(--positive)" dot={false} strokeWidth={1.6} connectNulls isAnimationActive={false} />
-                <Line dataKey="down" stroke="var(--negative)" dot={false} strokeWidth={1.6} connectNulls isAnimationActive={false} />
-              </LineChart>
-            </ResponsiveContainer>
-          ) : (
-            <div className="text-xs text-ink-55 h-10 flex items-center">情绪曲线加载中…（{p}）</div>
-          )}
+          {/* 上图：BTC 收盘价曲线 + 下单点在 BTC 上的相对位置 */}
+          <div>
+            <div className="text-[11px] font-semibold text-ink-80 mb-1 flex justify-between">
+              <span>BTC 价格走势与下单入场位置（{p}）</span>
+              {klines.length > 0 && (
+                <span className="font-mono text-ink-55">最新: ${klines[klines.length - 1].close.toLocaleString()}</span>
+              )}
+            </div>
+            {klines.length > 0 ? (
+              <ResponsiveContainer width="100%" height={170}>
+                <LineChart
+                  data={klines.map(k => ({ t: k.open_time, close: k.close }))}
+                  margin={{ top: 6, right: 12, left: 0, bottom: 0 }}
+                >
+                  <CartesianGrid stroke="var(--line-soft)" />
+                  <XAxis
+                    dataKey="t" type="number" domain={['dataMin', 'dataMax']} scale="time"
+                    tickFormatter={hhmm}
+                    tick={{ fontSize: 11, fill: 'var(--ink-55)', fontFamily: 'var(--font-stack-mono)' }}
+                    stroke="var(--line-soft)"
+                  />
+                  <YAxis
+                    domain={['auto', 'auto']}
+                    tick={{ fontSize: 11, fill: 'var(--ink-55)', fontFamily: 'var(--font-stack-mono)' }}
+                    stroke="var(--line-soft)" width={68}
+                    tickFormatter={(v: number) => v.toLocaleString()}
+                  />
+                  <Tooltip
+                    contentStyle={TOOLTIP_STYLE} labelStyle={TOOLTIP_LABEL_STYLE} itemStyle={TOOLTIP_ITEM_STYLE}
+                    labelFormatter={t => new Date(t as number).toLocaleString('zh-CN')}
+                    formatter={v => [typeof v === 'number' ? v.toLocaleString() : '--', 'BTC 价格']}
+                  />
+                  <Line dataKey="close" stroke="var(--ink-80)" dot={false} strokeWidth={1.6} isAnimationActive={false} />
+
+                  {/* 悬浮时刻垂直参考线 */}
+                  {hoveredMarker && (
+                    <ReferenceLine x={hoveredMarker.time} stroke="var(--ink-55)" strokeDasharray="3 3" />
+                  )}
+
+                  {/* BTC K线上的订单标记点 */}
+                  {orderMarkers.map(m => {
+                    if (m.btcPrice == null) return null
+                    const isUp = m.direction === 'UP'
+                    const isFailed = m.status === 'FAILED'
+                    const fill = isFailed ? '#FFFFFF' : (isUp ? 'var(--positive)' : 'var(--negative)')
+                    const stroke = isFailed ? 'var(--warning)' : (isUp ? 'var(--positive)' : 'var(--negative)')
+                    return (
+                      <ReferenceDot
+                        key={`btc-dot-${m.id}`}
+                        x={m.time}
+                        y={m.btcPrice}
+                        r={hoveredMarker?.id === m.id ? 6.5 : 4.5}
+                        fill={fill}
+                        stroke={stroke}
+                        strokeWidth={2}
+                        className="cursor-pointer transition-all"
+                        onMouseEnter={() => setHoveredMarker(m)}
+                        onMouseLeave={() => setHoveredMarker(null)}
+                      />
+                    )
+                  })}
+                </LineChart>
+              </ResponsiveContainer>
+            ) : (
+              <div className="text-xs text-ink-55 h-10 flex items-center">K 线加载中…（{p}）</div>
+            )}
+          </div>
+
+          {/* 下图：预测市场情绪曲线（UP/DOWN） + 订单成交均价点 */}
+          <div>
+            <div className="text-[11px] font-semibold text-ink-80 mb-1 flex justify-between">
+              <span>预测市场报价曲线（UP/DOWN）与成交均价点（直观核对入场时机与滑点）</span>
+              {points.length > 0 && (
+                <span className="font-mono text-ink-55">
+                  UP: {points[points.length - 1].up_price?.toFixed(2) ?? '--'} · DOWN: {points[points.length - 1].down_price?.toFixed(2) ?? '--'}
+                </span>
+              )}
+            </div>
+            {points.length > 1 ? (
+              <ResponsiveContainer width="100%" height={140}>
+                <LineChart
+                  data={points.map(pt => ({ t: pt.timestamp, up: pt.up_price, down: pt.down_price }))}
+                  margin={{ top: 6, right: 12, left: 0, bottom: 0 }}
+                >
+                  <CartesianGrid stroke="var(--line-soft)" />
+                  <XAxis
+                    dataKey="t" type="number" domain={['dataMin', 'dataMax']} scale="time"
+                    tickFormatter={hhmm}
+                    tick={{ fontSize: 11, fill: 'var(--ink-55)', fontFamily: 'var(--font-stack-mono)' }}
+                    stroke="var(--line-soft)"
+                  />
+                  <YAxis
+                    domain={[0, 1]}
+                    tick={{ fontSize: 11, fill: 'var(--ink-55)', fontFamily: 'var(--font-stack-mono)' }}
+                    stroke="var(--line-soft)" width={68}
+                    tickFormatter={(v: number) => v.toFixed(2)}
+                  />
+                  <Tooltip
+                    contentStyle={TOOLTIP_STYLE} labelStyle={TOOLTIP_LABEL_STYLE} itemStyle={TOOLTIP_ITEM_STYLE}
+                    labelFormatter={t => new Date(t as number).toLocaleString('zh-CN')}
+                    formatter={(v, name) => [typeof v === 'number' ? v.toFixed(3) : '--', name === 'up' ? 'UP 报价' : 'DOWN 报价']}
+                  />
+                  <Line dataKey="up" stroke="var(--positive)" dot={false} strokeWidth={1.6} connectNulls isAnimationActive={false} />
+                  <Line dataKey="down" stroke="var(--negative)" dot={false} strokeWidth={1.6} connectNulls isAnimationActive={false} />
+
+                  {/* 悬浮时刻垂直参考线 */}
+                  {hoveredMarker && (
+                    <ReferenceLine x={hoveredMarker.time} stroke="var(--ink-55)" strokeDasharray="3 3" />
+                  )}
+
+                  {/* 情绪曲线上的成交均价标记点 */}
+                  {orderMarkers.map(m => {
+                    if (m.averagePrice == null) return null
+                    const isUp = m.direction === 'UP'
+                    const isFailed = m.status === 'FAILED'
+                    const fill = isFailed ? '#FFFFFF' : (isUp ? 'var(--positive)' : 'var(--negative)')
+                    const stroke = isFailed ? 'var(--warning)' : (isUp ? 'var(--positive)' : 'var(--negative)')
+                    return (
+                      <ReferenceDot
+                        key={`quote-dot-${m.id}`}
+                        x={m.time}
+                        y={m.averagePrice}
+                        r={hoveredMarker?.id === m.id ? 6.5 : 4.5}
+                        fill={fill}
+                        stroke={stroke}
+                        strokeWidth={2}
+                        className="cursor-pointer transition-all"
+                        onMouseEnter={() => setHoveredMarker(m)}
+                        onMouseLeave={() => setHoveredMarker(null)}
+                      />
+                    )
+                  })}
+                </LineChart>
+              </ResponsiveContainer>
+            ) : (
+              <div className="text-xs text-ink-55 h-10 flex items-center">情绪曲线加载中…（{p}）</div>
+            )}
+          </div>
         </div>
       </Card>
     </div>
@@ -1813,7 +2050,7 @@ function ChartDrawer({ orders }: { orders: Record<string, unknown>[] }) {
           <button onClick={() => setOpen(false)} className="text-ink-55 hover:text-ink-80 text-lg leading-none px-1">✕</button>
         </div>
         <div className="flex-1 min-h-0 overflow-auto p-3">
-          <div className={tab === 'chart' ? '' : 'hidden'}><LiveChartCard /></div>
+          <div className={tab === 'chart' ? '' : 'hidden'}><LiveOrderChartCard orders={orders} /></div>
           <div className={tab === 'funds' ? '' : 'hidden'}><FundsFlowCard orders={orders} /></div>
           <div className={tab === 'pnl' ? '' : 'hidden'}><PnlCurveCard /></div>
         </div>
@@ -2301,6 +2538,11 @@ function LiveTradeTab() {
           )}
         </div>
       </Card>
+      </div>
+
+      {/* 实盘订单与行情对照图表区（位于信号实盘通道与订单记录之间） */}
+      <div className="lg:col-span-2">
+        <LiveOrderChartCard orders={orders} />
       </div>
 
       {/* 最近订单：主区账户状态下方（2026-08-28 用户要求回归页面展示） */}
