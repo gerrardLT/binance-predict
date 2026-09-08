@@ -4,6 +4,7 @@ import {
   ResponsiveContainer, Area, AreaChart, ReferenceLine,
   BarChart, Bar, Legend, LineChart, Line,
   ReferenceArea, ReferenceDot, Cell, ComposedChart,
+  useXAxisScale, useYAxisScale,
 } from 'recharts'
 
 // ============================================================
@@ -822,11 +823,126 @@ interface LiveOrderMarker {
   btcPrice: number | null
 }
 
+interface BtcKlinePoint extends BtcKline {
+  t: number
+}
+
+// 蜡烛图单根柱体自定义 Dot 组件（基于 Line 的每个数据点绘制上下影线与阴阳实体）
+function CandleShapeDot(props: {
+  cx?: number
+  cy?: number
+  payload?: BtcKlinePoint
+  yScale?: ((v: unknown) => number | undefined) | null
+  candleWidth?: number
+}) {
+  const { cx, payload, yScale, candleWidth = 5 } = props
+  if (!payload || cx == null || !yScale) return null
+  const { open, high, low, close } = payload
+  const yOpen = yScale(open)
+  const yClose = yScale(close)
+  const yHigh = yScale(high)
+  const yLow = yScale(low)
+  if (yOpen == null || yClose == null || yHigh == null || yLow == null) return null
+
+  const isUp = close >= open
+  const color = isUp ? 'var(--positive)' : 'var(--negative)'
+  const topY = Math.min(yOpen, yClose)
+  const bodyHeight = Math.max(1.5, Math.abs(yClose - yOpen))
+
+  return (
+    <g className="kline-candle">
+      {/* 上下影线 */}
+      <line x1={cx} y1={yHigh} x2={cx} y2={yLow} stroke={color} strokeWidth={1.2} strokeLinecap="round" />
+      {/* 蜡烛实体（实体填充；若涨跌持平则给最小高度） */}
+      <rect
+        x={cx - candleWidth / 2}
+        y={topY}
+        width={candleWidth}
+        height={bodyHeight}
+        fill={color}
+        stroke={color}
+        strokeWidth={1}
+        rx={0.5}
+      />
+    </g>
+  )
+}
+
+// 蜡烛图层渲染器：从内部读取 yAxis 缩放比例，并根据 K 线间隔动态计算实体宽度
+function CandlestickSeriesLayer({ klines }: { klines: BtcKlinePoint[] }) {
+  const yScale = useYAxisScale()
+  const xScale = useXAxisScale()
+
+  const candleWidth = useMemo(() => {
+    if (!xScale || klines.length < 2) return 5
+    const x0 = xScale(klines[0].t)
+    const x1 = xScale(klines[1].t)
+    if (x0 == null || x1 == null) return 5
+    const span = Math.abs(x1 - x0)
+    return Math.max(2.5, Math.min(10, span * 0.7))
+  }, [xScale, klines])
+
+  return (
+    <Line
+      dataKey="close"
+      stroke="transparent"
+      isAnimationActive={false}
+      dot={<CandleShapeDot yScale={yScale} candleWidth={candleWidth} />}
+    />
+  )
+}
+
+// 订单标记点交互组件：扩大透明点击/悬浮判定圆（r=14），避免细小圆点悬浮抖动丢失
+function OrderMarkerShape(props: {
+  cx?: number
+  cy?: number
+  marker: LiveOrderMarker
+  isHovered: boolean
+  isPinned: boolean
+  onSelect: (m: LiveOrderMarker) => void
+}) {
+  const { cx, cy, marker, isHovered, isPinned, onSelect } = props
+  if (cx == null || cy == null) return null
+
+  const isUp = marker.direction === 'UP'
+  const isFailed = marker.status === 'FAILED'
+  const color = isFailed ? 'var(--warning)' : (isUp ? 'var(--positive)' : 'var(--negative)')
+  const fill = isFailed ? '#FFFFFF' : color
+  const active = isHovered || isPinned
+
+  return (
+    <g
+      className="order-marker-glyph cursor-pointer transition-transform"
+      onClick={e => {
+        e.stopPropagation()
+        onSelect(marker)
+      }}
+    >
+      {/* 外层隐形 hitbox，r=14，方便鼠标移动时无缝触发悬浮与点击 */}
+      <circle cx={cx} cy={cy} r={14} fill="transparent" />
+      {/* 激活光圈 */}
+      {active && (
+        <circle cx={cx} cy={cy} r={9} fill="none" stroke={color} strokeWidth={1.5} opacity={0.5} strokeDasharray={isPinned ? 'none' : '2 2'} />
+      )}
+      {/* 核心标记圆点 */}
+      <circle
+        cx={cx}
+        cy={cy}
+        r={active ? 6 : 4.5}
+        fill={fill}
+        stroke={color}
+        strokeWidth={2}
+      />
+    </g>
+  )
+}
+
 function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[] }) {
   const [p, setP] = useState<'5m' | '15m'>('5m')
   const [klines, setKlines] = useState<BtcKline[]>([])
   const [points, setPoints] = useState<PMPoint[]>([])
   const [hoveredMarker, setHoveredMarker] = useState<LiveOrderMarker | null>(null)
+  const [pinnedMarker, setPinnedMarker] = useState<LiveOrderMarker | null>(null)
 
   const load = useCallback(() => {
     api.getBtcKlines(p, 96).then(k => {
@@ -851,6 +967,23 @@ function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[
   // 提取图表时间范围
   const klineMinTime = klines.length > 0 ? klines[0].open_time : 0
   const klineMaxTime = klines.length > 0 ? klines[klines.length - 1].open_time + (p === '15m' ? 15 : 5) * 60_000 : 0
+
+  // 预先转为带 t 坐标的 K 线数据列表，并自动计算 high/low 极值用于 YAxis domain
+  const klineChartData: BtcKlinePoint[] = useMemo(() => {
+    return klines.map(k => ({ ...k, t: k.open_time }))
+  }, [klines])
+
+  const btcYDomain: [number, number] = useMemo(() => {
+    if (klines.length === 0) return [0, 100_000]
+    let minP = Infinity
+    let maxP = -Infinity
+    for (const k of klines) {
+      if (k.low < minP) minP = k.low
+      if (k.high > maxP) maxP = k.high
+    }
+    const pad = Math.max(15, (maxP - minP) * 0.05)
+    return [Math.floor(minP - pad), Math.ceil(maxP + pad)]
+  }, [klines])
 
   // 将 orders 映射为图表上的点
   const orderMarkers: LiveOrderMarker[] = useMemo(() => {
@@ -904,19 +1037,26 @@ function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[
     return list
   }, [orders, klines, p, klineMinTime, klineMaxTime])
 
+  // 当前激活的订单详情（锁定优先，其次悬浮）
+  const activeMarker = pinnedMarker || hoveredMarker
+
+  const handleSelectMarker = useCallback((m: LiveOrderMarker) => {
+    setPinnedMarker(curr => (curr?.id === m.id ? null : m))
+  }, [])
+
   return (
-    <div className="lg:col-span-2">
+    <div className="lg:col-span-2" onClick={() => setPinnedMarker(null)}>
       <Card title={`实盘行情 × 报价走势 × 下单点对照（${p}，20s 自动刷新）`}>
         <div className="flex items-center justify-between mb-3 text-xs flex-wrap gap-2">
           <div className="flex items-center gap-2 flex-wrap">
             {(['5m', '15m'] as const).map(iv => (
-              <button key={iv} onClick={() => setP(iv)}
+              <button key={iv} onClick={() => { setP(iv); setPinnedMarker(null); setHoveredMarker(null) }}
                 className={`px-3 py-1 rounded-sm border font-semibold transition ${
                   p === iv ? 'bg-brand text-white border-brand' : 'bg-card text-ink-80 border-line hover:border-brand'
                 }`}>{iv} 周期</button>
             ))}
             <span className="text-ink-55 text-[11px] ml-1">
-              <span className="text-positive font-semibold">— UP 报价</span> · <span className="text-negative font-semibold">— DOWN 报价</span> · <span className="text-ink-95 font-semibold">— BTC 价格</span>
+              <span className="text-positive font-semibold">█ 阳线(涨)</span> · <span className="text-negative font-semibold">█ 阴线(跌)</span> · <span className="text-positive font-semibold">— UP 报价</span> · <span className="text-negative font-semibold">— DOWN 报价</span>
             </span>
           </div>
           <div className="flex items-center gap-2 text-[11px] text-ink-55 flex-wrap">
@@ -930,69 +1070,84 @@ function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[
               <span className="w-2.5 h-2.5 rounded-full border border-warning bg-card inline-block" /> 失败单
             </span>
             <span className="text-ink-40">|</span>
-            <span>图表范围内共 {orderMarkers.length} 笔订单点（悬浮查看详情）</span>
+            <span>图表范围内共 {orderMarkers.length} 笔订单点（点击可常驻锁定）</span>
           </div>
         </div>
 
-        {/* 悬浮下单点详情提示条 */}
-        <div className="mb-2 min-h-[30px] px-3 py-1.5 bg-sunken rounded-sm border border-line text-xs flex items-center justify-between flex-wrap gap-2">
-          {hoveredMarker ? (
+        {/* 悬浮/固定下单点详情面板 */}
+        <div className={`mb-2 min-h-[32px] px-3 py-1.5 rounded-sm border text-xs flex items-center justify-between flex-wrap gap-2 transition-colors ${
+          pinnedMarker ? 'bg-brand-soft/40 border-brand' : 'bg-sunken border-line'
+        }`}>
+          {activeMarker ? (
             <div className="flex items-center gap-3 flex-wrap">
-              <span className="font-mono text-ink-55">{new Date(hoveredMarker.time).toLocaleTimeString()}</span>
-              <span className="font-semibold text-ink-95">#{String(hoveredMarker.id)} {hoveredMarker.channelName}</span>
-              <span className={`px-1.5 py-0.2 rounded-pill font-bold ${hoveredMarker.direction === 'UP' ? 'bg-positive-soft text-positive' : 'bg-negative-soft text-negative'}`}>
-                {hoveredMarker.direction}
+              <span className="font-mono text-ink-55">{new Date(activeMarker.time).toLocaleTimeString()}</span>
+              <span className="font-semibold text-ink-95">#{String(activeMarker.id)} {activeMarker.channelName}</span>
+              <span className={`px-1.5 py-0.2 rounded-pill font-bold ${activeMarker.direction === 'UP' ? 'bg-positive-soft text-positive' : 'bg-negative-soft text-negative'}`}>
+                {activeMarker.direction}
               </span>
               <span className="font-mono">
-                {hoveredMarker.status === 'FILLED' ? (
+                {activeMarker.status === 'FILLED' ? (
                   <span className="text-positive font-semibold">已成交</span>
-                ) : hoveredMarker.status === 'FAILED' ? (
+                ) : activeMarker.status === 'FAILED' ? (
                   <span className="text-negative font-semibold">失败</span>
                 ) : (
                   <span className="text-ink-80">待定</span>
                 )}
               </span>
               <span className="text-ink-80 font-mono">
-                均价: {hoveredMarker.averagePrice != null ? hoveredMarker.averagePrice.toFixed(2) : '--'}
-                {hoveredMarker.priceKind === 'quote' && <span className="text-[10px] text-warning ml-0.5">(报价)</span>}
+                均价: {activeMarker.averagePrice != null ? activeMarker.averagePrice.toFixed(2) : '--'}
+                {activeMarker.priceKind === 'quote' && <span className="text-[10px] text-warning ml-0.5">(报价)</span>}
               </span>
               <span className="text-ink-80 font-mono">
-                金额: {hoveredMarker.amountUsdt != null ? `${hoveredMarker.amountUsdt.toFixed(2)}U` : '--'}
+                金额: {activeMarker.amountUsdt != null ? `${activeMarker.amountUsdt.toFixed(2)}U` : '--'}
               </span>
               <span className="font-mono font-bold">
-                {hoveredMarker.win === true ? (
-                  <span className="text-positive">赢 (+{hoveredMarker.pnl != null ? hoveredMarker.pnl.toFixed(2) : '0.00'}U)</span>
-                ) : hoveredMarker.win === false ? (
-                  <span className="text-negative">输 ({hoveredMarker.pnl != null ? hoveredMarker.pnl.toFixed(2) : '-'}U)</span>
+                {activeMarker.win === true ? (
+                  <span className="text-positive">赢 (+{activeMarker.pnl != null ? activeMarker.pnl.toFixed(2) : '0.00'}U)</span>
+                ) : activeMarker.win === false ? (
+                  <span className="text-negative">输 ({activeMarker.pnl != null ? activeMarker.pnl.toFixed(2) : '-'}U)</span>
                 ) : (
                   <span className="text-ink-55">未结算</span>
                 )}
               </span>
-              {hoveredMarker.errorMessage && (
-                <span className="text-ink-55 text-[11px] truncate max-w-[200px]" title={hoveredMarker.errorMessage}>
-                  {hoveredMarker.errorMessage}
+              {activeMarker.btcPrice != null && (
+                <span className="text-ink-55 font-mono text-[11px]">
+                  对应 BTC: ${activeMarker.btcPrice.toLocaleString()}
                 </span>
+              )}
+              {activeMarker.errorMessage && (
+                <span className="text-negative text-[11px] truncate max-w-[240px]" title={activeMarker.errorMessage}>
+                  原因: {activeMarker.errorMessage}
+                </span>
+              )}
+              {pinnedMarker && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); setPinnedMarker(null) }}
+                  className="text-[11px] text-brand hover:underline font-semibold ml-auto"
+                >
+                  [解除固定]
+                </button>
               )}
             </div>
           ) : (
-            <span className="text-ink-55 text-[11px]">鼠标移动到图表上的订单圆点可查看下单细节，双图时刻垂直对齐</span>
+            <span className="text-ink-55 text-[11px]">鼠标移动到图表上的订单圆点可查看下单细节，点击圆点可常驻锁定详情</span>
           )}
         </div>
 
         <div className="space-y-3">
-          {/* 上图：BTC 收盘价曲线 + 下单点在 BTC 上的相对位置 */}
+          {/* 上图：BTC K线图（阳线绿色/阴线红色，带上下影线） + 下单点在 BTC 上的相对位置 */}
           <div>
             <div className="text-[11px] font-semibold text-ink-80 mb-1 flex justify-between">
-              <span>BTC 价格走势与下单入场位置（{p}）</span>
+              <span>BTC 价格走势（K 线蜡烛图）与下单入场位置（{p}）</span>
               {klines.length > 0 && (
                 <span className="font-mono text-ink-55">最新: ${klines[klines.length - 1].close.toLocaleString()}</span>
               )}
             </div>
             {klines.length > 0 ? (
-              <ResponsiveContainer width="100%" height={170}>
+              <ResponsiveContainer width="100%" height={180}>
                 <LineChart
-                  data={klines.map(k => ({ t: k.open_time, close: k.close }))}
-                  margin={{ top: 6, right: 12, left: 0, bottom: 0 }}
+                  data={klineChartData}
+                  margin={{ top: 8, right: 12, left: 0, bottom: 0 }}
                 >
                   <CartesianGrid stroke="var(--line-soft)" />
                   <XAxis
@@ -1002,7 +1157,7 @@ function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[
                     stroke="var(--line-soft)"
                   />
                   <YAxis
-                    domain={['auto', 'auto']}
+                    domain={btcYDomain}
                     tick={{ fontSize: 11, fill: 'var(--ink-55)', fontFamily: 'var(--font-stack-mono)' }}
                     stroke="var(--line-soft)" width={68}
                     tickFormatter={(v: number) => v.toLocaleString()}
@@ -1010,32 +1165,56 @@ function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[
                   <Tooltip
                     contentStyle={TOOLTIP_STYLE} labelStyle={TOOLTIP_LABEL_STYLE} itemStyle={TOOLTIP_ITEM_STYLE}
                     labelFormatter={t => new Date(t as number).toLocaleString('zh-CN')}
-                    formatter={v => [typeof v === 'number' ? v.toLocaleString() : '--', 'BTC 价格']}
+                    content={({ active, payload }) => {
+                      if (!active || !payload || !payload[0]?.payload) return null
+                      const d = payload[0].payload as BtcKlinePoint
+                      const isUp = d.close >= d.open
+                      return (
+                        <div style={TOOLTIP_STYLE} className="p-2 text-xs space-y-1">
+                          <div className="text-ink-55 font-mono">{new Date(d.t).toLocaleString('zh-CN')}</div>
+                          <div className="flex gap-3">
+                            <span className={isUp ? 'text-positive font-bold' : 'text-negative font-bold'}>
+                              {isUp ? '阳线(涨)' : '阴线(跌)'}
+                            </span>
+                            <span className="font-mono">收: ${d.close.toLocaleString()}</span>
+                          </div>
+                          <div className="grid grid-cols-2 gap-x-3 text-ink-80 font-mono text-[11px]">
+                            <span>开: ${d.open.toLocaleString()}</span>
+                            <span>高: ${d.high.toLocaleString()}</span>
+                            <span>低: ${d.low.toLocaleString()}</span>
+                            <span>量: {d.volume.toFixed(2)}</span>
+                          </div>
+                        </div>
+                      )
+                    }}
                   />
-                  <Line dataKey="close" stroke="var(--ink-80)" dot={false} strokeWidth={1.6} isAnimationActive={false} />
 
-                  {/* 悬浮时刻垂直参考线 */}
-                  {hoveredMarker && (
-                    <ReferenceLine x={hoveredMarker.time} stroke="var(--ink-55)" strokeDasharray="3 3" />
+                  {/* 真实 K 线蜡烛图层 */}
+                  <CandlestickSeriesLayer klines={klineChartData} />
+
+                  {/* 悬浮或固定时刻垂直参考线 */}
+                  {activeMarker && (
+                    <ReferenceLine x={activeMarker.time} stroke="var(--ink-55)" strokeDasharray="3 3" />
                   )}
 
                   {/* BTC K线上的订单标记点 */}
                   {orderMarkers.map(m => {
                     if (m.btcPrice == null) return null
-                    const isUp = m.direction === 'UP'
-                    const isFailed = m.status === 'FAILED'
-                    const fill = isFailed ? '#FFFFFF' : (isUp ? 'var(--positive)' : 'var(--negative)')
-                    const stroke = isFailed ? 'var(--warning)' : (isUp ? 'var(--positive)' : 'var(--negative)')
+                    const isHovered = hoveredMarker?.id === m.id
+                    const isPinned = pinnedMarker?.id === m.id
                     return (
                       <ReferenceDot
                         key={`btc-dot-${m.id}`}
                         x={m.time}
                         y={m.btcPrice}
-                        r={hoveredMarker?.id === m.id ? 6.5 : 4.5}
-                        fill={fill}
-                        stroke={stroke}
-                        strokeWidth={2}
-                        className="cursor-pointer transition-all"
+                        shape={
+                          <OrderMarkerShape
+                            marker={m}
+                            isHovered={isHovered}
+                            isPinned={isPinned}
+                            onSelect={handleSelectMarker}
+                          />
+                        }
                         onMouseEnter={() => setHoveredMarker(m)}
                         onMouseLeave={() => setHoveredMarker(null)}
                       />
@@ -1085,28 +1264,29 @@ function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[
                   <Line dataKey="up" stroke="var(--positive)" dot={false} strokeWidth={1.6} connectNulls isAnimationActive={false} />
                   <Line dataKey="down" stroke="var(--negative)" dot={false} strokeWidth={1.6} connectNulls isAnimationActive={false} />
 
-                  {/* 悬浮时刻垂直参考线 */}
-                  {hoveredMarker && (
-                    <ReferenceLine x={hoveredMarker.time} stroke="var(--ink-55)" strokeDasharray="3 3" />
+                  {/* 悬浮或固定时刻垂直参考线 */}
+                  {activeMarker && (
+                    <ReferenceLine x={activeMarker.time} stroke="var(--ink-55)" strokeDasharray="3 3" />
                   )}
 
                   {/* 情绪曲线上的成交均价标记点 */}
                   {orderMarkers.map(m => {
                     if (m.averagePrice == null) return null
-                    const isUp = m.direction === 'UP'
-                    const isFailed = m.status === 'FAILED'
-                    const fill = isFailed ? '#FFFFFF' : (isUp ? 'var(--positive)' : 'var(--negative)')
-                    const stroke = isFailed ? 'var(--warning)' : (isUp ? 'var(--positive)' : 'var(--negative)')
+                    const isHovered = hoveredMarker?.id === m.id
+                    const isPinned = pinnedMarker?.id === m.id
                     return (
                       <ReferenceDot
                         key={`quote-dot-${m.id}`}
                         x={m.time}
                         y={m.averagePrice}
-                        r={hoveredMarker?.id === m.id ? 6.5 : 4.5}
-                        fill={fill}
-                        stroke={stroke}
-                        strokeWidth={2}
-                        className="cursor-pointer transition-all"
+                        shape={
+                          <OrderMarkerShape
+                            marker={m}
+                            isHovered={isHovered}
+                            isPinned={isPinned}
+                            onSelect={handleSelectMarker}
+                          />
+                        }
                         onMouseEnter={() => setHoveredMarker(m)}
                         onMouseLeave={() => setHoveredMarker(null)}
                       />
