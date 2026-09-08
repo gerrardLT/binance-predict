@@ -209,6 +209,16 @@ class MultiLiveTrader:
                 continue
             if not (q_lo <= float(down_price) < q_hi):
                 continue
+            # 时段门：北京时间 window_start hour ∈ [lo, hi)
+            if spec.hour_guard is not None:
+                from datetime import datetime, timezone
+                win_start_dt = datetime.fromtimestamp(window_start_ms / 1000.0, tz=timezone.utc)
+                bjt_hour = win_start_dt.hour + 8  # UTC+8，无夏令时
+                if not (spec.hour_guard[0] <= bjt_hour < spec.hour_guard[1]):
+                    logger.debug(
+                        "多通道实盘：{} 时段门未过 | 窗口 {} | 北京时间 {} 时 | 要求 {}-{} 时",
+                        ch, _fmt_win(window_start_ms), bjt_hour, spec.hour_guard[0], spec.hour_guard[1])
+                    continue
             if spec.v2_guard is not None:
                 # v3 通道的价格门禁同 contrarian_v2（max_rise），阈值勿复制
                 guard_key = "quote_contrarian_v2" if spec.v3_env else ch
@@ -222,6 +232,16 @@ class MultiLiveTrader:
                 # 核验通过才进 _fire_quote_edge，未过/缺失 → 弃单
                 task = asyncio.create_task(
                     self._verify_v3_env_and_fire(
+                        ch, window_start_ms, window_end_ms, t_rel,
+                        float(down_price), btc_price, int(ts_ms),
+                        window_btc_curve),
+                    name=f"live_qe_{ch}_{window_start_ms}",
+                )
+            elif spec.ln_dd_guard:
+                # 深夜距日高门需异步 DB 核验（仅日高，不要求前窗 DOWN）：
+                # 核验通过才进 _fire_quote_edge，未过/缺失 → 弃单
+                task = asyncio.create_task(
+                    self._verify_ln_dd_and_fire(
                         ch, window_start_ms, window_end_ms, t_rel,
                         float(down_price), btc_price, int(ts_ms),
                         window_btc_curve),
@@ -410,6 +430,37 @@ class MultiLiveTrader:
             logger.warning("多通道实盘：v3 环境核验任务异常 | {} | 窗口 {} | {}",
                            channel, _fmt_win(window_start), exc)
 
+    async def _verify_ln_dd_and_fire(self, channel: str, window_start: int,
+                                     window_end: int, t_rel: float,
+                                     down_price: float, btc_price: float | None,
+                                     quote_ts: int,
+                                     window_btc_curve: list | None = None) -> None:
+        """深夜距日高门禁异步核验 → 通过才走常规 quote_edge 下单链路。
+        
+        日高缺失（归档相位竞态/瞬时 REST 故障）→ 延迟 STREAK_RETRY_DELAY_S 重查一次；
+        仍缺失或未过阈值 → 仅日志弃单（fired 占位已生效，本窗不再重试）；
+        任何异常只告警不抛（采样循环派生任务的共同契约）。
+        """
+        try:
+            passed, reason = await self._check_ln_dd(
+                channel, window_start, quote_ts, btc_price, window_btc_curve)
+            if not passed and reason == "day_high_missing" and not self._stopped:
+                await asyncio.sleep(STREAK_RETRY_DELAY_S)
+                if not self._stopped:
+                    passed, reason = await self._check_ln_dd(
+                        channel, window_start, quote_ts, btc_price,
+                        window_btc_curve)
+            if not passed:
+                logger.info(
+                    "多通道实盘：{} 深夜距日高门禁未过，弃单 | 窗口 {} | 原因={}",
+                    channel, _fmt_win(window_start), reason)
+                return
+            await self._fire_quote_edge(channel, window_start, window_end,
+                                        t_rel, down_price)
+        except Exception as exc:
+            logger.warning("多通道实盘：{} 深夜距日高核验任务异常 | 窗口 {} | {}",
+                           channel, _fmt_win(window_start), exc)
+
     async def _pass_live_v3_guard(self, channel: str, window_start_ms: int,
                                   quote_ts: int, btc_price: float | None,
                                   window_btc_curve: list | None = None) -> bool:
@@ -490,6 +541,7 @@ class MultiLiveTrader:
                 return False, "prev_not_down"
             if not V3_ENV_GUARDS.get(channel):
                 return True, "ok"
+
             day_start = (quote_ts // 86_400_000) * 86_400_000
             curves = (await session.execute(
                 sa_select(SentimentWindow.curve_btc_price).where(
@@ -522,6 +574,53 @@ class MultiLiveTrader:
                 channel, _LiveBtcPoint(quote_ts, float(btc_price)), quote_ts,
                 prev, best):
             return False, "env_guard_reject"
+        return True, "ok"
+    async def _check_ln_dd(self, channel: str, window_start_ms: int,
+                           quote_ts: int, btc_price: float | None,
+                           window_btc_curve: list | None = None,
+                           ) -> tuple[bool, str]:
+        """深夜距日高门禁实时版：触发时点距当日高点回落≥0.30%（不含前窗 DOWN 要求）。
+        
+        返回 (passed, reason)，reason 供日志/重查分流：
+        btc_missing / day_high_missing / dd_guard_reject / ok。
+        数据源/无未来函数约束与 v3b 同口径（影子侧 cache_key 分族避免污染）；
+        门禁数据缺失 → 不落表（保守跳过，同影子 fail-safe 口径）。
+        """
+        if btc_price is None:
+            return False, "btc_missing"
+        async with async_session_factory() as session:
+            day_start = (quote_ts // 86_400_000) * 86_400_000
+            curves = (await session.execute(
+                sa_select(SentimentWindow.curve_btc_price).where(
+                    SentimentWindow.start_time >= day_start,
+                    SentimentWindow.start_time <= window_start_ms,
+                )
+            )).scalars().all()
+        best: float | None = None
+        for curve in curves:
+            for p in curve or []:
+                t, v = p.get("t"), p.get("v")
+                if t is None or v is None:
+                    continue
+                if int(t) <= quote_ts and (best is None or float(v) > best):
+                    best = float(v)
+        # 本窗已采样 BTC 时序 ∪ 触发时刻实时点
+        for p in (window_btc_curve or []):
+            t, v = p.get("t"), p.get("v")
+            if t is None or v is None:
+                continue
+            if int(t) <= quote_ts and (best is None or float(v) > best):
+                best = float(v)
+        if best is None or float(btc_price) > best:
+            best = float(btc_price)
+        if best <= 0:
+            return False, "day_high_missing"
+        # 复用影子门禁纯函数逻辑（不查 LN_DD_GUARDS 字典）：伪窗口只含触发时刻实时 BTC 点（trig 即 btc_price）
+        from binance_predict.services.quote_edge_detector import LN_DD_GUARDS
+        threshold = LN_DD_GUARDS[channel][1]  # -0.30
+        dd_pct = (float(btc_price) - best) / best * 100.0
+        if dd_pct > threshold:
+            return False, "dd_guard_reject"
         return True, "ok"
 
     async def _verify_streak_and_fire(self, channel: str, window_start: int,

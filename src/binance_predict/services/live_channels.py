@@ -58,6 +58,8 @@ class ChannelSpec:
     regime_gate: bool = False     # quote_edge v4 regime 门禁（ret24≤阈值，K 线异步核验）
     streak_gate: bool = False     # quote_edge v3 非连涨门禁（末收15m，K 线异步核验）
     entry_band_whitelist: tuple[tuple[float, float], ...] | None = None
+    hour_guard: tuple[int, int] | None = None   # quote_edge 时段门禁（北京时间 window_start hour∈[lo,hi)）
+    ln_dd_guard: bool = False     # quote_edge 深夜距日高回落门（触发时点距当日高点回落≥0.30%，与 v3b 同口径；仅深夜版用）
     # 下单层入场价白名单（x4_v3）：决策点真实成交均价须落在任一 [lo,hi) 区间，
     # 否则 FAILED 弃单（prediction_trading 报价后检查，含 FOK 重试轮复检）。
     # None = 不启用（既有通道零影响）；研究冻结口径，不进 parse_channel_config 可覆盖项。
@@ -76,6 +78,13 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     "quote_contrarian_v2": ChannelSpec(
         "quote_contrarian_v2", "quote_edge", "5m", "DOWN", _qe_guard("quote_contrarian_v1"),
         "报价反向·门禁版", v2_guard="max_rise",
+    ),
+    # late_night_contrarian_v2（2026-09-08 实盘接入）：v1 ∩ 时段门(北京 22-24) ∩ 距日高回落≥0.30%
+    # 依据（F1 优化发现）：OOS n=50 wr 44.0% CI[31.2%,57.7%] vs 盈亏平衡≈27%；门禁数据缺失→不落表。
+    # ⚠️ 纪律推翻：原 docstring "纯影子前向攒样本" 被用户拍板改为实盘注册（线上已开启下单）。
+    "late_night_contrarian_v2": ChannelSpec(
+        "late_night_contrarian_v2", "quote_edge", "5m", "DOWN", _qe_guard("late_night_contrarian_v2"),
+        "深夜逆势·日高回落门禁版", v2_guard="max_rise", hour_guard=(22, 24), ln_dd_guard=True,
     ),
     # --- x4 族（影子 PENDING → 次窗 +150s 决策点，入场价历史偏低）---
     "x4_v2": ChannelSpec("x4_v2", "x4", "5m", "DOWN", 0.50, "情绪错位·平静市门禁版"),

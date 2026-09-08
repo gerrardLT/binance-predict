@@ -181,12 +181,12 @@ def _stub_select_db(monkeypatch, rows: list) -> None:
 # ============================================================
 
 def test_parse_defaults_all_off(monkeypatch) -> None:
-    """默认：全 23 在线通道 OFF、金额/日限取全局默认（用户拍板 2U / 100 单）。"""
+    """默认：全 24 在线通道 OFF、金额/日限取全局默认（用户拍板 2U / 100 单）。"""
     monkeypatch.setattr(settings, "live_default_amount_usdt", 2.0)
     monkeypatch.setattr(settings, "live_default_max_daily_orders", 100)
     monkeypatch.setattr(settings, "live_channels_json", "")
     cfgs = parse_channel_config()
-    assert len(cfgs) == 23  # G0/G1/G3+G4+G7 族 6 变体 = 10 firsthit + 其他 13
+    assert len(cfgs) == 24  # G0/G1/G3+G4+G7 族 6 变体 + late_night v2 = 11 firsthit+quote_edge+...
     assert all(not c.enabled for c in cfgs.values())
     assert all(c.amount_usdt == 2.0 for c in cfgs.values())
     assert all(c.max_daily_orders == 100 for c in cfgs.values())
@@ -279,9 +279,10 @@ def test_parse_non_int_daily_rejected(monkeypatch) -> None:
 
 
 def test_channels_registry_shape() -> None:
-    """注册表形状（2026-09-08 firsthit G4+G7 系注册后）：23 在线 + 8 退役，两者不交。"""
+    """注册表形状（2026-09-08 late_night_contrarian_v2 接入后）：24 在线 + 8 退役，两者不交。"""
     assert set(LIVE_CHANNELS) == {
         "quote_contrarian_v2",
+        "late_night_contrarian_v2",
         "x4_v2",
         "x4_v3",
         "scene_bull_exhaust", "scene_bull_exhaust_confirm",
@@ -312,6 +313,12 @@ def test_channels_registry_shape() -> None:
     assert by["quote_contrarian_v2"].market_period == "5m"
     assert by["quote_contrarian_v2"].v2_guard == "max_rise"
     assert by["quote_contrarian_v2"].auto_max_exec == 0.28
+    # late_night_contrarian_v2 新注册（时段门 22-24+距日高门≥0.30%）
+    assert by["late_night_contrarian_v2"].market_period == "5m"
+    assert by["late_night_contrarian_v2"].v2_guard == "max_rise"
+    assert by["late_night_contrarian_v2"].auto_max_exec == 0.33
+    assert by["late_night_contrarian_v2"].hour_guard == (22, 24)
+    assert by["late_night_contrarian_v2"].ln_dd_guard is True
     assert by["x4_v2"].auto_max_exec == 0.50
     assert all(by[ch].market_period == "15m" for ch in
                ("scene_bull_exhaust", "scene_bull_exhaust_confirm",
@@ -676,6 +683,14 @@ async def test_check_v3_env_branches(monkeypatch) -> None:
     assert await t._check_v3_env(
         "quote_contrarian_v3b", WINDOW_START, ts, 9975.0) \
         == (False, "env_guard_reject")
+    # late_night v2: 小时卫 + 距日高门（不查前窗 DOWN），仅测日高部分
+    # btc 9970 → 距日高 10000 回落−0.30% 含边界过（假设 22-24 时已判定时段）
+    assert await t._check_ln_dd(
+        "late_night_contrarian_v2", WINDOW_START, ts, 9970.0) == (True, "ok")
+    # 9975 → −0.25% 不过
+    assert await t._check_ln_dd(
+        "late_night_contrarian_v2", WINDOW_START, ts, 9975.0) \
+        == (False, "dd_guard_reject")
     # W1：本窗喂价时序中的高点 10010 计入日高 → 9975 也过
     # （回落 −0.35% ≥ 0.30%；无喂价时按归档日高 10000 会被拒）
     assert await t._check_v3_env(
@@ -1733,14 +1748,14 @@ def test_set_channel_daily_over_cap_rejected(monkeypatch) -> None:
 
 
 def test_status_shape(monkeypatch) -> None:
-    """status：31 通道全量（23 在线 +8 退役 fixture）、enabled_any/defaults/amount_cap、单通道字段。"""
+    """status：32 通道全量（24 在线 +8 退役 fixture）、enabled_any/defaults/amount_cap、单通道字段。"""
     t = _make_trader(monkeypatch, _FakeTrader(), channels=["quote_contrarian_v1"])
     s = t.status()
     assert s["enabled_any"] is True
     assert s["amount_cap"] == 50
     assert s["defaults"]["amount_usdt"] == 2.0
     assert s["defaults"]["max_daily_orders"] == 100
-    assert len(s["channels"]) == 31   # 既有 24+G7 系列 6→30，加 G4 共 31
+    assert len(s["channels"]) == 32   # 既有 24+G7 系列 6→30，加 G4→31，再加 late_night v2→32
     by = {c["channel"]: c for c in s["channels"]}
     c = by["quote_contrarian_v1"]
     assert c["enabled"] is True and c["enabled_at_startup"] is True
