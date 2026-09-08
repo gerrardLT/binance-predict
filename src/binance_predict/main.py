@@ -670,14 +670,39 @@ async def _sentiment_window_archiver() -> None:
                             )
                             continue
 
-                    # 断链自愈（2026-08-27 误结算事故）：冷启动落在窗中时快照的
-                    # entry 是窗中价（与前窗 exit 断链），klines 精确回读开盘价替代。
-                    # 归档先于结算（+7min），此处修正即阻断后续订单误结算。
-                    from .services.archive_contamination_repair import correct_entry_break
-                    repaired_entry = await correct_entry_break(
-                        db, start_ms, entry_price, collector)
-                    if repaired_entry is not None:
-                        entry_price = repaired_entry
+                    # 结算口径以币安 K 线 open/close 为准（2026-09-08 误结算事故）。
+                    #
+                    # 旧实现：entry = 窗口起点内存快照，exit =「tracker 检测到窗口
+                    # 切换那一刻」的 mid_price（main.py:377）。检测发生在边界之后的
+                    # 下一轮轮询 —— 晚到多少就污染多少：实锤 22:55~23:00 窗中，最后采样
+                    # 22:59:46（BTC 78964.485，UP+2.85bp；市场报价 UP=95.5%），exit 却记成
+                    # 78938.385，该价出现在 23:00 那根 1m K 线内（下一窗口），result
+                    # 由 UP 翻成 DOWN，firsthit_down_v1/body_v1 两笔 DOWN 单虚记
+                    # +43.13 USDT（币安侧 DOWN token 归零，redeemable 接口返回
+                    # claimable_count:0，今日 realizedPnl=-21.35 非盈利）。
+                    #
+                    # K 线 open/close 精确落在窗口边界且与市场结算同源：审计 400 窗显示
+                    # entry/exit与kline偏差>2bp仅2.0%，与币安现货WS快照在正常切换
+                    # 场景下高度吻合（例：09-07 22:55 entry 78942.005 vs kline open
+                    # 78942.01，误差仅$0.005 ≈ mid trade 价差）；近零收益窗（±0.04bp）
+                    # 是市场无法定价的不确定区间，K 线仍优于抽样价格的时间漂移。
+                    #
+                    # 直接回读替代快照：若 fetch 失败（网络未收盘）则沿用原快照（可能
+                    # 污染），启动时 heal_boundary_contaminated_windows 兜底重算历史。
+                    kopen = await collector.fetch_kline_open("5m", start_ms)
+                    kclose = await collector.fetch_kline_close("5m", start_ms)
+                    if kopen and kopen > 0:
+                        logger.info(
+                            "归档回读 K 线 | {}~{} | entry {:.2f}→{:.2f}",
+                            start_ms, end_ms, entry_price or 0.0, kopen,
+                        )
+                        entry_price = kopen
+                    if kclose and kclose > 0:
+                        logger.info(
+                            "归档回读 K 线 | {}~{} | exit {:.2f}→{:.2f}",
+                            start_ms, end_ms, exit_price or 0.0, kclose,
+                        )
+                        exit_price = kclose
 
                     # 计算实际结果（结算口径对齐）：预测市场只按涨跌方向赔付，
                     # 与幅度无关，故 outcome 按 actual_return 正负号标注；恰好为 0
@@ -3395,6 +3420,13 @@ SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     "firsthit_down_v1": (None, None, "首触基底G0: 5m窗内DOWN首次进入(0.005,0.1]→买DOWN（44d回测EV+0.22 CI[+0.10,+0.35]；前向现算裁决）"),
     "firsthit_down_body_v1": (None, None, "首触体貌G1: G0+body_r≤0.35（FDR q=0.007，calib EV+1.44→confirm +1.59 两段CI下界>0；前向现算裁决）"),
     "firsthit_down_chg_v1": (None, None, "首触偏离G3: G0+chg≤+2.82bp（logit β=+0.07 p=0.000，calib EV+0.39→confirm +0.97；前向现算裁决）"),
+    # 首触反转 G7 系列（2026-09-08 优化衍生）：
+    "firsthit_down_g7_v1": (None, None, "首触G7基底: G0+body_r≤0.35∧wick=1（40d回测胜率19~20%, EV+1.98~+2.34, FDR q=0.0002；前向现算裁决）"),
+    "g7_streak_v1": (None, None, "首触G7非强连阳: G7+前驱5m连阳≤1（回测胜率18~20%, EV+1.92~+2.86, FDR q=0.0004；前向现算裁决）"),
+    "g7_wick20_v1": (None, None, "首触G7长上影: G7+upper_wick≥2bp（回测胜率18~24%, EV+1.84~+3.06；前向现算裁决）"),
+    "g7_strict_v1": (None, None, "首触G7严格版: G7+streak≤1∧wick≥1.5bp（回测胜率21~23%, EV+2.68~+3.27；前向现算裁决）"),
+    "g7_q05_v1": (None, None, "首触G7深折价: G7+q≤0.05（极端赔率凸性档, EV+4.10~+5.77；前向现算裁决）"),
+    "g7_t270_v1": (None, None, "首触G7非极晚: G7+t≤270s（回测胜率28~30%, EV+3.08~+4.41；前向现算裁决）"),
     # S2 条件单族（2026-09-06）：实盘 S2(bear_exhaust) 派生窗内 t=4/t=5 判价条件确认 →
     # 押次周期 15m UP，落 kline_shadow_signals（version 隔离），入场快照真实 15m UP 报价。
     # 基准胜率=720d 冻结「价-only」硬数字（审计锚点 scripts/s2_cond_freeze_counts_720d.py，
@@ -3608,6 +3640,9 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
         "absorption_follow_td120_v1", "absorption_follow_td150_v1",  # 吸收/欠反应跟随族（纯影子，2026-09-04：专用表 absorption_shadow_signals，TD120/150 双 variant 滚动标定）
         "s2_cond_t4_v1", "s2_cond_t5d_v1",  # S2 条件单族（纯影子，2026-09-06：实盘 bear_exhaust 派生窗内 t=4/t=5 判价→押 UP，共表 kline_shadow_signals version 隔离）
         "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1",  # 首触反转族（纯影子，2026-09-07：专用表 firsthit_shadow_signals，G0 基底 / G1 body_r≤0.35 / G3 chg≤+2.82bp，前向验证 4 周）
+        # 首触反转 G7 系列（2026-09-08 优化衍生，专用表 firsthit_shadow_signals，独立下单）
+        "firsthit_down_g7_v1", "g7_streak_v1", "g7_wick20_v1",
+        "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",
     ]
     versions += sorted({s.version for s in sh_rows} - set(versions))
     # 影子版本 → 实盘通道状态（version==通道名，2026-09-06 promote + x4_v3 注册后 13 通道；
