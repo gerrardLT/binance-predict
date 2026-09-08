@@ -189,6 +189,64 @@ class BinanceDataCollector:
             logger.warning("fetch_kline_open 失败 | interval={} start={} | {}", interval, start_ms, exc)
             return 0.0
 
+    async def fetch_kline_close(self, interval: str, start_ms: int) -> float:
+        """获取指定周期起点时刻的 K 线收盘价（用于出口污染修正）。
+
+        用途：窗口归档时 exit_price 被采样中断污染，用 K 线 close 精确回读替代。
+        对称于 fetch_kline_open()，分别处理入口/出口价回读。
+
+        Args:
+            interval: K 线周期（"5m" | "15m"，与预测市场周期对齐）
+            start_ms: 周期起点时刻（ms，即市场 start_date）
+
+        Returns:
+            该时刻所在 K 线的收盘价；失败返回 0.0，调用方应检查 > 0。
+            返回 0.0 时本轮顺延，下轮重试（历史 kline 数据终将可得）。
+        """
+        url = f"{settings.binance_api_base}/api/v3/klines"
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    url,
+                    params={
+                        "symbol": settings.symbol,
+                        "interval": interval,
+                        "startTime": start_ms,
+                        "limit": 1,
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                if not data:
+                    logger.warning("fetch_kline_close 返回空 | interval={} start={}", interval, start_ms)
+                    return 0.0
+                open_time = int(data[0][0])
+                close_time = int(data[0][6])
+                close_price = float(data[0][4])
+                # 对齐校验：市场 start_date 与自然 kline 边界错位时可观测
+                if abs(open_time - start_ms) > 60_000:
+                    logger.warning(
+                        "kline 边界与市场周期起点错位 | interval={} start={} kline_open_time={} 差{}s",
+                        interval, start_ms, open_time, abs(open_time - start_ms) // 1000,
+                    )
+                # 收盘守卫：进行中的 K 线 close 是「当前价」而非窗口终价，
+                # 拿它当 exit 等于把旧 bug 换个来源重演。未收盘返回 0.0，
+                # 调用方沿用快照并由启动自愈兜底（归档器在边界+15s 唤醒，
+                # 正常路径必然已收盘）。
+                if close_time > int(time.time() * 1000) + 500:
+                    logger.warning(
+                        "kline 未收盘，拒绝作为窗口终价 | interval={} start={} close_time={}",
+                        interval, start_ms, close_time,
+                    )
+                    return 0.0
+                if close_price <= 0:
+                    logger.warning("kline 收盘价无效 | interval={} start={} close={}", interval, start_ms, close_price)
+                    return 0.0
+                return close_price
+        except Exception as exc:
+            logger.warning("fetch_kline_close 失败 | interval={} start={} | {}", interval, start_ms, exc)
+            return 0.0
+
     async def fetch_recent_klines(self, interval: str, limit: int) -> list[dict]:
         """拉最近 limit 根已收盘 K 线（升序），供周期收盘质量判定与图表 API 使用。
 

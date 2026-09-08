@@ -1157,9 +1157,19 @@ async def lifespan(app: FastAPI):
     # 已结算订单；失败不阻塞启动。
     try:
         from binance_predict.services.archive_contamination_repair import (
-            heal_entry_break_windows,
+            heal_entry_break_windows, heal_exit_break_windows,
         )
         await heal_entry_break_windows(collector)
+        logger.info("入场价断链自愈启动")
+        
+        # 出口价污染自愈（幂等）：采样在边界前停止污染 exit_price → outcome 翻转
+        # → 订单误结算（2026-09-08 事故）。修复近 24h 污染窗并重结算已结算订单。
+        stats = await heal_exit_break_windows(collector)
+        if stats["repaired"]:
+            logger.warning(
+                "出口价污染自愈完成 | 扫描 {} 修复 {} 订单重结算 {}",
+                stats["scanned"], stats["repaired"], stats["orders_resettled"],
+            )
     except Exception as exc:
         logger.error("断链自愈失败（不阻塞启动）: {}", exc)
 

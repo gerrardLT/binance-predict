@@ -356,6 +356,11 @@ async def repair_contaminated_archives() -> dict:
 # 断链判定相对容差：正常切换严格相等；边界处 mid 与 kline 开盘天然偏差
 # 实测 ≤$8（≈1e-4），容差取 2e-4 留裕量；真实断链偏差为几十美元级
 ENTRY_BREAK_REL_TOL = 2e-4
+# 出口污染判定容差（比入口更紧）：400 窗实测 |exit−kline close| 分布
+# median≈0 / p90=0.67bp / p95=1.13bp / p99=2.79bp，取 1bp 让「幅度失真」
+# 只命中尾部 6.2%。注意：容差只是次要触发条件，主条件是 outcome 改判 ——
+# 2026-09-08 事故窗偏差仅 1.75bp，单靠 2bp 容差会漏判（见 heal 函数 docstring）。
+EXIT_BREAK_REL_TOL = 1e-4
 
 
 async def _prev_exit_price(session, window_start_ms: int) -> float | None:
@@ -380,6 +385,115 @@ async def detect_entry_break(
     if prev_exit is None or prev_exit <= 0:
         return False
     return abs(entry_price - prev_exit) > prev_exit * ENTRY_BREAK_REL_TOL
+
+
+def detect_exit_break(exit_price: float | None, kline_close: float | None) -> bool:
+    """出口污染判定：归档 exit_price 与 K 线收盘偏差超容差 → 采样中断污染嫌疑。
+
+    纯函数（kline_close 由调用方回读后传入），便于测试且避免重复 REST。
+    价格无效/回读失败 → False（无从判定，不动）。
+    """
+    if not exit_price or exit_price <= 0:
+        return False
+    if not kline_close or kline_close <= 0:
+        return False
+    return abs(exit_price - kline_close) > kline_close * EXIT_BREAK_REL_TOL
+
+
+def outcome_of(entry_price: float | None, exit_price: float | None) -> tuple[float | None, str | None]:
+    """按 entry/exit 算 (actual_return, outcome)，口径与归档器一致。
+
+    预测市场只按涨跌方向赔付，与幅度无关；恰好为 0 标 NOISE。
+    """
+    if not entry_price or entry_price <= 0 or not exit_price or exit_price <= 0:
+        return None, None
+    ret = exit_price / entry_price - 1
+    if ret > 0:
+        return ret, "UP"
+    if ret < 0:
+        return ret, "DOWN"
+    return ret, "NOISE"
+
+
+async def heal_exit_break_windows(collector, hours: float = 24.0) -> dict:
+    """启动自愈：修复近 hours 小时内 exit_price 被采样中断污染的归档窗。
+
+    污染机制（2026-09-08 实锤）：exit_price 原取「tracker 检测到窗口切换那一刻」
+    的 mid_price，而检测发生在边界之后的下一轮轮询 —— 晚到多少就污染多少，
+    晚到的快照实际落在下一窗口内。实锤 22:55~23:00 窗：末次采样 22:59:46
+    BTC=78964.485（UP +2.85bp，市场 UP 报价已到 95.5%），exit 却记 78938.385
+    （该价出现在 23:00 那根 1m K 线内），outcome 由 UP 翻成 DOWN，
+    firsthit_down_v1 / firsthit_down_body_v1 两笔 DOWN 单虚记 +43.13 USDT
+    （币安侧 DOWN token 归零：redeemable claimable_count=0）。
+
+    触发修复的两个条件（满足其一即修）：
+      ① outcome 改判：归档 outcome ≠ 按 (entry, kline close) 重算的 outcome
+         —— 这是真正造成误结算的条件，无论偏差多小都必须修；
+      ② 偏差超容差：|exit − kline close| > kline close × EXIT_BREAK_REL_TOL
+         —— 方向未变但幅度失真，影响 actual_return 下游研究口径。
+    条件①不可省：事故窗偏差仅 1.75bp，落在 400 窗实测分布的 p95(1.13bp) 与
+    p99(2.79bp) 之间，任何 >1.75bp 的纯容差判定都会漏掉它。
+
+    修复：exit ← kline close，重算 actual_return/outcome，并重结算该窗 5m 订单。
+    幂等：修复后 exit == kline close 且 outcome 一致，再次启动 0 命中即 no-op。
+    前置：须在 heal_entry_break_windows 之后调用（entry 先修，否则 outcome
+    重算仍基于污染的 entry）。
+    """
+    import time
+
+    from sqlalchemy import update as _sa_update
+
+    stats = {"scanned": 0, "repaired": 0, "orders_resettled": 0,
+             "kline_failed": 0, "outcome_flipped": 0}
+    cutoff_ms = int(time.time() * 1000) - int(hours * 3_600_000)
+    async with async_session_factory() as session:
+        wins = (await session.execute(
+            sa_select(SentimentWindow)
+            .where(SentimentWindow.start_time >= cutoff_ms)
+            .order_by(SentimentWindow.start_time.asc())
+        )).scalars().all()
+    for w in wins:
+        stats["scanned"] += 1
+        kclose = await collector.fetch_kline_close("5m", int(w.start_time))
+        if not kclose or kclose <= 0:
+            stats["kline_failed"] += 1
+            continue
+        old_return, old_outcome = outcome_of(w.entry_price, w.exit_price)
+        new_return, new_outcome = outcome_of(w.entry_price, kclose)
+        flipped = old_outcome != new_outcome
+        deviated = detect_exit_break(w.exit_price, kclose)
+        if not flipped and not deviated:
+            continue
+        async with async_session_factory() as session:
+            await session.execute(
+                _sa_update(SentimentWindow)
+                .where(SentimentWindow.id == w.id)
+                .values(
+                    exit_price=kclose,
+                    actual_return=new_return,
+                    outcome=new_outcome,
+                )
+            )
+            resettled = await resettle_window_orders(
+                session, int(w.start_time), kclose, new_outcome)
+            await session.commit()
+        stats["repaired"] += 1
+        stats["orders_resettled"] += resettled
+        if flipped:
+            stats["outcome_flipped"] += 1
+        logger.warning(
+            "出口污染自愈（启动）| 窗口 {} | exit {:.2f}→{:.2f} | outcome {}→{} "
+            "| 改判={} | 订单重结算 {}",
+            w.start_time, w.exit_price or 0.0, kclose, old_outcome, new_outcome,
+            flipped, resettled,
+        )
+    if stats["repaired"]:
+        logger.warning(
+            "出口污染自愈（启动）完成 | 扫描 {} 修复 {}（改判 {}）订单重结算 {} kline失败 {}",
+            stats["scanned"], stats["repaired"], stats["outcome_flipped"],
+            stats["orders_resettled"], stats["kline_failed"])
+    return stats
+
 
 
 async def resettle_window_orders(
