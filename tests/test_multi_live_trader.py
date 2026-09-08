@@ -181,12 +181,12 @@ def _stub_select_db(monkeypatch, rows: list) -> None:
 # ============================================================
 
 def test_parse_defaults_all_off(monkeypatch) -> None:
-    """默认：全 22 在线通道 OFF、金额/日限取全局默认（用户拍板 2U / 100 单）。"""
+    """默认：全 23 在线通道 OFF、金额/日限取全局默认（用户拍板 2U / 100 单）。"""
     monkeypatch.setattr(settings, "live_default_amount_usdt", 2.0)
     monkeypatch.setattr(settings, "live_default_max_daily_orders", 100)
     monkeypatch.setattr(settings, "live_channels_json", "")
     cfgs = parse_channel_config()
-    assert len(cfgs) == 22
+    assert len(cfgs) == 23  # G0/G1/G3+G4+G7 族 6 变体 = 10 firsthit + 其他 13
     assert all(not c.enabled for c in cfgs.values())
     assert all(c.amount_usdt == 2.0 for c in cfgs.values())
     assert all(c.max_daily_orders == 100 for c in cfgs.values())
@@ -279,7 +279,7 @@ def test_parse_non_int_daily_rejected(monkeypatch) -> None:
 
 
 def test_channels_registry_shape() -> None:
-    """注册表形状（2026-09-08 firsthit G7 系列注册后）：22 在线 + 8 退役，两者不交。"""
+    """注册表形状（2026-09-08 firsthit G4+G7 系列注册后）：23 在线 + 8 退役，两者不交。"""
     assert set(LIVE_CHANNELS) == {
         "quote_contrarian_v2",
         "x4_v2",
@@ -293,6 +293,8 @@ def test_channels_registry_shape() -> None:
         "absorption_follow_td120_v1", "absorption_follow_td150_v1",
         # 2026-09-07 firsthit 三通道（默认全 OFF，用户确认独立下单）
         "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1",
+        # 2026-09-08 firsthit G4 交互门（G1∩G3，默认 OFF；⚠非独立暴露，见 live_channels 注释）
+        "firsthit_down_g4_v1",
         # 2026-09-08 firsthit G7 系列六通道（默认全 OFF，用户确认独立下单）
         "firsthit_down_g7_v1", "g7_streak_v1", "g7_wick20_v1",
         "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",
@@ -1731,14 +1733,14 @@ def test_set_channel_daily_over_cap_rejected(monkeypatch) -> None:
 
 
 def test_status_shape(monkeypatch) -> None:
-    """status：30 通道全量（22 在线 + 8 退役 fixture）、enabled_any/defaults/amount_cap、单通道字段。"""
+    """status：31 通道全量（23 在线 +8 退役 fixture）、enabled_any/defaults/amount_cap、单通道字段。"""
     t = _make_trader(monkeypatch, _FakeTrader(), channels=["quote_contrarian_v1"])
     s = t.status()
     assert s["enabled_any"] is True
     assert s["amount_cap"] == 50
     assert s["defaults"]["amount_usdt"] == 2.0
     assert s["defaults"]["max_daily_orders"] == 100
-    assert len(s["channels"]) == 30   # 既有 24 + 新增 G7 系列 6 通道
+    assert len(s["channels"]) == 31   # 既有 24+G7 系列 6→30，加 G4 共 31
     by = {c["channel"]: c for c in s["channels"]}
     c = by["quote_contrarian_v1"]
     assert c["enabled"] is True and c["enabled_at_startup"] is True

@@ -181,7 +181,7 @@ def test_outcome_of_judgeable_only():
 
 
 def test_gate_of_version_logic():
-    """G0 恒真；G1 body≤0.35；G3 chg≤+2.82bp；缺失特征 → 假。"""
+    """G0 恒真；G1 body≤0.35；G3 chg≤+2.82bp；G4 = G1∩G3；缺失特征 → 假。"""
     ext_ok = {
         "q": 0.07, "trigger_ts": START + 120_000, "td_sec": 120,
         "chg_bps": 2.0, "body_r": 0.30, "wick01": 0.0, "rng_bps": 5.0,
@@ -190,12 +190,14 @@ def test_gate_of_version_logic():
     assert _gate_of("firsthit_down_v1", ext_ok) is True
     assert _gate_of("firsthit_down_body_v1", ext_ok) is True    # 0.30 ≤ 0.35
     assert _gate_of("firsthit_down_chg_v1", ext_ok) is True     # 2.0 ≤ 2.82
+    assert _gate_of("firsthit_down_g4_v1", ext_ok) is True      # 两条件同时满足
 
     # body_r 超限
     ext_bad_body = ext_ok.copy()
     ext_bad_body["body_r"] = 0.40
     assert _gate_of("firsthit_down_body_v1", ext_bad_body) is False
     assert _gate_of("firsthit_down_chg_v1", ext_bad_body) is True
+    assert _gate_of("firsthit_down_g4_v1", ext_bad_body) is False   # 交集：body 不过即假
 
     # chg_bps 超限
     ext_bad_chg = ext_ok.copy()
@@ -203,6 +205,61 @@ def test_gate_of_version_logic():
     assert _gate_of("firsthit_down_v1", ext_bad_chg) is True
     assert _gate_of("firsthit_down_body_v1", ext_bad_chg) is True
     assert _gate_of("firsthit_down_chg_v1", ext_bad_chg) is False
+    assert _gate_of("firsthit_down_g4_v1", ext_bad_chg) is False    # 交集：chg 不过即假
+
+
+def test_gate_of_g4_is_intersection_of_g1_and_g3():
+    """G4 严格等于 G1 ∧ G3（四象限全覆盖）：任一为假则 G4 为假，两者皆真才为真。
+
+    这条锁住 G4 的集合语义——G4 ⊂ G1 且 G4 ⊂ G3，因此同窗 G1/G3/G4 全中
+    是对同一 DOWN 事件的重复下注（非独立信号），实盘暴露须按事件而非通道核算。
+    """
+    base = {
+        "q": 0.07, "trigger_ts": START + 120_000, "td_sec": 120,
+        "chg_bps": 2.0, "body_r": 0.30, "wick01": 0.0, "rng_bps": 5.0,
+        "npts": 20, "dvol": None, "dpar": None,
+    }
+    for chg, body, expect in [
+        (2.0, 0.30, True),    # G1 ✓ G3 ✓ → G4 ✓
+        (2.0, 0.40, False),   # G1 ✗ G3 ✓ → G4 ✗
+        (5.0, 0.30, False),   # G1 ✓ G3 ✗ → G4 ✗
+        (5.0, 0.40, False),   # G1 ✗ G3 ✗ → G4 ✗
+    ]:
+        ext = {**base, "chg_bps": chg, "body_r": body}
+        g1 = _gate_of("firsthit_down_body_v1", ext)
+        g3 = _gate_of("firsthit_down_chg_v1", ext)
+        g4 = _gate_of("firsthit_down_g4_v1", ext)
+        assert g4 is expect, f"chg={chg} body={body}"
+        assert g4 is (g1 and g3), "G4 必须恒等于 G1∧G3"
+
+
+def test_gate_of_g4_boundary_inclusive_and_none_guard():
+    """G4 贴线判定（含边界，与 G1/G3 同口径 ≤）+ 特征缺失 None 守卫 → 不落表。"""
+    base = {
+        "q": 0.07, "trigger_ts": START + 120_000, "td_sec": 120,
+        "chg_bps": fhd.CHG_BPS_GATE, "body_r": fhd.BODY_R_GATE,
+        "wick01": 0.0, "rng_bps": 5.0, "npts": 20, "dvol": None, "dpar": None,
+    }
+    # 贴线：chg == 2.82 且 body == 0.35 → 双双放行（含贴线）
+    assert _gate_of("firsthit_down_g4_v1", base) is True
+    # 越界一例即拒：chg 刚过线
+    assert _gate_of("firsthit_down_g4_v1", {**base, "chg_bps": fhd.CHG_BPS_GATE + 1e-9}) is False
+    # 越界一例即拒：body 刚过线
+    assert _gate_of("firsthit_down_g4_v1", {**base, "body_r": fhd.BODY_R_GATE + 1e-9}) is False
+    # None 守卫：特征缺失一律不落表（不得抛异常）
+    assert _gate_of("firsthit_down_g4_v1", {**base, "chg_bps": None}) is False
+    assert _gate_of("firsthit_down_g4_v1", {**base, "body_r": None}) is False
+    assert _gate_of("firsthit_down_g4_v1", {**base, "chg_bps": None, "body_r": None}) is False
+
+
+def test_firsthit_specs_contains_g4_and_is_unique():
+    """FIRSTHIT_SPECS 注册了 G4，且 version 名全表唯一（幂等键依赖唯一性）。"""
+    versions = [v for v, _ in fhd.FIRSTHIT_SPECS]
+    assert "firsthit_down_g4_v1" in versions
+    assert len(versions) == len(set(versions)), "version 重名会破坏 (version, window_start) 幂等"
+    # G4 排在 G3 之后、G7 之前（族内顺序，便于日志与面板阅读）
+    assert versions.index("firsthit_down_chg_v1") < versions.index("firsthit_down_g4_v1") \
+        < versions.index("firsthit_down_g7_v1")
 
 
 # ============================================================
@@ -413,10 +470,10 @@ def test_settings_default_on():
 
 
 def test_specs_self_consistent():
-    """spec 自洽：九 version 合法（G0/G1/G3+6G7）、不超 DB 列宽 String(32)，冻结常数正确。"""
+    """spec 自洽：十 version 合法（G0/G1/G3/G4+6G7）、不超 DB 列宽 String(32)，冻结常数正确。"""
     assert set(v for v, _ in FIRSTHIT_SPECS) == {
         "firsthit_down_v1",
-        "firsthit_down_body_v1", "firsthit_down_chg_v1",
+        "firsthit_down_body_v1", "firsthit_down_chg_v1", "firsthit_down_g4_v1",
         "firsthit_down_g7_v1", "g7_streak_v1", "g7_wick20_v1",
         "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",
     }

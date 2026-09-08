@@ -10,10 +10,18 @@
         rng_bps = (路径 max−min)/开盘×1e4      （soft）
         npts    = t≤触发 的 btc 采样点数；npts < 8 → 整窗不落表（v2 主分析口径，
                   触发前路径太稀疏的特征不可信）
-    三 version 同表隔离（G1/G3 ⊂ G0；全特征落库，G4=body∧chg 等交叉门事后重构）：
+    十 version 同表隔离（G1/G3/G4/G7 族均 ⊂ G0；全特征落库，交叉门可事后重构）：
         firsthit_down_v1       G0 基底（全部首触，对照组）
         firsthit_down_body_v1  G1：body_r ≤ 0.35（FDR q=0.007，logit β=+1.28 p=0.000）
         firsthit_down_chg_v1   G3：chg_bps ≤ +2.82（logit β=+0.07 p=0.000）
+        firsthit_down_g4_v1    G4：G1 ∩ G3（FDR q=0.063，confirm STRICT_PASS）
+                               ⚠ G4 ⊂ G1 且 G4 ⊂ G3 —— 三者非独立，同窗全中即对同一
+                                 DOWN 事件重复下注；实盘暴露须按「事件」而非「通道」核算。
+                               ⚠ 前向功效偏紧：calib EV(+1.03) 与 4 周前向 CI 半宽(≈1.08)
+                                 接近 → 即使真实效应等于 calib 估计，通过概率也仅 ≈50%；
+                                 FAIL 时应延长观察期而非直接否决（见证据文档 D3）。
+        firsthit_down_g7_v1    G7：G1 ∧ wick01=1（FDR q=0.000，全表最强门）
+        g7_* 五个变体          G7 + streak/upper_wick/q/td_sec 收紧（见 FIRSTHIT_SPECS）
 
     EV（本检测器的生命线，逐事件真实触发价，禁用任何均值/pct 代理）：
         win  → 0.98/q − 1     （费 2% 无溢价，与 absorption/quote_edge._ev_at_entry 同源）
@@ -50,6 +58,9 @@ FIRSTHIT_SPECS: list[tuple[str, str]] = [
     ("firsthit_down_v1", "G0 基底（全部首触）"),
     ("firsthit_down_body_v1", "G1 小实体 body_r≤0.35"),
     ("firsthit_down_chg_v1", "G3 价格偏离 chg≤+2.82bp"),
+    # G4 interaction（shape_scan_v2 已 FDR q=0.063 + confirm STRICT_PASS）：
+    # chg_bps ≤ 2.82 ∧ body_r ≤ 0.35，样本量偏小但 EV 极高；注册影子版本用于前向验证
+    ("firsthit_down_g4_v1", "G4 交互门 chg≤2.82∧body≤0.35"),
     ("firsthit_down_g7_v1", "G7 纯组合基底 body_r≤0.35∧wick=1"),
     ("g7_streak_v1", "G7+非强连阳 streak_up≤1"),
     ("g7_wick20_v1", "G7+长上影 upper_wick≥2.0bp"),
@@ -198,13 +209,23 @@ def _extract(w: SentimentWindow) -> dict | None:
 
 
 def _gate_of(version: str, ext: dict, streak_up: int | None = None) -> bool:
-    """version → 落表门（G0 恒真；G1 body；G3 chg；G7 及各变体）。特征缺失（None）不落。"""
+    """version → 落表门（G0 恒真；G1 body；G3 chg；G4=G1∩G3；G7 及各变体）。
+
+    特征缺失（None）一律不落表——宁可少样本，不用不可信特征污染前向裁决。
+    """
     if version == "firsthit_down_v1":
         return True
     if version == "firsthit_down_body_v1":
         return ext["body_r"] is not None and ext["body_r"] <= BODY_R_GATE
     if version == "firsthit_down_chg_v1":
         return ext["chg_bps"] is not None and ext["chg_bps"] <= CHG_BPS_GATE
+    if version == "firsthit_down_g4_v1":
+        # G4 = G1 ∩ G3（chg_bps ≤ 2.82 ∧ body_r ≤ 0.35）。
+        # 注意：G4 ⊂ G1 且 G4 ⊂ G3，与两者非独立——同窗三门全中即同一注的 3 倍暴露。
+        return (
+            ext["chg_bps"] is not None and ext["chg_bps"] <= CHG_BPS_GATE
+            and ext["body_r"] is not None and ext["body_r"] <= BODY_R_GATE
+        )
 
     # G7 基准条件：小实体 + 上影拒绝
     is_g7 = (
@@ -235,7 +256,7 @@ def _gate_of(version: str, ext: dict, streak_up: int | None = None) -> bool:
 
 
 class FirstHitShadowDetector:
-    """5m DOWN 首触反转影子检测器：轮询新归档窗 → 首触特征 → 三 version 门 → 落 SETTLED。
+    """5m DOWN 首触反转影子检测器：轮询新归档窗 → 首触特征 → 逐 version 门 → 落 SETTLED。
 
     归档后处理（同 absorption/quote_edge）：窗已结算才处理，插行即 SETTLED，无 PENDING。
     """

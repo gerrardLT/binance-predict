@@ -47,7 +47,7 @@ class ChannelSpec:
     """通道静态描述（冻结，运行时不可变）。"""
 
     channel: str
-    family: str                   # quote_edge | x4 | scene | s2_cond | nextbar | absorption
+    family: str                   # quote_edge | x4 | scene | s2_cond | nextbar | absorption | firsthit
     market_period: str            # 5m | 15m
     direction: str                # 典型下单方向（scene/s2_cond 族由信号 side 决定；
                                   # absorption 族由 BTC 位移符号动态决定，此处为基准方向）
@@ -165,6 +165,18 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     "firsthit_down_chg_v1": ChannelSpec(
         "firsthit_down_chg_v1", "firsthit", "5m", "DOWN", 0.09,
         "首触G3偏离 chg≤+2.82bp（押DOWN）",
+    ),
+    # G4 交互门（2026-09-08 影子+实盘接入）：G4 = G1 ∩ G3（chg≤2.82 ∧ body≤0.35）
+    # 依据 shape_scan_v2 冻结扫描：calib n=214 P=12.6% EV+1.03 CI[+0.08,+2.22]；
+    # confirm n=86 P=23.3% EV+1.85 CI[+0.35,+3.44]；binom p=0.025 → BH-FDR q=0.063 ✅ STRICT_PASS。
+    # 护栏推导：盈亏平衡 q* = P×0.98；calib P=12.6% → q*=0.1235，取 0.12（边际 2.8%）。
+    # ⚠️ 非独立暴露：G4 ⊂ G1 且 G4 ⊂ G3，同窗三门全中即同一 DOWN 事件 4 倍下注（含 G0）。
+    # ⚠️ 功效警告（见 .pytest_tmp/firsthit_optimization_evidence_v2.md D3）：G4 calib EV(+1.03)
+    #   与前向 CI 半宽(≈1.08)几乎相等 → 即使真实效应等于 calib 估计，前向通过概率仅 ≈50%。
+    #   预期它大概率 FAIL 时应延长观察期而非直接否决。
+    "firsthit_down_g4_v1": ChannelSpec(
+        "firsthit_down_g4_v1", "firsthit", "5m", "DOWN", 0.12,
+        "首触G4交互门 chg≤2.82∧body≤0.35（押DOWN）",
     ),
     # G7 族（2026-09-08 影子+实盘接入）：G7 纯组合基底及 5 个科学变体
     # 护栏设置依据：回测中均值触发价约 0.068~0.075，盈亏平衡平衡价 wr*0.98（胜率 18%~24% 对应 0.17~0.23）；

@@ -736,6 +736,10 @@ const SIGNAL_INFO: Record<string, { name: string; kind: '实盘' | '影子' | '�
     name: '首触G3偏离（押DOWN）', kind: '影子', liveOk: true,
     desc: 'G0 + chg≤+2.82bp（首触时 BTC 相对窗开盘涨幅有限，深折价更像报价错杀而非信息驱动）。默认关闭；与 G0/G1 独立下单，不做跨版本互斥，每通道每窗至多一单。执行价护栏 0.09，实际成交均价高于护栏弃单。confirm 段已 burned，护栏非前向胜率背书。',
   },
+  firsthit_down_g4_v1: {
+    name: '首触G4交互门（押DOWN）', kind: '影子', liveOk: true,
+    desc: 'G0 + 小实体(body_r≤0.35) ∧ 价格偏离(chg≤+2.82bp)，即 G1∩G3。冻结扫描 calib n=214 P=12.6% EV+1.03 CI[+0.08,+2.22]；confirm n=86 P=23.3% EV+1.85 CI[+0.35,+3.44]；BH-FDR q=0.063 STRICT_PASS。执行价护栏 0.12。⚠️非独立暴露：G4⊂G1 且 G4⊂G3，同窗三门全中即同一注重复下注。⚠️功效偏紧：calib EV(+1.03) 与前向 CI 半宽(≈1.08) 接近，前向通过概率约 50%，FAIL 时应延长观察期而非直接否决。默认关闭，每通道每窗至多一单。',
+  },
   firsthit_down_g7_v1: {
     name: '首触G7基底（押DOWN）', kind: '影子', liveOk: true,
     desc: 'G0 + 小实体(body_r≤0.35) ∧ 上影拒绝(wick01=1)。40d 全量回测胜率 19%~20%，EV +1.98~+2.34（FDR q=0.0002）。默认关闭，执行价护栏 0.10，每通道每窗至多一单。',
@@ -4374,6 +4378,7 @@ const SHADOW_META: Record<string, { label: string; color: string }> = {
   firsthit_down_v1: { label: '首触G0 基底 q∈(0.005,0.1]→DOWN', color: 'var(--chart-3)' },
   firsthit_down_body_v1: { label: '首触G1 body_r≤0.35→DOWN', color: 'var(--chart-4)' },
   firsthit_down_chg_v1: { label: '首触G3 chg≤+2.82bp→DOWN', color: 'var(--chart-5)' },
+  firsthit_down_g4_v1: { label: '首触G4 交互 chg≤2.82∧body≤0.35→DOWN', color: 'var(--chart-2)' },
   firsthit_down_g7_v1: { label: '首触G7 基底 body≤0.35∧wick=1→DOWN', color: 'var(--chart-6)' },
   g7_streak_v1: { label: '首触G7 非强连阳 streak≤1→DOWN', color: 'var(--chart-7)' },
   g7_wick20_v1: { label: '首触G7 长上影 wick≥2bp→DOWN', color: 'var(--chart-8)' },
@@ -4421,6 +4426,7 @@ const ANALYTICS_EXTRA_DESC: Record<string, string> = {
   firsthit_down_v1: '首触反转 G0 基底（对照组）：5m 窗内 DOWN token 报价**首次**进入 (0.005, 0.1]（深折价，市场判定几乎不会跌）的采样点 → 按该时刻真实报价买 DOWN，押注最终结算 DOWN =「反转」的影子信号，仅记录不下单。触发时刻特征严格 ex-ante（只读 ≤触发时刻采样）：chg_bps（BTC 相对开盘涨跌）、body_r（|btc@触−开盘|/路径 max−min 归一实体）、npts（路径采样点数，<8 整窗不落表=路径太稀疏特征不可信）。落专用表 firsthit_shadow_signals，G1/G3 为 G0 的纯子集（同表 version 隔离、全特征落库，交叉门 G4=body∧chg 可事后重构）。44d 回测基底 EV +0.22（日聚类 CI[+0.10,+0.35]），EV 按逐事件真实触发价现算：赢 0.98/q−1 / 输 −1（禁用任何均值/分位代理）。预注册裁决（4 周前向）：若 G0 前向 EV 日聚类 CI **上界** < 0 → DOWN 侧 edge 消失，整族否决重来。',
   firsthit_down_body_v1: '首触反转 G1 小实体：G0 基底 + body_r ≤ 0.35 门禁（触发时刻 BTC 相对开盘的净位移只占窗内路径振幅的 ≤35%，即价格来回震荡而非单边跑出去）→ 按首触时刻真实 DOWN 报价买 DOWN 的影子信号，仅记录不下单。研究口径：45 维条件扫描中 body_r≤0.35 是唯一扛住 FDR 多重校正的形态门（q=0.007，logit 控 t+t² 后 β=+1.28 p=0.000），排除时间分段混淆。严格 ex-ante 时间切分两段考试：calib EV +1.44 → confirm EV +1.59（两段日聚类 CI 下界均 > 0）。落专用表 firsthit_shadow_signals（G0 纯子集，version 隔离），EV 逐事件真实触发价现算：赢 0.98/q−1 / 输 −1。预注册裁决（4 周前向）：通过 = 前向触发率 P ≥ 12% 且 EV 日聚类 CI 下界 > 0。',
   firsthit_down_chg_v1: '首触反转 G3 价格偏离：G0 基底 + chg_bps ≤ +2.82bp 门禁（触发时刻 BTC 相对窗开盘涨幅不超过 +2.82 个基点，即深折价并非由 BTC 真涨造成，属报价错杀而非信息驱动）→ 按首触时刻真实 DOWN 报价买 DOWN 的影子信号，仅记录不下单。研究口径：logit 控 t+t² 后 β=+0.07 p=0.000（chg 越低反转概率越高，单调）。严格 ex-ante 时间切分两段考试：calib EV +0.39 → confirm EV +0.97（confirm 段更强但样本少）。落专用表 firsthit_shadow_signals（G0 纯子集，version 隔离），EV 逐事件真实触发价现算：赢 0.98/q−1 / 输 −1。预注册裁决（4 周前向）：通过 = 前向触发率 P ≥ 10% 且 EV 日聚类 CI 下界 > 0。',
+  firsthit_down_g4_v1: '首触反转 G4 交互门：G0 基底 + body_r≤0.35（小实体）∧ chg_bps≤+2.82bp（价格偏离有限），即 G1 ∩ G3 的交集门 → 按首触时刻真实 DOWN 报价买 DOWN。机制：长时间窄幅震荡（chg 小）且实体占路径振幅比例低（body 小）后的破位，续跌概率最高。研究口径（shape_scan_v2 冻结扫描，SPLIT=2026-08-24，npts≥8）：calib n=214 P=12.6% EV +1.03 CI[+0.08,+2.22]；confirm n=86 P=23.3%（全表最高）EV +1.85 CI[+0.35,+3.44]；binom p=0.025 → BH-FDR q=0.063 ✅ STRICT_PASS。落专用表 firsthit_shadow_signals，EV 逐事件真实触发价现算：赢 0.98/q−1 / 输 −1。实盘护栏 0.12（按 calib P=12.6% → q*=0.1235 保守取值，边际 2.8%）。⚠️非独立暴露：G4 ⊂ G1 且 G4 ⊂ G3，同窗三门全中即对同一 DOWN 事件重复下注（含 G0 共 4 倍），非 4 个独立信号。⚠️前向功效偏紧：G4 calib EV(+1.03) 与前向 4 周 CI 半宽(≈1.08) 几乎相等，即使真实效应完全等于 calib 估计，通过「EV 日聚类 CI 下界>0」的概率也仅约 50%；FAIL 时应延长观察期而非直接否决。',
   firsthit_down_g7_v1: '首触反转 G7 基底：G0 基底 + body_r≤0.35（小实体）∧ wick01=1.0（上影拒绝），捕捉冲高受阻回落反转。40d 全量回测 Calib 胜率 18.8% (EV +2.34)，Confirm 盲测 20.0% (EV +1.98，CI[+0.45,+3.46])，FDR q=0.0002。日均 ~6.5 单。落专用表 firsthit_shadow_signals。实盘护栏 0.10。',
   g7_streak_v1: '首触反转 G7 非强连阳：G7 组合 + 排除大级别连续多头单边（前驱 5m 连阳数 streak_up≤1 根）。回测 Calib 胜率 20.0% (EV +2.86)，Confirm 胜率 18.2% (EV +1.92，CI[+0.45,+3.30])，FDR q=0.0004，日均 5.1 单。落专用表 firsthit_shadow_signals。实盘护栏 0.10。',
   g7_wick20_v1: '首触反转 G7 长上影：G7 组合 + 显著上影线拒绝 upper_wick_bps≥2.0bp。多头更深力竭，回测 Confirm 胜率 24.1% (EV +3.06，CI[+0.94,+5.09])，FDR q=0.0304，日均 ~3.2 单。落专用表 firsthit_shadow_signals。实盘护栏 0.12。',

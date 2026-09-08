@@ -3430,6 +3430,11 @@ SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     "firsthit_down_v1": (None, None, "首触基底G0: 5m窗内DOWN首次进入(0.005,0.1]→买DOWN（44d回测EV+0.22 CI[+0.10,+0.35]；前向现算裁决）"),
     "firsthit_down_body_v1": (None, None, "首触体貌G1: G0+body_r≤0.35（FDR q=0.007，calib EV+1.44→confirm +1.59 两段CI下界>0；前向现算裁决）"),
     "firsthit_down_chg_v1": (None, None, "首触偏离G3: G0+chg≤+2.82bp（logit β=+0.07 p=0.000，calib EV+0.39→confirm +0.97；前向现算裁决）"),
+    # 首触反转 G4 交互门（2026-09-08 影子+实盘接入）：G4 = G1 ∩ G3
+    # shape_scan_v2 冻结扫描：calib n=214 P=12.6% EV+1.03 CI[+0.08,+2.22]；
+    # confirm n=86 P=23.3% EV+1.85 CI[+0.35,+3.44]；binom p=0.025 → BH-FDR q=0.063 STRICT_PASS。
+    # 两条诚实警告写入说明，前端面板直接可见：非独立暴露 + 前向功效偏紧。
+    "firsthit_down_g4_v1": (None, None, "首触交互G4: G0+body_r≤0.35∧chg≤+2.82bp（即G1∩G3；calib n=214 P=12.6% EV+1.03 CI[+0.08,+2.22]，confirm n=86 P=23.3% EV+1.85 CI[+0.35,+3.44]，BH-FDR q=0.063 STRICT_PASS；⚠G4⊂G1且⊂G3非独立暴露，同窗三门全中=同一注重复下注；⚠前向功效偏紧：calib EV与前向CI半宽接近，通过概率约50%，FAIL应延长观察期而非直接否决；前向现算裁决）"),
     # 首触反转 G7 系列（2026-09-08 优化衍生）：
     "firsthit_down_g7_v1": (None, None, "首触G7基底: G0+body_r≤0.35∧wick=1（40d回测胜率19~20%, EV+1.98~+2.34, FDR q=0.0002；前向现算裁决）"),
     "g7_streak_v1": (None, None, "首触G7非强连阳: G7+前驱5m连阳≤1（回测胜率18~20%, EV+1.92~+2.86, FDR q=0.0004；前向现算裁决）"),
@@ -3650,6 +3655,7 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
         "absorption_follow_td120_v1", "absorption_follow_td150_v1",  # 吸收/欠反应跟随族（纯影子，2026-09-04：专用表 absorption_shadow_signals，TD120/150 双 variant 滚动标定）
         "s2_cond_t4_v1", "s2_cond_t5d_v1",  # S2 条件单族（纯影子，2026-09-06：实盘 bear_exhaust 派生窗内 t=4/t=5 判价→押 UP，共表 kline_shadow_signals version 隔离）
         "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1",  # 首触反转族（纯影子，2026-09-07：专用表 firsthit_shadow_signals，G0 基底 / G1 body_r≤0.35 / G3 chg≤+2.82bp，前向验证 4 周）
+        "firsthit_down_g4_v1",  # 首触反转 G4 交互门（2026-09-08：G1∩G3，专用表 firsthit_shadow_signals，影子+实盘通道）
         # 首触反转 G7 系列（2026-09-08 优化衍生，专用表 firsthit_shadow_signals，独立下单）
         "firsthit_down_g7_v1", "g7_streak_v1", "g7_wick20_v1",
         "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",
