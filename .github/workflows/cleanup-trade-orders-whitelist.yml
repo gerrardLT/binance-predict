@@ -1,0 +1,255 @@
+# ============================================================
+# 一次性维护：trade_orders 白名单清理（保留 9 个指定通道）
+#
+# 保留（KEEP）：
+#   scene_bull_exhaust            场景S1 多头耗尽（押DOWN）
+#   scene_bull_exhaust_confirm    场景S5 确认入场（押DOWN）
+#   scene_bear_exhaust            场景S2 空头耗尽（押UP）
+#   scene_momentum_fade           场景S4 动量衰竭（押DOWN）
+#   s5_deep_z20_v1                S5深档·深回落门禁版
+#   s2_cond_t4_v1                 S2条件单·t4价<开（押UP）
+#   s2_cond_t5d_v1                S2条件单·t5剔深（押UP）
+#   x4_v2                         情绪错位·平静市门禁版
+#   x4_v3                         情绪错位·趋势过滤版
+# 其余（quote_*/x4_v1/nb_*/absorption_*/firsthit_*/g7_*/manual_test/NULL）
+# 的历史订单全部删除。影子信号表与行情采样表不受影响。
+#
+# 安全设计：
+#   1. 默认 dry_run_only=true：只备份+报告，不删任何行。
+#   2. 真删需 dry_run_only=false 且 confirm_phrase=DELETE_NON_WHITELIST。
+#   3. 删除前全量备份 trade_orders 到 workflow artifact（30 天）。
+#   4. T0 时间边界：备份开始前先取 VPS 时钟 T0，删除条件带
+#      created_at <= T0 —— 保证每一行被删数据都必然在备份快照里；
+#      同时避免误删删除期间新落库的订单（用户拍板保留
+#      absorption_follow_td150_v1 / firsthit_down_body_v1 继续实盘，
+#      它们的新单会自然留下，属预期行为）。
+#   5. 单条 psql -c 多语句 = 单隐式事务（原子）：先解除
+#      agent_predictions.trade_order_id 外键引用，再 DELETE。
+#   6. 删除后立即校验：created_at <= T0 的白名单外行数必须为 0，
+#      否则 step 失败退出。
+#
+# 用法：Actions → 本 workflow → Run workflow → 先跑一次默认 dry-run
+#       看报告 → 再以 dry_run_only=false + 确认短语执行。
+# ============================================================
+
+name: Cleanup Trade Orders (Whitelist)
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run_only:
+        description: "true=仅预检不删除；false=执行真实删除"
+        required: true
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+      confirm_phrase:
+        description: "执行真实删除时必须填写：DELETE_NON_WHITELIST"
+        required: false
+        default: ""
+
+concurrency:
+  group: cleanup-trade-orders
+  cancel-in-progress: false
+
+env:
+  # 白名单唯一事实源（逗号分隔，勿加空格）
+  KEEP_LIST: scene_bull_exhaust,scene_bull_exhaust_confirm,scene_bear_exhaust,scene_momentum_fade,s5_deep_z20_v1,s2_cond_t4_v1,s2_cond_t5d_v1,x4_v2,x4_v3
+
+jobs:
+  cleanup:
+    name: Backup, report, (delete) & verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # ---------- 1. VPS 上全量备份（纯 SELECT） ----------
+      - name: Backup trade_orders on VPS (pure SELECT)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
+          script: |
+            set -euo pipefail
+            cd /www/wwwroot/binance-predict
+            if [ ! -f docker-compose.prod.yml ]; then
+              echo "ERROR: docker-compose.prod.yml not found"
+              exit 1
+            fi
+
+            REMOTE_DIR=/tmp/trade_cleanup_backup
+            rm -rf "$REMOTE_DIR"
+            mkdir -p "$REMOTE_DIR"
+
+            # T0：备份开始前的 VPS 时钟。删除条件将带 created_at <= T0，
+            # 确保被删的每一行都包含在下面的备份快照里。
+            T0=$(date -u +%Y-%m-%dT%H:%M:%S)
+            echo "$T0" > "$REMOTE_DIR/t0_boundary.txt"
+            echo "T0 boundary: $T0"
+
+            docker compose -f docker-compose.prod.yml exec -T db \
+              sh -c "psql -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -v ON_ERROR_STOP=1 -c '\copy (SELECT * FROM trade_orders ORDER BY id) TO STDOUT WITH CSV HEADER'" \
+              > "$REMOTE_DIR/trade_orders_backup.csv"
+
+            echo "---- backup rows (含表头) ----"
+            wc -l "$REMOTE_DIR"/trade_orders_backup.csv
+            echo "---- md5 ----"
+            md5sum "$REMOTE_DIR"/*
+
+            echo "---- 当前各版本行数（删除前基线） ----"
+            docker compose -f docker-compose.prod.yml exec -T db \
+              sh -c "psql -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -v ON_ERROR_STOP=1 -c \"SELECT signal_version, count(*) AS total, sum(CASE WHEN status = 'FILLED' THEN 1 ELSE 0 END) AS filled FROM trade_orders GROUP BY 1 ORDER BY 1;\""
+
+      # ---------- 2. 备份拉回 runner 并存 artifact ----------
+      - name: Pull backup to runner
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
+          source: "/tmp/trade_cleanup_backup/*"
+          target: "trade_cleanup_backup"
+          strip_components: 2
+
+      - name: Upload backup artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trade-orders-backup-run${{ github.run_id }}
+          path: trade_cleanup_backup/
+          retention-days: 30
+          if-no-files-found: error
+
+      # ---------- 3. 在 runner 上统计（不碰生产） ----------
+      - name: Compute keep/delete stats
+        id: stats
+        run: |
+          python3 - <<'PY'
+          import csv
+          import os
+          from collections import Counter
+
+          keep = {
+              "scene_bull_exhaust",
+              "scene_bull_exhaust_confirm",
+              "scene_bear_exhaust",
+              "scene_momentum_fade",
+              "s5_deep_z20_v1",
+              "s2_cond_t4_v1",
+              "s2_cond_t5d_v1",
+              "x4_v2",
+              "x4_v3",
+          }
+
+          with open("trade_cleanup_backup/trade_orders_backup.csv",
+                    encoding="utf-8", newline="") as fh:
+              rows = list(csv.DictReader(fh))
+
+          counts = Counter((r.get("signal_version") or "<NULL>") for r in rows)
+          keep_total = sum(n for v, n in counts.items() if v in keep)
+          delete_total = sum(n for v, n in counts.items() if v not in keep)
+          by_version = [f"{v}: {n} rows" for v, n in sorted(counts.items())]
+
+          with open("trade_cleanup_backup/t0_boundary.txt",
+                    encoding="utf-8") as fh:
+              t0 = fh.read().strip()
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"delete_total={delete_total}\n")
+              out.write(f"keep_total={keep_total}\n")
+              out.write(f"t0={t0}\n")
+              out.write("by_version<<STATS_EOF\n")
+              for line in by_version:
+                  out.write(line + "\n")
+              out.write("STATS_EOF\n")
+
+          print(f"backup rows total : {len(rows)}")
+          print(f"keep (whitelist)  : {keep_total}")
+          print(f"delete (others)   : {delete_total}")
+          print(f"T0 delete bound   : {t0}")
+          print("per-version:")
+          for line in by_version:
+              print("  " + line)
+          PY
+
+      # ---------- 4. 真删模式下的确认短语硬门禁 ----------
+      - name: Guard confirm phrase
+        if: inputs.dry_run_only == 'false'
+        run: |
+          if [ "${{ inputs.confirm_phrase }}" != "DELETE_NON_WHITELIST" ]; then
+            echo "::error::dry_run_only=false 但确认短语不正确（需 DELETE_NON_WHITELIST）。已中止，未删除任何数据。"
+            exit 1
+          fi
+          echo "确认短语校验通过。"
+
+      # ---------- 5. 报告（dry-run 与真删都打印） ----------
+      - name: Report plan
+        run: |
+          echo "================ trade_orders 白名单清理报告 ================"
+          echo "T0 删除边界（仅删 created_at <= T0 的行）: ${{ steps.stats.outputs.t0 }}"
+          echo "保留（白名单 9 通道）: ${{ steps.stats.outputs.keep_total }} 行"
+          echo "删除（其余全部，含 manual_test 与 NULL）: ${{ steps.stats.outputs.delete_total }} 行"
+          echo ""
+          echo "各版本明细："
+          echo "${{ steps.stats.outputs.by_version }}"
+          echo ""
+          if [ "${{ inputs.dry_run_only }}" == "true" ]; then
+            echo ">>> DRY-RUN 模式：以上仅为预览，未删除任何数据。"
+          else
+            echo ">>> 真实删除模式：即将在事务中执行 DELETE。"
+          fi
+
+      # ---------- 6. 真删（T0 边界 + 单事务 + 即时校验） ----------
+      - name: Delete non-whitelist rows (transactional, T0-bounded)
+        if: inputs.dry_run_only == 'false' && steps.stats.outputs.delete_total != '0'
+        uses: appleboy/ssh-action@v1
+        env:
+          KEEP_LIST: ${{ env.KEEP_LIST }}
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
+          envs: KEEP_LIST
+          script: |
+            set -euo pipefail
+            cd /www/wwwroot/binance-predict
+
+            T0=$(cat /tmp/trade_cleanup_backup/t0_boundary.txt)
+            echo "T0 boundary: $T0"
+
+            # a,b,c -> 'a','b','c'
+            IN_LIST=$(printf '%s\n' "$KEEP_LIST" | sed "s/,/','/g; s/^/'/; s/$/'/")
+            COND="(signal_version NOT IN ($IN_LIST) OR signal_version IS NULL) AND created_at <= '$T0'"
+            echo "Delete condition: $COND"
+
+            # 单条 -c 多语句 = 单隐式事务（原子）：
+            # 先解除 agent_predictions.trade_order_id 外键引用，再 DELETE。
+            docker compose -f docker-compose.prod.yml exec -T db \
+              sh -c "psql -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -v ON_ERROR_STOP=1 -c \"UPDATE agent_predictions SET trade_order_id = NULL WHERE trade_order_id IN (SELECT id FROM trade_orders WHERE $COND); DELETE FROM trade_orders WHERE $COND;\""
+
+            echo "---- 删除后各版本剩余行数 ----"
+            docker compose -f docker-compose.prod.yml exec -T db \
+              sh -c "psql -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -v ON_ERROR_STOP=1 -c \"SELECT signal_version, count(*) AS total, sum(CASE WHEN status = 'FILLED' THEN 1 ELSE 0 END) AS filled FROM trade_orders GROUP BY 1 ORDER BY 1;\""
+
+            STRAY=$(docker compose -f docker-compose.prod.yml exec -T db \
+              sh -c "psql -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -v ON_ERROR_STOP=1 -t -A -c \"SELECT count(*) FROM trade_orders WHERE $COND;\"")
+            echo "残留校验（created_at <= T0 且白名单外）: $STRAY 行"
+            if [ "$STRAY" != "0" ]; then
+              echo "::error::清理校验失败：仍有 $STRAY 行白名单外数据（T0 前）。"
+              exit 1
+            fi
+            echo "VERIFIED: T0 前的白名单外订单已全部删除。"
+
+      # ---------- 7. 清理 VPS 临时目录（无论成败） ----------
+      - name: Cleanup remote temp dir
+        if: always()
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
+          script: rm -rf /tmp/trade_cleanup_backup
