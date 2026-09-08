@@ -171,7 +171,7 @@ async def test_trade_test_failed_order_passthrough(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_recent_trades_fields_and_limit() -> None:
-    """订单行字段透传（含 quote_json 提取的 average_price）；limit 截断到 1~100。"""
+    """订单行字段透传（含 quote_json 提取的 average_price）；limit 截断到 1~5000。"""
     import binance_predict.main as m
 
     row = SimpleNamespace(

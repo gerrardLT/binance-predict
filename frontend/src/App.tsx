@@ -491,7 +491,7 @@ const api = {
   // 实盘面板（2026-08-22）：钱包/实盘状态/下单/订单历史
   getPredictionWallet: () => authFetch('/api/prediction-wallet').then(r => r.json()),
   getLiveStatus: () => authFetch('/api/misalignment/signals').then(r => r.json()),
-  getRecentTrades: (limit = 100) => authFetch(`/api/trades/recent?limit=${limit}`).then(r => r.json()),
+  getRecentTrades: (limit = 5000) => authFetch(`/api/trades/recent?limit=${limit}`).then(r => r.json()),
   getFundFlow: () => authFetch('/api/trades/fund-flow').then(r => r.json()),
   postTradeTest: (amount_usdt: number, prediction: string) =>
     authFetch('/api/trade/test', {
@@ -1270,7 +1270,7 @@ function TestTradeFab({ quote, remainSec, urgent, wallet, refresh }: {
 // 2026-08-29：加「目标周期」列——window_start + market_period 展示真正下注的窗口时段；
 // 2026-09-08：失败单从主列表剥离，改双 Tab（最近订单 / 失败订单）——
 // 失败单 amount_in=0、token_id=""、均价是报价不是成交价，混在主列表里会污染盈亏阅读）
-const ORDERS_PAGE_SIZE = 20
+const DEFAULT_ORDERS_PAGE_SIZE = 20
 
 function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
   orders: Record<string, unknown>[]
@@ -1282,7 +1282,11 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
   const [fStatus, setFStatus] = useState('ALL')
   const [fChannel, setFChannel] = useState('ALL')
   const [fDirection, setFDirection] = useState('ALL')
+  const [fKeyword, setFKeyword] = useState('')
+  const [pageSize, setPageSize] = useState<number>(DEFAULT_ORDERS_PAGE_SIZE)
   const [page, setPage] = useState(1)
+  const [sortField, setSortField] = useState<'time' | 'amount' | 'pnl'>('time')
+  const [sortAsc, setSortAsc] = useState(false)
 
   // 失败单严格分流：主 Tab 只留非 FAILED（FILLED / PENDING / 未知状态都在），失败 Tab 只留 FAILED
   const activeOrders = orders.filter(o => String(o.status ?? '') !== 'FAILED')
@@ -1291,27 +1295,65 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
 
   const channels = Array.from(new Set(
     base.map(o => String(o.signal_version ?? '')).filter(v => v && v !== '--'))).sort()
+  const kw = fKeyword.trim().toLowerCase()
   const filtered = base.filter(o => {
     if (orderTab === 'active' && fStatus !== 'ALL' && String(o.status ?? '') !== fStatus) return false
     if (fChannel !== 'ALL' && String(o.signal_version ?? '') !== fChannel) return false
     if (fDirection !== 'ALL' && String(o.direction ?? '') !== fDirection) return false
+    if (kw) {
+      const idStr = String(o.id ?? '').toLowerCase()
+      const ver = String(o.signal_version ?? '').toLowerCase()
+      const verName = (SIGNAL_INFO[o.signal_version as string]?.name ?? '').toLowerCase()
+      const msg = String(o.error_message ?? '').toLowerCase()
+      const dir = String(o.direction ?? '').toLowerCase()
+      if (!idStr.includes(kw) && !ver.includes(kw) && !verName.includes(kw) && !msg.includes(kw) && !dir.includes(kw)) {
+        return false
+      }
+    }
     return true
+  }).sort((a, b) => {
+    let diff = 0
+    if (sortField === 'time') {
+      const ta = a.created_at ? new Date(String(a.created_at)).getTime() : 0
+      const tb = b.created_at ? new Date(String(b.created_at)).getTime() : 0
+      diff = ta - tb
+    } else if (sortField === 'amount') {
+      const aa = a.amount_in != null ? Number(a.amount_in) : 0
+      const ab = b.amount_in != null ? Number(b.amount_in) : 0
+      diff = aa - ab
+    } else if (sortField === 'pnl') {
+      const pa = typeof a.pnl === 'number' ? (a.pnl as number) : -999999
+      const pb = typeof b.pnl === 'number' ? (b.pnl as number) : -999999
+      diff = pa - pb
+    }
+    return sortAsc ? diff : -diff
   })
   const settledOrders = filtered.filter(o => o.settled_at != null)
   const settledCount = settledOrders.length
   const totalPnl = settledOrders.reduce(
     (s, o) => s + (typeof o.pnl === 'number' ? (o.pnl as number) : 0), 0)
-  const filterActive = fStatus !== 'ALL' || fChannel !== 'ALL' || fDirection !== 'ALL'
+  const filterActive = fStatus !== 'ALL' || fChannel !== 'ALL' || fDirection !== 'ALL' || fKeyword !== ''
   const selectCls = 'px-1.5 py-0.5 border border-line rounded-sm text-xs text-ink-80 bg-card'
   // 分页：筛选变化时回到第 1 页；超出范围时钳位（避免删数据后空白页）
-  useEffect(() => { setPage(1) }, [fStatus, fChannel, fDirection])
+  useEffect(() => { setPage(1) }, [fStatus, fChannel, fDirection, fKeyword, pageSize])
   // 切 Tab 必须清筛选：否则主 Tab 选的 FILLED 会让失败 Tab 直接空白
   useEffect(() => {
-    setFStatus('ALL'); setFChannel('ALL'); setFDirection('ALL'); setPage(1)
+    setFStatus('ALL'); setFChannel('ALL'); setFDirection('ALL'); setFKeyword(''); setPage(1)
   }, [orderTab])
-  const totalPages = Math.max(1, Math.ceil(filtered.length / ORDERS_PAGE_SIZE))
+
+  const actualPageSize = pageSize > 0 ? pageSize : Math.max(1, filtered.length)
+  const totalPages = Math.max(1, Math.ceil(filtered.length / actualPageSize))
   const safePage = Math.min(page, totalPages)
-  const pageRows = filtered.slice((safePage - 1) * ORDERS_PAGE_SIZE, safePage * ORDERS_PAGE_SIZE)
+  const pageRows = filtered.slice((safePage - 1) * actualPageSize, safePage * actualPageSize)
+
+  const toggleSort = (field: 'time' | 'amount' | 'pnl') => {
+    if (sortField === field) setSortAsc(!sortAsc)
+    else { setSortField(field); setSortAsc(false) }
+  }
+  const sortIcon = (field: 'time' | 'amount' | 'pnl') => {
+    if (sortField !== field) return <span className="text-ink-40 ml-0.5 text-[10px]">⇅</span>
+    return <span className="text-brand ml-0.5 text-[10px]">{sortAsc ? '▲' : '▼'}</span>
+  }
 
   const tabBtn = (t: 'active' | 'failed', label: string, count: number) => (
     <button
@@ -1390,23 +1432,62 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
     </td>
   )
 
-  const pager = filtered.length > ORDERS_PAGE_SIZE && (
-    <div className="flex items-center justify-end gap-1 mt-2 text-xs">
-      <button
-        disabled={safePage <= 1} onClick={() => setPage(safePage - 1)}
-        className="px-2 py-0.5 rounded-pill border border-line bg-card text-ink-80 disabled:opacity-40"
-      >上一页</button>
-      {Array.from({ length: totalPages }, (_, i) => i + 1).map(n => (
+  const renderPaginationButtons = () => {
+    if (totalPages <= 1) return null
+    const pages: (number | string)[] = []
+    if (totalPages <= 7) {
+      for (let i = 1; i <= totalPages; i++) pages.push(i)
+    } else {
+      pages.push(1)
+      if (safePage > 3) pages.push('...')
+      const start = Math.max(2, safePage - 1)
+      const end = Math.min(totalPages - 1, safePage + 1)
+      for (let i = start; i <= end; i++) pages.push(i)
+      if (safePage < totalPages - 2) pages.push('...')
+      pages.push(totalPages)
+    }
+    return pages.map((p, idx) => {
+      if (typeof p === 'string') {
+        return <span key={`ellipsis-${idx}`} className="px-1 text-ink-40">…</span>
+      }
+      return (
         <button
-          key={n} onClick={() => setPage(n)}
-          className={`px-2 py-0.5 rounded-pill border ${n === safePage ? 'bg-brand text-white border-brand' : 'bg-card text-ink-80 border-line hover:border-brand'}`}
-        >{n}</button>
-      ))}
-      <button
-        disabled={safePage >= totalPages} onClick={() => setPage(safePage + 1)}
-        className="px-2 py-0.5 rounded-pill border border-line bg-card text-ink-80 disabled:opacity-40"
-      >下一页</button>
-      <span className="text-ink-55 ml-1">每页 {ORDERS_PAGE_SIZE} 条</span>
+          key={p} onClick={() => setPage(p)}
+          className={`px-2 py-0.5 rounded-pill border text-xs ${p === safePage ? 'bg-brand text-white border-brand font-semibold' : 'bg-card text-ink-80 border-line hover:border-brand'}`}
+        >{p}</button>
+      )
+    })
+  }
+
+  const pager = (
+    <div className="flex items-center justify-between gap-2 mt-2 text-xs flex-wrap">
+      <div className="flex items-center gap-1 text-ink-55">
+        <span>每页</span>
+        <select
+          value={pageSize}
+          onChange={e => setPageSize(Number(e.target.value))}
+          className={selectCls}
+        >
+          <option value={20}>20 条</option>
+          <option value={50}>50 条</option>
+          <option value={100}>100 条</option>
+          <option value={0}>全部显示 ({filtered.length} 条)</option>
+        </select>
+        <span>共 {filtered.length} 单 / {totalPages} 页</span>
+      </div>
+      {pageSize > 0 && totalPages > 1 && (
+        <div className="flex items-center gap-1">
+          <button
+            disabled={safePage <= 1} onClick={() => setPage(safePage - 1)}
+            className="px-2 py-0.5 rounded-pill border border-line bg-card text-ink-80 disabled:opacity-40 hover:border-brand"
+          >上一页</button>
+          {renderPaginationButtons()}
+          <button
+            disabled={safePage >= totalPages} onClick={() => setPage(safePage + 1)}
+            className="px-2 py-0.5 rounded-pill border border-line bg-card text-ink-80 disabled:opacity-40 hover:border-brand"
+          >下一页</button>
+        </div>
+      )}
     </div>
   )
 
@@ -1437,9 +1518,16 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
             <option value="DOWN">DOWN 看跌</option>
             <option value="UP">UP 看涨</option>
           </select>
+          <input
+            type="text"
+            placeholder="搜索通道/单号/错误信息..."
+            value={fKeyword}
+            onChange={e => setFKeyword(e.target.value)}
+            className={`${selectCls} w-36`}
+          />
           {filterActive && (
             <button
-              onClick={() => { setFStatus('ALL'); setFChannel('ALL'); setFDirection('ALL') }}
+              onClick={() => { setFStatus('ALL'); setFChannel('ALL'); setFDirection('ALL'); setFKeyword('') }}
               className="px-1.5 py-0.5 text-xs text-brand hover:underline"
             >清除筛选</button>
           )}
@@ -1469,16 +1557,22 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
         <>
         <table className="w-full text-xs">
           <thead>
-            <tr className="text-left text-ink-55 border-b border-line-soft">
-              <th className="py-1 pr-2">时间</th>
+            <tr className="text-left text-ink-55 border-b border-line-soft select-none">
+              <th className="py-1 pr-2 cursor-pointer hover:text-brand" onClick={() => toggleSort('time')}>
+                时间{sortIcon('time')}
+              </th>
               <th className="py-1 pr-2" title="本单真正下注的市场周期时段（window_start 起，5m/15m 窗口）">目标周期</th>
               <th className="py-1 pr-2">通道</th>
               <th className="py-1 pr-2">方向</th>
               <th className="py-1 pr-2">状态</th>
               <th className="py-1 pr-2">结果</th>
               <th className="py-1 pr-2" title="币安实际成交均价；标「报价」的是下单时的报价/委托价（PENDING 未成交/护栏弃单时 filledUsdtAmount=0 但币安仍回 price），不是成交价，不能用来核对盈亏">均价</th>
-              <th className="py-1 pr-2">金额 (USDT)</th>
-              <th className="py-1 pr-2">盈亏</th>
+              <th className="py-1 pr-2 cursor-pointer hover:text-brand" onClick={() => toggleSort('amount')}>
+                金额 (USDT){sortIcon('amount')}
+              </th>
+              <th className="py-1 pr-2 cursor-pointer hover:text-brand" onClick={() => toggleSort('pnl')}>
+                盈亏{sortIcon('pnl')}
+              </th>
               <th className="py-1">说明</th>
             </tr>
           </thead>
@@ -1536,13 +1630,17 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
         <>
         <table className="w-full text-xs">
           <thead>
-            <tr className="text-left text-ink-55 border-b border-line-soft">
-              <th className="py-1 pr-2">时间</th>
+            <tr className="text-left text-ink-55 border-b border-line-soft select-none">
+              <th className="py-1 pr-2 cursor-pointer hover:text-brand" onClick={() => toggleSort('time')}>
+                时间{sortIcon('time')}
+              </th>
               <th className="py-1 pr-2" title="本单真正下注的市场周期时段（window_start 起，5m/15m 窗口）">目标周期</th>
               <th className="py-1 pr-2">通道</th>
               <th className="py-1 pr-2">方向</th>
               <th className="py-1 pr-2" title="下单时的报价/委托价（失败单 FOK 未成交，filledUsdtAmount=0 但币安仍回 price），不是成交价">触发报价</th>
-              <th className="py-1 pr-2" title="计划投入金额；失败单未提交到币安时落库为 0，显示 --">计划金额</th>
+              <th className="py-1 pr-2 cursor-pointer hover:text-brand" onClick={() => toggleSort('amount')}>
+                计划金额{sortIcon('amount')}
+              </th>
               <th className="py-1">
                 <span className="inline-flex items-center gap-1">失败原因
                   <HelpHint text="error_message 可能是泛化文案（如「下单失败」），真实拒单原因（护栏弃单 / 币安错误码 -1102 等）要看后端 place_order 层日志" />
@@ -4891,179 +4989,652 @@ function SignalAnalyticsTab() {
   const activeShadowRows = mergeSub(new Set(activeShadowEntries.map(([k]) => k)))
   const retiredShadowRows = mergeSub(new Set(retiredShadowEntries.map(([k]) => k)))
 
-  /* 影子分区卡片渲染（在线区 / 退役区共用）：表格 + 累计胜率曲线 + 脚注。
-     与改造前单一「影子信号」卡片的 DOM、交互逐位一致（状态开关、实盘通道按钮、
-     HelpHint、bench 虚线、盈亏平衡点线语义全部保留），仅两处变化：
-       1) 数据源换成传入的 entries/rows 分区子集；
-       2) faded 淡化的序号基准从全量改为本区序号（每区前十条实色）。
-     退役区的「状态」列天然渲染成不可点的「已退役」徽章、「实盘」列渲染 —，
-     因为 live 在 retired 时短路为 null——分区后语义不变，只是不再与在线行混排。 */
-  const renderShadowCard = ({
-    title, entries, rows, footnote, emptyHint,
-  }: {
-    title: string
-    entries: [string, { label: string; color: string }][]
-    rows: Record<string, number>[]
-    footnote: React.ReactNode
-    emptyHint?: string
-  }) => {
-    if (!analytics) return null
-    if (entries.length === 0) {
-      return (
-        <Card title={title}>
-          <div className="text-center text-ink-55 py-6 text-xs">{emptyHint ?? '无数据'}</div>
-        </Card>
-      )
-    }
+function ShadowSignalCard({
+  title,
+  entries,
+  rows,
+  footnote,
+  emptyHint,
+  analytics,
+  load,
+  pumpTs,
+  isRetired,
+}: {
+  title: string
+  entries: [string, { label: string; color: string }][]
+  rows: Record<string, number>[]
+  footnote: React.ReactNode
+  emptyHint?: string
+  analytics: SignalsAnalytics
+  load: () => void
+  pumpTs: number | null
+  isRetired?: boolean
+}) {
+  const [kw, setKw] = useState('')
+  const [statusFilter, setStatusFilter] = useState<'ALL' | 'ONLINE' | 'OFFLINE' | 'LIVE'>('ALL')
+  const [sortCol, setSortCol] = useState<string>('default')
+  const [sortAsc, setSortAsc] = useState<boolean>(false)
+
+  if (entries.length === 0) {
     return (
       <Card title={title}>
-        <div className="overflow-x-auto mb-3">
-          <table className="w-full text-xs">
-            <thead>
-              <tr className="border-b border-line text-ink-55">
-                <th className="py-1 px-2 text-left">版本</th>
-                <th className="py-1 px-2 text-center">状态</th>
-                <th className="py-1 px-2 text-center">实盘</th>
-                <th className="py-1 px-2 text-right">n</th>
-                <th className="py-1 px-2 text-right">胜率</th>
-                <th className="py-1 px-2 text-right">盈亏平衡</th>
-                <th className="py-1 px-2 text-right">回测</th>
-                <th className="py-1 px-2 text-right">偏离</th>
-                <th className="py-1 px-2 text-right">平均EV</th>
-                <th className="py-1 px-2 text-right">累计EV</th>
-              </tr>
-            </thead>
-            <tbody>
-              {entries.map(([k, m], i) => {
-                const s = analytics.shadow[k].summary
-                // 与图表同序：本区第 11 条起降透明度，保证表格色块与曲线一一对应
-                const faded = i >= 10
-                // bench 可空（后端动态发现的新版本无冻结基准），双非空才计算偏离
-                const dev = s.win_rate != null && s.bench_winrate != null ? s.win_rate - s.bench_winrate : null
-                // enabled 缺失（旧后端）视为在线，与 gate 默认语义一致
-                const online = s.enabled !== false
-                // retired 缺失（旧后端）视为未退役；退役是不可逆硬闸，优先级高于 enabled
-                const retired = s.retired === true
-                // 实盘通道（2026-09-06 promote）：version==通道名时后端下发护栏三件套；
-                // 已退役行不渲染按钮（通道即便历史上注册过也已随版本硬闸失效）
-                const live = retired ? null : (s.live_channel ?? null)
-                return (
-                  <tr key={k} className={`border-b border-line-soft hover:bg-sunken ${online ? '' : 'opacity-45'}`}>
-                    <td className="py-1 px-2 font-medium" style={{ color: m.color, opacity: faded ? 0.6 : 1 }} title={s.desc}>
-                      <span className="inline-flex items-center gap-1">
-                        {m.label}
-                        {signalDescFor('shadow', k) && <HelpHint text={`${k}：${signalDescFor('shadow', k)}`} />}
-                      </span>
-                    </td>
-                    <td className="py-1 px-2 text-center">
-                      {retired ? (
-                        <span
-                          className="px-1.5 py-0.5 rounded-pill text-[10px] font-medium border border-line bg-sunken text-ink-55 cursor-not-allowed"
-                          title="已永久退役（2026-09-04）：代码级硬闸停发，不可重新上线；冻结 bench 基准与历史曲线仍保留供审计"
-                        >已退役</span>
-                      ) : (
-                      <button
-                        onClick={async () => { await api.toggleShadow(k, !online); load() }}
-                        className={`px-1.5 py-0.5 rounded-pill text-[10px] font-medium border transition ${
-                          online
-                            ? 'text-positive border-positive bg-positive-soft hover:bg-positive-soft-hover'
-                            : 'text-ink-55 border-line bg-card hover:bg-sunken'
-                        }`}
-                        title={online
-                          ? '点击下线：停止采集新信号（历史数据保留，曲线照常显示已有样本）'
-                          : '点击上线：恢复采集新信号'}
-                      >
-                        {online ? '在线' : '已下线'}
-                      </button>
-                      )}
-                    </td>
-                    <td className="py-1 px-2 text-center">
-                      {live ? (
-                        <button
-                          onClick={async () => {
-                            const next = !live.enabled
-                            if (next) {
-                              if (!window.confirm(
-                                `确认开启通道实盘？\n通道: ${SIGNAL_INFO[k]?.name ?? k}（${k}）\n每单 ${String(live.amount_usdt)} USDT | 执行价护栏 ${String(live.max_exec_price)} | 日限 ${String(live.max_daily_orders)} 单\n\n命中信号将下真实订单（真金白银）；设定写入 DB 重启后保持（仅持久化失败时回落 LIVE_CHANNELS_JSON）。`)) return
-                            } else {
-                              if (!window.confirm(
-                                `确认关闭通道实盘？\n通道: ${SIGNAL_INFO[k]?.name ?? k}（${k}）\n（不取消在途任务，只阻止该通道新单派生）`)) return
-                            }
-                            try {
-                              const res = await api.postLiveChannel(k, next)
-                              if (res?.error) alert(`切换失败: ${String(res.error)}`)
-                              load()
-                            } catch (e) {
-                              alert(`请求失败: ${(e as Error).message}`)
-                            }
-                          }}
-                          className={`px-1.5 py-0.5 rounded-pill text-[10px] font-medium border transition ${
-                            live.enabled
-                              ? 'text-positive border-positive bg-positive-soft hover:bg-positive-soft-hover'
-                              : 'text-ink-55 border-line bg-card hover:bg-sunken'
-                          }`}
-                          title={live.enabled ? '实盘下单中，点击关闭该通道（影子采集不受影响）' : '点击开启实盘下单（真金白银；影子采集不受影响）'}
-                        >
-                          {live.enabled ? '实盘中' : '加入实盘'}
-                        </button>
-                      ) : (
-                        <span className="inline-flex items-center gap-0.5 text-ink-40">
-                          —
-                          <HelpHint text="该影子族未注册实盘通道（不下注）；实盘化需在 services/live_channels.py 注册同名 ChannelSpec 并重启" />
-                        </span>
-                      )}
-                    </td>
-                    <td className="py-1 px-2 text-right font-mono">{s.n}</td>
-                    <td className="py-1 px-2 text-right font-mono font-bold">{pct1(s.win_rate)}</td>
-                    <td className="py-1 px-2 text-right font-mono text-ink-55">{pct1(s.avg_breakeven)}</td>
-                    <td className="py-1 px-2 text-right font-mono text-ink-55">{pct1(s.bench_winrate)}</td>
-                    <td className={`py-1 px-2 text-right font-mono ${dev == null ? 'text-ink-55' : dev >= 0 ? 'text-positive' : 'text-negative'}`}>
-                      {dev == null ? '—' : `${dev >= 0 ? '+' : ''}${(dev * 100).toFixed(1)}pp`}
-                    </td>
-                    <td className={`py-1 px-2 text-right font-mono ${s.avg_ev == null ? 'text-ink-55' : s.avg_ev >= 0 ? 'text-positive' : 'text-negative'}`}>{evFmt(s.avg_ev)}</td>
-                    <td className={`py-1 px-2 text-right font-mono ${s.cum_ev == null ? 'text-ink-55' : s.cum_ev >= 0 ? 'text-positive' : 'text-negative'}`}>{evFmt(s.cum_ev)}</td>
-                  </tr>
-                )
-              })}
-            </tbody>
-          </table>
-        </div>
-        <ResponsiveContainer width="100%" height={240}>
-          <LineChart data={rows} margin={{ top: 6, right: 12, left: 0, bottom: 0 }}>
-            <CartesianGrid stroke="var(--line-soft)" />
-            <XAxis dataKey="ts" type="number" domain={['dataMin', 'dataMax']} scale="time"
-              tickFormatter={utcMD} tick={{ fontSize: 11, fill: 'var(--ink-55)', fontFamily: 'var(--font-stack-mono)' }} stroke="var(--ink-55)" />
-            <YAxis domain={[0, 100]} tick={{ fontSize: 11, fill: 'var(--ink-55)', fontFamily: 'var(--font-stack-mono)' }} stroke="var(--ink-55)" width={40}
-              tickFormatter={(v: number) => v + '%'} />
-            <Tooltip
-              contentStyle={TOOLTIP_STYLE} labelStyle={TOOLTIP_LABEL_STYLE} itemStyle={TOOLTIP_ITEM_STYLE}
-              labelFormatter={t => new Date(t as number).toUTCString().slice(0, 16)}
-              formatter={(v, n) => [typeof v === 'number' ? v.toFixed(1) + '%' : '--', n]}
-            />
-            {pumpTs != null && <ReferenceLine x={pumpTs} stroke="var(--warning)" strokeDasharray="4 3" />}
-            {entries.map(([k, m], i) => {
-              const s = analytics.shadow[k].summary
-              // 本区第 11 条起与前十条同色，用「淡 + 细」区分，dash 留给基准/盈亏平衡语义
-              const faded = i >= 10
-              return (
-                <Fragment key={k}>
-                  <Line dataKey={m.label} stroke={m.color} strokeWidth={faded ? 1.5 : 2}
-                    strokeOpacity={faded ? 0.55 : 1} dot={false} connectNulls isAnimationActive={false} />
-                  {s.bench_winrate != null && (
-                    <ReferenceLine y={s.bench_winrate * 100} stroke={m.color} strokeDasharray="5 4" strokeOpacity={faded ? 0.3 : 0.5} />
-                  )}
-                  {s.avg_breakeven != null && (
-                    <ReferenceLine y={s.avg_breakeven! * 100} stroke={m.color} strokeDasharray="1 3" strokeOpacity={faded ? 0.35 : 0.6} />
-                  )}
-                </Fragment>
-              )
-            })}
-          </LineChart>
-        </ResponsiveContainer>
-        <div className="text-[10px] text-ink-55 mt-1">{footnote}</div>
+        <div className="text-center text-ink-55 py-6 text-xs">{emptyHint ?? '无数据'}</div>
       </Card>
     )
   }
+
+  const toggleSort = (col: string) => {
+    if (sortCol === col) {
+      setSortAsc(!sortAsc)
+    } else {
+      setSortCol(col)
+      setSortAsc(false)
+    }
+  }
+
+  const thSort = (field: string, label: string, align: 'left' | 'center' | 'right' = 'right', hint?: string) => (
+    <th
+      className={`py-1 px-2 text-${align} cursor-pointer select-none hover:text-brand transition-colors`}
+      onClick={() => toggleSort(field)}
+      title={hint}
+    >
+      <span className={`inline-flex items-center gap-0.5 ${align === 'right' ? 'justify-end' : align === 'center' ? 'justify-center' : 'justify-start'}`}>
+        {label}
+        {sortCol === field ? (
+          <span className="text-brand font-mono text-[10px]">{sortAsc ? '▲' : '▼'}</span>
+        ) : (
+          <span className="text-ink-40 font-mono text-[10px]">⇅</span>
+        )}
+      </span>
+    </th>
+  )
+
+  const search = kw.trim().toLowerCase()
+  const filtered = entries.filter(([k, m]) => {
+    const s = analytics.shadow[k]?.summary
+    if (!s) return false
+    if (search) {
+      const matchKey = k.toLowerCase().includes(search)
+      const matchLabel = m.label.toLowerCase().includes(search)
+      const matchDesc = String(s.desc ?? '').toLowerCase().includes(search)
+      const matchExtra = (signalDescFor('shadow', k) ?? '').toLowerCase().includes(search)
+      if (!matchKey && !matchLabel && !matchDesc && !matchExtra) return false
+    }
+    const online = s.enabled !== false
+    const retired = s.retired === true
+    const live = retired ? null : (s.live_channel ?? null)
+    if (statusFilter === 'ONLINE') {
+      if (retired || !online) return false
+    } else if (statusFilter === 'OFFLINE') {
+      if (retired || online) return false
+    } else if (statusFilter === 'LIVE') {
+      if (retired || !live || !live.enabled) return false
+    }
+    return true
+  })
+
+  const sorted = [...filtered].sort(([ka, ma], [kb, mb]) => {
+    if (sortCol === 'default') return 0
+    const sa = analytics.shadow[ka]?.summary
+    const sb = analytics.shadow[kb]?.summary
+    if (!sa || !sb) return 0
+    let diff = 0
+    if (sortCol === 'ver') {
+      diff = ma.label.localeCompare(mb.label, 'zh-CN')
+    } else if (sortCol === 'status') {
+      const valA = sa.retired ? -1 : sa.enabled !== false ? 1 : 0
+      const valB = sb.retired ? -1 : sb.enabled !== false ? 1 : 0
+      diff = valA - valB
+    } else if (sortCol === 'live') {
+      const valA = sa.retired ? 0 : sa.live_channel?.enabled ? 2 : sa.live_channel ? 1 : 0
+      const valB = sb.retired ? 0 : sb.live_channel?.enabled ? 2 : sb.live_channel ? 1 : 0
+      diff = valA - valB
+    } else if (sortCol === 'n') {
+      diff = (sa.n ?? 0) - (sb.n ?? 0)
+    } else if (sortCol === 'win_rate') {
+      diff = (sa.win_rate ?? -1) - (sb.win_rate ?? -1)
+    } else if (sortCol === 'breakeven') {
+      diff = (sa.avg_breakeven ?? -1) - (sb.avg_breakeven ?? -1)
+    } else if (sortCol === 'bench') {
+      diff = (sa.bench_winrate ?? -1) - (sb.bench_winrate ?? -1)
+    } else if (sortCol === 'dev') {
+      const devA = sa.win_rate != null && sa.bench_winrate != null ? sa.win_rate - sa.bench_winrate : -999
+      const devB = sb.win_rate != null && sb.bench_winrate != null ? sb.win_rate - sb.bench_winrate : -999
+      diff = devA - devB
+    } else if (sortCol === 'avg_ev') {
+      diff = (sa.avg_ev ?? -999) - (sb.avg_ev ?? -999)
+    } else if (sortCol === 'cum_ev') {
+      diff = (sa.cum_ev ?? -999) - (sb.cum_ev ?? -999)
+    }
+    return sortAsc ? diff : -diff
+  })
+
+  const filterActive = search !== '' || statusFilter !== 'ALL'
+  const selectCls = 'px-1.5 py-0.5 border border-line rounded-sm text-xs text-ink-80 bg-card'
+
+  return (
+    <Card title={title}>
+      {/* 筛选与搜索栏 */}
+      <div className="flex items-center justify-between mb-3 gap-2 flex-wrap text-xs">
+        <div className="flex items-center gap-2 flex-wrap">
+          <input
+            type="text"
+            placeholder="搜索版本/说明/代号..."
+            value={kw}
+            onChange={e => setKw(e.target.value)}
+            className={`${selectCls} w-44`}
+          />
+          {!isRetired && (
+            <select
+              value={statusFilter}
+              onChange={e => setStatusFilter(e.target.value as 'ALL' | 'ONLINE' | 'OFFLINE' | 'LIVE')}
+              className={selectCls}
+            >
+              <option value="ALL">全部状态</option>
+              <option value="ONLINE">仅在线采集</option>
+              <option value="OFFLINE">仅已下线</option>
+              <option value="LIVE">仅实盘中</option>
+            </select>
+          )}
+          {filterActive && (
+            <button
+              onClick={() => { setKw(''); setStatusFilter('ALL') }}
+              className="px-1.5 py-0.5 text-xs text-brand hover:underline"
+            >清除筛选</button>
+          )}
+          {sortCol !== 'default' && (
+            <button
+              onClick={() => { setSortCol('default'); setSortAsc(false) }}
+              className="px-1.5 py-0.5 text-xs text-ink-55 hover:underline"
+            >重置排序</button>
+          )}
+        </div>
+        <span className="text-xs text-ink-55">
+          显示 {sorted.length} / 共 {entries.length} 个版本
+        </span>
+      </div>
+
+      {sorted.length === 0 ? (
+        <div className="text-center text-ink-55 py-6 text-xs">当前筛选条件下无匹配版本</div>
+      ) : (
+        <>
+          <div className="overflow-x-auto mb-3">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="border-b border-line text-ink-55">
+                  {thSort('ver', '版本', 'left')}
+                  {thSort('status', '状态', 'center')}
+                  {thSort('live', '实盘', 'center')}
+                  {thSort('n', 'n', 'right')}
+                  {thSort('win_rate', '胜率', 'right')}
+                  {thSort('breakeven', '盈亏平衡', 'right')}
+                  {thSort('bench', '回测', 'right')}
+                  {thSort('dev', '偏离', 'right')}
+                  {thSort('avg_ev', '平均EV', 'right')}
+                  {thSort('cum_ev', '累计EV', 'right')}
+                </tr>
+              </thead>
+              <tbody>
+                {sorted.map(([k, m], i) => {
+                  const s = analytics.shadow[k].summary
+                  // 与图表同序：本区第 11 条起降透明度，保证表格色块与曲线一一对应
+                  const faded = i >= 10
+                  const dev = s.win_rate != null && s.bench_winrate != null ? s.win_rate - s.bench_winrate : null
+                  const online = s.enabled !== false
+                  const retired = s.retired === true
+                  const live = retired ? null : (s.live_channel ?? null)
+                  return (
+                    <tr key={k} className={`border-b border-line-soft hover:bg-sunken ${online ? '' : 'opacity-45'}`}>
+                      <td className="py-1 px-2 font-medium" style={{ color: m.color, opacity: faded ? 0.6 : 1 }} title={s.desc}>
+                        <span className="inline-flex items-center gap-1">
+                          {m.label}
+                          {signalDescFor('shadow', k) && <HelpHint text={`${k}：${signalDescFor('shadow', k)}`} />}
+                        </span>
+                      </td>
+                      <td className="py-1 px-2 text-center">
+                        {retired ? (
+                          <span
+                            className="px-1.5 py-0.5 rounded-pill text-[10px] font-medium border border-line bg-sunken text-ink-55 cursor-not-allowed"
+                            title="已永久退役（2026-09-04）：代码级硬闸停发，不可重新上线；冻结 bench 基准与历史曲线仍保留供审计"
+                          >已退役</span>
+                        ) : (
+                          <button
+                            onClick={async () => { await api.toggleShadow(k, !online); load() }}
+                            className={`px-1.5 py-0.5 rounded-pill text-[10px] font-medium border transition ${
+                              online
+                                ? 'text-positive border-positive bg-positive-soft hover:bg-positive-soft-hover'
+                                : 'text-ink-55 border-line bg-card hover:bg-sunken'
+                            }`}
+                            title={online
+                              ? '点击下线：停止采集新信号（历史数据保留，曲线照常显示已有样本）'
+                              : '点击上线：恢复采集新信号'}
+                          >
+                            {online ? '在线' : '已下线'}
+                          </button>
+                        )}
+                      </td>
+                      <td className="py-1 px-2 text-center">
+                        {live ? (
+                          <button
+                            onClick={async () => {
+                              const next = !live.enabled
+                              if (next) {
+                                if (!window.confirm(
+                                  `确认开启通道实盘？\n通道: ${SIGNAL_INFO[k]?.name ?? k}（${k}）\n每单 ${String(live.amount_usdt)} USDT | 执行价护栏 ${String(live.max_exec_price)} | 日限 ${String(live.max_daily_orders)} 单\n\n命中信号将下真实订单（真金白银）；设定写入 DB 重启后保持（仅持久化失败时回落 LIVE_CHANNELS_JSON）。`)) return
+                              } else {
+                                if (!window.confirm(
+                                  `确认关闭通道实盘？\n通道: ${SIGNAL_INFO[k]?.name ?? k}（${k}）\n（不取消在途任务，只阻止该通道新单派生）`)) return
+                              }
+                              try {
+                                const res = await api.postLiveChannel(k, next)
+                                if (res?.error) alert(`切换失败: ${String(res.error)}`)
+                                load()
+                              } catch (e) {
+                                alert(`请求失败: ${(e as Error).message}`)
+                              }
+                            }}
+                            className={`px-1.5 py-0.5 rounded-pill text-[10px] font-medium border transition ${
+                              live.enabled
+                                ? 'text-positive border-positive bg-positive-soft hover:bg-positive-soft-hover'
+                                : 'text-ink-55 border-line bg-card hover:bg-sunken'
+                            }`}
+                            title={live.enabled ? '实盘下单中，点击关闭该通道（影子采集不受影响）' : '点击开启实盘下单（真金白银；影子采集不受影响）'}
+                          >
+                            {live.enabled ? '实盘中' : '加入实盘'}
+                          </button>
+                        ) : (
+                          <span className="inline-flex items-center gap-0.5 text-ink-40">
+                            —
+                            <HelpHint text="该影子族未注册实盘通道（不下注）；实盘化需在 services/live_channels.py 注册同名 ChannelSpec 并重启" />
+                          </span>
+                        )}
+                      </td>
+                      <td className="py-1 px-2 text-right font-mono">{s.n}</td>
+                      <td className="py-1 px-2 text-right font-mono font-bold">{pct1(s.win_rate)}</td>
+                      <td className="py-1 px-2 text-right font-mono text-ink-55">{pct1(s.avg_breakeven)}</td>
+                      <td className="py-1 px-2 text-right font-mono text-ink-55">{pct1(s.bench_winrate)}</td>
+                      <td className={`py-1 px-2 text-right font-mono ${dev == null ? 'text-ink-55' : dev >= 0 ? 'text-positive' : 'text-negative'}`}>
+                        {dev == null ? '—' : `${dev >= 0 ? '+' : ''}${(dev * 100).toFixed(1)}pp`}
+                      </td>
+                      <td className={`py-1 px-2 text-right font-mono ${s.avg_ev == null ? 'text-ink-55' : s.avg_ev >= 0 ? 'text-positive' : 'text-negative'}`}>{evFmt(s.avg_ev)}</td>
+                      <td className={`py-1 px-2 text-right font-mono ${s.cum_ev == null ? 'text-ink-55' : s.cum_ev >= 0 ? 'text-positive' : 'text-negative'}`}>{evFmt(s.cum_ev)}</td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+          <ResponsiveContainer width="100%" height={240}>
+            <LineChart data={rows} margin={{ top: 6, right: 12, left: 0, bottom: 0 }}>
+              <CartesianGrid stroke="var(--line-soft)" />
+              <XAxis dataKey="ts" type="number" domain={['dataMin', 'dataMax']} scale="time"
+                tickFormatter={utcMD} tick={{ fontSize: 11, fill: 'var(--ink-55)', fontFamily: 'var(--font-stack-mono)' }} stroke="var(--ink-55)" />
+              <YAxis domain={[0, 100]} tick={{ fontSize: 11, fill: 'var(--ink-55)', fontFamily: 'var(--font-stack-mono)' }} stroke="var(--ink-55)" width={40}
+                tickFormatter={(v: number) => v + '%'} />
+              <Tooltip
+                contentStyle={TOOLTIP_STYLE} labelStyle={TOOLTIP_LABEL_STYLE} itemStyle={TOOLTIP_ITEM_STYLE}
+                labelFormatter={t => new Date(t as number).toUTCString().slice(0, 16)}
+                formatter={(v, n) => [typeof v === 'number' ? v.toFixed(1) + '%' : '--', n]}
+              />
+              {pumpTs != null && <ReferenceLine x={pumpTs} stroke="var(--warning)" strokeDasharray="4 3" />}
+              {sorted.map(([k, m], i) => {
+                const s = analytics.shadow[k].summary
+                const faded = i >= 10
+                return (
+                  <Fragment key={k}>
+                    <Line dataKey={m.label} stroke={m.color} strokeWidth={faded ? 1.5 : 2}
+                      strokeOpacity={faded ? 0.55 : 1} dot={false} connectNulls isAnimationActive={false} />
+                    {s.bench_winrate != null && (
+                      <ReferenceLine y={s.bench_winrate * 100} stroke={m.color} strokeDasharray="5 4" strokeOpacity={faded ? 0.3 : 0.5} />
+                    )}
+                    {s.avg_breakeven != null && (
+                      <ReferenceLine y={s.avg_breakeven! * 100} stroke={m.color} strokeDasharray="1 3" strokeOpacity={faded ? 0.35 : 0.6} />
+                    )}
+                  </Fragment>
+                )
+              })}
+            </LineChart>
+          </ResponsiveContainer>
+        </>
+      )}
+      <div className="text-[10px] text-ink-55 mt-1">{footnote}</div>
+    </Card>
+  )
+}
+
+function SceneSignalsCard({
+  sceneEntries,
+  sceneRows,
+  analytics,
+  pumpTs,
+}: {
+  sceneEntries: [string, { label: string; color: string }][]
+  sceneRows: Record<string, number>[]
+  analytics: SignalsAnalytics
+  pumpTs: number | null
+}) {
+  const [kw, setKw] = useState('')
+  const [sortCol, setSortCol] = useState<string>('default')
+  const [sortAsc, setSortAsc] = useState<boolean>(false)
+
+  const toggleSort = (col: string) => {
+    if (sortCol === col) {
+      setSortAsc(!sortAsc)
+    } else {
+      setSortCol(col)
+      setSortAsc(false)
+    }
+  }
+
+  const thSort = (field: string, label: string, align: 'left' | 'center' | 'right' = 'right', hint?: string) => (
+    <th
+      className={`py-1 px-2 text-${align} cursor-pointer select-none hover:text-brand transition-colors`}
+      onClick={() => toggleSort(field)}
+      title={hint}
+    >
+      <span className={`inline-flex items-center gap-0.5 ${align === 'right' ? 'justify-end' : align === 'center' ? 'justify-center' : 'justify-start'}`}>
+        {label}
+        {sortCol === field ? (
+          <span className="text-brand font-mono text-[10px]">{sortAsc ? '▲' : '▼'}</span>
+        ) : (
+          <span className="text-ink-40 font-mono text-[10px]">⇅</span>
+        )}
+      </span>
+    </th>
+  )
+
+  const search = kw.trim().toLowerCase()
+  const filtered = sceneEntries.filter(([k, m]) => {
+    const s = analytics.scene[k]?.summary
+    if (!s) return false
+    if (search) {
+      const matchKey = k.toLowerCase().includes(search)
+      const matchLabel = m.label.toLowerCase().includes(search)
+      const matchExtra = (signalDescFor('scene', k) ?? '').toLowerCase().includes(search)
+      if (!matchKey && !matchLabel && !matchExtra) return false
+    }
+    return true
+  })
+
+  const sorted = [...filtered].sort(([ka, ma], [kb, mb]) => {
+    if (sortCol === 'default') return 0
+    const sa = analytics.scene[ka]?.summary
+    const sb = analytics.scene[kb]?.summary
+    if (!sa || !sb) return 0
+    let diff = 0
+    if (sortCol === 'scene') {
+      diff = ma.label.localeCompare(mb.label, 'zh-CN')
+    } else if (sortCol === 'n') {
+      diff = (sa.n ?? 0) - (sb.n ?? 0)
+    } else if (sortCol === 'winrate') {
+      diff = (sa.winrate ?? -1) - (sb.winrate ?? -1)
+    } else if (sortCol === 'bench') {
+      diff = (sa.bench_winrate ?? -1) - (sb.bench_winrate ?? -1)
+    } else if (sortCol === 'dev') {
+      const devA = sa.winrate != null && sa.bench_winrate != null ? sa.winrate - sa.bench_winrate : -999
+      const devB = sb.winrate != null && sb.bench_winrate != null ? sb.winrate - sb.bench_winrate : -999
+      diff = devA - devB
+    } else if (sortCol === 'avg_ev') {
+      diff = (sa.avg_ev ?? -999) - (sb.avg_ev ?? -999)
+    } else if (sortCol === 'cum_ev') {
+      diff = (sa.cum_ev ?? -999) - (sb.cum_ev ?? -999)
+    }
+    return sortAsc ? diff : -diff
+  })
+
+  const selectCls = 'px-1.5 py-0.5 border border-line rounded-sm text-xs text-ink-80 bg-card'
+
+  return (
+    <Card title="场景信号（FakeBreakout 正式信号）：累计胜率 vs 回测冻结基准">
+      <div className="flex items-center justify-between mb-3 gap-2 flex-wrap text-xs">
+        <div className="flex items-center gap-2 flex-wrap">
+          <input
+            type="text"
+            placeholder="搜索场景/说明..."
+            value={kw}
+            onChange={e => setKw(e.target.value)}
+            className={`${selectCls} w-44`}
+          />
+          {kw && (
+            <button
+              onClick={() => setKw('')}
+              className="px-1.5 py-0.5 text-xs text-brand hover:underline"
+            >清除筛选</button>
+          )}
+          {sortCol !== 'default' && (
+            <button
+              onClick={() => { setSortCol('default'); setSortAsc(false) }}
+              className="px-1.5 py-0.5 text-xs text-ink-55 hover:underline"
+            >重置排序</button>
+          )}
+        </div>
+        <span className="text-xs text-ink-55">
+          显示 {sorted.length} / 共 {sceneEntries.length} 个场景
+        </span>
+      </div>
+
+      {sorted.length === 0 ? (
+        <div className="text-center text-ink-55 py-6 text-xs">当前筛选条件下无匹配场景</div>
+      ) : (
+        <>
+          <div className="overflow-x-auto mb-3">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="border-b border-line text-ink-55">
+                  {thSort('scene', '场景', 'left')}
+                  {thSort('n', 'n', 'right')}
+                  {thSort('winrate', '线上胜率', 'right')}
+                  {thSort('bench', '回测', 'right')}
+                  {thSort('dev', '偏离', 'right')}
+                  {thSort('avg_ev', '平均EV', 'right')}
+                  {thSort('cum_ev', '累计EV', 'right')}
+                </tr>
+              </thead>
+              <tbody>
+                {sorted.map(([k, m]) => {
+                  const s = analytics.scene[k].summary
+                  const dev = s.winrate != null && s.bench_winrate != null ? s.winrate - s.bench_winrate : null
+                  return (
+                    <tr key={k} className="border-b border-line-soft hover:bg-sunken">
+                      <td className="py-1 px-2 font-medium" style={{ color: m.color }}>
+                        <span className="inline-flex items-center gap-1">
+                          {m.label}
+                          {signalDescFor('scene', k) && <HelpHint text={`${k}：${signalDescFor('scene', k)}`} />}
+                        </span>
+                      </td>
+                      <td className="py-1 px-2 text-right font-mono">{s.n}</td>
+                      <td className="py-1 px-2 text-right font-mono font-bold">{pct1(s.winrate)}</td>
+                      <td className="py-1 px-2 text-right font-mono text-ink-55">{pct1(s.bench_winrate)}</td>
+                      <td className={`py-1 px-2 text-right font-mono ${dev == null ? 'text-ink-55' : dev >= 0 ? 'text-positive' : 'text-negative'}`}>
+                        {dev == null ? '—' : `${dev >= 0 ? '+' : ''}${(dev * 100).toFixed(1)}pp`}
+                      </td>
+                      <td className={`py-1 px-2 text-right font-mono ${s.avg_ev == null ? 'text-ink-55' : s.avg_ev >= 0 ? 'text-positive' : 'text-negative'}`}>{evFmt(s.avg_ev)}</td>
+                      <td className={`py-1 px-2 text-right font-mono ${s.cum_ev == null ? 'text-ink-55' : s.cum_ev >= 0 ? 'text-positive' : 'text-negative'}`}>{evFmt(s.cum_ev)}</td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+          <ResponsiveContainer width="100%" height={240}>
+            <LineChart data={sceneRows} margin={{ top: 6, right: 12, left: 0, bottom: 0 }}>
+              <CartesianGrid stroke="var(--line-soft)" />
+              <XAxis dataKey="ts" type="number" domain={['dataMin', 'dataMax']} scale="time"
+                tickFormatter={utcMD} tick={{ fontSize: 11, fill: 'var(--ink-55)', fontFamily: 'var(--font-stack-mono)' }} stroke="var(--ink-55)" />
+              <YAxis domain={[0, 100]} tick={{ fontSize: 11, fill: 'var(--ink-55)', fontFamily: 'var(--font-stack-mono)' }} stroke="var(--ink-55)" width={40}
+                tickFormatter={(v: number) => v + '%'} />
+              <Tooltip
+                contentStyle={TOOLTIP_STYLE} labelStyle={TOOLTIP_LABEL_STYLE} itemStyle={TOOLTIP_ITEM_STYLE}
+                labelFormatter={t => new Date(t as number).toUTCString().slice(0, 16)}
+                formatter={(v, n) => [typeof v === 'number' ? v.toFixed(1) + '%' : '--', n]}
+              />
+              {pumpTs != null && <ReferenceLine x={pumpTs} stroke="var(--warning)" strokeDasharray="4 3" />}
+              {sorted.map(([k, m]) => (
+                <Fragment key={k}>
+                  <Line dataKey={m.label} stroke={m.color} strokeWidth={2} dot={false} connectNulls isAnimationActive={false} />
+                  {analytics.scene[k].summary.bench_winrate != null && (
+                    <ReferenceLine y={analytics.scene[k].summary.bench_winrate! * 100}
+                      stroke={m.color} strokeDasharray="5 4" strokeOpacity={0.5} />
+                  )}
+                </Fragment>
+              ))}
+            </LineChart>
+          </ResponsiveContainer>
+        </>
+      )}
+      <div className="text-[10px] text-ink-55 mt-1">实线=线上累计胜率，同色虚线=回测冻结基准；x 轴为信号时间（UTC）。</div>
+    </Card>
+  )
+}
+
+function RegimeByVersionTable({
+  shadowEntries,
+  regimeByVersion,
+}: {
+  shadowEntries: [string, { label: string; color: string }][]
+  regimeByVersion: Record<string, Record<string, { n: number; wins: number; winrate: number | null }>>
+}) {
+  const [kw, setKw] = useState('')
+  const [phaseFilter, setPhaseFilter] = useState<'ALL' | 'pre' | 'pump'>('ALL')
+  const [sortCol, setSortCol] = useState<'default' | 'ver' | 'phase' | 'n' | 'winrate'>('default')
+  const [sortAsc, setSortAsc] = useState<boolean>(false)
+
+  const items: Array<{
+    key: string
+    label: string
+    color: string
+    phase: 'pre' | 'pump'
+    phaseName: string
+    n: number
+    winrate: number | null
+  }> = []
+
+  for (const [k, m] of shadowEntries) {
+    const phases = regimeByVersion[k]
+    if (!phases) continue
+    for (const ph of ['pre', 'pump'] as const) {
+      const g = phases[ph]
+      items.push({
+        key: k,
+        label: m.label,
+        color: m.color,
+        phase: ph,
+        phaseName: ph === 'pre' ? '大涨前' : '大涨期',
+        n: g ? g.n : 0,
+        winrate: g ? g.winrate : null,
+      })
+    }
+  }
+
+  const search = kw.trim().toLowerCase()
+  const filtered = items.filter(item => {
+    if (search && !item.label.toLowerCase().includes(search) && !item.key.toLowerCase().includes(search)) return false
+    if (phaseFilter !== 'ALL' && item.phase !== phaseFilter) return false
+    return true
+  })
+
+  const sorted = [...filtered].sort((a, b) => {
+    if (sortCol === 'default') return 0
+    let diff = 0
+    if (sortCol === 'ver') {
+      diff = a.label.localeCompare(b.label, 'zh-CN')
+    } else if (sortCol === 'phase') {
+      diff = a.phase.localeCompare(b.phase)
+    } else if (sortCol === 'n') {
+      diff = a.n - b.n
+    } else if (sortCol === 'winrate') {
+      diff = (a.winrate ?? -1) - (b.winrate ?? -1)
+    }
+    return sortAsc ? diff : -diff
+  })
+
+  const toggleSort = (col: 'ver' | 'phase' | 'n' | 'winrate') => {
+    if (sortCol === col) setSortAsc(!sortAsc)
+    else { setSortCol(col); setSortAsc(false) }
+  }
+
+  const thSort = (field: 'ver' | 'phase' | 'n' | 'winrate', label: string, align: 'left' | 'center' | 'right' = 'right') => (
+    <th
+      className={`py-1 px-2 text-${align} cursor-pointer select-none hover:text-brand transition-colors`}
+      onClick={() => toggleSort(field)}
+    >
+      <span className={`inline-flex items-center gap-0.5 ${align === 'right' ? 'justify-end' : align === 'center' ? 'justify-center' : 'justify-start'}`}>
+        {label}
+        {sortCol === field ? (
+          <span className="text-brand font-mono text-[10px]">{sortAsc ? '▲' : '▼'}</span>
+        ) : (
+          <span className="text-ink-40 font-mono text-[10px]">⇅</span>
+        )}
+      </span>
+    </th>
+  )
+
+  const selectCls = 'px-1.5 py-0.5 border border-line rounded-sm text-xs text-ink-80 bg-card'
+  const filterActive = search !== '' || phaseFilter !== 'ALL'
+
+  return (
+    <div className="overflow-x-auto mb-4">
+      <div className="flex items-center justify-between mb-2 gap-2 flex-wrap text-xs">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-xs text-ink-55 font-medium">逐影子版本拆分</span>
+          <input
+            type="text"
+            placeholder="搜索版本..."
+            value={kw}
+            onChange={e => setKw(e.target.value)}
+            className={`${selectCls} w-32`}
+          />
+          <select
+            value={phaseFilter}
+            onChange={e => setPhaseFilter(e.target.value as 'ALL' | 'pre' | 'pump')}
+            className={selectCls}
+          >
+            <option value="ALL">全部阶段</option>
+            <option value="pre">大涨前</option>
+            <option value="pump">大涨期</option>
+          </select>
+          {filterActive && (
+            <button
+              onClick={() => { setKw(''); setPhaseFilter('ALL') }}
+              className="px-1.5 py-0.5 text-xs text-brand hover:underline"
+            >清除</button>
+          )}
+          {sortCol !== 'default' && (
+            <button
+              onClick={() => { setSortCol('default'); setSortAsc(false) }}
+              className="px-1.5 py-0.5 text-xs text-ink-55 hover:underline"
+            >重置排序</button>
+          )}
+        </div>
+        <span className="text-xs text-ink-55">显示 {sorted.length} / 共 {items.length} 项</span>
+      </div>
+      <table className="w-full text-xs">
+        <thead>
+          <tr className="border-b border-line text-ink-55">
+            {thSort('ver', '版本', 'left')}
+            {thSort('phase', '阶段', 'center')}
+            {thSort('n', 'n', 'right')}
+            {thSort('winrate', '胜率', 'right')}
+          </tr>
+        </thead>
+        <tbody>
+          {sorted.map(item => (
+            <tr key={`${item.key}-${item.phase}`} className="border-b border-line-soft hover:bg-sunken">
+              <td className="py-1 px-2" style={{ color: item.color }}>
+                {item.label}
+              </td>
+              <td className="py-1 px-2 text-center text-ink-55">
+                {item.phaseName}
+              </td>
+              <td className="py-1 px-2 text-right font-mono">{item.n}</td>
+              <td className="py-1 px-2 text-right font-mono font-bold">{pct1(item.winrate)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
 
   return (
     <div className="space-y-6">
@@ -5139,105 +5710,54 @@ function SignalAnalyticsTab() {
       </Card>
 
       {/* 场景信号 */}
-      <Card title="场景信号（FakeBreakout 正式信号）：累计胜率 vs 回测冻结基准">
-        {analytics && (
-          <>
-            <div className="overflow-x-auto mb-3">
-              <table className="w-full text-xs">
-                <thead>
-                  <tr className="border-b border-line text-ink-55">
-                    <th className="py-1 px-2 text-left">场景</th>
-                    <th className="py-1 px-2 text-right">n</th>
-                    <th className="py-1 px-2 text-right">线上胜率</th>
-                    <th className="py-1 px-2 text-right">回测</th>
-                    <th className="py-1 px-2 text-right">偏离</th>
-                    <th className="py-1 px-2 text-right">平均EV</th>
-                    <th className="py-1 px-2 text-right">累计EV</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {sceneEntries.map(([k, m]) => {
-                    const s = analytics.scene[k].summary
-                    const dev = s.winrate != null && s.bench_winrate != null ? s.winrate - s.bench_winrate : null
-                    return (
-                      <tr key={k} className="border-b border-line-soft hover:bg-sunken">
-                        <td className="py-1 px-2 font-medium" style={{ color: m.color }}>
-                          <span className="inline-flex items-center gap-1">
-                            {m.label}
-                            {signalDescFor('scene', k) && <HelpHint text={`${k}：${signalDescFor('scene', k)}`} />}
-                          </span>
-                        </td>
-                        <td className="py-1 px-2 text-right font-mono">{s.n}</td>
-                        <td className="py-1 px-2 text-right font-mono font-bold">{pct1(s.winrate)}</td>
-                        <td className="py-1 px-2 text-right font-mono text-ink-55">{pct1(s.bench_winrate)}</td>
-                        <td className={`py-1 px-2 text-right font-mono ${dev == null ? 'text-ink-55' : dev >= 0 ? 'text-positive' : 'text-negative'}`}>
-                          {dev == null ? '—' : `${dev >= 0 ? '+' : ''}${(dev * 100).toFixed(1)}pp`}
-                        </td>
-                        <td className={`py-1 px-2 text-right font-mono ${s.avg_ev == null ? 'text-ink-55' : s.avg_ev >= 0 ? 'text-positive' : 'text-negative'}`}>{evFmt(s.avg_ev)}</td>
-                        <td className={`py-1 px-2 text-right font-mono ${s.cum_ev == null ? 'text-ink-55' : s.cum_ev >= 0 ? 'text-positive' : 'text-negative'}`}>{evFmt(s.cum_ev)}</td>
-                      </tr>
-                    )
-                  })}
-                </tbody>
-              </table>
-            </div>
-            <ResponsiveContainer width="100%" height={240}>
-              <LineChart data={sceneRows} margin={{ top: 6, right: 12, left: 0, bottom: 0 }}>
-                <CartesianGrid stroke="var(--line-soft)" />
-                <XAxis dataKey="ts" type="number" domain={['dataMin', 'dataMax']} scale="time"
-                  tickFormatter={utcMD} tick={{ fontSize: 11, fill: 'var(--ink-55)', fontFamily: 'var(--font-stack-mono)' }} stroke="var(--ink-55)" />
-                <YAxis domain={[0, 100]} tick={{ fontSize: 11, fill: 'var(--ink-55)', fontFamily: 'var(--font-stack-mono)' }} stroke="var(--ink-55)" width={40}
-                  tickFormatter={(v: number) => v + '%'} />
-                <Tooltip
-                  contentStyle={TOOLTIP_STYLE} labelStyle={TOOLTIP_LABEL_STYLE} itemStyle={TOOLTIP_ITEM_STYLE}
-                  labelFormatter={t => new Date(t as number).toUTCString().slice(0, 16)}
-                  formatter={(v, n) => [typeof v === 'number' ? v.toFixed(1) + '%' : '--', n]}
-                />
-                {pumpTs != null && <ReferenceLine x={pumpTs} stroke="var(--warning)" strokeDasharray="4 3" />}
-                {sceneEntries.map(([k, m]) => (
-                  <Fragment key={k}>
-                    <Line dataKey={m.label} stroke={m.color} strokeWidth={2} dot={false} connectNulls isAnimationActive={false} />
-                    {analytics.scene[k].summary.bench_winrate != null && (
-                      <ReferenceLine y={analytics.scene[k].summary.bench_winrate! * 100}
-                        stroke={m.color} strokeDasharray="5 4" strokeOpacity={0.5} />
-                    )}
-                  </Fragment>
-                ))}
-              </LineChart>
-            </ResponsiveContainer>
-            <div className="text-[10px] text-ink-55 mt-1">实线=线上累计胜率，同色虚线=回测冻结基准；x 轴为信号时间（UTC）。</div>
-          </>
-        )}
-      </Card>
+      {analytics && (
+        <SceneSignalsCard
+          sceneEntries={sceneEntries}
+          sceneRows={sceneRows}
+          analytics={analytics}
+          pumpTs={pumpTs}
+        />
+      )}
 
       {/* 影子在线区（2026-09-07 与退役区分开）：只看仍在采集的版本前向进展 */}
-      {renderShadowCard({
-        title: `影子信号·在线采集（${activeShadowEntries.length} 版）：累计胜率 vs 回测基准 vs 盈亏平衡`,
-        entries: activeShadowEntries,
-        rows: activeShadowRows,
-        footnote: (
-          <>
-            实线=线上累计胜率；同色虚线=回测冻结基准；同色点线=逐版本平均盈亏平衡（x4 含溢价 0.01 口径，其余无溢价）。
-            第 11 条起复用前十色相并降为淡色细线（克制色板做不出 22 个可区分色相），表格中的版本名同步淡化以保持对应。
-            本区版本仍在采集，曲线末端=最新前向进展；「回测」列为冻结基准（无冻结基准的新版本显示 —，由前向数据自行裁决）。
-          </>
-        ),
-      })}
+      {analytics && (
+        <ShadowSignalCard
+          title={`影子信号·在线采集（${activeShadowEntries.length} 版）：累计胜率 vs 回测基准 vs 盈亏平衡`}
+          entries={activeShadowEntries}
+          rows={activeShadowRows}
+          analytics={analytics}
+          load={load}
+          pumpTs={pumpTs}
+          footnote={
+            <>
+              实线=线上累计胜率；同色虚线=回测冻结基准；同色点线=逐版本平均盈亏平衡（x4 含溢价 0.01 口径，其余无溢价）。
+              第 11 条起复用前十色相并降为淡色细线（克制色板做不出 22 个可区分色相），表格中的版本名同步淡化以保持对应。
+              本区版本仍在采集，曲线末端=最新前向进展；「回测」列为冻结基准（无冻结基准的新版本显示 —，由前向数据自行裁决）。
+            </>
+          }
+        />
+      )}
 
       {/* 影子退役区：momentum 族 / contrarian v1系 / x4_v1 / HM 族 已于 2026-09-04 永久下线，
           只作历史审计（代码级硬闸停发，toggle API 拒绝上线），不与在线版本混排 */}
-      {renderShadowCard({
-        title: `影子信号·已退役历史（${retiredShadowEntries.length} 版）：冻结基准 vs 历史累计胜率`,
-        entries: retiredShadowEntries,
-        rows: retiredShadowRows,
-        emptyHint: '当前无已退役影子版本',
-        footnote: (
-          <>
-            本区版本均为 2026-09-04 永久下线（代码级硬闸停发，不可重新上线），不再产生新样本，
-            曲线末端即最后采集点；冻结 bench 基准与历史曲线保留供审计，退役理由见版本名旁「?」悬浮说明。
-          </>
-        ),
-      })}
+      {analytics && (
+        <ShadowSignalCard
+          title={`影子信号·已退役历史（${retiredShadowEntries.length} 版）：冻结基准 vs 历史累计胜率`}
+          entries={retiredShadowEntries}
+          rows={retiredShadowRows}
+          analytics={analytics}
+          load={load}
+          pumpTs={pumpTs}
+          isRetired={true}
+          emptyHint="当前无已退役影子版本"
+          footnote={
+            <>
+              本区版本均为 2026-09-04 永久下线（代码级硬闸停发，不可重新上线），不再产生新样本，
+              曲线末端即最后采集点；冻结 bench 基准与历史曲线保留供审计，退役理由见版本名旁「?」悬浮说明。
+            </>
+          }
+        />
+      )}
 
       {/* 周期归因 */}
       <Card title={`周期归因：大涨前 vs 大涨期（${pumpTs != null ? `${utcMD(pumpTs)} 00:00` : '—'} UTC 分界，场景+影子全部信号）`}>
@@ -5263,41 +5783,10 @@ function SignalAnalyticsTab() {
             </div>
             {/* 逐影子版本 × 阶段（对齐审计报告表二归因维度） */}
             {Object.keys(analytics.regime.by_version).length > 0 && (
-              <div className="overflow-x-auto mb-4">
-                <div className="text-xs text-ink-55 mb-1">逐影子版本拆分</div>
-                <table className="w-full text-xs">
-                  <thead>
-                    <tr className="border-b border-line text-ink-55">
-                      <th className="py-1 px-2 text-left">版本 × 阶段</th>
-                      <th className="py-1 px-2 text-right">n</th>
-                      <th className="py-1 px-2 text-right">胜率</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {shadowEntries.map(([k, m]) => {
-                      const phases = analytics.regime.by_version[k]
-                      if (!phases) return null
-                      return (
-                        <Fragment key={k}>
-                          {(['pre', 'pump'] as const).map(ph => {
-                            const g = phases[ph]
-                            return (
-                              <tr key={ph} className="border-b border-line-soft hover:bg-sunken">
-                                <td className="py-1 px-2" style={{ color: m.color }}>
-                                  {m.label}
-                                  <span className="text-ink-55 ml-1.5">{ph === 'pre' ? '大涨前' : '大涨期'}</span>
-                                </td>
-                                <td className="py-1 px-2 text-right font-mono">{g ? g.n : 0}</td>
-                                <td className="py-1 px-2 text-right font-mono font-bold">{g ? pct1(g.winrate) : '—'}</td>
-                              </tr>
-                            )
-                          })}
-                        </Fragment>
-                      )
-                    })}
-                  </tbody>
-                </table>
-              </div>
+              <RegimeByVersionTable
+                shadowEntries={shadowEntries}
+                regimeByVersion={analytics.regime.by_version}
+              />
             )}
             {analytics.regime.daily.length > 0 && (
               <>

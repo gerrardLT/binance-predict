@@ -32,7 +32,7 @@ BTC 预测市场（Binance Prediction）自动化交易系统。**真金实盘�
 - 执行价护栏判定**含贴线**（`avg_price >= max_exec_price` 即弃单）：贴线时滑点空间为 0，币安拒收 `slippageBps=0`（错误码 -1102）
 - 失败单 `amount_in="0"`、`token_id=""`（未提交到币安）；`error_message` 可能是泛化文案，真实原因要看 `place_order` 层日志
 - 划转（transfer-in/out）**不落库**；资金类统计口径从订单派生
-- API 硬上限：`/api/trades/recent` limit≤100；影子信号接口 ≤200 条
+- API 上限：`/api/trades/recent` limit≤5000（支持全量订单历史）；影子信号接口 ≤200 条
 - 每通道每窗口至多一单；15m 市场必须先登记进 `trader._15m_markets` 否则被锚定守卫拒单（**测试构造第二窗口时同理**）
 
 ## 前端约定

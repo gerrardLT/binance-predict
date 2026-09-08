@@ -2121,7 +2121,7 @@ def _order_price_kind(o) -> str | None:
 
 @app.get("/api/trades/recent")
 async def get_recent_trades(
-    limit: int = 20,
+    limit: int = 100,
     _: None = Depends(_require_auth),
     db: AsyncSession = Depends(get_db),
 ):
@@ -2129,7 +2129,7 @@ async def get_recent_trades(
     from sqlalchemy import select
     from .db.models import TradeOrderModel
 
-    limit = max(1, min(int(limit), 100))
+    limit = max(1, min(int(limit), 5000))
     stmt = (
         select(TradeOrderModel)
         .order_by(TradeOrderModel.created_at.desc())
