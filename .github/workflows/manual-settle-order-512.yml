@@ -1,0 +1,79 @@
+# ============================================================
+# 手动补录结算数据：订单 512 + 情绪归档窗口 14:50~14:55
+#
+# 安全设计：
+#   1. 仅限针对订单 512 与窗口 1788850200000 补录。
+#   2. 执行前备份受影响表当前状态并打印。
+#   3. 执行前后对比校验。
+# ============================================================
+
+name: Manual Settle Order 512
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: manual-settle-order-512
+  cancel-in-progress: false
+
+jobs:
+  settle:
+    name: Settle order 512 and insert sentiment window
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Execute Settlement via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
+          script: |
+            set -euo pipefail
+            cd /www/wwwroot/binance-predict
+            if [ ! -f docker-compose.prod.yml ]; then
+              echo "ERROR: docker-compose.prod.yml not found"
+              exit 1
+            fi
+
+            echo "=== 执行前：检查订单 512 当前状态 ==="
+            docker compose -f docker-compose.prod.yml exec -T db \
+              sh -c "psql -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -v ON_ERROR_STOP=1 -c \"SELECT id, signal_version, window_start, status, direction, amount_in, win, pnl, settle_outcome, settled_at FROM trade_orders WHERE id = 512;\""
+
+            echo "=== 执行前：检查 sentiment_windows 该窗口状态 ==="
+            docker compose -f docker-compose.prod.yml exec -T db \
+              sh -c "psql -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -v ON_ERROR_STOP=1 -c \"SELECT id, start_time, end_time, entry_price, exit_price, outcome, actual_return FROM sentiment_windows WHERE start_time = 1788850200000;\""
+
+            echo "=== 执行事务更新 ==="
+            docker compose -f docker-compose.prod.yml exec -T db \
+              sh -c "psql -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -v ON_ERROR_STOP=1 -c \"
+              BEGIN;
+              INSERT INTO sentiment_windows (
+                  start_time, end_time, entry_price, exit_price, actual_return, outcome, sample_count
+              ) VALUES (
+                  1788850200000, 1788850500000, 78350.15, 78281.18, -0.00088002, 'DOWN', 0
+              ) ON CONFLICT (start_time) DO UPDATE SET
+                  exit_price = EXCLUDED.exit_price,
+                  actual_return = EXCLUDED.actual_return,
+                  outcome = EXCLUDED.outcome;
+
+              UPDATE trade_orders
+              SET
+                  settle_outcome = 'DOWN',
+                  win = TRUE,
+                  settle_price = 78281.18,
+                  pnl = 0.54,
+                  settled_at = NOW()
+              WHERE id = 512 AND settled_at IS NULL;
+              COMMIT;
+              \""
+
+            echo "=== 执行后：校验订单 512 状态 ==="
+            docker compose -f docker-compose.prod.yml exec -T db \
+              sh -c "psql -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -v ON_ERROR_STOP=1 -c \"SELECT id, signal_version, window_start, status, direction, amount_in, win, pnl, settle_outcome, settled_at FROM trade_orders WHERE id = 512;\""
+
+            echo "=== 执行后：校验 sentiment_windows 窗口状态 ==="
+            docker compose -f docker-compose.prod.yml exec -T db \
+              sh -c "psql -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -v ON_ERROR_STOP=1 -c \"SELECT id, start_time, end_time, entry_price, exit_price, outcome, actual_return FROM sentiment_windows WHERE start_time = 1788850200000;\""
