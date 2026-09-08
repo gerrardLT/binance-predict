@@ -198,6 +198,8 @@ async def test_analytics_scene_curve_prefers_db_fields() -> None:
     blk = out["scene"]["bull_exhaust"]
     assert blk["summary"]["n"] == 3
     assert blk["summary"]["winrate"] == pytest.approx(2 / 3)
+    assert blk["summary"]["quote_n"] == 3
+    assert blk["summary"]["quote_coverage"] == 1.0
     assert blk["summary"]["bench_winrate"] == 0.644  # RESEARCH_WIN_RATES
     # 累计胜率优先 DB 落库字段
     assert [p["cum_wr"] for p in blk["curve"]] == [1.0, 1.0, round(2 / 3, 4)]
@@ -227,6 +229,8 @@ async def test_analytics_scene_ev_q_missing_and_clamp() -> None:
     blk = out["scene"]["bull_exhaust"]
     assert blk["summary"]["n"] == 2
     assert blk["summary"]["winrate"] == 1.0  # q 缺失不影响胜负
+    assert blk["summary"]["quote_n"] == 1
+    assert blk["summary"]["quote_coverage"] == 0.5
     assert blk["summary"]["avg_ev"] == pytest.approx(0.98 / 0.99 - 1, rel=1e-6)
     assert [p["cum_ev"] for p in blk["curve"]] == [0.0, -0.0101]
 
@@ -405,6 +409,8 @@ async def test_analytics_krev_merged_from_kline_shadow_table() -> None:
     a = out["shadow"]["krev_a_v1"]
     assert a["summary"]["n"] == 1
     assert a["summary"]["win_rate"] == 1.0
+    assert a["summary"]["quote_n"] == 0
+    assert a["summary"]["quote_coverage"] == 0.0
     # 无报价/无 EV：EV 与盈亏平衡列恒空（前端显示 '—'），胜率曲线正常
     assert a["summary"]["avg_ev"] is None and a["summary"]["cum_ev"] is None
     assert a["summary"]["avg_breakeven"] is None
@@ -417,6 +423,19 @@ async def test_analytics_krev_merged_from_kline_shadow_table() -> None:
     bv = out["regime"]["by_version"]
     assert bv["krev_a_v1"]["pre"] == {"n": 1, "wins": 1, "winrate": 1.0}
     assert bv["krev_b_v1"]["pre"] == {"n": 1, "wins": 0, "winrate": 0.0}
+
+
+@pytest.mark.asyncio
+async def test_analytics_shadow_stale_ev_without_quote_is_excluded() -> None:
+    """旧行即使有落库 EV，缺少对应真实报价时也只能计入胜率。"""
+    import binance_predict.main as m
+
+    rows = [_shadow_row(ev_at_entry=9.9, entry_down_price=None)]
+    out = await m.get_signals_analytics(_make_db(rows, []))
+    summary = out["shadow"]["x4_v1"]["summary"]
+    assert summary["n"] == 1 and summary["win_rate"] == 1.0
+    assert summary["quote_n"] == 0 and summary["quote_coverage"] == 0.0
+    assert summary["avg_ev"] is None and summary["cum_ev"] is None
 
 
 @pytest.mark.asyncio

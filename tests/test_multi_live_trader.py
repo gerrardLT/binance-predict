@@ -134,6 +134,9 @@ def _make_trader(monkeypatch, trader: _FakeTrader,
     async def _no_attempt(self, version: str, ws: int) -> bool:
         return False
 
+    async def _no_group_fill(self, group: frozenset[str], ws: int) -> str | None:
+        return None
+
     async def _no_backfill(self, ws: int, version: str | None = None) -> None:
         return None
 
@@ -142,6 +145,7 @@ def _make_trader(monkeypatch, trader: _FakeTrader,
 
     monkeypatch.setattr(MultiLiveTrader, "_count_filled_today", _no_filled)
     monkeypatch.setattr(MultiLiveTrader, "_has_attempt", _no_attempt)
+    monkeypatch.setattr(MultiLiveTrader, "_group_filled_channel", _no_group_fill)
     monkeypatch.setattr(MultiLiveTrader, "_backfill_signal_link", _no_backfill)
     monkeypatch.setattr(MultiLiveTrader, "_link_signal_id", _no_link)
     return t
@@ -349,8 +353,7 @@ def test_channels_registry_shape() -> None:
     assert all(not s.v3_env and not s.regime_gate and not s.streak_gate
                for s in LIVE_CHANNELS.values())
     assert all(s.v2_guard in (None, "max_rise") for s in LIVE_CHANNELS.values())
-    # 同窗互斥组：S5 组（既有）+ promote 新增 s2_cond/absorption 双变体两组；
-    # momentum 组随三成员全退役而移除
+    # 同窗互斥组：S5、S2 condition、absorption 与 firsthit 全族。
     from binance_predict.services.live_channels import exclusive_group
     g_s5 = exclusive_group("s5_deep_z20_v1")
     assert g_s5 == frozenset({"scene_bull_exhaust_confirm", "s5_deep_z20_v1"})
@@ -358,6 +361,13 @@ def test_channels_registry_shape() -> None:
         {"s2_cond_t4_v1", "s2_cond_t5d_v1"})
     assert exclusive_group("absorption_follow_td150_v1") == frozenset(
         {"absorption_follow_td120_v1", "absorption_follow_td150_v1"})
+    firsthit_group = frozenset({
+        "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1",
+        "firsthit_down_g4_v1", "firsthit_down_g7_v1", "g7_streak_v1",
+        "g7_wick20_v1", "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",
+    })
+    assert exclusive_group("firsthit_down_v1") == firsthit_group
+    assert exclusive_group("g7_t270_v1") == firsthit_group
     assert exclusive_group("scene_bull_exhaust") is None
     assert exclusive_group("quote_contrarian_v2") is None
     assert exclusive_group("quote_momentum_v3") is None   # 退役组不参与生产判定
@@ -1539,8 +1549,8 @@ async def test_firsthit_g1_g3_gate_rejects_high_chg_or_large_body(monkeypatch) -
 
 
 @pytest.mark.asyncio
-async def test_firsthit_three_channels_independent_same_window_fires_all_on(monkeypatch) -> None:
-    """三通道同时开启且三门全中：派生三单，互不阻塞（用户确认独立下单）。
+async def test_firsthit_three_channels_share_same_window_exclusive_fill(monkeypatch) -> None:
+    """三门全中时仍派生候选，但同窗互斥只允许一笔成交。
     
     三门全中需要：chg≤+2.82bp（G3）、body_r≤0.35（G1）、npts≥8（路径质量）。
     body_r<1 要求 btc_curve 有波动（中间有比 bo 更低或比 btc_trig 更高的点）。"""
@@ -1570,15 +1580,11 @@ async def test_firsthit_three_channels_independent_same_window_fires_all_on(monk
     # per-channel fired 防重复；三通道各自 open
     assert set(fired) == {"firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1"}
     await _drain(t)
-    # 应有三单
-    assert len(fake.calls) == 3
-    versions = [c["signal_version"] for c in fake.calls]
-    assert set(versions) == {"firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1"}
+    # 候选任务全部派生，但同窗互斥只允许先完成的一笔成交。
+    assert len(fake.calls) == 1
+    assert fake.calls[0]["signal_version"] == "firsthit_down_v1"
     # 检查护栏按 spec auto_max_exec 生效
-    exec_prices = {c["signal_version"]: c.get("max_exec_price") for c in fake.calls}
-    assert exec_prices.get("firsthit_down_v1") == 0.08
-    assert exec_prices.get("firsthit_down_body_v1") == 0.12
-    assert exec_prices.get("firsthit_down_chg_v1") == 0.09
+    assert fake.calls[0]["max_exec_price"] == 0.08
 
 
 @pytest.mark.asyncio
@@ -1703,17 +1709,65 @@ async def test_firsthit_g7_series_all_fire(monkeypatch) -> None:
     assert set(fired) == set(g7_channels)
     await _drain(t)
 
-    assert len(fake.calls) == 6
-    called_channels = [c["signal_version"] for c in fake.calls]
-    assert set(called_channels) == set(g7_channels)
-    # 验证各通道护栏
-    guards = {c["signal_version"]: c.get("max_exec_price") for c in fake.calls}
-    assert guards["firsthit_down_g7_v1"] == 0.10
-    assert guards["g7_streak_v1"] == 0.10
-    assert guards["g7_wick20_v1"] == 0.12
-    assert guards["g7_strict_v1"] == 0.12
-    assert guards["g7_q05_v1"] == 0.05
-    assert guards["g7_t270_v1"] == 0.10
+    assert len(fake.calls) == 1
+    assert fake.calls[0]["signal_version"] == "firsthit_down_g7_v1"
+    assert fake.calls[0].get("max_exec_price") == 0.10
+
+
+@pytest.mark.asyncio
+async def test_firsthit_exclusive_allows_next_channel_after_failed_attempt(monkeypatch) -> None:
+    """首个 firsthit 候选未成交时，同窗后续候选仍可尝试。"""
+    class _FailThenFillTrader(_FakeTrader):
+        def __init__(self):
+            super().__init__()
+            self.results = [None, _fake_order()]
+
+        async def execute_signal_trade(self, **kwargs):
+            self.calls.append(kwargs)
+            return self.results.pop(0)
+
+    fake = _FailThenFillTrader()
+    t = _make_trader(monkeypatch, fake,
+                     channels=["firsthit_down_v1", "firsthit_down_body_v1"])
+    dn_p = _firsthit_down_curve(trigger_q=0.07, npts=20, trigger_idx=8)
+    btc_p = [{"t": WINDOW_START, "v": 100.0}]
+    for i in range(1, 20):
+        ts = WINDOW_START + i * 15_000
+        btc_p.append({"t": ts, "v": 100.0 - i * 0.01 if i <= 7 else 100.02})
+    fired = t.check(WINDOW_START, WINDOW_END, WINDOW_START + 120_000,
+                    down_price=0.5, btc_price=100.3,
+                    window_entry_price=100.0,
+                    window_btc_curve=btc_p, window_down_curve=dn_p)
+    assert set(fired) == {"firsthit_down_v1", "firsthit_down_body_v1"}
+    await _drain(t)
+    assert [c["signal_version"] for c in fake.calls] == [
+        "firsthit_down_v1", "firsthit_down_body_v1"]
+
+
+@pytest.mark.asyncio
+async def test_firsthit_exclusive_blocks_persisted_fill_after_restart(monkeypatch) -> None:
+    """重启后同窗已有另一 firsthit 版本成交时，不得再次下单。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["firsthit_down_body_v1"])
+
+    async def _persisted(self, group: frozenset[str], ws: int) -> str | None:
+        assert "firsthit_down_v1" in group
+        assert ws == WINDOW_START
+        return "firsthit_down_v1"
+
+    monkeypatch.setattr(MultiLiveTrader, "_group_filled_channel", _persisted)
+    dn_p = _firsthit_down_curve(trigger_q=0.07, npts=20, trigger_idx=8)
+    btc_p = [{"t": WINDOW_START, "v": 100.0}]
+    for i in range(1, 20):
+        ts = WINDOW_START + i * 15_000
+        btc_p.append({"t": ts, "v": 100.0 - i * 0.01 if i <= 7 else 100.02})
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 120_000,
+                   down_price=0.5, btc_price=100.02,
+                   window_entry_price=100.0,
+                   window_btc_curve=btc_p,
+                   window_down_curve=dn_p) == ["firsthit_down_body_v1"]
+    await _drain(t)
+    assert fake.calls == []
 
 
 # ============================================================

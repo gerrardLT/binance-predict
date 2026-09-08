@@ -688,10 +688,9 @@ class MultiLiveTrader:
     async def _exec_with_exclusive(self, channel: str, **trade_kwargs) -> dict | None:
         """下单 + 同窗互斥槽：互斥组内每市场窗口至多一个通道成交。
 
-        (组, 窗口) 锁串行化组内并发下单尝试：先成交者占槽，组内他通道同窗
-        弃单（防同源通道同窗同向叠加敞口）；未成交（护栏弃单/失败/占位）
-        不占槽，组内互补通道照常下单。不在组的通道直连下单（行为零变化）。
-        窗口键取 kwargs["window_start"]（下单与互斥槽同键）。
+        (组, 窗口) 锁串行化组内并发下单尝试；DB 已成交检查覆盖服务重启。
+        未成交（护栏弃单/失败/占位）不占槽，组内后续通道仍可下单。
+        不在组的通道直连下单（行为零变化）。
         """
         grp = exclusive_group(channel)
         window_start = int(trade_kwargs["window_start"])
@@ -699,10 +698,12 @@ class MultiLiveTrader:
             return await self._trader.execute_signal_trade(**trade_kwargs)
         async with self._group_lock(grp, window_start):
             taken = self._window_filled.get(window_start, set()) & grp
-            if taken:
+            persisted = None if taken else await self._group_filled_channel(grp, window_start)
+            if taken or persisted is not None:
+                blockers = sorted(taken) if taken else [persisted]
                 logger.info(
                     "多通道实盘：{} 同窗互斥弃单 | 窗口 {} | 已被 {} 成交",
-                    channel, _fmt_win(window_start), sorted(taken))
+                    channel, _fmt_win(window_start), blockers)
                 return None
             order = await self._trader.execute_signal_trade(**trade_kwargs)
             if order is not None and order.get("status") == "FILLED":
@@ -713,6 +714,20 @@ class MultiLiveTrader:
                         k: v for k, v in self._window_filled.items()
                         if k >= cutoff}
             return order
+
+    async def _group_filled_channel(
+        self, group: frozenset[str], window_start: int,
+    ) -> str | None:
+        """返回互斥组同窗已成交版本，供重启后恢复事件级互斥。"""
+        async with async_session_factory() as session:
+            return (await session.execute(
+                sa_select(TradeOrderModel.signal_version).where(
+                    TradeOrderModel.signal_version.in_(group),
+                    TradeOrderModel.window_start == window_start,
+                    TradeOrderModel.status == "FILLED",
+                ).limit(1)
+            )).scalar_one_or_none()
+
 
     # ------------------------------------------------------------------
     # x4 族：PENDING 信号轮询 → 决策点下单

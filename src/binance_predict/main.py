@@ -3427,7 +3427,9 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
         AbsorptionShadowSignal, FirstHitShadowSignal, KlineShadowSignal,
         MisalignmentSignal, PatternShadowSignal,
     )
-    from .services.fake_breakout_detector import RESEARCH_WIN_RATES
+    from .services.fake_breakout_detector import (
+        RESEARCH_WIN_RATES, scene_realized_ev,
+    )
 
     # ---- 影子信号：全量 SETTLED 升序（仅取所需列，避免整行 ORM 实体化）----
     sh_rows = (await db.execute(
@@ -3553,14 +3555,15 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
         for i, s in enumerate(g, 1):
             wins += int(bool(s.win))
             q = s.entry_down_price if s.direction == "DOWN" else s.entry_up_price
-            # EV 优先读落库 ev_at_entry；未落库的表（pattern 系 HM/S5、kline 系
-            # KREV/P1/P2/nextbar/combo）按落库报价兜底现算实现 EV；报价缺失行 q 空 → None
-            ev = (float(s.ev_at_entry) if s.ev_at_entry is not None
-                  else _shadow_realized_ev(v, bool(s.win), float(q) if q else None))
+            valid_q = q is not None and float(q) > 0
+            # 落库 EV 与兜底现算都必须有对应方向的真实报价；缺报价只计胜率。
+            ev = None
+            if valid_q:
+                ev = (float(s.ev_at_entry) if s.ev_at_entry is not None
+                      else _shadow_realized_ev(v, bool(s.win), float(q)))
             if ev is not None:
                 evs.append(ev)
                 cum_ev += ev
-            if q:
                 bes.append(_shadow_breakeven(v, float(q)))
             curve.append({
                 "i": i, "ts": s.window_start,
@@ -3572,6 +3575,8 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
             "summary": {
                 "n": n,
                 "win_rate": wins / n if n else None,
+                "quote_n": len(evs),
+                "quote_coverage": len(evs) / n if n else None,
                 "avg_ev": sum(evs) / len(evs) if evs else None,
                 "cum_ev": round(cum_ev, 4) if evs else None,
                 "avg_breakeven": sum(bes) / len(bes) if bes else None,
@@ -3618,12 +3623,9 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
         for i, r in enumerate(rows_pt, 1):
             won = r.settle_outcome == ("DOWN" if r.side == "high" else "UP")
             wins += int(won)
-            # 审计口径逐笔实现 EV：赢 0.98/(q+0.01)−1（截断[0.01,0.99]）/ 输 −1；
-            # q 按 side 取入场报价，缺失不计入（与 local_scene_signal_full_analysis.py 一致）
             q = r.entry_up_price_15m if r.side == "low" else r.entry_down_price_15m
-            ev = None
-            if q and float(q) > 0:
-                ev = (0.98 / min(max(float(q) + 0.01, 0.01), 0.99) - 1.0) if won else -1.0
+            ev = scene_realized_ev(won, float(q) if q is not None else None)
+            if ev is not None:
                 evs.append(ev)
                 cum_ev += ev
             # 累计胜率优先 DB 落库字段（detector 同口径），缺失回退自算
@@ -3633,12 +3635,15 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
                 "cum_wr": round(float(cw), 4), "cum_ev": round(cum_ev, 4),
             })
         n = len(rows_pt)
+        quote_n = len(evs)
         scene[pt] = {
             "summary": {
                 "n": n,
                 "winrate": wins / n if n else None,
-                "avg_ev": sum(evs) / len(evs) if evs else None,
-                "cum_ev": round(cum_ev, 4) if evs else None,
+                "quote_n": quote_n,
+                "quote_coverage": quote_n / n if n else None,
+                "avg_ev": sum(evs) / quote_n if quote_n else None,
+                "cum_ev": round(cum_ev, 4) if quote_n else None,
                 "bench_winrate": RESEARCH_WIN_RATES.get(pt),
             },
             "curve": curve[-_CURVE_MAX_POINTS:],

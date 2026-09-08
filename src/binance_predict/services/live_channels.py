@@ -156,10 +156,9 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
         "吸收跟随TD150欠反应→顺势",
     ),
     # --- firsthit 族（2026-09-07 影子 promote）：5m 采样循环按本窗完整历史重放
-    # DOWN 首次进入 (0.005,0.1] 的触发点，命中后买 DOWN。三个 version 共用
+    # DOWN 首次进入 (0.005,0.1] 的触发点，命中后买 DOWN。所有版本共用
     # firsthit_shadow_detector.extract_firsthit_features / _gate_of，保证实盘与
-    # 影子口径同源。用户确认三通道各自独立下单，不加入 SAME_WINDOW_EXCLUSIVE：
-    # 同窗三门全中且全开启时最多 3 单（2U×3=6U）；每通道每窗仍至多一单。
+    # 影子口径同源。嵌套版本共用同一首触事件，统一互斥组限制同窗最多一笔 FILLED。
     # 护栏为保守成交上限，不代表前向胜率背书：G0 用研究价-only 胜率 8.9%×0.98≈0.087
     # 下方 0.08；G1/G3 的 confirm 段已 burned，分别按冻结研究口径保守取 0.12/0.09。
     # 触发后实际成交均价高于护栏弃单，不追价。
@@ -282,6 +281,12 @@ SAME_WINDOW_EXCLUSIVE: tuple[frozenset[str], ...] = (
     # 吸收跟随双变体同窗同假设（TD120/TD150 只是判定时点不同，欠反应状态连续），
     # 防同窗双成交（2026-09-06 promote）。
     frozenset({"absorption_follow_td120_v1", "absorption_follow_td150_v1"}),
+    # firsthit 全族共享同一首触母事件，防嵌套版本同窗重复下注。
+    frozenset({
+        "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1",
+        "firsthit_down_g4_v1", "firsthit_down_g7_v1", "g7_streak_v1",
+        "g7_wick20_v1", "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",
+    }),
 )
 
 # 退役的同窗互斥组（不参与生产判定：exclusive_group 只读 SAME_WINDOW_EXCLUSIVE）

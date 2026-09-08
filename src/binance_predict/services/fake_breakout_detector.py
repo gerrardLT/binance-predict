@@ -265,47 +265,71 @@ def confirm_bull_exhaust_5m(c5_close: float, anchor: float) -> tuple[bool, str]:
     return False, "FLAT"
 
 
+def _scene_entry_price(quote: float | None) -> float | None:
+    """场景真实报价加溢价后的有效入场价；缺报价保持 None。"""
+    if quote is None or float(quote) <= 0:
+        return None
+    return min(max(float(quote) + PREMIUM, 0.01), 0.99)
+
+
+def scene_realized_ev(won: bool, quote: float | None) -> float | None:
+    """场景逐笔实现 EV：赢按真实报价，输为 -1。"""
+    entry = _scene_entry_price(quote)
+    if entry is None:
+        return None
+    return (1.0 - FEE) / entry - 1.0 if won else -1.0
+
+
+def scene_expected_ev(pattern_type: str | None, quote: float | None) -> float | None:
+    """场景按冻结研究胜率与真实报价计算的入场期望 EV。"""
+    p = RESEARCH_WIN_RATES.get(pattern_type or "")
+    entry = _scene_entry_price(quote)
+    if p is None or entry is None:
+        return None
+    return p * (1.0 - FEE) / entry - 1.0
+
+
 def compute_pattern_stats(rows: list) -> dict:
     """按 pattern_type 已结算正式信号计算实盘统计（结算回填与 stats API 共用的纯函数）。
 
-    口径：每笔 1 USDT 本金；entry 价取入场报价快照（按方向选 DOWN/UP），
-    缺失回退 0.51（含溢价理论价）；单笔实现收益 = 赢 (1-FEE)/entry-1 / 输 -1。
+    n/winrate 使用全部已结算行；EV 与收益曲线只使用真实入场报价有效的行。
+    缺报价不回退理论价格，quote_n/quote_coverage 显式披露 EV 样本覆盖率。
 
     Returns:
-        {n, wins, winrate, cumulative_ev, avg_ev_at_entry,
-         equity_curve, peak_equity, max_drawdown}
+        {n, wins, winrate, quote_n, quote_coverage, cumulative_ev,
+         avg_ev_at_entry, equity_curve, peak_equity, max_drawdown}
     """
     wins = 0
-    rets: list[float] = []
+    realized: list[float | None] = []
     ev_entries: list[float] = []
     for row in rows:
-        entry = row.entry_down_price_15m if row.side == "high" else row.entry_up_price_15m
-        entry = float(entry) if entry and entry > 0 else 0.50 + PREMIUM
-        ret = (1.0 - FEE) / entry - 1.0
+        quote = row.entry_down_price_15m if row.side == "high" else row.entry_up_price_15m
         won = row.settle_outcome == ("DOWN" if row.side == "high" else "UP")
         if won:
             wins += 1
-            rets.append(ret)
-        else:
-            rets.append(-1.0)
-        p = RESEARCH_WIN_RATES.get(row.pattern_type or "")
-        if p is not None:
-            ev_entries.append(p * (1.0 + ret) - 1.0)
+        realized.append(scene_realized_ev(won, float(quote) if quote is not None else None))
+        expected = scene_expected_ev(row.pattern_type, float(quote) if quote is not None else None)
+        if expected is not None:
+            ev_entries.append(expected)
     n = len(rows)
+    quote_n = sum(ret is not None for ret in realized)
     cum = 0.0
     peak = 0.0
     max_dd = 0.0
     curve: list[float] = []
-    for r in rets:
-        cum += r
+    for ret in realized:
+        if ret is not None:
+            cum += ret
+            peak = max(peak, cum)
+            max_dd = max(max_dd, peak - cum)
         curve.append(round(cum, 6))
-        peak = max(peak, cum)
-        max_dd = max(max_dd, peak - cum)
     return {
         "n": n,
         "wins": wins,
         "winrate": wins / n if n else None,
-        "cumulative_ev": cum / n if n else None,
+        "quote_n": quote_n,
+        "quote_coverage": quote_n / n if n else None,
+        "cumulative_ev": cum / quote_n if quote_n else None,
         "avg_ev_at_entry": sum(ev_entries) / len(ev_entries) if ev_entries else None,
         "equity_curve": curve,
         "peak_equity": peak,
@@ -1593,7 +1617,7 @@ class FakeBreakoutDetector:
 
         仅正式信号（排除 SHADOW 版本名，ACTIVE 版本演进兼容）；
         统计口径见 compute_pattern_stats。
-        ev_at_entry 按入场报价与真 OOS 胜率点估计补算（快照缺失回退 0.51 理论价）。
+        ev_at_entry 按真实入场报价与真 OOS 胜率点估计补算；报价缺失保持 NULL。
         """
         shadow_names = [s["version"] for s in self._shadow_versions]
         try:
@@ -1613,17 +1637,17 @@ class FakeBreakoutDetector:
                 rows = (await session.execute(stmt)).scalars().all()
                 if not rows:
                     return
-                # ev_at_entry 补齐（入场时刻预期 EV = p×(1-FEE)/entry − 1）
+                # 全量重算以纠正旧理论价回退污染；缺真实报价的历史行清回 NULL。
                 p_research = RESEARCH_WIN_RATES.get(pattern_type)
-                for row in rows:
-                    if row.ev_at_entry is not None or p_research is None:
-                        continue
-                    entry = (
-                        row.entry_down_price_15m if row.side == "high"
-                        else row.entry_up_price_15m
-                    )
-                    entry = float(entry) if entry and entry > 0 else 0.50 + PREMIUM
-                    row.ev_at_entry = round(p_research * (1.0 - FEE) / entry - 1.0, 6)
+                if p_research is not None:
+                    for row in rows:
+                        quote = (
+                            row.entry_down_price_15m if row.side == "high"
+                            else row.entry_up_price_15m
+                        )
+                        expected = scene_expected_ev(
+                            pattern_type, float(quote) if quote is not None else None)
+                        row.ev_at_entry = round(expected, 6) if expected is not None else None
                 stats = compute_pattern_stats(rows)
                 latest = rows[-1]
                 latest.cumulative_winrate = (

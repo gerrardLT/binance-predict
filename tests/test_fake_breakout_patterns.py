@@ -251,23 +251,23 @@ def _settled_row(side: str, outcome: str, entry: float | None,
 
 
 def test_pattern_stats_2win_1loss() -> None:
-    """2 胜 1 负（entry=0.51）：累计 EV / 收益曲线 / 回撤 / 入场 EV 口径。"""
+    """缺报价保留胜率样本，但真实报价 EV 只使用有报价的两笔。"""
     rows = [
-        _settled_row("high", "DOWN", 0.51),  # 赢：(1-FEE)/0.51−1 ≈ 0.9216
+        _settled_row("high", "DOWN", 0.51),  # 赢：有效入场价 0.51+PREMIUM
         _settled_row("high", "UP", 0.51),    # 输：−1
-        _settled_row("low", "UP", None),     # 赢：entry 缺失回退 0.51（含溢价理论价）
+        _settled_row("low", "UP", None),     # 赢：缺报价，不计入 EV
     ]
     s = compute_pattern_stats(rows)
     assert s["n"] == 3 and s["wins"] == 2
     assert s["winrate"] == pytest.approx(2 / 3)
-    ret_win = (1.0 - FEE) / 0.51 - 1.0
-    assert s["cumulative_ev"] == pytest.approx((ret_win - 1.0 + ret_win) / 3, abs=1e-4)
-    assert s["equity_curve"][1] == pytest.approx(ret_win - 1.0, abs=1e-3)
-    # peak 0.9216 → 谷 −0.0784：回撤恰为 1.0
+    assert s["quote_n"] == 2
+    assert s["quote_coverage"] == pytest.approx(2 / 3)
+    ret_win = (1.0 - FEE) / 0.52 - 1.0
+    assert s["cumulative_ev"] == pytest.approx((ret_win - 1.0) / 2, abs=1e-4)
+    assert s["equity_curve"] == pytest.approx([ret_win, ret_win - 1.0, ret_win - 1.0], abs=1e-3)
     assert s["max_drawdown"] == pytest.approx(1.0, abs=1e-3)
-    # 入场时刻 EV=p×(1-FEE)/entry−1 只看 p 与 entry，与实际输赢无关
     p = RESEARCH_WIN_RATES["bull_exhaust"]
-    assert s["avg_ev_at_entry"] == pytest.approx(p * (1.0 + ret_win) - 1.0, abs=1e-4)
+    assert s["avg_ev_at_entry"] == pytest.approx(p * (1.0 - FEE) / 0.52 - 1.0, abs=1e-4)
 
 
 def test_pattern_stats_empty_safe() -> None:
@@ -276,6 +276,21 @@ def test_pattern_stats_empty_safe() -> None:
     assert s["n"] == 0
     assert s["winrate"] is None and s["cumulative_ev"] is None
     assert s["equity_curve"] == [] and s["max_drawdown"] == 0.0
+
+
+def test_pattern_stats_all_quotes_missing_keeps_ev_empty() -> None:
+    """全部报价缺失时保留方向统计，但不得生成理论价 EV。"""
+    rows = [
+        _settled_row("high", "DOWN", None),
+        _settled_row("low", "DOWN", None),
+    ]
+    s = compute_pattern_stats(rows)
+    assert s["n"] == 2 and s["wins"] == 1
+    assert s["winrate"] == 0.5
+    assert s["quote_n"] == 0 and s["quote_coverage"] == 0.0
+    assert s["cumulative_ev"] is None and s["avg_ev_at_entry"] is None
+    assert s["equity_curve"] == [0.0, 0.0]
+    assert s["peak_equity"] == 0.0 and s["max_drawdown"] == 0.0
 
 
 # ============================================================
@@ -413,10 +428,11 @@ def test_s5_pattern_stats_ev_uses_785_entry() -> None:
     rows = [_settled_row("high", "DOWN", 0.65, pattern_type="bull_exhaust_confirm")]
     s = compute_pattern_stats(rows)
     p = RESEARCH_WIN_RATES["bull_exhaust_confirm"]
-    ret = (1.0 - FEE) / 0.65 - 1.0
+    ret = (1.0 - FEE) / 0.66 - 1.0
     assert s["winrate"] == 1.0
+    assert s["quote_n"] == 1 and s["quote_coverage"] == 1.0
     assert s["cumulative_ev"] == pytest.approx(ret, abs=1e-6)
-    assert s["avg_ev_at_entry"] == pytest.approx(p * (1.0 + ret) - 1.0, abs=1e-6)
+    assert s["avg_ev_at_entry"] == pytest.approx(p * (1.0 - FEE) / 0.66 - 1.0, abs=1e-6)
     # 盈亏平衡入场价 ≈ 0.769：0.65 入场为正 EV，与回测敏感性表一致
     assert s["avg_ev_at_entry"] > 0
 

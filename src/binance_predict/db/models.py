@@ -1296,6 +1296,84 @@ class FirstHitShadowSignal(Base):
 
 
 # ============================================================
+# 首触研究账本：全窗口审计层
+# ============================================================
+
+class FirstHitWindowAudit(Base):
+    """5m 首触研究全窗口审计行；每个窗口最多一行。"""
+
+    __tablename__ = "firsthit_window_audit"
+    __table_args__ = (
+        UniqueConstraint("window_start", name="uq_fh_audit_window"),
+        Index("ix_fh_audit_window_start", "window_start"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    window_start: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    window_end: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    audit_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    expected_samples: Mapped[int] = mapped_column(Integer, nullable=False)
+    actual_samples: Mapped[int] = mapped_column(Integer, nullable=False)
+    down_pts: Mapped[int] = mapped_column(Integer, nullable=False)
+    up_pts: Mapped[int] = mapped_column(Integer, nullable=False)
+    btc_pts: Mapped[int] = mapped_column(Integer, nullable=False)
+    max_gap_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    raw_firsthit_detected: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    firsthit_detected: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    exclusion_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    outcome: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    settled: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+# ============================================================
+# 首触研究账本：唯一 G0 母事件层
+# ============================================================
+
+class FirstHitMotherEvent(Base):
+    """5m 首触 G0 母事件及可重构标签；每个窗口最多一行。"""
+
+    __tablename__ = "firsthit_mother_event"
+    __table_args__ = (
+        UniqueConstraint("window_start", name="uq_fh_mother_window"),
+        Index("ix_fh_mother_window_start", "window_start"),
+        Index("ix_fh_mother_stratum", "stratum"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    window_start: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    window_end: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    trigger_ts: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    feature_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    q: Mapped[float] = mapped_column(Float, nullable=False)
+    q_prev: Mapped[float | None] = mapped_column(Float, nullable=True)
+    dt_prev_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    up_price_at_trigger: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sum_gap: Mapped[float | None] = mapped_column(Float, nullable=True)
+    btc_open: Mapped[float] = mapped_column(Float, nullable=False)
+    btc_trigger: Mapped[float] = mapped_column(Float, nullable=False)
+    path_hi: Mapped[float] = mapped_column(Float, nullable=False)
+    path_lo: Mapped[float] = mapped_column(Float, nullable=False)
+    chg_bps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    body_r: Mapped[float | None] = mapped_column(Float, nullable=True)
+    wick01: Mapped[float | None] = mapped_column(Float, nullable=True)
+    upper_wick_bps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    rng_bps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    npts: Mapped[int] = mapped_column(Integer, nullable=False)
+    td_sec: Mapped[int] = mapped_column(Integer, nullable=False)
+    dvol: Mapped[float | None] = mapped_column(Float, nullable=True)
+    dpar: Mapped[float | None] = mapped_column(Float, nullable=True)
+    dvol_missing: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    dpar_missing: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    labels: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    stratum: Mapped[str] = mapped_column(String(12), nullable=False)
+    settle_outcome: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    win: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    intention_ev: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+# ============================================================
 # 模式回测快照表（每个模式每次回测的完整记录，支撑无限进化与前后对比）
 # ============================================================
 
