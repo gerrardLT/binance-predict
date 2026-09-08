@@ -54,7 +54,7 @@ jobs:
                   start_time, end_time, entry_price, exit_price, actual_return, outcome, sample_count
               ) VALUES (
                   1788850200000, 1788850500000, 78350.15, 78281.18, -0.00088002, 'DOWN', 0
-              ) ON CONFLICT (start_time) DO UPDATE SET
+              ) ON CONFLICT (start_time, end_time) DO UPDATE SET
                   exit_price = EXCLUDED.exit_price,
                   actual_return = EXCLUDED.actual_return,
                   outcome = EXCLUDED.outcome;
