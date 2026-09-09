@@ -814,6 +814,7 @@ interface LiveOrderMarker {
   windowSpanStr: string
   windowOffsetSec: number | null
   market_period: string
+  periodDurationMin: number
   channel: string
   channelName: string
   channelDesc?: string
@@ -823,15 +824,20 @@ interface LiveOrderMarker {
   orderId: string | null
   tokenId: string | null
   averagePrice: number | null
+  quotedAvgPrice: number | null
+  priceSlippage: number | null
   priceKind: string | null
   amountUsdt: number | null
   settleOutcome: string | null
   settlePrice: number | null
+  btcPriceDiff: number | null
+  btcPriceDiffPct: number | null
   win: boolean | null
   pnl: number | null
   returnPct: number | null
   settledAt: string | null
   settledAtStr: string | null
+  settleDelaySec: number | null
   redeemedAt: string | null
   errorMessage: string | null
   btcPrice: number | null
@@ -1045,8 +1051,11 @@ function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[
       const returnPct = (amt != null && amt > 0 && pnlVal != null) ? (pnlVal / amt) * 100 : null
       const qj = (o.quote_json && typeof o.quote_json === 'object') ? (o.quote_json as Record<string, unknown>) : null
       const filledShares = qj?.filledShareQty != null ? Number(qj.filledShareQty) : null
+      const quotedPrice = qj?.quotedAvgPrice != null ? Number(qj.quotedAvgPrice) : null
+      const slippage = (avgP != null && quotedPrice != null && quotedPrice > 0) ? avgP - quotedPrice : null
 
-      const windowDurationMs = (per === '15m' ? 15 : 5) * 60_000
+      const periodMinutes = per === '15m' ? 15 : 5
+      const windowDurationMs = periodMinutes * 60_000
       const wEnd = ws > 0 ? ws + windowDurationMs : 0
       const wSpanStr = ws > 0 ? `${hhmm(ws)}–${hhmm(wEnd)}` : '--'
       const wOffsetSec = ws > 0 && t >= ws ? Math.floor((t - ws) / 1000) : null
@@ -1055,11 +1064,19 @@ function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[
         hour: '2-digit', minute: '2-digit', second: '2-digit',
         hour12: false,
       })
+      const settledMs = o.settled_at ? new Date(String(o.settled_at)).getTime() : null
       const settledAtStr = o.settled_at ? new Date(String(o.settled_at)).toLocaleString('zh-CN', {
         month: '2-digit', day: '2-digit',
         hour: '2-digit', minute: '2-digit', second: '2-digit',
         hour12: false,
       }) : null
+      const settleDelay = (settledMs != null && wEnd > 0 && settledMs >= wEnd)
+        ? Math.floor((settledMs - wEnd) / 1000)
+        : null
+
+      const settleP = typeof o.settle_price === 'number' ? o.settle_price : null
+      const btcDiff = (settleP != null && nearestBtc != null) ? settleP - nearestBtc : null
+      const btcDiffPct = (settleP != null && nearestBtc != null && nearestBtc > 0) ? ((settleP - nearestBtc) / nearestBtc) * 100 : null
 
       list.push({
         id: o.id as (string | number),
@@ -1070,6 +1087,7 @@ function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[
         windowSpanStr: wSpanStr,
         windowOffsetSec: wOffsetSec,
         market_period: per,
+        periodDurationMin: periodMinutes,
         channel: ver,
         channelName: info?.name ?? ver,
         channelDesc: info?.desc,
@@ -1079,15 +1097,20 @@ function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[
         orderId: o.order_id ? String(o.order_id) : null,
         tokenId: o.token_id ? String(o.token_id) : null,
         averagePrice: avgP,
+        quotedAvgPrice: quotedPrice,
+        priceSlippage: slippage,
         priceKind: (o.price_kind as string | null) ?? null,
         amountUsdt: amt,
         settleOutcome: o.settle_outcome ? String(o.settle_outcome) : null,
-        settlePrice: typeof o.settle_price === 'number' ? o.settle_price : null,
+        settlePrice: settleP,
+        btcPriceDiff: btcDiff,
+        btcPriceDiffPct: btcDiffPct,
         win: typeof o.win === 'boolean' ? o.win : null,
         pnl: pnlVal,
         returnPct,
         settledAt: o.settled_at ? String(o.settled_at) : null,
         settledAtStr,
+        settleDelaySec: settleDelay,
         redeemedAt: o.redeemed_at ? String(o.redeemed_at) : null,
         errorMessage: (o.error_message as string | null) ?? null,
         btcPrice: nearestBtc,
@@ -1180,103 +1203,155 @@ function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[
                 </div>
               </div>
 
-              {/* 指标卡矩阵：窗口、金额与均价、结算与收益、订单号等 */}
-              <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-x-4 gap-y-2 text-[11px]">
-                <div>
-                  <div className="text-ink-55">下单时间 (精确)</div>
-                  <div className="font-mono text-ink-95 font-bold mt-0.5" title={`时间戳: ${activeMarker.time}`}>
-                    {activeMarker.createdAtStr}
+              {/* 全维度指标卡矩阵：分 4 个紧凑逻辑区块（时间周期、执行成交、结算ROI、行情走势） */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2 text-[11px]">
+                {/* 维度 1：时间与周期窗口 */}
+                <div className="bg-sunken/60 p-2 rounded-sm border border-line-soft space-y-1">
+                  <div className="text-[10px] font-bold text-ink-55 uppercase tracking-wider flex items-center justify-between">
+                    <span>⏱️ 时间与窗口时序</span>
+                    <span className="text-brand font-mono font-semibold">{activeMarker.market_period} 周期 ({activeMarker.periodDurationMin}m)</span>
                   </div>
-                  {activeMarker.windowOffsetSec != null && (
-                    <div className="text-ink-55 text-[10px] font-mono">
-                      (窗开第 <span className="text-brand font-bold">{activeMarker.windowOffsetSec}s</span> 触发)
+                  <div className="space-y-0.5 font-mono">
+                    <div className="flex justify-between">
+                      <span className="text-ink-55">下单时间:</span>
+                      <span className="text-ink-95 font-bold" title={`毫秒: ${activeMarker.time}`}>{activeMarker.createdAtStr}</span>
                     </div>
-                  )}
-                </div>
-
-                <div>
-                  <div className="text-ink-55">目标窗口时段 ({activeMarker.market_period})</div>
-                  <div className="font-mono text-ink-95 font-medium mt-0.5">
-                    {activeMarker.windowSpanStr}
-                  </div>
-                  {activeMarker.settledAtStr && (
-                    <div className="text-ink-55 text-[10px] font-mono" title={`结算落库时间: ${activeMarker.settledAt}`}>
-                      结: {activeMarker.settledAtStr}
-                    </div>
-                  )}
-                </div>
-
-                <div>
-                  <div className="text-ink-55">下注金额 / 周期</div>
-                  <div className="font-mono text-ink-95 font-medium mt-0.5">
-                    {activeMarker.amountUsdt != null ? (
-                      <span className="font-bold">{activeMarker.amountUsdt.toFixed(2)} USDT</span>
-                    ) : '--'}
-                    <span className="ml-1 px-1 rounded-pill bg-sunken text-ink-55 text-[10px]">{activeMarker.market_period}</span>
-                  </div>
-                </div>
-
-                <div>
-                  <div className="text-ink-55 flex items-center gap-1">
-                    <span>均价 / 股数</span>
-                    {activeMarker.priceKind === 'quote' && (
-                      <span className="px-1 py-0.2 rounded-pill text-[9px] font-bold bg-warning-soft text-warning border border-warning">报价</span>
-                    )}
-                  </div>
-                  <div className="font-mono text-ink-95 font-medium mt-0.5">
-                    {activeMarker.averagePrice != null ? activeMarker.averagePrice.toFixed(2) : '--'}
-                    {activeMarker.shares != null && (
-                      <span className="text-ink-55 ml-1 text-[10px]">({activeMarker.shares.toFixed(2)} 股)</span>
-                    )}
-                  </div>
-                </div>
-
-                <div>
-                  <div className="text-ink-55">结算状态 / 盈亏</div>
-                  <div className="font-mono font-medium mt-0.5">
-                    {activeMarker.win === true ? (
-                      <span className="text-positive font-bold">
-                        赢 (+{activeMarker.pnl != null ? activeMarker.pnl.toFixed(2) : '0.00'}U)
-                        {activeMarker.returnPct != null && (
-                          <span className="text-[10px] ml-1">+{activeMarker.returnPct.toFixed(1)}%</span>
+                    <div className="flex justify-between">
+                      <span className="text-ink-55">目标窗口:</span>
+                      <span className="text-ink-80 font-medium">
+                        {activeMarker.windowSpanStr}
+                        {activeMarker.windowOffsetSec != null && (
+                          <span className="text-brand ml-1 text-[10px] font-bold">(开窗+{activeMarker.windowOffsetSec}s)</span>
                         )}
                       </span>
-                    ) : activeMarker.win === false ? (
-                      <span className="text-negative font-bold">
-                        输 ({activeMarker.pnl != null ? activeMarker.pnl.toFixed(2) : '-'}U)
-                        {activeMarker.returnPct != null && (
-                          <span className="text-[10px] ml-1">{activeMarker.returnPct.toFixed(1)}%</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-ink-55">结算时间:</span>
+                      <span className="text-ink-80">
+                        {activeMarker.settledAtStr ?? '--'}
+                        {activeMarker.settleDelaySec != null && (
+                          <span className="text-ink-40 ml-1 text-[10px]" title="窗口结束后落库延时">(+${activeMarker.settleDelaySec}s)</span>
                         )}
                       </span>
-                    ) : activeMarker.settleOutcome != null ? (
-                      <span className="text-ink-80 font-bold">{activeMarker.settleOutcome}</span>
-                    ) : (
-                      <span className="text-ink-55">待结算</span>
-                    )}
+                    </div>
                   </div>
                 </div>
 
-                <div>
-                  <div className="text-ink-55">入场 BTC / 结算 BTC</div>
-                  <div className="font-mono text-ink-95 font-medium mt-0.5">
-                    {activeMarker.btcPrice != null ? `$${activeMarker.btcPrice.toLocaleString()}` : '--'}
-                    {activeMarker.settlePrice != null && (
-                      <span className="text-ink-55 ml-1 text-[10px]" title="结算参考价">
-                        (结:${activeMarker.settlePrice.toLocaleString()})
+                {/* 维度 2：交易执行与滑点 */}
+                <div className="bg-sunken/60 p-2 rounded-sm border border-line-soft space-y-1">
+                  <div className="text-[10px] font-bold text-ink-55 uppercase tracking-wider flex items-center justify-between">
+                    <span>🎯 交易执行与成本</span>
+                    <span className="text-ink-80 font-mono font-semibold">
+                      {activeMarker.amountUsdt != null ? `${activeMarker.amountUsdt.toFixed(2)} USDT` : '--'}
+                    </span>
+                  </div>
+                  <div className="space-y-0.5 font-mono">
+                    <div className="flex justify-between items-center">
+                      <span className="text-ink-55">成交均价:</span>
+                      <span className="text-ink-95 font-bold flex items-center gap-1">
+                        {activeMarker.averagePrice != null ? activeMarker.averagePrice.toFixed(3) : '--'}
+                        {activeMarker.priceKind === 'quote' && (
+                          <span className="px-1 py-0.2 rounded-pill text-[9px] font-bold bg-warning-soft text-warning border border-warning">报价</span>
+                        )}
                       </span>
-                    )}
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-ink-55">委托/股数:</span>
+                      <span className="text-ink-80">
+                        {activeMarker.quotedAvgPrice != null ? `原报:${activeMarker.quotedAvgPrice.toFixed(3)} · ` : ''}
+                        {activeMarker.shares != null ? `${activeMarker.shares.toFixed(2)} 股` : '--'}
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-ink-55">执行滑点:</span>
+                      <span>
+                        {activeMarker.priceSlippage != null ? (
+                          <span className={activeMarker.priceSlippage > 0 ? 'text-negative font-bold' : activeMarker.priceSlippage < 0 ? 'text-positive font-bold' : 'text-ink-55'}>
+                            {activeMarker.priceSlippage > 0 ? `+${activeMarker.priceSlippage.toFixed(3)}(滑点)` : `${activeMarker.priceSlippage.toFixed(3)}(更优)`}
+                          </span>
+                        ) : '--'}
+                      </span>
+                    </div>
                   </div>
                 </div>
 
-                <div>
-                  <div className="text-ink-55">币安单号 / 领奖状态</div>
-                  <div className="font-mono text-ink-80 mt-0.5 truncate" title={activeMarker.orderId ?? '--'}>
-                    {activeMarker.orderId ? `${activeMarker.orderId.slice(0, 10)}…` : '--'}
-                    {activeMarker.redeemedAt ? (
-                      <span className="text-positive text-[10px] ml-1">✓已领奖</span>
-                    ) : activeMarker.win ? (
-                      <span className="text-warning text-[10px] ml-1">待领奖</span>
-                    ) : null}
+                {/* 维度 3：结算胜负与投资回报 */}
+                <div className="bg-sunken/60 p-2 rounded-sm border border-line-soft space-y-1">
+                  <div className="text-[10px] font-bold text-ink-55 uppercase tracking-wider flex items-center justify-between">
+                    <span>📊 结算与投资回报</span>
+                    <span className="font-mono font-bold">
+                      {activeMarker.win === true ? (
+                        <span className="text-positive">✓ 获胜</span>
+                      ) : activeMarker.win === false ? (
+                        <span className="text-negative">✗ 告负</span>
+                      ) : (
+                        <span className="text-ink-55">待结算</span>
+                      )}
+                    </span>
+                  </div>
+                  <div className="space-y-0.5 font-mono">
+                    <div className="flex justify-between items-center">
+                      <span className="text-ink-55">净盈亏 / 收益率:</span>
+                      <span className={activeMarker.win === true ? 'text-positive font-bold' : activeMarker.win === false ? 'text-negative font-bold' : 'text-ink-80'}>
+                        {activeMarker.pnl != null ? `${activeMarker.pnl > 0 ? '+' : ''}${activeMarker.pnl.toFixed(2)}U` : '--'}
+                        {activeMarker.returnPct != null && (
+                          <span className="ml-1 text-[10px]">({activeMarker.returnPct > 0 ? '+' : ''}${activeMarker.returnPct.toFixed(1)}%)</span>
+                        )}
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-ink-55">窗口胜出方向:</span>
+                      <span className="font-bold text-ink-95">
+                        {activeMarker.settleOutcome ?? '等待结果'}
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-ink-55">领奖兑现:</span>
+                      <span className="text-ink-80">
+                        {activeMarker.redeemedAt ? (
+                          <span className="text-positive font-bold">✓ 奖金已到账</span>
+                        ) : activeMarker.win === true ? (
+                          <span className="text-warning font-bold">待系统批量领取</span>
+                        ) : '--'}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* 维度 4：入场时刻行情与结算比对 */}
+                <div className="bg-sunken/60 p-2 rounded-sm border border-line-soft space-y-1">
+                  <div className="text-[10px] font-bold text-ink-55 uppercase tracking-wider flex items-center justify-between">
+                    <span>📈 BTC行情对照</span>
+                    <span className="text-ink-55 font-mono truncate max-w-[120px]" title={activeMarker.orderId ?? ''}>
+                      单号: {activeMarker.orderId ? activeMarker.orderId.slice(0, 8) + '…' : '--'}
+                    </span>
+                  </div>
+                  <div className="space-y-0.5 font-mono">
+                    <div className="flex justify-between">
+                      <span className="text-ink-55">下单对应 BTC:</span>
+                      <span className="text-ink-95 font-bold">
+                        {activeMarker.btcPrice != null ? `$${activeMarker.btcPrice.toLocaleString()}` : '--'}
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-ink-55">结算终盘 BTC:</span>
+                      <span className="text-ink-95 font-medium">
+                        {activeMarker.settlePrice != null ? `$${activeMarker.settlePrice.toLocaleString()}` : '--'}
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-ink-55">周期内 BTC 变动:</span>
+                      <span>
+                        {activeMarker.btcPriceDiff != null ? (
+                          <span className={activeMarker.btcPriceDiff >= 0 ? 'text-positive font-bold' : 'text-negative font-bold'}>
+                            {activeMarker.btcPriceDiff >= 0 ? `+$${activeMarker.btcPriceDiff.toFixed(1)}` : `-$${Math.abs(activeMarker.btcPriceDiff).toFixed(1)}`}
+                            {activeMarker.btcPriceDiffPct != null && (
+                              <span className="ml-1 text-[10px]">({activeMarker.btcPriceDiffPct >= 0 ? '+' : ''}${activeMarker.btcPriceDiffPct.toFixed(2)}%)</span>
+                            )}
+                          </span>
+                        ) : '--'}
+                      </span>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -1378,15 +1453,20 @@ function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[
                                 <span className="font-bold text-white font-mono">
                                   #{String(matchedOrder.id)} {matchedOrder.channelName}
                                 </span>
-                                <span className={`px-1.5 py-0.2 rounded-pill font-bold text-[10px] ${
-                                  matchedOrder.direction === 'UP' ? 'bg-positive text-white' : 'bg-negative text-white'
-                                }`}>
-                                  {matchedOrder.direction}
-                                </span>
+                                <div className="flex items-center gap-1">
+                                  <span className="px-1.5 py-0.2 rounded-pill bg-brand/80 text-white font-mono font-bold text-[10px]">
+                                    {matchedOrder.market_period} ({matchedOrder.periodDurationMin}m)
+                                  </span>
+                                  <span className={`px-1.5 py-0.2 rounded-pill font-bold text-[10px] ${
+                                    matchedOrder.direction === 'UP' ? 'bg-positive text-white' : 'bg-negative text-white'
+                                  }`}>
+                                    {matchedOrder.direction}
+                                  </span>
+                                </div>
                               </div>
 
-                              {/* 详细时间信息 */}
-                              <div className="bg-black/25 px-2 py-1 rounded text-[11px] font-mono space-y-0.5 border border-white/10">
+                              {/* 详细时间与周期信息 */}
+                              <div className="bg-black/30 px-2 py-1.5 rounded text-[11px] font-mono space-y-0.5 border border-white/10">
                                 <div className="text-white flex items-center justify-between">
                                   <span className="text-ink-55">下单时间:</span>
                                   <span className="font-bold text-positive">{matchedOrder.createdAtStr}</span>
@@ -1398,30 +1478,51 @@ function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[
                                     {matchedOrder.windowOffsetSec != null ? ` (开窗+${matchedOrder.windowOffsetSec}s)` : ''}
                                   </span>
                                 </div>
-                                {matchedOrder.settledAtStr && (
-                                  <div className="flex items-center justify-between text-[10px] text-ink-55">
-                                    <span>结算时间:</span>
-                                    <span className="text-ink-80">{matchedOrder.settledAtStr}</span>
-                                  </div>
-                                )}
+                                <div className="flex items-center justify-between text-[10px] text-ink-55">
+                                  <span>结算周期:</span>
+                                  <span className="text-ink-80">
+                                    {matchedOrder.market_period} 周期
+                                    {matchedOrder.settledAtStr ? ` · 结: ${matchedOrder.settledAtStr}` : ' · 待结算'}
+                                    {matchedOrder.settleDelaySec != null ? ` (+${matchedOrder.settleDelaySec}s)` : ''}
+                                  </span>
+                                </div>
                               </div>
 
+                              {/* 执行与结算指标网格 */}
                               <div className="grid grid-cols-2 gap-x-2 gap-y-0.5 text-[11px] font-mono">
                                 <div>状态: <span className={matchedOrder.status === 'FILLED' ? 'text-positive font-bold' : 'text-negative font-bold'}>{matchedOrder.status}</span></div>
                                 <div>金额: <span className="font-bold">{matchedOrder.amountUsdt != null ? `${matchedOrder.amountUsdt.toFixed(2)}U` : '--'}</span></div>
-                                <div>均价: <span>{matchedOrder.averagePrice != null ? matchedOrder.averagePrice.toFixed(2) : '--'}{matchedOrder.priceKind === 'quote' ? '(报价)' : ''}</span></div>
+                                <div>均价: <span>{matchedOrder.averagePrice != null ? matchedOrder.averagePrice.toFixed(3) : '--'}{matchedOrder.priceKind === 'quote' ? '(报价)' : ''}</span></div>
+                                <div>滑点: <span>
+                                  {matchedOrder.priceSlippage != null ? (
+                                    <span className={matchedOrder.priceSlippage > 0 ? 'text-negative font-bold' : 'text-positive font-bold'}>
+                                      {matchedOrder.priceSlippage > 0 ? `+${matchedOrder.priceSlippage.toFixed(3)}` : `${matchedOrder.priceSlippage.toFixed(3)}`}
+                                    </span>
+                                  ) : '--'}
+                                </span></div>
+                                <div>股数: <span>{matchedOrder.shares != null ? `${matchedOrder.shares.toFixed(2)} 股` : '--'}</span></div>
                                 <div>盈亏: <span className={matchedOrder.win === true ? 'text-positive font-bold' : matchedOrder.win === false ? 'text-negative font-bold' : 'text-white/60'}>
                                   {matchedOrder.win === true ? `+${matchedOrder.pnl?.toFixed(2)}U` : matchedOrder.win === false ? `${matchedOrder.pnl?.toFixed(2)}U` : '待结算'}
+                                  {matchedOrder.returnPct != null && (
+                                    <span className="ml-1 text-[10px]">({matchedOrder.returnPct > 0 ? '+' : ''}${matchedOrder.returnPct.toFixed(1)}%)</span>
+                                  )}
                                 </span></div>
-                                {matchedOrder.shares != null && (
-                                  <div>份额: <span>{matchedOrder.shares.toFixed(2)} 股</span></div>
-                                )}
-                                {matchedOrder.settlePrice != null && (
-                                  <div>结算价: <span>${matchedOrder.settlePrice.toLocaleString()}</span></div>
+                                <div>入场BTC: <span>{matchedOrder.btcPrice != null ? `$${matchedOrder.btcPrice.toLocaleString()}` : '--'}</span></div>
+                                <div>结算BTC: <span>{matchedOrder.settlePrice != null ? `$${matchedOrder.settlePrice.toLocaleString()}` : '--'}</span></div>
+                                {matchedOrder.btcPriceDiff != null && (
+                                  <div className="col-span-2 text-[10px]">
+                                    BTC变动: <span className={matchedOrder.btcPriceDiff >= 0 ? 'text-positive font-bold' : 'text-negative font-bold'}>
+                                      {matchedOrder.btcPriceDiff >= 0 ? `+$${matchedOrder.btcPriceDiff.toFixed(1)}` : `-$${Math.abs(matchedOrder.btcPriceDiff).toFixed(1)}`}
+                                      {matchedOrder.btcPriceDiffPct != null && ` (${matchedOrder.btcPriceDiffPct >= 0 ? '+' : ''}${matchedOrder.btcPriceDiffPct.toFixed(2)}%)`}
+                                    </span>
+                                    {matchedOrder.settleOutcome && (
+                                      <span className="text-white/80 ml-2">终盘胜出: <b className="text-white">{matchedOrder.settleOutcome}</b></span>
+                                    )}
+                                  </div>
                                 )}
                               </div>
                               {matchedOrder.errorMessage && (
-                                <div className="text-negative text-[10px] leading-tight break-all">
+                                <div className="text-negative text-[10px] leading-tight break-all border-t border-white/10 pt-1">
                                   原因: {matchedOrder.errorMessage}
                                 </div>
                               )}
@@ -1544,7 +1645,7 @@ function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[
                                 </span>
                               </div>
 
-                              <div className="bg-black/25 px-2 py-1 rounded text-[11px] font-mono space-y-0.5 border border-white/10">
+                              <div className="bg-black/30 px-2 py-1.5 rounded text-[11px] font-mono space-y-0.5 border border-white/10">
                                 <div className="text-white flex items-center justify-between">
                                   <span className="text-ink-55">下单时间:</span>
                                   <span className="font-bold text-positive">{matchedOrder.createdAtStr}</span>
@@ -1556,15 +1657,35 @@ function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[
                                     {matchedOrder.windowOffsetSec != null ? ` (开窗+${matchedOrder.windowOffsetSec}s)` : ''}
                                   </span>
                                 </div>
+                                <div className="flex items-center justify-between text-[10px] text-ink-55">
+                                  <span>结算周期:</span>
+                                  <span className="text-ink-80">
+                                    {matchedOrder.market_period} 周期 ({matchedOrder.periodDurationMin}m)
+                                    {matchedOrder.settledAtStr ? ` · 结: ${matchedOrder.settledAtStr}` : ' · 待结算'}
+                                  </span>
+                                </div>
                               </div>
 
                               <div className="grid grid-cols-2 gap-x-2 gap-y-0.5 text-[11px] font-mono">
                                 <div>状态: <span className={matchedOrder.status === 'FILLED' ? 'text-positive font-bold' : 'text-negative font-bold'}>{matchedOrder.status}</span></div>
                                 <div>金额: <span className="font-bold">{matchedOrder.amountUsdt != null ? `${matchedOrder.amountUsdt.toFixed(2)}U` : '--'}</span></div>
-                                <div>均价: <span>{matchedOrder.averagePrice != null ? matchedOrder.averagePrice.toFixed(2) : '--'}{matchedOrder.priceKind === 'quote' ? '(报价)' : ''}</span></div>
+                                <div>均价: <span>{matchedOrder.averagePrice != null ? matchedOrder.averagePrice.toFixed(3) : '--'}{matchedOrder.priceKind === 'quote' ? '(报价)' : ''}</span></div>
+                                <div>滑点: <span>
+                                  {matchedOrder.priceSlippage != null ? (
+                                    <span className={matchedOrder.priceSlippage > 0 ? 'text-negative font-bold' : 'text-positive font-bold'}>
+                                      {matchedOrder.priceSlippage > 0 ? `+${matchedOrder.priceSlippage.toFixed(3)}` : `${matchedOrder.priceSlippage.toFixed(3)}`}
+                                    </span>
+                                  ) : '--'}
+                                </span></div>
                                 <div>盈亏: <span className={matchedOrder.win === true ? 'text-positive font-bold' : matchedOrder.win === false ? 'text-negative font-bold' : 'text-white/60'}>
                                   {matchedOrder.win === true ? `+${matchedOrder.pnl?.toFixed(2)}U` : matchedOrder.win === false ? `${matchedOrder.pnl?.toFixed(2)}U` : '待结算'}
+                                  {matchedOrder.returnPct != null && (
+                                    <span className="ml-1 text-[10px]">({matchedOrder.returnPct > 0 ? '+' : ''}${matchedOrder.returnPct.toFixed(1)}%)</span>
+                                  )}
                                 </span></div>
+                                {matchedOrder.shares != null && (
+                                  <div>股数: <span>{matchedOrder.shares.toFixed(2)} 股</span></div>
+                                )}
                               </div>
                             </div>
                           )}
