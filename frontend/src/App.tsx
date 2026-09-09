@@ -533,11 +533,11 @@ const api = {
   postSyncBinance: () => authFetch('/api/trades/sync-binance', { method: 'POST' }).then(r => r.json()),
   // 奖金领取（2026-08-23）：可领查询 + batch-redeem
   getRedeemable: () => authFetch('/api/prediction/redeemable').then(r => r.json()),
-  postRedeem: () =>
+  postRedeem: (tokenIds?: string[]) =>
     authFetch('/api/prediction/redeem', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
+      body: JSON.stringify(tokenIds && tokenIds.length > 0 ? { token_ids: tokenIds } : {}),
     }).then(r => r.json()),
 }
 
@@ -2908,6 +2908,7 @@ function LiveTradeTab() {
   const [redeemable, setRedeemable] = useState<Record<string, unknown> | null>(null)
   const [redeeming, setRedeeming] = useState(false)
   const [redeemResult, setRedeemResult] = useState<Record<string, unknown> | null>(null)
+  const [showRedeemDetails, setShowRedeemDetails] = useState(false)
   // 通道盈亏与 ROI 数据（2026-09-09：在实盘通道卡片中直观映射实盘战绩与盈利率）
   const [pnlData, setPnlData] = useState<PnlCurveData | null>(null)
 
@@ -3122,14 +3123,17 @@ function LiveTradeTab() {
     }
   }
 
-  const handleRedeem = async () => {
-    const n = Number(redeemable?.claimable_count ?? 0)
+  const handleRedeem = async (tokenIds?: string[]) => {
+    const n = tokenIds ? tokenIds.length : Number(redeemable?.claimable_count ?? 0)
     if (n <= 0) return
-    if (!window.confirm(`确认领取 ${n} 个获胜 token 的奖金？\n（batch-redeem 赎回后入预测钱包 USDT 余额）`)) return
+    const msg = tokenIds
+      ? `确认领取选中的 ${n} 笔获胜 token 奖金？\n（batch-redeem 赎回后入预测钱包 USDT 余额）`
+      : `确认领取全部 ${n} 个获胜 token 的奖金？\n（batch-redeem 赎回后入预测钱包 USDT 余额）`
+    if (!window.confirm(msg)) return
     setRedeeming(true)
     setRedeemResult(null)
     try {
-      const res = await api.postRedeem()
+      const res = await api.postRedeem(tokenIds)
       setRedeemResult(res)
       refresh()
     } catch (e) {
@@ -3138,6 +3142,25 @@ function LiveTradeTab() {
       setRedeeming(false)
     }
   }
+
+  const claimableCount = Number(redeemable?.claimable_count ?? 0)
+  const totalEstPayout = typeof redeemable?.total_est_payout === 'number' ? (redeemable.total_est_payout as number) : 0
+  const redeemDetails = Array.isArray(redeemable?.details) ? (redeemable.details as Array<{
+    order_id: number
+    token_id: string
+    signal_version: string | null
+    market_period: string
+    direction: string | null
+    amount_usdt: number
+    pnl: number
+    est_payout: number
+    settle_price: number | null
+    settled_at: string | null
+    created_at: string | null
+    is_in_wallet: boolean
+    can_claim: boolean
+  }>) : []
+  const positionsPreview = Array.isArray(redeemable?.positions_preview) ? (redeemable.positions_preview as Array<Record<string, unknown>>) : []
 
   return (
     <>
@@ -3179,24 +3202,167 @@ function LiveTradeTab() {
               : <span className="text-ink-55">--</span>}
           </div>
           {/* 可领取奖金：赢单 token 需手动 batch-redeem 才变 USDT（官方链路） */}
-          <div className="flex justify-between gap-2 items-center">
+          <div className="flex justify-between gap-2 items-center flex-wrap">
             <span className="text-ink-55 shrink-0 flex items-center">
               可领取奖金
               <HelpHint text="赢单的奖金以获胜 token 形式留在链上钱包，不会自动变成 USDT；需要调官方 batch-redeem 赎回后才入预测钱包余额。赢单后记得来这里领取。" />
             </span>
-            {Number(redeemable?.claimable_count ?? 0) > 0
-              ? <span className="flex items-center gap-2">
-                  <span className="font-mono font-semibold text-warning">
-                    {String(redeemable?.claimable_count)} 个 token 待领取
-                    {redeemable?.wallet_source === 'degraded' && <span className="text-ink-55 font-normal">（钱包查询降级，含本地兑底）</span>}
-                  </span>
-                  <button
-                    onClick={handleRedeem} disabled={redeeming}
-                    className="px-3 py-1 text-xs font-semibold rounded-pill bg-warning text-white disabled:opacity-50"
-                  >{redeeming ? '领取中…' : '领取奖金'}</button>
+            {claimableCount > 0 ? (
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="font-mono font-semibold text-warning flex items-center gap-1.5">
+                  <span>{claimableCount} 笔待领</span>
+                  {totalEstPayout > 0 && (
+                    <span className="text-positive font-bold">（预计回款 ~{totalEstPayout.toFixed(2)} USDT）</span>
+                  )}
+                  {redeemable?.wallet_source === 'degraded' && (
+                    <span className="text-[10px] text-ink-55 font-normal">（钱包查询降级，本地兑底）</span>
+                  )}
                 </span>
-              : <span className="text-ink-55">--</span>}
+                <button
+                  type="button"
+                  onClick={() => setShowRedeemDetails(!showRedeemDetails)}
+                  className="px-2 py-0.5 text-xs font-semibold rounded-pill border border-line bg-card text-ink-80 hover:border-brand hover:text-brand transition-colors"
+                >
+                  明细 {showRedeemDetails ? '▲' : '▼'}
+                </button>
+                <button
+                  onClick={() => handleRedeem()} disabled={redeeming}
+                  className="px-3 py-1 text-xs font-semibold rounded-pill bg-warning text-white hover:bg-warning-hover disabled:opacity-50 transition-colors"
+                >
+                  {redeeming ? '领取中…' : '领取全部奖金'}
+                </button>
+              </div>
+            ) : (
+              <div className="flex items-center gap-2">
+                <span className="text-ink-55">--</span>
+                {redeemDetails.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setShowRedeemDetails(!showRedeemDetails)}
+                    className="text-[11px] text-ink-55 hover:text-brand underline cursor-pointer"
+                  >
+                    查看对账明细 ({redeemDetails.length}) {showRedeemDetails ? '▲' : '▼'}
+                  </button>
+                )}
+              </div>
+            )}
           </div>
+
+          {/* 可领取奖金细节展开面板 */}
+          {showRedeemDetails && (
+            <div className="bg-sunken border border-warning/30 rounded-sm p-2.5 my-2 space-y-2 text-xs">
+              <div className="flex items-center justify-between gap-2 border-b border-line-soft pb-1.5 flex-wrap">
+                <div className="flex items-center gap-2">
+                  <span className="font-bold text-ink-95">获胜待领 Token 细节对账清单</span>
+                  <span className="text-[10px] text-ink-55">
+                    共 {redeemDetails.length} 笔记录（{claimableCount} 笔链上可赎）
+                  </span>
+                </div>
+                {claimableCount > 0 && (
+                  <div className="text-[11px] font-mono text-ink-80">
+                    总回款预估：<span className="text-positive font-bold font-mono">+{totalEstPayout.toFixed(2)} USDT</span>
+                  </div>
+                )}
+              </div>
+
+              {redeemDetails.length === 0 ? (
+                <p className="text-ink-55 py-2 text-center">暂无待领取的获胜订单</p>
+              ) : (
+                <div className="overflow-x-auto max-h-56 overflow-y-auto">
+                  <table className="w-full text-left">
+                    <thead className="sticky top-0 bg-sunken text-[11px] text-ink-55 border-b border-line-soft">
+                      <tr>
+                        <th className="py-1 pr-2">订单 / 周期</th>
+                        <th className="py-1 pr-2">信号通道</th>
+                        <th className="py-1 pr-2">方向</th>
+                        <th className="py-1 pr-2 text-right">投入</th>
+                        <th className="py-1 pr-2 text-right">净收益</th>
+                        <th className="py-1 pr-2 text-right">预计兑付</th>
+                        <th className="py-1 pr-2">Token ID</th>
+                        <th className="py-1 pr-2">状态</th>
+                        <th className="py-1 text-right">操作</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-line-soft font-mono">
+                      {redeemDetails.map(d => {
+                        const info = d.signal_version ? SIGNAL_INFO[d.signal_version] : null
+                        const name = info?.name ?? d.signal_version ?? '人工/未知'
+                        const isClaimable = d.can_claim
+                        return (
+                          <tr key={d.order_id} className="hover:bg-card/50 transition-colors">
+                            <td className="py-1.5 pr-2">
+                              <span className="font-bold text-ink-95">#{d.order_id}</span>
+                              <span className="ml-1 px-1 rounded-pill bg-card text-[9px] text-ink-55 border border-line">
+                                {d.market_period}
+                              </span>
+                            </td>
+                            <td className="py-1.5 pr-2 font-sans text-ink-95 truncate max-w-[140px]" title={d.signal_version ?? ''}>
+                              {name}
+                            </td>
+                            <td className="py-1.5 pr-2">
+                              <span className={`px-1 py-0.5 rounded-sm text-[10px] font-bold ${d.direction === 'UP' ? 'bg-positive-soft text-positive' : 'bg-negative-soft text-negative'}`}>
+                                {d.direction ?? '--'}
+                              </span>
+                            </td>
+                            <td className="py-1.5 pr-2 text-right text-ink-80">
+                              {d.amount_usdt.toFixed(2)}U
+                            </td>
+                            <td className="py-1.5 pr-2 text-right text-positive font-bold">
+                              +{d.pnl.toFixed(2)}U
+                            </td>
+                            <td className="py-1.5 pr-2 text-right text-warning font-bold">
+                              {d.est_payout.toFixed(2)}U
+                            </td>
+                            <td className="py-1.5 pr-2 text-[10px] text-ink-55">
+                              <span title={d.token_id} className="cursor-help underline decoration-dotted">
+                                {d.token_id ? `${d.token_id.slice(0, 6)}…${d.token_id.slice(-4)}` : '--'}
+                              </span>
+                            </td>
+                            <td className="py-1.5 pr-2 font-sans">
+                              {isClaimable ? (
+                                <span className="px-1.5 py-0.5 text-[9px] font-bold rounded-pill bg-positive-soft text-positive border border-positive/30">
+                                  可赎回
+                                </span>
+                              ) : (
+                                <span className="px-1.5 py-0.5 text-[9px] font-normal rounded-pill bg-card text-ink-55 border border-line" title="链上已无持仓或已完成兑换">
+                                  链上已结
+                                </span>
+                              )}
+                            </td>
+                            <td className="py-1.5 text-right">
+                              {isClaimable ? (
+                                <button
+                                  type="button"
+                                  disabled={redeeming}
+                                  onClick={() => handleRedeem([d.token_id])}
+                                  className="px-2 py-0.5 text-[10px] font-bold rounded-pill bg-warning text-white hover:bg-warning-hover disabled:opacity-40"
+                                >
+                                  单笔领
+                                </button>
+                              ) : (
+                                <span className="text-ink-55 text-[10px] font-sans">已完结</span>
+                              )}
+                            </td>
+                          </tr>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              <div className="pt-1 border-t border-line-soft text-[10px] text-ink-55 leading-relaxed flex items-center justify-between flex-wrap gap-1">
+                <span>
+                  💡 官方机制：每个获胜的预测合约结算后兑现为 1 USDT。链上作为获胜 Token 存留，点击领取时调用官方 batch-redeem 接口销毁 Token 并划入预测钱包余额。
+                </span>
+                {positionsPreview.length > 0 && (
+                  <span className="text-ink-80 font-mono">
+                    链上原始持仓: {positionsPreview.length} 项
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
           {redeemResult && (
             <div className={`text-xs px-2 py-1 rounded-sm break-all ${redeemResult.status === 'SUCCESS' ? 'bg-positive-soft text-positive' : redeemResult.status === 'NOOP' ? 'bg-sunken text-ink-55' : 'bg-negative-soft text-negative'}`}>
               {redeemResult.status === 'SUCCESS'

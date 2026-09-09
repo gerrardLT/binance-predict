@@ -1282,8 +1282,16 @@ async def test_prediction_redeemable_merges_sources(monkeypatch) -> None:
     monkeypatch.setattr(m.prediction_trader, "last_pending_error", None)
     monkeypatch.setattr(m.prediction_trader, "last_pending_raw", '{"positions":[...]}')
 
-    row = SimpleNamespace(id=13, token_id="T-13")   # DB 与钱包重叠
-    row2 = SimpleNamespace(id=14, token_id="T-14")  # DB 独有（链上无 → 不得计入可领）
+    row = SimpleNamespace(
+        id=13, token_id="T-13", signal_version="quote_contrarian_v2",
+        market_period="5m", direction="DOWN", amount_in="2000000000000000000",
+        pnl=4.0, settle_price=78000.0, settled_at=None, created_at=None,
+    )   # DB 与钱包重叠
+    row2 = SimpleNamespace(
+        id=14, token_id="T-14", signal_version="scene_bull_exhaust",
+        market_period="15m", direction="UP", amount_in="1000000000000000000",
+        pnl=1.5, settle_price=78100.0, settled_at=None, created_at=None,
+    )  # DB 独有（链上无 → 不得计入可领）
     db = AsyncMock()
     result = MagicMock()
     result.all.return_value = [row, row2]
@@ -1303,6 +1311,10 @@ async def test_prediction_redeemable_merges_sources(monkeypatch) -> None:
     assert out["claimable_count"] == 1
     assert out["wallet_source"] == "ok"
     assert out["db_win_unclaimed_ids"] == [13, 14]
+    assert out["total_est_payout"] == 6.0  # 2.0 + 4.0
+    assert len(out["details"]) == 2
+    assert out["details"][0]["can_claim"] is True
+    assert out["details"][1]["can_claim"] is False
 
     # 官方端点降级：DB 源兜底
     async def _fail():
@@ -1312,6 +1324,7 @@ async def test_prediction_redeemable_merges_sources(monkeypatch) -> None:
     out2 = await m.prediction_redeemable(_=None)
     assert out2["wallet_source"] == "degraded"
     assert out2["claimable_tokens"] == ["T-13", "T-14"]
+    assert out2["total_est_payout"] == 8.5  # (2+4) + (1+1.5)
 
 
 @pytest.mark.asyncio

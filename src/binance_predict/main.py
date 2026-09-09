@@ -2696,11 +2696,23 @@ async def prediction_redeemable(_: None = Depends(_require_auth)):
 
     async with async_session_factory() as db:
         rows = (await db.execute(
-            select(TradeOrderModel.id, TradeOrderModel.token_id)
+            select(
+                TradeOrderModel.id,
+                TradeOrderModel.token_id,
+                TradeOrderModel.signal_version,
+                TradeOrderModel.market_period,
+                TradeOrderModel.direction,
+                TradeOrderModel.amount_in,
+                TradeOrderModel.pnl,
+                TradeOrderModel.settle_price,
+                TradeOrderModel.settled_at,
+                TradeOrderModel.created_at,
+            )
             .where(TradeOrderModel.win.is_(True))
             .where(TradeOrderModel.redeemed_at.is_(None))
             .where(TradeOrderModel.token_id.isnot(None))
             .where(TradeOrderModel.token_id != "")
+            .order_by(TradeOrderModel.id.desc())
         )).all()
     db_tokens = [r.token_id for r in rows]
 
@@ -2711,9 +2723,37 @@ async def prediction_redeemable(_: None = Depends(_require_auth)):
         # 钱包查询成功：链上事实为权威。DB 中链上已赎回/不可赎的 token
         # 不得计入可领（否则送去 batch-redeem 会触发币安 400 -9000 SYSTEM_ERROR）
         merged = wallet_tokens
+
+    details = []
+    for r in rows:
+        amt = round(float(getattr(r, "amount_in", 0) or 0) / 1e18, 4)
+        pnl_val = float(getattr(r, "pnl", 0) or 0) if getattr(r, "pnl", None) is not None else 0.0
+        est_payout = round(amt + pnl_val, 4) if (amt + pnl_val) > 0 else amt
+        is_in_wallet = r.token_id in wallet_tokens
+        can_claim = (r.token_id in merged)
+        details.append({
+            "order_id": r.id,
+            "token_id": r.token_id,
+            "signal_version": getattr(r, "signal_version", None),
+            "market_period": getattr(r, "market_period", "5m"),
+            "direction": getattr(r, "direction", None),
+            "amount_usdt": amt,
+            "pnl": pnl_val,
+            "est_payout": est_payout,
+            "settle_price": getattr(r, "settle_price", None),
+            "settled_at": r.settled_at.isoformat() if getattr(r, "settled_at", None) else None,
+            "created_at": r.created_at.isoformat() if getattr(r, "created_at", None) else None,
+            "is_in_wallet": is_in_wallet,
+            "can_claim": can_claim,
+        })
+
+    total_est_payout = round(sum(d["est_payout"] for d in details if d["can_claim"]), 4)
+
     return {
         "claimable_count": len(merged),
         "claimable_tokens": merged,
+        "total_est_payout": total_est_payout,
+        "details": details,
         "wallet_source": "ok" if positions is not None else "degraded",
         "db_win_unclaimed_ids": [r.id for r in rows],
         "positions_preview": (positions or [])[:10],
