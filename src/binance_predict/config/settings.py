@@ -417,6 +417,12 @@ class Settings(BaseSettings):
     # 信号一致，部署即生效；仅作紧急停用制动力，正常情况下无需触碰。
     s2_cond_shadow_enabled: bool = True
 
+    # --- 15m 经典孕线上吊线/倒垂线反转（rev2 族，2026-09-09）---
+    # 720d 全样本实证：明显极值高低点 + 最长实体 + 孕线完全包裹，上吊线胜率 56.6%（30d 65.4%），
+    # 倒垂线胜率 52.5%（30d 62.5%）。最佳挂单价格 0.30 护栏（单笔期望 EV +18.3%，成交率 65.7%）。
+    # 影子只记录不下注，落表 kline_shadow_signals，与实盘通道 hm_inside_15m_v2 / ih_inside_15m_v2 挂钩。
+    rev2_inside_shadow_enabled: bool = True
+
     # --- 多通道实盘（MultiLiveTrader，2026-08-24，取代旧单版本 quote_edge 实盘字段）---
     # 13 通道（quote_edge 族 1：contrarian_v2；x4 × 2：x4_v2/x4_v3；
     # 场景 5：S1/S2/S4/S5 + s5_deep；2026-09-06 影子 promote 5：

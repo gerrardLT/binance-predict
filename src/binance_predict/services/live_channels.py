@@ -217,6 +217,18 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
         "g7_t270_v1", "firsthit", "5m", "DOWN", 0.10,
         "首触G7+非极晚 t≤270s（押DOWN）",
     ),
+    # --- rev2 族（2026-09-09 孕线反转）：15m 上吊线/倒垂线 + 最长实体 + 孕线包裹 ---
+    # 依据：720d 全样本实证，最佳挂单护栏为 0.30（单笔期望 EV +18.3%，成交率 65.7%，收益最高）
+    # hm_inside_15m_v2：近4根高点大实体阳线 + 包裹长下影上吊线 -> 押次根 15m 收阴 DOWN（720d 胜率 56.6%，30d 胜率 65.4%）
+    # ih_inside_15m_v2：近4根低点大实体阴线 + 包裹长上影倒垂线 -> 押次根 15m 收阳 UP（720d 胜率 52.5%，30d 胜率 62.5%）
+    "hm_inside_15m_v2": ChannelSpec(
+        "hm_inside_15m_v2", "nextbar", "15m", "DOWN", 0.30,
+        "15m孕线上吊线反转（押DOWN）",
+    ),
+    "ih_inside_15m_v2": ChannelSpec(
+        "ih_inside_15m_v2", "nextbar", "15m", "UP", 0.30,
+        "15m孕线倒垂线反转（押UP）",
+    ),
 }
 
 

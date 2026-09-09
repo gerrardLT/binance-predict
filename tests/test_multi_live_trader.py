@@ -185,12 +185,12 @@ def _stub_select_db(monkeypatch, rows: list) -> None:
 # ============================================================
 
 def test_parse_defaults_all_off(monkeypatch) -> None:
-    """默认：全 24 在线通道 OFF、金额/日限取全局默认（用户拍板 2U / 100 单）。"""
+    """默认：全 26 在线通道 OFF、金额/日限取全局默认（用户拍板 2U / 100 单）。"""
     monkeypatch.setattr(settings, "live_default_amount_usdt", 2.0)
     monkeypatch.setattr(settings, "live_default_max_daily_orders", 100)
     monkeypatch.setattr(settings, "live_channels_json", "")
     cfgs = parse_channel_config()
-    assert len(cfgs) == 24  # G0/G1/G3+G4+G7 族 6 变体 + late_night v2 = 11 firsthit+quote_edge+...
+    assert len(cfgs) == 26  # G0/G1/G3+G4+G7 族 6 变体 + late_night v2 + 15m Ver2 双通道 = 26
     assert all(not c.enabled for c in cfgs.values())
     assert all(c.amount_usdt == 2.0 for c in cfgs.values())
     assert all(c.max_daily_orders == 100 for c in cfgs.values())
@@ -283,7 +283,7 @@ def test_parse_non_int_daily_rejected(monkeypatch) -> None:
 
 
 def test_channels_registry_shape() -> None:
-    """注册表形状（2026-09-08 late_night_contrarian_v2 接入后）：24 在线 + 8 退役，两者不交。"""
+    """注册表形状（2026-09-09 15m Ver2 接入后）：26 在线 + 8 退役，两者不交。"""
     assert set(LIVE_CHANNELS) == {
         "quote_contrarian_v2",
         "late_night_contrarian_v2",
@@ -303,6 +303,8 @@ def test_channels_registry_shape() -> None:
         # 2026-09-08 firsthit G7 系列六通道（默认全 OFF，用户确认独立下单）
         "firsthit_down_g7_v1", "g7_streak_v1", "g7_wick20_v1",
         "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",
+        # 2026-09-09 15m 经典孕线反转双通道（默认全 OFF）
+        "hm_inside_15m_v2", "ih_inside_15m_v2",
     }
     assert set(RETIRED_CHANNELS) == {
         "quote_momentum_v1", "quote_contrarian_v1",
@@ -317,6 +319,12 @@ def test_channels_registry_shape() -> None:
     assert by["quote_contrarian_v2"].market_period == "5m"
     assert by["quote_contrarian_v2"].v2_guard == "max_rise"
     assert by["quote_contrarian_v2"].auto_max_exec == 0.28
+    assert by["hm_inside_15m_v2"].market_period == "15m"
+    assert by["hm_inside_15m_v2"].direction == "DOWN"
+    assert by["hm_inside_15m_v2"].auto_max_exec == 0.30
+    assert by["ih_inside_15m_v2"].market_period == "15m"
+    assert by["ih_inside_15m_v2"].direction == "UP"
+    assert by["ih_inside_15m_v2"].auto_max_exec == 0.30
     # late_night_contrarian_v2 新注册（时段门 22-24+距日高门≥0.30%）
     assert by["late_night_contrarian_v2"].market_period == "5m"
     assert by["late_night_contrarian_v2"].v2_guard == "max_rise"
@@ -1809,7 +1817,7 @@ def test_status_shape(monkeypatch) -> None:
     assert s["amount_cap"] == 50
     assert s["defaults"]["amount_usdt"] == 2.0
     assert s["defaults"]["max_daily_orders"] == 100
-    assert len(s["channels"]) == 32   # 既有 24+G7 系列 6→30，加 G4→31，再加 late_night v2→32
+    assert len(s["channels"]) == 34   # 既有 24 + G7(6) + G4(1) + late_night(1) + 15m Ver2(2) = 34
     by = {c["channel"]: c for c in s["channels"]}
     c = by["quote_contrarian_v1"]
     assert c["enabled"] is True and c["enabled_at_startup"] is True
