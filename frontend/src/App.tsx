@@ -2273,7 +2273,16 @@ function FundsFlowCard({ orders }: { orders: Record<string, unknown>[] }) {
 // 数据源 GET /api/live/pnl-curve（trade_orders 按通道分组逐单累计 pnl）
 // ============================================================
 
-interface PnlPoint { n: number; t: number; pnl: number; cum: number; win: boolean }
+interface PnlPoint {
+  n: number
+  t: number
+  pnl: number
+  cum: number
+  cost?: number
+  cum_cost?: number
+  cum_roi?: number
+  win: boolean
+}
 interface PnlChannel {
   channel: string
   display_name: string
@@ -2284,11 +2293,19 @@ interface PnlChannel {
   win_count: number
   win_rate: number | null
   total_pnl: number
+  total_cost: number
+  roi: number | null
   points: PnlPoint[]
 }
 interface PnlCurveData {
   channels: PnlChannel[]
-  total: { settled_count: number; total_pnl: number; win_rate: number | null }
+  total: {
+    settled_count: number
+    total_pnl: number
+    total_cost: number
+    win_rate: number | null
+    roi: number | null
+  }
 }
 
 // 通道曲线色板（按 total_pnl 排序后取色；12 色，通道数 >12 时按 idx % 12 循环复用）
@@ -2296,18 +2313,23 @@ interface PnlCurveData {
    第 11 条起靠渲染层的「淡色 + 细线」区分；表格图例圆点同步降透明度以保持对应。 */
 const PNL_COLORS = Array.from({ length: 10 }, (_, i) => `var(--chart-${i + 1})`)
 
-// 曲线指标切换：数据点已含 pnl/win，胜率趋势 = 截至第 n 笔的滚动胜率（前端派生）
-type PnlMetric = 'cum' | 'rate' | 'pnl'
+// 曲线指标切换：数据点已含 pnl/win，胜率趋势 = 截至第 n 笔的滚动胜率（前端派生），ROI = 滚动总收益率
+type PnlMetric = 'cum' | 'roi' | 'rate' | 'pnl'
 const PNL_METRICS: { key: PnlMetric; label: string }[] = [
   { key: 'cum', label: '累计盈亏' },
+  { key: 'roi', label: '收益率趋势(ROI)' },
   { key: 'rate', label: '胜率趋势' },
   { key: 'pnl', label: '单笔盈亏' },
 ]
+
+type PnlSortField = 'channel' | 'enabled' | 'settled_count' | 'total_cost' | 'win_rate' | 'total_pnl' | 'roi'
 
 function PnlCurveCard() {
   const [data, setData] = useState<PnlCurveData | null>(null)
   const [onlyEnabled, setOnlyEnabled] = useState(false)
   const [metric, setMetric] = useState<PnlMetric>('cum')
+  const [sortField, setSortField] = useState<PnlSortField>('roi')
+  const [sortAsc, setSortAsc] = useState(false)
   useEffect(() => {
     const load = () => api.getLivePnlCurve().then(setData).catch(() => {})
     load()
@@ -2327,17 +2349,58 @@ function PnlCurveCard() {
       const p = c.points[i]
       if (!p) { row[c.display_name] = null; continue }
       if (p.win) winSoFar[c.display_name] += 1
-      row[c.display_name] = metric === 'rate'
-        ? Math.round((winSoFar[c.display_name] / (i + 1)) * 1000) / 10
-        : metric === 'pnl' ? p.pnl : p.cum
+      if (metric === 'rate') {
+        row[c.display_name] = Math.round((winSoFar[c.display_name] / (i + 1)) * 1000) / 10
+      } else if (metric === 'roi') {
+        const curRoi = p.cum_roi != null
+          ? p.cum_roi
+          : (p.cum_cost && p.cum_cost > 0 ? p.cum / p.cum_cost : 0)
+        row[c.display_name] = Math.round(curRoi * 1000) / 10
+      } else if (metric === 'pnl') {
+        row[c.display_name] = p.pnl
+      } else {
+        row[c.display_name] = p.cum
+      }
     }
     return row
   })
   const sumPnl = chans.reduce((s, c) => s + c.total_pnl, 0)
+  const sumCost = chans.reduce((s, c) => s + (c.total_cost ?? 0), 0)
   const sumCount = chans.reduce((s, c) => s + c.settled_count, 0)
   const sumWin = chans.reduce((s, c) => s + c.win_count, 0)
+  const totalRoi = sumCost > 0 ? (sumPnl / sumCost) * 100 : null
   const statBox = 'rounded-card border border-line bg-card px-3 py-2'
   const metricLabel = PNL_METRICS.find(m => m.key === metric)?.label ?? '累计盈亏'
+
+  // 通道表格排序
+  const sortedChans = [...chans].sort((a, b) => {
+    let cmp = 0
+    if (sortField === 'channel') {
+      cmp = a.display_name.localeCompare(b.display_name)
+    } else if (sortField === 'enabled') {
+      cmp = (a.enabled === b.enabled ? 0 : a.enabled ? 1 : -1)
+    } else if (sortField === 'settled_count') {
+      cmp = a.settled_count - b.settled_count
+    } else if (sortField === 'total_cost') {
+      cmp = (a.total_cost ?? 0) - (b.total_cost ?? 0)
+    } else if (sortField === 'win_rate') {
+      cmp = (a.win_rate ?? -1) - (b.win_rate ?? -1)
+    } else if (sortField === 'total_pnl') {
+      cmp = a.total_pnl - b.total_pnl
+    } else if (sortField === 'roi') {
+      cmp = (a.roi ?? -999) - (b.roi ?? -999)
+    }
+    return sortAsc ? cmp : -cmp
+  })
+
+  const toggleSort = (field: PnlSortField) => {
+    if (sortField === field) {
+      setSortAsc(!sortAsc)
+    } else {
+      setSortField(field)
+      setSortAsc(false)
+    }
+  }
 
   return (
     <Card title={`盈利趋势（每通道${metricLabel}）`}>
@@ -2360,7 +2423,7 @@ function PnlCurveCard() {
         </div>
         <span className="text-[10px] text-ink-55">
           口径：当前注册实盘通道的已结算成交单（本地估算 pnl，赢=股数−成本，输=−投入）；
-          不含 manual_test / 已退役通道历史 / NOISE·EXPIRED / 失败未成交——与「资金变化」面板的全量订单口径不同，勿直接对比；胜率趋势=截至该笔的滚动胜率；每 30s 刷新
+          不含 manual_test / 已退役通道历史 / NOISE·EXPIRED / 失败未成交；ROI=累计净盈亏/累计本金投入；每 30s 刷新
         </span>
       </div>
       {allChans.length === 0 ? (
@@ -2369,7 +2432,7 @@ function PnlCurveCard() {
         </p>
       ) : (
         <>
-          <div className="flex flex-wrap gap-2 mb-3 text-xs">
+          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-2 mb-3 text-xs">
             <div className={statBox}>
               <div className="text-ink-55 mb-0.5">累计盈亏（USDT）</div>
               <div className={`text-base font-bold font-mono ${sumPnl >= 0 ? 'text-positive' : 'text-negative'}`}>
@@ -2377,8 +2440,11 @@ function PnlCurveCard() {
               </div>
             </div>
             <div className={statBox}>
-              <div className="text-ink-55 mb-0.5">已结算单数</div>
-              <div className="text-base font-bold font-mono text-ink-95">{sumCount}</div>
+              <div className="text-ink-55 mb-0.5">总收益率 (ROI)</div>
+              <div className={`text-base font-bold font-mono ${totalRoi != null && totalRoi >= 0 ? 'text-positive' : totalRoi != null ? 'text-negative' : 'text-ink-55'}`}>
+                {totalRoi != null ? `${totalRoi >= 0 ? '+' : ''}${totalRoi.toFixed(1)}%` : '--'}
+              </div>
+              <div className="text-[10px] font-mono text-ink-55">投入 {sumCost.toFixed(2)} U</div>
             </div>
             <div className={statBox}>
               <div className="text-ink-55 mb-0.5">总胜率</div>
@@ -2386,6 +2452,10 @@ function PnlCurveCard() {
                 {sumCount > 0 ? `${((sumWin / sumCount) * 100).toFixed(0)}%` : '--'}
                 <span className="text-[10px] font-normal text-ink-55 ml-1">{sumWin}胜/{sumCount - sumWin}负</span>
               </div>
+            </div>
+            <div className={statBox}>
+              <div className="text-ink-55 mb-0.5">已结算单数</div>
+              <div className="text-base font-bold font-mono text-ink-95">{sumCount}</div>
             </div>
             <div className={statBox}>
               <div className="text-ink-55 mb-0.5">有单通道</div>
@@ -2400,17 +2470,20 @@ function PnlCurveCard() {
                 <CartesianGrid stroke="var(--line-soft)" />
                 <XAxis dataKey="n" tick={{ fontSize: 11, fill: 'var(--ink-55)', fontFamily: 'var(--font-stack-mono)' }} stroke="var(--ink-55)"
                   label={{ value: '已结算单序号', position: 'insideBottomRight', offset: -2, fontSize: 10, fill: 'var(--ink-55)' }} />
-                <YAxis tick={{ fontSize: 11, fill: 'var(--ink-55)', fontFamily: 'var(--font-stack-mono)' }} stroke="var(--ink-55)" width={52}
+                <YAxis tick={{ fontSize: 11, fill: 'var(--ink-55)', fontFamily: 'var(--font-stack-mono)' }} stroke="var(--ink-55)" width={56}
                   domain={metric === 'rate' ? [0, 100] : undefined}
-                  tickFormatter={(v: number) => metric === 'rate' ? `${v}%` : v.toFixed(1)} />
+                  tickFormatter={(v: number) => (metric === 'rate' || metric === 'roi') ? `${v}%` : v.toFixed(1)} />
                 <Tooltip
                   contentStyle={TOOLTIP_STYLE} labelStyle={TOOLTIP_LABEL_STYLE} itemStyle={TOOLTIP_ITEM_STYLE}
-                  formatter={(v) => metric === 'rate'
-                    ? [`${Number(v).toFixed(1)}%`, undefined]
-                    : [`${Number(v) >= 0 ? '+' : ''}${Number(v).toFixed(2)} USDT`, undefined]}
+                  formatter={(v) => {
+                    const num = Number(v)
+                    if (metric === 'rate') return [`${num.toFixed(1)}%`, undefined]
+                    if (metric === 'roi') return [`${num >= 0 ? '+' : ''}${num.toFixed(1)}%`, undefined]
+                    return [`${num >= 0 ? '+' : ''}${num.toFixed(2)} USDT`, undefined]
+                  }}
                   labelFormatter={(n) => `第 ${n} 笔已结算单`} />
                 <Legend wrapperStyle={{ fontSize: 11 }} />
-                <ReferenceLine y={metric === 'rate' ? 50 : 0} stroke="var(--line)" />
+                <ReferenceLine y={metric === 'rate' ? 50 : 0} stroke="var(--line)" strokeDasharray={metric === 'roi' ? '3 3' : undefined} />
                 {chans.map((c, i) => (
                   <Line key={c.channel} type="monotone" dataKey={c.display_name}
                     stroke={PNL_COLORS[i % PNL_COLORS.length]}
@@ -2422,41 +2495,64 @@ function PnlCurveCard() {
           ) : (
             <p className="text-sm text-ink-55 py-4 text-center">所选通道暂无已结算订单</p>
           )}
-          <div className="overflow-x-auto max-h-52 overflow-y-auto mt-2">
+          <div className="overflow-x-auto max-h-56 overflow-y-auto mt-2">
             <table className="w-full text-xs">
-              <thead className="sticky top-0 bg-card">
+              <thead className="sticky top-0 bg-card select-none">
                 <tr className="text-left text-ink-55 border-b border-line-soft">
-                  <th className="py-1 pr-2">通道</th>
-                  <th className="py-1 pr-2">状态</th>
-                  <th className="py-1 pr-2 text-right">已结算</th>
-                  <th className="py-1 pr-2 text-right">胜率</th>
-                  <th className="py-1 pr-2 text-right">累计盈亏 (USDT)</th>
+                  <th className="py-1.5 pr-2 cursor-pointer hover:text-brand" onClick={() => toggleSort('channel')}>
+                    通道 {sortField === 'channel' ? (sortAsc ? '▲' : '▼') : ''}
+                  </th>
+                  <th className="py-1.5 pr-2 cursor-pointer hover:text-brand" onClick={() => toggleSort('enabled')}>
+                    状态 {sortField === 'enabled' ? (sortAsc ? '▲' : '▼') : ''}
+                  </th>
+                  <th className="py-1.5 pr-2 text-right cursor-pointer hover:text-brand" onClick={() => toggleSort('settled_count')}>
+                    已结算 {sortField === 'settled_count' ? (sortAsc ? '▲' : '▼') : ''}
+                  </th>
+                  <th className="py-1.5 pr-2 text-right cursor-pointer hover:text-brand" onClick={() => toggleSort('total_cost')}>
+                    总投入(U) {sortField === 'total_cost' ? (sortAsc ? '▲' : '▼') : ''}
+                  </th>
+                  <th className="py-1.5 pr-2 text-right cursor-pointer hover:text-brand" onClick={() => toggleSort('win_rate')}>
+                    胜率 {sortField === 'win_rate' ? (sortAsc ? '▲' : '▼') : ''}
+                  </th>
+                  <th className="py-1.5 pr-2 text-right cursor-pointer hover:text-brand" onClick={() => toggleSort('total_pnl')}>
+                    累计盈亏(U) {sortField === 'total_pnl' ? (sortAsc ? '▲' : '▼') : ''}
+                  </th>
+                  <th className="py-1.5 pr-2 text-right cursor-pointer hover:text-brand" onClick={() => toggleSort('roi')}>
+                    盈利率(ROI) {sortField === 'roi' ? (sortAsc ? '▲' : '▼') : ''}
+                  </th>
                 </tr>
               </thead>
               <tbody>
-                {chans.map(c => {
+                {sortedChans.map(c => {
                   const info = SIGNAL_INFO[c.channel]
                   const ci = chans.findIndex(x => x.channel === c.channel)
                   const color = PNL_COLORS[ci % PNL_COLORS.length]
                   // 圆点与曲线同序淡化，否则第 11 条起的图例色块会与前三条撞色
                   const faded = ci >= 10
+                  const roiPct = c.roi != null ? c.roi * 100 : (c.total_cost > 0 ? (c.total_pnl / c.total_cost) * 100 : null)
                   return (
-                    <tr key={c.channel} className="border-b border-line-soft">
-                      <td className="py-1 pr-2">
+                    <tr key={c.channel} className="border-b border-line-soft hover:bg-card-hover transition-colors">
+                      <td className="py-1.5 pr-2">
                         <span className="inline-block w-2 h-2 rounded-full mr-1.5 shrink-0" style={{ background: color, opacity: faded ? 0.55 : 1 }} />
-                        <span className="text-ink-95">{info?.name ?? c.display_name}</span>
+                        <span className="text-ink-95 font-medium">{info?.name ?? c.display_name}</span>
                       </td>
-                      <td className="py-1 pr-2">
+                      <td className="py-1.5 pr-2">
                         <span className={`px-1.5 py-0.5 text-[10px] font-bold rounded-pill border ${c.enabled ? 'bg-positive-soft text-positive border-positive' : 'bg-sunken text-ink-55 border-line'}`}>
                           {c.enabled ? '实盘中' : '已停火'}
                         </span>
                       </td>
-                      <td className="py-1 pr-2 text-right font-mono text-ink-80">{c.settled_count}</td>
-                      <td className="py-1 pr-2 text-right font-mono text-ink-80">
+                      <td className="py-1.5 pr-2 text-right font-mono text-ink-80">{c.settled_count}</td>
+                      <td className="py-1.5 pr-2 text-right font-mono text-ink-80">
+                        {c.total_cost != null ? c.total_cost.toFixed(2) : '--'}
+                      </td>
+                      <td className="py-1.5 pr-2 text-right font-mono text-ink-80">
                         {c.win_rate == null ? '--' : `${(c.win_rate * 100).toFixed(0)}%`}
                       </td>
-                      <td className={`py-1 pr-2 text-right font-mono font-bold ${c.total_pnl >= 0 ? 'text-positive' : 'text-negative'}`}>
+                      <td className={`py-1.5 pr-2 text-right font-mono font-bold ${c.total_pnl >= 0 ? 'text-positive' : 'text-negative'}`}>
                         {c.total_pnl >= 0 ? '+' : ''}{c.total_pnl.toFixed(2)}
+                      </td>
+                      <td className={`py-1.5 pr-2 text-right font-mono font-bold ${roiPct != null && roiPct >= 0 ? 'text-positive' : roiPct != null ? 'text-negative' : 'text-ink-55'}`}>
+                        {roiPct != null ? `${roiPct >= 0 ? '+' : ''}${roiPct.toFixed(1)}%` : '--'}
                       </td>
                     </tr>
                   )
@@ -2559,12 +2655,15 @@ function LiveTradeTab() {
   const [redeemable, setRedeemable] = useState<Record<string, unknown> | null>(null)
   const [redeeming, setRedeeming] = useState(false)
   const [redeemResult, setRedeemResult] = useState<Record<string, unknown> | null>(null)
+  // 通道盈亏与 ROI 数据（2026-09-09：在实盘通道卡片中直观映射实盘战绩与盈利率）
+  const [pnlData, setPnlData] = useState<PnlCurveData | null>(null)
 
   const refresh = useCallback(() => {
     api.getPredictionWallet().then(setWallet).catch(() => {})
     api.getLiveStatus().then(d => setLive(d?.live_channels ?? null)).catch(() => {})
     api.getRecentTrades().then(d => setOrders(d?.orders ?? [])).catch(() => {})
     api.getRedeemable().then(setRedeemable).catch(() => {})
+    api.getLivePnlCurve().then(setPnlData).catch(() => {})
     api.getQuotePreview().then((q: Record<string, unknown>) => {
       setQuote(q)
       if (typeof q?.server_now_ms === 'number') {
@@ -2591,6 +2690,15 @@ function LiveTradeTab() {
   const liveChannels = Array.isArray(live?.channels) ? live.channels as LiveChannelStatus[] : []
   const enabledCount = liveChannels.filter(c => c.enabled).length
   const liveDefaults = (live?.defaults ?? {}) as Record<string, unknown>
+
+  // 通道 pnl 快速索引
+  const pnlByChan = useMemo(() => {
+    const map: Record<string, PnlChannel> = {}
+    for (const c of pnlData?.channels ?? []) {
+      map[c.channel] = c
+    }
+    return map
+  }, [pnlData])
 
   // 倒计时：服务端时钟修正后的剩余毫秒；<60s 红色警示
   const windowEnd = quote?.window_end as number | null | undefined
@@ -2965,6 +3073,35 @@ function LiveTradeTab() {
                     <span className="shrink-0 font-mono text-[10px] text-ink-55 hidden sm:inline" title="今日成交/日限 / 累计开火">
                       今日{String(ch.filled_today ?? 0)}/{String(ch.max_daily_orders)} · 开火{String(ch.fire_total)}
                     </span>
+                    {(() => {
+                      const p = pnlByChan[ch.channel]
+                      const cnt = p?.settled_count ?? 0
+                      const pnl = p?.total_pnl ?? 0
+                      const roi = p?.roi != null ? p.roi * 100 : (p?.total_cost && p.total_cost > 0 ? (pnl / p.total_cost) * 100 : null)
+                      return (
+                        <span
+                          className="shrink-0 font-mono text-[11px] px-1.5 py-0.5 rounded-sm border select-none hidden md:inline-flex items-center gap-1"
+                          title={cnt > 0 ? `已结算 ${cnt} 单 · 总投入 ${(p?.total_cost ?? 0).toFixed(2)} U · 胜率 ${p?.win_rate != null ? (p.win_rate * 100).toFixed(0) : '--'}%` : '暂无已结算单'}
+                          style={{
+                            backgroundColor: cnt > 0 ? (pnl >= 0 ? 'var(--positive-soft)' : 'var(--negative-soft)') : 'var(--sunken)',
+                            borderColor: cnt > 0 ? (pnl >= 0 ? 'var(--positive)' : 'var(--negative)') : 'var(--line)',
+                          }}
+                        >
+                          {cnt > 0 ? (
+                            <>
+                              <span className={pnl >= 0 ? 'text-positive font-bold' : 'text-negative font-bold'}>
+                                {pnl >= 0 ? '+' : ''}{pnl.toFixed(1)}U
+                              </span>
+                              <span className={`text-[10px] font-semibold ${roi != null && roi >= 0 ? 'text-positive' : 'text-negative'}`}>
+                                ({roi != null ? `${roi >= 0 ? '+' : ''}${roi.toFixed(1)}%` : '--'})
+                              </span>
+                            </>
+                          ) : (
+                            <span className="text-ink-55 text-[10px]">无单</span>
+                          )}
+                        </span>
+                      )
+                    })()}
                     <span className="shrink-0 flex items-center gap-1">
                       <input
                         type="number" min={0.1} max={50} step={0.5}

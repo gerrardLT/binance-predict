@@ -2052,12 +2052,12 @@ async def test_live_pnl_curve_endpoint(monkeypatch) -> None:
     import binance_predict.main as m
 
     rows = [
-        # (signal_version, window_start, settled_at, win, pnl) 按 window_start 升序
+        # (signal_version, window_start, settled_at, win, pnl, amount_in) 按 window_start 升序
         ("quote_contrarian_v1", 1000,
-         datetime(2026, 8, 30, 10, 0, tzinfo=timezone.utc), True, 4.0),
-        ("scene_bull_exhaust", 1500, None, True, 1.5),
+         datetime(2026, 8, 30, 10, 0, tzinfo=timezone.utc), True, 4.0, "2000000000000000000"),  # 2 U
+        ("scene_bull_exhaust", 1500, None, True, 1.5, "1000000000000000000"),  # 1 U
         ("quote_contrarian_v1", 2000,
-         datetime(2026, 8, 30, 10, 5, tzinfo=timezone.utc), False, -2.0),
+         datetime(2026, 8, 30, 10, 5, tzinfo=timezone.utc), False, -2.0, "2000000000000000000"),  # 2 U
     ]
     _stub_select_db(monkeypatch, rows)
     monkeypatch.setattr(m, "multi_live_trader", None)  # 元数据回落注册表
@@ -2065,6 +2065,8 @@ async def test_live_pnl_curve_endpoint(monkeypatch) -> None:
     out = await m.live_pnl_curve(_=None, db=_SelectSession(rows))
     assert out["total"]["settled_count"] == 3
     assert out["total"]["total_pnl"] == 3.5
+    assert out["total"]["total_cost"] == 5.0
+    assert out["total"]["roi"] == 0.7  # 3.5 / 5.0
     assert out["total"]["win_rate"] == round(2 / 3, 4)
     # 口径自描述字段（2026-09-08 审计）：前端展示口径的事实源
     assert out["scope"]["filter"] == "LIVE_CHANNELS ∩ FILLED ∩ win≠NULL ∩ pnl≠NULL"
@@ -2078,13 +2080,26 @@ async def test_live_pnl_curve_endpoint(monkeypatch) -> None:
     q = by["quote_contrarian_v1"]
     assert q["settled_count"] == 2 and q["win_count"] == 1
     assert q["total_pnl"] == 2.0
+    assert q["total_cost"] == 4.0
+    assert q["roi"] == 0.5  # 2.0 / 4.0
     assert [p["cum"] for p in q["points"]] == [4.0, 2.0]   # 逐单累计
+    assert q["points"][0]["cost"] == 2.0
+    assert q["points"][0]["cum_cost"] == 2.0
+    assert q["points"][0]["cum_roi"] == 2.0  # 4.0 / 2.0
+    assert q["points"][1]["cost"] == 2.0
+    assert q["points"][1]["cum_cost"] == 4.0
+    assert q["points"][1]["cum_roi"] == 0.5  # 2.0 / 4.0
     assert q["points"][1]["n"] == 2
     assert q["enabled"] is False   # 执行器未装配 → 回落注册表默认
 
     s = by["scene_bull_exhaust"]
     assert s["total_pnl"] == 1.5
+    assert s["total_cost"] == 1.0
+    assert s["roi"] == 1.5  # 1.5 / 1.0
     assert s["points"][0]["t"] == 1500   # settled_at 缺失回落 window_start
+    assert s["points"][0]["cost"] == 1.0
+    assert s["points"][0]["cum_cost"] == 1.0
+    assert s["points"][0]["cum_roi"] == 1.5
 
 
 @pytest.mark.asyncio
@@ -2097,7 +2112,7 @@ async def test_live_pnl_curve_endpoint_empty(monkeypatch) -> None:
 
     out = await m.live_pnl_curve(_=None, db=_SelectSession([]))
     assert out["channels"] == []
-    assert out["total"] == {"settled_count": 0, "total_pnl": 0, "win_rate": None}
+    assert out["total"] == {"settled_count": 0, "total_pnl": 0, "total_cost": 0, "win_rate": None, "roi": None}
 
 
 # ============================================================

@@ -2492,6 +2492,7 @@ async def live_pnl_curve(
             TradeOrderModel.settled_at,
             TradeOrderModel.win,
             TradeOrderModel.pnl,
+            TradeOrderModel.amount_in,
         ).where(
             TradeOrderModel.signal_version.in_(list(LIVE_CHANNELS)),
             TradeOrderModel.status == "FILLED",
@@ -2517,20 +2518,35 @@ async def live_pnl_curve(
 
     # 按通道分组累计（window_start 已升序；settle 时序与窗口时序一致）
     by_ch: dict[str, list] = {}
-    for ver, ws, settled_at, win, pnl in rows:
+    for ver, ws, settled_at, win, pnl, amt_in in rows:
+        cost = round(float(amt_in or 0) / 1e18, 4)
         by_ch.setdefault(ver, []).append(
             {"window_start": int(ws), "win": bool(win), "pnl": float(pnl),
+             "cost": cost,
              "t": int(settled_at.timestamp() * 1000) if settled_at else int(ws)})
 
     channels_out = []
     for ch, pts in by_ch.items():
         cum = 0.0
+        cum_cost = 0.0
         points = []
         for n, p in enumerate(pts, start=1):
             cum += p["pnl"]
-            points.append({"n": n, "t": p["t"], "pnl": round(p["pnl"], 4),
-                           "cum": round(cum, 4), "win": p["win"]})
+            cum_cost += p["cost"]
+            cum_roi = round(cum / cum_cost, 4) if cum_cost > 0 else 0.0
+            points.append({
+                "n": n, "t": p["t"],
+                "pnl": round(p["pnl"], 4),
+                "cum": round(cum, 4),
+                "cost": round(p["cost"], 4),
+                "cum_cost": round(cum_cost, 4),
+                "cum_roi": cum_roi,
+                "win": p["win"],
+            })
         wins = sum(1 for p in pts if p["win"])
+        tot_cost = round(cum_cost, 4)
+        tot_pnl = round(cum, 4)
+        ch_roi = round(tot_pnl / tot_cost, 4) if tot_cost > 0 else None
         m = meta.get(ch, {})
         channels_out.append({
             "channel": ch,
@@ -2541,20 +2557,26 @@ async def live_pnl_curve(
             "settled_count": len(pts),
             "win_count": wins,
             "win_rate": round(wins / len(pts), 4) if pts else None,
-            "total_pnl": round(cum, 4),
+            "total_pnl": tot_pnl,
+            "total_cost": tot_cost,
+            "roi": ch_roi,
             "points": points,
         })
     channels_out.sort(key=lambda c: c["total_pnl"], reverse=True)
 
     total_pnl = round(sum(c["total_pnl"] for c in channels_out), 4)
+    total_cost = round(sum(c["total_cost"] for c in channels_out), 4)
     total_cnt = sum(c["settled_count"] for c in channels_out)
     total_win = sum(c["win_count"] for c in channels_out)
+    total_roi = round(total_pnl / total_cost, 4) if total_cost > 0 else None
     return {
         "channels": channels_out,
         "total": {
             "settled_count": total_cnt,
             "total_pnl": total_pnl,
+            "total_cost": total_cost,
             "win_rate": round(total_win / total_cnt, 4) if total_cnt else None,
+            "roi": total_roi,
         },
         # 口径自描述（2026-09-08 审计）：前端展示口径的唯一事实源，
         # 与 fund-flow（全量订单派生）不同，见 docstring。
