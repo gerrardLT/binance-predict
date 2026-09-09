@@ -808,7 +808,11 @@ function Card({ title, children, className = '' }: { title: string; children: Re
 interface LiveOrderMarker {
   id: string | number
   time: number
+  createdAtStr: string
   window_start: number
+  windowEnd: number
+  windowSpanStr: string
+  windowOffsetSec: number | null
   market_period: string
   channel: string
   channelName: string
@@ -827,6 +831,7 @@ interface LiveOrderMarker {
   pnl: number | null
   returnPct: number | null
   settledAt: string | null
+  settledAtStr: string | null
   redeemedAt: string | null
   errorMessage: string | null
   btcPrice: number | null
@@ -1041,10 +1046,29 @@ function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[
       const qj = (o.quote_json && typeof o.quote_json === 'object') ? (o.quote_json as Record<string, unknown>) : null
       const filledShares = qj?.filledShareQty != null ? Number(qj.filledShareQty) : null
 
+      const windowDurationMs = (per === '15m' ? 15 : 5) * 60_000
+      const wEnd = ws > 0 ? ws + windowDurationMs : 0
+      const wSpanStr = ws > 0 ? `${hhmm(ws)}–${hhmm(wEnd)}` : '--'
+      const wOffsetSec = ws > 0 && t >= ws ? Math.floor((t - ws) / 1000) : null
+      const createdAtStr = new Date(t).toLocaleString('zh-CN', {
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+        hour12: false,
+      })
+      const settledAtStr = o.settled_at ? new Date(String(o.settled_at)).toLocaleString('zh-CN', {
+        month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+        hour12: false,
+      }) : null
+
       list.push({
         id: o.id as (string | number),
         time: t,
+        createdAtStr,
         window_start: ws,
+        windowEnd: wEnd,
+        windowSpanStr: wSpanStr,
+        windowOffsetSec: wOffsetSec,
         market_period: per,
         channel: ver,
         channelName: info?.name ?? ver,
@@ -1063,6 +1087,7 @@ function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[
         pnl: pnlVal,
         returnPct,
         settledAt: o.settled_at ? String(o.settled_at) : null,
+        settledAtStr,
         redeemedAt: o.redeemed_at ? String(o.redeemed_at) : null,
         errorMessage: (o.error_message as string | null) ?? null,
         btcPrice: nearestBtc,
@@ -1158,15 +1183,27 @@ function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[
               {/* 指标卡矩阵：窗口、金额与均价、结算与收益、订单号等 */}
               <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-x-4 gap-y-2 text-[11px]">
                 <div>
-                  <div className="text-ink-55">下单时点 / 窗口</div>
-                  <div className="font-mono text-ink-95 font-medium mt-0.5">
-                    {new Date(activeMarker.time).toLocaleTimeString()}
-                    {activeMarker.window_start > 0 && (
-                      <span className="text-ink-55 ml-1 text-[10px]" title={`目标窗口起点: ${new Date(activeMarker.window_start).toLocaleTimeString()}`}>
-                        ({hhmm(activeMarker.window_start)}–{hhmm(activeMarker.window_start + (activeMarker.market_period === '15m' ? 15 : 5) * 60_000)})
-                      </span>
-                    )}
+                  <div className="text-ink-55">下单时间 (精确)</div>
+                  <div className="font-mono text-ink-95 font-bold mt-0.5" title={`时间戳: ${activeMarker.time}`}>
+                    {activeMarker.createdAtStr}
                   </div>
+                  {activeMarker.windowOffsetSec != null && (
+                    <div className="text-ink-55 text-[10px] font-mono">
+                      (窗开第 <span className="text-brand font-bold">{activeMarker.windowOffsetSec}s</span> 触发)
+                    </div>
+                  )}
+                </div>
+
+                <div>
+                  <div className="text-ink-55">目标窗口时段 ({activeMarker.market_period})</div>
+                  <div className="font-mono text-ink-95 font-medium mt-0.5">
+                    {activeMarker.windowSpanStr}
+                  </div>
+                  {activeMarker.settledAtStr && (
+                    <div className="text-ink-55 text-[10px] font-mono" title={`结算落库时间: ${activeMarker.settledAt}`}>
+                      结: {activeMarker.settledAtStr}
+                    </div>
+                  )}
                 </div>
 
                 <div>
@@ -1220,7 +1257,7 @@ function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[
                 </div>
 
                 <div>
-                  <div className="text-ink-55">入场时 BTC 对应价</div>
+                  <div className="text-ink-55">入场 BTC / 结算 BTC</div>
                   <div className="font-mono text-ink-95 font-medium mt-0.5">
                     {activeMarker.btcPrice != null ? `$${activeMarker.btcPrice.toLocaleString()}` : '--'}
                     {activeMarker.settlePrice != null && (
@@ -1347,6 +1384,28 @@ function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[
                                   {matchedOrder.direction}
                                 </span>
                               </div>
+
+                              {/* 详细时间信息 */}
+                              <div className="bg-black/25 px-2 py-1 rounded text-[11px] font-mono space-y-0.5 border border-white/10">
+                                <div className="text-white flex items-center justify-between">
+                                  <span className="text-ink-55">下单时间:</span>
+                                  <span className="font-bold text-positive">{matchedOrder.createdAtStr}</span>
+                                </div>
+                                <div className="flex items-center justify-between text-[10px] text-ink-55">
+                                  <span>目标窗口:</span>
+                                  <span className="text-ink-80">
+                                    {matchedOrder.windowSpanStr}
+                                    {matchedOrder.windowOffsetSec != null ? ` (开窗+${matchedOrder.windowOffsetSec}s)` : ''}
+                                  </span>
+                                </div>
+                                {matchedOrder.settledAtStr && (
+                                  <div className="flex items-center justify-between text-[10px] text-ink-55">
+                                    <span>结算时间:</span>
+                                    <span className="text-ink-80">{matchedOrder.settledAtStr}</span>
+                                  </div>
+                                )}
+                              </div>
+
                               <div className="grid grid-cols-2 gap-x-2 gap-y-0.5 text-[11px] font-mono">
                                 <div>状态: <span className={matchedOrder.status === 'FILLED' ? 'text-positive font-bold' : 'text-negative font-bold'}>{matchedOrder.status}</span></div>
                                 <div>金额: <span className="font-bold">{matchedOrder.amountUsdt != null ? `${matchedOrder.amountUsdt.toFixed(2)}U` : '--'}</span></div>
@@ -1354,6 +1413,12 @@ function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[
                                 <div>盈亏: <span className={matchedOrder.win === true ? 'text-positive font-bold' : matchedOrder.win === false ? 'text-negative font-bold' : 'text-white/60'}>
                                   {matchedOrder.win === true ? `+${matchedOrder.pnl?.toFixed(2)}U` : matchedOrder.win === false ? `${matchedOrder.pnl?.toFixed(2)}U` : '待结算'}
                                 </span></div>
+                                {matchedOrder.shares != null && (
+                                  <div>份额: <span>{matchedOrder.shares.toFixed(2)} 股</span></div>
+                                )}
+                                {matchedOrder.settlePrice != null && (
+                                  <div>结算价: <span>${matchedOrder.settlePrice.toLocaleString()}</span></div>
+                                )}
                               </div>
                               {matchedOrder.errorMessage && (
                                 <div className="text-negative text-[10px] leading-tight break-all">
@@ -1438,7 +1503,74 @@ function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[
                   <Tooltip
                     contentStyle={TOOLTIP_STYLE} labelStyle={TOOLTIP_LABEL_STYLE} itemStyle={TOOLTIP_ITEM_STYLE}
                     labelFormatter={t => new Date(t as number).toLocaleString('zh-CN')}
-                    formatter={(v, name) => [typeof v === 'number' ? v.toFixed(3) : '--', name === 'up' ? 'UP 报价' : 'DOWN 报价']}
+                    content={({ active, payload }) => {
+                      if (!active || !payload || !payload[0]?.payload) return null
+                      const pt = payload[0].payload as { t: number; up: number | null; down: number | null }
+
+                      // 检查该时刻附近是否有实盘订单
+                      const matchedOrder = hoveredMarker && Math.abs(hoveredMarker.time - pt.t) < (p === '15m' ? 15 : 5) * 60_000
+                        ? hoveredMarker
+                        : orderMarkers.find(m => Math.abs(m.time - pt.t) < (p === '15m' ? 7.5 : 2.5) * 60_000)
+
+                      return (
+                        <div style={TOOLTIP_STYLE} className="p-2.5 text-xs space-y-2 max-w-xs sm:max-w-sm">
+                          <div className="text-ink-55 font-mono flex items-center justify-between gap-2 border-b border-white/10 pb-1">
+                            <span>{new Date(pt.t).toLocaleString('zh-CN')}</span>
+                            <span className="text-[10px] text-ink-40">{p} 报价</span>
+                          </div>
+
+                          <div className="flex items-center gap-4 text-xs font-mono">
+                            <div className="text-positive flex items-center gap-1">
+                              <span>UP:</span>
+                              <span className="font-bold">{pt.up != null ? pt.up.toFixed(3) : '--'}</span>
+                            </div>
+                            <div className="text-negative flex items-center gap-1">
+                              <span>DOWN:</span>
+                              <span className="font-bold">{pt.down != null ? pt.down.toFixed(3) : '--'}</span>
+                            </div>
+                          </div>
+
+                          {/* 关联订单 */}
+                          {matchedOrder && (
+                            <div className="pt-2 border-t border-white/15 space-y-1.5 bg-white/5 p-2 rounded-sm">
+                              <div className="flex items-center justify-between gap-1 flex-wrap">
+                                <span className="font-bold text-white font-mono">
+                                  #{String(matchedOrder.id)} {matchedOrder.channelName}
+                                </span>
+                                <span className={`px-1.5 py-0.2 rounded-pill font-bold text-[10px] ${
+                                  matchedOrder.direction === 'UP' ? 'bg-positive text-white' : 'bg-negative text-white'
+                                }`}>
+                                  {matchedOrder.direction}
+                                </span>
+                              </div>
+
+                              <div className="bg-black/25 px-2 py-1 rounded text-[11px] font-mono space-y-0.5 border border-white/10">
+                                <div className="text-white flex items-center justify-between">
+                                  <span className="text-ink-55">下单时间:</span>
+                                  <span className="font-bold text-positive">{matchedOrder.createdAtStr}</span>
+                                </div>
+                                <div className="flex items-center justify-between text-[10px] text-ink-55">
+                                  <span>目标窗口:</span>
+                                  <span className="text-ink-80">
+                                    {matchedOrder.windowSpanStr}
+                                    {matchedOrder.windowOffsetSec != null ? ` (开窗+${matchedOrder.windowOffsetSec}s)` : ''}
+                                  </span>
+                                </div>
+                              </div>
+
+                              <div className="grid grid-cols-2 gap-x-2 gap-y-0.5 text-[11px] font-mono">
+                                <div>状态: <span className={matchedOrder.status === 'FILLED' ? 'text-positive font-bold' : 'text-negative font-bold'}>{matchedOrder.status}</span></div>
+                                <div>金额: <span className="font-bold">{matchedOrder.amountUsdt != null ? `${matchedOrder.amountUsdt.toFixed(2)}U` : '--'}</span></div>
+                                <div>均价: <span>{matchedOrder.averagePrice != null ? matchedOrder.averagePrice.toFixed(2) : '--'}{matchedOrder.priceKind === 'quote' ? '(报价)' : ''}</span></div>
+                                <div>盈亏: <span className={matchedOrder.win === true ? 'text-positive font-bold' : matchedOrder.win === false ? 'text-negative font-bold' : 'text-white/60'}>
+                                  {matchedOrder.win === true ? `+${matchedOrder.pnl?.toFixed(2)}U` : matchedOrder.win === false ? `${matchedOrder.pnl?.toFixed(2)}U` : '待结算'}
+                                </span></div>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )
+                    }}
                   />
                   <Line dataKey="up" stroke="var(--positive)" dot={false} strokeWidth={1.6} connectNulls isAnimationActive={false} />
                   <Line dataKey="down" stroke="var(--negative)" dot={false} strokeWidth={1.6} connectNulls isAnimationActive={false} />
