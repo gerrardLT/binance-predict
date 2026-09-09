@@ -910,8 +910,9 @@ function OrderMarkerShape(props: {
   isHovered: boolean
   isPinned: boolean
   onSelect: (m: LiveOrderMarker) => void
+  onHover?: (m: LiveOrderMarker | null) => void
 }) {
-  const { cx, cy, marker, isHovered, isPinned, onSelect } = props
+  const { cx, cy, marker, isHovered, isPinned, onSelect, onHover } = props
   if (cx == null || cy == null) return null
 
   const isUp = marker.direction === 'UP'
@@ -923,16 +924,25 @@ function OrderMarkerShape(props: {
   return (
     <g
       className="order-marker-glyph cursor-pointer transition-transform"
+      style={{ pointerEvents: 'auto' }}
+      onMouseEnter={(e) => {
+        e.stopPropagation()
+        onHover?.(marker)
+      }}
+      onMouseLeave={(e) => {
+        e.stopPropagation()
+        onHover?.(null)
+      }}
       onClick={e => {
         e.stopPropagation()
         onSelect(marker)
       }}
     >
       {/* 外层隐形 hitbox，r=14，方便鼠标移动时无缝触发悬浮与点击 */}
-      <circle cx={cx} cy={cy} r={14} fill="transparent" />
+      <circle cx={cx} cy={cy} r={14} fill="transparent" pointerEvents="all" />
       {/* 激活光圈 */}
       {active && (
-        <circle cx={cx} cy={cy} r={9} fill="none" stroke={color} strokeWidth={1.5} opacity={0.5} strokeDasharray={isPinned ? 'none' : '2 2'} />
+        <circle cx={cx} cy={cy} r={9} fill="none" stroke={color} strokeWidth={1.5} opacity={0.5} strokeDasharray={isPinned ? 'none' : '2 2'} pointerEvents="none" />
       )}
       {/* 核心标记圆点 */}
       <circle
@@ -942,6 +952,7 @@ function OrderMarkerShape(props: {
         fill={fill}
         stroke={color}
         strokeWidth={2}
+        pointerEvents="none"
       />
     </g>
   )
@@ -1294,21 +1305,63 @@ function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[
                       if (!active || !payload || !payload[0]?.payload) return null
                       const d = payload[0].payload as BtcKlinePoint
                       const isUp = d.close >= d.open
+
+                      // 检查当根 K 线下是否有实盘订单
+                      const matchedOrder = hoveredMarker && Math.abs(hoveredMarker.time - d.t) < (p === '15m' ? 15 : 5) * 60_000
+                        ? hoveredMarker
+                        : orderMarkers.find(m => Math.abs(m.time - d.t) < (p === '15m' ? 7.5 : 2.5) * 60_000)
+
                       return (
-                        <div style={TOOLTIP_STYLE} className="p-2 text-xs space-y-1">
-                          <div className="text-ink-55 font-mono">{new Date(d.t).toLocaleString('zh-CN')}</div>
-                          <div className="flex gap-3">
-                            <span className={isUp ? 'text-positive font-bold' : 'text-negative font-bold'}>
-                              {isUp ? '阳线(涨)' : '阴线(跌)'}
-                            </span>
-                            <span className="font-mono">收: ${d.close.toLocaleString()}</span>
+                        <div style={TOOLTIP_STYLE} className="p-2.5 text-xs space-y-2 max-w-xs sm:max-w-sm">
+                          <div className="text-ink-55 font-mono flex items-center justify-between gap-2 border-b border-white/10 pb-1">
+                            <span>{new Date(d.t).toLocaleString('zh-CN')}</span>
+                            <span className="text-[10px] text-ink-40">{p} 周期</span>
                           </div>
-                          <div className="grid grid-cols-2 gap-x-3 text-ink-80 font-mono text-[11px]">
-                            <span>开: ${d.open.toLocaleString()}</span>
-                            <span>高: ${d.high.toLocaleString()}</span>
-                            <span>低: ${d.low.toLocaleString()}</span>
-                            <span>量: {d.volume.toFixed(2)}</span>
+                          
+                          {/* K 线行情数据 */}
+                          <div>
+                            <div className="flex items-center gap-3">
+                              <span className={isUp ? 'text-positive font-bold' : 'text-negative font-bold'}>
+                                {isUp ? '阳线(涨)' : '阴线(跌)'}
+                              </span>
+                              <span className="font-mono font-bold">收: ${d.close.toLocaleString()}</span>
+                            </div>
+                            <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-white/80 font-mono text-[11px] mt-1">
+                              <span>开: ${d.open.toLocaleString()}</span>
+                              <span>高: ${d.high.toLocaleString()}</span>
+                              <span>低: ${d.low.toLocaleString()}</span>
+                              <span>量: {d.volume.toFixed(2)}</span>
+                            </div>
                           </div>
+
+                          {/* 若当根 K 线下有订单，直接在浮层内直观展现完整订单信息 */}
+                          {matchedOrder && (
+                            <div className="pt-2 border-t border-white/15 space-y-1.5 bg-white/5 p-2 rounded-sm">
+                              <div className="flex items-center justify-between gap-1 flex-wrap">
+                                <span className="font-bold text-white font-mono">
+                                  #{String(matchedOrder.id)} {matchedOrder.channelName}
+                                </span>
+                                <span className={`px-1.5 py-0.2 rounded-pill font-bold text-[10px] ${
+                                  matchedOrder.direction === 'UP' ? 'bg-positive text-white' : 'bg-negative text-white'
+                                }`}>
+                                  {matchedOrder.direction}
+                                </span>
+                              </div>
+                              <div className="grid grid-cols-2 gap-x-2 gap-y-0.5 text-[11px] font-mono">
+                                <div>状态: <span className={matchedOrder.status === 'FILLED' ? 'text-positive font-bold' : 'text-negative font-bold'}>{matchedOrder.status}</span></div>
+                                <div>金额: <span className="font-bold">{matchedOrder.amountUsdt != null ? `${matchedOrder.amountUsdt.toFixed(2)}U` : '--'}</span></div>
+                                <div>均价: <span>{matchedOrder.averagePrice != null ? matchedOrder.averagePrice.toFixed(2) : '--'}{matchedOrder.priceKind === 'quote' ? '(报价)' : ''}</span></div>
+                                <div>盈亏: <span className={matchedOrder.win === true ? 'text-positive font-bold' : matchedOrder.win === false ? 'text-negative font-bold' : 'text-white/60'}>
+                                  {matchedOrder.win === true ? `+${matchedOrder.pnl?.toFixed(2)}U` : matchedOrder.win === false ? `${matchedOrder.pnl?.toFixed(2)}U` : '待结算'}
+                                </span></div>
+                              </div>
+                              {matchedOrder.errorMessage && (
+                                <div className="text-negative text-[10px] leading-tight break-all">
+                                  原因: {matchedOrder.errorMessage}
+                                </div>
+                              )}
+                            </div>
+                          )}
                         </div>
                       )
                     }}
@@ -1338,6 +1391,7 @@ function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[
                             isHovered={isHovered}
                             isPinned={isPinned}
                             onSelect={handleSelectMarker}
+                            onHover={setHoveredMarker}
                           />
                         }
                         onMouseEnter={() => setHoveredMarker(m)}
@@ -1410,6 +1464,7 @@ function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[
                             isHovered={isHovered}
                             isPinned={isPinned}
                             onSelect={handleSelectMarker}
+                            onHover={setHoveredMarker}
                           />
                         }
                         onMouseEnter={() => setHoveredMarker(m)}
