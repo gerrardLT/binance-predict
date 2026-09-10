@@ -268,6 +268,12 @@ class ManualTradeTestRequest(BaseModel):
     prediction: str = Field(
         default="DOWN", description="方向 UP/DOWN（测试单随意，验证链路为目的）"
     )
+    order_type: str = Field(
+        default="MARKET", description="下单类型 MARKET | LIMIT"
+    )
+    price_limit: float | None = Field(
+        default=None, description="限价价格（当 order_type=LIMIT 时传入，如 0.25）"
+    )
 
 
 class TransferInboundRequest(BaseModel):

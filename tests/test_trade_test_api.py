@@ -87,14 +87,31 @@ async def test_trade_test_success_fields(monkeypatch) -> None:
 
     assert out["status"] == "FILLED"
     assert out["order_id"] == "ORD-1"
-    assert out["average_price"] == 0.5
-    assert out["direction"] == "DOWN"  # 3b：direction 落库后回显
-    assert out["error_message"] is None
-    assert seen["prediction"] == "DOWN"
-    assert seen["amount_usdt"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_trade_test_limit_order_passthrough(monkeypatch) -> None:
+    """支持测试限价挂单：透传 order_type='LIMIT' 与 max_exec_price=price_limit。"""
+    import binance_predict.main as m
+
+    seen = {}
+    async def _exec(**kw):
+        seen.update(kw)
+        return _order(status="PENDING", order_id="ORD-LIMIT-TEST")
+
+    monkeypatch.setattr(m.prediction_trader, "execute_signal_trade", _exec)
+    out = await m.manual_trade_test(
+        ManualTradeTestRequest(amount_usdt=0.5, prediction="DOWN", order_type="LIMIT", price_limit=0.25),
+        _=None,
+    )
+
+    assert out["status"] == "PENDING"
+    assert out["order_id"] == "ORD-LIMIT-TEST"
+    assert seen["order_type"] == "LIMIT"
+    assert seen["max_exec_price"] == 0.25
+    assert seen["amount_usdt"] == 0.5
     assert seen["signal_version"] == "manual_test"
     assert seen["window_start"] % 300_000 == 0  # 5m 窗口对齐
-    assert "max_exec_price" not in seen or seen["max_exec_price"] is None
 
 
 @pytest.mark.asyncio

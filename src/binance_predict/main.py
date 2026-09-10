@@ -2385,6 +2385,8 @@ async def manual_trade_test(
         amount_usdt=req.amount_usdt,
         signal_version="manual_test",
         window_start=window_start,
+        max_exec_price=req.price_limit if req.order_type == "LIMIT" else None,
+        order_type=req.order_type,
     )
     if order is None:
         return {
