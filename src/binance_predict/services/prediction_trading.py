@@ -671,6 +671,76 @@ class BinancePredictionTrader:
                 return orders
         return [data]
 
+    async def query_active_orders(self, limit: int = 50) -> list | None:
+        """查询当前正在挂单中的活动订单（GET order/list）。
+
+        官方端点：Query Active Orders (PREDICTION_TRADE)。
+        返回未成交或部分成交的限价挂单列表；失败返回 None。
+        """
+        self.last_api_error = None
+        signed_url = self._build_signed_url(
+            "/sapi/v1/w3w/wallet/prediction/order/list",
+            {
+                "walletAddress": self._wallet_address,
+                "limit": limit,
+            },
+        )
+        try:
+            client = self._get_client()
+            resp = await client.get(
+                signed_url,
+                headers={"X-MBX-APIKEY": self._api_key},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except httpx.HTTPStatusError as e:
+            self.last_api_error = f"HTTP {e.response.status_code}: {e.response.text[:300]}"
+            logger.error("查询活动挂单失败 (HTTP {}): {}", e.response.status_code, e.response.text[:300])
+            return None
+        except Exception as e:
+            self.last_api_error = f"{type(e).__name__}: {e}"
+            logger.error("查询活动挂单失败: {}", e)
+            return None
+
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            orders = data.get("orders") or data.get("items") or data.get("data")
+            if isinstance(orders, list):
+                return orders
+        return [data]
+
+    async def cancel_order(self, order_id: str) -> bool:
+        """撤销单个预测市场限价挂单（POST batch-cancel）。
+
+        官方端点：Batch Cancel Orders (PREDICTION_TRADE)。
+        """
+        if not order_id:
+            return False
+        signed_url = self._build_signed_url(
+            "/sapi/v1/w3w/wallet/prediction/trade/batch-cancel",
+            {
+                "walletAddress": self._wallet_address,
+                "walletId": self._wallet_id,
+                "cancelInfoList": f'[{{"orderId":"{order_id}"}}]',
+            },
+        )
+        try:
+            client = self._get_client()
+            resp = await client.post(
+                signed_url,
+                headers={"X-MBX-APIKEY": self._api_key},
+            )
+            resp.raise_for_status()
+            logger.info("撤销限价挂单成功 | orderId={}", order_id)
+            return True
+        except httpx.HTTPStatusError as e:
+            logger.error("撤单失败 (HTTP {}): {}", e.response.status_code, e.response.text[:300])
+            return False
+        except Exception as e:
+            logger.error("撤单异常: {}", e)
+            return False
+
     async def confirm_order_status(
         self, order_id: str | None,
         attempts: int = CONFIRM_ATTEMPTS, delay: float = CONFIRM_DELAY_S,
@@ -1084,6 +1154,8 @@ class BinancePredictionTrader:
         token_id: str,
         side: str = "BUY",
         amount_usdt: float | None = None,
+        order_type: str = "MARKET",
+        price_limit: float | None = None,
     ) -> dict | None:
         """
         获取交易报价
@@ -1092,6 +1164,8 @@ class BinancePredictionTrader:
             token_id: 预测 outcome token ID
             side: BUY 或 SELL
             amount_usdt: 交易金额（USDT），默认使用配置值
+            order_type: MARKET (市价) 或 LIMIT (限价)
+            price_limit: 限价价格（当 order_type=LIMIT 时传入，如 0.30）
 
         Returns:
             报价响应 dict，包含 quoteId 等信息；失败返回 None
@@ -1100,18 +1174,22 @@ class BinancePredictionTrader:
         # 转换为 wei 格式（18 位小数）
         amount_wei = str(int(amount * 10**18))
 
+        params = {
+            "walletAddress": self._wallet_address,
+            "tokenId": token_id,
+            "side": side,
+            "amountIn": amount_wei,
+            "orderType": order_type,
+            "slippageBps": 1200,  # 12% 滑点容忍
+        }
+        if order_type == "LIMIT" and price_limit is not None:
+            params["priceLimit"] = str(price_limit)
+
         # 使用 _build_signed_url 手动构建完整 URL
         # httpx.post(params=dict) 的 URL 编码会导致签名不匹配（-1022）
         signed_url = self._build_signed_url(
             "/sapi/v1/w3w/wallet/prediction/trade/get-quote",
-            {
-                "walletAddress": self._wallet_address,
-                "tokenId": token_id,
-                "side": side,
-                "amountIn": amount_wei,
-                "orderType": "MARKET",
-                "slippageBps": 1200,  # 12% 滑点容忍
-            },
+            params,
         )
 
         logger.debug(
@@ -1153,30 +1231,44 @@ class BinancePredictionTrader:
             logger.error("获取报价异常: {}", e)
             return None
 
-    async def place_order(self, quote: dict, slippage_bps: int = 1200) -> dict | None:
+    async def place_order(
+        self,
+        quote: dict,
+        slippage_bps: int = 1200,
+        order_type: str = "MARKET",
+        time_in_force: str = "FOK",
+        price_limit: float | None = None,
+    ) -> dict | None:
         """
-        执行下单
+        执行下单（支持 MARKET FOK 与 LIMIT GTC 挂单）
 
         Args:
             quote: get_quote 返回的报价响应
             slippage_bps: 滑点容忍（基点，默认 1200=12%）；信号实盘通道按
                 执行价护栏动态收紧，防成交价突破护栏价（CodeReview Medium#2）
+            order_type: 'MARKET' 或 'LIMIT'
+            time_in_force: 'FOK' (用于 MARKET) 或 'GTC' (用于 LIMIT 挂单)
+            price_limit: 限价挂单价格 (例如 0.30)
 
         Returns:
             下单响应 dict，包含 orderId；失败返回 None
         """
+        payload = {
+            "walletAddress": self._wallet_address,
+            "walletId": self._wallet_id,
+            "quoteId": quote["quoteId"],
+            "timeInForce": time_in_force,
+            "accountType": "SPOT",
+            "orderType": order_type,
+            "slippageBps": slippage_bps,
+        }
+        if order_type == "LIMIT" and price_limit is not None:
+            payload["priceLimit"] = str(price_limit)
+
         # 使用 _build_signed_url 手动构建完整 URL
         signed_url = self._build_signed_url(
             "/sapi/v1/w3w/wallet/prediction/trade/place-order-bundle",
-            {
-                "walletAddress": self._wallet_address,
-                "walletId": self._wallet_id,
-                "quoteId": quote["quoteId"],
-                "timeInForce": "FOK",
-                "accountType": "SPOT",
-                "orderType": "MARKET",
-                "slippageBps": slippage_bps,
-            },
+            payload,
         )
 
         try:
@@ -1187,7 +1279,8 @@ class BinancePredictionTrader:
             )
             resp.raise_for_status()
             result = resp.json()
-            logger.info("下单成功 | orderId={}", result.get("orderId"))
+            logger.info("下单成功 | orderId={} | orderType={} | timeInForce={}",
+                        result.get("orderId"), order_type, time_in_force)
             return result
         except httpx.HTTPStatusError as e:
             logger.error("下单失败 (HTTP {}): {}", e.response.status_code, e.response.text)
@@ -1343,6 +1436,7 @@ class BinancePredictionTrader:
         market_period: str = "5m",
         scene_signal_id: int | None = None,
         entry_band_whitelist: tuple[tuple[float, float], ...] | None = None,
+        order_type: str = "MARKET",
     ) -> dict | None:
         """
         信号驱动实盘专用通道（多通道 LIVE：quote_edge/x4 用 5m，场景用 15m）：
@@ -1486,7 +1580,17 @@ class BinancePredictionTrader:
                     pending, "FAILED", direction=prediction,
                     error_message=f"余额预检弃单 | {bal_why}")
 
-            quote = await self.get_quote(token_id, "BUY", amount_usdt=amount_usdt)
+            # 区分 LIMIT GTC 挂单 vs MARKET FOK 市价单
+            is_limit = (order_type == "LIMIT")
+            limit_price = max_exec_price if is_limit else None
+
+            if is_limit:
+                quote = await self.get_quote(
+                    token_id, "BUY", amount_usdt=amount_usdt,
+                    order_type=order_type, price_limit=limit_price,
+                )
+            else:
+                quote = await self.get_quote(token_id, "BUY", amount_usdt=amount_usdt)
             if not quote:
                 detail = self.last_api_error or "无详情（网络异常？）"
                 # 错误分类（P1）：-9000 是币安的余额不足文案，预检放行但下单时
@@ -1498,63 +1602,81 @@ class BinancePredictionTrader:
                     error_message=f"获取报价失败 | {detail}",
                 )
 
-            # 执行价护栏：报价均价超阈弃单（不追贵，保护回测 EV 口径）
-            try:
-                avg_price = float(quote.get("averagePrice") or 0.0)
-            except (TypeError, ValueError):
-                avg_price = 0.0
-            # 护栏含贴线（>=）：报价=护栏价时滑点空间为 0，币安拒收
-            # slippageBps=0（-1102，2026-08-29 id=100 实证），贴线单无法安全提交。
-            if max_exec_price is not None and (avg_price <= 0 or avg_price >= max_exec_price):
-                wechat_notifier.notify_order_abandoned(
-                    channel=signal_version,
-                    direction=prediction,
-                    window_start=window_start,
-                    quote_price=avg_price,
-                    guard_price=max_exec_price,
-                    reason=f"报价 {avg_price} 超出或贴线护栏上限 {max_exec_price}",
-                )
-                return await self._update_signal_order(
-                    pending, "FAILED", direction=prediction,
-                    error_message=f"执行价护栏弃单 | averagePrice={avg_price} >= {max_exec_price}（贴线无滑点空间）",
-                    quote_json=quote)
+            # 市价单模式检查护栏与白名单
+            if not is_limit:
+                try:
+                    avg_price = float(quote.get("averagePrice") or 0.0)
+                except (TypeError, ValueError):
+                    avg_price = 0.0
+                # 护栏含贴线（>=）：报价=护栏价时滑点空间为 0，币安拒收
+                # slippageBps=0（-1102，2026-08-29 id=100 实证），贴线单无法安全提交。
+                if max_exec_price is not None and (avg_price <= 0 or avg_price >= max_exec_price):
+                    wechat_notifier.notify_order_abandoned(
+                        channel=signal_version,
+                        direction=prediction,
+                        window_start=window_start,
+                        quote_price=avg_price,
+                        guard_price=max_exec_price,
+                        reason=f"报价 {avg_price} 超出或贴线护栏上限 {max_exec_price}",
+                    )
+                    return await self._update_signal_order(
+                        pending, "FAILED", direction=prediction,
+                        error_message=f"执行价护栏弃单 | averagePrice={avg_price} >= {max_exec_price}（贴线无滑点空间）",
+                        quote_json=quote)
 
-            # 入场价白名单（x4_v3 下单层主护栏）：报价后、下单前检查——白名单依赖
-            # 决策点才可知的成交均价，与执行价护栏相互独立（白名单过、护栏超 →
-            # 仍弃单；反之亦然）。avg≤0 已被纯函数 fail-safe 拦截。
-            if not in_entry_band_whitelist(avg_price, entry_band_whitelist):
-                wechat_notifier.notify_order_abandoned(
-                    channel=signal_version,
-                    direction=prediction,
-                    window_start=window_start,
-                    quote_price=avg_price,
-                    guard_price=max_exec_price,
-                    reason=f"成交均价 {avg_price} 不在入场白名单区间 {entry_band_whitelist}",
-                )
-                return await self._update_signal_order(
-                    pending, "FAILED", direction=prediction,
-                    error_message=f"入场价白名单弃单 | averagePrice={avg_price} 不在 {entry_band_whitelist}",
-                    quote_json=quote)
+                # 入场价白名单（x4_v3 下单层主护栏）：报价后、下单前检查——白名单依赖
+                # 决策点才可知的成交均价，与执行价护栏相互独立（白名单过、护栏超 →
+                # 仍弃单；反之亦然）。avg≤0 已被纯函数 fail-safe 拦截。
+                if not in_entry_band_whitelist(avg_price, entry_band_whitelist):
+                    wechat_notifier.notify_order_abandoned(
+                        channel=signal_version,
+                        direction=prediction,
+                        window_start=window_start,
+                        quote_price=avg_price,
+                        guard_price=max_exec_price,
+                        reason=f"成交均价 {avg_price} 不在入场白名单区间 {entry_band_whitelist}",
+                    )
+                    return await self._update_signal_order(
+                        pending, "FAILED", direction=prediction,
+                        error_message=f"入场价白名单弃单 | averagePrice={avg_price} 不在 {entry_band_whitelist}",
+                        quote_json=quote)
 
-            # 动态滑点收紧（CodeReview Medium#2）：FOK 成交价不得突破护栏价，
-            # 否则 slippageBps=1200 会让 0.78 的护栏形同虚设（最高可成交 ~0.87）。
-            # 首轮保守（≤1200bps）；FOK 未成交后的重试轮放宽到护栏全空间（见下）。
+            # 动态滑点收紧（CodeReview Medium#2）：FOK 成交价不得突破护栏价
             slippage_bps = 1200
-            if max_exec_price is not None and avg_price > 0:
+            if not is_limit and max_exec_price is not None and avg_price > 0:
                 cap = int((max_exec_price / avg_price - 1.0) * 10000)
                 slippage_bps = max(0, min(1200, cap))
 
-            order_result = await self.place_order(quote, slippage_bps=slippage_bps)
+            tif = "GTC" if is_limit else "FOK"
+            if is_limit:
+                order_result = await self.place_order(
+                    quote,
+                    slippage_bps=slippage_bps,
+                    order_type=order_type,
+                    time_in_force=tif,
+                    price_limit=limit_price,
+                )
+            else:
+                order_result = await self.place_order(quote, slippage_bps=slippage_bps)
             if not order_result:
                 return await self._update_signal_order(
                     pending, "FAILED", direction=prediction,
                     error_message="下单失败", quote_json=quote)
 
-            # 币安侧终态回查（FOK 受理后仍可能翻转 FAILED；防幽灵成交，
-            # 2026-08 对账发现 2 笔本地 FILLED 而币安 filled=0）。
-            # P0：两轮轮询（≈6s + 深轮询≈6s），消除旧 2.4s 窗口差 471ms 返回
-            # None 导致 FOK 重试短路的竞态。
             order_id = order_result.get("orderId")
+
+            # 限价挂单：直接落 PENDING（GTC 挂单常驻在币安撮合簿等待被动撮合，不走 FOK 即时重试）
+            if is_limit:
+                logger.info(
+                    "信号实盘：限价 GTC 挂单已提交至币安撮合簿 | signal={} | window={} | orderId={} | limitPrice={}",
+                    signal_version, window_start, order_id, limit_price)
+                return await self._update_signal_order(
+                    pending, "PENDING",
+                    direction=prediction,
+                    token_id=token_id,
+                    order_id=order_id,
+                    quote_json=quote,
+                )
             confirmed = await self._confirm_with_backfill(order_id)
 
             # FOK 未成交即时重试（成交率改进，2026-08-30 S1 实证）：15m 开盘瞬间

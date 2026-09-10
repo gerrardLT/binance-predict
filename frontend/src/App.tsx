@@ -2894,6 +2894,7 @@ interface LiveChannelStatus {
   family: string
   market_period: string
   direction: string
+  order_type?: string
   enabled: boolean
   enabled_at_startup: boolean
   amount_usdt: number
@@ -3481,6 +3482,9 @@ function LiveTradeTab() {
                   >
                     <span className="flex items-center gap-1.5 min-w-0 flex-1">
                       <span className={`ds-badge shrink-0 ${SIGNAL_KIND_BADGE[info?.kind ?? '影子']}`}>{info?.kind ?? '影子'}</span>
+                      <span className={`px-1.5 py-0.5 text-[10px] font-semibold rounded-pill border shrink-0 ${ch.order_type === 'LIMIT' ? 'bg-brand-soft text-brand border-brand/30' : 'bg-sunken text-ink-70 border-line'}`} title={ch.order_type === 'LIMIT' ? '限价挂单模式（GTC 长效挂单被动撮合）' : '市价模式（FOK 询价即时成交）'}>
+                        {ch.order_type === 'LIMIT' ? '限价GTC' : '市价FOK'}
+                      </span>
                       <span className="text-ink-95 font-medium truncate">{info?.name ?? ch.display_name}</span>
                       <span className="text-[10px] text-ink-55 font-mono shrink-0 hidden md:inline">{ch.channel}</span>
                       <HelpHint text={info?.desc ?? ch.display_name} />

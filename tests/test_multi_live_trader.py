@@ -3973,3 +3973,240 @@ async def test_signal_trade_quote_error_classifies_insufficient_balance(
     assert order2["status"] == "FAILED"
     msg2 = updates[-1][1]["error_message"]
     assert "余额不足" not in msg2 and "HTTP 500" in msg2
+
+
+# ============================================================
+# 组 11：原生 LIMIT GTC 限价挂单改造链路专项测试 (2026-09-10)
+# ============================================================
+
+def test_limit_order_channels_marked_in_registry() -> None:
+    """限价折价通道必须在 ChannelSpec 中声明 order_type='LIMIT'。"""
+    expected_limit_channels = [
+        "hm_inside_15m_v2",
+        "ih_inside_15m_v2",
+        "firsthit_down_v1",
+        "firsthit_down_body_v1",
+        "firsthit_down_chg_v1",
+        "firsthit_down_g4_v1",
+        "firsthit_down_g7_v1",
+        "g7_streak_v1",
+        "g7_wick20_v1",
+        "g7_strict_v1",
+        "g7_q05_v1",
+        "g7_t270_v1",
+        "quote_contrarian_v2",
+        "late_night_contrarian_v2",
+        "s2_cond_t4_v1",
+    ]
+    for ch in expected_limit_channels:
+        spec = LIVE_CHANNELS.get(ch)
+        assert spec is not None, f"通道 {ch} 未注册"
+        assert spec.order_type == "LIMIT", f"通道 {ch} 的 order_type 应为 LIMIT，实为 {spec.order_type}"
+
+    # 市价通道保持 MARKET
+    expected_market_channels = [
+        "scene_bull_exhaust",
+        "scene_bull_exhaust_confirm",
+        "scene_bear_exhaust",
+        "scene_momentum_fade",
+        "x4_v2",
+        "x4_v3",
+        "s5_deep_z20_v1",
+        "s2_cond_t5d_v1",
+        "nb_smaslope_5m_v1",
+        "absorption_follow_td120_v1",
+        "absorption_follow_td150_v1",
+    ]
+    for ch in expected_market_channels:
+        spec = LIVE_CHANNELS.get(ch)
+        assert spec is not None, f"通道 {ch} 未注册"
+        assert spec.order_type == "MARKET", f"通道 {ch} 的 order_type 应为 MARKET，实为 {spec.order_type}"
+
+
+@pytest.mark.asyncio
+async def test_signal_trade_limit_gtc_order_flow(monkeypatch) -> None:
+    """execute_signal_trade 传入 order_type='LIMIT'：
+    1. 调用 get_quote 传 order_type='LIMIT' 与 price_limit=max_exec_price
+    2. 调用 place_order 传 order_type='LIMIT', time_in_force='GTC', price_limit=max_exec_price
+    3. 状态直接落 PENDING（GTC 挂单常驻币安撮合簿等待被动撮合），不走 FOK 即时确认与重试。
+    """
+    trader = _make_real_trader(monkeypatch)
+    quote_calls: list[dict] = []
+    place_calls: list[dict] = []
+    updates: list[tuple] = []
+
+    async def _reserve(_v, _ws, direction=None, market_period="5m", scene_signal_id=None):
+        return _pending_order()
+
+    async def _update(order, status, **kwargs):
+        updates.append((status, kwargs))
+        return {**order, "status": status, **kwargs}
+
+    async def _quote(token_id, side="BUY", amount_usdt=None, order_type="MARKET", price_limit=None):
+        quote_calls.append({
+            "token_id": token_id,
+            "side": side,
+            "amount_usdt": amount_usdt,
+            "order_type": order_type,
+            "price_limit": price_limit,
+        })
+        return {
+            "quoteId": "Q-LIMIT-1",
+            "price": "0.30",
+            "averagePrice": "0.30",
+            "amountIn": "5000000000000000000",
+            "amountOut": "16666666666666666666",
+        }
+
+    async def _place(quote, slippage_bps=1200, order_type="MARKET", time_in_force="FOK", price_limit=None):
+        place_calls.append({
+            "quote": quote,
+            "slippage_bps": slippage_bps,
+            "order_type": order_type,
+            "time_in_force": time_in_force,
+            "price_limit": price_limit,
+        })
+        return {"orderId": "ORD-LIMIT-GTC-1"}
+
+    confirm_calls: list[str] = []
+    async def _confirm(order_id, **kwargs):
+        confirm_calls.append(order_id)
+        return {"orderId": order_id, "status": "FILLED"}
+
+    monkeypatch.setattr(trader, "_reserve_order_slot", _reserve)
+    monkeypatch.setattr(trader, "_update_signal_order", _update)
+    monkeypatch.setattr(trader, "get_quote", _quote)
+    monkeypatch.setattr(trader, "place_order", _place)
+    monkeypatch.setattr(trader, "confirm_order_status", _confirm)
+
+    order = await trader.execute_signal_trade(
+        prediction="DOWN",
+        amount_usdt=5.0,
+        signal_version="hm_inside_15m_v2",
+        window_start=WINDOW_START,
+        max_exec_price=0.30,
+        market_period="15m",
+        order_type="LIMIT",
+    )
+
+    # 1. 断言 get_quote 传参
+    assert len(quote_calls) == 1
+    assert quote_calls[0]["order_type"] == "LIMIT"
+    assert quote_calls[0]["price_limit"] == 0.30
+
+    # 2. 断言 place_order 传参
+    assert len(place_calls) == 1
+    assert place_calls[0]["order_type"] == "LIMIT"
+    assert place_calls[0]["time_in_force"] == "GTC"
+    assert place_calls[0]["price_limit"] == 0.30
+
+    # 3. 断言直接落 PENDING，且绝不走 FOK 即时回查与重试
+    assert order["status"] == "PENDING"
+    assert order["order_id"] == "ORD-LIMIT-GTC-1"
+    assert len(confirm_calls) == 0  # GTC 挂单不进行同步终态回查
+    assert updates[-1][0] == "PENDING"
+    assert updates[-1][1]["order_id"] == "ORD-LIMIT-GTC-1"
+
+
+@pytest.mark.asyncio
+async def test_multi_live_trader_passes_limit_order_type_from_spec(monkeypatch) -> None:
+    """MultiLiveTrader 触发 nextbar/firsthit/s2_cond 限价通道时，
+    必须透传 spec.order_type='LIMIT' 给 execute_signal_trade。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["hm_inside_15m_v2"])
+    sig = {
+        "version": "hm_inside_15m_v2",
+        "market_start": WINDOW_START,
+        "market_end": WINDOW_START + 900_000,
+        "direction": "DOWN",
+    }
+    t.on_nextbar_signal(sig)
+    await _drain(t)
+
+    assert len(fake.calls) == 1
+    assert fake.calls[0]["signal_version"] == "hm_inside_15m_v2"
+    assert fake.calls[0]["order_type"] == "LIMIT"
+    assert fake.calls[0]["max_exec_price"] == 0.30
+
+
+@pytest.mark.asyncio
+async def test_exclusive_limit_gtc_pending_order_occupies_slot(monkeypatch) -> None:
+    """同窗互斥：限价单落 PENDING（挂在撮合簿）即占用互斥槽，防止同组后续通道并发挂单叠加敞口。"""
+    fake = _FakeTrader(result=_fake_order(status="PENDING", signal_version="firsthit_down_v1"))
+    t = _make_trader(monkeypatch, fake, channels=["firsthit_down_v1", "firsthit_down_body_v1"])
+
+    # 模拟 firsthit_down_v1 开火并返回 PENDING
+    dn_p = _firsthit_down_curve(trigger_q=0.04, npts=20, trigger_idx=8)
+    btc_p = [{"t": WINDOW_START + i * 15_000, "v": 100.0} for i in range(20)]
+
+    fired = t.check(
+        WINDOW_START, WINDOW_END, WINDOW_START + 120_000,
+        down_price=0.04, btc_price=100.0,
+        window_entry_price=100.0,
+        window_btc_curve=btc_p, window_down_curve=dn_p,
+    )
+    assert "firsthit_down_v1" in fired
+    await _drain(t)
+
+    # 槽位已被占：同窗后续通道尝试开火时被互斥阻拦
+    assert WINDOW_START in t._window_filled
+    assert "firsthit_down_v1" in t._window_filled[WINDOW_START]
+
+
+@pytest.mark.asyncio
+async def test_sync_binance_orders_cancels_expired_limit_order(monkeypatch) -> None:
+    """对账循环：PENDING 限价单且周期已结束（未成交）→ 触发 cancel_order 撤单并改判 FAILED。"""
+    import binance_predict.main as m
+
+    now_ms = int(time.time() * 1000)
+    # 构造一个 20 分钟前的 15m 挂单（周期已过 15m + 1m 容差）
+    old_window = now_ms - 20 * 60_000
+    pending_order = SimpleNamespace(
+        id=99,
+        status="PENDING",
+        window_start=old_window,
+        market_period="15m",
+        order_id="ORD-LIMIT-EXP-1",
+        signal_version="hm_inside_15m_v2",
+        amount_in="5000000000000000000",
+        quote_json={},
+        error_message=None,
+    )
+
+    class _SyncDb:
+        def __init__(self, rows):
+            self._rows = rows
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def execute(self, stmt):
+            res = MagicMock()
+            res.scalars.return_value.all.return_value = self._rows
+            return res
+        async def commit(self):
+            return None
+
+    monkeypatch.setattr(m, "async_session_factory", lambda: _SyncDb([pending_order]))
+    monkeypatch.setattr(m.prediction_trader, "_api_key", "test-key")
+    monkeypatch.setattr(m.prediction_trader, "_wallet_address", "0xADDR")
+
+    # 模拟订单历史中无该单（或者该单未成交不在历史）
+    async def _hist(limit=100):
+        return []
+    monkeypatch.setattr(m.prediction_trader, "query_order_history", _hist)
+
+    cancelled: list[str] = []
+    async def _cancel(order_id):
+        cancelled.append(order_id)
+        return True
+    monkeypatch.setattr(m.prediction_trader, "cancel_order", _cancel)
+
+    res = await m._sync_binance_orders_impl()
+    assert res.get("synced") == 1
+    assert pending_order.status == "FAILED"
+    assert "限价挂单周期已结束未成交" in pending_order.error_message
+    assert cancelled == ["ORD-LIMIT-EXP-1"]
+
+
+

@@ -53,6 +53,7 @@ class ChannelSpec:
                                   # absorption 族由 BTC 位移符号动态决定，此处为基准方向）
     auto_max_exec: float          # 默认执行价护栏（可被配置覆盖）
     display_name: str
+    order_type: str = "MARKET"    # 下单类型：'MARKET'（市价 FOK） | 'LIMIT'（限价挂单 GTC）
     v2_guard: str | None = None   # quote_edge v2 门禁模式：min_drop | max_rise | None
     v3_env: bool = False          # quote_edge v3 环境门禁（前窗DOWN [+距日高回落]，异步核验）
     regime_gate: bool = False     # quote_edge v4 regime 门禁（ret24≤阈值，K 线异步核验）
@@ -77,14 +78,14 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     # 是回测口径事实源，整体保留）；退役只停「v1 自身作为通道/影子版本」。
     "quote_contrarian_v2": ChannelSpec(
         "quote_contrarian_v2", "quote_edge", "5m", "DOWN", _qe_guard("quote_contrarian_v1"),
-        "报价反向·门禁版", v2_guard="max_rise",
+        "报价反向·门禁版", order_type="LIMIT", v2_guard="max_rise",
     ),
     # late_night_contrarian_v2（2026-09-08 实盘接入）：v1 ∩ 时段门(北京 22-24) ∩ 距日高回落≥0.30%
     # 依据（F1 优化发现）：OOS n=50 wr 44.0% CI[31.2%,57.7%] vs 盈亏平衡≈27%；门禁数据缺失→不落表。
     # ⚠️ 纪律推翻：原 docstring "纯影子前向攒样本" 被用户拍板改为实盘注册（线上已开启下单）。
     "late_night_contrarian_v2": ChannelSpec(
         "late_night_contrarian_v2", "quote_edge", "5m", "DOWN", _qe_guard("late_night_contrarian_v2"),
-        "深夜逆势·日高回落门禁版", v2_guard="max_rise", hour_guard=(22, 24), ln_dd_guard=True,
+        "深夜逆势·日高回落门禁版", order_type="LIMIT", v2_guard="max_rise", hour_guard=(22, 24), ln_dd_guard=True,
     ),
     # --- x4 族（影子 PENDING → 次窗 +150s 决策点，入场价历史偏低）---
     "x4_v2": ChannelSpec("x4_v2", "x4", "5m", "DOWN", 0.50, "情绪错位·平静市门禁版"),
@@ -129,6 +130,7 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     # 两版同源同目标周期 → 同窗互斥（至多一单成交，弃单不占槽）。
     "s2_cond_t4_v1": ChannelSpec(
         "s2_cond_t4_v1", "s2_cond", "15m", "UP", 0.38, "S2条件t=4价<开（押UP）",
+        order_type="LIMIT",
     ),
     "s2_cond_t5d_v1": ChannelSpec(
         "s2_cond_t5d_v1", "s2_cond", "15m", "UP", 0.44, "S2条件t=5剔深（押UP）",
@@ -164,15 +166,15 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     # 触发后实际成交均价高于护栏弃单，不追价。
     "firsthit_down_v1": ChannelSpec(
         "firsthit_down_v1", "firsthit", "5m", "DOWN", 0.08,
-        "首触G0基底 q∈(0.005,0.1]（押DOWN）",
+        "首触G0基底 q∈(0.005,0.1]（押DOWN）", order_type="LIMIT",
     ),
     "firsthit_down_body_v1": ChannelSpec(
         "firsthit_down_body_v1", "firsthit", "5m", "DOWN", 0.12,
-        "首触G1小实体 body_r≤0.35（押DOWN）",
+        "首触G1小实体 body_r≤0.35（押DOWN）", order_type="LIMIT",
     ),
     "firsthit_down_chg_v1": ChannelSpec(
         "firsthit_down_chg_v1", "firsthit", "5m", "DOWN", 0.09,
-        "首触G3偏离 chg≤+2.82bp（押DOWN）",
+        "首触G3偏离 chg≤+2.82bp（押DOWN）", order_type="LIMIT",
     ),
     # G4 交互门（2026-09-08 影子+实盘接入）：G4 = G1 ∩ G3（chg≤2.82 ∧ body≤0.35）
     # 依据 shape_scan_v2 冻结扫描：calib n=214 P=12.6% EV+1.03 CI[+0.08,+2.22]；
@@ -186,7 +188,7 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     #   用户知情后仍拍板维持实盘（线上已开启下单），前向影子+实盘双重验证裁决。
     "firsthit_down_g4_v1": ChannelSpec(
         "firsthit_down_g4_v1", "firsthit", "5m", "DOWN", 0.12,
-        "首触G4交互门 chg≤2.82∧body≤0.35（押DOWN）",
+        "首触G4交互门 chg≤2.82∧body≤0.35（押DOWN）", order_type="LIMIT",
     ),
     # G7 族（2026-09-08 影子+实盘接入）：G7 纯组合基底及 5 个科学变体
     # 护栏设置依据：回测中均值触发价约 0.068~0.075，盈亏平衡平衡价 wr*0.98（胜率 18%~24% 对应 0.17~0.23）；
@@ -195,39 +197,39 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     #   （显著负）——用户知情后仍拍板维持实盘（线上已开启下单），前向验证裁决。
     "firsthit_down_g7_v1": ChannelSpec(
         "firsthit_down_g7_v1", "firsthit", "5m", "DOWN", 0.10,
-        "首触G7基底 body_r≤0.35∧wick=1（押DOWN）",
+        "首触G7基底 body_r≤0.35∧wick=1（押DOWN）", order_type="LIMIT",
     ),
     "g7_streak_v1": ChannelSpec(
         "g7_streak_v1", "firsthit", "5m", "DOWN", 0.10,
-        "首触G7+非强连阳 streak_up≤1（押DOWN）",
+        "首触G7+非强连阳 streak_up≤1（押DOWN）", order_type="LIMIT",
     ),
     "g7_wick20_v1": ChannelSpec(
         "g7_wick20_v1", "firsthit", "5m", "DOWN", 0.12,
-        "首触G7+长上影 upper_wick≥2bp（押DOWN）",
+        "首触G7+长上影 upper_wick≥2bp（押DOWN）", order_type="LIMIT",
     ),
     "g7_strict_v1": ChannelSpec(
         "g7_strict_v1", "firsthit", "5m", "DOWN", 0.12,
-        "首触G7严格版 streak≤1∧wick≥1.5bp（押DOWN）",
+        "首触G7严格版 streak≤1∧wick≥1.5bp（押DOWN）", order_type="LIMIT",
     ),
     "g7_q05_v1": ChannelSpec(
         "g7_q05_v1", "firsthit", "5m", "DOWN", 0.05,
-        "首触G7+深折价 q≤0.05（押DOWN）",
+        "首触G7+深折价 q≤0.05（押DOWN）", order_type="LIMIT",
     ),
     "g7_t270_v1": ChannelSpec(
         "g7_t270_v1", "firsthit", "5m", "DOWN", 0.10,
-        "首触G7+非极晚 t≤270s（押DOWN）",
+        "首触G7+非极晚 t≤270s（押DOWN）", order_type="LIMIT",
     ),
     # --- rev2 族（2026-09-09 孕线反转）：15m 上吊线/倒垂线 + 最长实体 + 孕线包裹 ---
     # 依据：720d 全样本实证，最佳挂单护栏为 0.30（单笔期望 EV +18.3%，成交率 65.7%，收益最高）
-    # hm_inside_15m_v2：近4根高点大实体阳线 + 包裹长下影上吊线 -> 押次根 15m 收阴 DOWN（720d 胜率 56.6%，30d 胜率 65.4%）
-    # ih_inside_15m_v2：近4根低点大实体阴线 + 包裹长上影倒垂线 -> 押次根 15m 收阳 UP（720d 胜率 52.5%，30d 胜率 62.5%）
+    # hm_inside_15m_v2：近4根高点大实体阳线 + 包裹长下影上吊线 -> 押次根 15m 收阴 DOWN（720d 胜率 56.6%，30d 胜率 65.4）
+    # ih_inside_15m_v2：近4根低点大实体阴线 + 包裹长上影倒垂线 -> 押次根 15m 收阳 UP（720d 胜率 52.5%，30d 胜率 62.5）
     "hm_inside_15m_v2": ChannelSpec(
         "hm_inside_15m_v2", "nextbar", "15m", "DOWN", 0.30,
-        "15m孕线上吊线反转（押DOWN）",
+        "15m孕线上吊线反转（押DOWN）", order_type="LIMIT",
     ),
     "ih_inside_15m_v2": ChannelSpec(
         "ih_inside_15m_v2", "nextbar", "15m", "UP", 0.30,
-        "15m孕线倒垂线反转（押UP）",
+        "15m孕线倒垂线反转（押UP）", order_type="LIMIT",
     ),
 }
 

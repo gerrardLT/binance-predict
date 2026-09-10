@@ -707,7 +707,7 @@ class MultiLiveTrader:
                     channel, _fmt_win(window_start), blockers)
                 return None
             order = await self._trader.execute_signal_trade(**trade_kwargs)
-            if order is not None and order.get("status") == "FILLED":
+            if order is not None and order.get("status") in ("FILLED", "PENDING"):
                 self._window_filled.setdefault(window_start, set()).add(channel)
                 if len(self._window_filled) > 1024:
                     cutoff = time.time() * 1000 - 6 * 3_600_000
@@ -719,13 +719,13 @@ class MultiLiveTrader:
     async def _group_filled_channel(
         self, group: frozenset[str], window_start: int,
     ) -> str | None:
-        """返回互斥组同窗已成交版本，供重启后恢复事件级互斥。"""
+        """返回互斥组同窗已成交或挂单版本，供重启后恢复事件级互斥。"""
         async with async_session_factory() as session:
             return (await session.execute(
                 sa_select(TradeOrderModel.signal_version).where(
                     TradeOrderModel.signal_version.in_(group),
                     TradeOrderModel.window_start == window_start,
-                    TradeOrderModel.status == "FILLED",
+                    TradeOrderModel.status.in_(["FILLED", "PENDING"]),
                 ).limit(1)
             )).scalar_one_or_none()
 
@@ -834,6 +834,7 @@ class MultiLiveTrader:
                 max_exec_price=resolve_max_exec(spec, cfg),
                 market_period="5m",
                 entry_band_whitelist=spec.entry_band_whitelist,
+                order_type=spec.order_type,
             )
             await self._after_fill(order, version, cfg)
             if order is not None and order.get("status") == "FILLED":
@@ -932,6 +933,7 @@ class MultiLiveTrader:
                 max_exec_price=resolve_max_exec(spec, cfg),
                 market_period="15m",
                 scene_signal_id=int(sig["id"]),
+                order_type=spec.order_type,
             )
             await self._after_fill(order, channel, cfg)
             # scene_signal_id 下单即落库（无需 signal_id 回填）
@@ -1031,6 +1033,7 @@ class MultiLiveTrader:
                 window_start=market_start,
                 max_exec_price=resolve_max_exec(spec, cfg),
                 market_period="15m",
+                order_type=spec.order_type,
             )
             await self._after_fill(order, channel, cfg)
             # kline 影子信号无订单 signal_id 关联列，对账走 signal_version+window_start
@@ -1064,6 +1067,7 @@ class MultiLiveTrader:
                 window_start=market_start,
                 max_exec_price=resolve_max_exec(spec, cfg),
                 market_period=spec.market_period,
+                order_type=spec.order_type,
             )
             await self._after_fill(order, channel, cfg)
         except Exception as exc:
@@ -1099,6 +1103,7 @@ class MultiLiveTrader:
                 window_start=window_start,
                 max_exec_price=resolve_max_exec(spec, cfg),
                 market_period="5m",
+                order_type=spec.order_type,
             )
             await self._after_fill(order, channel, cfg)
         except Exception as exc:
@@ -1133,6 +1138,7 @@ class MultiLiveTrader:
                 window_start=window_start,
                 max_exec_price=resolve_max_exec(spec, cfg),
                 market_period="5m",
+                order_type=spec.order_type,
             )
             await self._after_fill(order, channel, cfg)
         except Exception as exc:
@@ -1202,6 +1208,7 @@ class MultiLiveTrader:
                 window_start=window_start,
                 max_exec_price=resolve_max_exec(spec, cfg),
                 market_period="5m",
+                order_type=spec.order_type,
             )
             if order is None:
                 # 同窗已有占位（重启/并发重复）或前置配置缺失，未花钱，正常路径
@@ -1540,6 +1547,7 @@ class MultiLiveTrader:
             "max_exec_price": resolve_max_exec(spec, cfg),
             "auto_max_exec": spec.auto_max_exec,
             "custom_max_exec": cfg.max_exec_price is not None,
+            "order_type": spec.order_type,
             "fire_total": cfg.fire_total,
             "fired_windows": sorted(cfg.fired)[-10:],
         }

@@ -2945,6 +2945,7 @@ async def _sync_binance_orders_impl() -> dict:
 
     synced: list[dict] = []
     amount_corrected: list[dict] = []
+    now_ms = int(time.time() * 1000)
     async with async_session_factory() as db:
         stmt = select(TradeOrderModel).where(
             TradeOrderModel.status == "PENDING",
@@ -2960,6 +2961,22 @@ async def _sync_binance_orders_impl() -> dict:
                 cands = by_window_any.get(row.window_start) or []
                 bo = cands[0] if len(cands) == 1 else None
             if not bo:
+                # 限价挂单超时出清：仅对已提交币安（具有 order_id）的订单，
+                # 若未在币安订单历史中查到成交，且该周期已彻底结束（超 1min 容差缓冲），
+                # 触发币安主动撤单并将本地状态出清为 FAILED，避免僵尸挂单滞留撮合簿或本地永久卡 PENDING
+                cycle_len_ms = 900_000 if period == "15m" else 300_000
+                if row.order_id and now_ms > int(row.window_start) + cycle_len_ms + 60_000:
+                    try:
+                        await prediction_trader.cancel_order(str(row.order_id))
+                    except Exception as exc:
+                        logger.warning("对账循环：撤销过期挂单异常 | order_id={} | {}", row.order_id, exc)
+                    row.status = "FAILED"
+                    row.error_message = "限价挂单周期已结束未成交，已自动撤单出清"
+                    synced.append({
+                        "id": row.id, "window_start": row.window_start,
+                        "status": "FAILED", "order_id": row.order_id,
+                        "reason": "expired_limit_order_cancelled",
+                    })
                 continue
             filled = Decimal(str(bo.get("filledUsdtAmount") or "0"))
             bo_status = str(bo.get("status") or "")
