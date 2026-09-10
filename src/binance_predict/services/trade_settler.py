@@ -43,6 +43,7 @@ from sqlalchemy import select as sa_select, update as sa_update
 
 from binance_predict.db.engine import async_session_factory
 from binance_predict.db.models import FakeBreakoutSignal, SentimentWindow, TradeOrderModel
+from binance_predict.services.wechat_notifier import wechat_notifier
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +233,19 @@ class TradeSettler:
             row.id, row.window_start, row.direction, outcome, win,
             f"{pnl:+.4f}" if pnl is not None else "N/A", settle_price,
         )
+        try:
+            wechat_notifier.notify_order_settled(
+                channel=row.signal_version or "unknown",
+                window_start=int(row.window_start),
+                direction=str(row.direction),
+                outcome=str(outcome),
+                win=win,
+                pnl=pnl,
+                amount_usdt=self._amount_usdt(row),
+                settle_price=settle_price,
+            )
+        except Exception as exc:
+            logger.warning("企微结算通知异常: %s", exc)
         return True
 
     async def _settle_scene_row(self, row: TradeOrderModel) -> bool:
@@ -319,6 +333,19 @@ class TradeSettler:
             row.id, row.scene_signal_id, row.window_start, row.direction, outcome,
             win, f"{pnl:+.4f}" if pnl is not None else "N/A", settle_price,
         )
+        try:
+            wechat_notifier.notify_order_settled(
+                channel=row.signal_version or "scene",
+                window_start=int(row.window_start),
+                direction=str(row.direction),
+                outcome=str(outcome),
+                win=win,
+                pnl=pnl,
+                amount_usdt=self._amount_usdt(row),
+                settle_price=settle_price,
+            )
+        except Exception as exc:
+            logger.warning("企微场景结算通知异常: %s", exc)
         return True
 
     async def _expire_row(self, row: TradeOrderModel, now_dt: datetime) -> bool:

@@ -77,6 +77,7 @@ from .live_channels import scene_pattern_to_channel
 from .scene_params import DEFAULT_SCENE_PARAMS, SceneParams
 from .signal_notify import TZ_BJT, has_scene_filled_order, is_live_enabled
 from .shadow_version_gate import shadow_gate
+from .wechat_notifier import wechat_notifier
 
 # 超宽限阈值：到期后超过此宽限未结算的信号转 klines 精确补结算路径
 # （周期锚点口径下 P(S)/P(E) 均为历史时点，klines 必然可得，停机无损）
@@ -549,6 +550,21 @@ class FakeBreakoutDetector:
                         "破位记 pending [{} {}] | BTC {:.0f} 破 {:.0f} | 周期 {}",
                         level, side, mid,
                         lv["resistance"] if side == "high" else lv["support"], cycle_id,
+                    )
+                    # 微信提前预警雷达：破位已发生，提醒注意本周期末收盘确认（潜在 S1/S2 次周期开盘单）
+                    cycle_end_ms = (cycle_id + 1) * 900_000
+                    rem_sec = max(0, int((cycle_end_ms - now_ms) / 1000))
+                    dir_guess = "DOWN（多头耗尽反转）" if side == "high" else "UP（空头耗尽反转）"
+                    guard_guess = 0.70 if side == "high" else 0.65
+                    wechat_notifier.notify_pre_trade_radar(
+                        radar_type="15m 场景阻力/支撑破位",
+                        channel="scene_bull_exhaust" if side == "high" else "scene_bear_exhaust",
+                        direction="DOWN" if side == "high" else "UP",
+                        target_time_ms=cycle_end_ms,
+                        lead_seconds=rem_sec,
+                        max_exec_price=guard_guess,
+                        features_desc=f"BTC {mid:.1f} 突破 4h {level} {'阻力' if side == 'high' else '支撑'} {lv['resistance'] if side == 'high' else lv['support']:.1f}，等待周期收盘质量确认",
+                        dedup_key=f"radar_scene_{level}_{side}_{cycle_id}",
                     )
 
     async def _on_cycle_boundary(self, prev_cycle: int, cur_cycle: int, now_ms: int) -> None:

@@ -32,6 +32,7 @@ from ..config.settings import settings
 from ..db.engine import async_session_factory
 from ..db.models import TradeOrderModel
 from . import clock_sync
+from .wechat_notifier import wechat_notifier
 
 # ---------------------------------------------------------------------------
 # 预测钱包余额常量（P0-1：余额看不全；2026-08-23 agent-reach 调研收敛）
@@ -341,6 +342,11 @@ class BinancePredictionTrader:
                     except (TypeError, ValueError):
                         pass
                     break
+
+        # 低余额预警推送
+        if out.get("usdt_free") is not None and out["usdt_free"] < LOW_BALANCE_ALERT_USDT:
+            wechat_notifier.notify_low_balance(out["usdt_free"])
+
         return out
 
     async def _fetch_prediction_asset_list(self) -> list | None:
@@ -1500,6 +1506,14 @@ class BinancePredictionTrader:
             # 护栏含贴线（>=）：报价=护栏价时滑点空间为 0，币安拒收
             # slippageBps=0（-1102，2026-08-29 id=100 实证），贴线单无法安全提交。
             if max_exec_price is not None and (avg_price <= 0 or avg_price >= max_exec_price):
+                wechat_notifier.notify_order_abandoned(
+                    channel=signal_version,
+                    direction=prediction,
+                    window_start=window_start,
+                    quote_price=avg_price,
+                    guard_price=max_exec_price,
+                    reason=f"报价 {avg_price} 超出或贴线护栏上限 {max_exec_price}",
+                )
                 return await self._update_signal_order(
                     pending, "FAILED", direction=prediction,
                     error_message=f"执行价护栏弃单 | averagePrice={avg_price} >= {max_exec_price}（贴线无滑点空间）",
@@ -1509,6 +1523,14 @@ class BinancePredictionTrader:
             # 决策点才可知的成交均价，与执行价护栏相互独立（白名单过、护栏超 →
             # 仍弃单；反之亦然）。avg≤0 已被纯函数 fail-safe 拦截。
             if not in_entry_band_whitelist(avg_price, entry_band_whitelist):
+                wechat_notifier.notify_order_abandoned(
+                    channel=signal_version,
+                    direction=prediction,
+                    window_start=window_start,
+                    quote_price=avg_price,
+                    guard_price=max_exec_price,
+                    reason=f"成交均价 {avg_price} 不在入场白名单区间 {entry_band_whitelist}",
+                )
                 return await self._update_signal_order(
                     pending, "FAILED", direction=prediction,
                     error_message=f"入场价白名单弃单 | averagePrice={avg_price} 不在 {entry_band_whitelist}",

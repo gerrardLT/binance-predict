@@ -539,6 +539,8 @@ const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(tokenIds && tokenIds.length > 0 ? { token_ids: tokenIds } : {}),
     }).then(r => r.json()),
+  // 微信通知连通性测试 (2026-09-10)
+  postTestWechatNotify: () => authFetch('/api/notify/test-wechat', { method: 'POST' }).then(r => r.json()),
 }
 
 // ============================================================
@@ -2166,6 +2168,17 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
             onClick={onSyncBinance} disabled={syncing}
             className="ds-btn-dark px-3 py-1 text-xs font-semibold disabled:opacity-50"
           >{syncing ? '对账中…' : '对账（同步币安）'}</button>
+          <button
+            onClick={() => {
+              api.postTestWechatNotify()
+                .then((r: Record<string, unknown>) => {
+                  alert(r?.message ? String(r.message) : '测试推送已派发，请查收微信！')
+                })
+                .catch((e: unknown) => alert('测试推送请求失败: ' + String(e)))
+            }}
+            className="px-2.5 py-1 text-xs font-semibold border border-line rounded-pill bg-card text-ink-80 hover:border-brand hover:text-brand transition-colors"
+            title="点击向已配置的 WxPusher / 企业微信发送一条测试消息"
+          >🔔 测试微信通知</button>
         </div>
       </div>
       {filtered.length === 0 ? (

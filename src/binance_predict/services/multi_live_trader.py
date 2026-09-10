@@ -81,6 +81,7 @@ from .live_channels import (
     resolve_max_exec,
     scene_pattern_to_channel,
 )
+from .wechat_notifier import wechat_notifier
 from .misalignment_detector import DECISION_T_SEC
 from .quote_edge_detector import (
     QUOTE_EDGE_RULES,
@@ -765,6 +766,23 @@ class MultiLiveTrader:
             decision_ms = int(target_start) + int(DECISION_T_SEC * 1000)
             if now_ms > decision_ms + X4_DECISION_TOLERANCE_MS:
                 continue  # 错过决策点：不追单（迟到价破坏回测口径）
+
+            # 提前预警雷达：发现 PENDING 错位信号，提前预警次窗 T+150s 决策点挂单
+            rem_sec = max(0, int((decision_ms - now_ms) / 1000))
+            if rem_sec >= 30 and version in self._configs and self._configs[version].enabled:
+                spec = self._specs.get(version)
+                guard_p = resolve_max_exec(spec, self._configs[version]) if spec else 0.50
+                wechat_notifier.notify_pre_trade_radar(
+                    radar_type="5m 情绪错位挂单",
+                    channel=version,
+                    direction="DOWN",
+                    target_time_ms=decision_ms,
+                    lead_seconds=rem_sec,
+                    max_exec_price=guard_p,
+                    features_desc="5m 市场窗口产生 PENDING 错位信号，次窗 T+150s 决策点将进入挂单核验",
+                    dedup_key=f"radar_x4_{version}_{target_start}",
+                )
+
             task = asyncio.create_task(
                 self._fire_x4(int(sig_id), str(version), int(target_start)),
                 name=f"live_x4_{version}_{target_start}",
@@ -1198,7 +1216,7 @@ class MultiLiveTrader:
 
     async def _after_fill(self, order: dict | None, channel: str,
                           cfg) -> None:
-        """成交后公共动作：计数 + 余额缓存作废。"""
+        """成交后公共动作：计数 + 余额缓存作废 + 企微成交通知。"""
         if order is None:
             return
         cfg.fire_total += 1
@@ -1208,6 +1226,21 @@ class MultiLiveTrader:
                 self._on_balance_change()
             except Exception:
                 logger.warning("多通道实盘：余额缓存作废回调异常（不影响下单）")
+
+        # 企微成交通知
+        if order.get("status") == "FILLED":
+            try:
+                wechat_notifier.notify_order_filled(
+                    channel=channel,
+                    direction=str(order.get("direction", "")),
+                    window_start=int(order.get("window_start", 0)),
+                    avg_price=float(order.get("avg_price", 0.0)),
+                    amount_usdt=float(order.get("amount_usdt", cfg.amount_usdt)),
+                    shares=float(order.get("shares")) if order.get("shares") is not None else None,
+                    order_id=order.get("id"),
+                )
+            except Exception as exc:
+                logger.warning("多通道实盘：企微成交通知异常 | {}", exc)
 
     # ------------------------------------------------------------------
     # 市场列表后台预热（2026-08-30 S1 漏单修复 A）

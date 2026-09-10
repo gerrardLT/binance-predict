@@ -34,6 +34,9 @@ from binance_predict.discovery.data import Klines
 from binance_predict.services.shadow_entry_quote import snapshot_entry_quote
 from binance_predict.services.shadow_version_gate import shadow_gate
 
+from binance_predict.services.wechat_notifier import wechat_notifier
+from binance_predict.config.settings import settings
+
 REV2_SHADOW_SPECS: list[dict] = [
     {
         "version": "hm_inside_15m_v2",
@@ -232,6 +235,49 @@ class Rev2InsideShadowDetector:
             self._last_evaluated_bar = last_start
         await self._settle_pending(closed_15m)
         await self._expire_stale_pending()
+        await self._check_radar()
+
+    async def _check_radar(self) -> None:
+        """提前预警雷达：探测当前正在走的 15m K 线是否初具孕线反转雏形。"""
+        if not settings.wechat_radar_enabled or not settings.wechat_work_enabled:
+            return
+        try:
+            raw_15m = await self._collector.fetch_klines_raw("15m", WARMUP_BARS)
+            if len(raw_15m) < 5:
+                return
+            current_bar = raw_15m[-1]
+            now_ms = int(time.time() * 1000)
+            bar_start = int(current_bar["open_time"])
+            bar_end = bar_start + BAR_MS_15M
+            rem_sec = int((bar_end - now_ms) / 1000)
+
+            # 仅在收盘前 45s ~ 150s 区间进行雷达检测并推送预警
+            if not (45 <= rem_sec <= 150):
+                return
+
+            kl15 = _to_klines(raw_15m, BAR_MS_15M)
+            hits = evaluate_rev2_patterns(kl15, 1)
+            for hit in hits:
+                spec = hit["spec"]
+                channel = spec["version"]
+                direction = spec["direction"]
+                snap = hit["snapshot"]
+                features = (
+                    f"前根实体占比 {snap['prev_body_r']*100:.1f}%，"
+                    f"当前孕线包裹，下影 {snap.get('lower_r', 0)*100:.1f}% / 上影 {snap.get('upper_r', 0)*100:.1f}%"
+                )
+                wechat_notifier.notify_pre_trade_radar(
+                    radar_type="15m 经典孕线反转",
+                    channel=channel,
+                    direction=direction,
+                    target_time_ms=bar_end,
+                    lead_seconds=rem_sec,
+                    max_exec_price=0.30,
+                    features_desc=features,
+                    dedup_key=f"radar_rev2_{channel}_{bar_start}",
+                )
+        except Exception as exc:
+            logger.debug("Rev2Inside 雷达探测异常: {}", exc)
 
     async def _evaluate_new_bars(self, closed_15m: list[dict]) -> None:
         kl15 = _to_klines(closed_15m, BAR_MS_15M)

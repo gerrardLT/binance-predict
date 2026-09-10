@@ -302,6 +302,38 @@ class BinanceDataCollector:
             logger.warning("fetch_recent_klines 失败 | interval={} | {}", interval, exc)
             return []
 
+    async def fetch_klines_raw(self, interval: str, limit: int) -> list[dict]:
+        """拉取最近 K 线列表（包含当前正在走的那一根，用于提前预警雷达）。"""
+        url = f"{settings.binance_api_base}/api/v3/klines"
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    url,
+                    params={
+                        "symbol": settings.symbol,
+                        "interval": interval,
+                        "limit": limit,
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            if not data:
+                return []
+            return [
+                {
+                    "open_time": int(k[0]),
+                    "open": float(k[1]),
+                    "high": float(k[2]),
+                    "low": float(k[3]),
+                    "close": float(k[4]),
+                    "volume": float(k[5]),
+                }
+                for k in data
+            ]
+        except Exception as exc:
+            logger.warning("fetch_klines_raw 失败 | interval={} | {}", interval, exc)
+            return []
+
     def _safe_cached_mid_price(self) -> float:
         """返回缓存的 mid_price，若为 0.0 则记录严重警告。"""
         cached = self.store.mid_price

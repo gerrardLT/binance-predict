@@ -212,6 +212,28 @@ class Settings(BaseSettings):
     # 日常 5~10 封），800 仅作异常洪峰（多通道齐开/极端行情）的兜底闸。
     signal_push_max_daily_emails: int = 800
 
+    # --- 企业微信机器人推送与提前预警 (2026-09-10) ---
+    # 总开关：为 True 且 wechat_work_webhook_url 非空时启用企业微信推送
+    wechat_work_enabled: bool = True
+    # 企业微信群机器人 Webhook URL (支持 .env 中的 WECHAT_WORK_WEBHOOK_URL)
+    wechat_work_webhook_url: str = ""
+
+    # --- WxPusher 微信消息推送 (2026-09-10 微信个人号直推，永久免费) ---
+    # 总开关：为 True 时启用 WxPusher 微信直推
+    wxpusher_enabled: bool = True
+    # 方式一：极简模式 (SPT)，公众号扫码即得，最简单，推荐 (支持 .env WXPUSHER_SPT)
+    wxpusher_spt: str = ""
+    # 方式二：标准应用模式 (appToken + UID)
+    wxpusher_app_token: str = ""
+    wxpusher_uids: str = ""  # 逗号分隔的 UID
+
+    # 提前预警雷达总开关：是否在挂单前留出缓冲时间提前推送
+    wechat_radar_enabled: bool = True
+    # 15m 周期提前预警秒数（默认收盘前 90 秒探测雏形）
+    wechat_radar_lead_seconds_15m: int = 90
+    # 企微/微信推送每日消息硬上限（防极端行情刷屏轰炸）
+    wechat_max_daily_messages: int = 300
+
     # --- 风控统计缓存（Fix #20）---
     # RiskController.refresh_daily_stats 的 TTL（秒），避免短时间内重复全量查询。
     risk_stats_cache_ttl_sec: float = 30.0

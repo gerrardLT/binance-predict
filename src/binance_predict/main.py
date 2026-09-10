@@ -76,6 +76,7 @@ from .services.reversal_shadow_detector import ReversalShadowDetector
 from .services.rev2_inside_shadow_detector import Rev2InsideShadowDetector
 from .services.s2_cond_shadow_detector import S2CondShadowDetector
 from .services.shadow_version_gate import shadow_gate
+from .services.wechat_notifier import wechat_notifier
 from .services.trade_settler import TradeSettler
 from .services.llm_service import LLMService
 from .services.pattern_reevaluator import pattern_reevaluator
@@ -2448,6 +2449,28 @@ async def live_toggle(
             f" 护栏 {_ch['max_exec_price']}）"
         ),
         "status": _status,
+    }
+
+
+@app.post("/api/notify/test-wechat")
+async def test_wechat_notify(_: None = Depends(_require_auth)):
+    """一键测试微信 / 企业微信通知渠道连通性（2026-09-10）。"""
+    from datetime import datetime
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    test_msg = (
+        f"### ⚡【微信通知服务连通测试】\n"
+        f"> **测试时间**：`{now_str}`\n"
+        f"> **WxPusher 直推状态**：`{'已开启' if settings.wxpusher_enabled else '未开启'}`\n"
+        f"> **企业微信群机器人状态**：`{'已开启' if settings.wechat_work_enabled else '未开启'}`\n"
+        f"> **提前预警雷达状态**：`{'已开启 (缓冲 90s)' if settings.wechat_radar_enabled else '未开启'}`\n\n"
+        f"🎉 收到本条消息代表你的微信通知通道已配置成功，后续将自动推送提前预警与实盘播报！"
+    )
+    wechat_notifier.push_markdown(test_msg)
+    return {
+        "status": "SENT",
+        "message": "测试通知已派发至异步推送队列，请检查微信/企业微信接收情况",
+        "wxpusher_configured": bool(settings.wxpusher_spt.strip() or settings.wxpusher_app_token.strip()),
+        "wechat_work_configured": bool(settings.wechat_work_webhook_url.strip()),
     }
 
 
