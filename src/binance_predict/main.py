@@ -2962,7 +2962,18 @@ async def _sync_binance_orders_impl() -> dict:
     # key 带市场周期（P2b）：5m 与 15m 市场的窗口起始秒会重合（生产币安历史
     # 实测 12 个窗口秒两周期并存），只用 window_start 做 key 时后写覆盖先写，
     # 15m 的 PENDING 行可能被 5m 订单行回填（串号）。
-    by_window: dict[tuple[int, str], dict] = {}
+    # P2c（2026-09-10 同窗多单串号修复）：同一窗口同一周期可能有多笔币安订单
+    # （scene 市价单 + s2_cond 限价单同窗开火），by_window 单值映射后写覆盖先写
+    # → 两个本地 PENDING 行回填同一笔订单：order_id 互相覆盖、盈亏张冠李戴，
+    # 真实成交单沦为孤儿（生产实锤 id=727/729、id=721/723、id=725/726 三组串号，
+    # 2 笔真单 -1.29 USDT 从未入账）。新口径：
+    #   ① 有 order_id 的行优先精确匹配（LIMIT 挂单下单即落 order_id，币安
+    #      orderId 全局唯一，精确匹配零歧义）；
+    #   ② 精确命中即「占用」该币安订单，窗口回退只在未占用候选中挑，且候选唯一
+    #      才回填（多候选宁可不猜，保持 PENDING 下轮/人工处理）；
+    #   ③ 同一 order_id 被多个本地行声明（历史串号遗留）→ 不动作、不撤单
+    #      （撤的可能是别人真持仓），CRITICAL 留痕交人工核对。
+    by_window: dict[tuple[int, str], list[dict]] = {}
     by_window_any: dict[int, list[dict]] = {}   # 本地行 market_period 为 NULL（旧数据）时的候选
     by_orderid: dict[str, dict] = {}
     for o in history:
@@ -2977,26 +2988,80 @@ async def _sync_binance_orders_impl() -> dict:
             # 币安历史行用 marketTopicTitle（非 title），这里映射后传入。
             per = prediction_trader._classify_period(
                 {"title": o.get("marketTopicTitle"), "slug": o.get("slug")}) or ""
-            by_window[(ws, per)] = o
+            by_window.setdefault((ws, per), []).append(o)
             by_window_any.setdefault(ws, []).append(o)
+
+    def _oid(o: dict) -> str:
+        """币安订单占用键：orderId 优先；缺失时退化为对象身份（单次调用内稳定）。"""
+        v = o.get("orderId")
+        return str(v) if v else f"obj#{id(o)}"
 
     synced: list[dict] = []
     amount_corrected: list[dict] = []
+    ambiguous: list[dict] = []
     now_ms = int(time.time() * 1000)
     async with async_session_factory() as db:
-        stmt = select(TradeOrderModel).where(
-            TradeOrderModel.status == "PENDING",
-            TradeOrderModel.window_start.isnot(None),
+        stmt = (
+            select(TradeOrderModel)
+            .where(
+                TradeOrderModel.status == "PENDING",
+                TradeOrderModel.window_start.isnot(None),
+            )
+            .order_by(TradeOrderModel.id.asc())   # 占用顺序确定化（先建者先认领）
         )
         rows = (await db.execute(stmt)).scalars().all()
+
+        # 预扫描：同一 order_id 被多行声明 = 历史串号遗留（旧 by_window 单值映射所致）
+        owner_count: dict[str, int] = {}
+        for row in rows:
+            if row.order_id:
+                key = str(row.order_id)
+                owner_count[key] = owner_count.get(key, 0) + 1
+
+        claimed: set[str] = set()   # 本轮已被本地 PENDING 行占用的币安订单
         for row in rows:
             period = row.market_period or ""
-            bo = by_window.get((row.window_start, period))
-            if bo is None and not period:
-                # 旧数据无 market_period：仅当该窗口秒只有一个周期的订单行时才回填；
-                # 5m/15m 并存时宁可不猜（保持 PENDING，下轮对账或人工处理）。
-                cands = by_window_any.get(row.window_start) or []
-                bo = cands[0] if len(cands) == 1 else None
+            bo: dict | None = None
+            dup = bool(row.order_id) and owner_count.get(str(row.order_id), 0) > 1
+
+            if row.order_id and not dup:
+                cand = by_orderid.get(str(row.order_id))
+                if cand is not None:
+                    bo = cand
+                    claimed.add(_oid(cand))
+
+            if bo is None and not dup:
+                # 无 order_id（旧数据）或该 orderId 已翻出最近 100 条历史 → 窗口回退
+                pool = (by_window.get((row.window_start, period)) if period
+                        else by_window_any.get(row.window_start)) or []
+                cands = [o for o in pool if _oid(o) not in claimed]
+                if len(cands) == 1:
+                    bo = cands[0]
+                    claimed.add(_oid(bo))
+                elif len(cands) > 1:
+                    logger.warning(
+                        "对账：窗口候选歧义（{} 笔未占用币安订单），保持 PENDING 不猜"
+                        " | id={} | window={} | period={}",
+                        len(cands), row.id, row.window_start, period or "NULL")
+                    ambiguous.append({
+                        "id": row.id, "window_start": row.window_start,
+                        "status": "PENDING", "candidates": len(cands),
+                        "reason": "ambiguous_window_candidates",
+                    })
+
+            if dup:
+                logger.critical(
+                    "对账：order_id={} 被 {} 个本地 PENDING 行声明（历史串号遗留）"
+                    "→ 不动作不撤单，需人工核对 | id={} | window={} | signal={}",
+                    row.order_id, owner_count[str(row.order_id)], row.id,
+                    row.window_start, row.signal_version)
+                ambiguous.append({
+                    "id": row.id, "window_start": row.window_start,
+                    "status": "PENDING", "order_id": row.order_id,
+                    "reason": "duplicate_order_id_ownership",
+                })
+                continue
+
             if not bo:
                 # 限价挂单超时出清：仅对已提交币安（具有 order_id）的订单，
                 # 若未在币安订单历史中查到成交，且该周期已彻底结束（超 1min 容差缓冲），
@@ -3147,9 +3212,12 @@ async def _sync_binance_orders_impl() -> dict:
                 row.order_id, row.id, local_wei / 1e18, amt, shares,
                 f"{row.pnl:+.4f}" if row.pnl is not None else "N/A")
         await db.commit()
-    return {"synced": len(synced), "details": synced,
-            "amount_corrected": amount_corrected,
-            "binance_orders": len(history)}
+    result = {"synced": len(synced), "details": synced,
+              "amount_corrected": amount_corrected,
+              "binance_orders": len(history)}
+    if ambiguous:
+        result["ambiguous"] = ambiguous
+    return result
 
 
 @app.post("/api/trades/sync-binance")

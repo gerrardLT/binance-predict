@@ -1570,3 +1570,174 @@ async def test_binance_active_and_cancel_endpoints(monkeypatch) -> None:
     out_bad = await m.cancel_binance_order({}, _=None)
     assert "缺少" in out_bad["error"]
 
+
+# ============================================================
+# P2c (2026-09-10): 同窗多单精确匹配与重复声明检测
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_sync_binance_same_window_multi_orders_exact_match(monkeypatch) -> None:
+    """P2c：同一窗口同一周期两笔币安订单（市价 + 限价同窗开火），
+    各带不同 order_id → 本地行按 order_id 精确回填，绝不串号。"""
+    import binance_predict.main as m
+
+    monkeypatch.setattr(m.prediction_trader, "_api_key", "k")
+    monkeypatch.setattr(m.prediction_trader, "_wallet_address", "0xW")
+
+    ws = 1_787_418_600_000
+    sec = ws // 1000
+    history = [
+        {"orderId": "A-SMART", "slug": f"btc-updown-5m-{sec}",
+         "status": "FILLED", "filledUsdtAmount": "2", "price": "0.61"},
+        {"orderId": "A-LIMIT", "slug": f"btc-updown-5m-{sec}",
+         "status": "FILLED", "filledUsdtAmount": "3", "price": "0.55"},
+    ]
+
+    async def _history(limit=100):
+        return history
+
+    monkeypatch.setattr(m.prediction_trader, "query_order_history", _history)
+
+    row_smart = SimpleNamespace(
+        id=100, window_start=ws, status="PENDING", order_id="A-SMART",
+        amount_in="0", quote_json=None, error_message=None,
+        market_period="5m")
+    row_limit = SimpleNamespace(
+        id=101, window_start=ws, status="PENDING", order_id="A-LIMIT",
+        amount_in="0", quote_json=None, error_message=None,
+        market_period="5m")
+
+    r_pending = MagicMock()
+    r_pending.scalars.return_value.all.return_value = [row_smart, row_limit]
+    r_filled = MagicMock()
+    r_filled.scalars.return_value.all.return_value = []
+    db = AsyncMock()
+    db.execute = AsyncMock(side_effect=[r_pending, r_filled])
+
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def _factory():
+        yield db
+
+    monkeypatch.setattr(m, "async_session_factory", _factory)
+
+    out = await m.sync_binance_orders(_=None)
+
+    assert out["synced"] == 2, f"两笔都该回填 FILLED，但 synced={out['synced']}"
+    # 精确匹配：各回自己的 order_id
+    assert row_smart.order_id == "A-SMART" and row_smart.status == "FILLED"
+    assert row_limit.order_id == "A-LIMIT" and row_limit.status == "FILLED"
+    assert row_smart.quote_json["averagePrice"] == 0.61
+    assert row_limit.quote_json["averagePrice"] == 0.55
+    assert row_smart.error_message is None
+    assert row_limit.error_message is None
+    db.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_sync_binance_duplicate_order_id_ownership_critical(monkeypatch) -> None:
+    """P2c：历史遗留 → 两个 PENDING 行声称同一 order_id；
+    owner_count > 1 → 不动作、不撤单，CRITICAL log，ambiguous 标记。"""
+    import binance_predict.main as m
+
+    monkeypatch.setattr(m.prediction_trader, "_api_key", "k")
+    monkeypatch.setattr(m.prediction_trader, "_wallet_address", "0xW")
+
+    history = []  # 无币安订单（旧 string bug 导致 order_id 被误写入）
+    async def _history(limit=100):
+        return history
+
+    monkeypatch.setattr(m.prediction_trader, "query_order_history", _history)
+
+    # 两条行都声称同一个 order_id
+    row_a = SimpleNamespace(
+        id=200, window_start=1_787_418_600_000, status="PENDING", order_id="STRING-BUG-XXX",
+        amount_in="0", quote_json=None, error_message=None,
+        market_period="5m", signal_version="test_signal")
+    row_b = SimpleNamespace(
+        id=201, window_start=1_787_418_600_000, status="PENDING", order_id="STRING-BUG-XXX",
+        amount_in="0", quote_json=None, error_message=None,
+        market_period="5m", signal_version="test_signal")
+
+    r_pending = MagicMock()
+    r_pending.scalars.return_value.all.return_value = [row_a, row_b]
+    r_filled = MagicMock()
+    r_filled.scalars.return_value.all.return_value = []
+    db = AsyncMock()
+    db.execute = AsyncMock(side_effect=[r_pending, r_filled])
+
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def _factory():
+        yield db
+
+    monkeypatch.setattr(m, "async_session_factory", _factory)
+
+    out = await m.sync_binance_orders(_=None)
+
+    # 都不动 → synced == 0
+    assert out["synced"] == 0
+    assert row_a.status == "PENDING" and row_b.status == "PENDING"
+    # ambiguous 含 duplicate_order_id_ownership
+    assert len(out.get("ambiguous", [])) == 2
+    reasons = {a["reason"] for a in out["ambiguous"]}
+    assert "duplicate_order_id_ownership" in reasons
+
+
+@pytest.mark.asyncio
+async def test_sync_binance_claimed_exclusion_from_window_fallback(monkeypatch) -> None:
+    """P2c：order_id 行先占用对应币安订单 → 后续行走窗口回退时该订单已 claimed，
+    若池内只剩它则保持 PENDING（不猜）。"""
+    import binance_predict.main as m
+
+    monkeypatch.setattr(m.prediction_trader, "_api_key", "k")
+    monkeypatch.setattr(m.prediction_trader, "_wallet_address", "0xW")
+
+    ws = 1_787_418_600_000
+    sec = ws // 1000
+    # 只有一笔币安订单 A-X
+    history = [{"orderId": "A-X", "slug": f"btc-updown-5m-{sec}",
+                "status": "FILLED", "filledUsdtAmount": "1", "price": "0.50"}]
+
+    async def _history(limit=100):
+        return history
+
+    monkeypatch.setattr(m.prediction_trader, "query_order_history", _history)
+
+    # Row A: 有 order_id='A-X'
+    row_a = SimpleNamespace(
+        id=300, window_start=ws, status="PENDING", order_id="A-X",
+        amount_in="0", quote_json=None, error_message=None,
+        market_period="5m")
+    # Row B: 无 order_id，靠窗口回退找候选
+    row_b = SimpleNamespace(
+        id=301, window_start=ws, status="PENDING", order_id=None,
+        amount_in="0", quote_json=None, error_message=None,
+        market_period="5m")
+
+    r_pending = MagicMock()
+    r_pending.scalars.return_value.all.return_value = [row_a, row_b]
+    r_filled = MagicMock()
+    r_filled.scalars.return_value.all.return_value = []
+    db = AsyncMock()
+    db.execute = AsyncMock(side_effect=[r_pending, r_filled])
+
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def _factory():
+        yield db
+
+    monkeypatch.setattr(m, "async_session_factory", _factory)
+
+    out = await m.sync_binance_orders(_=None)
+
+    # row_a 精确命中并claimed，已回填
+    assert out["synced"] == 1
+    assert row_a.status == "FILLED" and row_a.order_id == "A-X"
+    # row_b 的候选=A-X，但它已被 claim → 保持 PENDING
+    assert row_b.status == "PENDING" and row_b.order_id is None
+
