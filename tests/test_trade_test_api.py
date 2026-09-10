@@ -1534,3 +1534,39 @@ def test_sync_status_endpoint_removed() -> None:
     # 主对账路径仍在（未被误删）
     assert hasattr(m, "_sync_binance_orders_impl")
     assert "/api/trades/sync-binance" in paths
+
+
+@pytest.mark.asyncio
+async def test_binance_active_and_cancel_endpoints(monkeypatch) -> None:
+    """GET /api/trades/binance-active 与 POST /api/trades/cancel-order 端点行为测试。"""
+    import binance_predict.main as m
+
+    monkeypatch.setattr(m.prediction_trader, "_api_key", "k")
+    monkeypatch.setattr(m.prediction_trader, "_wallet_address", "0xW")
+    monkeypatch.setattr(m.prediction_trader, "_wallet_id", "WID")
+
+    async def _active(limit=50):
+        return [{"orderId": "ACTIVE-1", "orderType": "LIMIT", "price": "0.30"}]
+
+    cancelled = []
+    async def _cancel(order_id):
+        cancelled.append(order_id)
+        return True
+
+    monkeypatch.setattr(m.prediction_trader, "query_active_orders", _active)
+    monkeypatch.setattr(m.prediction_trader, "cancel_order", _cancel)
+
+    # 1. 查活动挂单
+    out_active = await m.get_binance_active_orders(limit=10, _=None)
+    assert len(out_active["orders"]) == 1
+    assert out_active["orders"][0]["orderId"] == "ACTIVE-1"
+
+    # 2. 撤单测试
+    out_cancel = await m.cancel_binance_order({"order_id": "ACTIVE-1"}, _=None)
+    assert out_cancel["status"] == "SUCCESS"
+    assert cancelled == ["ACTIVE-1"]
+
+    # 3. 缺少参数
+    out_bad = await m.cancel_binance_order({}, _=None)
+    assert "缺少" in out_bad["error"]
+

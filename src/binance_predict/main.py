@@ -2894,6 +2894,41 @@ async def get_binance_order_history(
     return {"orders": orders}
 
 
+@app.get("/api/trades/binance-active")
+async def get_binance_active_orders(
+    limit: int = 50,
+    _: None = Depends(_require_auth),
+):
+    """查询币安撮合簿中当前正在挂单中的活动限价单（GET order/list）。"""
+    if not prediction_trader._api_key:
+        return {"error": "Binance API Key 未配置"}
+    if not prediction_trader._wallet_address or not prediction_trader._wallet_id:
+        wallet = await prediction_trader.fetch_wallet_info()
+        if not wallet:
+            return {"error": "未找到预测钱包"}
+    limit = max(1, min(int(limit), 100))
+    orders = await prediction_trader.query_active_orders(limit=limit)
+    if orders is None:
+        return {"error": prediction_trader.last_api_error or "查询活动挂单失败", "orders": []}
+    return {"orders": orders}
+
+
+@app.post("/api/trades/cancel-order")
+async def cancel_binance_order(
+    req: dict,
+    _: None = Depends(_require_auth),
+):
+    """撤销单个正在挂单中的限价单（POST batch-cancel）。"""
+    order_id = req.get("order_id")
+    if not order_id:
+        return {"error": "缺少 order_id 参数"}
+    ok = await prediction_trader.cancel_order(str(order_id))
+    if not ok:
+        return {"status": "FAILED", "error": prediction_trader.last_api_error or "撤单失败"}
+    return {"status": "SUCCESS", "message": f"挂单 {order_id} 已成功撤销"}
+
+
+
 async def _sync_binance_orders_impl() -> dict:
     """对账回填实现（/api/trades/sync-binance 端点主体，2026-08-28 抽函数不改行为）。
 
