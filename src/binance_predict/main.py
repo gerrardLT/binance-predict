@@ -3017,6 +3017,29 @@ async def _sync_binance_orders_impl() -> dict:
                 continue
             filled = Decimal(str(bo.get("filledUsdtAmount") or "0"))
             bo_status = str(bo.get("status") or "")
+            cycle_len_ms = 900_000 if period == "15m" else 300_000
+            cycle_expired = now_ms > int(row.window_start) + cycle_len_ms + 60_000
+
+            # 活跃挂单状态（SUBMITTED/NEW/PENDING/ACCEPTED）：
+            # 若周期尚未结束，保持 PENDING 等待撮合；若周期已结束，主动撤单出清为 FAILED
+            if bo_status in ("SUBMITTED", "NEW", "PENDING", "ACCEPTED"):
+                if not cycle_expired:
+                    row.order_id = bo.get("orderId")
+                    continue
+                if row.order_id:
+                    try:
+                        await prediction_trader.cancel_order(str(row.order_id))
+                    except Exception as exc:
+                        logger.warning("对账循环：撤销过期挂单异常 | order_id={} | {}", row.order_id, exc)
+                row.status = "FAILED"
+                row.error_message = "限价挂单周期已结束未成交，已自动撤单出清"
+                synced.append({
+                    "id": row.id, "window_start": row.window_start,
+                    "status": "FAILED", "order_id": row.order_id,
+                    "reason": "expired_limit_order_cancelled",
+                })
+                continue
+
             row.status = "FILLED" if bo_status == "FILLED" else "FAILED"
             row.order_id = bo.get("orderId")
             row.amount_in = str(int(filled * (10 ** 18)))
@@ -3032,6 +3055,8 @@ async def _sync_binance_orders_impl() -> dict:
             # 无法区分 FOK 空成交 / 部分成交 / 其他终态）
             if row.status == "FILLED":
                 row.error_message = None
+            elif bo_status == "CANCELLED":
+                row.error_message = f"对账订正：币安侧限价单已取消（{bo.get('errorMessage') or '未成交'}）"
             elif filled <= 0:
                 row.error_message = (
                     f"对账订正：币安侧订单终态 {bo_status or 'UNKNOWN'}"
