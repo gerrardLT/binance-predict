@@ -1,14 +1,22 @@
 """交易结算器（P0-2）：回读结算源回填 FILLED 订单的输赢/盈亏。
 
-结算源分流（两口径，_settle_row 入口硬编码，防错配）：
+结算源分流（三口径，_settle_row 入口硬编码，防错配）：
 1. 5m 订单（默认）：回读 SentimentWindow——每 5 分钟归档器按 entry/exit
    价判定 outcome（UP/DOWN/NOISE），start_time 与订单 window_start 同为
    5m 窗口起点 ms，可直接对齐。
-2. 15m 场景订单（market_period='15m'）：回读 FakeBreakoutSignal
-   .settle_outcome（周期锚点口径：P(E) vs P(S)，与币安 15m 市场真实
-   结算一致）。**为何必须分流**：15m 周期起点与 5m 窗口起点数值重合
-   （900s 网格 ⊂ 300s 网格），若走 SentimentWindow 会被同名 5m 窗
+2. 15m 场景订单（market_period='15m' 且有 scene_signal_id）：回读
+   FakeBreakoutSignal.settle_outcome（周期锚点口径：P(E) vs P(S)，与币安
+   15m 市场真实结算一致）。**为何必须分流**：15m 周期起点与 5m 窗口起点
+   数值重合（900s 网格 ⊂ 300s 网格），若走 SentimentWindow 会被同名 5m 窗
    错口径结算输赢——这是多通道改造最隐蔽的坑。
+3. 15m K 线影子族订单（market_period='15m' 且 scene_signal_id IS NULL）：
+   回读 KlineShadowSignal（version=signal_version ∧ target_bar_start=
+   window_start）的 settle_outcome/settle_close——s2_cond 条件单族
+   （t4/t5d）与 nextbar 15m 族（hm_inside_15m_v2/ih_inside_15m_v2）的信号
+   行落 kline_shadow_signals，下单路径无 signal_id 关联列。**为何必须独立
+   成路**：2026-09-10 生产实锤，旧口径把这类行塞进 2（缺 scene_signal_id →
+   CRITICAL + EXPIRED/win=NULL/pnl=0），FILLED 真单的真实亏损被抹平
+   （id=466 真实 -1.00 记为 +0.00），统计口径整体失真。
 
 扫描锚点 = trade_orders.settled_at IS NULL（部分索引
 ix_trade_orders_settle_pending 只覆盖待结算行，空转亚毫秒）。
@@ -42,7 +50,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select as sa_select, update as sa_update
 
 from binance_predict.db.engine import async_session_factory
-from binance_predict.db.models import FakeBreakoutSignal, SentimentWindow, TradeOrderModel
+from binance_predict.db.models import FakeBreakoutSignal, KlineShadowSignal, SentimentWindow, TradeOrderModel
 from binance_predict.services.wechat_notifier import wechat_notifier
 
 logger = logging.getLogger(__name__)
@@ -138,7 +146,17 @@ class TradeSettler:
     # ------------------------------------------------------------------
 
     async def _settle_row(self, row: TradeOrderModel) -> bool:
-        # 口径分流：15m 场景订单走 FakeBreakoutSignal 结算（防错配，见模块 docstring）
+        # 口径分流（防错配，见模块 docstring）：
+        #   ① 15m + 有 scene_signal_id → scene 族，回读 FakeBreakoutSignal
+        #   ② 15m + 无 scene_signal_id → K 线影子族（s2_cond 条件单 / nextbar hm·ih），
+        #      回读 KlineShadowSignal（按 version + target_bar_start 对齐）
+        #   ③ 5m → SentimentWindow
+        # 为何必须分 ②：旧口径把 ② 塞进 _settle_scene_row，缺 scene_signal_id 即
+        # CRITICAL + EXPIRED/pnl=0 —— FILLED 真单的真实盈亏被抹平（2026-09-10 生产
+        # 实锤 id=466 真实 -1.00 记为 +0.00，且 EXPIRED 语义让「已成交」显示为过期）。
+        # 按「有无 scene_signal_id」分流而非硬编码通道名：新增 15m 影子族通道无需改此处。
+        if row.market_period == "15m" and row.scene_signal_id is None:
+            return await self._settle_kline_shadow_row(row)
         if row.market_period == "15m" or row.scene_signal_id is not None:
             return await self._settle_scene_row(row)
 
@@ -346,6 +364,123 @@ class TradeSettler:
             )
         except Exception as exc:
             logger.warning("企微场景结算通知异常: %s", exc)
+        return True
+
+    async def _settle_kline_shadow_row(self, row: TradeOrderModel) -> bool:
+        """K 线影子族订单结算：回读 KlineShadowSignal（version + target_bar_start 对齐）。
+
+        适用范围：15m 且无 scene_signal_id 的通道——s2_cond 条件单族（t4/t5d）与
+        nextbar 15m 族（hm_inside_15m_v2/ih_inside_15m_v2）。这些通道的信号行落
+        kline_shadow_signals（检测器在次根收盘时用 15m K 线 open/close 判向），
+        下单路径无 signal_id 关联列，故按 (version=signal_version,
+        target_bar_start=window_start) 回查。
+
+        判向与 pnl 口径与其余两路径完全一致：
+            outcome ∈ {UP,DOWN}：win = (direction == outcome)；
+                赢：优先 shares − amount，回退 amount/avg_price − amount；输：−amount
+            outcome == NOISE：win=None、pnl=0（检测器把 NOISE 行 status 记为
+                EXPIRED 但 settle_outcome 仍为 NOISE，故本路径只认 settle_outcome
+                不认 status，避免把平盘误判为「无结算源」）
+            影子行缺失 / settle_outcome 为空：created_at 超 EXPIRE_AFTER 才出清
+                EXPIRED，否则下轮重试（检测器结算可能迟到）
+        settle_price 取次根收盘价 settle_close（15m 周期末 BTC 价，与币安 15m
+        市场结算价同源）。
+        """
+        now_dt = datetime.now(timezone.utc)
+        async with async_session_factory() as session:
+            stmt = sa_select(KlineShadowSignal).where(
+                KlineShadowSignal.version == row.signal_version,
+                KlineShadowSignal.target_bar_start == row.window_start,
+            )
+            sig = (await session.execute(stmt)).scalar_one_or_none()
+
+        if sig is None:
+            # 影子行缺失：影子 gate 被手动下线 / 检测器重启未回补 / 通道名与
+            # version 不一致。无法判赢 → 超 24h 出清，未超期下轮重试（gate 恢复
+            # 或检测器补录后仍可结算）。
+            created = self._aware(row.created_at)
+            if created is not None and created > now_dt - EXPIRE_AFTER:
+                logger.warning(
+                    "订单结算 | id=%s | K 线影子行缺失（version=%s target_bar=%s），下轮重试",
+                    row.id, row.signal_version, row.window_start)
+                return False
+            logger.critical(
+                "订单结算 | id=%s | K 线影子行缺失且超 %s → EXPIRED 出清 | signal=%s | window=%s",
+                row.id, EXPIRE_AFTER, row.signal_version, row.window_start)
+            return await self._expire_row(row, now_dt)
+
+        outcome = (sig.settle_outcome or "").upper() or None
+        if outcome in ("UP", "DOWN"):
+            win = row.direction == outcome
+            settle_price = self._to_float(sig.settle_close)
+        elif outcome == "NOISE":
+            win = None
+            settle_price = self._to_float(sig.settle_close)
+        else:
+            # 影子行仍 PENDING（次根未收盘 / 检测器结算迟到）：24h 内重试
+            created = self._aware(row.created_at)
+            if created is not None and created > now_dt - EXPIRE_AFTER:
+                return False
+            logger.warning(
+                "订单结算 | id=%s | 影子行无 outcome（status=%s）且超 %s → EXPIRED 出清",
+                row.id, sig.status, EXPIRE_AFTER)
+            return await self._expire_row(row, now_dt)
+
+        amount = self._amount_usdt(row)
+        avg_price = self._avg_price(row)
+        shares = self._shares(row)
+        if outcome == "NOISE":
+            pnl = 0.0
+        elif win and amount is not None and shares is not None:
+            pnl = shares - amount  # 币安实际到手股数（已扣费）：对齐实现盈亏
+        elif win and amount is not None and avg_price is not None:
+            pnl = amount / avg_price - amount
+        elif not win and amount is not None:
+            pnl = -amount
+        else:
+            pnl = None  # 均价/金额缺失：输向无需均价，赢向无法估算
+
+        # 幂等守卫：WHERE settled_at IS NULL（与其余两路径同模式）
+        async with async_session_factory() as session:
+            stmt = (
+                sa_update(TradeOrderModel)
+                .where(
+                    TradeOrderModel.id == row.id,
+                    TradeOrderModel.settled_at.is_(None),
+                )
+                .values(
+                    settle_outcome=outcome,
+                    win=win,
+                    settle_price=settle_price,
+                    pnl=pnl,
+                    settled_at=now_dt,
+                )
+            )
+            result = await session.execute(stmt)
+            await session.commit()
+        if result.rowcount == 0:
+            return False  # 已被并发结算（幂等守卫生效）
+        self._settled_count += 1
+        logger.info(
+            "订单结算 | id=%s | kline_shadow | signal=%s | window=%s | direction=%s → %s"
+            " | win=%s | pnl=%s | settle_price=%s",
+            row.id, row.signal_version, row.window_start, row.direction, outcome,
+            win, f"{pnl:+.4f}" if pnl is not None else "N/A", settle_price,
+        )
+        try:
+            # notify_order_settled 是同步方法（与 5m/scene 两路径同口径调用）
+            wechat_notifier.notify_order_settled(
+                channel=row.signal_version or "kline_shadow",
+                window_start=int(row.window_start),
+                direction=str(row.direction),
+                outcome=str(outcome),
+                win=win,
+                pnl=pnl,
+                amount_usdt=amount,
+                settle_price=settle_price,
+            )
+        except Exception as exc:
+            logger.warning("企微 K 线影子结算通知异常: %s", exc)
         return True
 
     async def _expire_row(self, row: TradeOrderModel, now_dt: datetime) -> bool:

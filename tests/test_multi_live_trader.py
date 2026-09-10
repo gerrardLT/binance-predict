@@ -3207,18 +3207,16 @@ async def test_settle_scene_expired(monkeypatch) -> None:
     assert p["settle_price"] is None
 
 
-@pytest.mark.asyncio
-async def test_settle_scene_missing_signal_id_expired(monkeypatch) -> None:
-    """15m 行缺 scene_signal_id（数据异常）→ 直接 EXPIRED 出清
-    （不查窗口——防错口径结算入口分流的 or 条件）。"""
-    db = _SceneDb([_scene_row(scene_signal_id=None)], _scene_signal("DOWN"))
-    _stub_scene_db(monkeypatch, db)
-
-    assert await TradeSettler().poll_once() == 1
-
-    assert db.get_pks == []   # 无 id 可查
-    p = _params(db.updates[0])
-    assert p["settle_outcome"] == "EXPIRED"
+# ============================================================
+# Test removed: test_settle_scene_missing_signal_id_expired
+# ============================================================
+# The previous test expected 15m orders with scene_signal_id=NULL to be
+# marked EXPIRED + pnl=0 directly in _settle_scene_row. This WAS THE BUG
+# we're fixing — those shadow orders were mis-settled. The new routing
+# sends them through _settle_kline_shadow_row instead (see trade_settler.py),
+# which queries KlineShadowSignal for proper settlement. Therefore this test
+# is obsolete and was removed; equivalent coverage exists in
+# tests/test_trade_settler.py via test_kline_shadow_* suite.
 
 
 @pytest.mark.asyncio

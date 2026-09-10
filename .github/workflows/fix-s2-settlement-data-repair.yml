@@ -1,0 +1,100 @@
+# ============================================================
+# Bug #1 数据修复：15m 影子族订单被误判 EXPIRED/pnl=0 的历史单重算
+# ============================================================
+# 前提：代码已部署（TradeSettler._settle_kline_shadow_row 已上线，
+#       且 TradeSettler 每 60s 轮询 settled_at IS NULL 的行）。
+#
+# 修复原理：
+#   旧路由把 15m 无 scene_signal_id 的影子单（s2_cond / nextbar hm·ih）
+#   误塞进 _settle_scene_row → 缺 scene_signal_id 即 EXPIRED/win=NULL/pnl=0，
+#   FILLED 真单的真实盈亏被抹平（2026-09-10 实锤 id=466 真实 -1.00 记为 0.00）。
+#   本 workflow 只把这些误判行的结算字段重置为 NULL；下一轮 TradeSettler
+#   轮询（≤60s）会用新路由回读 KlineShadowSignal 正确重算，无需手动触发。
+#
+# 安全设计（对齐 manual-settle-order-512.yml 既有可用模式）：
+#   1. 走 SSH → docker compose exec db psql（VPS DB 不对公网开放，
+#      Actions 无法直连；SSH 是本仓库唯一验证过的运维通道）。
+#   2. 默认 dry-run：只 SELECT 待修复行 + 校验影子信号存在，不写库。
+#   3. 幂等守卫 WHERE settled_at IS NOT NULL AND settle_outcome='EXPIRED'
+#      AND pnl=0，只命中「误判 EXPIRED 平盘」行，不碰正常结算单。
+#   4. 事务包裹；执行前后各打一次快照对比。
+#   5. 不硬编码任何 token/密钥——SSH 凭据来自 GitHub Secrets。
+# ============================================================
+
+name: Fix S2/NextBar Settlement Data Repair
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry-run（只 SELECT 不写库）；改 false 才执行 UPDATE"
+        required: false
+        default: "true"
+        type: string
+      target_ids:
+        description: "逗号分隔的订单 ID（默认 466,729）"
+        required: false
+        default: "466,729"
+        type: string
+
+concurrency:
+  group: fix-s2-settlement-data-repair
+  cancel-in-progress: false
+
+jobs:
+  repair-settlement-data:
+    name: Reset mis-settled 15m shadow orders for TradeSettler re-scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Execute via SSH
+        uses: appleboy/ssh-action@v1
+        env:
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          TARGET_IDS: ${{ github.event.inputs.target_ids }}
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
+          envs: DRY_RUN,TARGET_IDS
+          script: |
+            set -euo pipefail
+            cd /www/wwwroot/binance-predict
+            if [ ! -f docker-compose.prod.yml ]; then
+              echo "ERROR: docker-compose.prod.yml not found"
+              exit 1
+            fi
+
+            # ID 列表消毒：只允许数字与逗号，防注入
+            IDS=$(echo "${TARGET_IDS:-466,729}" | tr -cd '0-9,')
+            if [ -z "$IDS" ]; then
+              echo "ERROR: TARGET_IDS empty after sanitize"
+              exit 1
+            fi
+            echo "Target IDs: $IDS | dry_run=${DRY_RUN:-true}"
+
+            psql_exec() {
+              docker compose -f docker-compose.prod.yml exec -T db \
+                sh -c "psql -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -v ON_ERROR_STOP=1 -c \"$1\""
+            }
+
+            echo "=== Step 1: 待修复订单当前状态 ==="
+            psql_exec "SELECT id, signal_version, window_start, direction, amount_in, order_id, status, settle_outcome, win, pnl, settled_at FROM trade_orders WHERE id IN ($IDS);"
+
+            echo "=== Step 2: 校验对应 kline_shadow_signals 影子行存在（结算源）==="
+            psql_exec "SELECT k.version, k.target_bar_start, k.settle_open, k.settle_close, k.win, k.settle_outcome, k.status FROM kline_shadow_signals k WHERE (k.version, k.target_bar_start) IN (SELECT signal_version, window_start FROM trade_orders WHERE id IN ($IDS));"
+
+            if [ "${DRY_RUN:-true}" != "false" ]; then
+              echo "=== DRY-RUN：跳过 UPDATE。确认上方影子行存在且 outcome 非空后，以 dry_run=false 重跑。 ==="
+              exit 0
+            fi
+
+            echo "=== Step 3: 事务内重置误判 EXPIRED 平盘行的结算字段 ==="
+            psql_exec "BEGIN; UPDATE trade_orders SET settled_at = NULL, settle_outcome = NULL, win = NULL, pnl = NULL, settle_price = NULL WHERE id IN ($IDS) AND settled_at IS NOT NULL AND settle_outcome = 'EXPIRED' AND pnl = 0; COMMIT;"
+
+            echo "=== Step 4: 重置后状态（settled_at 应为 NULL，等待 TradeSettler ≤60s 内重算）==="
+            psql_exec "SELECT id, signal_version, window_start, direction, order_id, status, settle_outcome, win, pnl, settled_at FROM trade_orders WHERE id IN ($IDS);"
+
+            echo "=== 完成。TradeSettler 下一轮轮询将回读 KlineShadowSignal 正确重算这些行。 ==="

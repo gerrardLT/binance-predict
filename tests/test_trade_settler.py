@@ -26,7 +26,12 @@ import pytest
 from sqlalchemy import Select, Update
 
 import binance_predict.services.trade_settler as ts_mod
-from binance_predict.db.models import SentimentWindow, TradeOrderModel
+from binance_predict.db.models import (
+    FakeBreakoutSignal,
+    KlineShadowSignal,
+    SentimentWindow,
+    TradeOrderModel,
+)
 from binance_predict.services.trade_settler import TradeSettler
 
 WS = 1_787_400_000_000  # 任意 5m 窗口起点 ms
@@ -35,8 +40,9 @@ WS = 1_787_400_000_000  # 任意 5m 窗口起点 ms
 def _row(**over) -> SimpleNamespace:
     """TradeOrderModel 待结算行替身（FILLED + 未结算 + 超 7min 延迟）。
 
-    market_period/scene_signal_id 为 5m 默认值（15m 分流分支见
-    test_multi_live_trader.py 的场景结算用例）。
+    market_period/scene_signal_id 为 5m 默认值（15m 分流分支见下方
+    「15m 分流」区块：scene 族走 FakeBreakoutSignal，K 线影子族走
+    KlineShadowSignal）。
     """
     base = dict(
         id=11, status="FILLED", settled_at=None, window_start=WS,
@@ -44,9 +50,20 @@ def _row(**over) -> SimpleNamespace:
         direction="DOWN", amount_in=str(10 ** 18),  # 1 USDT
         quote_json={"averagePrice": 0.5},
         market_period="5m", scene_signal_id=None,
+        signal_version="firsthit_g7_base_v1",
     )
     base.update(over)
     return SimpleNamespace(**base)
+
+
+def _row15(**over) -> SimpleNamespace:
+    """15m 且无 scene_signal_id 的订单行替身（K 线影子族：s2_cond / nextbar hm·ih）。"""
+    base = dict(
+        market_period="15m", scene_signal_id=None,
+        signal_version="s2_cond_t4_v1", direction="UP",
+    )
+    base.update(over)
+    return _row(**base)
 
 
 def _window(outcome: str, exit_price: float = 43250.0) -> SimpleNamespace:
@@ -54,10 +71,32 @@ def _window(outcome: str, exit_price: float = 43250.0) -> SimpleNamespace:
     return SimpleNamespace(start_time=WS, outcome=outcome, exit_price=exit_price)
 
 
-class _Db:
-    """按 stmt 类型路由 execute：订单查询 / 窗口查询 / UPDATE 捕获。"""
+def _shadow(settle_outcome: str | None, *, status: str = "SETTLED",
+            settle_open: float = 79104.0, settle_close: float = 78813.0,
+            win: bool | None = None,
+            created_at: datetime | None = None) -> SimpleNamespace:
+    """KlineShadowSignal 影子行替身（检测器次根收盘结算后写入）。
 
-    def __init__(self, rows, window, update_rowcount: int = 1) -> None:
+    ⚠ 探测器约定：NOISE 行 status 记为 "EXPIRED" 但 settle_outcome 仍为
+    "NOISE"（见 s2_cond_shadow_detector._settle_pending），故结算器只认
+    settle_outcome 不认 status——test_kline_shadow_noise 即锁此约定。
+    """
+    return SimpleNamespace(
+        version="s2_cond_t4_v1", target_bar_start=WS,
+        settle_outcome=settle_outcome, win=win, status=status,
+        settle_open=settle_open, settle_close=settle_close,
+        created_at=created_at or (datetime.now(timezone.utc) - timedelta(hours=1)),
+    )
+
+
+class _Db:
+    """按 stmt 类型路由 execute：订单 / 窗口 / 影子信号查询 + UPDATE 捕获。
+
+    scene 路径用 session.get(FakeBreakoutSignal, id)，故另桩 get()。
+    """
+
+    def __init__(self, rows, window, update_rowcount: int = 1,
+                 shadow=None, scene_signal=None) -> None:
         self.updates: list[Update] = []
         self._update_rowcount = update_rowcount
 
@@ -65,6 +104,8 @@ class _Db:
         orders_res.scalars.return_value.all.return_value = rows
         window_res = MagicMock()
         window_res.scalar_one_or_none.return_value = window
+        shadow_res = MagicMock()
+        shadow_res.scalar_one_or_none.return_value = shadow
 
         async def _execute(stmt):
             if isinstance(stmt, Update):
@@ -78,9 +119,12 @@ class _Db:
                 return orders_res
             if entity is SentimentWindow:
                 return window_res
+            if entity is KlineShadowSignal:
+                return shadow_res
             raise AssertionError(f"未知查询实体: {entity}")
 
         self.execute = AsyncMock(side_effect=_execute)
+        self.get = AsyncMock(return_value=scene_signal)
         self.commit = AsyncMock()
 
 
@@ -254,3 +298,164 @@ async def test_direction_null_created_at_missing(monkeypatch) -> None:
 
     assert await TradeSettler().poll_once() == 1
     assert _params(db.updates[0])["settle_outcome"] == "EXPIRED"
+
+
+# ------------------------------------------------------------------
+# K 线影子族 15m 订单（s2_cond / nextbar hm·ih）——Bug #1 修复验证
+# ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_kline_shadow_15m_win(monkeypatch) -> None:
+    """K 线影子结算：15m+ 无 scene_signal_id → win=True、pnl=shares−amount。
+
+    对照 Bug #1 生产实锤 id=466: s2_cond_t4_v1(UP)/窗口 DOWN 被误判 EXPIRED/pnl=0。
+    正确应读 KlineShadowSignal(settle_outcome='UP',settle_close=78813)→win=True。
+    """
+    shadow = _shadow("UP", win=True, settle_close=78813.0)
+    db = _Db([_row15(signal_version="s2_cond_t4_v1", amount_in=str(2 * 10**18),
+                     quote_json={"averagePrice": 0.16, "filledShareQty": 12.28})],
+             None, shadow=shadow)
+    _stub_db(monkeypatch, db)
+
+    assert await TradeSettler().poll_once() == 1
+
+    p = _params(db.updates[0])
+    assert p["settle_outcome"] == "UP"
+    assert p["win"] is True
+    assert p["pnl"] == pytest.approx(12.28 - 2.0)  # shares−cost
+    assert p["settle_price"] == pytest.approx(78813.0)
+    assert isinstance(p["settled_at"], datetime)
+
+
+@pytest.mark.asyncio
+async def test_kline_shadow_15m_lose(monkeypatch) -> None:
+    """K 线影子结算：direction≠outcome → win=False、pnl=-amount（输）。"""
+    shadow = _shadow("DOWN", win=False, settle_close=78500.0)
+    db = _Db([_row15(direction="UP", amount_in=str(1 * 10**18))], None, shadow=shadow)
+    _stub_db(monkeypatch, db)
+
+    assert await TradeSettler().poll_once() == 1
+
+    p = _params(db.updates[0])
+    assert p["settle_outcome"] == "DOWN"
+    assert p["win"] is False
+    assert p["pnl"] == pytest.approx(-1.0)
+
+
+@pytest.mark.asyncio
+async def test_kline_shadow_noise(monkeypatch) -> None:
+    """NOISE：探测器 status="EXPIRED"但 settle_outcome="NOISE"→win=None/pnl=0.0。
+
+    锁定探测器约定（见 s2_cond_shadow_detector._settle_pending line 364-370）：
+    NOISE 行不写 status="SETTLED"而写"EXPIRED"，但 settle_outcome 仍为"NOISE"。
+    结算器只认 outcome 不认 status，避免把平盘误判为「无结算源」。
+    """
+    shadow = _shadow("NOISE", status="EXPIRED", settle_close=79000.0)
+    db = _Db([_row15()], None, shadow=shadow)
+    _stub_db(monkeypatch, db)
+
+    assert await TradeSettler().poll_once() == 1
+
+    p = _params(db.updates[0])
+    assert p["settle_outcome"] == "NOISE"
+    assert p["win"] is None
+    assert p["pnl"] == 0.0
+    assert p["settle_price"] == pytest.approx(79000.0)
+
+
+@pytest.mark.asyncio
+async def test_kline_shadow_missing_retry(monkeypatch) -> None:
+    """影子行缺失且未超 24h → 不写 UPDATE，下轮重试（gate 恢复/检测器补录后可结算）。"""
+    db = _Db([_row15(created_at=datetime.now(timezone.utc) - timedelta(hours=2))],
+             None, shadow=None)
+    _stub_db(monkeypatch, db)
+
+    assert await TradeSettler().poll_once() == 0
+    assert db.updates == []
+
+
+@pytest.mark.asyncio
+async def test_kline_shadow_missing_expired(monkeypatch) -> None:
+    """影子行缺失超 24h → EXPIRED 兜底（无法判赢，防永挂「在途持仓」）。"""
+    old = datetime.now(timezone.utc) - timedelta(hours=25)
+    db = _Db([_row15(created_at=old)], None, shadow=None)
+    _stub_db(monkeypatch, db)
+
+    assert await TradeSettler().poll_once() == 1
+
+    p = _params(db.updates[0])
+    assert p["settle_outcome"] == "EXPIRED"
+    assert p["win"] is None
+    assert p["pnl"] == 0.0
+    assert p["settle_price"] is None
+
+
+@pytest.mark.asyncio
+async def test_kline_shadow_pending_retry(monkeypatch) -> None:
+    """影子行存在但无 outcome（PENDING 未结算）→ 24h 内重试。"""
+    shadow = _shadow(None, status="PENDING")
+    db = _Db([_row15(created_at=datetime.now(timezone.utc) - timedelta(hours=2))],
+             None, shadow=shadow)
+    _stub_db(monkeypatch, db)
+
+    assert await TradeSettler().poll_once() == 0
+    assert db.updates == []
+
+
+@pytest.mark.asyncio
+async def test_kline_shadow_idempotent_guard(monkeypatch) -> None:
+    """UPDATE rowcount=0（已被并发结算）→ 幂等守卫生效，不计入 settled。"""
+    shadow = _shadow("UP", win=True, settle_close=78800.0)
+    db = _Db([_row15()], None, shadow=shadow, update_rowcount=0)
+    _stub_db(monkeypatch, db)
+
+    assert await TradeSettler().poll_once() == 0
+    assert len(db.updates) == 1  # 语句仍发出，只是守卫判定未生效
+
+
+@pytest.mark.asyncio
+async def test_nextbar_15m_down_direction(monkeypatch) -> None:
+    """nextbar hm_inside_15m_v2(DOWN) 路由到影子路径：outcome=DOWN→win=True。
+
+    证明分流按「有无 scene_signal_id」而非硬编码通道名：
+    nextbar 族同样落 kline_shadow_signals，无需修改 trade_settler 即可支持。
+    """
+    shadow = _shadow("DOWN", win=True, settle_close=78500.0)
+    db = _Db([_row15(signal_version="hm_inside_15m_v2", direction="DOWN",
+                     amount_in=str(1 * 10**18))], None, shadow=shadow)
+    _stub_db(monkeypatch, db)
+
+    assert await TradeSettler().poll_once() == 1
+
+    p = _params(db.updates[0])
+    assert p["settle_outcome"] == "DOWN"
+    assert p["win"] is True
+    assert p["pnl"] == pytest.approx(1.0 / 0.5 - 1.0)  # amount/avg_price−amount
+
+
+@pytest.mark.asyncio
+async def test_15m_with_scene_signal_id_uses_fake_breakout(monkeypatch) -> None:
+    """15m + 有 scene_signal_id → 走 FakeBreakoutSignal（scene 族），非影子路径。
+
+    回归保护：routing 改为「15m 且 scene_signal_id IS NULL → 影子路径」后，
+    原 scene 订单仍走旧口径（周期锚点 P(E)/P(S)，settle_price=settle_btc_price）。
+    """
+    scene_sig = SimpleNamespace(
+        id=42, settle_outcome="UP", settle_btc_price=79000.0,
+        settle_deadline=int((datetime.now(timezone.utc)
+                             + timedelta(hours=1)).timestamp() * 1000),
+    )
+    db = _Db(
+        [_row(market_period="15m", scene_signal_id=42, direction="UP",
+              signal_version="scene_bear_exhaust")],
+        None, scene_signal=scene_sig)
+    _stub_db(monkeypatch, db)
+
+    assert await TradeSettler().poll_once() == 1
+
+    p = _params(db.updates[0])
+    assert p["settle_outcome"] == "UP"
+    assert p["win"] is True
+    assert p["pnl"] == pytest.approx(1.0 / 0.5 - 1.0)
+    assert p["settle_price"] == pytest.approx(79000.0)
+    db.get.assert_awaited_once()
