@@ -169,12 +169,19 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     # 护栏为保守成交上限，不代表前向胜率背书：G0 用研究价-only 胜率 8.9%×0.98≈0.087
     # 下方 0.08；G1/G3 的 confirm 段已 burned，分别按冻结研究口径保守取 0.12/0.09。
     # 触发后实际成交均价高于护栏弃单，不追价。
+    # 2026-09-10 优化（实盘逆向选择归因后）：
+    # - G1 护栏 0.12→0.15：影子端 15/22 赢单落在 q∈(0.08,0.10]，0.12 仍切除部分
+    #   反弹窗；G1 是唯一前向正 EV 版本（n=30 wr13.3% cum_ev+28.8），放宽成交空间。
+    # - 下单层叠加盘前过滤器（连阳>1 / |chg|>50bp / 上影<0.5bp 跳过）与动态护栏
+    #   （只收紧不放松，clamp [0.05, base]），实现见 multi_live_trader.py 顶部
+    #   FIRSTHIT_PRE_MARKET_* 常量区。过滤参数为保守先验未经离线回测，前向观测
+    #   裁决后可调；影子端口径不变（仍记录全部触发），护栏选择效应由离线分析覆盖。
     "firsthit_down_v1": ChannelSpec(
         "firsthit_down_v1", "firsthit", "5m", "DOWN", 0.08,
         "首触G0基底 q∈(0.005,0.1]（押DOWN）", order_type="LIMIT",
     ),
     "firsthit_down_body_v1": ChannelSpec(
-        "firsthit_down_body_v1", "firsthit", "5m", "DOWN", 0.12,
+        "firsthit_down_body_v1", "firsthit", "5m", "DOWN", 0.15,
         "首触G1小实体 body_r≤0.35（押DOWN）", order_type="LIMIT",
     ),
     "firsthit_down_chg_v1": ChannelSpec(

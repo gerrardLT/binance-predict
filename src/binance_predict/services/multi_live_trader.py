@@ -29,8 +29,10 @@
    （kline/absorption 影子信号无订单 signal_id 关联列，对账走 signal_version+window_start。）
 7. firsthit 族（5m 市场，2026-09-07 promote）：采样循环 check() 按本窗完整 DOWN/BTC
    历史重放首次进入 (0.005,0.1] 的触发点，复用 firsthit_shadow_detector 的纯特征/门
-   函数 → 命中后真单押 DOWN。三通道按用户确认各自独立下单，不做跨版本同窗互斥；
-   每通道每窗仍至多一单。
+   函数 → 命中后真单押 DOWN。各通道按用户确认各自独立下单，不做跨版本同窗互斥；
+   每通道每窗仍至多一单。2026-09-10 优化：全通道统一异步核验（前驱 5m 连阳
+   streak_up → 盘前过滤器 veto：连阳>1 / |chg|>50bp / 上影<0.5bp → 版本门），
+   下单护栏改走动态护栏（base + 负向调整只收紧不放松，clamp [0.05, base]）。
 
 安全护栏（继承旧执行器全部教训）：
 1. 每通道每窗至多一单：内存 fired 集合 + 先占位后下单（place_order 前先插
@@ -111,6 +113,57 @@ MARKET_WARMUP_INTERVAL_S = 60.0     # 市场列表后台预热间隔（未来 15
 ABS_LIVE_JUDGE_GRACE_S = 90.0       # absorption 判定新鲜度：t_rel 超 TD+此值 → 本窗放弃
                                     # （重启/中途启用后的在途窗，当前价已非 TD 时刻价，
                                     # 与影子 ≤TD 末点口径不成立 → 保守不下注）
+
+# -----------------------------------------------------------------------------
+# firsthit 族盘前过滤器和动态护栏（2026-09-10 优化版）
+# 方向：只减不做——通过过滤降低触发频率，通过收紧护栏防止逆向选择成交
+# 参数为保守先验，未经离线回测验证；上线前向观测裁决，可调整
+# -----------------------------------------------------------------------------
+FIRSTHIT_PRE_MARKET_STREAK_MAX = 1            # streak_up > 此值跳过（连阳后反转失败率高）
+FIRSTHIT_PRE_MARKET_CHG_BPS_MAX = 50.0        # |chg_bps| > 50bp = |0.5%|单边市跳过
+FIRSTHIT_PRE_MARKET_UPPER_WICK_BPS_MIN = 0.5  # upper_wick_bps < 此值跳过（紧贴新高无反弹空间）
+FIRSTHIT_DYNAMIC_GUARD_CLAMP_LO = 0.05        # 动态护栏下限 clamp（低于触发区无意义）
+
+
+def _firsthit_pre_market_veto(ext: dict, streak_up: int | None) -> str | None:
+    """首触盘前过滤器 veto 检查（ex-ante，仅用窗口内已知特征）。
+
+    Returns: None = 放行；str = 拦截原因。
+    参数依据为保守先验（未经冻结扫描验证），上线前向裁决后可调优。
+    """
+    if streak_up is not None and streak_up > FIRSTHIT_PRE_MARKET_STREAK_MAX:
+        return f"连阳{streak_up}根超出阈值{FIRSTHIT_PRE_MARKET_STREAK_MAX}"
+    chg_bps = ext.get("chg_bps")
+    if chg_bps is not None and abs(chg_bps) > FIRSTHIT_PRE_MARKET_CHG_BPS_MAX:
+        return f"BTC5m动量过大|chg={chg_bps:+.1f}bp>|{FIRSTHIT_PRE_MARKET_CHG_BPS_MAX}bp|"
+    upper_wick = ext.get("upper_wick_bps")
+    if upper_wick is not None and upper_wick < FIRSTHIT_PRE_MARKET_UPPER_WICK_BPS_MIN:
+        return f"上影过小{upper_wick:.2f}bp接近新高无反弹空间"
+    return None
+
+
+def _resolve_firsthit_dynamic_guard(spec, cfg, ext: dict,
+                                    streak_up: int | None = None) -> float:
+    """firsthit 族动态护栏计算：base + adj (≤0)，clamp [CLAMP_LO, base]。
+
+    设计哲学：护栏只往严的方向动态化（adj ≤ 0），不会放松超过用户配置；
+    放宽应由人工配置决定（LIVE_CHANNELS_JSON / set_channel 覆盖）。
+    """
+    base = resolve_max_exec(spec, cfg)
+    adj = 0.0
+
+    # 调整项 1：前驱连阳状态（streak_up ≥ 2 已被盘前 veto 拦截，
+    # 此处仅处理 streak==1 的温和收紧）
+    if streak_up == 1:
+        adj -= 0.01  # 单根阳线后的反转概率略低，温和收紧
+
+    # 调整项 2：BTC 距 5m 新高位置（upper_wick_bps 小 ≈ 贴近新高 → 反弹空间小）
+    upper_wick = ext.get("upper_wick_bps")
+    if upper_wick is not None and upper_wick < 1.0:
+        adj -= 0.01  # 上影小于 1bp，价格几乎贴在最高位
+
+    dynamic_guard = max(FIRSTHIT_DYNAMIC_GUARD_CLAMP_LO, min(base + adj, base))
+    return round(dynamic_guard, 4)
 
 
 class MultiLiveTrader:
@@ -359,11 +412,14 @@ class MultiLiveTrader:
             task.add_done_callback(self._tasks.discard)
             fired.append(ch)
 
-        # ---- firsthit 族（2026-09-07 promote / 2026-09-08 G7扩容）：喂价内联重放本窗真实首触 ----
+        # ---- firsthit 族（2026-09-07 promote / 2026-09-08 G7扩容 / 2026-09-10 过滤器+动态护栏）----
         # 必须用完整 window_down_curve/window_btc_curve 找第一个入区点，而不是把
         # 当前采样当首触；否则部署重启或通道中途开启后，第二次入区会被误判为
         # 首次触价。特征/门调用 firsthit_shadow_detector 纯函数，影子与实盘同源。
         # 各通道按用户确认独立下单，不加入同窗互斥；每通道自身 fired 防重。
+        # 2026-09-10：全通道统一派生异步核验任务（查前驱连阳 → 盘前过滤器 veto
+        # → 版本门 → 动态护栏下单）。同步层先做 chg/upper_wick 快速否决（streak_up
+        # 传 None 跳过该维度），避免明显劣态窗口白派 10 个 DB 查询任务。
         if window_down_curve and window_btc_curve and window_entry_price:
             ext = extract_firsthit_features(
                 window_start_ms, float(window_entry_price),
@@ -371,33 +427,32 @@ class MultiLiveTrader:
                 max_trigger_ts=int(ts_ms),
             )
             if ext is not None:
+                # 同步快速否决（不含 streak 维度——前驱窗需 DB，异步任务内复核）
+                quick_veto = _firsthit_pre_market_veto(ext, None)
                 for ch, spec in self._specs.items():
                     if spec.family != "firsthit":
                         continue
                     cfg = self._configs[ch]
                     if not cfg.enabled or window_start_ms in cfg.fired:
                         continue
-                    if ch in ("g7_streak_v1", "g7_strict_v1"):
-                        # 需要前驱 5m 连阳核验的通道：派生异步任务核验并开火
-                        cfg.fired.add(window_start_ms)
-                        task = asyncio.create_task(
-                            self._verify_firsthit_streak_and_fire(ch, window_start_ms, ext),
-                            name=f"live_firsthit_streak_{ch}_{window_start_ms}",
-                        )
-                        self._tasks.add(task)
-                        task.add_done_callback(self._tasks.discard)
-                        fired.append(ch)
-                    else:
+                    if quick_veto is not None:
+                        logger.info(
+                            "多通道实盘：{} 盘前快速否决 | 窗口 {} | {}",
+                            ch, _fmt_win(window_start_ms), quick_veto)
+                        continue                     # 不占 fired：否决非尝试，后续采样仍可触发
+                    # 版本门同步判定（保持旧语义：纯特征门未过不进 fired 不派任务）；
+                    # g7_streak/g7_strict 的门依赖 streak_up，延后到异步任务复核。
+                    if ch not in ("g7_streak_v1", "g7_strict_v1"):
                         if not firsthit_gate_of(ch, ext):
                             continue
-                        cfg.fired.add(window_start_ms)
-                        task = asyncio.create_task(
-                            self._fire_firsthit(ch, window_start_ms, ext),
-                            name=f"live_firsthit_{ch}_{window_start_ms}",
-                        )
-                        self._tasks.add(task)
-                        task.add_done_callback(self._tasks.discard)
-                        fired.append(ch)
+                    cfg.fired.add(window_start_ms)
+                    task = asyncio.create_task(
+                        self._verify_firsthit_all_gates(ch, window_start_ms, ext),
+                        name=f"live_firsthit_{ch}_{window_start_ms}",
+                    )
+                    self._tasks.add(task)
+                    task.add_done_callback(self._tasks.discard)
+                    fired.append(ch)
         return fired
 
     @staticmethod
@@ -1133,8 +1188,13 @@ class MultiLiveTrader:
             logger.warning("多通道实盘：吸收跟随下单任务异常 | {} | {} | {}",
                            channel, win_label, exc)
 
-    async def _fire_firsthit(self, channel: str, window_start: int, ext: dict) -> None:
-        """firsthit 下单任务：5m 市场买 DOWN，复用统一护栏/日限/防重链路。"""
+    async def _fire_firsthit(self, channel: str, window_start: int, ext: dict,
+                             streak_up: int | None = None) -> None:
+        """firsthit 下单任务：5m 市场买 DOWN，复用统一护栏/日限/防重链路。
+
+        2026-09-10 优化：护栏改走动态护栏（base + 负向调整，只收紧不放松），
+        抑制「反弹窗被 0.08 一刀切切除、暴拉窗低价全成交」的逆向选择。
+        """
         spec = self._specs[channel]
         cfg = self._configs[channel]
         win_label = _fmt_win(window_start)
@@ -1147,19 +1207,20 @@ class MultiLiveTrader:
                 return
             if await self._has_attempt(channel, window_start):
                 return
+            dyn_guard = _resolve_firsthit_dynamic_guard(spec, cfg, ext, streak_up)
             logger.info(
                 "多通道实盘开火 | {} | 首触反转押 DOWN | 窗口 {} | t=+{}s q={:.4f}"
-                " chg={:+.2f}bp body_r={:.3f} npts={} | 金额 {} | 护栏 {}",
+                " chg={:+.2f}bp body_r={:.3f} npts={} | 金额 {} | 护栏 {}（动态）",
                 channel, win_label, ext.get("td_sec"), ext.get("q"),
                 ext.get("chg_bps"), ext.get("body_r"), ext.get("npts"),
-                cfg.amount_usdt, resolve_max_exec(spec, cfg))
+                cfg.amount_usdt, dyn_guard)
             order = await self._exec_with_exclusive(
                 channel,
                 prediction="DOWN",
                 amount_usdt=cfg.amount_usdt,
                 signal_version=channel,
                 window_start=window_start,
-                max_exec_price=resolve_max_exec(spec, cfg),
+                max_exec_price=dyn_guard,
                 market_period="5m",
                 order_type=spec.order_type,
             )
@@ -1168,8 +1229,15 @@ class MultiLiveTrader:
             logger.warning("多通道实盘：首触下单任务异常 | {} | {} | {}",
                            channel, win_label, exc)
 
-    async def _verify_firsthit_streak_and_fire(self, channel: str, window_start: int, ext: dict) -> None:
-        """firsthit 异步连阳核验任务：g7_streak_v1 / g7_strict_v1 通道查前驱 5m 连阳后开火。"""
+    async def _verify_firsthit_all_gates(self, channel: str, window_start: int, ext: dict) -> None:
+        """firsthit 统一异步核验任务（2026-09-10 优化版，取代 _verify_firsthit_streak_and_fire）：
+        查前驱 5m 连阳 streak_up → 盘前过滤器 veto（streak 维度）→ 版本门 → 开火。
+
+        chg/upper_wick 维度已在 check() 同步层快速否决；此处只需复核 streak 维度
+        （_firsthit_pre_market_veto 对 chg/upper_wick 的复检幂等无害）。
+        DB 查询失败 → 异常上抛到外层 except，仅告警不开火（保守口径：门禁数据
+        缺失不下注，与影子「门禁数据缺失不落表」一致）。
+        """
         win_label = _fmt_win(window_start)
         try:
             streak_up = 0
@@ -1188,13 +1256,18 @@ class MultiLiveTrader:
                         streak_up += 1
                     else:
                         break
+            veto = _firsthit_pre_market_veto(ext, streak_up)
+            if veto is not None:
+                logger.info("多通道实盘：{} 盘前过滤拦截 | 窗口 {} | {}",
+                            channel, win_label, veto)
+                return
             if not firsthit_gate_of(channel, ext, streak_up=streak_up):
-                logger.info("多通道实盘：{} 连阳门禁未过(streak={})，弃单 | 窗口 {}",
+                logger.info("多通道实盘：{} 版本门未过(streak={})，弃单 | 窗口 {}",
                             channel, streak_up, win_label)
                 return
-            await self._fire_firsthit(channel, window_start, ext)
+            await self._fire_firsthit(channel, window_start, ext, streak_up=streak_up)
         except Exception as exc:
-            logger.warning("多通道实盘：首触连阳核验任务异常 | {} | {} | {}",
+            logger.warning("多通道实盘：首触核验任务异常 | {} | {} | {}",
                            channel, win_label, exc)
 
     # ------------------------------------------------------------------

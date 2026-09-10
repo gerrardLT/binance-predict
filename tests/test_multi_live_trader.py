@@ -148,6 +148,21 @@ def _make_trader(monkeypatch, trader: _FakeTrader,
     monkeypatch.setattr(MultiLiveTrader, "_group_filled_channel", _no_group_fill)
     monkeypatch.setattr(MultiLiveTrader, "_backfill_signal_link", _no_backfill)
     monkeypatch.setattr(MultiLiveTrader, "_link_signal_id", _no_link)
+    
+    # 2026-09-10 firsthit 盘前过滤器 / 动态护栏：所有通道统一查前驱连阳（异步任务），
+    # 统一 mock session factory 返回空序列（streak_up=0），与旧 g7 测试内自行 mock
+    # 的行为兼容（测试内后续的 monkeypatch.setattr(milt, "async_session_factory")
+    # 会覆盖此设置）。
+    class _NoStreakSession:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def execute(self, stmt):
+            from unittest.mock import MagicMock
+            res = MagicMock()
+            res.scalars.return_value.all.return_value = []  # 无前驱窗 → streak_up=0
+            return res
+    
+    monkeypatch.setattr(milt, "async_session_factory", lambda: _NoStreakSession())
     return t
 
 
@@ -1494,10 +1509,25 @@ def _firsthit_down_curve(trigger_q: float = 0.07, npts: int = 20, trigger_idx: i
 
 
 def _firsthit_btc_curve(btc_open: float = 100.0, btc_trig: float = 100.3, npts: int = 20) -> list[dict]:
-    """btc_curve：开盘 + 连续上升至 btc_trig。"""
+    """btc_curve：开盘 → 冲高(btc_trig+0.05) → 回落至 btc_trig 后走平（留上影）。
+
+    2026-09-10：盘前过滤器要求 upper_wick_bps ≥ 0.5（贴近新高即 veto），
+    单调上升曲线 upper_wick=0 会被拦；冲高 0.05 且在触发点（i=8）前完成回落
+    → 触发点上影 5bp，同时免于动态护栏收紧（<1.0bp 会 adj −0.01）。
+    """
+    peak = btc_trig + 0.05
     pts = [{"t": WINDOW_START, "v": btc_open}]
+    up_end = max(1, npts // 5)          # i=1..up_end 冲高（npts=20 → 4）
+    down_end = up_end + 3               # i=up_end+1..down_end 回落至 btc_trig
     for i in range(1, npts):
-        pts.append({"t": WINDOW_START + i * 15_000, "v": btc_open + (btc_trig - btc_open) * (i / (npts - 1))})
+        ts = WINDOW_START + i * 15_000
+        if i <= up_end:
+            v = btc_open + (peak - btc_open) * (i / up_end)
+        elif i <= down_end:
+            v = peak - (peak - btc_trig) * ((i - up_end) / (down_end - up_end))
+        else:
+            v = btc_trig                # 触发点前已走平：btc_trig 精确可控
+        pts.append({"t": ts, "v": v})
     return pts
 
 
@@ -1542,13 +1572,14 @@ async def test_firsthit_g0_match_real_first_touch(monkeypatch) -> None:
 async def test_firsthit_g1_g3_gate_rejects_high_chg_or_large_body(monkeypatch) -> None:
     """G1/G3 门：chg≤+2.82bp / body_r≤0.35；不满足则不开火，G0 仍可开。"""
     fake = _FakeTrader()
-    # chg 较大（+5bp）、body_r 较大（≈1.0）
+    # chg 较大（+45bp）、body_r 较大（≈0.9）；2026-09-10 起盘前 veto 阈值 |chg|>50bp，
+    # 100.45 → +45bp 安全远离贴线（浮点 (100.5/100-1)*1e4 = 50.00000000000004 会误拦）
     t = _make_trader(monkeypatch, fake, channels=["firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1"])
     dn_p = _firsthit_down_curve(trigger_q=0.07, npts=20)
-    btc_p = _firsthit_btc_curve(btc_open=100.0, btc_trig=100.5, npts=20)  # chg≈+5bp
+    btc_p = _firsthit_btc_curve(btc_open=100.0, btc_trig=100.45, npts=20)  # chg≈+45bp
     REL_T_SEC = 120
     fired = t.check(WINDOW_START, WINDOW_END, WINDOW_START + REL_T_SEC * 1000,
-                    down_price=0.5, btc_price=100.5,
+                    down_price=0.5, btc_price=100.45,
                     window_entry_price=100.0,
                     window_btc_curve=btc_p, window_down_curve=dn_p)
     assert "firsthit_down_v1" in fired
@@ -1569,18 +1600,20 @@ async def test_firsthit_three_channels_share_same_window_exclusive_fill(monkeypa
                      channels=["firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1"],
                      overrides={"firsthit_down_body_v1": {"enabled": True, "max_exec_price": 0.12},
                                 "firsthit_down_chg_v1": {"enabled": True, "max_exec_price": 0.09}})
-    # chg=+2bp、body_r≈0.17 → 三门全中（i=8 触发点 v=100.02）
+    # chg=+2bp、body_r≈0.125 → 三门全中（i=8 触发点 v=100.02）
     dn_p = _firsthit_down_curve(trigger_q=0.07, npts=20, trigger_idx=8)
-    # btc_curve：下跌→反弹，让 body_r<0.35 且 chg≤2.82bp
+    # btc_curve：冲高→下跌→反弹，让 body_r<0.35、chg≤2.82bp 且上影≥0.5bp（盘前 veto 要求）
     btc_p = [{"t": WINDOW_START, "v": 100.0}]
     for i in range(1, 20):
         ts = WINDOW_START + i * 15_000
-        if i <= 7:
-            v = 100.0 - i * 0.0143  # 下跌段 100.0→99.90 (i=7 最低)
+        if i <= 2:
+            v = 100.0 + i * 0.03          # 冲高 100.0→100.06（留 4bp 上影）
+        elif i <= 7:
+            v = 100.06 - (i - 2) * 0.032  # 回落 100.06→99.90 (i=7 最低)
         elif i == 8:
-            v = 100.02           # i=8 触发点：直接到 100.02（chg=+2bp）
+            v = 100.02                    # i=8 触发点：chg=+2bp，上影=(100.06-100.02)=4bp
         else:
-            v = 100.02 + (i - 8) * 0.01  # 反弹后继续上行
+            v = 100.02 + (i - 8) * 0.01   # 反弹后继续上行
         btc_p.append({"t": ts, "v": v})
     REL_T_SEC = 120
     fired = t.check(WINDOW_START, WINDOW_END, WINDOW_START + REL_T_SEC * 1000,
@@ -1646,8 +1679,12 @@ async def test_firsthit_does_not_look_ahead_past_current_sample(monkeypatch) -> 
         {"t": WINDOW_START + 15_000, "v": 0.30},
         {"t": WINDOW_START + 30_000, "v": 0.07},   # 真实首触（未来）
     ]
-    # btc_curve：3.75s 间隔，t≤30s 共 9 点（满足 npts≥8，排除 npts 门兜底）
-    btc_p = [{"t": WINDOW_START + i * 3_750, "v": 100.0 + i * 0.01} for i in range(9)]
+    # btc_curve：冲高→回落，触发点有上影（盘前 veto 要求 upper_wick≥0.5bp）
+    btc_p = [
+        {"t": WINDOW_START + i * 3_750,
+         "v": 100.0 + (i * 0.03 if i <= 4 else 0.12 - (i - 4) * 0.01)}
+        for i in range(9)
+    ]
 
     # t=15s：首触尚未发生 → 不得开火
     assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 15_000,
@@ -1743,7 +1780,13 @@ async def test_firsthit_exclusive_allows_next_channel_after_failed_attempt(monke
     btc_p = [{"t": WINDOW_START, "v": 100.0}]
     for i in range(1, 20):
         ts = WINDOW_START + i * 15_000
-        btc_p.append({"t": ts, "v": 100.0 - i * 0.01 if i <= 7 else 100.02})
+        if i <= 3:
+            v = 100.0 + i * 0.02              # 冲高到 100.06（留 4bp 上影）
+        elif i <= 7:
+            v = 100.06 - (i - 3) * 0.0325     # 回落到 ~99.93
+        else:
+            v = 100.02
+        btc_p.append({"t": ts, "v": v})
     fired = t.check(WINDOW_START, WINDOW_END, WINDOW_START + 120_000,
                     down_price=0.5, btc_price=100.3,
                     window_entry_price=100.0,
@@ -1770,7 +1813,13 @@ async def test_firsthit_exclusive_blocks_persisted_fill_after_restart(monkeypatc
     btc_p = [{"t": WINDOW_START, "v": 100.0}]
     for i in range(1, 20):
         ts = WINDOW_START + i * 15_000
-        btc_p.append({"t": ts, "v": 100.0 - i * 0.01 if i <= 7 else 100.02})
+        if i <= 3:
+            v = 100.0 + i * 0.02              # 冲高到 100.06（留 4bp 上影）
+        elif i <= 7:
+            v = 100.06 - (i - 3) * 0.0325     # 回落到 ~99.93
+        else:
+            v = 100.02
+        btc_p.append({"t": ts, "v": v})
     assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 120_000,
                    down_price=0.5, btc_price=100.02,
                    window_entry_price=100.0,
@@ -4139,11 +4188,19 @@ async def test_exclusive_limit_gtc_pending_order_occupies_slot(monkeypatch) -> N
 
     # 模拟 firsthit_down_v1 开火并返回 PENDING
     dn_p = _firsthit_down_curve(trigger_q=0.04, npts=20, trigger_idx=8)
-    btc_p = [{"t": WINDOW_START + i * 15_000, "v": 100.0} for i in range(20)]
+    # btc_curve：冲高→回落留上影（盘前 veto 要求 upper_wick≥0.5bp）
+    btc_p = [{"t": WINDOW_START, "v": 100.0}]
+    for i in range(1, 20):
+        ts = WINDOW_START + i * 15_000
+        if i <= 4:
+            v = 100.0 + i * 0.02          # 冲高到 100.08（peak）
+        else:
+            v = 100.08 - (i - 4) * 0.005  # 缓慢回落（i=8 时≈100.06）
+        btc_p.append({"t": ts, "v": v})
 
     fired = t.check(
         WINDOW_START, WINDOW_END, WINDOW_START + 120_000,
-        down_price=0.04, btc_price=100.0,
+        down_price=0.04, btc_price=100.06,
         window_entry_price=100.0,
         window_btc_curve=btc_p, window_down_curve=dn_p,
     )
