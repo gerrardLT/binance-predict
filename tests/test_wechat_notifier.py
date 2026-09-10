@@ -6,6 +6,26 @@ from binance_predict.config.settings import settings
 from binance_predict.services.wechat_notifier import WeChatNotifier
 
 
+def test_format_channel_title():
+    from binance_predict.services.live_channels import format_channel_title
+
+    # 1. 正常活跃通道
+    res_active = format_channel_title("hm_inside_15m_v2")
+    assert res_active == "**15m孕线上吊线反转（押DOWN）** (`hm_inside_15m_v2`)"
+
+    # 2. 退役通道兜底
+    res_retired = format_channel_title("quote_momentum_v1")
+    assert res_retired == "**报价动量（A格顺势）** (`quote_momentum_v1`)"
+
+    # 3. 未知通道安全回退
+    res_unknown = format_channel_title("unknown_channel_xyz")
+    assert res_unknown == "`unknown_channel_xyz`"
+
+    # 4. 空字符串或 None 安全兜底
+    assert format_channel_title("") == "``"
+    assert format_channel_title(None) == "``"
+
+
 @pytest.fixture
 def notifier():
     n = WeChatNotifier()
@@ -98,6 +118,68 @@ def test_wechat_radar_dedup(notifier):
             dedup_key="radar_test_1",
         )
         assert mock_push.call_count == 1  # 依然是 1 次
+
+
+def test_wechat_notifier_channel_formatting(notifier):
+    with patch.object(settings, "wechat_radar_enabled", True), \
+         patch.object(notifier, "push_markdown") as mock_push:
+        
+        # 1. 提前预警雷达
+        notifier.notify_pre_trade_radar(
+            radar_type="15m 经典孕线反转",
+            channel="hm_inside_15m_v2",
+            direction="DOWN",
+            target_time_ms=1725900000000,
+            lead_seconds=90,
+            max_exec_price=0.30,
+            features_desc="前根大实体",
+            dedup_key="radar_test_fmt",
+        )
+        assert mock_push.called
+        content = mock_push.call_args[0][0]
+        assert "> **策略通道**：**15m孕线上吊线反转（押DOWN）** (`hm_inside_15m_v2`)" in content
+
+    with patch.object(notifier, "push_markdown") as mock_push:
+        # 2. 实盘订单成交
+        notifier.notify_order_filled(
+            channel="quote_contrarian_v2",
+            direction="DOWN",
+            window_start=1725900000000,
+            avg_price=0.25,
+            amount_usdt=5.0,
+            shares=20.0,
+            order_id=123,
+        )
+        content = mock_push.call_args[0][0]
+        assert "> **策略通道**：**报价反向·门禁版** (`quote_contrarian_v2`)" in content
+
+    with patch.object(notifier, "push_markdown") as mock_push:
+        # 3. 护栏弃单
+        notifier.notify_order_abandoned(
+            channel="x4_v2",
+            direction="DOWN",
+            window_start=1725900000000,
+            quote_price=0.55,
+            guard_price=0.50,
+            reason="报价超出护栏",
+        )
+        content = mock_push.call_args[0][0]
+        assert "> **策略通道**：**情绪错位·平静市门禁版** (`x4_v2`)" in content
+
+    with patch.object(notifier, "push_markdown") as mock_push:
+        # 4. 结算复盘
+        notifier.notify_order_settled(
+            channel="s5_deep_z20_v1",
+            window_start=1725900000000,
+            direction="DOWN",
+            outcome="DOWN",
+            win=True,
+            pnl=3.5,
+            amount_usdt=5.0,
+            settle_price=65000.0,
+        )
+        content = mock_push.call_args[0][0]
+        assert "> **策略通道**：**S5深档·深回落门禁版** (`s5_deep_z20_v1`)" in content
 
 
 @pytest.mark.asyncio

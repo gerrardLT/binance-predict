@@ -18,6 +18,7 @@ import httpx
 from loguru import logger
 
 from ..config.settings import settings
+from .live_channels import format_channel_title
 
 TZ_BJT = timezone(timedelta(hours=8))
 
@@ -199,7 +200,7 @@ class WeChatNotifier:
 
         content = (
             f"### ⚡【潜在限价单提前预警】<{dir_color}>{radar_type}</{dir_color}>\n"
-            f"> **策略通道**：`{channel}`\n"
+            f"> **策略通道**：{format_channel_title(channel)}\n"
             f"> **预测方向**：**{dir_emoji}**\n"
             f"> **预计挂单时间**：`{fmt_bjt(target_time_ms)}`\n"
             f"> **剩余决策缓冲**：<font color=\"comment\">约 {lead_seconds} 秒</font>\n"
@@ -228,7 +229,7 @@ class WeChatNotifier:
         shares_str = f"{shares:.2f}" if shares is not None else "待回读"
         content = (
             f"### 🎯【实盘订单已成交】\n"
-            f"> **策略通道**：`{channel}`\n"
+            f"> **策略通道**：{format_channel_title(channel)}\n"
             f"> **标的周期**：`{fmt_bjt(window_start)}`\n"
             f"> **下单方向**：<font color=\"info\">{dir_emoji}</font>\n"
             f"> **成交均价**：`{avg_price:.4f}`\n"
@@ -257,7 +258,7 @@ class WeChatNotifier:
         g_str = f"{guard_price:.4f}" if guard_price is not None else "N/A"
         content = (
             f"### 🛡️【护栏安全弃单保护】\n"
-            f"> **策略通道**：`{channel}`\n"
+            f"> **策略通道**：{format_channel_title(channel)}\n"
             f"> **标的周期**：`{fmt_bjt(window_start)}`\n"
             f"> **意向方向**：`{direction}`\n"
             f"> **市场报价**：`{q_str}` (护栏上限: `{g_str}`)\n"
@@ -301,7 +302,7 @@ class WeChatNotifier:
 
         content = (
             f"### 🏁【实盘订单结算复盘】<{res_color}>{res_tag}</{res_color}>\n"
-            f"> **策略通道**：`{channel}`\n"
+            f"> **策略通道**：{format_channel_title(channel)}\n"
             f"> **所属窗口**：`{fmt_bjt(window_start)}`\n"
             f"> **下注 vs 结算**：下注 `{direction}` ➜ 最终 `{outcome}`\n"
             f"> **结算 BTC 价格**：`{s_price_str}`\n"
