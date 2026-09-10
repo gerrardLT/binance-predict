@@ -183,98 +183,115 @@ class MultiLiveTrader:
         t_rel = (ts_ms - window_start_ms) / 1000.0
         fired: list[str] = []
         for ch, spec in self._specs.items():
-            # down_price 仅 quote_edge 族需要（absorption 族只依赖 up_price，
-            # DOWN 报价缺失不应连带跳过 absorption 判定）
-            if spec.family != "quote_edge" or down_price is None:
-                continue
-            cfg = self._configs[ch]
-            if not cfg.enabled:
-                continue
-            if window_start_ms in cfg.fired:
-                continue
-            # v2 用 base(v1) 冻结区间；v3 基于 contrarian v1 区间；
-            # v4 基于 REGIME_GUARDS base 区间；v3 非连涨基于 STREAK_GUARDS
-            # base 区间（映射，勿复制数值）
-            if ch in V2_PRICE_GUARDS:
-                rule_key = V2_PRICE_GUARDS[ch][0]
-            elif spec.v3_env:
-                rule_key = "quote_contrarian_v1"
-            elif ch in REGIME_GUARDS:
-                rule_key = REGIME_GUARDS[ch][0]
-            elif ch in STREAK_GUARDS:
-                rule_key = STREAK_GUARDS[ch]
-            else:
-                rule_key = ch
-            t_lo, t_hi, q_lo, q_hi = QUOTE_EDGE_RULES[rule_key]
-            if not (t_lo <= t_rel < t_hi):
-                continue
-            if not (q_lo <= float(down_price) < q_hi):
-                continue
-            # 时段门：北京时间 window_start hour ∈ [lo, hi)
-            if spec.hour_guard is not None:
-                from datetime import datetime, timezone
-                win_start_dt = datetime.fromtimestamp(window_start_ms / 1000.0, tz=timezone.utc)
-                bjt_hour = win_start_dt.hour + 8  # UTC+8，无夏令时
-                if not (spec.hour_guard[0] <= bjt_hour < spec.hour_guard[1]):
-                    logger.debug(
-                        "多通道实盘：{} 时段门未过 | 窗口 {} | 北京时间 {} 时 | 要求 {}-{} 时",
-                        ch, _fmt_win(window_start_ms), bjt_hour, spec.hour_guard[0], spec.hour_guard[1])
+            try:
+                # down_price 仅 quote_edge 族需要（absorption 族只依赖 up_price，
+                # DOWN 报价缺失不应连带跳过 absorption 判定）
+                if spec.family != "quote_edge" or down_price is None:
                     continue
-            if spec.v2_guard is not None:
-                # v3 通道的价格门禁同 contrarian_v2（max_rise），阈值勿复制
-                guard_key = "quote_contrarian_v2" if spec.v3_env else ch
-                if not self._pass_live_v2_guard(
-                        guard_key, btc_price, window_entry_price):
+                cfg = self._configs[ch]
+                if not cfg.enabled:
                     continue
-            # 命中：立即占位（内存），防同通道同窗后续采样重复派生
-            cfg.fired.add(window_start_ms)
-            if spec.v3_env:
-                # v3 环境门禁需异步 DB 核验（前窗 outcome / 日高）：
-                # 核验通过才进 _fire_quote_edge，未过/缺失 → 弃单
-                task = asyncio.create_task(
-                    self._verify_v3_env_and_fire(
-                        ch, window_start_ms, window_end_ms, t_rel,
-                        float(down_price), btc_price, int(ts_ms),
-                        window_btc_curve),
-                    name=f"live_qe_{ch}_{window_start_ms}",
-                )
-            elif spec.ln_dd_guard:
-                # 深夜距日高门需异步 DB 核验（仅日高，不要求前窗 DOWN）：
-                # 核验通过才进 _fire_quote_edge，未过/缺失 → 弃单
-                task = asyncio.create_task(
-                    self._verify_ln_dd_and_fire(
-                        ch, window_start_ms, window_end_ms, t_rel,
-                        float(down_price), btc_price, int(ts_ms),
-                        window_btc_curve),
-                    name=f"live_qe_{ch}_{window_start_ms}",
-                )
-            elif spec.regime_gate:
-                # v4 regime 门禁需异步 K 线核验（ret24，影子/实盘同口径）：
-                # 核验通过才进 _fire_quote_edge，未过/缺失 → 弃单
-                task = asyncio.create_task(
-                    self._verify_regime_and_fire(
-                        ch, window_start_ms, window_end_ms, t_rel,
-                        float(down_price), int(ts_ms)),
-                    name=f"live_qe_{ch}_{window_start_ms}",
-                )
-            elif spec.streak_gate:
-                # v3 非连涨门禁需异步 K 线核验（末收 15m，影子/实盘同口径）：
-                # 核验通过才进 _fire_quote_edge，未过/缺失 → 弃单
-                task = asyncio.create_task(
-                    self._verify_streak_and_fire(
-                        ch, window_start_ms, window_end_ms, t_rel,
-                        float(down_price), int(ts_ms)),
-                    name=f"live_qe_{ch}_{window_start_ms}",
-                )
-            else:
-                task = asyncio.create_task(
-                    self._fire_quote_edge(ch, window_start_ms, window_end_ms,
-                                          t_rel, float(down_price)),
-                    name=f"live_qe_{ch}_{window_start_ms}",
-                )
-            self._tasks.add(task)
-            task.add_done_callback(self._tasks.discard)
-            fired.append(ch)
+                if window_start_ms in cfg.fired:
+                    continue
+                # v2 用 base(v1) 冻结区间；v3 基于 contrarian v1 区间；
+                # v4 基于 REGIME_GUARDS base 区间；v3 非连涨基于 STREAK_GUARDS
+                # base 区间（映射，勿复制数值）
+                if ch in V2_PRICE_GUARDS:
+                    rule_key = V2_PRICE_GUARDS[ch][0]
+                elif spec.v3_env:
+                    rule_key = "quote_contrarian_v1"
+                elif ch in REGIME_GUARDS:
+                    rule_key = REGIME_GUARDS[ch][0]
+                elif ch in STREAK_GUARDS:
+                    rule_key = STREAK_GUARDS[ch]
+                else:
+                    rule_key = ch
+                t_lo, t_hi, q_lo, q_hi = QUOTE_EDGE_RULES[rule_key]
+                if not (t_lo <= t_rel < t_hi):
+                    continue
+                if not (q_lo <= float(down_price) < q_hi):
+                    continue
+                # 时段门：北京时间 window_start hour ∈ [lo, hi)
+                if spec.hour_guard is not None:
+                    from datetime import datetime, timezone
+                    win_start_dt = datetime.fromtimestamp(window_start_ms / 1000.0, tz=timezone.utc)
+                    bjt_hour = win_start_dt.hour + 8  # UTC+8，无夏令时
+                    if not (spec.hour_guard[0] <= bjt_hour < spec.hour_guard[1]):
+                        logger.debug(
+                            "多通道实盘：{} 时段门未过 | 窗口 {} | 北京时间 {} 时 | 要求 {}-{} 时",
+                            ch, _fmt_win(window_start_ms), bjt_hour, spec.hour_guard[0], spec.hour_guard[1])
+                        continue
+                if spec.v2_guard is not None:
+                    # v3 通道的价格门禁同 contrarian_v2（max_rise），阈值勿复制
+                    guard_key = "quote_contrarian_v2" if spec.v3_env else ch
+                    # 与影子同口径守卫（quote_edge_detector：
+                    # `if version in V2_PRICE_GUARDS and _pass_v2_price_guard(...)`）：
+                    # 字典未登记该版本 → 不施加本门禁（短路放行），绝不下标查表。
+                    # 缺此守卫时 KeyError 会从本循环冒出，连带跳过其后的 absorption /
+                    # firsthit 两族判定（late_night_contrarian_v2 影子 36 单 / 实盘
+                    # 0 单的根因，2026-09-10 归因）。
+                    if guard_key in V2_PRICE_GUARDS and not self._pass_live_v2_guard(
+                            guard_key, btc_price, window_entry_price):
+                        continue
+                # 命中：立即占位（内存），防同通道同窗后续采样重复派生
+                cfg.fired.add(window_start_ms)
+                if spec.v3_env:
+                    # v3 环境门禁需异步 DB 核验（前窗 outcome / 日高）：
+                    # 核验通过才进 _fire_quote_edge，未过/缺失 → 弃单
+                    task = asyncio.create_task(
+                        self._verify_v3_env_and_fire(
+                            ch, window_start_ms, window_end_ms, t_rel,
+                            float(down_price), btc_price, int(ts_ms),
+                            window_btc_curve),
+                        name=f"live_qe_{ch}_{window_start_ms}",
+                    )
+                elif spec.ln_dd_guard:
+                    # 深夜距日高门需异步 DB 核验（仅日高，不要求前窗 DOWN）：
+                    # 核验通过才进 _fire_quote_edge，未过/缺失 → 弃单
+                    task = asyncio.create_task(
+                        self._verify_ln_dd_and_fire(
+                            ch, window_start_ms, window_end_ms, t_rel,
+                            float(down_price), btc_price, int(ts_ms),
+                            window_btc_curve),
+                        name=f"live_qe_{ch}_{window_start_ms}",
+                    )
+                elif spec.regime_gate:
+                    # v4 regime 门禁需异步 K 线核验（ret24，影子/实盘同口径）：
+                    # 核验通过才进 _fire_quote_edge，未过/缺失 → 弃单
+                    task = asyncio.create_task(
+                        self._verify_regime_and_fire(
+                            ch, window_start_ms, window_end_ms, t_rel,
+                            float(down_price), int(ts_ms)),
+                        name=f"live_qe_{ch}_{window_start_ms}",
+                    )
+                elif spec.streak_gate:
+                    # v3 非连涨门禁需异步 K 线核验（末收 15m，影子/实盘同口径）：
+                    # 核验通过才进 _fire_quote_edge，未过/缺失 → 弃单
+                    task = asyncio.create_task(
+                        self._verify_streak_and_fire(
+                            ch, window_start_ms, window_end_ms, t_rel,
+                            float(down_price), int(ts_ms)),
+                        name=f"live_qe_{ch}_{window_start_ms}",
+                    )
+                else:
+                    task = asyncio.create_task(
+                        self._fire_quote_edge(ch, window_start_ms, window_end_ms,
+                                              t_rel, float(down_price)),
+                        name=f"live_qe_{ch}_{window_start_ms}",
+                    )
+                self._tasks.add(task)
+                task.add_done_callback(self._tasks.discard)
+                fired.append(ch)
+            except Exception as exc:
+                # 单通道判定异常只跳过本通道：不让某个通道的 KeyError/
+                # AttributeError 从本循环冒出，连带跳过其后的 absorption /
+                # firsthit 两族判定（late_night_contrarian_v2 的 v2_guard
+                # 查表 KeyError 曾造成此附带伤害，2026-09-10 归因）。
+                # error 级 + exc_info：不再被上层 except Exception 静默吞掉。
+                logger.error(
+                    "多通道实盘：quote_edge 单通道 {} 判定异常，跳过本通道 | 窗口 {} | {}",
+                    ch, _fmt_win(window_start_ms), exc, exc_info=True)
+                continue
 
         # ---- absorption 族（2026-09-06 promote）：喂价内联判定，逐通道独立时点 ----
         # 窗开快照：(up_open, btc_open) = (本窗归档首个有效 UP 采样价, 窗开 BTC)；
@@ -390,8 +407,14 @@ class MultiLiveTrader:
 
         阈值复用 V2_PRICE_GUARDS（min_drop: chg≤阈值 / max_rise: chg<阈值）。
         数据缺失 → False 不触发（与影子「门禁数据缺失不落表」同保守口径）。
+        版本未登记于 V2_PRICE_GUARDS → True 放行（语义 = 该版本无此价格门禁，
+        与影子 `version in V2_PRICE_GUARDS` 短路跳过同口径；绝不下标查表抛
+        KeyError 打断采样循环）。
         """
-        mode, threshold = V2_PRICE_GUARDS[version][1], V2_PRICE_GUARDS[version][2]
+        entry = V2_PRICE_GUARDS.get(version)
+        if entry is None:
+            return True
+        mode, threshold = entry[1], entry[2]
         if not btc_price or not window_entry_price or window_entry_price <= 0:
             return False
         chg_pct = (btc_price - window_entry_price) / window_entry_price * 100.0

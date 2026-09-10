@@ -325,9 +325,11 @@ def test_channels_registry_shape() -> None:
     assert by["ih_inside_15m_v2"].market_period == "15m"
     assert by["ih_inside_15m_v2"].direction == "UP"
     assert by["ih_inside_15m_v2"].auto_max_exec == 0.30
-    # late_night_contrarian_v2 新注册（时段门 22-24+距日高门≥0.30%）
+    # late_night_contrarian_v2 新注册（时段门 22-24+距日高门≥0.30%，无 v2_guard）。
+    # ⚠️ 本通道实盘 never registered v2_guard → shadow口径一致；早期误加v2_guard="max_rise"
+    #   但 V2_PRICE_GUARDS 未登记该版本→check() KeyError，影子 36 单/实盘 0 单（2026-09-10修复）。
     assert by["late_night_contrarian_v2"].market_period == "5m"
-    assert by["late_night_contrarian_v2"].v2_guard == "max_rise"
+    assert by["late_night_contrarian_v2"].v2_guard is None  # A 方案删除了错误声明
     assert by["late_night_contrarian_v2"].auto_max_exec == 0.33
     assert by["late_night_contrarian_v2"].hour_guard == (22, 24)
     assert by["late_night_contrarian_v2"].ln_dd_guard is True
@@ -4207,6 +4209,235 @@ async def test_sync_binance_orders_cancels_expired_limit_order(monkeypatch) -> N
     assert pending_order.status == "FAILED"
     assert "限价挂单周期已结束未成交" in pending_order.error_message
     assert cancelled == ["ORD-LIMIT-EXP-1"]
+
+
+# ============================================================
+# 组 9：late_night_contrarian_v2 线上 0 单根因回归（2026-09-10）
+# ============================================================
+# 线上现象：影子 n=36 / wr 41.7% / cum_ev +16.77，通道 enabled=True，
+# 但 trade_orders 里 0 条记录（连 FAILED 弃单行都没有）。
+#
+# 根因：ChannelSpec 声明 v2_guard="max_rise"，而 quote_edge_detector.V2_PRICE_GUARDS
+# 只登记了 quote_momentum_v2 / quote_contrarian_v2 → check() 里
+# _pass_live_v2_guard 下标查表抛 KeyError。影子侧用
+# `if version in V2_PRICE_GUARDS and ...` 守卫会短路跳过该门禁，所以影子照常
+# 出单；实盘侧只看 `spec.v2_guard is not None` 就查表 → 两侧口径分叉。
+# KeyError 在 cfg.fired 占位之前抛出，故连弃单痕迹都没有；异常冒到 main.py
+# 采样循环被 `except Exception` 降级成一行 warning 静默吞掉。
+#
+# 附带伤害：KeyError 从 quote_edge 循环冒出 → 其后的 absorption 族与 firsthit
+# 族判定整段跳过（当时 absorption_follow_td150_v1 与 G 系列均 enabled）。
+#
+# 修复 A+B+C：
+#   A live_channels.py：删除 late_night_contrarian_v2 的 v2_guard 声明
+#     （门禁组合回到「时段门 ∩ 距日高回落」，与影子落表口径一致）
+#   B multi_live_trader.py：调用处补 `guard_key in V2_PRICE_GUARDS` 守卫，
+#     _pass_live_v2_guard 内部改 .get() 缺项返回 True（防御纵深）
+#   C multi_live_trader.py：quote_edge 循环加 per-channel try/except，
+#     单通道异常只跳过本通道，不再拖垮其他通道与其后两族
+#
+# 下列用例均为 mutation-test：撤销任一修复即变红。
+
+LN_CH = "late_night_contrarian_v2"
+
+
+def _ln_window_args() -> tuple[int, int, int, float]:
+    """late_night 触发夹具：北京 22:00（UTC 14:00）窗口 + 区间中点 t/报价。"""
+    ws = int(datetime(2026, 9, 9, 14, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    we = ws + 300_000
+    t_lo, t_hi, q_lo, q_hi = QUOTE_EDGE_RULES[LN_CH]
+    ts = ws + int((t_lo + t_hi) / 2 * 1000)
+    return ws, we, ts, (q_lo + q_hi) / 2
+
+
+def test_ln_fixture_lands_in_hour_guard() -> None:
+    """夹具自检：窗口须落在 hour_guard(22,24) 内，否则后续用例无意义。"""
+    ws, _we, ts, dp = _ln_window_args()
+    assert 22 <= (ws // 3_600_000 + 8) % 24 < 24
+    t_lo, t_hi, q_lo, q_hi = QUOTE_EDGE_RULES[LN_CH]
+    assert t_lo <= (ts - ws) / 1000.0 < t_hi
+    assert q_lo <= dp < q_hi
+
+
+def test_ln_guard_would_not_block_fill() -> None:
+    """护栏 0.33 高于触发区间上界 0.30 → 护栏不是 0 单的原因（排除竞争假设）。"""
+    assert lc.LIVE_CHANNELS[LN_CH].auto_max_exec == 0.33
+    assert QUOTE_EDGE_RULES[LN_CH][3] == 0.30
+
+
+# ---- A：注册表自洽性 ----
+
+def test_ln_spec_v2_guard_removed() -> None:
+    """A 方案：v2_guard 声明已移除（撤销 A → 本用例红）。"""
+    assert lc.LIVE_CHANNELS[LN_CH].v2_guard is None
+
+
+def test_ln_other_gate_registries_intact() -> None:
+    """A 方案只摘 v2_guard，其余门禁登记不动（时段门 + 距日高回落仍在）。"""
+    from binance_predict.services.quote_edge_detector import HOUR_GUARDS, LN_DD_GUARDS
+    assert LN_CH in QUOTE_EDGE_RULES
+    assert HOUR_GUARDS[LN_CH] == (22, 24)
+    assert LN_CH in LN_DD_GUARDS
+
+
+def test_invariant_every_v2_guard_declaration_is_registered() -> None:
+    """不变量护栏：声明 v2_guard 的通道，其 guard_key 必须在 V2_PRICE_GUARDS 里。
+
+    这条正是本 bug 的复发防线——任何人再给通道加 v2_guard 却忘了登记门禁字典，
+    CI 立刻红（撤销 B 的守卫后，违反此不变量会重新变成线上 KeyError）。
+    """
+    from binance_predict.services.quote_edge_detector import V2_PRICE_GUARDS
+    offenders = []
+    for ch, spec in lc.LIVE_CHANNELS.items():
+        if spec.v2_guard is None:
+            continue
+        guard_key = "quote_contrarian_v2" if spec.v3_env else ch
+        if guard_key not in V2_PRICE_GUARDS:
+            offenders.append(f"{ch}→{guard_key}")
+    assert offenders == [], f"v2_guard 已声明但门禁字典未登记: {offenders}"
+
+
+# ---- B：_pass_live_v2_guard 防御纵深 ----
+
+def test_v2_guard_unregistered_version_passes_through() -> None:
+    """B 方案：未登记版本返回 True（语义 = 无此门禁，放行），绝不抛 KeyError。
+
+    撤销 B（改回 V2_PRICE_GUARDS[version] 下标）→ 本用例抛 KeyError 而红。
+    """
+    g = MultiLiveTrader._pass_live_v2_guard
+    assert g(LN_CH, 110_000.0, 110_010.0) is True
+    assert g("no_such_version_at_all", 1.0, 1.0) is True
+
+
+def test_v2_guard_registered_versions_still_enforce_threshold() -> None:
+    """B 方案不能弱化既有门禁：登记版本的阈值判定与边界语义保持不变。"""
+    g = MultiLiveTrader._pass_live_v2_guard
+    # min_drop ≤ −0.10%（含边界）
+    assert g("quote_momentum_v2", 9990.0, 10000.0) is True
+    assert g("quote_momentum_v2", 9991.0, 10000.0) is False
+    # max_rise < +0.10%（不含边界）
+    assert g("quote_contrarian_v2", 10009.0, 10000.0) is True
+    assert g("quote_contrarian_v2", 10010.0, 10000.0) is False
+    # 数据缺失仍保守不触发
+    assert g("quote_momentum_v2", None, 10000.0) is False
+    assert g("quote_contrarian_v2", 10000.0, None) is False
+
+
+# ---- A+B 集成：late_night 命中后能走到下单派生 ----
+
+@pytest.mark.asyncio
+async def test_ln_check_fires_and_places_order(monkeypatch) -> None:
+    """修复后关键路径通畅：深夜窗口 + 区间命中 → 占位 → 派生 → 真下单调用。
+
+    ln_dd_guard 需异步 DB 核验日高，此处桩为「门通过」，聚焦验证 v2_guard
+    不再阻断主链路（撤销 A 或 B → check() 抛 KeyError，本用例红）。
+    """
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=[LN_CH])
+    ws, we, ts, dp = _ln_window_args()
+
+    calls: list[tuple] = []
+
+    async def _ln_gate_passed(channel, window_start, window_end, t_rel,
+                              down_price, btc_price, quote_ts,
+                              window_btc_curve=None) -> None:
+        """桩：距日高门核验通过 → 直接走常规下单链路。"""
+        calls.append((channel, window_start))
+        await t._fire_quote_edge(channel, window_start, window_end, t_rel, down_price)
+
+    monkeypatch.setattr(t, "_verify_ln_dd_and_fire", _ln_gate_passed)
+
+    fired = t.check(ws, we, ts, dp, btc_price=110_000.0, window_entry_price=110_010.0)
+
+    # check() 是同步方法，命中后用 asyncio.create_task 派生异步核验任务；
+    # 必须先 drain 让在途任务跑完，再断言桩里累积的调用与下单记录。
+    assert fired == [LN_CH], f"应命中并派生，实际 fired={fired}"
+    assert ws in t._configs[LN_CH].fired, "应写入 fired 占位（防同窗重单）"
+
+    await _drain(t)
+
+    assert calls == [(LN_CH, ws)], "应进入深夜距日高门核验分支"
+    assert [c["signal_version"] for c in fake.calls] == [LN_CH], \
+        "应产生一笔 late_night 下单调用"
+
+
+def test_ln_outside_hour_guard_does_not_fire(monkeypatch) -> None:
+    """反向例：同一报价/时点但窗口落在北京 14 时 → 时段门拦下，不开火。"""
+    t = _make_trader(monkeypatch, _FakeTrader(), channels=[LN_CH])
+    ws, we, ts, dp = _ln_window_args()
+    ws_day = ws - 8 * 3_600_000          # 回拨 8 小时 → 北京 14 时
+    assert t.check(ws_day, ws_day + 300_000, ts - 8 * 3_600_000, dp,
+                   btc_price=110_000.0, window_entry_price=110_010.0) == []
+
+
+def test_ln_outside_quote_band_does_not_fire(monkeypatch) -> None:
+    """反向例：深夜窗口但报价 0.35 越出 [0.25,0.30) → 不开火。"""
+    t = _make_trader(monkeypatch, _FakeTrader(), channels=[LN_CH])
+    ws, we, ts, _dp = _ln_window_args()
+    assert t.check(ws, we, ts, 0.35,
+                   btc_price=110_000.0, window_entry_price=110_010.0) == []
+
+
+# ---- C：per-channel 异常隔离（附带伤害防线）----
+
+@pytest.mark.asyncio
+async def test_channel_gate_exception_does_not_abort_sweep(monkeypatch) -> None:
+    """C 方案：某通道门禁判定抛异常时，只跳过本通道，同批其他通道照常开火。
+
+    momentum_v1/v2 共用区间（t∈[90,120) q∈[0.69,0.75)），同一采样点双命中；
+    让 v2 的门禁查表抛异常，v1（无门禁）必须仍能开火并返回。
+    撤销 C（去掉 try/except）→ 异常冒出 check()，本用例红。
+    """
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake,
+                     channels=["quote_momentum_v1", "quote_momentum_v2"])
+
+    real_gate = MultiLiveTrader._pass_live_v2_guard
+
+    def _boom(version, btc_price, window_entry_price):
+        if version == "quote_momentum_v2":
+            raise KeyError(version)          # 复刻本次线上故障形态
+        return real_gate(version, btc_price, window_entry_price)
+
+    monkeypatch.setattr(MultiLiveTrader, "_pass_live_v2_guard",
+                        staticmethod(_boom))
+
+    fired = t.check(WINDOW_START, WINDOW_END, WINDOW_START + 100_000, 0.71,
+                    btc_price=9980.0, window_entry_price=10000.0)
+
+    assert "quote_momentum_v1" in fired, \
+        "异常隔离后，同批其他通道应照常开火"
+    assert "quote_momentum_v2" not in fired, "抛异常的通道应被跳过"
+
+    await _drain(t)
+    assert [c["signal_version"] for c in fake.calls] == ["quote_momentum_v1"]
+
+
+@pytest.mark.asyncio
+async def test_channel_gate_exception_does_not_skip_absorption_section(monkeypatch) -> None:
+    """C 方案的附带伤害防线：quote_edge 循环内抛异常，不得跳过其后的 absorption 段。
+
+    可观测证据：absorption 段首次判定会写入窗开快照 self._abs_open[ws]
+    （multi_live_trader.py 第 306 行）。异常若中断 check()，该快照不会建立。
+    """
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake,
+                     channels=["quote_momentum_v2", "absorption_follow_td150_v1"])
+
+    def _boom(version, btc_price, window_entry_price):
+        raise KeyError(version)
+
+    monkeypatch.setattr(MultiLiveTrader, "_pass_live_v2_guard",
+                        staticmethod(_boom))
+
+    t.check(WINDOW_START, WINDOW_END, WINDOW_START + 100_000, 0.71,
+            btc_price=10000.0, window_entry_price=10000.0,
+            up_price=0.72, up_open=0.70)
+
+    assert WINDOW_START in t._abs_open, (
+        "absorption 段应已执行并建立窗开快照；"
+        "缺失说明 quote_edge 循环的异常中断了整个 check() sweep")
+    assert t._abs_open[WINDOW_START] == (0.70, 10000.0)
 
 
 

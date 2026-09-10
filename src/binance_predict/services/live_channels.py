@@ -83,9 +83,14 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     # late_night_contrarian_v2（2026-09-08 实盘接入）：v1 ∩ 时段门(北京 22-24) ∩ 距日高回落≥0.30%
     # 依据（F1 优化发现）：OOS n=50 wr 44.0% CI[31.2%,57.7%] vs 盈亏平衡≈27%；门禁数据缺失→不落表。
     # ⚠️ 纪律推翻：原 docstring "纯影子前向攒样本" 被用户拍板改为实盘注册（线上已开启下单）。
+    # ⚠️ 不要给本通道加 v2_guard：门禁组合只有「时段门 + 距日高回落」，与影子
+    #   late_night_contrarian_v2 落表口径一致（quote_edge_detector 只查 HOUR_GUARDS
+    #   + LN_DD_GUARDS，不查 V2_PRICE_GUARDS）。曾误加 v2_guard="max_rise" 而
+    #   V2_PRICE_GUARDS 未登记该版本 → 实盘查表 KeyError 被采样循环静默吞掉，
+    #   影子 36 单 / 实盘 0 单（2026-09-10 归因修复）。
     "late_night_contrarian_v2": ChannelSpec(
         "late_night_contrarian_v2", "quote_edge", "5m", "DOWN", _qe_guard("late_night_contrarian_v2"),
-        "深夜逆势·日高回落门禁版", order_type="LIMIT", v2_guard="max_rise", hour_guard=(22, 24), ln_dd_guard=True,
+        "深夜逆势·日高回落门禁版", order_type="LIMIT", hour_guard=(22, 24), ln_dd_guard=True,
     ),
     # --- x4 族（影子 PENDING → 次窗 +150s 决策点，入场价历史偏低）---
     "x4_v2": ChannelSpec("x4_v2", "x4", "5m", "DOWN", 0.50, "情绪错位·平静市门禁版"),
@@ -419,3 +424,18 @@ def scene_pattern_to_channel(pattern_type: str) -> str | None:
     """场景 pattern_type → 通道名（fake_breakout 钩子 payload 映射）。"""
     ch = f"scene_{pattern_type}"
     return ch if ch in LIVE_CHANNELS else None
+
+
+def format_channel_title(channel: str | None) -> str:
+    """将策略通道英文标识转换为中文+英文展示格式。
+
+    例如: 'hm_inside_15m_v2' -> '**15m孕线上吊线反转（押DOWN）** (`hm_inside_15m_v2`)'
+    若未匹配到中文名或为空，则安全回退为 '`channel`'。
+    """
+    if not channel:
+        return f"`{channel or ''}`"
+    spec = LIVE_CHANNELS.get(channel) or RETIRED_CHANNEL_SPECS.get(channel)
+    if spec and spec.display_name:
+        return f"**{spec.display_name}** (`{channel}`)"
+    return f"`{channel}`"
+
