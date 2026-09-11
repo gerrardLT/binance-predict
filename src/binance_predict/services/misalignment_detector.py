@@ -62,12 +62,17 @@ POLL_INTERVAL = 60.0     # 轮询间隔（秒）
 BACKSCAN_WINDOWS = 12    # 冷启动回补窗口数（1 小时）
 PENDING_TIMEOUT_MS = 20 * 60 * 1000  # PENDING 超时（次窗归档最迟 ~6min）
 
-# ---- x4_v2 平静市门禁（2026-08-22 5m 归因落地，只加不改；v1 冻结口径原样）----
-# 触发前 1h（±10min 容差）BTC 累计涨跌幅 |chg|<0.5% 才触发：
-# 51 笔已结算 x4_v1 归因——平静市段 wr 57.6%/EV+9.70 vs 单边段 wr 23%/EV−13.8。
+# ---- x4_v2 平静市门禁（2026-08-22 5m 归因落地；2026-09-11 注释修正）----
+# ⚠️ 实际回看窗长 = 50min（非名义 60min）：窗在 5m 网格上，target=start−1h 恰落窗界，
+#    [target−10min, target+10min] 内有 5 个窗，SQL 取 order_by(start_time.desc()).limit(1)
+#    → 稳定命中 target+10min → 回看 = 60−10 = 50min（实测 4849/4860 = 99.8%）。
+# 口径一致性：标定源 scripts/local_shadow_v2v3_real_backtest.py:_x4_base 为同一逻辑，
+#    0.5% 阈值系针对 50min 净位移标定 → 改回看长会使阈值失去标定依据，故只正注释不改行为。
+# 归因依据（51 笔已结算 x4_v1）：平静市段 wr 57.6%/EV+9.70 vs 单边段 wr 23%/EV−13.8；
+#    ⚠️ 该归因 n=51 为事后分组，分段后 CI 宽度±20pp，两段 CI 重叠，不构成显著性证据。
 X4_V2_VERSION = "x4_v2"
-X4_V2_PAST1H_MAX_ABS_PCT = 0.5   # |过去 1h 涨幅| 上限（%）
-X4_V2_LOOKBACK_MS = 3_600_000    # 回看 1h
+X4_V2_PAST1H_MAX_ABS_PCT = 0.5   # |净位移| 上限（%）；阈值针对"实际 50min"标定，勿动
+X4_V2_LOOKBACK_MS = 3_600_000    # 名义回看 1h；受 TOL + 取最晚窗影响实际 = 50min
 X4_V2_TOL_MS = 600_000           # 历史窗 start_time 容差 ±10min（兜数据缺口）
 
 # ---- x4_v3 趋势过滤版（2026-09-06 C3 拦截规则落地，只加不改；v1/v2 冻结口径原样）----
@@ -96,11 +101,16 @@ def _window_open_price(w: SentimentWindow) -> float | None:
 
 
 async def _past_1h_chg_pct(session, w: SentimentWindow) -> float | None:
-    """触发前 1h 的 BTC 累计涨跌幅（%）。
+    """触发前净位移（%）——名义 1h，实际回看 50min（见常量区注释）。
 
     基准 = start−1h（±10min 容差）内最晚已归档窗口的 entry_price；
     当前 = 本窗开盘价（entry_price 优先回退 curve 首点）。
     任一缺失 → None（门禁数据不足，v2 不触发）。
+
+    注：返回值是净位移（端点差分），非波动率。对 X4 的 mean-reversion 赌注而言
+    这是正确选择：门禁意图是避开「单边市」（趋势延续杀死反转注），
+    而趋势性由净位移衡量；RV 只量路径幅度、不辨方向，会拦掉往返震荡市
+    （实证：低NET+高RV 象限 n=28 WR 60.7%/EV+0.84，为四象限最佳，故不可改用 RV）。
     """
     target = int(w.start_time) - X4_V2_LOOKBACK_MS
     base = (await session.execute(

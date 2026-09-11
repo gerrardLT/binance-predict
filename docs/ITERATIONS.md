@@ -5,6 +5,34 @@
 
 ---
 
+## 2026-09-11 X4_v2/v3 入场价白名单修复（死区止损） `pending commit`
+
+**问题** 实盘数据审计发现 `[0.10, 0.30)` 价格带为"死区"：x4_v2 (n=28, pnl=-42.22 USDT), x4_v3 (n=4, pnl=-3.77 USDT) 持续亏损；`[0.30, 0.40)` 利润带表现优异 (n=26, pnl=+26.60 USDT, WR=61.5%)。根因：v2 的 `entry_band_whitelist=None`（裸奔），v3 虽有白名单但覆盖 `[0.0, 0.2)` 导致仍买入死区左半部。
+
+**改动** 
+1. `live_channels.py`: 
+   - x4_v2: `None` → `((0.0, 0.1), (0.3, 0.4))`（挖掉 `[0.1, 0.3)` 死区）
+   - x4_v3: `((0.0, 0.2), (0.3, 0.4))` → `((0.0, 0.1), (0.3, 0.4))`（统一口径，停止 v3 在 `[0.1, 0.2)` 流血）
+2. `misalignment_detector.py`: 仅注释修正（±10min 容差导致实际回看 50min），零行为改变，通过 AST 验证等价性
+3. `test_multi_live_trader.py`: 
+   - `test_x4_poll_passes_v3_whitelist` 断言值同步更新
+   - `_V3_BANDS` 常量同步更新
+   - `test_signal_trade_whitelist_band_matrix` parametrize 用例矩阵重构（旧 [0,0.2)→新 [0,0.1)，增加死区边界点）
+   - `test_signal_trade_fok_retry_whitelist_rechecks_retry_quote` 首报价格从 0.19→0.08（确保在死区外）
+
+**验证** 
+- AST 等价性验证：`misalignment_detector.py` 修改前后语法树完全一致（纯注释）
+- 全量测试 **181 PASS**（`test_multi_live_trader.py::test_x4_poll_passes_v3_whitelist` 从 FAIL 转为 PASS）
+- 白名单边界测试覆盖：avg=0.05/0.09 (带内真), 0.10/0.19/0.25/0.40/0.49 (带外假), 0.30/0.39 (利润带真)
+- FOK 重试复检逻辑：首报 0.08 放行成交，重试报价 0.22 死区拦截，不产生第二单
+
+**遗留**
+- DB 覆盖层配置：生产环境 `live_channel_overrides.max_exec_price` 仍为 x4_v2=0.35、x4_v3=0.32（需手动调 >0.40 如 0.45），否则 `[0.30, 0.40)` 利润带仍被护栏先弃（白名单与护栏两道独立防线，max_exec_price 必须 >0.40）
+- 影子观测周期：建议 7 天观察期内监控死区拦截率提升比例、`[0.30, 0.40)` 盈利单捕获率是否显著改善（预估 n≈20 新信号可统计）
+- 代码注释同步：`_past_1h_chg_pct` docstring 已澄清净位移 ≠ 波动率且保留 RV 会拦最优子集（低 NET+ 高 RV 象限 EV+0.84），无需阈值敏感性调整（0.3~0.8% 区间平坦）
+
+---
+
 ## 2026-09-11 firsthit G7 护栏逆选择 Bug 修复 `pending commit`
 
 **问题** 静态绝对阈值护拦（base=0.10~0.12）造成严重逆向选择：反转成功窗（DOWN 报价从 0.08 弹升 0.36-0.92）被拦截 → 17 笔 FAILED 弃单；单边暴拉必死单（ DOWN 报价暴跌至 0.01-0.07）成交 → 14 笔 FILLED 单胜率 0%。生产数据铁证：id=647 FAILED(averagePrice=0.65 ≥ 0.12)，id=572 FILLED(averagePrice=0.01 → 全损)

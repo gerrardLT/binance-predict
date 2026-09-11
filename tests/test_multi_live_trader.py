@@ -1070,7 +1070,7 @@ async def test_x4_poll_passes_v3_whitelist(monkeypatch) -> None:
     assert len(fake.calls) == 1
     call = fake.calls[0]
     assert call["signal_version"] == "x4_v3"
-    assert call["entry_band_whitelist"] == ((0.0, 0.2), (0.3, 0.4))
+    assert call["entry_band_whitelist"] == ((0.0, 0.1), (0.3, 0.4))
     assert call["max_exec_price"] == 0.50
     assert call["market_period"] == "5m"
 
@@ -2871,7 +2871,7 @@ async def test_signal_trade_fok_retry_guardrail_rejects_retry_quote(monkeypatch)
 # 入场价白名单（x4_v3 下单层主护栏，entry_band_whitelist 透传）
 # ------------------------------------------------------------
 
-_V3_BANDS = ((0.0, 0.2), (0.3, 0.4))   # 与 live_channels x4_v3 冻结口径一致
+_V3_BANDS = ((0.0, 0.1), (0.3, 0.4))   # 与 live_channels x4_v3 冻结口径一致
 
 
 def _stub_whitelist_trade(monkeypatch, trader, quotes, confirms):
@@ -2907,16 +2907,18 @@ def _stub_whitelist_trade(monkeypatch, trader, quotes, confirms):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("avg,inside", [
-    (0.05, True),    # [0, 0.2) 带内
-    (0.19, True),    # 上界内侧（左闭右开）
-    (0.20, False),   # 上界贴线（0.2 不含）
+    (0.05, True),    # [0, 0.1) 带内
+    (0.09, True),    # 上界内侧（左闭右开）
+    (0.10, False),   # 死区开始（挖掉的区间）
+    (0.19, False),   # 死区内（旧 v3 带宽被挖掉）
     (0.25, False),   # 两带间隙
-    (0.30, True),    # 第二带下界（左闭）
+    (0.30, True),    # 利润带下界（左闭）
+    (0.39, True),    # 利润带上界内侧
     (0.40, False),   # 第二带上界贴线
     (0.49, False),   # 护栏内但带外
 ])
 async def test_signal_trade_whitelist_band_matrix(monkeypatch, avg, inside) -> None:
-    """x4_v3 白名单边界矩阵：[0,0.2)∪[0.3,0.4)，带外弃单且币安零请求。"""
+    """x4_v3 白名单边界矩阵：[0,0.1)∪[0.3,0.4)，挖掉死区 [0.1,0.3)，带外弃单且币安零请求。"""
     trader = _make_real_trader(monkeypatch)
     updates, place_calls = _stub_whitelist_trade(
         monkeypatch, trader,
@@ -2971,12 +2973,12 @@ async def test_signal_trade_whitelist_nonpositive_avg_failsafe(monkeypatch) -> N
 
 @pytest.mark.asyncio
 async def test_signal_trade_fok_retry_whitelist_rechecks_retry_quote(monkeypatch) -> None:
-    """首报 0.19 过白名单 → FOK 未成交；重试报价 0.22 跳出带 → 复检拦，不下第二单。"""
+    """首报 0.08 过白名单 → FOK 未成交；重试报价 0.22 死区 → 复检拦，不下第二单。"""
     trader = _make_real_trader(monkeypatch)
     updates, place_calls = _stub_whitelist_trade(
         monkeypatch, trader,
         quotes=[
-            {"averagePrice": 0.19, "amountIn": "5", "amountOut": "10", "quoteId": "Q1"},
+            {"averagePrice": 0.08, "amountIn": "5", "amountOut": "10", "quoteId": "Q1"},
             {"averagePrice": 0.22, "amountIn": "5", "amountOut": "9", "quoteId": "Q2"},
         ],
         confirms=[{"orderId": "ORD-1", "status": "FAILED"}])
