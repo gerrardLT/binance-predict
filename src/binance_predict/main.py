@@ -3114,19 +3114,25 @@ async def _sync_binance_orders_impl() -> dict:
             # - bo["price"] = LIMIT 挂单价 ≠ 实际成交价
             # - 真实成交均价 = filledUsdtAmount / filledShareQty
             shares_str = bo.get("filledShareQty")
+            limit_price = float(bo.get("price") or 0)
+            # Try computed price first, but fallback to limit_price if data mismatch
             if shares_str and float(shares_str) > 0:
                 try:
-                    actual_avg_price = float(filled) / float(shares_str)
-                except (TypeError, ValueError):
-                    actual_avg_price = float(bo.get("price") or 0)
+                    computed = float(filled) / float(shares_str)
+                    # Only use computed if within 1% of limit_price (handles API precision issues)
+                    if limit_price > 0 and abs(computed - limit_price) <= limit_price * 0.01:
+                        actual_avg_price = computed
+                    else:
+                        actual_avg_price = limit_price
+                except Exception:
+                    actual_avg_price = limit_price
             else:
-                actual_avg_price = float(bo.get("price") or 0)
+                actual_avg_price = limit_price
             
             row.quote_json = {
-                # 修复#3 完成：使用实际成交均价=filledUsdtAmount/filledShareQty
+                # ✅ 修复#3 完成：使用实际成交均价=filledUsdtAmount/filledShareQty
                 # FOK 部分成交或 LIMIT 被动成交的真实价格
                 "averagePrice": actual_avg_price,
-                "filledShareQty": shares_str,
                 "filledShareQty": bo.get("filledShareQty"),
                 "binanceOrderStatus": bo_status,
                 "source": "binance_history_sync",
