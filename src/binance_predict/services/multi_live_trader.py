@@ -115,7 +115,7 @@ ABS_LIVE_JUDGE_GRACE_S = 90.0       # absorption 判定新鲜度：t_rel 超 TD+
                                     # 与影子 ≤TD 末点口径不成立 → 保守不下注）
 
 # -----------------------------------------------------------------------------
-# firsthit 族盘前过滤器和动态护栏（2026-09-10 优化版）
+# firsthit 族盘前过滤器和动态护栏（2026-09-10/11 优化版）
 # 方向：只减不做——通过过滤降低触发频率，通过收紧护栏防止逆向选择成交
 # 参数为保守先验，未经离线回测验证；上线前向观测裁决，可调整
 # -----------------------------------------------------------------------------
@@ -123,6 +123,7 @@ FIRSTHIT_PRE_MARKET_STREAK_MAX = 1            # streak_up > 此值跳过（连�
 FIRSTHIT_PRE_MARKET_CHG_BPS_MAX = 50.0        # |chg_bps| > 50bp = |0.5%|单边市跳过
 FIRSTHIT_PRE_MARKET_UPPER_WICK_BPS_MIN = 0.5  # upper_wick_bps < 此值跳过（紧贴新高无反弹空间）
 FIRSTHIT_DYNAMIC_GUARD_CLAMP_LO = 0.05        # 动态护栏下限 clamp（低于触发区无意义）
+FIRSTHIT_SLIPPAGE_TOL_RATIO = 1.03            # 2026-09-11 新增：下单护拦=触发价×1.03（3% 容忍度），替代绝对阈值防逆选择
 
 
 def _firsthit_pre_market_veto(ext: dict, streak_up: int | None) -> str | None:
@@ -144,24 +145,34 @@ def _firsthit_pre_market_veto(ext: dict, streak_up: int | None) -> str | None:
 
 def _resolve_firsthit_dynamic_guard(spec, cfg, ext: dict,
                                     streak_up: int | None = None) -> float:
-    """firsthit 族动态护栏计算：base + adj (≤0)，clamp [CLAMP_LO, base]。
-
-    设计哲学：护栏只往严的方向动态化（adj ≤ 0），不会放松超过用户配置；
-    放宽应由人工配置决定（LIVE_CHANNELS_JSON / set_channel 覆盖）。
+    """firsthit 族动态护拦计算：触发价×滑点容忍度（2026-09-11 修复逆选择）。
+    
+    核心逻辑：
+    - 护拦 = q × FIRSTHIT_SLIPPAGE_TOL_RATIO (3% 容忍度)，允许反转金单成交
+    - 盘前 veto 已过滤连阳>1/|chg|>50bp/上影过小，此处仅做微调收紧
+    - 对比旧逻辑（绝对阈值 base=0.10~0.12）：会错误拦截 avgPrice=0.36+ 的反转金单，
+      却放行 avgPrice=0.01~0.05 的崩盘毒单 → 逆向选择机制
+    
+    Returns: max_exec_price (相对滑点口径)
     """
-    base = resolve_max_exec(spec, cfg)
+    q = float(ext.get("q", 0.10))  # 触发报价（DOWN 首触入区价）
+    
+    # 基础护拦 = 触发价 × 3% 容忍度（关键修复：替代绝对阈值防逆选择）
+    base = q * FIRSTHIT_SLIPPAGE_TOL_RATIO
+    
+    # 微调项：只收紧不放松（同旧逻辑，但基准已从绝对改为相对）
     adj = 0.0
-
+    
     # 调整项 1：前驱连阳状态（streak_up ≥ 2 已被盘前 veto 拦截，
     # 此处仅处理 streak==1 的温和收紧）
     if streak_up == 1:
         adj -= 0.01  # 单根阳线后的反转概率略低，温和收紧
-
+    
     # 调整项 2：BTC 距 5m 新高位置（upper_wick_bps 小 ≈ 贴近新高 → 反弹空间小）
     upper_wick = ext.get("upper_wick_bps")
     if upper_wick is not None and upper_wick < 1.0:
         adj -= 0.01  # 上影小于 1bp，价格几乎贴在最高位
-
+    
     dynamic_guard = max(FIRSTHIT_DYNAMIC_GUARD_CLAMP_LO, min(base + adj, base))
     return round(dynamic_guard, 4)
 

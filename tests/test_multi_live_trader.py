@@ -1565,7 +1565,8 @@ async def test_firsthit_g0_match_real_first_touch(monkeypatch) -> None:
     assert call["window_start"] == WINDOW_START
     assert call["market_period"] == "5m"
     assert call["amount_usdt"] == 2.0
-    assert call["max_exec_price"] == 0.08
+    # 2026-09-11: 新动态护拦=触发价×1.03（q=0.07 → 0.0721），替代旧绝对阈值 0.08
+    assert abs(call["max_exec_price"] - 0.0721) < 1e-4
 
 
 @pytest.mark.asyncio
@@ -1626,8 +1627,8 @@ async def test_firsthit_three_channels_share_same_window_exclusive_fill(monkeypa
     # 候选任务全部派生，但同窗互斥只允许先完成的一笔成交。
     assert len(fake.calls) == 1
     assert fake.calls[0]["signal_version"] == "firsthit_down_v1"
-    # 检查护栏按 spec auto_max_exec 生效
-    assert fake.calls[0]["max_exec_price"] == 0.08
+    # 2026-09-11: 新动态护拦=触发价×1.03（q=0.07 → 0.0721），替代旧绝对阈值 0.08
+    assert abs(fake.calls[0]["max_exec_price"] - 0.0721) < 1e-4
 
 
 @pytest.mark.asyncio
@@ -1758,7 +1759,8 @@ async def test_firsthit_g7_series_all_fire(monkeypatch) -> None:
 
     assert len(fake.calls) == 1
     assert fake.calls[0]["signal_version"] == "firsthit_down_g7_v1"
-    assert fake.calls[0].get("max_exec_price") == 0.10
+    # 2026-09-11: 新动态护拦=触发价×1.03 (q=0.04 → 0.0412)，但低于 CLAMP_LO(0.05) → 0.05
+    assert fake.calls[0].get("max_exec_price") == 0.05
 
 
 @pytest.mark.asyncio

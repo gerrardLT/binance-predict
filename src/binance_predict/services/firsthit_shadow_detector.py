@@ -113,7 +113,13 @@ def extract_firsthit_features(
     """首触特征纯函数：归档影子与实时实盘共用，防止两套公式漂移。
 
     返回 None 的情形：无首触 / 开盘基准缺失 / 触发时刻无 btc / npts < MIN_PTS。
-    max_trigger_ts 用于实时重放：只看 ≤ 当前采样时刻的历史，避免用未来报价判定。
+    max_trigger_ts 用于实时重放：先看 ≤max_trigger_ts 的历史找首触，再基于该最大时间戳计算 npts（允许窗口内后期成熟）。
+    
+    Key fix for early-touch pinning bug:
+    - First touch detection is pinned to the earliest qualifying sample (correct semantics).
+    - But npts counts ALL btc samples ≤ max_trigger_ts, NOT ≤ trigger_ts. This allows windows 
+      with early first touches (e.g., at t=30s) to mature and fire when path has ≥8 BTC samples 
+      by t=150s+ instead of being permanently suppressed.
     """
     start = int(window_start)
     dn_p = _ser(down_curve)
@@ -140,15 +146,16 @@ def extract_firsthit_features(
     if not bo or bo <= 0:
         return None
 
-    # 触发前路径：开盘 + t≤trigger_ts 的全部 btc 采样（严格 ex-ante）
-    pre = [float(p["v"]) for p in btc if int(p["t"]) <= trigger_ts]
+    # KEY FIX: 触发前路径使用 max_trigger_ts（当前采样时刻的最新历史），而非仅≤trigger_ts
+    # 这允许早期首触窗口在 t≥105s 后 npts 达标时正常开火，而不是永久被扼杀。
+    pre = [float(p["v"]) for p in btc if int(p["t"]) <= int(max_trigger_ts)] if max_trigger_ts else [float(p["v"]) for p in btc if int(p["t"]) <= trigger_ts]
     npts = len(pre)
     if npts < MIN_PTS:
         return None                                    # 路径质量门（v2 主分析口径）
     if pre[-1] <= 0:
         return None
     pts = [bo] + pre
-    btc_trig = pre[-1]                                 # 触发时刻 btc = ≤触发 的最后一点
+    btc_trig = pre[-1]                                 # 触发时刻 btc = ≤max_trigger_ts 的最后一点
 
     # 特征（与 local_shape_scan_v2.py / comprehensive_firsthit_backtest.py 同式）
     chg_bps = (btc_trig / bo - 1.0) * 1e4
