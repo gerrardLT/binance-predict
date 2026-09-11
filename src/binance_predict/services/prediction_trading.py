@@ -1602,7 +1602,13 @@ class BinancePredictionTrader:
                     error_message=f"获取报价失败 | {detail}",
                 )
 
-            # 市价单模式检查护栏与白名单
+            # ✅ 修复#2: 统一提取报价均价（MARKET/LIMIT共用）
+            try:
+                avg_price = float(quote.get("averagePrice") or 0.0)
+            except (TypeError, ValueError):
+                avg_price = 0.0
+            
+            # 市价单模式检查护栏与白名单（MARKET only）
             if not is_limit:
                 try:
                     avg_price = float(quote.get("averagePrice") or 0.0)
@@ -1622,6 +1628,23 @@ class BinancePredictionTrader:
                     return await self._update_signal_order(
                         pending, "FAILED", direction=prediction,
                         error_message=f"执行价护栏弃单 | averagePrice={avg_price} >= {max_exec_price}（贴线无滑点空间）",
+                        quote_json=quote)
+
+                # ✅ 修复#2: LIMIT 订单也加 quote-level 护栏检查
+                # 挂单虽不即时成交，但报价 avg_price 远超 guard 说明市场已大幅偏离，
+                # 提交此挂单大概率成交在更差价位或根本无人接单，不如直接弃单
+                if max_exec_price is not None and (avg_price <= 0 or avg_price >= max_exec_price):
+                    wechat_notifier.notify_order_abandoned(
+                        channel=signal_version,
+                        direction=prediction,
+                        window_start=window_start,
+                        quote_price=avg_price,
+                        guard_price=max_exec_price,
+                        reason=f"LIMIT 挂单报价 {avg_price} 超出或贴线护栏上限 {max_exec_price}",
+                    )
+                    return await self._update_signal_order(
+                        pending, "FAILED", direction=prediction,
+                        error_message=f"LIMIT 执行价护栏弃单 | averagePrice={avg_price} >= {max_exec_price}（报价已破护栏）",
                         quote_json=quote)
 
                 # 入场价白名单（x4_v3 下单层主护栏）：报价后、下单前检查——白名单依赖

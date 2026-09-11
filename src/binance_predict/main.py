@@ -3108,10 +3108,25 @@ async def _sync_binance_orders_impl() -> dict:
             row.status = "FILLED" if bo_status == "FILLED" else "FAILED"
             row.order_id = bo.get("orderId")
             row.amount_in = str(int(filled * (10 ** 18)))
+            
+            # ✅ 修复#3: 显式计算成交均价=filledUsdtAmount/filledShareQty
+            # 不再依赖 bo["price"] 委托价，因为：
+            # - bo["price"] = LIMIT 挂单价 ≠ 实际成交价
+            # - 真实成交均价 = filledUsdtAmount / filledShareQty
+            shares_str = bo.get("filledShareQty")
+            if shares_str and float(shares_str) > 0:
+                try:
+                    actual_avg_price = float(filled) / float(shares_str)
+                except (TypeError, ValueError):
+                    actual_avg_price = float(bo.get("price") or 0)
+            else:
+                actual_avg_price = float(bo.get("price") or 0)
+            
             row.quote_json = {
-                # ⚠ price 是币安订单行的报价/委托价，非成交均价（FOK 未成交时
-                # filledUsdtAmount=0 但 price 仍有值）——前端已标注为「报价」。
-                "averagePrice": float(bo.get("price") or 0),
+                # 修复#3 完成：使用实际成交均价=filledUsdtAmount/filledShareQty
+                # FOK 部分成交或 LIMIT 被动成交的真实价格
+                "averagePrice": actual_avg_price,
+                "filledShareQty": shares_str,
                 "filledShareQty": bo.get("filledShareQty"),
                 "binanceOrderStatus": bo_status,
                 "source": "binance_history_sync",

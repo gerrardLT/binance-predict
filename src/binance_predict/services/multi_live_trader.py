@@ -455,8 +455,9 @@ class MultiLiveTrader:
                     # g7_streak/g7_strict 的门依赖 streak_up，延后到异步任务复核。
                     if ch not in ("g7_streak_v1", "g7_strict_v1"):
                         if not firsthit_gate_of(ch, ext):
-                            continue
-                    cfg.fired.add(window_start_ms)
+                            continue                     # 门未过 → 不占 fired、不派任务
+                    # ✅ 关键修复#1：fired 占位延迟到异步任务内完成（见_verify_firsthit_all_gates）
+                    # 这样避免 Gate fail 仍占用同窗互斥槽的问题
                     task = asyncio.create_task(
                         self._verify_firsthit_all_gates(ch, window_start_ms, ext),
                         name=f"live_firsthit_{ch}_{window_start_ms}",
@@ -1276,6 +1277,9 @@ class MultiLiveTrader:
                 logger.info("多通道实盘：{} 版本门未过(streak={})，弃单 | 窗口 {}",
                             channel, streak_up, win_label)
                 return
+            # ✅ 修复#1 完成：veto + gate全部通过后再占位
+            cfg = self._configs[channel]
+            cfg.fired.add(window_start)
             await self._fire_firsthit(channel, window_start, ext, streak_up=streak_up)
         except Exception as exc:
             logger.warning("多通道实盘：首触核验任务异常 | {} | {} | {}",
