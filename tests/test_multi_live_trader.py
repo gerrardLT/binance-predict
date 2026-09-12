@@ -205,7 +205,7 @@ def test_parse_defaults_all_off(monkeypatch) -> None:
     monkeypatch.setattr(settings, "live_default_max_daily_orders", 100)
     monkeypatch.setattr(settings, "live_channels_json", "")
     cfgs = parse_channel_config()
-    assert len(cfgs) == 26  # G0/G1/G3+G4+G7 族 6 变体 + late_night v2 + 15m Ver2 双通道 = 26
+    assert len(cfgs) == 27  # G0/G1/G3+G4+G7 族 6 变体 + late_night v2 + Rev2 5m/15m 三通道 = 27
     assert all(not c.enabled for c in cfgs.values())
     assert all(c.amount_usdt == 2.0 for c in cfgs.values())
     assert all(c.max_daily_orders == 100 for c in cfgs.values())
@@ -318,8 +318,8 @@ def test_channels_registry_shape() -> None:
         # 2026-09-08 firsthit G7 系列六通道（默认全 OFF，用户确认独立下单）
         "firsthit_down_g7_v1", "g7_streak_v1", "g7_wick20_v1",
         "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",
-        # 2026-09-09 15m 经典孕线反转双通道（默认全 OFF）
-        "hm_inside_15m_v2", "ih_inside_15m_v2",
+        # 2026-09-09 15m 经典孕线反转双通道 + 2026-09-13 5m HM 精选通道（默认全 OFF）
+        "hm_inside_5m_v2", "hm_inside_15m_v2", "ih_inside_15m_v2",
     }
     assert set(RETIRED_CHANNELS) == {
         "quote_momentum_v1", "quote_contrarian_v1",
@@ -334,6 +334,10 @@ def test_channels_registry_shape() -> None:
     assert by["quote_contrarian_v2"].market_period == "5m"
     assert by["quote_contrarian_v2"].v2_guard == "max_rise"
     assert by["quote_contrarian_v2"].auto_max_exec == 0.28
+    assert by["hm_inside_5m_v2"].market_period == "5m"
+    assert by["hm_inside_5m_v2"].direction == "DOWN"
+    assert by["hm_inside_5m_v2"].auto_max_exec == 0.30
+    assert by["hm_inside_5m_v2"].order_type == "LIMIT"
     assert by["hm_inside_15m_v2"].market_period == "15m"
     assert by["hm_inside_15m_v2"].direction == "DOWN"
     assert by["hm_inside_15m_v2"].auto_max_exec == 0.30
@@ -1870,7 +1874,7 @@ def test_status_shape(monkeypatch) -> None:
     assert s["amount_cap"] == 50
     assert s["defaults"]["amount_usdt"] == 2.0
     assert s["defaults"]["max_daily_orders"] == 100
-    assert len(s["channels"]) == 34   # 既有 24 + G7(6) + G4(1) + late_night(1) + 15m Ver2(2) = 34
+    assert len(s["channels"]) == 35   # 既有 24 + G7(6) + G4(1) + late_night(1) + Rev2 5m/15m(3) = 35
     by = {c["channel"]: c for c in s["channels"]}
     c = by["quote_contrarian_v1"]
     assert c["enabled"] is True and c["enabled_at_startup"] is True
@@ -4035,6 +4039,7 @@ async def test_signal_trade_quote_error_classifies_insufficient_balance(
 def test_limit_order_channels_marked_in_registry() -> None:
     """限价折价通道必须在 ChannelSpec 中声明 order_type='LIMIT'。"""
     expected_limit_channels = [
+        "hm_inside_5m_v2",
         "hm_inside_15m_v2",
         "ih_inside_15m_v2",
         "firsthit_down_v1",
@@ -4180,6 +4185,33 @@ async def test_multi_live_trader_passes_limit_order_type_from_spec(monkeypatch) 
     assert fake.calls[0]["signal_version"] == "hm_inside_15m_v2"
     assert fake.calls[0]["order_type"] == "LIMIT"
     assert fake.calls[0]["max_exec_price"] == 0.30
+
+
+@pytest.mark.asyncio
+async def test_multi_live_trader_passes_5m_rev2_limit_and_hot_guard(monkeypatch) -> None:
+    """5m Rev2 nextbar 信号透传 5m 周期、DOWN、LIMIT 与热调后的护栏。"""
+    fake = _FakeTrader()
+    t = _make_trader(
+        monkeypatch,
+        fake,
+        channels=["hm_inside_5m_v2"],
+        overrides={"hm_inside_5m_v2": {"enabled": True, "max_exec_price": 0.27}},
+    )
+    sig = {
+        "version": "hm_inside_5m_v2",
+        "market_start": WINDOW_START,
+        "market_end": WINDOW_START + 300_000,
+        "direction": "DOWN",
+    }
+    t.on_nextbar_signal(sig)
+    await _drain(t)
+
+    assert len(fake.calls) == 1
+    assert fake.calls[0]["signal_version"] == "hm_inside_5m_v2"
+    assert fake.calls[0]["prediction"] == "DOWN"
+    assert fake.calls[0]["market_period"] == "5m"
+    assert fake.calls[0]["order_type"] == "LIMIT"
+    assert fake.calls[0]["max_exec_price"] == 0.27
 
 
 @pytest.mark.asyncio

@@ -1,22 +1,7 @@
-"""15m 经典孕线上吊线/倒垂线反转影子检测器与实盘驱动（rev2 族）。
+"""经典孕线上吊线/倒垂线反转影子检测器与实盘驱动（rev2 族）。
 
-信号定义（与 720d 回测严格对齐，禁止手抄/篡改阈值）：
-    1. hm_inside_15m_v2（15m 顶部长下影上吊线被孕线包裹 -> 押次根 15m 收阴 DOWN）：
-       - 前一根 K 线（Bar N-1）：实体阳线（is_green 且 body_r >= 0.40），且为近 4 根明显最高点，且实体长度大于前 3 根实体
-       - 信号柱（Bar N）：完全被前一根包裹（high <= prev_high 且 low >= prev_low）
-       - 几何特征：下影线 lower_r >= 0.45，实体 body_r <= 0.45，次影线 upper_r <= 0.25
-       - 押注方向：次根 15m 押 DOWN（720d 胜率 56.6%，30d 胜率 65.4%）
-       
-    2. ih_inside_15m_v2（15m 底部长上影倒垂线被孕线包裹 -> 押次根 15m 收阳 UP）：
-       - 前一根 K 线（Bar N-1）：实体阴线（not is_green 且 body_r >= 0.40），且为近 4 根明显最低点，且实体长度大于前 3 根实体
-       - 信号柱（Bar N）：完全被前一根包裹（high <= prev_high 且 low >= prev_low）
-       - 几何特征：上影线 upper_r >= 0.45，实体 body_r <= 0.45，次影线 lower_r <= 0.25
-       - 押注方向：次根 15m 押 UP（720d 胜率 52.5%，30d 胜率 62.5%）
-
-实盘下单执行与护栏策略：
-    - 最佳挂单护栏：0.30（网格优化显示 0.30 兼顾 65.7% 极高成交率与 +18.3% 单笔期望 EV，累计收益与获利因子最高）
-    - 驱动机制：新 15m 收盘判定命中后，触发 _on_live_fire 钩子直连 MultiLiveTrader
-    - 幂等防重：(version, signal_bar_start) 数据库唯一约束，避免重复开火
+15m 版本保持原有孕线几何口径，5m 新增精选 HM_DOWN 版本。每个实例只处理
+一个周期，确保 K 线、报价缓存、PENDING 结算和实盘开火窗口不会跨周期混用。
 """
 from __future__ import annotations
 
@@ -37,15 +22,18 @@ from binance_predict.services.shadow_version_gate import shadow_gate
 from binance_predict.services.wechat_notifier import wechat_notifier
 from binance_predict.config.settings import settings
 
-REV2_SHADOW_SPECS: list[dict] = [
+REV2_15M_SPECS: list[dict] = [
     {
         "version": "hm_inside_15m_v2",
         "discovery_id": "rev2_hm_15m",
         "timeframe": "15m",
         "direction": "DOWN",
+        "short_wick_max": 0.10,
+        "main_wick_min": 0.45,
+        "main_wick_max": None,
         "condition_text": (
             "prev_is_green == True AND prev_body_r >= 0.40 AND is_prominent_high "
-            "AND is_longest_body AND is_full_inside AND lower_r >= 0.45 AND body_r <= 0.45 AND upper_r <= 0.25"
+            "AND is_longest_body AND is_full_inside AND lower_r >= 0.45 AND body_r <= 0.45 AND upper_r <= 0.10"
         ),
     },
     {
@@ -53,19 +41,45 @@ REV2_SHADOW_SPECS: list[dict] = [
         "discovery_id": "rev2_ih_15m",
         "timeframe": "15m",
         "direction": "UP",
+        "short_wick_max": 0.10,
+        "main_wick_min": 0.45,
+        "main_wick_max": None,
         "condition_text": (
             "prev_is_green == False AND prev_body_r >= 0.40 AND is_prominent_low "
-            "AND is_longest_body AND is_full_inside AND upper_r >= 0.45 AND body_r <= 0.45 AND lower_r <= 0.25"
+            "AND is_longest_body AND is_full_inside AND upper_r >= 0.45 AND body_r <= 0.45 AND lower_r <= 0.10"
         ),
     },
 ]
 
+REV2_5M_SPECS: list[dict] = [
+    {
+        "version": "hm_inside_5m_v2",
+        "discovery_id": "rev2_hm_5m",
+        "timeframe": "5m",
+        "direction": "DOWN",
+        "short_wick_max": 0.10,
+        "main_wick_min": 0.75,
+        "main_wick_max": 0.90,
+        "condition_text": (
+            "prev_is_green == True AND prev_body_r >= 0.40 AND is_prominent_high "
+            "AND is_longest_body AND is_full_inside AND lower_r >= 0.75 AND lower_r < 0.90 "
+            "AND body_r <= 0.45 AND upper_r <= 0.10"
+        ),
+    },
+]
+
+REV2_SHADOW_SPECS: list[dict] = REV2_15M_SPECS + REV2_5M_SPECS
 REV2_VERSIONS = [s["version"] for s in REV2_SHADOW_SPECS]
-BAR_MS_15M = 900_000
+VERSIONS_BY_TF = {
+    "5m": [s["version"] for s in REV2_5M_SPECS],
+    "15m": [s["version"] for s in REV2_15M_SPECS],
+}
+BAR_MS = {"5m": 300_000, "15m": 900_000}
+BAR_MS_15M = BAR_MS["15m"]
 POLL_INTERVAL = 60.0
 WARMUP_BARS = 40
 BACKSCAN_BARS = 12
-PENDING_EXPIRE_MS = 4 * 3_600_000
+PENDING_EXPIRE_MS = {"5m": 3_600_000, "15m": 4 * 3_600_000}
 REV2_LIVE_MAX_LAG_MS = 90_000  # 目标根开盘 <=90s 的新鲜信号才驱动实盘
 
 
@@ -86,11 +100,14 @@ def _to_klines(rows: list[dict], bar_ms: int) -> Klines:
     return kl
 
 
-def evaluate_rev2_patterns(kl: Klines, n_tail: int) -> list[dict]:
-    """严谨求值 15m Ver 2 孕线反转形态。
-    
-    返回末 n_tail 根内的触发点列表。
-    """
+def evaluate_rev2_patterns(
+    kl: Klines, n_tail: int, specs: list[dict] | None = None
+) -> list[dict]:
+    """按给定周期规格求值孕线反转形态，返回末 n_tail 根内的触发点。"""
+    specs = REV2_15M_SPECS if specs is None else specs
+    specs_by_version = {spec["version"]: spec for spec in specs}
+    hm_spec = next((spec for version, spec in specs_by_version.items() if version.startswith("hm_inside_")), None)
+    ih_spec = next((spec for version, spec in specs_by_version.items() if version.startswith("ih_inside_")), None)
     o, h, l, c = kl.o, kl.h, kl.l, kl.c
     n = len(c)
     if n < 5:
@@ -106,7 +123,6 @@ def evaluate_rev2_patterns(kl: Klines, n_tail: int) -> list[dict]:
     lower_r = lower_w / rng_safe
     is_green = c >= o
 
-    # 逐根布尔数组
     hits = []
     start_eval = max(4, n - n_tail)
 
@@ -117,31 +133,26 @@ def evaluate_rev2_patterns(kl: Klines, n_tail: int) -> list[dict]:
         prev_h = h[i - 1]
         prev_l = l[i - 1]
 
-        # 1. 明显极值点：前置高点 >= 前4根最高，或前置低点 <= 前4根最低
-        # 前 4 根切片: i-4 .. i-1
         is_prominent_high = prev_h >= np.max(h[max(0, i - 4):i])
         is_prominent_low = prev_l <= np.min(l[max(0, i - 4):i])
-
-        # 2. 实体是附近最长：prev_body >= 前3根实体
         is_longest_body = prev_body >= np.max(body[max(0, i - 4):i - 1])
-
-        # 3. 完全包裹孕线（允许 0.02% 贴线微差）
         is_full_inside = (h[i] <= prev_h * 1.0002) and (l[i] >= prev_l * 0.9998)
 
         if not (is_longest_body and is_full_inside):
             continue
 
-        # 检查上吊线 HM
         if (
-            prev_is_green
+            hm_spec is not None
+            and prev_is_green
             and prev_body_r >= 0.40
             and is_prominent_high
-            and lower_r[i] >= 0.45
+            and lower_r[i] >= hm_spec["main_wick_min"]
+            and (hm_spec["main_wick_max"] is None or lower_r[i] < hm_spec["main_wick_max"])
             and body_r[i] <= 0.45
-            and upper_r[i] <= 0.25
+            and upper_r[i] <= hm_spec["short_wick_max"]
         ):
             hits.append({
-                "spec": REV2_SHADOW_SPECS[0],
+                "spec": hm_spec,
                 "idx": i,
                 "snapshot": {
                     "prev_body_r": round(float(prev_body_r), 4),
@@ -151,17 +162,18 @@ def evaluate_rev2_patterns(kl: Klines, n_tail: int) -> list[dict]:
                 }
             })
 
-        # 检查倒垂线 IH
         if (
-            (not prev_is_green)
+            ih_spec is not None
+            and (not prev_is_green)
             and prev_body_r >= 0.40
             and is_prominent_low
-            and upper_r[i] >= 0.45
+            and upper_r[i] >= ih_spec["main_wick_min"]
+            and (ih_spec["main_wick_max"] is None or upper_r[i] < ih_spec["main_wick_max"])
             and body_r[i] <= 0.45
-            and lower_r[i] <= 0.25
+            and lower_r[i] <= ih_spec["short_wick_max"]
         ):
             hits.append({
-                "spec": REV2_SHADOW_SPECS[1],
+                "spec": ih_spec,
                 "idx": i,
                 "snapshot": {
                     "prev_body_r": round(float(prev_body_r), 4),
@@ -175,17 +187,29 @@ def evaluate_rev2_patterns(kl: Klines, n_tail: int) -> list[dict]:
 
 
 class Rev2InsideShadowDetector:
-    """15m Ver2 孕线反转形态影子检测器：轮询 15m 收盘 -> 判定落表 -> 驱动实盘。"""
+    """单周期 Rev2 孕线反转检测器：轮询收盘、落影子信号并驱动实盘。"""
 
-    def __init__(self, collector, pm_15m_latest: dict) -> None:
+    def __init__(
+        self,
+        collector,
+        pm_latest: dict | None = None,
+        timeframe: str = "15m",
+        pm_15m_latest: dict | None = None,
+    ) -> None:
+        if timeframe not in BAR_MS:
+            raise ValueError(f"不支持的 Rev2 周期: {timeframe}")
         self._collector = collector
-        self._pm_15m = pm_15m_latest
+        self._pm_latest = pm_latest if pm_latest is not None else (pm_15m_latest or {})
+        self._timeframe = timeframe
+        self._bar_ms = BAR_MS[timeframe]
+        self._specs = REV2_5M_SPECS if timeframe == "5m" else REV2_15M_SPECS
+        self._versions = VERSIONS_BY_TF[timeframe]
         self._running = False
         self._task: asyncio.Task | None = None
         self._last_evaluated_bar: int | None = None
         self._trigger_count = 0
         self._settle_count = 0
-        self._on_live_fire = None  # 实盘钩子，由 main 注入
+        self._on_live_fire = None
 
     async def start(self) -> None:
         if self._running:
@@ -194,11 +218,13 @@ class Rev2InsideShadowDetector:
         try:
             await self._backscan()
         except Exception as exc:
-            logger.warning("Rev2Inside 影子：冷启动回补失败（忽略，循环内自愈）| {}", exc)
-        self._task = asyncio.create_task(self._loop(), name="rev2_inside_shadow_detector")
+            logger.warning("Rev2Inside 影子：{} 冷启动回补失败（忽略，循环内自愈）| {}", self._timeframe, exc)
+        self._task = asyncio.create_task(
+            self._loop(), name=f"rev2_inside_shadow_detector_{self._timeframe}"
+        )
         logger.info(
-            "Rev2Inside 15m 孕线反转检测器启动 | {} | 影子落表+实盘支持就绪",
-            "/".join(REV2_VERSIONS),
+            "Rev2Inside {} 孕线反转检测器启动 | {} | 影子落表+实盘支持就绪",
+            self._timeframe, "/".join(self._versions),
         )
 
     async def stop(self) -> None:
@@ -210,7 +236,10 @@ class Rev2InsideShadowDetector:
             except asyncio.CancelledError:
                 pass
         self._task = None
-        logger.info("Rev2Inside 影子检测器已停止 | 触发 {} 结算 {}", self._trigger_count, self._settle_count)
+        logger.info(
+            "Rev2Inside {} 影子检测器已停止 | 触发 {} 结算 {}",
+            self._timeframe, self._trigger_count, self._settle_count,
+        )
 
     async def _loop(self) -> None:
         while self._running:
@@ -226,20 +255,21 @@ class Rev2InsideShadowDetector:
                 break
 
     async def _poll_once(self) -> None:
-        closed_15m = await self._collector.fetch_recent_klines("15m", WARMUP_BARS)
-        if len(closed_15m) < WARMUP_BARS:
+        closed = await self._collector.fetch_recent_klines(self._timeframe, WARMUP_BARS)
+        if len(closed) < WARMUP_BARS:
             return
-        last_start = int(closed_15m[-1]["open_time"])
+        last_start = int(closed[-1]["open_time"])
         if self._last_evaluated_bar is None or last_start > self._last_evaluated_bar:
-            await self._evaluate_new_bars(closed_15m)
+            await self._evaluate_new_bars(closed)
             self._last_evaluated_bar = last_start
-        await self._settle_pending(closed_15m)
+        await self._settle_pending(closed)
         await self._expire_stale_pending()
-        await self._check_radar()
+        if self._timeframe == "15m":
+            await self._check_radar()
 
     async def _check_radar(self) -> None:
         """提前预警雷达：探测当前正在走的 15m K 线是否初具孕线反转雏形。"""
-        if not settings.wechat_radar_enabled or not settings.wechat_work_enabled:
+        if self._timeframe != "15m" or not settings.wechat_radar_enabled or not settings.wechat_work_enabled:
             return
         try:
             raw_15m = await self._collector.fetch_klines_raw("15m", WARMUP_BARS)
@@ -248,15 +278,14 @@ class Rev2InsideShadowDetector:
             current_bar = raw_15m[-1]
             now_ms = int(time.time() * 1000)
             bar_start = int(current_bar["open_time"])
-            bar_end = bar_start + BAR_MS_15M
+            bar_end = bar_start + self._bar_ms
             rem_sec = int((bar_end - now_ms) / 1000)
 
-            # 仅在收盘前 45s ~ 150s 区间进行雷达检测并推送预警
             if not (45 <= rem_sec <= 150):
                 return
 
-            kl15 = _to_klines(raw_15m, BAR_MS_15M)
-            hits = evaluate_rev2_patterns(kl15, 1)
+            kl15 = _to_klines(raw_15m, self._bar_ms)
+            hits = evaluate_rev2_patterns(kl15, 1, self._specs)
             for hit in hits:
                 spec = hit["spec"]
                 channel = spec["version"]
@@ -279,12 +308,12 @@ class Rev2InsideShadowDetector:
         except Exception as exc:
             logger.debug("Rev2Inside 雷达探测异常: {}", exc)
 
-    async def _evaluate_new_bars(self, closed_15m: list[dict]) -> None:
-        kl15 = _to_klines(closed_15m, BAR_MS_15M)
+    async def _evaluate_new_bars(self, closed: list[dict]) -> None:
+        kl = _to_klines(closed, self._bar_ms)
         if self._last_evaluated_bar is None:
             n_tail = BACKSCAN_BARS
         else:
-            starts = [int(r["open_time"]) for r in closed_15m]
+            starts = [int(r["open_time"]) for r in closed]
             try:
                 first_new = next(i for i, s in enumerate(starts) if s > self._last_evaluated_bar)
             except StopIteration:
@@ -292,7 +321,7 @@ class Rev2InsideShadowDetector:
             n_tail = len(starts) - first_new
         n_tail = min(n_tail, BACKSCAN_BARS)
 
-        hits = evaluate_rev2_patterns(kl15, n_tail)
+        hits = evaluate_rev2_patterns(kl, n_tail, self._specs)
         if not hits:
             return
 
@@ -301,14 +330,17 @@ class Rev2InsideShadowDetector:
             added = 0
             last_bar = None
             for hit in hits:
-                bar = closed_15m[hit["idx"]]
+                bar = closed[hit["idx"]]
                 last_bar = bar
                 if await self._record_signal(session, hit["spec"], bar, hit["snapshot"], live_payloads):
                     added += 1
             if added:
                 await session.commit()
                 self._trigger_count += added
-                logger.info("Rev2Inside 影子触发 +{} | 信号根 {}", added, int(last_bar["open_time"]))
+                logger.info(
+                    "Rev2Inside 影子触发 +{} | {} | 信号根 {}",
+                    added, self._timeframe, int(last_bar["open_time"]),
+                )
 
         self._dispatch_live(live_payloads)
 
@@ -335,13 +367,14 @@ class Rev2InsideShadowDetector:
         if exists is not None:
             return False
 
-        target_bar_start = start_ms + BAR_MS_15M
-        # 实盘开火收集：仅目标根刚开盘 <= 90s 内的新鲜命中
-        if live_payloads is not None and (0 <= int(time.time() * 1000) - target_bar_start <= REV2_LIVE_MAX_LAG_MS):
+        target_bar_start = start_ms + self._bar_ms
+        if live_payloads is not None and (
+            0 <= int(time.time() * 1000) - target_bar_start <= REV2_LIVE_MAX_LAG_MS
+        ):
             live_payloads.append({
                 "version": spec["version"],
                 "market_start": target_bar_start,
-                "market_end": target_bar_start + BAR_MS_15M,
+                "market_end": target_bar_start + self._bar_ms,
                 "direction": spec["direction"],
                 "signal_bar_start": start_ms,
             })
@@ -349,12 +382,12 @@ class Rev2InsideShadowDetector:
         if not shadow_gate.is_enabled(spec["version"]):
             return False
 
-        up_q, down_q, q_ts = snapshot_entry_quote(self._pm_15m, target_bar_start)
+        up_q, down_q, q_ts = snapshot_entry_quote(self._pm_latest, target_bar_start)
         session.add(KlineShadowSignal(
             version=spec["version"],
             discovery_id=spec["discovery_id"],
             condition_text=spec["condition_text"],
-            timeframe="15m",
+            timeframe=self._timeframe,
             signal_bar_start=start_ms,
             signal_bar_end=target_bar_start,
             direction=spec["direction"],
@@ -367,15 +400,15 @@ class Rev2InsideShadowDetector:
         ))
         return True
 
-    async def _settle_pending(self, closed_15m: list[dict]) -> None:
-        by_start = {int(r["open_time"]): r for r in closed_15m}
+    async def _settle_pending(self, closed: list[dict]) -> None:
+        by_start = {int(r["open_time"]): r for r in closed}
         starts = sorted(by_start)
         if not starts:
             return
         async with async_session_factory() as session:
             pendings = (await session.execute(
                 sa_select(KlineShadowSignal).where(
-                    KlineShadowSignal.version.in_(REV2_VERSIONS),
+                    KlineShadowSignal.version.in_(self._versions),
                     KlineShadowSignal.status == "PENDING",
                     KlineShadowSignal.target_bar_start.in_(starts),
                 )
@@ -396,18 +429,19 @@ class Rev2InsideShadowDetector:
                 sig.settled_at = datetime.now(timezone.utc)
                 self._settle_count += 1
                 logger.info(
-                    "Rev2Inside 影子结算 | {} | 信号根 {} | 次根 {} -> {} | win={}",
-                    sig.version, int(sig.signal_bar_start), int(sig.target_bar_start),
-                    sig.settle_outcome, sig.win if sig.status == "SETTLED" else "N/A",
+                    "Rev2Inside 影子结算 | {} | {} | 信号根 {} | 次根 {} -> {} | win={}",
+                    sig.version, self._timeframe, int(sig.signal_bar_start),
+                    int(sig.target_bar_start), sig.settle_outcome,
+                    sig.win if sig.status == "SETTLED" else "N/A",
                 )
             await session.commit()
 
     async def _expire_stale_pending(self) -> None:
-        cutoff = int(time.time() * 1000) - BAR_MS_15M - PENDING_EXPIRE_MS
+        cutoff = int(time.time() * 1000) - self._bar_ms - PENDING_EXPIRE_MS[self._timeframe]
         async with async_session_factory() as session:
             stale = (await session.execute(
                 sa_select(KlineShadowSignal).where(
-                    KlineShadowSignal.version.in_(REV2_VERSIONS),
+                    KlineShadowSignal.version.in_(self._versions),
                     KlineShadowSignal.status == "PENDING",
                     KlineShadowSignal.target_bar_start < cutoff,
                 )
@@ -421,20 +455,24 @@ class Rev2InsideShadowDetector:
             await session.commit()
 
     async def _backscan(self) -> None:
-        closed_15m = await self._collector.fetch_recent_klines("15m", WARMUP_BARS)
-        if len(closed_15m) < WARMUP_BARS:
-            logger.warning("Rev2Inside 影子：冷启动回补数据不足（{} 根），跳过", len(closed_15m))
+        closed = await self._collector.fetch_recent_klines(self._timeframe, WARMUP_BARS)
+        if len(closed) < WARMUP_BARS:
+            logger.warning(
+                "Rev2Inside 影子：{} 冷启动回补数据不足（{} 根），跳过",
+                self._timeframe, len(closed),
+            )
             return
-        await self._evaluate_new_bars(closed_15m)
-        self._last_evaluated_bar = int(closed_15m[-1]["open_time"])
-        await self._settle_pending(closed_15m)
+        await self._evaluate_new_bars(closed)
+        self._last_evaluated_bar = int(closed[-1]["open_time"])
+        await self._settle_pending(closed)
         await self._expire_stale_pending()
 
     def status(self) -> dict:
         return {
             "running": self._running,
+            "timeframe": self._timeframe,
             "last_evaluated_bar": self._last_evaluated_bar,
             "trigger_count": self._trigger_count,
             "settle_count": self._settle_count,
-            "versions": REV2_VERSIONS,
+            "versions": list(self._versions),
         }

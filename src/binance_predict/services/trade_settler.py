@@ -9,11 +9,13 @@
    15m 市场真实结算一致）。**为何必须分流**：15m 周期起点与 5m 窗口起点
    数值重合（900s 网格 ⊂ 300s 网格），若走 SentimentWindow 会被同名 5m 窗
    错口径结算输赢——这是多通道改造最隐蔽的坑。
-3. 15m K 线影子族订单（market_period='15m' 且 scene_signal_id IS NULL）：
+3. K 线影子族订单（market_period='15m' 且 scene_signal_id IS NULL）：
    回读 KlineShadowSignal（version=signal_version ∧ target_bar_start=
    window_start）的 settle_outcome/settle_close——s2_cond 条件单族
    （t4/t5d）与 nextbar 15m 族（hm_inside_15m_v2/ih_inside_15m_v2）的信号
-   行落 kline_shadow_signals，下单路径无 signal_id 关联列。**为何必须独立
+   行落 kline_shadow_signals，下单路径无 signal_id 关联列。5m Rev2
+   （hm_inside_5m_v2）仍走 5m SentimentWindow，因为它的结算源就是 5m 窗口归档。
+   **为何必须独立
    成路**：2026-09-10 生产实锤，旧口径把这类行塞进 2（缺 scene_signal_id →
    CRITICAL + EXPIRED/win=NULL/pnl=0），FILLED 真单的真实亏损被抹平
    （id=466 真实 -1.00 记为 +0.00），统计口径整体失真。

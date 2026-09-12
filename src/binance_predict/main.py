@@ -190,8 +190,9 @@ s2_cond_shadow_detector: S2CondShadowDetector | None = None
 # 前向验证 4 周——通过标准见 detector docstring 预注册）
 firsthit_shadow_detector: FirstHitShadowDetector | None = None
 
-# 15m 经典孕线上吊线/倒垂线影子检测器全局实例（rev2 族，2026-09-09：hm_inside_15m_v2 / ih_inside_15m_v2，只记录不下注，支持实盘开火钩子）
+# Rev2 孕线反转影子检测器：5m / 15m 独立实例，支持实盘开火钩子
 rev2_inside_shadow_detector: Rev2InsideShadowDetector | None = None
+rev2_inside_5m_shadow_detector: Rev2InsideShadowDetector | None = None
 
 # 交易结算器全局实例（P0-2：FILLED 订单结算回填输赢/盈亏，常开）
 trade_settler: TradeSettler | None = None
@@ -1312,15 +1313,25 @@ async def lifespan(app: FastAPI):
         await firsthit_shadow_detector.start()
         logger.info("首触反转影子检测器已启动（G0 基底 / G1 body_r≤0.35 / G3 chg≤+2.82bp 三 version；前向验证 4 周，通过标准已预注册；影子只记录不下注）")
 
-    # 15m 经典孕线上吊线/倒垂线反转影子信号（rev2 族，2026-09-09）
-    global rev2_inside_shadow_detector
+    # Rev2 孕线反转：5m / 15m 各自读取同周期 K 线与预测市场报价缓存
+    global rev2_inside_shadow_detector, rev2_inside_5m_shadow_detector
     if settings.rev2_inside_shadow_enabled:
         rev2_inside_shadow_detector = Rev2InsideShadowDetector(
             collector=collector,
-            pm_15m_latest=_pm_15m_latest,
+            pm_latest=_pm_15m_latest,
+            timeframe="15m",
+        )
+        rev2_inside_5m_shadow_detector = Rev2InsideShadowDetector(
+            collector=collector,
+            pm_latest=_pm_market_info,
+            timeframe="5m",
         )
         await rev2_inside_shadow_detector.start()
-        logger.info("Rev2Inside 15m 孕线反转影子检测器已启动（hm_inside_15m_v2 56.6%/ih_inside_15m_v2 52.5%，影子落表 + 实盘钩子挂载中）")
+        await rev2_inside_5m_shadow_detector.start()
+        logger.info(
+            "Rev2Inside 双周期检测器已启动（15m HM/IH 短影≤10%；"
+            "5m HM 短上影≤10%且主下影[75%,90%)；影子落表 + 实盘钩子挂载中）"
+        )
 
     # 交易结算器（P0-2）：回读 SentimentWindow 结算 FILLED 订单输赢/盈亏。
     # 无开关常开：行为只读窗口 + 回填结算字段，零资金风险。
@@ -1352,6 +1363,8 @@ async def lifespan(app: FastAPI):
             nextbar_shadow_detector._on_live_fire = multi_live_trader.on_nextbar_signal
         if rev2_inside_shadow_detector is not None:
             rev2_inside_shadow_detector._on_live_fire = multi_live_trader.on_nextbar_signal
+        if rev2_inside_5m_shadow_detector is not None:
+            rev2_inside_5m_shadow_detector._on_live_fire = multi_live_trader.on_nextbar_signal
         # absorption 标定源注入：check() 内联判定读最新标定快照
         # （检测器关闭/未注入 → absorption 通道保守不开火，fail-safe 同 kline_fetcher）
         multi_live_trader.absorption_calibrator = absorption_shadow_detector
@@ -1406,9 +1419,11 @@ async def lifespan(app: FastAPI):
     # 停止 HM 上吊线反弹入场影子检测器
     if hm_shadow_detector is not None:
         await hm_shadow_detector.stop()
-    # 停止 15m 孕线反转影子检测器
+    # 停止 Rev2 5m / 15m 孕线反转影子检测器
     if rev2_inside_shadow_detector is not None:
         await rev2_inside_shadow_detector.stop()
+    if rev2_inside_5m_shadow_detector is not None:
+        await rev2_inside_5m_shadow_detector.stop()
     # 停止反转形态影子检测器
     if reversal_shadow_detector is not None:
         await reversal_shadow_detector.stop()

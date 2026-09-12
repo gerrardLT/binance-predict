@@ -305,6 +305,22 @@ async def test_direction_null_created_at_missing(monkeypatch) -> None:
 # ------------------------------------------------------------------
 
 @pytest.mark.asyncio
+async def test_rev2_5m_uses_sentiment_window_settlement(monkeypatch) -> None:
+    """5m Rev2 HM 沿用 5m SentimentWindow，不误走 15m K 线影子分流。"""
+    db = _Db(
+        [_row(signal_version="hm_inside_5m_v2", market_period="5m", direction="DOWN")],
+        _window("DOWN", exit_price=43100.0),
+    )
+    _stub_db(monkeypatch, db)
+
+    assert await TradeSettler().poll_once() == 1
+    p = _params(db.updates[0])
+    assert p["settle_outcome"] == "DOWN"
+    assert p["win"] is True
+    assert p["settle_price"] == pytest.approx(43100.0)
+
+
+@pytest.mark.asyncio
 async def test_kline_shadow_15m_win(monkeypatch) -> None:
     """K 线影子结算：15m+ 无 scene_signal_id → win=True、pnl=shares−amount。
 
