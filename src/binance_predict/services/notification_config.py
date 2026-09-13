@@ -409,6 +409,7 @@ class NotificationConfigService:
                 row.enabled = next_enabled
                 row.config = next_config
             await session.commit()
+            await session.refresh(row, ["updated_at"])
             updated_at = row.updated_at
         self._store_row(channel, next_enabled, next_config, updated_at)
         self._loaded_at = time.monotonic()

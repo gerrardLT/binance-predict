@@ -54,6 +54,9 @@ class _FakeSession:
     async def commit(self) -> None:
         self.committed = True
 
+    async def refresh(self, _obj, _attrs=None) -> None:
+        pass
+
 
 class _FakeSessionCtx:
     def __init__(self, session: _FakeSession) -> None:
