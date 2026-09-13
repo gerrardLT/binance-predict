@@ -3,6 +3,15 @@
 新功能 / bug 修复 / 功能改造，改完在**最上方**追加一条。格式：问题 / 改动 / 验证 / 遗留，每条 5-8 行。
 豁免：纯 UI 微调、纯文档、一次性脚本。触碰交易语义 / 资金 / DB / 部署 / 新功能则必记。
 
+## 2026-09-13 解除 firsthit 全族同窗互斥支持 G7 各变体独立实盘测试 `pending commit`
+
+**问题** `SAME_WINDOW_EXCLUSIVE` 将所有 firsthit 信号（G0/G1/G3/G4/G7 全系）绑定在同一互斥组，一旦宽松的 G0/G3 触发成交，严格的 G7 及其子变体（如 g7_streak、g7_wick20、g7_strict）在同窗被直接弃单，无法收集 G7 变体在真实市场中的实际成交表现。
+**改动** 从 `live_channels.py` 的 `SAME_WINDOW_EXCLUSIVE` 中移出 firsthit 10 个通道集合；每个通道保留内存 `fired` 集合和 DB 尝试防重机制，确保各通道自身每窗至多一单，不再互相挤占。
+**验证** 更新 `test_multi_live_trader.py` 中 4 处测试用例（`test_firsthit_three_channels_independent_fill`、`test_firsthit_g7_series_all_fire`、`test_channels_registry_shape` 及通用互斥测试），全量 182 个实盘调度器测试 100% 通过。
+**遗留** 解除互斥后若同时开启宽松版本与严格版本，同一窗口若同时满足条件会并发下多笔 2 USDT 订单；实盘测试建议关闭宽门基底（如 G0），仅开启关注的 G7 变体对比表现。
+
+---
+
 ## 2026-09-13 逐信号通知配置（微信/邮件事件与字段） `dfb4d60`
 
 **问题** 通知只有 .env 总开关，无法按信号、事件、字段配置 WxPusher 与结算邮件；首版上线后前端保存报 500（SQLAlchemy 默认 `expire_on_commit=True` 导致 `row.updated_at` 触发异步懒加载异常）。

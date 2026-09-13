@@ -315,12 +315,7 @@ SAME_WINDOW_EXCLUSIVE: tuple[frozenset[str], ...] = (
     # 吸收跟随双变体同窗同假设（TD120/TD150 只是判定时点不同，欠反应状态连续），
     # 防同窗双成交（2026-09-06 promote）。
     frozenset({"absorption_follow_td120_v1", "absorption_follow_td150_v1"}),
-    # firsthit 全族共享同一首触母事件，防嵌套版本同窗重复下注。
-    frozenset({
-        "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1",
-        "firsthit_down_g4_v1", "firsthit_down_g7_v1", "g7_streak_v1",
-        "g7_wick20_v1", "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",
-    }),
+    # 2026-09-12：解除 firsthit 全族同窗互斥，允许各 G 系列及 G7 变体按门禁独立下单对比实盘效果
 )
 
 # 退役的同窗互斥组（不参与生产判定：exclusive_group 只读 SAME_WINDOW_EXCLUSIVE）

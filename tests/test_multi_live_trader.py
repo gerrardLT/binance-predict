@@ -382,7 +382,7 @@ def test_channels_registry_shape() -> None:
     assert all(not s.v3_env and not s.regime_gate and not s.streak_gate
                for s in LIVE_CHANNELS.values())
     assert all(s.v2_guard in (None, "max_rise") for s in LIVE_CHANNELS.values())
-    # 同窗互斥组：S5、S2 condition、absorption 与 firsthit 全族。
+    # 同窗互斥组：S5、S2 condition 与 absorption（firsthit 全族已于 2026-09-12 解除互斥以支持独立实盘测试）
     from binance_predict.services.live_channels import exclusive_group
     g_s5 = exclusive_group("s5_deep_z20_v1")
     assert g_s5 == frozenset({"scene_bull_exhaust_confirm", "s5_deep_z20_v1"})
@@ -390,13 +390,10 @@ def test_channels_registry_shape() -> None:
         {"s2_cond_t4_v1", "s2_cond_t5d_v1"})
     assert exclusive_group("absorption_follow_td150_v1") == frozenset(
         {"absorption_follow_td120_v1", "absorption_follow_td150_v1"})
-    firsthit_group = frozenset({
-        "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1",
-        "firsthit_down_g4_v1", "firsthit_down_g7_v1", "g7_streak_v1",
-        "g7_wick20_v1", "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",
-    })
-    assert exclusive_group("firsthit_down_v1") == firsthit_group
-    assert exclusive_group("g7_t270_v1") == firsthit_group
+    # firsthit 全族解除互斥
+    assert exclusive_group("firsthit_down_v1") is None
+    assert exclusive_group("g7_t270_v1") is None
+    assert exclusive_group("firsthit_down_g7_v1") is None
     assert exclusive_group("scene_bull_exhaust") is None
     assert exclusive_group("quote_contrarian_v2") is None
     assert exclusive_group("quote_momentum_v3") is None   # 退役组不参与生产判定
@@ -1595,8 +1592,8 @@ async def test_firsthit_g1_g3_gate_rejects_high_chg_or_large_body(monkeypatch) -
 
 
 @pytest.mark.asyncio
-async def test_firsthit_three_channels_share_same_window_exclusive_fill(monkeypatch) -> None:
-    """三门全中时仍派生候选，但同窗互斥只允许一笔成交。
+async def test_firsthit_three_channels_independent_fill(monkeypatch) -> None:
+    """2026-09-12 解除 firsthit 同窗互斥后：三门全中时各通道按各自门禁独立下单。
     
     三门全中需要：chg≤+2.82bp（G3）、body_r≤0.35（G1）、npts≥8（路径质量）。
     body_r<1 要求 btc_curve 有波动（中间有比 bo 更低或比 btc_trig 更高的点）。"""
@@ -1628,9 +1625,11 @@ async def test_firsthit_three_channels_share_same_window_exclusive_fill(monkeypa
     # per-channel fired 防重复；三通道各自 open
     assert set(fired) == {"firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1"}
     await _drain(t)
-    # 候选任务全部派生，但同窗互斥只允许先完成的一笔成交。
-    assert len(fake.calls) == 1
-    assert fake.calls[0]["signal_version"] == "firsthit_down_v1"
+    # 解除互斥后，三通道各自独立下单，总共 3 笔成交
+    assert len(fake.calls) == 3
+    assert {c["signal_version"] for c in fake.calls} == {
+        "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1"
+    }
     # 2026-09-11: 新动态护拦=触发价×1.03（q=0.07 → 0.0721），替代旧绝对阈值 0.08
     assert abs(fake.calls[0]["max_exec_price"] - 0.0721) < 1e-4
 
@@ -1761,15 +1760,16 @@ async def test_firsthit_g7_series_all_fire(monkeypatch) -> None:
     assert set(fired) == set(g7_channels)
     await _drain(t)
 
-    assert len(fake.calls) == 1
-    assert fake.calls[0]["signal_version"] == "firsthit_down_g7_v1"
+    # 2026-09-12：解除 firsthit 互斥后，所有满足门禁的 G7 变体均独立下单对比实盘效果
+    assert len(fake.calls) == 6
+    assert {c["signal_version"] for c in fake.calls} == set(g7_channels)
     # 2026-09-11: 新动态护拦=触发价×1.03 (q=0.04 → 0.0412)，但低于 CLAMP_LO(0.05) → 0.05
     assert fake.calls[0].get("max_exec_price") == 0.05
 
 
 @pytest.mark.asyncio
-async def test_firsthit_exclusive_allows_next_channel_after_failed_attempt(monkeypatch) -> None:
-    """首个 firsthit 候选未成交时，同窗后续候选仍可尝试。"""
+async def test_exclusive_allows_next_channel_after_failed_attempt(monkeypatch) -> None:
+    """互斥组内首个候选未成交时，同窗后续候选仍可尝试（以 S2 为例）。"""
     class _FailThenFillTrader(_FakeTrader):
         def __init__(self):
             super().__init__()
@@ -1781,56 +1781,29 @@ async def test_firsthit_exclusive_allows_next_channel_after_failed_attempt(monke
 
     fake = _FailThenFillTrader()
     t = _make_trader(monkeypatch, fake,
-                     channels=["firsthit_down_v1", "firsthit_down_body_v1"])
-    dn_p = _firsthit_down_curve(trigger_q=0.07, npts=20, trigger_idx=8)
-    btc_p = [{"t": WINDOW_START, "v": 100.0}]
-    for i in range(1, 20):
-        ts = WINDOW_START + i * 15_000
-        if i <= 3:
-            v = 100.0 + i * 0.02              # 冲高到 100.06（留 4bp 上影）
-        elif i <= 7:
-            v = 100.06 - (i - 3) * 0.0325     # 回落到 ~99.93
-        else:
-            v = 100.02
-        btc_p.append({"t": ts, "v": v})
-    fired = t.check(WINDOW_START, WINDOW_END, WINDOW_START + 120_000,
-                    down_price=0.5, btc_price=100.3,
-                    window_entry_price=100.0,
-                    window_btc_curve=btc_p, window_down_curve=dn_p)
-    assert set(fired) == {"firsthit_down_v1", "firsthit_down_body_v1"}
+                     channels=["s2_cond_t4_v1", "s2_cond_t5d_v1"])
+    t.on_s2_cond_signal(_s2_cond_sig("s2_cond_t4_v1"))
+    await _drain(t)
+    # t4 第一次尝试失败（未成交），t5d 仍可被调用
+    t.on_s2_cond_signal(_s2_cond_sig("s2_cond_t5d_v1"))
     await _drain(t)
     assert [c["signal_version"] for c in fake.calls] == [
-        "firsthit_down_v1", "firsthit_down_body_v1"]
+        "s2_cond_t4_v1", "s2_cond_t5d_v1"]
 
 
 @pytest.mark.asyncio
-async def test_firsthit_exclusive_blocks_persisted_fill_after_restart(monkeypatch) -> None:
-    """重启后同窗已有另一 firsthit 版本成交时，不得再次下单。"""
+async def test_exclusive_blocks_persisted_fill_after_restart(monkeypatch) -> None:
+    """重启后同窗已有互斥组内另一版本成交时，不得再次下单（以 S2 为例）。"""
     fake = _FakeTrader()
-    t = _make_trader(monkeypatch, fake, channels=["firsthit_down_body_v1"])
+    t = _make_trader(monkeypatch, fake, channels=["s2_cond_t5d_v1"])
 
     async def _persisted(self, group: frozenset[str], ws: int) -> str | None:
-        assert "firsthit_down_v1" in group
-        assert ws == WINDOW_START
-        return "firsthit_down_v1"
+        assert "s2_cond_t4_v1" in group
+        assert ws == MARKET_START_15M
+        return "s2_cond_t4_v1"
 
     monkeypatch.setattr(MultiLiveTrader, "_group_filled_channel", _persisted)
-    dn_p = _firsthit_down_curve(trigger_q=0.07, npts=20, trigger_idx=8)
-    btc_p = [{"t": WINDOW_START, "v": 100.0}]
-    for i in range(1, 20):
-        ts = WINDOW_START + i * 15_000
-        if i <= 3:
-            v = 100.0 + i * 0.02              # 冲高到 100.06（留 4bp 上影）
-        elif i <= 7:
-            v = 100.06 - (i - 3) * 0.0325     # 回落到 ~99.93
-        else:
-            v = 100.02
-        btc_p.append({"t": ts, "v": v})
-    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 120_000,
-                   down_price=0.5, btc_price=100.02,
-                   window_entry_price=100.0,
-                   window_btc_curve=btc_p,
-                   window_down_curve=dn_p) == ["firsthit_down_body_v1"]
+    t.on_s2_cond_signal(_s2_cond_sig("s2_cond_t5d_v1"))
     await _drain(t)
     assert fake.calls == []
 
@@ -4217,33 +4190,22 @@ async def test_multi_live_trader_passes_5m_rev2_limit_and_hot_guard(monkeypatch)
 @pytest.mark.asyncio
 async def test_exclusive_limit_gtc_pending_order_occupies_slot(monkeypatch) -> None:
     """同窗互斥：限价单落 PENDING（挂在撮合簿）即占用互斥槽，防止同组后续通道并发挂单叠加敞口。"""
-    fake = _FakeTrader(result=_fake_order(status="PENDING", signal_version="firsthit_down_v1"))
-    t = _make_trader(monkeypatch, fake, channels=["firsthit_down_v1", "firsthit_down_body_v1"])
+    fake = _FakeTrader(result=_fake_order(status="PENDING", signal_version="s2_cond_t4_v1"))
+    t = _make_trader(monkeypatch, fake, channels=["s2_cond_t4_v1", "s2_cond_t5d_v1"])
 
-    # 模拟 firsthit_down_v1 开火并返回 PENDING
-    dn_p = _firsthit_down_curve(trigger_q=0.04, npts=20, trigger_idx=8)
-    # btc_curve：冲高→回落留上影（盘前 veto 要求 upper_wick≥0.5bp）
-    btc_p = [{"t": WINDOW_START, "v": 100.0}]
-    for i in range(1, 20):
-        ts = WINDOW_START + i * 15_000
-        if i <= 4:
-            v = 100.0 + i * 0.02          # 冲高到 100.08（peak）
-        else:
-            v = 100.08 - (i - 4) * 0.005  # 缓慢回落（i=8 时≈100.06）
-        btc_p.append({"t": ts, "v": v})
-
-    fired = t.check(
-        WINDOW_START, WINDOW_END, WINDOW_START + 120_000,
-        down_price=0.04, btc_price=100.06,
-        window_entry_price=100.0,
-        window_btc_curve=btc_p, window_down_curve=dn_p,
-    )
-    assert "firsthit_down_v1" in fired
+    # 模拟 s2_cond_t4_v1 开火并返回 PENDING
+    t.on_s2_cond_signal(_s2_cond_sig("s2_cond_t4_v1"))
     await _drain(t)
 
     # 槽位已被占：同窗后续通道尝试开火时被互斥阻拦
-    assert WINDOW_START in t._window_filled
-    assert "firsthit_down_v1" in t._window_filled[WINDOW_START]
+    assert MARKET_START_15M in t._window_filled
+    assert "s2_cond_t4_v1" in t._window_filled[MARKET_START_15M]
+
+    # 同组后发通道触发被互斥阻拦
+    t.on_s2_cond_signal(_s2_cond_sig("s2_cond_t5d_v1"))
+    await _drain(t)
+    assert len(fake.calls) == 1
+    assert fake.calls[0]["signal_version"] == "s2_cond_t4_v1"
 
 
 @pytest.mark.asyncio
