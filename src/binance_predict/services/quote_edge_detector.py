@@ -96,7 +96,8 @@ from binance_predict.db.models import MisalignmentSignal, SentimentWindow
 from binance_predict.services.shadow_version_gate import shadow_gate
 from .btc_regime import regime_feed
 from .signal_notify import (
-    fire_signal_email, fmt_bjt, has_live_filled_order, is_fresh_signal, is_live_enabled,
+    fire_signal_email, fmt_bjt, has_live_filled_order, is_fresh_signal,
+    is_live_enabled, is_settled_field_enabled,
 )
 
 # 注：2026-08-26 从 stdlib logging 改为 loguru——stdlib 无 handler 配置时
@@ -621,15 +622,27 @@ class QuoteEdgeDetector:
                     if (is_fresh_signal(end_ms) and is_live_enabled(version)
                             and await has_live_filled_order(version, start_ms)):
                         win_str = "赢" if win else "输"
+                        parts = [f"版本: {version}（实盘已成交，本邮件为结算复盘）"]
+                        if is_settled_field_enabled(version, "window"):
+                            parts.append(
+                                f"窗口: {fmt_bjt(start_ms)}~{fmt_bjt(end_ms, with_date=False)} 北京时间"
+                            )
+                        if is_settled_field_enabled(version, "trigger"):
+                            parts.append(
+                                f"触发: t=+{(quote_ts - start_ms) / 1000.0:.0f}s DOWN报价 q={price:.3f}"
+                            )
+                        if is_settled_field_enabled(version, "outcome"):
+                            parts.append(f"结算: {outcome} → {win_str}")
+                        if is_settled_field_enabled(version, "ev"):
+                            parts.append(
+                                f"EV: {_ev_at_entry(win, price):+.3f}（0.98/q−1 / −1，费 2%）"
+                            )
                         fire_signal_email(
                             "quote_edge",
                             f"[信号·实盘] {version} | 押DOWN {win_str} | 窗口 "
                             f"{fmt_bjt(start_ms)} 北京时间",
-                            f"版本: {version}（实盘已成交，本邮件为结算复盘）\n"
-                            f"窗口: {fmt_bjt(start_ms)}~{fmt_bjt(end_ms, with_date=False)} 北京时间\n"
-                            f"触发: t=+{(quote_ts - start_ms) / 1000.0:.0f}s DOWN报价 q={price:.3f}\n"
-                            f"结算: {outcome} → {win_str}\n"
-                            f"EV: {_ev_at_entry(win, price):+.3f}（0.98/q−1 / −1，费 2%）",
+                            "\n".join(parts),
+                            channel=version,
                         )
                 except Exception as exc:
                     await session.rollback()

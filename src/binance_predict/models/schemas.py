@@ -345,6 +345,38 @@ class ToggleShadowRequest(BaseModel):
     )
 
 
+class NotifyChannelPatch(BaseModel):
+    """单通道通知配置补丁（PUT /api/notify/config 的 channels 项）。"""
+
+    channel: str = Field(description="LIVE_CHANNELS 通道 ID")
+    enabled: bool | None = Field(default=None, description="该信号全部业务通知总开关")
+    config: dict | None = Field(
+        default=None,
+        description="events.{radar|filled|abandoned|settled}.{wechat|email|fields}",
+    )
+
+
+class NotifyConfigPutRequest(BaseModel):
+    """PUT /api/notify/config：全局渠道 + 逐信号事件/字段（物理凭据不可提交）。"""
+
+    global_config: dict | None = Field(
+        default=None,
+        description="wechat_enabled / email_enabled / low_balance",
+    )
+    channels: list[NotifyChannelPatch] | None = Field(
+        default=None, description="逐信号补丁列表；未知通道 422"
+    )
+
+
+class NotifyConfigResetRequest(BaseModel):
+    """POST /api/notify/config/reset：删覆盖行回落默认全开。"""
+
+    channel: str | None = Field(
+        default=None,
+        description="指定通道（含 __global__）或空=全部恢复默认",
+    )
+
+
 class RedeemRequest(BaseModel):
     """POST /api/prediction/redeem（领取获胜 token 奖金，batch-redeem）。
 

@@ -36,6 +36,7 @@ from ..config.settings import settings
 from ..db.engine import async_session_factory
 from ..db.models import TradeOrderModel
 from .alerting import send_plain_email
+from .notification_config import notify_config
 
 # 邮件展示时区：北京时间（2026-08-25 用户要求，推送邮件时间统一北京时间，
 # 不再用 UTC；裸毫秒时间戳一律经 fmt_bjt 转可读格式，禁止直接拼 ms 进正文）。
@@ -127,15 +128,23 @@ async def has_scene_filled_order(scene_signal_id: int) -> bool:
         return False
 
 
-def fire_signal_email(tag: str, subject: str, body: str) -> None:
+def fire_signal_email(
+    tag: str,
+    subject: str,
+    body: str,
+    channel: str | None = None,
+) -> None:
     """fire-and-forget 推送（各检测器挂钩统一入口）。
 
     绝不阻塞检测循环（SMTP 丢包事故教训）；异常只日志不抛。
+    channel 传入后走逐信号结算邮件闸；缺省保持旧行为（仅总开关+日限）。
     """
 
     async def _run() -> None:
         try:
-            await push_signal_email(tag, subject, body, int(time.time() * 1000))
+            await push_signal_email(
+                tag, subject, body, int(time.time() * 1000), channel=channel,
+            )
         except Exception as exc:  # 推送失败不影响检测主流程
             logger.warning("[SIGNAL] 信号推送异常 | tag={} | {} | {}",
                            tag, type(exc).__name__, exc)
@@ -166,13 +175,44 @@ def reset_daily_count() -> None:
     _daily = (-1, 0)
 
 
-async def push_signal_email(tag: str, subject: str, body: str, now_ms: int) -> bool:
-    """推送一条信号邮件（总开关 + 全局日限双闸）。
+def is_settled_email_enabled(channel: str | None) -> bool:
+    """逐信号结算邮件闸；channel 缺省时只走全局邮件开关。"""
+    try:
+        if not notify_config.is_transport_globally_enabled("email"):
+            return False
+        if not channel:
+            return True
+        return notify_config.is_event_enabled(channel, "settled", "email")
+    except Exception as exc:
+        logger.warning("[SIGNAL] 通知配置查询异常，按放行处理 | channel={} | {}",
+                       channel, exc)
+        return True
+
+
+def is_settled_field_enabled(channel: str | None, field: str) -> bool:
+    """结算邮件字段显隐；配置异常按显示处理。"""
+    if not channel:
+        return True
+    try:
+        return notify_config.is_field_enabled(channel, "settled", field)
+    except Exception:
+        return True
+
+
+async def push_signal_email(
+    tag: str,
+    subject: str,
+    body: str,
+    now_ms: int,
+    channel: str | None = None,
+) -> bool:
+    """推送一条信号邮件（总开关 + 逐信号闸 + 全局日限）。
 
     Args:
         tag: 信号族标记（日志用），如 "quote_edge" / "x4" / "场景"
         subject/body: 邮件主题与正文（纯文本）
         now_ms: 调用方时钟（毫秒；日计数按 UTC 日翻转）
+        channel: 信号通道；传入后叠加逐信号结算邮件闸
 
     Returns:
         True=已发出；False=总开关关闭/超日限/SMTP 未配置/发送失败。
@@ -180,10 +220,13 @@ async def push_signal_email(tag: str, subject: str, body: str, now_ms: int) -> b
     """
     if not settings.signal_push_email_enabled:
         return False
+    if not is_settled_email_enabled(channel):
+        return False
     if not _try_bump_daily(now_ms):
         logger.info("[SIGNAL] 信号推送超全局日限（{}），本条仅日志 | {}",
                     settings.signal_push_max_daily_emails, subject)
         return False
     ok = await send_plain_email(subject, body)
-    logger.info("[SIGNAL] 信号邮件推送 | tag={} | subject={} | ok={}", tag, subject, ok)
+    logger.info("[SIGNAL] 信号邮件推送 | tag={} | channel={} | subject={} | ok={}",
+                tag, channel, subject, ok)
     return ok

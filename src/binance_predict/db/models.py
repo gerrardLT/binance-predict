@@ -1531,6 +1531,28 @@ class LiveChannelOverride(Base):
     )
 
 
+class NotificationChannelOverride(Base):
+    """逐信号通知路由与字段配置（缺行/缺键默认全开，兼容既有行为）。"""
+
+    __tablename__ = "notification_channel_overrides"
+
+    channel: Mapped[str] = mapped_column(
+        String(64), primary_key=True,
+        comment="LIVE_CHANNELS 通道名；__global__ 为全局渠道/低余额配置",
+    )
+    enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, comment="该信号全部业务通知总开关",
+    )
+    config: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict,
+        comment="经服务端白名单校验的事件、传输渠道与字段选择",
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+        onupdate=func.now(), comment="最后配置时间",
+    )
+
+
 class ShadowVersionOverride(Base):
     """影子信号版本的运行时开关覆盖层（前端手动下线/上线，重启不丢）。
 

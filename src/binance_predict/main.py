@@ -59,6 +59,8 @@ from .models.schemas import (
     TransferOutboundRequest,
     ToggleLiveRequest,
     ToggleShadowRequest,
+    NotifyConfigPutRequest,
+    NotifyConfigResetRequest,
 )
 from .services.absorption_shadow_detector import AbsorptionShadowDetector
 from .services.agent_scheduler import AgentScheduler
@@ -76,6 +78,7 @@ from .services.reversal_shadow_detector import ReversalShadowDetector
 from .services.rev2_inside_shadow_detector import Rev2InsideShadowDetector
 from .services.s2_cond_shadow_detector import S2CondShadowDetector
 from .services.shadow_version_gate import shadow_gate
+from .services.notification_config import GLOBAL_CHANNEL, notify_config
 from .services.wechat_notifier import wechat_notifier
 from .services.trade_settler import TradeSettler
 from .services.llm_service import LLMService
@@ -1136,6 +1139,7 @@ async def lifespan(app: FastAPI):
     # 影子版本开关 gate（前端手动下线能力）：先于所有影子检测器启动，保证首轮
     # 落库判定可用；DB 故障保守全在线（fail-safe，不停采集）。
     await shadow_gate.start()
+    await notify_config.start()
 
     # 场景信号系统：4h 破位记 pending → 15m 周期收盘确认 → 次周期信号（不下注）
     global fake_breakout_detector
@@ -1444,6 +1448,7 @@ async def lifespan(app: FastAPI):
         await firsthit_shadow_detector.stop()
     # 停止影子版本开关 gate（所有影子检测器已停，最后收后台刷新任务）
     await shadow_gate.stop()
+    await notify_config.stop()
     # 停止交易结算器
     if trade_settler is not None:
         await trade_settler.stop()
@@ -2469,6 +2474,43 @@ async def live_toggle(
     }
 
 
+@app.get("/api/notify/config")
+async def get_notify_config(_: None = Depends(_require_auth)):
+    """逐信号通知配置（不返回任何物理凭据）。"""
+    return notify_config.snapshot()
+
+
+@app.put("/api/notify/config")
+async def put_notify_config(
+    req: NotifyConfigPutRequest,
+    _: None = Depends(_require_auth),
+):
+    """保存通知路由/字段配置；本进程立即生效。"""
+    try:
+        if req.global_config is not None:
+            await notify_config.upsert(GLOBAL_CHANNEL, config=req.global_config)
+        for patch in req.channels or []:
+            await notify_config.upsert(
+                patch.channel, enabled=patch.enabled, config=patch.config,
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return {"message": "通知配置已保存", **notify_config.snapshot()}
+
+
+@app.post("/api/notify/config/reset")
+async def reset_notify_config(
+    req: NotifyConfigResetRequest,
+    _: None = Depends(_require_auth),
+):
+    """删覆盖行，回落默认全开。"""
+    try:
+        await notify_config.reset(req.channel)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return {"message": "已恢复默认全开", **notify_config.snapshot()}
+
+
 @app.post("/api/notify/test-wechat")
 async def test_wechat_notify(_: None = Depends(_require_auth)):
     """一键测试微信 / 企业微信通知渠道连通性（2026-09-10）。"""
@@ -2488,6 +2530,30 @@ async def test_wechat_notify(_: None = Depends(_require_auth)):
         "message": "测试通知已派发至异步推送队列，请检查微信/企业微信接收情况",
         "wxpusher_configured": bool(settings.wxpusher_spt.strip() or settings.wxpusher_app_token.strip()),
         "wechat_work_configured": bool(settings.wechat_work_webhook_url.strip()),
+    }
+
+
+@app.post("/api/notify/test-email")
+async def test_email_notify(_: None = Depends(_require_auth)):
+    """一键测试 SMTP 邮件物理通道（不受单信号路由影响）。"""
+    from datetime import datetime
+    from .services.alerting import send_plain_email
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ok = await send_plain_email(
+        "[信号邮件] 连通测试",
+        f"测试时间：{now_str}\n收到本邮即 SMTP 信号推送通道可用。",
+    )
+    return {
+        "status": "SENT" if ok else "SKIPPED",
+        "ok": ok,
+        "message": (
+            "测试邮件已发出，请查收件箱" if ok
+            else "邮件未发出（总开关关闭 / SMTP 未配置 / 发送失败）"
+        ),
+        "smtp_configured": bool(
+            settings.agent_alert_smtp_host.strip()
+            and any(x.strip() for x in settings.agent_alert_email_to.split(","))
+        ),
     }
 
 

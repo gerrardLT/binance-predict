@@ -49,7 +49,8 @@ from binance_predict.db.models import MisalignmentSignal, SentimentWindow
 from binance_predict.services.shadow_version_gate import shadow_gate
 from .btc_regime import regime_feed
 from .signal_notify import (
-    fire_signal_email, fmt_bjt, has_live_filled_order, is_fresh_signal, is_live_enabled,
+    fire_signal_email, fmt_bjt, has_live_filled_order, is_fresh_signal,
+    is_live_enabled, is_settled_field_enabled,
 )
 
 logger = logging.getLogger(__name__)
@@ -468,14 +469,35 @@ class MisalignmentDetector:
                     "x4",
                     f"[信号·实盘] {sig.version} | 押次窗DOWN {win_str} | 触发窗 "
                     f"{fmt_bjt(int(sig.window_start))} 北京时间",
-                    f"版本: {sig.version}（实盘已成交，本邮件为结算复盘）\n"
-                    f"触发窗: {fmt_bjt(int(sig.window_start))}"
-                    f"~{fmt_bjt(int(sig.window_end), with_date=False)} 北京时间\n"
-                    f"条件: 本窗收阳 & 窗末 UP%={float(sig.end_pct):.1f} ≤ 40\n"
-                    f"押注: 次窗 DOWN（次窗 {fmt_bjt(int(sig.target_window_start))} 北京时间）\n"
-                    f"入场: 决策点 +{DECISION_T_SEC:.0f}s DOWN报价 {entry_str}\n"
-                    f"结算: {sig.settle_outcome} → {win_str}\n"
-                    f"EV: {ev_str}（0.98/(p+0.01)−1 / −1，费 2%+溢 0.01）",
+                    "\n".join(filter(None, [
+                        f"版本: {sig.version}（实盘已成交，本邮件为结算复盘）",
+                        (
+                            f"触发窗: {fmt_bjt(int(sig.window_start))}"
+                            f"~{fmt_bjt(int(sig.window_end), with_date=False)} 北京时间"
+                            if is_settled_field_enabled(str(sig.version), "window") else ""
+                        ),
+                        (
+                            f"条件: 本窗收阳 & 窗末 UP%={float(sig.end_pct):.1f} ≤ 40"
+                            if is_settled_field_enabled(str(sig.version), "condition") else ""
+                        ),
+                        (
+                            f"押注: 次窗 DOWN（次窗 {fmt_bjt(int(sig.target_window_start))} 北京时间）"
+                            if is_settled_field_enabled(str(sig.version), "bet") else ""
+                        ),
+                        (
+                            f"入场: 决策点 +{DECISION_T_SEC:.0f}s DOWN报价 {entry_str}"
+                            if is_settled_field_enabled(str(sig.version), "entry") else ""
+                        ),
+                        (
+                            f"结算: {sig.settle_outcome} → {win_str}"
+                            if is_settled_field_enabled(str(sig.version), "outcome") else ""
+                        ),
+                        (
+                            f"EV: {ev_str}（0.98/(p+0.01)−1 / −1，费 2%+溢 0.01）"
+                            if is_settled_field_enabled(str(sig.version), "ev") else ""
+                        ),
+                    ])),
+                    channel=str(sig.version),
                 )
 
     async def _expire_stale_pending(self) -> None:

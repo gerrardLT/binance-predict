@@ -408,6 +408,57 @@ interface DeepLearnStreamEvent {
   holdout_count?: number
 }
 
+interface NotifyFieldMeta {
+  id: string
+  label: string
+  hint: string
+}
+interface NotifyEventMeta {
+  label: string
+  hint: string
+  transports: string[]
+  fields: NotifyFieldMeta[]
+}
+interface NotifyEventConfig {
+  wechat?: boolean
+  email?: boolean
+  fields: Record<string, boolean>
+}
+interface NotifyGlobalConfig {
+  wechat_enabled: boolean
+  email_enabled: boolean
+  low_balance: { wechat: boolean; fields: Record<string, boolean> }
+}
+interface NotifyChannelPatch {
+  channel: string
+  enabled?: boolean
+  config?: { events: Record<string, NotifyEventConfig> }
+}
+interface NotifyChannelRow {
+  channel: string
+  display_name: string
+  family: string
+  family_label: string
+  market_period: string
+  enabled: boolean
+  config: { events: Record<string, NotifyEventConfig> }
+  overridden: boolean
+}
+interface NotifyConfigSnapshot {
+  catalog: {
+    events: Record<string, NotifyEventMeta>
+    low_balance_fields: NotifyFieldMeta[]
+    families: Record<string, string>
+  }
+  physical: {
+    wechat: { env_enabled: boolean; wxpusher_configured: boolean; wechat_work_configured: boolean; radar_env_enabled: boolean }
+    email: { env_enabled: boolean; smtp_configured: boolean; scene_email_env_enabled: boolean }
+  }
+  global: { config: NotifyGlobalConfig; overridden: boolean }
+  channels: NotifyChannelRow[]
+  message?: string
+}
+
 // ============================================================
 // API helpers（仅保留路径B/C相关端点）
 // ============================================================
@@ -541,6 +592,20 @@ const api = {
     }).then(r => r.json()),
   // 微信通知连通性测试 (2026-09-10)
   postTestWechatNotify: () => authFetch('/api/notify/test-wechat', { method: 'POST' }).then(r => r.json()),
+  postTestEmailNotify: () => authFetch('/api/notify/test-email', { method: 'POST' }).then(r => r.json()),
+  getNotifyConfig: () => authFetch('/api/notify/config').then(r => r.json()),
+  putNotifyConfig: (payload: { global_config?: NotifyGlobalConfig; channels?: NotifyChannelPatch[] }) =>
+    authFetch('/api/notify/config', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }).then(r => r.json()),
+  resetNotifyConfig: (channel?: string | null) =>
+    authFetch('/api/notify/config/reset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(channel ? { channel } : {}),
+    }).then(r => r.json()),
 }
 
 // ============================================================
@@ -3605,7 +3670,7 @@ function LiveTradeTab() {
 // Main App
 // ============================================================
 
-const TAB_IDS = ['market', 'agent', 'monitor', 'analysis', 'live'] as const
+const TAB_IDS = ['market', 'agent', 'monitor', 'analysis', 'live', 'notify'] as const
 type TabId = (typeof TAB_IDS)[number]
 
 /* tab 中文名。此前内联在 5 个按钮里重复 5 次，收敛为单一事实源。 */
@@ -3615,6 +3680,7 @@ const TAB_LABELS: Record<TabId, string> = {
   monitor: '运行监控',
   analysis: '信号分析',
   live: '实盘交易',
+  notify: '通知配置',
 }
 
 // URL hash 记忆当前 tab：刷新 / 分享链接时回到原页，而不是一律落回首页
@@ -3885,7 +3951,293 @@ export default function App() {
 
         {tab === 'analysis' && <SignalAnalyticsTab />}
         {tab === 'live' && <LiveTradeTab />}
+        {tab === 'notify' && <NotifyConfigTab />}
       </main>
+    </div>
+  )
+}
+
+// ============================================================
+// 通知配置 Tab（逐信号事件/字段）
+// ============================================================
+
+function NotifyToggle({
+  checked, onChange, disabled, label,
+}: { checked: boolean; onChange: (v: boolean) => void; disabled?: boolean; label: string }) {
+  return (
+    <label className="inline-flex items-center gap-1.5 text-xs text-ink-80 cursor-pointer select-none">
+      <input
+        type="checkbox"
+        checked={checked}
+        disabled={disabled}
+        onChange={e => onChange(e.target.checked)}
+        className="accent-brand"
+      />
+      {label}
+    </label>
+  )
+}
+
+function NotifyConfigTab() {
+  const [data, setData] = useState<NotifyConfigSnapshot | null>(null)
+  const [q, setQ] = useState('')
+  const [family, setFamily] = useState('ALL')
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({})
+  const [saving, setSaving] = useState(false)
+  const [dirty, setDirty] = useState(false)
+  const [status, setStatus] = useState('')
+  const [error, setError] = useState('')
+
+  const load = useCallback(() => {
+    api.getNotifyConfig().then((d: NotifyConfigSnapshot) => {
+      setData(d)
+      setDirty(false)
+      setError('')
+    }).catch((e: unknown) => setError('加载失败: ' + String(e)))
+  }, [])
+
+  useEffect(() => { load() }, [load])
+
+  const save = async (payload?: { global_config?: NotifyGlobalConfig; channels?: NotifyChannelPatch[] }) => {
+    if (!data) return
+    setSaving(true); setError('')
+    try {
+      const body = payload ?? {
+        global_config: data.global.config,
+        channels: data.channels.map(ch => ({ channel: ch.channel, enabled: ch.enabled, config: ch.config })),
+      }
+      const r = await api.putNotifyConfig(body) as NotifyConfigSnapshot
+      if (r.channels) {
+        setData(r)
+        setDirty(false)
+        setStatus(r.message || '已保存')
+      } else {
+        setError(String((r as unknown as { detail?: string }).detail || '保存失败'))
+      }
+    } catch (e) {
+      setError('保存失败: ' + String(e))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const patchGlobal = (next: NotifyGlobalConfig) => {
+    if (!data) return
+    setData({ ...data, global: { ...data.global, config: next } })
+    setDirty(true)
+  }
+  const patchChannel = (channel: string, next: Partial<NotifyChannelRow>) => {
+    if (!data) return
+    setData({
+      ...data,
+      channels: data.channels.map(ch => ch.channel === channel ? { ...ch, ...next } : ch),
+    })
+    setDirty(true)
+  }
+
+  const setAll = (on: boolean) => {
+    if (!data) return
+    const events = data.catalog.events
+    setData({
+      ...data,
+      global: {
+        ...data.global,
+        config: {
+          wechat_enabled: on,
+          email_enabled: on,
+          low_balance: {
+            wechat: on,
+            fields: Object.fromEntries(data.catalog.low_balance_fields.map(f => [f.id, on])),
+          },
+        },
+      },
+      channels: data.channels.map(ch => ({
+        ...ch,
+        enabled: on,
+        config: {
+          events: Object.fromEntries(Object.entries(events).map(([eid, meta]) => [
+            eid,
+            {
+              ...Object.fromEntries(meta.transports.map(t => [t, on])),
+              fields: Object.fromEntries(meta.fields.map(f => [f.id, on])),
+            },
+          ])),
+        },
+      })),
+    })
+    setDirty(true)
+  }
+
+  const reset = async (channel?: string) => {
+    setSaving(true); setError('')
+    try {
+      const r = await api.resetNotifyConfig(channel) as NotifyConfigSnapshot
+      setData(r)
+      setDirty(false)
+      setStatus(r.message || '已恢复默认')
+    } catch (e) {
+      setError('恢复失败: ' + String(e))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const testWechat = () => {
+    api.postTestWechatNotify()
+      .then((r: Record<string, unknown>) => alert(String(r?.message || '测试已派发')))
+      .catch((e: unknown) => alert('测试失败: ' + String(e)))
+  }
+  const testEmail = () => {
+    api.postTestEmailNotify()
+      .then((r: Record<string, unknown>) => alert(String(r?.message || '测试已派发')))
+      .catch((e: unknown) => alert('测试失败: ' + String(e)))
+  }
+
+  if (!data) {
+    return <Card title="通知配置"><p className="text-sm text-ink-55">{error || '加载中…'}</p></Card>
+  }
+
+  const families = Array.from(new Set(data.channels.map(c => c.family)))
+  const filtered = data.channels.filter(ch => {
+    if (family !== 'ALL' && ch.family !== family) return false
+    if (!q.trim()) return true
+    const info = SIGNAL_INFO[ch.channel]
+    const hay = `${ch.channel} ${ch.display_name} ${info?.name ?? ''} ${ch.family_label}`.toLowerCase()
+    return hay.includes(q.trim().toLowerCase())
+  })
+  const g = data.global.config
+  const phys = data.physical
+
+  return (
+    <div className="space-y-4">
+      <Card title="物理通道状态">
+        <p className="text-xs text-ink-55 mb-3">凭据只存在服务器 .env，这里只显示是否已配置。测试按钮直连物理通道，不受单信号路由影响。</p>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
+          <div className="border border-line rounded-sm p-3 space-y-1">
+            <div className="font-medium text-ink-95 flex items-center gap-1">微信 / WxPusher <HelpHint text="WxPusher 个人号直推与企业微信群机器人共用同一业务正文。" /></div>
+            <div className="text-xs text-ink-80">WxPusher：{phys.wechat.wxpusher_configured ? '已配置' : '未配置'}</div>
+            <div className="text-xs text-ink-80">企业微信：{phys.wechat.wechat_work_configured ? '已配置' : '未配置'}</div>
+            <div className="text-xs text-ink-80">雷达环境开关：{phys.wechat.radar_env_enabled ? '开' : '关'}</div>
+            <button onClick={testWechat} className="mt-2 ds-btn-dark px-3 py-1 text-xs">测试微信</button>
+          </div>
+          <div className="border border-line rounded-sm p-3 space-y-1">
+            <div className="font-medium text-ink-95 flex items-center gap-1">邮箱 SMTP <HelpHint text="复用 agent_alert SMTP 物理通道，开关独立于 Agent 告警。" /></div>
+            <div className="text-xs text-ink-80">SMTP：{phys.email.smtp_configured ? '已配置' : '未配置'}</div>
+            <div className="text-xs text-ink-80">环境总开关：{phys.email.env_enabled ? '开' : '关'}</div>
+            <div className="text-xs text-ink-80">场景邮件环境开关：{phys.email.scene_email_env_enabled ? '开' : '关'}</div>
+            <button onClick={testEmail} className="mt-2 ds-btn-dark px-3 py-1 text-xs">测试邮件</button>
+          </div>
+        </div>
+      </Card>
+
+      <Card title="全局渠道">
+        <div className="flex flex-wrap gap-4 mb-3">
+          <NotifyToggle checked={g.wechat_enabled} onChange={v => patchGlobal({ ...g, wechat_enabled: v })} label="微信总开关" />
+          <NotifyToggle checked={g.email_enabled} onChange={v => patchGlobal({ ...g, email_enabled: v })} label="邮件总开关" />
+        </div>
+        <div className="text-xs text-ink-95 mb-1 flex items-center gap-1">钱包低余额告警 <HelpHint text="系统级事件，不属于某个信号通道。" /></div>
+        <div className="flex flex-wrap gap-3">
+          <NotifyToggle checked={g.low_balance.wechat} onChange={v => patchGlobal({ ...g, low_balance: { ...g.low_balance, wechat: v } })} label="微信推送" />
+          {data.catalog.low_balance_fields.map(f => (
+            <NotifyToggle
+              key={f.id}
+              checked={g.low_balance.fields[f.id] !== false}
+              onChange={v => patchGlobal({ ...g, low_balance: { ...g.low_balance, fields: { ...g.low_balance.fields, [f.id]: v } } })}
+              label={f.label}
+            />
+          ))}
+        </div>
+      </Card>
+
+      <Card title="逐信号通知">
+        <div className="flex flex-wrap items-center gap-2 mb-3">
+          <input value={q} onChange={e => setQ(e.target.value)} placeholder="搜索信号名/通道 ID" className="ds-input w-44 text-xs" />
+          <select value={family} onChange={e => setFamily(e.target.value)} className="ds-input text-xs w-32">
+            <option value="ALL">全部信号族</option>
+            {families.map(f => <option key={f} value={f}>{data.catalog.families[f] || f}</option>)}
+          </select>
+          <button onClick={() => setAll(true)} className="px-2 py-1 text-xs rounded-pill border border-line">全部全开</button>
+          <button onClick={() => setAll(false)} className="px-2 py-1 text-xs rounded-pill border border-line">全部全关</button>
+          <button onClick={() => reset()} disabled={saving} className="px-2 py-1 text-xs rounded-pill border border-warning text-warning">恢复默认</button>
+          <button onClick={() => save()} disabled={saving || !dirty} className="ds-btn-primary px-3 py-1 text-xs disabled:opacity-50">
+            {saving ? '保存中…' : dirty ? '保存更改' : '已保存'}
+          </button>
+          {status && !dirty && <span className="text-xs text-positive">{status}</span>}
+          {error && <span className="text-xs text-negative">{error}</span>}
+          {dirty && <span className="text-xs text-warning">有未保存更改</span>}
+        </div>
+        <p className="text-[11px] text-ink-55 mb-2">默认全开，兼容现网。标题与策略通道始终保留。邮件目前只覆盖结算复盘（quote / X4 / 场景）；雷达、成交、弃单走微信。</p>
+        <div className="space-y-2">
+          {filtered.map(ch => {
+            const info = SIGNAL_INFO[ch.channel]
+            const open = !!expanded[ch.channel]
+            return (
+              <div key={ch.channel} className={`border rounded-sm p-2 ${ch.enabled ? 'border-line bg-card' : 'border-line bg-sunken opacity-90'}`}>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    onClick={() => setExpanded(p => ({ ...p, [ch.channel]: !open }))}
+                    className="text-xs text-ink-55 w-5"
+                  >{open ? '▾' : '▸'}</button>
+                  <span className={`ds-badge ${SIGNAL_KIND_BADGE[info?.kind ?? '影子']}`}>{info?.kind ?? ch.family_label}</span>
+                  <span className="text-sm font-medium text-ink-95">{info?.name ?? ch.display_name}</span>
+                  <HelpHint text={info?.desc ?? ch.display_name} />
+                  <span className="text-[10px] font-mono text-ink-55 hidden md:inline">{ch.channel}</span>
+                  <span className="ml-auto" />
+                  <NotifyToggle checked={ch.enabled} onChange={v => patchChannel(ch.channel, { enabled: v })} label="本信号通知" />
+                </div>
+                <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 pl-6">
+                  {Object.entries(data.catalog.events).map(([eid, meta]) => {
+                    const block = ch.config.events[eid] || { fields: {} }
+                    return (
+                      <div key={eid} className="text-xs text-ink-80 flex items-center gap-2">
+                        <span className="text-ink-55" title={meta.hint}>{meta.label}</span>
+                        {meta.transports.includes('wechat') && (
+                          <NotifyToggle checked={block.wechat !== false} onChange={v => patchChannel(ch.channel, { config: { events: { ...ch.config.events, [eid]: { ...block, wechat: v } } } })} label="微信" />
+                        )}
+                        {meta.transports.includes('email') && (
+                          <NotifyToggle checked={block.email !== false} onChange={v => patchChannel(ch.channel, { config: { events: { ...ch.config.events, [eid]: { ...block, email: v } } } })} label="邮件" />
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+                {open && (
+                  <div className="mt-2 pl-6 space-y-2">
+                    {Object.entries(data.catalog.events).map(([eid, meta]) => {
+                      const block = ch.config.events[eid] || { fields: {} }
+                      return (
+                        <div key={eid}>
+                          <div className="text-[11px] text-ink-55 mb-1">{meta.label}字段</div>
+                          <div className="flex flex-wrap gap-x-3 gap-y-1">
+                            {meta.fields.map(f => (
+                              <span key={f.id} className="inline-flex items-center gap-1">
+                                <NotifyToggle
+                                  checked={block.fields?.[f.id] !== false}
+                                  onChange={v => patchChannel(ch.channel, {
+                                    config: {
+                                      events: {
+                                        ...ch.config.events,
+                                        [eid]: { ...block, fields: { ...block.fields, [f.id]: v } },
+                                      },
+                                    },
+                                  })}
+                                  label={f.label}
+                                />
+                                <HelpHint text={f.hint} />
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
+              </div>
+            )
+          })}
+          {filtered.length === 0 && <p className="text-sm text-ink-55">无匹配信号</p>}
+        </div>
+      </Card>
     </div>
   )
 }

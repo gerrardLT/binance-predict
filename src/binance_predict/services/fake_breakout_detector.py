@@ -75,7 +75,8 @@ from .alerting import send_plain_email
 from .data_collector import BinanceDataCollector
 from .live_channels import scene_pattern_to_channel
 from .scene_params import DEFAULT_SCENE_PARAMS, SceneParams
-from .signal_notify import TZ_BJT, has_scene_filled_order, is_live_enabled
+from .notification_config import notify_config
+from .signal_notify import TZ_BJT, has_scene_filled_order, is_live_enabled, is_settled_email_enabled
 from .shadow_version_gate import shadow_gate
 from .wechat_notifier import wechat_notifier
 
@@ -1396,23 +1397,55 @@ class FakeBreakoutDetector:
         settle_price_str = (
             f"{signal.settle_btc_price:.2f}" if signal.settle_btc_price else "N/A"
         )
-        body = (
-            f"确认时间：{t_str}\n"
-            f"场景：{pattern_label}（pattern_type={pt or 'N/A'}）\n"
-            f"{break_line}\n"
-            f"{close_pos_str}\n"
-            f"{vol_str}\n\n"
-            f"目标周期：下一个 15m 市场（到期 {end_str}）\n"
-            f"当时 {direction} token 报价：{entry_15m}\n\n"
-            f"入场方案：\n  {entry_plan}\n\n"
-            f"回测依据（scripts/local_continuation_discovery.py，发现集→验证集盲验）：\n"
-            f"  {backtest}\n"
-            f"机制：破位动能收盘未回吐（买力/卖力耗尽），次周期兑现反转。\n\n"
-            f"——结算结果（周期锚点口径，与币安结算规则一致）——\n"
-            f"结算方向：{settle_outcome or 'N/A'} → 押 {direction} {win_str}\n"
-            f"结算 BTC 价：{settle_price_str}\n"
-            f"当前阶段：系统不下注，仅记录信号并到期回读结算方向。\n"
-        )
+        channel = scene_pattern_to_channel(pt or "") or ""
+
+        def _on(field: str) -> bool:
+            if not channel:
+                return True
+            try:
+                return notify_config.is_field_enabled(channel, "settled", field)
+            except Exception:
+                return True
+
+        parts: list[str] = []
+        if _on("confirm_time"):
+            parts.append(f"确认时间：{t_str}")
+        if _on("scene"):
+            parts.append(f"场景：{pattern_label}（pattern_type={pt or 'N/A'}）")
+        if _on("break_line"):
+            parts.append(break_line)
+        if _on("close_pos"):
+            parts.append(close_pos_str)
+        if _on("vol_ratio"):
+            parts.append(vol_str)
+        if _on("target_window"):
+            parts.append(f"目标周期：下一个 15m 市场（到期 {end_str}）")
+        if _on("entry_quote"):
+            parts.append(f"当时 {direction} token 报价：{entry_15m}")
+        if _on("entry_plan"):
+            parts.append(f"入场方案：\n  {entry_plan}")
+        if _on("backtest"):
+            parts.append(
+                "回测依据（scripts/local_continuation_discovery.py，发现集→验证集盲验）：\n"
+                f"  {backtest}"
+            )
+        if _on("mechanism"):
+            parts.append("机制：破位动能收盘未回吐（买力/卖力耗尽），次周期兑现反转。")
+        settle_bits: list[str] = []
+        if _on("outcome"):
+            settle_bits.append(
+                f"结算方向：{settle_outcome or 'N/A'} → 押 {direction} {win_str}"
+            )
+        if _on("settle_price"):
+            settle_bits.append(f"结算 BTC 价：{settle_price_str}")
+        if settle_bits:
+            parts.append(
+                "——结算结果（周期锚点口径，与币安结算规则一致）——\n"
+                + "\n".join(settle_bits)
+            )
+        if _on("disclaimer"):
+            parts.append("当前阶段：系统不下注，仅记录信号并到期回读结算方向。")
+        body = "\n".join(parts) + ("\n" if parts else "")
         return await send_plain_email(subject, body)
 
     # ==================================================================
@@ -1616,6 +1649,8 @@ class FakeBreakoutDetector:
             for row_id, pt in settled_rows:
                 channel = scene_pattern_to_channel(pt) if pt else None
                 if channel is None or not is_live_enabled(channel):
+                    continue
+                if not is_settled_email_enabled(channel):
                     continue
                 if not await has_scene_filled_order(row_id):
                     continue

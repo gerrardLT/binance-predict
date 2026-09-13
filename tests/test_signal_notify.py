@@ -120,7 +120,7 @@ async def test_push_respects_daily_cap(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_fire_signal_email_swallows_errors(monkeypatch) -> None:
-    async def _boom(tag, subject, body, now_ms):
+    async def _boom(tag, subject, body, now_ms, channel=None):
         raise RuntimeError("smtp down")
 
     monkeypatch.setattr(sn, "push_signal_email", _boom)
