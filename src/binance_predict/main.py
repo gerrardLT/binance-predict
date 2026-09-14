@@ -3679,6 +3679,12 @@ SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     # 真实 EV 由生产报价前向现算（低买 UP 的正 EV 来自入场价而非胜率）
     "s2_cond_t4_v1": (0.389, None, "S2条件t=4: 实盘S2(bear_exhaust,破4h支撑+收阴+放量)派生→次周期t=4(+240s)1m收盘<周期开盘(全深度回落)→押次周期15m UP(收阳赢)（720d触发1069/2176=49.1%/1.48天,价-only胜率38.9%；开盘即买EV≈−0.042不赚钱,等t=4低买UP正EV来自入场价；真实EV前向现算,报价表研究EV+0.237属乐观上界）"),
     "s2_cond_t5d_v1": (0.448, None, "S2条件t=5剔深: 同S2派生→次周期t=5(+300s)0<ln(开盘/px5)<15bp(中度回落剔深)→押次周期15m UP(收阳赢)（720d触发643/2176=29.5%/0.89天,价-only胜率44.8%；剔深单均优于t=4全深度；真实EV前向现算,报价表研究EV+0.283属乐观上界）"),
+    # rev2 孕线反转族（2026-09-09 / 2026-09-13）：前置高/低点最长实体柱+信号柱完全包裹(Inside Bar)，
+    # 押次根收盘反转（kline_shadow_signals 表），15m 为经典 Ver2（短影≤10%），5m 为精选 HM（下影[75%,90%)）。
+    # 实盘挂 LIMIT 单（默认 0.30 护栏）；bench 胜率=720d 纯 K 线次根反转结算基准点估计；EV 由真实报价前向现算
+    "hm_inside_15m_v2": (0.557, None, "15m孕线上吊线: 前置高点大阳+Inside Bar+下影≥45%上影≤10% → 押次根15m DOWN（720d n=237 胜率55.7%，30d 60.0%；EV按目标窗真实报价前向现算）"),
+    "ih_inside_15m_v2": (0.546, None, "15m孕线倒垂线: 前置低点大阴+Inside Bar+上影≥45%下影≤10% → 押次根15m UP（720d n=183 胜率54.6%，30d 77.8%；EV按目标窗真实报价前向现算）"),
+    "hm_inside_5m_v2": (0.585, None, "5m孕线上吊线精选: 前置高点大阳+Inside Bar+下影[75%,90%)上影≤10% → 押次根5m DOWN（720d n=371 胜率58.5%，30d 71.4%；EV按目标窗真实报价前向现算）"),
 }
 # 周期切分点：08-19 00:00 UTC（三根大阳起点）；< 为震荡期（大涨前），≥ 为大涨期
 PUMP_TS_MS = int(datetime(2026, 8, 19, tzinfo=timezone.utc).timestamp() * 1000)
@@ -3891,6 +3897,8 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
         # 首触反转 G7 系列（2026-09-08 优化衍生，专用表 firsthit_shadow_signals，独立下单）
         "firsthit_down_g7_v1", "g7_streak_v1", "g7_wick20_v1",
         "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",
+        # rev2 孕线反转族（2026-09-09 / 2026-09-13：15m HM/IH + 5m HM 精选，kline_shadow_signals 表）
+        "hm_inside_15m_v2", "ih_inside_15m_v2", "hm_inside_5m_v2",
     ]
     versions += sorted({s.version for s in sh_rows} - set(versions))
     # 影子版本 → 实盘通道状态（version==通道名，2026-09-06 promote + x4_v3 注册后 13 通道；

@@ -6118,6 +6118,10 @@ const SHADOW_META: Record<string, { label: string; color: string }> = {
   g7_strict_v1: { label: '首触G7 严格版 streak≤1∧wick≥1.5bp→DOWN', color: 'var(--chart-9)' },
   g7_q05_v1: { label: '首触G7 深折价 q≤0.05→DOWN', color: 'var(--chart-10)' },
   g7_t270_v1: { label: '首触G7 非极晚 t≤270s→DOWN', color: 'var(--chart-1)' },
+  // 2026-09-09 / 2026-09-13 Rev2 经典孕线反转族（共表 kline_shadow_signals，影子+实盘通道）
+  hm_inside_15m_v2: { label: '15m 孕线上吊线 Inside Bar→DOWN', color: 'var(--chart-2)' },
+  ih_inside_15m_v2: { label: '15m 孕线倒垂线 Inside Bar→UP', color: 'var(--chart-3)' },
+  hm_inside_5m_v2: { label: '5m 孕线上吊线精选 Inside Bar→DOWN', color: 'var(--chart-4)' },
 }
 /* 场景曲线色 = chart-1..5。
    注意：label 是 recharts 的 dataKey 本身，改 label 会同时改曲线与图例（AGENTS.md 明示），
@@ -6166,6 +6170,9 @@ const ANALYTICS_EXTRA_DESC: Record<string, string> = {
   g7_strict_v1: '首触反转 G7 严格版：G7 组合 + streak_up≤1 ∧ upper_wick_bps≥1.5bp。双重质量门，回测 Calib 胜率 23.0% (EV +3.27)，Confirm 胜率 20.8% (EV +2.68，CI[+0.68,+4.51])，FDR q=0.0030，日均 ~2.9 单。落专用表 firsthit_shadow_signals。实盘护栏 0.12。',
   g7_q05_v1: '首触反转 G7 深折价：G7 组合 + 进场报价 q≤0.05（极端凸性赔率档，单注赢付 >18.6x）。回测单注 EV +4.10~+5.77，日均 ~1.3 单。落专用表 firsthit_shadow_signals。实盘护栏 0.05。',
   g7_t270_v1: '首触反转 G7 非极晚：G7 组合 + 触发时刻 t≤270s（排除最后 30s 缺乏均值回归扩散时间的毒瘤窗）。回测 Confirm 胜率 30.4% (EV +3.08)，FDR q=0.0002，日均 ~2.1 单。落专用表 firsthit_shadow_signals。实盘护栏 0.10。',
+  hm_inside_15m_v2: '15m 经典孕线上吊线反转：前置 4 根高点最长实体阳线 + 信号柱完全包裹(Inside Bar) + 顶部长下影上吊线(lower_r≥45%)、短上影 upper_r≤10% → 押次根 15m 收阴 DOWN。落表 kline_shadow_signals。720d 全样本回测 n=237 胜率 55.7%，30d 胜率 60.0%。实盘默认 LIMIT 挂单护栏 0.30。EV 按目标窗真实报价前向现算。',
+  ih_inside_15m_v2: '15m 经典孕线倒垂线反转：前置 4 根低点最长实体阴线 + 信号柱完全包裹(Inside Bar) + 底部长上影倒垂线(upper_r≥45%)、短下影 lower_r≤10% → 押次根 15m 收阳 UP。落表 kline_shadow_signals。720d 全样本回测 n=183 胜率 54.6%，30d 胜率 77.8%。实盘默认 LIMIT 挂单护栏 0.30。EV 按目标窗真实报价前向现算。',
+  hm_inside_5m_v2: '5m 孕线上吊线精选反转：前置 4 根高点最长实体阳线 + 信号柱完全包裹(Inside Bar) + 下影占比 [75%,90%)、短上影 upper_r≤10% → 押次根 5m 收阴 DOWN。落表 kline_shadow_signals。720d 全样本回测 n=371 胜率 58.5%，30d 胜率 71.4%。实盘默认 LIMIT 挂单护栏 0.30。EV 按目标窗真实报价前向现算。',
 }
 const signalDescFor = (kind: 'scene' | 'shadow', key: string): string => {
   if (ANALYTICS_EXTRA_DESC[key]) return ANALYTICS_EXTRA_DESC[key]

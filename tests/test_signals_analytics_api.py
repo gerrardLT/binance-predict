@@ -292,6 +292,8 @@ async def test_analytics_empty_db() -> None:
         # 2026-09-08 首触 G7 系列六变体
         "firsthit_down_g7_v1", "g7_streak_v1", "g7_wick20_v1",
         "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",
+        # rev2 孕线反转族
+        "hm_inside_15m_v2", "ih_inside_15m_v2", "hm_inside_5m_v2",
     }
     for v, blk in out["shadow"].items():
         assert blk["summary"]["n"] == 0
@@ -362,6 +364,16 @@ async def test_analytics_empty_db() -> None:
         cb = out["shadow"][ver]["summary"]
         assert cb["bench_winrate"] == bwr and cb["bench_ev"] is None
         assert cb["desc"].startswith(dpre)
+    # rev2 孕线反转族：720d 纯 K 线反转结算基准点估计只钉胜率，EV 留 None
+    hm15 = out["shadow"]["hm_inside_15m_v2"]["summary"]
+    assert hm15["bench_winrate"] == 0.557 and hm15["bench_ev"] is None
+    assert hm15["desc"].startswith("15m孕线上吊线")
+    ih15 = out["shadow"]["ih_inside_15m_v2"]["summary"]
+    assert ih15["bench_winrate"] == 0.546 and ih15["bench_ev"] is None
+    assert ih15["desc"].startswith("15m孕线倒垂线")
+    hm5 = out["shadow"]["hm_inside_5m_v2"]["summary"]
+    assert hm5["bench_winrate"] == 0.585 and hm5["bench_ev"] is None
+    assert hm5["desc"].startswith("5m孕线上吊线精选")
     # S2 条件单族（共表 kline_shadow_signals）：基准只钉 720d 冻结「价-only」胜率（硬数字，
     # 审计锚点 scripts/s2_cond_freeze_counts_720d.py）；EV 基准留 None——报价表研究 EV
     # (+0.237/+0.283) 属乐观上界，真实 EV 由生产报价前向现算（低买 UP 的正 EV 来自入场价）

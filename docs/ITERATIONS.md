@@ -3,6 +3,15 @@
 新功能 / bug 修复 / 功能改造，改完在**最上方**追加一条。格式：问题 / 改动 / 验证 / 遗留，每条 5-8 行。
 豁免：纯 UI 微调、纯文档、一次性脚本。触碰交易语义 / 资金 / DB / 部署 / 新功能则必记。
 
+## 2026-09-14 Rev2 经典孕线反转族补充回测胜率与前端分析配置 `pending commit`
+
+**问题** 前端信号分析面板中 Rev2 经典孕线反转族（hm_inside_15m_v2、ih_inside_15m_v2、hm_inside_5m_v2）回测胜率显示为 `--`，且 SHADOW_META 缺少专属图表配置。
+**改动** 在 `src/binance_predict/main.py` 的 `SHADOW_BENCH` 和分析端点版本列表中补齐 3 个版本 720d 历史全样本回测胜率（55.7%、54.6%、58.5%）及详细说明，在 `frontend/src/App.tsx` 中配置 `SHADOW_META` 图表元数据。
+**验证** 运行 `tests/test_signals_analytics_api.py` 及 `tests/test_rev2_inside_shadow_detector.py` 单元测试全部通过，前端 `npm run build` 打包通过无报错。
+**遗留** 胜率为 720d 纯 K 线次根反转结算基准点估计，真实入场 EV 与胜率将在影子信号落库与实盘结算中持续前向累计更新。
+
+---
+
 ## 2026-09-14 首触反转族及 G7 变体补充回测胜率与 EV 基准 `pending commit`
 
 **问题** 前端信号分析面板中首触反转族（G0/G1/G3/G4）及 G7 系列 6 个变体的回测胜率与 EV 均为 `--`，无法在累积胜率曲线及分析表格中对照历史基准。
