@@ -69,6 +69,13 @@ from binance_predict.db.models import (
 
 from .absorption_shadow_detector import ABSORPTION_SPECS
 from .btc_regime import regime_feed
+from .live_execution_policy import config_fingerprint, evaluate_absorption_policy
+from .shadow_execution_registry import SHADOW_VERSION_SPECS
+from .shadow_execution_store import (
+    get_or_create_runtime_assessment,
+    patch_assessment,
+)
+from .shadow_execution_types import AssessmentPatch, ReasonCode, TerminalStage
 from .firsthit_shadow_detector import (
     FIRSTHIT_SPECS,
     extract_firsthit_features,
@@ -215,6 +222,187 @@ class MultiLiveTrader:
         self._healed_total = 0
         self._stopped = False                    # stop 后拒绝派生新下单任务
         self._running = False
+
+    def _runtime_assessment_context(
+        self,
+        channel: str,
+        window_start: int,
+        direction: str,
+        *,
+        input_snapshot: dict | None = None,
+    ) -> dict | None:
+        """Freeze the runtime facts needed to create an assessment at order reservation."""
+        spec = SHADOW_VERSION_SPECS.get(channel)
+        live_spec = self._specs.get(channel)
+        cfg = self._configs.get(channel)
+        if spec is None or live_spec is None or cfg is None:
+            return None
+        max_exec_price = resolve_max_exec(live_spec, cfg)
+        config_snapshot = {
+            "enabled": cfg.enabled,
+            "amount_usdt": cfg.amount_usdt,
+            "max_daily_orders": cfg.max_daily_orders,
+            "max_exec_price": max_exec_price,
+            "order_type": live_spec.order_type,
+            "entry_band_whitelist": live_spec.entry_band_whitelist,
+        }
+        return {
+            "source_type": spec.source_type.value,
+            "signal_version": channel,
+            "target_window_start": window_start,
+            "market_period": live_spec.market_period,
+            "direction": direction,
+            "patch_values": {
+                "strategy_eligible": True,
+                "live_channel": channel,
+                "channel_mapped": True,
+                "enabled": cfg.enabled,
+                "retired": False,
+                "order_type": live_spec.order_type,
+                "amount_usdt": cfg.amount_usdt,
+                "max_daily_orders": cfg.max_daily_orders,
+                "effective_max_exec_price": max_exec_price,
+                "config_fingerprint": config_fingerprint(config_snapshot),
+                "config_snapshot": config_snapshot,
+                "input_snapshot": input_snapshot or {},
+            },
+        }
+
+    async def _ensure_runtime_assessment(
+        self,
+        channel: str,
+        window_start: int,
+        direction: str,
+        *,
+        input_snapshot: dict | None = None,
+        context: dict | None = None,
+        stage: TerminalStage = TerminalStage.STRATEGY,
+        reason: ReasonCode = ReasonCode.PASSED,
+        **outcome_values,
+    ) -> int | None:
+        """Persist one final rejection outcome atomically; failures never alter the decision."""
+        runtime_context = context or self._runtime_assessment_context(
+            channel, window_start, direction, input_snapshot=input_snapshot)
+        if runtime_context is None:
+            return None
+        identity = {
+            key: runtime_context[key]
+            for key in (
+                "source_type", "signal_version", "target_window_start",
+                "market_period", "direction",
+            )
+        }
+        patch_values = {**runtime_context["patch_values"], **outcome_values}
+        try:
+            async with async_session_factory() as session:
+                row = await get_or_create_runtime_assessment(session, **identity)
+                await patch_assessment(
+                    session,
+                    AssessmentPatch(
+                        assessment_id=int(row.id),
+                        stage=stage,
+                        reason=reason,
+                        **patch_values,
+                    ),
+                )
+                await session.commit()
+                return int(row.id)
+        except Exception as exc:
+            logger.error(
+                "多通道实盘：执行评估建账失败（不影响下单）| channel={} | window={} | {}",
+                channel, window_start, exc,
+            )
+            return None
+
+    async def _patch_runtime_assessment(
+        self,
+        assessment_id: int | None,
+        stage: TerminalStage,
+        reason: ReasonCode,
+        **values,
+    ) -> None:
+        if assessment_id is None:
+            return
+        try:
+            async with async_session_factory() as session:
+                await patch_assessment(
+                    session,
+                    AssessmentPatch(
+                        assessment_id=assessment_id,
+                        stage=stage,
+                        reason=reason,
+                        **values,
+                    ),
+                )
+                await session.commit()
+        except Exception as exc:
+            logger.error(
+                "多通道实盘：执行评估更新失败（不影响下单）| assessment={} | stage={} | {}",
+                assessment_id, stage.value, exc,
+            )
+
+    async def _record_strategy_outcome(
+        self,
+        channel: str,
+        window_start: int,
+        *,
+        reason: str,
+        rejected: bool,
+        input_snapshot: dict | None = None,
+    ) -> None:
+        """Record a final async strategy gate result without affecting its decision."""
+        await self._ensure_runtime_assessment(
+            channel,
+            window_start,
+            "DOWN",
+            input_snapshot=input_snapshot,
+            stage=TerminalStage.STRATEGY,
+            reason=(
+                ReasonCode.STRATEGY_REJECTED
+                if rejected
+                else ReasonCode.STRATEGY_DATA_MISSING
+            ),
+            strategy_eligible=False if rejected else None,
+            decision_snapshot={"strategy_reason": reason},
+        )
+
+    async def _prepare_runtime_execution(
+        self,
+        channel: str,
+        window_start: int,
+        direction: str,
+        *,
+        input_snapshot: dict | None = None,
+    ) -> tuple[dict | None, bool]:
+        """Run operational guards without a standalone observation write on pass paths."""
+        context = self._runtime_assessment_context(
+            channel, window_start, direction, input_snapshot=input_snapshot)
+        cfg = self._configs[channel]
+        filled_today = await self._count_filled_today(channel)
+        if filled_today >= cfg.max_daily_orders:
+            await self._ensure_runtime_assessment(
+                channel,
+                window_start,
+                direction,
+                context=context,
+                stage=TerminalStage.OPERATIONAL,
+                reason=ReasonCode.DAILY_LIMIT_REACHED,
+                operational_eligible=False,
+                decision_snapshot={"filled_today": filled_today},
+            )
+            return None, False
+        if await self._has_attempt(channel, window_start):
+            await self._ensure_runtime_assessment(
+                channel,
+                window_start,
+                direction,
+                context=context,
+                stage=TerminalStage.OPERATIONAL,
+                reason=ReasonCode.DUPLICATE_WINDOW,
+                operational_eligible=False,
+            )
+            return None, False
+        return context, True
 
     # ------------------------------------------------------------------
     # quote_edge 族：采样循环喂价 → 区间命中 → 开火
@@ -400,23 +588,23 @@ class MultiLiveTrader:
                 continue                     # 标定缺失/缓冲不足 → 保守不开火
             k, b, disp_gate, under_gate = fitted
             up_open, btc_open = self._abs_open[window_start_ms]
-            if btc_open <= 0:
-                continue
-            btc_move = (float(btc_price) - btc_open) / btc_open * 1e4      # bp
-            up_move = (float(up_price) - up_open) * 100.0                  # pp（real 基）
-            if btc_move == 0.0:
-                continue
-            # 冻结口径（absorption_shadow_detector._process_window 同源，勿改符号）：
-            # under = −sign(btc_move)·(up_move − (k·btc_move + b))，>0 = 报价欠反应/粘滞
-            resid = up_move - (k * btc_move + b)
-            under = -math.copysign(1.0, btc_move) * resid
-            if abs(btc_move) < disp_gate or under < under_gate:
+            policy = evaluate_absorption_policy(
+                btc_price=float(btc_price),
+                btc_open=btc_open,
+                up_price=float(up_price),
+                up_open=up_open,
+                k=k,
+                b=b,
+                disp_gate=disp_gate,
+                under_gate=under_gate,
+            )
+            if not policy.eligible or policy.prediction is None:
                 continue                     # 位移门/欠反应门未过
-            prediction = "UP" if btc_move > 0 else "DOWN"   # follow：顺 btc 补涨
             cfg.fired.add(window_start_ms)
             task = asyncio.create_task(
-                self._fire_absorption(ch, window_start_ms, prediction,
-                                      t_rel, float(up_price), btc_move, under),
+                self._fire_absorption(
+                    ch, window_start_ms, policy.prediction,
+                    t_rel, float(up_price), float(policy.btc_move), float(policy.under)),
                 name=f"live_abs_{ch}_{window_start_ms}",
             )
             self._tasks.add(task)
@@ -514,6 +702,18 @@ class MultiLiveTrader:
                 logger.info(
                     "多通道实盘：{} v3 环境门禁未过，弃单 | 窗口 {} | 原因={}",
                     channel, _fmt_win(window_start), reason)
+                await self._record_strategy_outcome(
+                    channel,
+                    window_start,
+                    reason=reason,
+                    rejected=reason in {"prev_not_down", "env_guard_reject"},
+                    input_snapshot={
+                        "t_rel": t_rel,
+                        "down_price": down_price,
+                        "btc_price": btc_price,
+                        "quote_ts": quote_ts,
+                    },
+                )
                 return
             await self._fire_quote_edge(channel, window_start, window_end,
                                         t_rel, down_price)
@@ -545,6 +745,18 @@ class MultiLiveTrader:
                 logger.info(
                     "多通道实盘：{} 深夜距日高门禁未过，弃单 | 窗口 {} | 原因={}",
                     channel, _fmt_win(window_start), reason)
+                await self._record_strategy_outcome(
+                    channel,
+                    window_start,
+                    reason=reason,
+                    rejected=reason == "dd_guard_reject",
+                    input_snapshot={
+                        "t_rel": t_rel,
+                        "down_price": down_price,
+                        "btc_price": btc_price,
+                        "quote_ts": quote_ts,
+                    },
+                )
                 return
             await self._fire_quote_edge(channel, window_start, window_end,
                                         t_rel, down_price)
@@ -581,6 +793,17 @@ class MultiLiveTrader:
                 logger.info(
                     "多通道实盘：{} regime 门禁未过，弃单 | 窗口 {} | 原因={}",
                     channel, _fmt_win(window_start), reason)
+                await self._record_strategy_outcome(
+                    channel,
+                    window_start,
+                    reason=reason,
+                    rejected=reason in {"regime_reject", "no_regime_guard"},
+                    input_snapshot={
+                        "t_rel": t_rel,
+                        "down_price": down_price,
+                        "quote_ts": quote_ts,
+                    },
+                )
                 return
             await self._fire_quote_edge(channel, window_start, window_end,
                                         t_rel, down_price)
@@ -733,6 +956,17 @@ class MultiLiveTrader:
                 logger.info(
                     "多通道实盘：{} v3 非连涨门禁未过，弃单 | 窗口 {} | 原因={}",
                     channel, _fmt_win(window_start), reason)
+                await self._record_strategy_outcome(
+                    channel,
+                    window_start,
+                    reason=reason,
+                    rejected=reason in {"streak_reject", "no_streak_guard"},
+                    input_snapshot={
+                        "t_rel": t_rel,
+                        "down_price": down_price,
+                        "quote_ts": quote_ts,
+                    },
+                )
                 return
             await self._fire_quote_edge(channel, window_start, window_end,
                                         t_rel, down_price)
@@ -777,25 +1011,66 @@ class MultiLiveTrader:
         return self._group_locks.setdefault(key, asyncio.Lock())
 
     async def _exec_with_exclusive(self, channel: str, **trade_kwargs) -> dict | None:
-        """下单 + 同窗互斥槽：互斥组内每市场窗口至多一个通道成交。
-
-        (组, 窗口) 锁串行化组内并发下单尝试；DB 已成交检查覆盖服务重启。
-        未成交（护栏弃单/失败/占位）不占槽，组内后续通道仍可下单。
-        不在组的通道直连下单（行为零变化）。
-        """
-        grp = exclusive_group(channel)
+        """下单 + 同窗互斥槽：互斥组内每市场窗口至多一个通道成交。"""
         window_start = int(trade_kwargs["window_start"])
+        assessment_id = trade_kwargs.get("assessment_id")
+        context = trade_kwargs.get("assessment_context")
+        if assessment_id is None and context is None:
+            context = self._runtime_assessment_context(
+                channel,
+                window_start,
+                str(trade_kwargs["prediction"]),
+            )
+            if context is not None:
+                trade_kwargs["assessment_context"] = context
+
+        async def _mark_operational_pass() -> None:
+            if context is not None:
+                context["patch_values"] = {
+                    **context["patch_values"],
+                    "operational_eligible": True,
+                }
+            elif assessment_id is not None:
+                await self._patch_runtime_assessment(
+                    assessment_id,
+                    TerminalStage.OPERATIONAL,
+                    ReasonCode.PASSED,
+                    operational_eligible=True,
+                )
+
+        grp = exclusive_group(channel)
         if grp is None:
+            await _mark_operational_pass()
             return await self._trader.execute_signal_trade(**trade_kwargs)
         async with self._group_lock(grp, window_start):
             taken = self._window_filled.get(window_start, set()) & grp
             persisted = None if taken else await self._group_filled_channel(grp, window_start)
             if taken or persisted is not None:
                 blockers = sorted(taken) if taken else [persisted]
+                if context is not None:
+                    await self._ensure_runtime_assessment(
+                        channel,
+                        window_start,
+                        str(trade_kwargs["prediction"]),
+                        context=context,
+                        stage=TerminalStage.OPERATIONAL,
+                        reason=ReasonCode.EXCLUSIVE_GROUP_BLOCKED,
+                        operational_eligible=False,
+                        exclusive_blocker_channel=blockers[0],
+                    )
+                else:
+                    await self._patch_runtime_assessment(
+                        assessment_id,
+                        TerminalStage.OPERATIONAL,
+                        ReasonCode.EXCLUSIVE_GROUP_BLOCKED,
+                        operational_eligible=False,
+                        exclusive_blocker_channel=blockers[0],
+                    )
                 logger.info(
                     "多通道实盘：{} 同窗互斥弃单 | 窗口 {} | 已被 {} 成交",
                     channel, _fmt_win(window_start), blockers)
                 return None
+            await _mark_operational_pass()
             order = await self._trader.execute_signal_trade(**trade_kwargs)
             if order is not None and order.get("status") in ("FILLED", "PENDING"):
                 self._window_filled.setdefault(window_start, set()).add(channel)
@@ -904,19 +1179,20 @@ class MultiLiveTrader:
             return
         spec = self._specs[version]
         try:
-            filled_today = await self._count_filled_today(version)
-            if filled_today >= cfg.max_daily_orders:
-                logger.warning(
-                    "多通道实盘：{} 日单量护栏停火 | 目标窗 {} | 今日已成交 {} ≥ {}",
-                    version, _fmt_win(target_start), filled_today, cfg.max_daily_orders)
-                return
-            if await self._has_attempt(version, target_start):
+            assessment_context, proceed = await self._prepare_runtime_execution(
+                version,
+                target_start,
+                "DOWN",
+                input_snapshot={"source_id": sig_id},
+            )
+            if not proceed:
                 return
             logger.info(
                 "多通道实盘开火 | {} | x4 决策点押 DOWN | 目标窗 {} | 金额 {} | 护栏 {}",
                 version, _fmt_win(target_start), cfg.amount_usdt,
                 resolve_max_exec(spec, cfg))
-            order = await self._trader.execute_signal_trade(
+            order = await self._exec_with_exclusive(
+                version,
                 prediction="DOWN",
                 amount_usdt=cfg.amount_usdt,
                 signal_version=version,
@@ -925,6 +1201,7 @@ class MultiLiveTrader:
                 market_period="5m",
                 entry_band_whitelist=spec.entry_band_whitelist,
                 order_type=spec.order_type,
+                assessment_context=assessment_context,
             )
             await self._after_fill(order, version, cfg)
             if order is not None and order.get("status") == "FILLED":
@@ -1002,13 +1279,13 @@ class MultiLiveTrader:
         # side=high（多头耗尽/动量衰竭）押 DOWN；side=low（空头耗尽）押 UP
         prediction = "DOWN" if sig.get("side") == "high" else "UP"
         try:
-            filled_today = await self._count_filled_today(channel)
-            if filled_today >= cfg.max_daily_orders:
-                logger.warning(
-                    "多通道实盘：{} 日单量护栏停火 | 周期 {} | 今日已成交 {} ≥ {}",
-                    channel, _fmt_win(market_start), filled_today, cfg.max_daily_orders)
-                return
-            if await self._has_attempt(channel, market_start):
+            assessment_context, proceed = await self._prepare_runtime_execution(
+                channel,
+                market_start,
+                prediction,
+                input_snapshot={"source_id": sig.get("id"), "side": sig.get("side")},
+            )
+            if not proceed:
                 return
             logger.info(
                 "多通道实盘开火 | {} | 15m 周期开盘押 {} | 周期 {} | 金额 {} | 护栏 {}",
@@ -1024,6 +1301,7 @@ class MultiLiveTrader:
                 market_period="15m",
                 scene_signal_id=int(sig["id"]),
                 order_type=spec.order_type,
+                assessment_context=assessment_context,
             )
             await self._after_fill(order, channel, cfg)
             # scene_signal_id 下单即落库（无需 signal_id 回填）
@@ -1103,13 +1381,13 @@ class MultiLiveTrader:
         # 判价命中（次周期内 1m 收盘<周期开盘）→ 押 UP 收阳（研究冻结方向，恒 UP）
         prediction = "UP"
         try:
-            filled_today = await self._count_filled_today(channel)
-            if filled_today >= cfg.max_daily_orders:
-                logger.warning(
-                    "多通道实盘：{} 日单量护栏停火 | 周期 {} | 今日已成交 {} ≥ {}",
-                    channel, _fmt_win(market_start), filled_today, cfg.max_daily_orders)
-                return
-            if await self._has_attempt(channel, market_start):
+            assessment_context, proceed = await self._prepare_runtime_execution(
+                channel,
+                market_start,
+                prediction,
+                input_snapshot={"parent_id": sig.get("parent_id")},
+            )
+            if not proceed:
                 return
             logger.info(
                 "多通道实盘开火 | {} | S2条件判价命中押 {} | 周期 {} | 金额 {} | 护栏 {} | 父信号 #{}",
@@ -1124,6 +1402,7 @@ class MultiLiveTrader:
                 max_exec_price=resolve_max_exec(spec, cfg),
                 market_period="15m",
                 order_type=spec.order_type,
+                assessment_context=assessment_context,
             )
             await self._after_fill(order, channel, cfg)
             # kline 影子信号无订单 signal_id 关联列，对账走 signal_version+window_start
@@ -1137,13 +1416,13 @@ class MultiLiveTrader:
         market_start = int(sig["market_start"])
         prediction = str(sig.get("direction") or spec.direction)  # 冻结方向（本族恒 UP）
         try:
-            filled_today = await self._count_filled_today(channel)
-            if filled_today >= cfg.max_daily_orders:
-                logger.warning(
-                    "多通道实盘：{} 日单量护栏停火 | 窗口 {} | 今日已成交 {} ≥ {}",
-                    channel, _fmt_win(market_start), filled_today, cfg.max_daily_orders)
-                return
-            if await self._has_attempt(channel, market_start):
+            assessment_context, proceed = await self._prepare_runtime_execution(
+                channel,
+                market_start,
+                prediction,
+                input_snapshot={"signal_bar_start": sig.get("signal_bar_start")},
+            )
+            if not proceed:
                 return
             logger.info(
                 "多通道实盘开火 | {} | nextbar 新根命中押 {} | 窗口 {} | 金额 {} | 护栏 {}",
@@ -1158,6 +1437,7 @@ class MultiLiveTrader:
                 max_exec_price=resolve_max_exec(spec, cfg),
                 market_period=spec.market_period,
                 order_type=spec.order_type,
+                assessment_context=assessment_context,
             )
             await self._after_fill(order, channel, cfg)
         except Exception as exc:
@@ -1172,13 +1452,18 @@ class MultiLiveTrader:
         cfg = self._configs[channel]
         win_label = _fmt_win(window_start)
         try:
-            filled_today = await self._count_filled_today(channel)
-            if filled_today >= cfg.max_daily_orders:
-                logger.warning(
-                    "多通道实盘：{} 日单量护栏停火 | 窗口 {} | 今日已成交 {} ≥ {}",
-                    channel, win_label, filled_today, cfg.max_daily_orders)
-                return
-            if await self._has_attempt(channel, window_start):
+            assessment_context, proceed = await self._prepare_runtime_execution(
+                channel,
+                window_start,
+                prediction,
+                input_snapshot={
+                    "t_rel": t_rel,
+                    "up_price": up_price,
+                    "btc_move": btc_move,
+                    "under": under,
+                },
+            )
+            if not proceed:
                 return
             logger.info(
                 "多通道实盘开火 | {} | 吸收跟随押 {} | 窗口 {} | t=+{:.0f}s up={:.3f}"
@@ -1194,6 +1479,7 @@ class MultiLiveTrader:
                 max_exec_price=resolve_max_exec(spec, cfg),
                 market_period="5m",
                 order_type=spec.order_type,
+                assessment_context=assessment_context,
             )
             await self._after_fill(order, channel, cfg)
         except Exception as exc:
@@ -1211,13 +1497,13 @@ class MultiLiveTrader:
         cfg = self._configs[channel]
         win_label = _fmt_win(window_start)
         try:
-            filled_today = await self._count_filled_today(channel)
-            if filled_today >= cfg.max_daily_orders:
-                logger.warning(
-                    "多通道实盘：{} 日单量护栏停火 | 窗口 {} | 今日已成交 {} ≥ {}",
-                    channel, win_label, filled_today, cfg.max_daily_orders)
-                return
-            if await self._has_attempt(channel, window_start):
+            assessment_context, proceed = await self._prepare_runtime_execution(
+                channel,
+                window_start,
+                "DOWN",
+                input_snapshot={"features": ext, "streak_up": streak_up},
+            )
+            if not proceed:
                 return
             dyn_guard = _resolve_firsthit_dynamic_guard(spec, cfg, ext, streak_up)
             logger.info(
@@ -1235,6 +1521,7 @@ class MultiLiveTrader:
                 max_exec_price=dyn_guard,
                 market_period="5m",
                 order_type=spec.order_type,
+                assessment_context=assessment_context,
             )
             await self._after_fill(order, channel, cfg)
         except Exception as exc:
@@ -1296,15 +1583,13 @@ class MultiLiveTrader:
         cfg = self._configs[channel]
         win_label = _fmt_win(window_start)
         try:
-            # 日单量护栏（DB 口径，重启不清零）
-            filled_today = await self._count_filled_today(channel)
-            if filled_today >= cfg.max_daily_orders:
-                logger.warning(
-                    "多通道实盘：{} 日单量护栏停火 | 窗口 {} | 今日已成交 {} ≥ {}",
-                    channel, win_label, filled_today, cfg.max_daily_orders)
-                return
-            # 重启防重：DB 已有本通道本窗尝试记录（FILLED/FAILED 皆算）则跳过
-            if await self._has_attempt(channel, window_start):
+            assessment_context, proceed = await self._prepare_runtime_execution(
+                channel,
+                window_start,
+                "DOWN",
+                input_snapshot={"t_rel": t_rel, "down_price": down_price},
+            )
+            if not proceed:
                 return
             logger.info(
                 "多通道实盘开火 | {} | LIVE 下单押 DOWN | 窗口 {} | t=+{:.0f}s"
@@ -1320,6 +1605,7 @@ class MultiLiveTrader:
                 max_exec_price=resolve_max_exec(spec, cfg),
                 market_period="5m",
                 order_type=spec.order_type,
+                assessment_context=assessment_context,
             )
             if order is None:
                 # 同窗已有占位（重启/并发重复）或前置配置缺失，未花钱，正常路径

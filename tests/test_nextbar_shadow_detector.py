@@ -13,6 +13,7 @@ output/klines_{15m,5m}_720d.csv（缺失时 skip，CI 无产物不阻塞）。
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -35,6 +36,7 @@ from binance_predict.services.nextbar_shadow_detector import (
 ROOT = Path(__file__).resolve().parents[1]
 CSV_15M = ROOT / "output" / "klines_15m_720d.csv"
 CSV_5M = ROOT / "output" / "klines_5m_720d.csv"
+FROZEN_LAST_DATE = "2026-09-04"
 
 # 冻结全样本触发计数（freeze_nb_thresholds.py 复现，与检测器 condition_mask 路径对齐）
 # 2026-09-04 重冻结（沿用 KREV 2026-09-01 先例）：720d K 线产物刷新至 2026-09-04，
@@ -67,11 +69,22 @@ def _rows_from_kl(kl, lo: int, hi: int) -> list[dict]:
 # 口径保真（硬闸门）：实时求值路径与 720d 离线冻结计数逐位一致
 # ============================================================
 
+def _require_frozen_snapshot(kl, timeframe: str) -> None:
+    last_date = datetime.fromtimestamp(
+        int(kl.t[-1]) / 1000, tz=timezone.utc
+    ).date().isoformat()
+    if last_date != FROZEN_LAST_DATE:
+        pytest.skip(
+            f"720d {timeframe} K 线截止 {last_date}，冻结计数仅适用于 {FROZEN_LAST_DATE}"
+        )
+
+
 @pytest.fixture(scope="module")
 def env_15m():
     if not CSV_15M.exists():
         pytest.skip("720d 15m K 线产物不存在（离线口径测试跳过）")
     kl = load_klines_csv(str(CSV_15M), 900_000)
+    _require_frozen_snapshot(kl, "15m")
     fm = build_feature_matrix(kl, 900_000)  # k5=None：本族无 path3 特征
     return kl, fm
 
@@ -81,6 +94,7 @@ def env_5m():
     if not CSV_5M.exists():
         pytest.skip("720d 5m K 线产物不存在（离线口径测试跳过）")
     kl = load_klines_csv(str(CSV_5M), 300_000)
+    _require_frozen_snapshot(kl, "5m")
     fm = build_feature_matrix(kl, 300_000)
     return kl, fm
 

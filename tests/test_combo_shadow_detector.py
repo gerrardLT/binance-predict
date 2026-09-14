@@ -16,7 +16,7 @@ output/klines_15m_720d.csv（缺失时 skip，CI 无产物不阻塞）。
 from __future__ import annotations
 
 import csv
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -35,6 +35,7 @@ from binance_predict.services.combo_shadow_detector import (
 
 ROOT = Path(__file__).resolve().parents[1]
 CSV_15M = ROOT / "output" / "klines_15m_720d.csv"
+FROZEN_LAST_DATE = "2026-09-04"
 
 # 冻结全样本触发/win 计数（mr_freeze_bench.py，720d + WARM=700 掩码后）
 FULL_COUNTS = {
@@ -65,7 +66,15 @@ def _rows_from_csv() -> list[dict]:
 def full_rows() -> list[dict]:
     if not CSV_15M.exists():
         pytest.skip("720d 15m K 线产物不存在（离线口径测试跳过）")
-    return _rows_from_csv()
+    rows = _rows_from_csv()
+    last_date = datetime.fromtimestamp(
+        rows[-1]["open_time"] / 1000, tz=timezone.utc
+    ).date().isoformat()
+    if last_date != FROZEN_LAST_DATE:
+        pytest.skip(
+            f"720d 15m K 线截止 {last_date}，冻结计数仅适用于 {FROZEN_LAST_DATE}"
+        )
+    return rows
 
 
 # ============================================================

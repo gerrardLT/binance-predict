@@ -909,6 +909,120 @@ async def test_sync_binance_backfills_pending_rows(monkeypatch) -> None:
     db.commit.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_sync_binance_advances_linked_assessment(monkeypatch) -> None:
+    """币安终态对账与订单同事务推进账本到 FILL，不增加外部请求。"""
+    import binance_predict.main as m
+    from contextlib import asynccontextmanager
+
+    monkeypatch.setattr(m.prediction_trader, "_api_key", "k")
+    monkeypatch.setattr(m.prediction_trader, "_wallet_address", "0xW")
+    ws = 1_787_418_600_000
+
+    async def _history(limit=100):
+        return [{
+            "orderId": "B-LINKED",
+            "slug": f"btc-updown-5m-{ws // 1000}",
+            "status": "FILLED",
+            "filledUsdtAmount": "1",
+            "filledShareQty": "1.79",
+            "price": "0.55",
+        }]
+
+    monkeypatch.setattr(m.prediction_trader, "query_order_history", _history)
+    row = SimpleNamespace(
+        id=70, window_start=ws, status="PENDING", order_id=None,
+        amount_in="0", quote_json=None, error_message=None,
+        market_period="5m", assessment_id=501,
+    )
+    pending = MagicMock()
+    pending.scalars.return_value.all.return_value = [row]
+    filled = MagicMock()
+    filled.scalars.return_value.all.return_value = []
+    db = AsyncMock()
+    db.execute = AsyncMock(side_effect=[pending, filled])
+
+    @asynccontextmanager
+    async def _nested():
+        yield
+
+    db.begin_nested = lambda: _nested()
+
+    @asynccontextmanager
+    async def _factory():
+        yield db
+
+    monkeypatch.setattr(m, "async_session_factory", _factory)
+    patches = []
+
+    async def _patch(session, patch):
+        patches.append((session, patch))
+
+    monkeypatch.setattr("binance_predict.services.shadow_execution_store.patch_assessment", _patch)
+
+    out = await m._sync_binance_orders_impl()
+    assert out["synced"] == 1 and row.status == "FILLED"
+    assert patches[0][0] is db
+    assert patches[0][1].assessment_id == 501
+    assert patches[0][1].stage.value == "FILL"
+    assert patches[0][1].reason.value == "ORDER_FILLED"
+    db.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_sync_assessment_failure_does_not_block_order_commit(monkeypatch) -> None:
+    """账本 savepoint 失败被吞掉，真实订单仍改判并提交。"""
+    import binance_predict.main as m
+    from contextlib import asynccontextmanager
+
+    monkeypatch.setattr(m.prediction_trader, "_api_key", "k")
+    monkeypatch.setattr(m.prediction_trader, "_wallet_address", "0xW")
+    ws = 1_787_418_600_000
+
+    async def _history(limit=100):
+        return [{
+            "orderId": "B-FAILED",
+            "slug": f"btc-updown-5m-{ws // 1000}",
+            "status": "FAILED",
+            "filledUsdtAmount": "0",
+            "price": "0.55",
+        }]
+
+    monkeypatch.setattr(m.prediction_trader, "query_order_history", _history)
+    row = SimpleNamespace(
+        id=71, window_start=ws, status="PENDING", order_id=None,
+        amount_in="0", quote_json=None, error_message=None,
+        market_period="5m", assessment_id=502,
+    )
+    pending = MagicMock()
+    pending.scalars.return_value.all.return_value = [row]
+    filled = MagicMock()
+    filled.scalars.return_value.all.return_value = []
+    db = AsyncMock()
+    db.execute = AsyncMock(side_effect=[pending, filled])
+
+    @asynccontextmanager
+    async def _nested():
+        yield
+
+    db.begin_nested = lambda: _nested()
+
+    @asynccontextmanager
+    async def _factory():
+        yield db
+
+    monkeypatch.setattr(m, "async_session_factory", _factory)
+
+    async def _fail(_session, _patch):
+        raise RuntimeError("assessment unavailable")
+
+    monkeypatch.setattr("binance_predict.services.shadow_execution_store.patch_assessment", _fail)
+
+    out = await m._sync_binance_orders_impl()
+    assert out["synced"] == 1 and row.status == "FAILED"
+    db.commit.assert_awaited_once()
+
+
 def _sync_harness(monkeypatch, history: list[dict], rows: list):
     """对账测试公用桩：钉 API 凭据 + 币安历史 + 本地行，返回 db 替身。
 

@@ -30,7 +30,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI, Depends, HTTPException, Request, status
+from fastapi import FastAPI, Depends, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -77,6 +77,8 @@ from .services.quote_edge_detector import QuoteEdgeDetector
 from .services.reversal_shadow_detector import ReversalShadowDetector
 from .services.rev2_inside_shadow_detector import Rev2InsideShadowDetector
 from .services.s2_cond_shadow_detector import S2CondShadowDetector
+from .services.shadow_execution_projector import shadow_execution_projector
+from .services.shadow_execution_types import EXECUTION_POLICY_VERSION
 from .services.shadow_version_gate import shadow_gate
 from .services.notification_config import GLOBAL_CHANNEL, notify_config
 from .services.wechat_notifier import wechat_notifier
@@ -1072,6 +1074,12 @@ async def lifespan(app: FastAPI):
         logger.warning("数据库连接失败（开发模式可忽略）: {}", e)
         logger.warning("系统将以降级模式运行，决策/验证任务将跳过数据库操作")
 
+    # 统一影子执行账本是低频可观测投影；失败不得阻断交易与既有检测器。
+    try:
+        await shadow_execution_projector.start()
+    except Exception as exc:
+        logger.warning("统一影子执行账本 projector 启动失败（不影响交易链路）| {}", exc)
+
     # 3. 启动高频 asyncio 任务（现货 WS 连接 + SSE 心跳 + 预测市场追踪）
     await collector.start()
 
@@ -1461,6 +1469,10 @@ async def lifespan(app: FastAPI):
     if agent_scheduler is not None:
         await agent_scheduler.stop()
     await collector.stop()
+    try:
+        await shadow_execution_projector.stop()
+    except Exception as exc:
+        logger.warning("统一影子执行账本 projector 停止失败 | {}", exc)
     # Fix #15: 关闭复用的 httpx 客户端，避免连接泄漏
     await market_data_service.aclose()
     await prediction_trader.aclose()
@@ -3028,6 +3040,12 @@ async def _sync_binance_orders_impl() -> dict:
     from decimal import Decimal
     from sqlalchemy import select
     from .db.models import TradeOrderModel
+    from .services.shadow_execution_store import patch_assessment
+    from .services.shadow_execution_types import (
+        AssessmentPatch,
+        ReasonCode,
+        TerminalStage,
+    )
 
     if not prediction_trader._api_key:
         return {"error": "Binance API Key 未配置"}
@@ -3082,6 +3100,30 @@ async def _sync_binance_orders_impl() -> dict:
     ambiguous: list[dict] = []
     now_ms = int(time.time() * 1000)
     async with async_session_factory() as db:
+        async def _patch_reconciled_assessment(
+            row: TradeOrderModel,
+            reason: ReasonCode,
+        ) -> None:
+            """Best-effort observation update isolated from order reconciliation."""
+            assessment_id = getattr(row, "assessment_id", None)
+            if assessment_id is None:
+                return
+            try:
+                async with db.begin_nested():
+                    await patch_assessment(
+                        db,
+                        AssessmentPatch(
+                            assessment_id=int(assessment_id),
+                            stage=TerminalStage.FILL,
+                            reason=reason,
+                        ),
+                    )
+            except Exception as exc:
+                logger.error(
+                    "对账：执行评估推进失败（不影响订单）| assessment={} | reason={} | {}",
+                    assessment_id, reason.value, exc,
+                )
+
         stmt = (
             select(TradeOrderModel)
             .where(
@@ -3155,6 +3197,7 @@ async def _sync_binance_orders_impl() -> dict:
                         logger.warning("对账循环：撤销过期挂单异常 | order_id={} | {}", row.order_id, exc)
                     row.status = "FAILED"
                     row.error_message = "限价挂单周期已结束未成交，已自动撤单出清"
+                    await _patch_reconciled_assessment(row, ReasonCode.ORDER_FAILED)
                     synced.append({
                         "id": row.id, "window_start": row.window_start,
                         "status": "FAILED", "order_id": row.order_id,
@@ -3179,6 +3222,7 @@ async def _sync_binance_orders_impl() -> dict:
                         logger.warning("对账循环：撤销过期挂单异常 | order_id={} | {}", row.order_id, exc)
                 row.status = "FAILED"
                 row.error_message = "限价挂单周期已结束未成交，已自动撤单出清"
+                await _patch_reconciled_assessment(row, ReasonCode.ORDER_FAILED)
                 synced.append({
                     "id": row.id, "window_start": row.window_start,
                     "status": "FAILED", "order_id": row.order_id,
@@ -3232,6 +3276,10 @@ async def _sync_binance_orders_impl() -> dict:
                 row.error_message = (
                     f"对账订正：币安侧订单终态 {bo_status or 'UNKNOWN'}"
                     f"（非 FILLED 但已有成交 {filled} USDT，按未成交处理）")
+            await _patch_reconciled_assessment(
+                row,
+                ReasonCode.ORDER_FILLED if row.status == "FILLED" else ReasonCode.ORDER_FAILED,
+            )
             synced.append({
                 "id": row.id, "window_start": row.window_start,
                 "status": row.status, "order_id": row.order_id,
@@ -3254,6 +3302,7 @@ async def _sync_binance_orders_impl() -> dict:
             row.settle_outcome = None
             row.settled_at = None
             row.error_message = "对账改判：币安侧订单终态 FAILED（幽灵成交订正）"
+            await _patch_reconciled_assessment(row, ReasonCode.ORDER_FAILED)
             synced.append({
                 "id": row.id, "window_start": row.window_start,
                 "status": "FAILED", "order_id": row.order_id,
@@ -3873,33 +3922,10 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
         .order_by(FirstHitShadowSignal.window_start)
     )).all()
     sh_rows = sh_rows + list(firsthit_rows)
-    # 版本 = 冻结基准已知版本 ∪ 数据中出现的版本（新版本缺基准不崩，bench 为 None）
-    versions = [
-        "x4_v1", "quote_momentum_v1", "quote_contrarian_v1",
-        "x4_v2", "quote_momentum_v2", "quote_contrarian_v2",  # v2 门禁版（部署即入面板）
-        "x4_v3",  # 错位v3 趋势过滤版（v2+双趋势门禁+入场价白名单，2026-09-06，实盘默认 OFF 可 toggle）
-        "quote_contrarian_v3a", "quote_contrarian_v3b",  # v3 环境门禁版（可选实盘通道，默认 OFF）
-        "quote_contrarian_v4",  # v4 regime 门禁版（下跌周期，默认 OFF）
-        "late_night_contrarian_v1",  # 深夜时段变体（纯影子，2026-08-26）
-        "late_night_contrarian_v2",  # 深夜门禁 v2（纯影子，2026-08-27：v1+距日高回落≥0.30%）
-        "krev_a_v1", "krev_b_v1",  # K 线反转族（纯影子，2026-08-28：新表 kline_shadow_signals）
-        "hm_touch_down_v1",  # HM 上吊线反弹入场（纯影子，2026-09-01：新表 pattern_shadow_signals）
-        "hm_touch_down_v2",  # HM v2：v1+非下跌段∧非低波门禁（纯影子，2026-09-01 后验切片）
-        "rev_p1_v1", "rev_p2_v1",  # 反转形态 P1/P2（纯影子，2026-09-03：共表 kline_shadow_signals）
-        "nb_zschamp_15m_v1", "nb_smaslope_5m_v1",  # nextbar 族（纯影子，2026-09-03：共表 kline_shadow_signals，15m+5m 双 tf）
-        "combo_p1_v1", "combo_p2_v1", "combo_p3_v1", "combo_p4_v1", "combo_p5_v1",  # combo 组合族（纯影子，2026-09-04：共表 kline_shadow_signals，5 组合 3DOWN/2UP）
-        "s5_deep_z20_v1",  # S5 深档 z5≤−20bp（纯影子，2026-09-03：共表 pattern_shadow_signals）
-        "quote_momentum_v3",  # 报价动量 v3 非连涨门禁（纯影子，2026-09-03：misalignment_signals）
-        "absorption_follow_td120_v1", "absorption_follow_td150_v1",  # 吸收/欠反应跟随族（纯影子，2026-09-04：专用表 absorption_shadow_signals，TD120/150 双 variant 滚动标定）
-        "s2_cond_t4_v1", "s2_cond_t5d_v1",  # S2 条件单族（纯影子，2026-09-06：实盘 bear_exhaust 派生窗内 t=4/t=5 判价→押 UP，共表 kline_shadow_signals version 隔离）
-        "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1",  # 首触反转族（纯影子，2026-09-07：专用表 firsthit_shadow_signals，G0 基底 / G1 body_r≤0.35 / G3 chg≤+2.82bp，前向验证 4 周）
-        "firsthit_down_g4_v1",  # 首触反转 G4 交互门（2026-09-08：G1∩G3，专用表 firsthit_shadow_signals，影子+实盘通道）
-        # 首触反转 G7 系列（2026-09-08 优化衍生，专用表 firsthit_shadow_signals，独立下单）
-        "firsthit_down_g7_v1", "g7_streak_v1", "g7_wick20_v1",
-        "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",
-        # rev2 孕线反转族（2026-09-09 / 2026-09-13：15m HM/IH + 5m HM 精选，kline_shadow_signals 表）
-        "hm_inside_15m_v2", "ih_inside_15m_v2", "hm_inside_5m_v2",
-    ]
+    # 版本顺序以统一注册表为权威口径；历史未知版本仍追加，避免旧数据从 API 消失。
+    from .services.shadow_execution_registry import SHADOW_VERSIONS
+
+    versions = list(SHADOW_VERSIONS)
     versions += sorted({s.version for s in sh_rows} - set(versions))
     # 影子版本 → 实盘通道状态（version==通道名，2026-09-06 promote + x4_v3 注册后 13 通道；
     # 一次 status_async 拉全量按 channel 建索引，执行器未装配/查询失败 → 空表兜底）
@@ -4059,6 +4085,31 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
             ],
         },
     }
+
+
+@app.get("/api/signals/execution-comparison")
+async def get_signals_execution_comparison(
+    policy_version: str = Query(default=EXECUTION_POLICY_VERSION),
+    from_ts: int | None = Query(default=None, alias="from"),
+    to_ts: int | None = Query(default=None, alias="to"),
+    market_period: str | None = None,
+    include_retired: bool = False,
+    db: AsyncSession = Depends(get_db),
+):
+    """Compare theoretical shadow returns with executable and actual facts."""
+    if from_ts is not None and to_ts is not None and from_ts >= to_ts:
+        raise HTTPException(status_code=422, detail="from must be less than to")
+
+    from .services.shadow_execution_analytics import build_execution_comparison
+
+    return await build_execution_comparison(
+        db,
+        policy_version=policy_version,
+        from_ts=from_ts,
+        to_ts=to_ts,
+        market_period=market_period,
+        include_retired=include_retired,
+    )
 
 
 # ============================================================

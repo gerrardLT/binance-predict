@@ -13,6 +13,7 @@ output/klines_15m_720d.csv（缺失时 skip，CI 无产物不阻塞）。
 from __future__ import annotations
 
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -42,6 +43,7 @@ from binance_predict.services.hm_shadow_detector import (
 
 ROOT = Path(__file__).resolve().parents[1]
 CSV_15M = ROOT / "output" / "klines_15m_720d.csv"
+FROZEN_LAST_DATE = "2026-09-04"
 
 T0 = 1_700_000_000_000 // BAR_MS_15M * BAR_MS_15M
 
@@ -54,7 +56,15 @@ T0 = 1_700_000_000_000 // BAR_MS_15M * BAR_MS_15M
 def kl720():
     if not CSV_15M.exists():
         pytest.skip("720d 15m K 线产物不存在（离线口径测试跳过）")
-    return load_klines_csv(str(CSV_15M), BAR_MS_15M)
+    kl = load_klines_csv(str(CSV_15M), BAR_MS_15M)
+    last_date = datetime.fromtimestamp(
+        int(kl.t[-1]) / 1000, tz=timezone.utc
+    ).date().isoformat()
+    if last_date != FROZEN_LAST_DATE:
+        pytest.skip(
+            f"720d 15m K 线截止 {last_date}，冻结计数仅适用于 {FROZEN_LAST_DATE}"
+        )
+    return kl
 
 
 def test_720d_replay_trigger_count(kl720) -> None:

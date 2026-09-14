@@ -310,6 +310,71 @@ interface SignalsAnalytics {
   }
 }
 
+interface ExecutionFunnel {
+  theoretical: number
+  strategy_eligible: number
+  operational_eligible: number
+  execution_eligible: number
+  submitted: number
+  filled: number
+  settled: number
+  unknown: number
+  no_live_mapping: number
+}
+interface FixedUnitReturn { n: number; sum: number; avg: number | null }
+interface ActualExecutionReturn { settled_n: number; stake: number; pnl: number; roi: number | null }
+interface ExecutionReturns {
+  theoretical_fixed_1u: FixedUnitReturn
+  executable_fixed_1u: FixedUnitReturn
+  actual: ActualExecutionReturn
+}
+interface ExecutionGap { n: number; rate: number | null }
+interface ExecutionGaps {
+  selection: ExecutionGap
+  operational: ExecutionGap
+  execution: ExecutionGap
+  fill: ExecutionGap
+  settlement: ExecutionGap
+  coverage: ExecutionGap
+}
+interface ExecutionReasonCount { reason: string; count: number }
+interface ExecutionComparisonVersion {
+  signal_version: string
+  policy_version: string | null
+  market_period: string | null
+  channel_mapped: boolean
+  retired: boolean
+  funnel: ExecutionFunnel
+  returns: ExecutionReturns
+  gaps: ExecutionGaps
+  reason_counts: ExecutionReasonCount[]
+}
+interface ExecutionComparisonCurvePoint {
+  timestamp: number
+  signal_version: string
+  policy_version: string | null
+  theoretical_fixed_1u: number | null
+  executable_fixed_1u: number | null
+  actual_stake: number
+  actual_pnl: number | null
+  actual_roi: number | null
+}
+interface ExecutionComparison {
+  scope: {
+    policy_version: string | null
+    from: number | null
+    to: number | null
+    market_period: string | null
+    include_retired: boolean
+  }
+  funnel: ExecutionFunnel
+  returns: ExecutionReturns
+  gaps: ExecutionGaps
+  reason_counts: ExecutionReasonCount[]
+  versions: ExecutionComparisonVersion[]
+  curves: ExecutionComparisonCurvePoint[]
+}
+
 // 模式池分级与回测快照：与后端 /api/agent/patterns/compare + /backtest-runs 对齐
 interface PatternBacktestRun {
   id: number
@@ -522,6 +587,11 @@ const api = {
   getBtcKlines: (interval: string, limit: number) =>
     authFetch(`/api/chart/btc-klines?interval=${interval}&limit=${limit}`).then(r => r.json()),
   getSignalsAnalytics: () => authFetch('/api/signals/analytics').then(r => r.json()),
+  getSignalsExecutionComparison: (): Promise<ExecutionComparison> =>
+    authFetch('/api/signals/execution-comparison').then(r => {
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      return r.json() as Promise<ExecutionComparison>
+    }),
   // 影子版本手动下线/上线（2026-09-04）：下线=停采集新信号+面板置灰，历史数据保留
   toggleShadow: (version: string, enabled: boolean) =>
     authFetch('/api/shadow/toggle', {
@@ -6207,8 +6277,291 @@ function mergeCurves(
   return Array.from(rowMap.values()).sort((a, b) => (a.ts as number) - (b.ts as number))
 }
 
+function isExecutionComparison(value: unknown): value is ExecutionComparison {
+  if (!value || typeof value !== 'object') return false
+  const v = value as Partial<ExecutionComparison>
+  const isNum = (n: unknown) => typeof n === 'number' && Number.isFinite(n)
+  const isNullableNum = (n: unknown) => n === null || isNum(n)
+  const validFunnel = (f: unknown): f is ExecutionFunnel => {
+    if (!f || typeof f !== 'object') return false
+    const row = f as Record<string, unknown>
+    return ['theoretical', 'strategy_eligible', 'operational_eligible', 'execution_eligible', 'submitted', 'filled', 'settled', 'unknown', 'no_live_mapping'].every(k => isNum(row[k]))
+  }
+  const validFixed = (r: unknown): r is FixedUnitReturn => !!r && typeof r === 'object'
+    && isNum((r as FixedUnitReturn).n) && isNum((r as FixedUnitReturn).sum) && isNullableNum((r as FixedUnitReturn).avg)
+  const validReturns = (r: unknown): r is ExecutionReturns => {
+    if (!r || typeof r !== 'object') return false
+    const row = r as ExecutionReturns
+    return validFixed(row.theoretical_fixed_1u) && validFixed(row.executable_fixed_1u)
+      && !!row.actual && isNum(row.actual.settled_n) && isNum(row.actual.stake)
+      && isNum(row.actual.pnl) && isNullableNum(row.actual.roi)
+  }
+  const validGaps = (g: unknown): g is ExecutionGaps => {
+    if (!g || typeof g !== 'object') return false
+    const row = g as Record<string, unknown>
+    return ['selection', 'operational', 'execution', 'fill', 'settlement', 'coverage'].every(k => {
+      const gap = row[k] as Partial<ExecutionGap> | undefined
+      return !!gap && isNum(gap.n) && isNullableNum(gap.rate)
+    })
+  }
+  const validReasons = (r: unknown) => Array.isArray(r) && r.every(x => !!x && typeof x === 'object'
+    && typeof (x as ExecutionReasonCount).reason === 'string' && isNum((x as ExecutionReasonCount).count))
+  const scope = v.scope
+  if (!scope || typeof scope !== 'object' || typeof scope.include_retired !== 'boolean') return false
+  if (!(scope.policy_version === null || typeof scope.policy_version === 'string')) return false
+  if (!(scope.market_period === null || typeof scope.market_period === 'string')) return false
+  if (!isNullableNum(scope.from) || !isNullableNum(scope.to)) return false
+  if (!validFunnel(v.funnel) || !validReturns(v.returns) || !validGaps(v.gaps) || !validReasons(v.reason_counts)) return false
+  if (!Array.isArray(v.versions) || !v.versions.every(row => !!row && typeof row.signal_version === 'string'
+    && (row.policy_version === null || typeof row.policy_version === 'string')
+    && (row.market_period === null || typeof row.market_period === 'string')
+    && typeof row.channel_mapped === 'boolean' && typeof row.retired === 'boolean'
+    && validFunnel(row.funnel) && validReturns(row.returns) && validGaps(row.gaps) && validReasons(row.reason_counts))) return false
+  return Array.isArray(v.curves) && v.curves.every(p => !!p && isNum(p.timestamp)
+    && typeof p.signal_version === 'string'
+    && (p.policy_version === null || typeof p.policy_version === 'string')
+    && isNullableNum(p.theoretical_fixed_1u) && isNullableNum(p.executable_fixed_1u)
+    && isNum(p.actual_stake) && isNullableNum(p.actual_pnl) && isNullableNum(p.actual_roi))
+}
+
+const executionTs = (ts: number) => ts < 10_000_000_000 ? ts * 1000 : ts
+const executionPct = (v: number | null) => v == null ? '—' : `${(v * 100).toFixed(1)}%`
+const executionMoney = (v: number | null) => v == null ? '—' : `${v >= 0 ? '+' : ''}${v.toFixed(2)}`
+
+function ShadowExecutionComparisonCard({
+  data,
+  unavailable,
+}: {
+  data: ExecutionComparison | null
+  unavailable: string
+}) {
+  const [versionText, setVersionText] = useState('')
+  const [period, setPeriod] = useState('ALL')
+  const [mapping, setMapping] = useState<'ALL' | 'MAPPED' | 'UNMAPPED'>('ALL')
+  const [retired, setRetired] = useState<'ALL' | 'ACTIVE' | 'RETIRED'>('ALL')
+  const [policy, setPolicy] = useState('ALL')
+
+  if (!data) {
+    return (
+      <Card title="影子信号·理论到实盘执行对比">
+        <div className="rounded-sm border border-line bg-sunken px-4 py-6 text-center text-xs text-ink-55">
+          {unavailable || '执行对比数据加载中...'}
+        </div>
+      </Card>
+    )
+  }
+
+  const periods = Array.from(new Set(data.versions.map(v => v.market_period).filter((v): v is string => !!v))).sort()
+  const policies = Array.from(new Set(data.versions.map(v => v.policy_version).filter((v): v is string => !!v))).sort()
+  const search = versionText.trim().toLowerCase()
+  const versions = data.versions.filter(v => {
+    if (search && !v.signal_version.toLowerCase().includes(search)) return false
+    if (period !== 'ALL' && v.market_period !== period) return false
+    if (policy !== 'ALL' && v.policy_version !== policy) return false
+    if (mapping === 'MAPPED' && !v.channel_mapped) return false
+    if (mapping === 'UNMAPPED' && v.channel_mapped) return false
+    if (retired === 'ACTIVE' && v.retired) return false
+    if (retired === 'RETIRED' && !v.retired) return false
+    return true
+  })
+  const versionKeys = new Set(versions.map(v => `${v.signal_version}\u0000${v.policy_version ?? ''}`))
+  let previousTheoretical = 0
+  let previousExecutable = 0
+  let previousStake = 0
+  let previousPnl = 0
+  let selectedTheoretical = 0
+  let selectedExecutable = 0
+  let selectedStake = 0
+  let selectedPnl = 0
+  const curves = data.curves.flatMap(p => {
+    const theoretical = p.theoretical_fixed_1u ?? previousTheoretical
+    const executable = p.executable_fixed_1u ?? previousExecutable
+    const pnl = p.actual_pnl ?? previousPnl
+    const theoreticalDelta = theoretical - previousTheoretical
+    const executableDelta = executable - previousExecutable
+    const stakeDelta = p.actual_stake - previousStake
+    const pnlDelta = pnl - previousPnl
+    previousTheoretical = theoretical
+    previousExecutable = executable
+    previousStake = p.actual_stake
+    previousPnl = pnl
+    if (!versionKeys.has(`${p.signal_version}\u0000${p.policy_version ?? ''}`)) return []
+    selectedTheoretical += theoreticalDelta
+    selectedExecutable += executableDelta
+    selectedStake += stakeDelta
+    selectedPnl += pnlDelta
+    const actualRoi = selectedStake > 0 ? selectedPnl / selectedStake : null
+    return [{
+      ...p,
+      timestamp: executionTs(p.timestamp),
+      theoretical_fixed_1u: selectedTheoretical,
+      executable_fixed_1u: selectedExecutable,
+      actual_stake: selectedStake,
+      actual_pnl: selectedPnl,
+      actual_roi: actualRoi,
+      actual_roi_pct: actualRoi == null ? null : actualRoi * 100,
+    }]
+  })
+  const reasons = new Map<string, number>()
+  for (const row of versions) for (const reason of row.reason_counts) {
+    reasons.set(reason.reason, (reasons.get(reason.reason) ?? 0) + reason.count)
+  }
+  const reasonRows = Array.from(reasons.entries()).sort((a, b) => b[1] - a[1])
+  const filterActive = !!search || period !== 'ALL' || mapping !== 'ALL' || retired !== 'ALL' || policy !== 'ALL'
+  const filteredFunnel = versions.reduce<ExecutionFunnel>((total, row) => ({
+    theoretical: total.theoretical + row.funnel.theoretical,
+    strategy_eligible: total.strategy_eligible + row.funnel.strategy_eligible,
+    operational_eligible: total.operational_eligible + row.funnel.operational_eligible,
+    execution_eligible: total.execution_eligible + row.funnel.execution_eligible,
+    submitted: total.submitted + row.funnel.submitted,
+    filled: total.filled + row.funnel.filled,
+    settled: total.settled + row.funnel.settled,
+    unknown: total.unknown + row.funnel.unknown,
+    no_live_mapping: total.no_live_mapping + row.funnel.no_live_mapping,
+  }), {
+    theoretical: 0, strategy_eligible: 0, operational_eligible: 0,
+    execution_eligible: 0, submitted: 0, filled: 0, settled: 0,
+    unknown: 0, no_live_mapping: 0,
+  })
+  const fixedReturn = (key: 'theoretical_fixed_1u' | 'executable_fixed_1u'): FixedUnitReturn => {
+    const total = versions.reduce((acc, row) => ({
+      n: acc.n + row.returns[key].n,
+      sum: acc.sum + row.returns[key].sum,
+    }), { n: 0, sum: 0 })
+    return { ...total, avg: total.n > 0 ? total.sum / total.n : null }
+  }
+  const actual = versions.reduce<ActualExecutionReturn>((total, row) => ({
+    settled_n: total.settled_n + row.returns.actual.settled_n,
+    stake: total.stake + row.returns.actual.stake,
+    pnl: total.pnl + row.returns.actual.pnl,
+    roi: null,
+  }), { settled_n: 0, stake: 0, pnl: 0, roi: null })
+  actual.roi = actual.stake > 0 ? actual.pnl / actual.stake : null
+  const filteredReturns: ExecutionReturns = {
+    theoretical_fixed_1u: fixedReturn('theoretical_fixed_1u'),
+    executable_fixed_1u: fixedReturn('executable_fixed_1u'),
+    actual,
+  }
+  const selectCls = 'px-1.5 py-0.5 border border-line rounded-sm text-xs text-ink-80 bg-card'
+  const funnel = [
+    ['理论影子', filteredFunnel.theoretical], ['策略通过', filteredFunnel.strategy_eligible],
+    ['运营通过', filteredFunnel.operational_eligible], ['执行通过', filteredFunnel.execution_eligible],
+    ['已下单', filteredFunnel.submitted], ['已成交', filteredFunnel.filled], ['已结算', filteredFunnel.settled],
+  ] as const
+  const help = '理论收益采用已实现结果的固定 1U 公式；实际 ROI = sum(pnl) / sum(stake)，为本金加权口径。unknown（未知）不是拒绝；no mapping（无实盘映射）不是执行失败。执行可行不保证 LIMIT 限价单成交。历史缺失的瞬时配置、市场、余额与互斥状态不会用当前状态反推重建。'
+  const gapLabel: Record<keyof ExecutionGaps, string> = {
+    selection: '策略', operational: '运营', execution: '执行', fill: '成交', settlement: '结算', coverage: '覆盖',
+  }
+
+  return (
+    <Card title="影子信号·理论到实盘执行对比">
+      <div className="flex items-start gap-1 mb-3 text-xs text-ink-55">
+        <span>统一查看信号从理论样本到真实结算的漏斗、收益与缺口。</span><HelpHint text={help} />
+      </div>
+
+      <div className="overflow-x-auto mb-3">
+        <div className="flex min-w-[760px] items-stretch gap-1">
+          {funnel.map(([label, value], i) => (
+            <Fragment key={label}>
+              <div className="flex-1 border border-line rounded-sm bg-sunken px-2 py-2 text-center">
+                <div className="text-[10px] text-ink-55">{label}</div>
+                <div className="font-mono text-lg font-bold text-ink-95">{value.toLocaleString()}</div>
+                {i > 0 && <div className="text-[10px] text-ink-40">前步 {funnel[i - 1][1] > 0 ? `${(value / funnel[i - 1][1] * 100).toFixed(1)}%` : '—'}</div>}
+              </div>
+              {i < funnel.length - 1 && <div className="self-center text-ink-40">→</div>}
+            </Fragment>
+          ))}
+        </div>
+      </div>
+      <div className="flex flex-wrap gap-2 mb-4 text-xs">
+        <span className="ds-badge ds-badge-neutral">未知 {filteredFunnel.unknown}</span>
+        <span className="ds-badge ds-badge-neutral">无实盘映射 {filteredFunnel.no_live_mapping}</span>
+        {filterActive && <span className="ds-badge ds-badge-neutral">当前筛选汇总</span>}
+        <span className="text-[10px] text-ink-55 self-center">未知不是拒绝；无映射不是执行失败。</span>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-2 mb-4">
+        {[
+          ['理论固定 1U', filteredReturns.theoretical_fixed_1u, 'var(--chart-1)'],
+          ['可执行固定 1U', filteredReturns.executable_fixed_1u, 'var(--warning)'],
+        ].map(([label, raw, color]) => {
+          const r = raw as FixedUnitReturn
+          return <div key={label as string} className="border border-line rounded-sm bg-card p-3">
+            <div className="text-xs text-ink-55">{label as string}</div>
+            <div className="mt-1 font-mono font-bold" style={{ color: color as string }}>{executionMoney(r.sum)} U</div>
+            <div className="text-[10px] text-ink-55">n={r.n} · 均值 {executionMoney(r.avg)} U</div>
+          </div>
+        })}
+        <div className="border border-line rounded-sm bg-card p-3">
+          <div className="text-xs text-ink-55">实际实盘（本金加权）</div>
+          <div className={`mt-1 font-mono font-bold ${filteredReturns.actual.pnl >= 0 ? 'text-positive' : 'text-negative'}`}>
+            {executionMoney(filteredReturns.actual.pnl)} USDT · {executionPct(filteredReturns.actual.roi)}
+          </div>
+          <div className="text-[10px] text-ink-55">结算 {filteredReturns.actual.settled_n} · 本金 {filteredReturns.actual.stake.toFixed(2)} USDT</div>
+        </div>
+      </div>
+
+      <div className="flex items-center justify-between mb-3 gap-2 flex-wrap text-xs">
+        <div className="flex items-center gap-2 flex-wrap">
+          <input value={versionText} onChange={e => setVersionText(e.target.value)} placeholder="搜索版本..." className={`${selectCls} w-36`} />
+          <select value={period} onChange={e => setPeriod(e.target.value)} className={selectCls}><option value="ALL">全部周期</option>{periods.map(v => <option key={v}>{v}</option>)}</select>
+          <select value={mapping} onChange={e => setMapping(e.target.value as typeof mapping)} className={selectCls}><option value="ALL">全部映射</option><option value="MAPPED">已有映射</option><option value="UNMAPPED">无映射</option></select>
+          <select value={retired} onChange={e => setRetired(e.target.value as typeof retired)} className={selectCls}><option value="ALL">全部退役状态</option><option value="ACTIVE">未退役</option><option value="RETIRED">已退役</option></select>
+          <select value={policy} onChange={e => setPolicy(e.target.value)} className={selectCls}><option value="ALL">全部策略版本</option>{policies.map(v => <option key={v}>{v}</option>)}</select>
+          {filterActive && <button onClick={() => { setVersionText(''); setPeriod('ALL'); setMapping('ALL'); setRetired('ALL'); setPolicy('ALL') }} className="text-brand hover:underline">清除筛选</button>}
+        </div>
+        <span className="text-ink-55">显示 {versions.length} / 共 {data.versions.length} 个版本</span>
+      </div>
+
+      {versions.length === 0 ? <div className="text-center text-ink-55 py-6 text-xs">当前筛选条件下无匹配版本</div> : (
+        <div className="overflow-x-auto mb-4">
+          <table className="w-full min-w-[1160px] text-xs">
+            <thead><tr className="border-b border-line text-ink-55">
+              <th className="py-1 px-2 text-left">版本</th><th className="py-1 px-2 text-left">周期 / 策略</th>
+              <th className="py-1 px-2 text-right">理论 n / sum</th><th className="py-1 px-2 text-right">执行通过 / sum</th>
+              <th className="py-1 px-2 text-right">实际结算 / 本金</th><th className="py-1 px-2 text-right">ROI / PnL</th>
+              {(Object.keys(gapLabel) as (keyof ExecutionGaps)[]).map(k => <th key={k} className="py-1 px-2 text-right">{gapLabel[k]}缺口</th>)}
+            </tr></thead>
+            <tbody>{versions.map(v => <tr key={`${v.signal_version}-${v.policy_version ?? ''}-${v.market_period ?? ''}`} className={`border-b border-line-soft hover:bg-sunken ${v.retired ? 'opacity-55' : ''}`}>
+              <td className="py-1.5 px-2"><span className="font-medium text-ink-95">{v.signal_version}</span><div className="text-[10px] text-ink-55">{v.channel_mapped ? '有映射' : '无映射'}{v.retired ? ' · 已退役' : ''}</div></td>
+              <td className="py-1.5 px-2 text-ink-55"><span className="font-mono">{v.market_period ?? '—'}</span><div>{v.policy_version ?? '—'}</div></td>
+              <td className="py-1.5 px-2 text-right font-mono">{v.returns.theoretical_fixed_1u.n} / {executionMoney(v.returns.theoretical_fixed_1u.sum)}</td>
+              <td className="py-1.5 px-2 text-right font-mono">{v.funnel.execution_eligible} / {executionMoney(v.returns.executable_fixed_1u.sum)}</td>
+              <td className="py-1.5 px-2 text-right font-mono">{v.returns.actual.settled_n} / {v.returns.actual.stake.toFixed(2)}</td>
+              <td className={`py-1.5 px-2 text-right font-mono ${v.returns.actual.pnl >= 0 ? 'text-positive' : 'text-negative'}`}>{executionPct(v.returns.actual.roi)} / {executionMoney(v.returns.actual.pnl)}</td>
+              {(Object.keys(gapLabel) as (keyof ExecutionGaps)[]).map(k => <td key={k} className="py-1.5 px-2 text-right font-mono" title={`n=${v.gaps[k].n}`}>{executionPct(v.gaps[k].rate)}</td>)}
+            </tr>)}</tbody>
+          </table>
+        </div>
+      )}
+
+      <div className="mb-4">
+        <div className="text-xs font-medium text-ink-80 mb-2">主要缺口原因</div>
+        {reasonRows.length > 0 ? <div className="flex flex-wrap gap-1.5">{reasonRows.map(([reason, count]) => <span key={reason} className="px-2 py-1 border border-line rounded-sm bg-sunken text-[11px] text-ink-80"><span className="font-mono font-bold">{count}</span> · {reason}</span>)}</div> : <div className="text-xs text-ink-55">当前范围无缺口原因记录。</div>}
+      </div>
+
+      {curves.length > 0 ? <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+        <div><div className="text-xs text-ink-55 mb-1">固定 1U 累计收益（U）</div><ResponsiveContainer width="100%" height={220}><LineChart data={curves} margin={{ top: 6, right: 12, left: 0, bottom: 0 }}>
+          <CartesianGrid stroke="var(--line-soft)" /><XAxis dataKey="timestamp" type="number" domain={['dataMin', 'dataMax']} scale="time" tickFormatter={utcMD} tick={{ fontSize: 11, fill: 'var(--ink-55)', fontFamily: 'var(--font-stack-mono)' }} stroke="var(--ink-55)" />
+          <YAxis tick={{ fontSize: 11, fill: 'var(--ink-55)', fontFamily: 'var(--font-stack-mono)' }} stroke="var(--ink-55)" width={48} /><Tooltip contentStyle={TOOLTIP_STYLE} labelStyle={TOOLTIP_LABEL_STYLE} itemStyle={TOOLTIP_ITEM_STYLE} labelFormatter={t => new Date(t as number).toUTCString().slice(0, 16)} formatter={(v, n) => [typeof v === 'number' ? `${v.toFixed(2)} U` : '—', n]} /><Legend />
+          <Line name="理论固定 1U" dataKey="theoretical_fixed_1u" stroke="var(--chart-1)" strokeWidth={2} dot={false} connectNulls isAnimationActive={false} /><Line name="可执行固定 1U" dataKey="executable_fixed_1u" stroke="var(--warning)" strokeWidth={2} dot={false} connectNulls isAnimationActive={false} />
+        </LineChart></ResponsiveContainer></div>
+        <div><div className="text-xs text-ink-55 mb-1">实际累计 PnL（USDT）与本金加权 ROI</div><ResponsiveContainer width="100%" height={220}><LineChart data={curves} margin={{ top: 6, right: 8, left: 0, bottom: 0 }}>
+          <CartesianGrid stroke="var(--line-soft)" /><XAxis dataKey="timestamp" type="number" domain={['dataMin', 'dataMax']} scale="time" tickFormatter={utcMD} tick={{ fontSize: 11, fill: 'var(--ink-55)', fontFamily: 'var(--font-stack-mono)' }} stroke="var(--ink-55)" />
+          <YAxis yAxisId="pnl" tick={{ fontSize: 11, fill: 'var(--ink-55)' }} stroke="var(--positive)" width={68} tickFormatter={(v: number) => `${v} USDT`} /><YAxis yAxisId="roi" orientation="right" tick={{ fontSize: 11, fill: 'var(--ink-55)' }} stroke="var(--warning)" width={48} tickFormatter={(v: number) => `${v}%`} />
+          <Tooltip contentStyle={TOOLTIP_STYLE} labelStyle={TOOLTIP_LABEL_STYLE} itemStyle={TOOLTIP_ITEM_STYLE} labelFormatter={t => new Date(t as number).toUTCString().slice(0, 16)} formatter={(v, n) => [typeof v === 'number' ? `${v.toFixed(2)}${n === '实际 ROI' ? '%' : ' USDT'}` : '—', n]} /><Legend />
+          <Line yAxisId="pnl" name="实际 PnL" dataKey="actual_pnl" stroke="var(--positive)" strokeWidth={2} dot={false} connectNulls isAnimationActive={false} /><Line yAxisId="roi" name="实际 ROI" dataKey="actual_roi_pct" stroke="var(--warning)" strokeWidth={2} dot={false} connectNulls isAnimationActive={false} />
+        </LineChart></ResponsiveContainer></div>
+      </div> : <div className="text-center text-ink-55 py-3 text-xs">当前范围暂无执行收益曲线。</div>}
+      <div className="text-[10px] text-ink-55 mt-2">可执行仅表示通过记录到的执行前置条件，不保证 LIMIT 限价单成交；历史缺失的瞬时配置、市场、余额与互斥状态不从当前状态重建。</div>
+    </Card>
+  )
+}
+
 function SignalAnalyticsTab() {
   const [analytics, setAnalytics] = useState<SignalsAnalytics | null>(null)
+  const [executionComparison, setExecutionComparison] = useState<ExecutionComparison | null>(null)
+  const [executionUnavailable, setExecutionUnavailable] = useState('')
   const [klines, setKlines] = useState<BtcKline[]>([])
   const [kinterval, setKinterval] = useState<'1d' | '1h'>('1d')
   const [autoRefresh, setAutoRefresh] = useState(true)
@@ -6219,6 +6572,20 @@ function SignalAnalyticsTab() {
 
   const load = useCallback(() => {
     const id = ++reqIdRef.current
+    api.getSignalsExecutionComparison().then(value => {
+      if (id !== reqIdRef.current) return
+      if (isExecutionComparison(value)) {
+        setExecutionComparison(value)
+        setExecutionUnavailable('')
+      } else {
+        setExecutionComparison(null)
+        setExecutionUnavailable('执行对比暂不可用：后端返回格式不兼容。')
+      }
+    }).catch(() => {
+      if (id !== reqIdRef.current) return
+      setExecutionComparison(null)
+      setExecutionUnavailable('执行对比暂不可用：当前后端未提供该数据。')
+    })
     Promise.all([
       api.getSignalsAnalytics(),
       api.getBtcKlines(kinterval, kinterval === '1d' ? 30 : 168),
@@ -7041,6 +7408,9 @@ function RegimeByVersionTable({
           }
         />
       )}
+
+      {/* 理论影子到实盘结算的只读执行对比；端点缺失时独立降级，不影响既有分析 */}
+      <ShadowExecutionComparisonCard data={executionComparison} unavailable={executionUnavailable} />
 
       {/* 影子退役区：momentum 族 / contrarian v1系 / x4_v1 / HM 族 已于 2026-09-04 永久下线，
           只作历史审计（代码级硬闸停发，toggle API 拒绝上线），不与在线版本混排 */}

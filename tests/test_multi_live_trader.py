@@ -23,7 +23,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy import Select, Update
@@ -59,6 +59,7 @@ from binance_predict.services.quote_edge_detector import (
     QUOTE_EDGE_RULES,
     REGIME_GUARDS,
 )
+from binance_predict.services.shadow_execution_types import ReasonCode, TerminalStage
 from binance_predict.services.trade_settler import TradeSettler
 
 WINDOW_START = 1_000_000_000_000           # 5m 窗口起点（ms）
@@ -610,6 +611,55 @@ async def test_v3_env_gate_failure_aborts(monkeypatch) -> None:
     # 同窗后续采样不再派生（fired 占位已生效）
     assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 55_000, 0.21,
                    btc_price=9995.0, window_entry_price=10000.0) == []
+
+
+@pytest.mark.asyncio
+async def test_v3_env_gate_rejection_records_proven_false(monkeypatch) -> None:
+    """明确环境 veto 记 False；评估写入不改变 fired 与弃单行为。"""
+    t = _make_trader(
+        monkeypatch, _FakeTrader(), channels=["quote_contrarian_v3b"])
+    record = AsyncMock()
+
+    async def _env(self, channel, ws, ts, btc, curve=None):
+        return False, "env_guard_reject"
+
+    monkeypatch.setattr(MultiLiveTrader, "_check_v3_env", _env)
+    monkeypatch.setattr(t, "_record_strategy_outcome", record)
+
+    assert t.check(
+        WINDOW_START, WINDOW_END, WINDOW_START + 50_000, 0.20,
+        btc_price=9995.0, window_entry_price=10000.0,
+    ) == ["quote_contrarian_v3b"]
+    await _drain(t)
+
+    assert WINDOW_START in t._configs["quote_contrarian_v3b"].fired
+    assert t._trader.calls == []
+    assert record.await_args.kwargs["reason"] == "env_guard_reject"
+    assert record.await_args.kwargs["rejected"] is True
+
+
+@pytest.mark.asyncio
+async def test_v3_missing_data_records_unknown_after_retry(monkeypatch) -> None:
+    """重试后仍缺前窗，只记 unknown，不把覆盖缺口伪造成策略拒绝。"""
+    t = _make_trader(
+        monkeypatch, _FakeTrader(), channels=["quote_contrarian_v3a"])
+    record = AsyncMock()
+
+    async def _env(self, channel, ws, ts, btc, curve=None):
+        return False, "prev_not_archived"
+
+    monkeypatch.setattr(MultiLiveTrader, "_check_v3_env", _env)
+    monkeypatch.setattr(milt, "V3_PREV_RETRY_DELAY_S", 0.0)
+    monkeypatch.setattr(t, "_record_strategy_outcome", record)
+
+    assert t.check(
+        WINDOW_START, WINDOW_END, WINDOW_START + 50_000, 0.20,
+        btc_price=9995.0, window_entry_price=10000.0,
+    ) == ["quote_contrarian_v3a"]
+    await _drain(t)
+
+    assert record.await_args.kwargs["reason"] == "prev_not_archived"
+    assert record.await_args.kwargs["rejected"] is False
 
 
 @pytest.mark.asyncio
@@ -1768,6 +1818,117 @@ async def test_firsthit_g7_series_all_fire(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_runtime_rejections_use_one_final_assessment_write(monkeypatch) -> None:
+    """策略与运营拒绝直接写最终事实，不先提交相反的 PASSED。"""
+    t = _make_trader(
+        monkeypatch,
+        _FakeTrader(),
+        channels=["firsthit_down_v1"],
+        overrides={"firsthit_down_v1": {"enabled": True, "max_daily_orders": 1}},
+    )
+    ensure = AsyncMock(return_value=91)
+    patch = AsyncMock()
+    monkeypatch.setattr(t, "_ensure_runtime_assessment", ensure)
+    monkeypatch.setattr(t, "_patch_runtime_assessment", patch)
+
+    await t._record_strategy_outcome(
+        "firsthit_down_v1",
+        WINDOW_START,
+        reason="env_guard_reject",
+        rejected=True,
+        input_snapshot={"q": 0.04},
+    )
+    strategy = ensure.await_args.kwargs
+    assert strategy["stage"] == TerminalStage.STRATEGY
+    assert strategy["reason"] == ReasonCode.STRATEGY_REJECTED
+    assert strategy["strategy_eligible"] is False
+
+    ensure.reset_mock()
+    monkeypatch.setattr(t, "_count_filled_today", AsyncMock(return_value=1))
+    context, proceed = await t._prepare_runtime_execution(
+        "firsthit_down_v1", WINDOW_START, "DOWN")
+    assert context is None
+    assert proceed is False
+    operational = ensure.await_args.kwargs
+    assert operational["stage"] == TerminalStage.OPERATIONAL
+    assert operational["reason"] == ReasonCode.DAILY_LIMIT_REACHED
+    assert operational["operational_eligible"] is False
+    patch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_runtime_rejection_patch_failure_does_not_commit_preliminary_row(
+        monkeypatch) -> None:
+    """最终拒绝 patch 失败时不提交仅含 SOURCE_MISSING/PASSED 的半成品。"""
+    t = _make_trader(monkeypatch, _FakeTrader(), channels=["firsthit_down_v1"])
+    commit = AsyncMock()
+    session = SimpleNamespace(commit=commit)
+
+    @asynccontextmanager
+    async def _factory():
+        yield session
+
+    get_or_create = AsyncMock(return_value=SimpleNamespace(id=92))
+    final_patch = AsyncMock(side_effect=RuntimeError("assessment unavailable"))
+    monkeypatch.setattr(milt, "async_session_factory", _factory)
+    monkeypatch.setattr(milt, "get_or_create_runtime_assessment", get_or_create)
+    monkeypatch.setattr(milt, "patch_assessment", final_patch)
+
+    result = await t._ensure_runtime_assessment(
+        "firsthit_down_v1",
+        WINDOW_START,
+        "DOWN",
+        stage=TerminalStage.OPERATIONAL,
+        reason=ReasonCode.DAILY_LIMIT_REACHED,
+        operational_eligible=False,
+    )
+
+    assert result is None
+    get_or_create.assert_awaited_once()
+    final_patch.assert_awaited_once()
+    commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_runtime_assessment_pass_path_defers_persistence_to_order_reservation(
+        monkeypatch) -> None:
+    """运营门通过时只传内存上下文，不在真钱下单前独立写 assessment。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["firsthit_down_v1"])
+
+    async def _unexpected_ensure(*args, **kwargs):
+        raise AssertionError("成功路径不得独立持久化 assessment")
+
+    monkeypatch.setattr(t, "_ensure_runtime_assessment", _unexpected_ensure)
+    context, proceed = await t._prepare_runtime_execution(
+        "firsthit_down_v1",
+        WINDOW_START,
+        "DOWN",
+        input_snapshot={"q": 0.04},
+    )
+    assert proceed is True
+    assert context is not None
+
+    await t._exec_with_exclusive(
+        "firsthit_down_v1",
+        prediction="DOWN",
+        amount_usdt=2.0,
+        signal_version="firsthit_down_v1",
+        window_start=WINDOW_START,
+        max_exec_price=0.05,
+        market_period="5m",
+        order_type="MARKET",
+        assessment_context=context,
+    )
+
+    assert len(fake.calls) == 1
+    forwarded = fake.calls[0]["assessment_context"]
+    assert forwarded is context
+    assert forwarded["patch_values"]["strategy_eligible"] is True
+    assert forwarded["patch_values"]["operational_eligible"] is True
+
+
+@pytest.mark.asyncio
 async def test_exclusive_allows_next_channel_after_failed_attempt(monkeypatch) -> None:
     """互斥组内首个候选未成交时，同窗后续候选仍可尝试（以 S2 为例）。"""
     class _FailThenFillTrader(_FakeTrader):
@@ -2205,6 +2366,368 @@ def _make_real_trader(monkeypatch, with_15m: bool = True) -> BinancePredictionTr
 
 def _pending_order() -> dict:
     return _fake_order(status="PENDING")
+
+
+@pytest.mark.asyncio
+async def test_signal_trade_market_success_external_call_baseline(monkeypatch) -> None:
+    """MARKET 成功链每个外部边界只调用一次，观测接入不得追加请求。"""
+    trader = _make_real_trader(monkeypatch)
+    calls = {name: 0 for name in ("list", "detail", "balance", "quote", "place", "confirm")}
+    original_list = trader.list_markets
+    original_detail = trader._fetch_market_via_detail
+    original_balance = trader._preflight_balance
+
+    async def _list():
+        calls["list"] += 1
+        return await original_list()
+
+    async def _detail(period, start_ms):
+        calls["detail"] += 1
+        return await original_detail(period, start_ms)
+
+    async def _balance(amount_usdt):
+        calls["balance"] += 1
+        return await original_balance(amount_usdt)
+
+    async def _reserve(_v, _ws, direction=None, market_period="5m", scene_signal_id=None):
+        return _pending_order()
+
+    async def _update(order, status, **kwargs):
+        return {**order, "status": status, **kwargs}
+
+    async def _quote(_token, _side, amount_usdt=None):
+        calls["quote"] += 1
+        return {"averagePrice": 0.25, "amountIn": "5", "amountOut": "19", "quoteId": "Q-BASE"}
+
+    async def _place(_quote, slippage_bps=1200):
+        calls["place"] += 1
+        return {"orderId": "ORD-BASE"}
+
+    async def _confirm(_order_id, attempts=CONFIRM_ATTEMPTS, delay=CONFIRM_DELAY_S):
+        calls["confirm"] += 1
+        return {"orderId": "ORD-BASE", "status": "FILLED", "price": "0.25"}
+
+    monkeypatch.setattr(trader, "list_markets", _list)
+    monkeypatch.setattr(trader, "_fetch_market_via_detail", _detail)
+    monkeypatch.setattr(trader, "_preflight_balance", _balance)
+    monkeypatch.setattr(trader, "_reserve_order_slot", _reserve)
+    monkeypatch.setattr(trader, "_update_signal_order", _update)
+    monkeypatch.setattr(trader, "get_quote", _quote)
+    monkeypatch.setattr(trader, "place_order", _place)
+    monkeypatch.setattr(trader, "confirm_order_status", _confirm)
+
+    order = await trader.execute_signal_trade(
+        "DOWN", 5.0, "x4_v2", WINDOW_START, max_exec_price=0.50,
+    )
+
+    assert order["status"] == "FILLED"
+    assert calls == {
+        "list": 1,
+        "detail": 0,
+        "balance": 1,
+        "quote": 1,
+        "place": 1,
+        "confirm": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_reserve_order_slot_creates_and_binds_assessment_in_same_transaction(
+        monkeypatch) -> None:
+    """assessment 建账与订单占位复用同一 session，并在一次外层 commit 中绑定。"""
+    trader = _make_real_trader(monkeypatch)
+    added: list[TradeOrderModel] = []
+    sessions: list[object] = []
+    commits = 0
+
+    class _ReservationSession:
+        def add(self, row):
+            added.append(row)
+
+        def begin_nested(self):
+            @asynccontextmanager
+            async def _nested():
+                yield
+            return _nested()
+
+        async def commit(self):
+            nonlocal commits
+            commits += 1
+
+    db = _ReservationSession()
+
+    @asynccontextmanager
+    async def _factory():
+        yield db
+
+    async def _get_or_create(session, **identity):
+        sessions.append(session)
+        assert identity["signal_version"] == "x4_v2"
+        return SimpleNamespace(id=902)
+
+    async def _patch(session, patch):
+        sessions.append(session)
+        assert patch.assessment_id == 902
+        assert patch.stage == TerminalStage.OPERATIONAL
+        assert patch.reason == ReasonCode.PASSED
+        assert patch.strategy_eligible is True
+        assert patch.operational_eligible is True
+
+    monkeypatch.setattr(pt, "async_session_factory", _factory)
+    monkeypatch.setattr(pt, "get_or_create_runtime_assessment", _get_or_create)
+    monkeypatch.setattr(pt, "patch_assessment", _patch)
+    context = {
+        "source_type": "misalignment",
+        "signal_version": "x4_v2",
+        "target_window_start": WINDOW_START,
+        "market_period": "5m",
+        "direction": "DOWN",
+        "patch_values": {
+            "strategy_eligible": True,
+            "operational_eligible": True,
+        },
+    }
+
+    order = await trader._reserve_order_slot(
+        "x4_v2",
+        WINDOW_START,
+        direction="DOWN",
+        assessment_context=context,
+    )
+
+    assert order is added[0]
+    assert order.assessment_id == 902
+    assert sessions == [db, db]
+    assert commits == 1
+
+
+@pytest.mark.asyncio
+async def test_signal_trade_reservation_assessment_failure_does_not_block_order(
+        monkeypatch) -> None:
+    """占位事务内 assessment savepoint 失败后，订单仍提交且真钱调用次数不变。"""
+    trader = _make_real_trader(monkeypatch)
+    calls = {name: 0 for name in ("list", "balance", "quote", "place", "confirm")}
+    original_list = trader.list_markets
+    original_balance = trader._preflight_balance
+    added: list[TradeOrderModel] = []
+
+    class _ReservationSession:
+        def add(self, row):
+            added.append(row)
+
+        def begin_nested(self):
+            @asynccontextmanager
+            async def _nested():
+                yield
+            return _nested()
+
+        async def commit(self):
+            return None
+
+    @asynccontextmanager
+    async def _factory():
+        yield _ReservationSession()
+
+    async def _get_or_create(*args, **kwargs):
+        return SimpleNamespace(id=901)
+
+    async def _broken_patch(*args, **kwargs):
+        raise RuntimeError("assessment unavailable")
+
+    async def _list():
+        calls["list"] += 1
+        return await original_list()
+
+    async def _balance(amount_usdt):
+        calls["balance"] += 1
+        return await original_balance(amount_usdt)
+
+    async def _quote(_token, _side, amount_usdt=None):
+        calls["quote"] += 1
+        return {"averagePrice": 0.25, "amountIn": "5", "amountOut": "19"}
+
+    async def _place(_quote, slippage_bps=1200):
+        calls["place"] += 1
+        return {"orderId": "ORD-SAVEPOINT"}
+
+    async def _confirm(order_id, attempts=CONFIRM_ATTEMPTS, delay=CONFIRM_DELAY_S):
+        calls["confirm"] += 1
+        return {"orderId": order_id, "status": "FILLED", "price": "0.25"}
+
+    async def _update(order, status, **kwargs):
+        return {"status": status, **kwargs}
+
+    monkeypatch.setattr(pt, "async_session_factory", _factory)
+    monkeypatch.setattr(pt, "get_or_create_runtime_assessment", _get_or_create)
+    monkeypatch.setattr(pt, "patch_assessment", _broken_patch)
+    monkeypatch.setattr(trader, "list_markets", _list)
+    monkeypatch.setattr(trader, "_preflight_balance", _balance)
+    monkeypatch.setattr(trader, "get_quote", _quote)
+    monkeypatch.setattr(trader, "place_order", _place)
+    monkeypatch.setattr(trader, "confirm_order_status", _confirm)
+    monkeypatch.setattr(trader, "_update_signal_order", _update)
+
+    context = {
+        "source_type": "misalignment",
+        "signal_version": "x4_v2",
+        "target_window_start": WINDOW_START,
+        "market_period": "5m",
+        "direction": "DOWN",
+        "patch_values": {
+            "strategy_eligible": True,
+            "operational_eligible": True,
+        },
+    }
+    order = await trader.execute_signal_trade(
+        "DOWN", 5.0, "x4_v2", WINDOW_START,
+        max_exec_price=0.50,
+        assessment_context=context,
+    )
+
+    assert order["status"] == "FILLED"
+    assert len(added) == 1
+    assert added[0].assessment_id is None
+    assert calls == {
+        "list": 1,
+        "balance": 1,
+        "quote": 1,
+        "place": 1,
+        "confirm": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_signal_trade_market_assessment_keeps_execution_facts_after_order_update(
+        monkeypatch) -> None:
+    """MARKET 终态先落订单，再写完整执行事实；观测不增加外部请求。"""
+    trader = _make_real_trader(monkeypatch)
+    trader._active_market = {"marketTopicId": 321}
+    sequence: list[str] = []
+    patches: list[tuple] = []
+    calls = {name: 0 for name in ("quote", "place", "confirm")}
+
+    async def _reserve(_v, _ws, direction=None, market_period="5m",
+                       scene_signal_id=None, assessment_id=None):
+        assert assessment_id == 77
+        return _pending_order()
+
+    async def _update(order, status, **kwargs):
+        sequence.append("order")
+        return {**order, "status": status, **kwargs}
+
+    async def _patch(assessment_id, stage, reason, **values):
+        sequence.append("assessment")
+        patches.append((assessment_id, stage, reason, values))
+
+    async def _quote(_token, _side, amount_usdt=None):
+        calls["quote"] += 1
+        return {"averagePrice": 0.25, "amountIn": "5", "amountOut": "19",
+                "quoteId": "Q-ASSESS"}
+
+    async def _place(_quote, slippage_bps=1200):
+        calls["place"] += 1
+        return {"orderId": "ORD-ASSESS"}
+
+    async def _confirm(_order_id, attempts=CONFIRM_ATTEMPTS, delay=CONFIRM_DELAY_S):
+        calls["confirm"] += 1
+        return {"orderId": _order_id, "status": "FILLED", "price": "0.26"}
+
+    monkeypatch.setattr(trader, "_reserve_order_slot", _reserve)
+    monkeypatch.setattr(trader, "_update_signal_order", _update)
+    monkeypatch.setattr(trader, "_patch_signal_assessment", _patch)
+    monkeypatch.setattr(trader, "get_quote", _quote)
+    monkeypatch.setattr(trader, "place_order", _place)
+    monkeypatch.setattr(trader, "confirm_order_status", _confirm)
+
+    order = await trader.execute_signal_trade(
+        "DOWN", 5.0, "x4_v2", WINDOW_START,
+        max_exec_price=0.50, assessment_id=77,
+    )
+
+    assert order["status"] == "FILLED"
+    assert sequence == ["order", "assessment"]
+    assert calls == {"quote": 1, "place": 1, "confirm": 1}
+    assessment_id, stage, reason, values = patches[0]
+    assert (assessment_id, stage, reason) == (
+        77, TerminalStage.FILL, ReasonCode.ORDER_FILLED)
+    assert values["execution_eligible"] is True
+    assert values["guard_applied"] is True
+    assert values["market_id"] == 321
+    assert values["token_id"] == "TOKEN-DOWN"
+    assert values["balance_available"] == 1000.0
+    assert values["balance_required"] == 5.0
+    assert values["quote_average_price"] == 0.25
+    assert values["quote_snapshot"]["quoteId"] == "Q-ASSESS"
+    assert values["decision_snapshot"]["order_type"] == "MARKET"
+    assert values["decision_snapshot"]["attempts"] == [{
+        "attempt": 0,
+        "order_id": "ORD-ASSESS",
+        "quote_average_price": 0.25,
+        "guard_applied": True,
+        "whitelist_applied": False,
+        "slippage_bps": 1200,
+        "terminal_status": "FILLED",
+    }]
+
+
+@pytest.mark.asyncio
+async def test_signal_trade_market_assessment_records_fok_retry_attempts(monkeypatch) -> None:
+    """FOK 重试沿用原请求链，并在最终评估中保留每轮终态。"""
+    trader = _make_real_trader(monkeypatch)
+    patches: list[tuple] = []
+    quotes = [
+        {"averagePrice": 0.49, "amountIn": "5", "amountOut": "10", "quoteId": "Q1"},
+        {"averagePrice": 0.52, "amountIn": "5", "amountOut": "9", "quoteId": "Q2"},
+    ]
+    places = [{"orderId": "ORD-1"}, {"orderId": "ORD-2"}]
+    confirms = {
+        "ORD-1": {"orderId": "ORD-1", "status": "FAILED"},
+        "ORD-2": {"orderId": "ORD-2", "status": "FILLED", "price": "0.58"},
+    }
+
+    async def _reserve(_v, _ws, direction=None, market_period="5m",
+                       scene_signal_id=None, assessment_id=None):
+        return _pending_order()
+
+    async def _update(order, status, **kwargs):
+        return {**order, "status": status, **kwargs}
+
+    async def _patch(assessment_id, stage, reason, **values):
+        patches.append((stage, reason, values))
+
+    async def _quote(_token, _side, amount_usdt=None):
+        return quotes.pop(0)
+
+    async def _place(_quote, slippage_bps=1200):
+        return places.pop(0)
+
+    async def _confirm(order_id, attempts=CONFIRM_ATTEMPTS, delay=CONFIRM_DELAY_S):
+        return confirms[order_id]
+
+    monkeypatch.setattr(trader, "_reserve_order_slot", _reserve)
+    monkeypatch.setattr(trader, "_update_signal_order", _update)
+    monkeypatch.setattr(trader, "_patch_signal_assessment", _patch)
+    monkeypatch.setattr(trader, "get_quote", _quote)
+    monkeypatch.setattr(trader, "place_order", _place)
+    monkeypatch.setattr(trader, "confirm_order_status", _confirm)
+
+    order = await trader.execute_signal_trade(
+        "DOWN", 5.0, "x4_v2", WINDOW_START,
+        max_exec_price=0.60, assessment_id=88,
+    )
+
+    assert order["status"] == "FILLED"
+    assert order["order_id"] == "ORD-2"
+    stage, reason, values = patches[0]
+    assert (stage, reason) == (TerminalStage.FILL, ReasonCode.ORDER_FILLED)
+    attempts = values["decision_snapshot"]["attempts"]
+    assert [attempt["attempt"] for attempt in attempts] == [0, 1]
+    assert [attempt["order_id"] for attempt in attempts] == ["ORD-1", "ORD-2"]
+    assert [attempt["terminal_status"] for attempt in attempts] == ["FAILED", "FILLED"]
+    assert attempts[0]["slippage_bps"] == 1200
+    assert attempts[1]["slippage_bps"] == 1538
+    assert values["quote_snapshot"]["quoteId"] == "Q1"
+    assert values["quote_average_price"] == 0.49
 
 
 @pytest.mark.asyncio
@@ -4056,15 +4579,25 @@ def test_limit_order_channels_marked_in_registry() -> None:
 
 @pytest.mark.asyncio
 async def test_signal_trade_limit_gtc_order_flow(monkeypatch) -> None:
-    """execute_signal_trade 传入 order_type='LIMIT'：
-    1. 调用 get_quote 传 order_type='LIMIT' 与 price_limit=max_exec_price
-    2. 调用 place_order 传 order_type='LIMIT', time_in_force='GTC', price_limit=max_exec_price
-    3. 状态直接落 PENDING（GTC 挂单常驻币安撮合簿等待被动撮合），不走 FOK 即时确认与重试。
-    """
+    """冻结 LIMIT 当前语义：quote-level guard/白名单不执行，GTC 直接挂 PENDING。"""
     trader = _make_real_trader(monkeypatch)
     quote_calls: list[dict] = []
     place_calls: list[dict] = []
     updates: list[tuple] = []
+    list_calls = 0
+    balance_calls = 0
+    original_list_markets = trader.list_markets
+    original_preflight_balance = trader._preflight_balance
+
+    async def _list_markets():
+        nonlocal list_calls
+        list_calls += 1
+        return await original_list_markets()
+
+    async def _preflight_balance(amount_usdt):
+        nonlocal balance_calls
+        balance_calls += 1
+        return await original_preflight_balance(amount_usdt)
 
     async def _reserve(_v, _ws, direction=None, market_period="5m", scene_signal_id=None):
         return _pending_order()
@@ -4100,10 +4633,13 @@ async def test_signal_trade_limit_gtc_order_flow(monkeypatch) -> None:
         return {"orderId": "ORD-LIMIT-GTC-1"}
 
     confirm_calls: list[str] = []
+
     async def _confirm(order_id, **kwargs):
         confirm_calls.append(order_id)
         return {"orderId": order_id, "status": "FILLED"}
 
+    monkeypatch.setattr(trader, "list_markets", _list_markets)
+    monkeypatch.setattr(trader, "_preflight_balance", _preflight_balance)
     monkeypatch.setattr(trader, "_reserve_order_slot", _reserve)
     monkeypatch.setattr(trader, "_update_signal_order", _update)
     monkeypatch.setattr(trader, "get_quote", _quote)
@@ -4117,24 +4653,28 @@ async def test_signal_trade_limit_gtc_order_flow(monkeypatch) -> None:
         window_start=WINDOW_START,
         max_exec_price=0.30,
         market_period="15m",
+        entry_band_whitelist=((0.0, 0.10),),
         order_type="LIMIT",
     )
 
-    # 1. 断言 get_quote 传参
-    assert len(quote_calls) == 1
-    assert quote_calls[0]["order_type"] == "LIMIT"
-    assert quote_calls[0]["price_limit"] == 0.30
-
-    # 2. 断言 place_order 传参
+    # averagePrice == guard 且不在白名单内，仍按当前 LIMIT 语义提交。
+    assert quote_calls == [{
+        "token_id": "TOKEN-15M-DOWN",
+        "side": "BUY",
+        "amount_usdt": 5.0,
+        "order_type": "LIMIT",
+        "price_limit": 0.30,
+    }]
     assert len(place_calls) == 1
     assert place_calls[0]["order_type"] == "LIMIT"
     assert place_calls[0]["time_in_force"] == "GTC"
     assert place_calls[0]["price_limit"] == 0.30
 
-    # 3. 断言直接落 PENDING，且绝不走 FOK 即时回查与重试
     assert order["status"] == "PENDING"
     assert order["order_id"] == "ORD-LIMIT-GTC-1"
-    assert len(confirm_calls) == 0  # GTC 挂单不进行同步终态回查
+    assert list_calls == 1
+    assert balance_calls == 1
+    assert len(confirm_calls) == 0
     assert updates[-1][0] == "PENDING"
     assert updates[-1][1]["order_id"] == "ORD-LIMIT-GTC-1"
 

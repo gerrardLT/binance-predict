@@ -50,7 +50,7 @@ def _row(**over) -> SimpleNamespace:
         direction="DOWN", amount_in=str(10 ** 18),  # 1 USDT
         quote_json={"averagePrice": 0.5},
         market_period="5m", scene_signal_id=None,
-        signal_version="firsthit_g7_base_v1",
+        signal_version="firsthit_g7_base_v1", assessment_id=None,
     )
     base.update(over)
     return SimpleNamespace(**base)
@@ -160,6 +160,62 @@ async def test_settle_win(monkeypatch) -> None:
     assert p["settle_price"] == pytest.approx(43250.0)
     assert isinstance(p["settled_at"], datetime)
     db.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_settle_win_advances_linked_assessment(monkeypatch) -> None:
+    """订单先结算成功，再把关联账本推进到 SETTLEMENT/SETTLED。"""
+    db = _Db([_row(direction="DOWN", assessment_id=71)], _window("DOWN"))
+    _stub_db(monkeypatch, db)
+    patches = []
+
+    async def _patch(session, patch):
+        patches.append((session, patch))
+
+    monkeypatch.setattr(ts_mod, "patch_assessment", _patch)
+
+    assert await TradeSettler().poll_once() == 1
+    assert len(patches) == 1
+    session, patch = patches[0]
+    assert session is db
+    assert patch.assessment_id == 71
+    assert patch.stage.value == "SETTLEMENT"
+    assert patch.reason.value == "SETTLED"
+    assert db.commit.await_count == 2  # 订单结算先提交，观测随后独立提交
+
+
+@pytest.mark.asyncio
+async def test_settlement_expiry_advances_linked_assessment(monkeypatch) -> None:
+    """EXPIRED/NOISE 非胜负结算在账本中明确归入 settlement coverage gap。"""
+    old = datetime.now(timezone.utc) - timedelta(hours=25)
+    db = _Db([_row(created_at=old, assessment_id=72)], None)
+    _stub_db(monkeypatch, db)
+    patches = []
+
+    async def _patch(_session, patch):
+        patches.append(patch)
+
+    monkeypatch.setattr(ts_mod, "patch_assessment", _patch)
+
+    assert await TradeSettler().poll_once() == 1
+    assert patches[0].stage.value == "SETTLEMENT"
+    assert patches[0].reason.value == "SETTLEMENT_EXPIRED"
+
+
+@pytest.mark.asyncio
+async def test_assessment_failure_does_not_fail_order_settlement(monkeypatch) -> None:
+    """观测落库失败不反转已提交的真实订单结算，也不触发重复结算。"""
+    db = _Db([_row(direction="DOWN", assessment_id=73)], _window("DOWN"))
+    _stub_db(monkeypatch, db)
+
+    async def _fail(_session, _patch):
+        raise RuntimeError("assessment unavailable")
+
+    monkeypatch.setattr(ts_mod, "patch_assessment", _fail)
+
+    assert await TradeSettler().poll_once() == 1
+    assert len(db.updates) == 1
+    assert db.commit.await_count == 1  # 真实订单提交已完成，观测事务未提交
 
 
 @pytest.mark.asyncio

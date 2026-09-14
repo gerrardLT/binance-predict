@@ -53,6 +53,8 @@ from sqlalchemy import select as sa_select, update as sa_update
 
 from binance_predict.db.engine import async_session_factory
 from binance_predict.db.models import FakeBreakoutSignal, KlineShadowSignal, SentimentWindow, TradeOrderModel
+from binance_predict.services.shadow_execution_store import patch_assessment
+from binance_predict.services.shadow_execution_types import AssessmentPatch, ReasonCode, TerminalStage
 from binance_predict.services.wechat_notifier import wechat_notifier
 
 logger = logging.getLogger(__name__)
@@ -189,6 +191,7 @@ class TradeSettler:
                 await session.commit()
             if result.rowcount == 0:
                 return False
+            await self._patch_settlement_assessment(row, "EXPIRED")
             self._settled_count += 1
             logger.info(
                 "订单结算 | id=%s | direction=NULL（旧数据）→ EXPIRED 出清 | window=%s",
@@ -247,6 +250,7 @@ class TradeSettler:
             await session.commit()
         if result.rowcount == 0:
             return False  # 已被并发结算（幂等守卫生效）
+        await self._patch_settlement_assessment(row, str(outcome))
         self._settled_count += 1
         logger.info(
             "订单结算 | id=%s | window=%s | direction=%s → %s | win=%s | pnl=%s | settle_price=%s",
@@ -346,6 +350,7 @@ class TradeSettler:
             await session.commit()
         if result.rowcount == 0:
             return False  # 已被并发结算（幂等守卫生效）
+        await self._patch_settlement_assessment(row, str(outcome))
         self._settled_count += 1
         logger.info(
             "订单结算 | id=%s | scene_signal=%s | window=%s | direction=%s → %s"
@@ -462,6 +467,7 @@ class TradeSettler:
             await session.commit()
         if result.rowcount == 0:
             return False  # 已被并发结算（幂等守卫生效）
+        await self._patch_settlement_assessment(row, str(outcome))
         self._settled_count += 1
         logger.info(
             "订单结算 | id=%s | kline_shadow | signal=%s | window=%s | direction=%s → %s"
@@ -506,12 +512,41 @@ class TradeSettler:
             await session.commit()
         if result.rowcount == 0:
             return False
+        await self._patch_settlement_assessment(row, "EXPIRED")
         self._settled_count += 1
         return True
 
     # ------------------------------------------------------------------
     # 辅助
     # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _patch_settlement_assessment(row: TradeOrderModel, outcome: str) -> None:
+        """Advance observation only after the authoritative order settlement commits."""
+        assessment_id = getattr(row, "assessment_id", None)
+        if assessment_id is None:
+            return
+        reason = (
+            ReasonCode.SETTLED
+            if outcome in ("UP", "DOWN")
+            else ReasonCode.SETTLEMENT_EXPIRED
+        )
+        try:
+            async with async_session_factory() as session:
+                await patch_assessment(
+                    session,
+                    AssessmentPatch(
+                        assessment_id=int(assessment_id),
+                        stage=TerminalStage.SETTLEMENT,
+                        reason=reason,
+                    ),
+                )
+                await session.commit()
+        except Exception as exc:
+            logger.error(
+                "交易结算器：执行评估推进失败（不影响订单）| assessment=%s | reason=%s | %s",
+                assessment_id, reason.value, exc,
+            )
 
     async def _find_window(self, window_start: int) -> SentimentWindow | None:
         stmt = sa_select(SentimentWindow).where(

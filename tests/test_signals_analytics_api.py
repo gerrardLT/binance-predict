@@ -28,6 +28,58 @@ import pytest
 from fastapi import HTTPException
 
 
+@pytest.mark.asyncio
+async def test_execution_comparison_route_forwards_scope(monkeypatch) -> None:
+    """新端点将统一筛选范围原样交给聚合服务。"""
+    import binance_predict.main as m
+    import binance_predict.services.shadow_execution_analytics as analytics
+
+    seen = {}
+
+    async def _build(db, **kwargs):
+        seen["db"] = db
+        seen.update(kwargs)
+        return {"scope": kwargs}
+
+    monkeypatch.setattr(analytics, "build_execution_comparison", _build)
+    db = AsyncMock()
+    out = await m.get_signals_execution_comparison(
+        policy_version="policy-a",
+        from_ts=100,
+        to_ts=200,
+        market_period="15m",
+        include_retired=True,
+        db=db,
+    )
+
+    assert seen == {
+        "db": db,
+        "policy_version": "policy-a",
+        "from_ts": 100,
+        "to_ts": 200,
+        "market_period": "15m",
+        "include_retired": True,
+    }
+    assert out["scope"]["policy_version"] == "policy-a"
+
+
+@pytest.mark.asyncio
+async def test_execution_comparison_route_rejects_invalid_range() -> None:
+    """from 必须严格小于 to，错误范围在聚合查询前返回 422。"""
+    import binance_predict.main as m
+
+    with pytest.raises(HTTPException) as exc:
+        await m.get_signals_execution_comparison(
+            policy_version="live-exec-v1",
+            from_ts=200,
+            to_ts=200,
+            market_period=None,
+            include_retired=False,
+            db=AsyncMock(),
+        )
+    assert exc.value.status_code == 422
+
+
 def _shadow_row(**over) -> SimpleNamespace:
     """影子信号行替身：默认 x4_v1 已结算押 DOWN 赢。"""
     base = dict(

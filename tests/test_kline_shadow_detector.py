@@ -5,6 +5,7 @@ output/klines_{15m,5m}_720d.csv（缺失时 skip，CI 无产物不阻塞）。
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -26,6 +27,7 @@ from binance_predict.services.kline_shadow_detector import (
 ROOT = Path(__file__).resolve().parents[1]
 CSV_15M = ROOT / "output" / "klines_15m_720d.csv"
 CSV_5M = ROOT / "output" / "klines_5m_720d.csv"
+FROZEN_LAST_DATE = "2026-09-04"
 
 # 冻结注册表逐字条件（与 SHADOW_CONDITIONS 同源，测试独立复核）
 COND_A = ("dist_prior_low_atr_5 <= -0.0935059731 AND "
@@ -55,6 +57,20 @@ def full_env():
         pytest.skip("720d K 线产物不存在（离线口径测试跳过）")
     kl15 = load_klines_csv(str(CSV_15M), 900_000)
     kl5 = load_klines_csv(str(CSV_5M), 300_000)
+    last_dates = {
+        "15m": datetime.fromtimestamp(
+            int(kl15.t[-1]) / 1000, tz=timezone.utc
+        ).date().isoformat(),
+        "5m": datetime.fromtimestamp(
+            int(kl5.t[-1]) / 1000, tz=timezone.utc
+        ).date().isoformat(),
+    }
+    mismatched = [tf for tf, value in last_dates.items() if value != FROZEN_LAST_DATE]
+    if mismatched:
+        actual = ", ".join(f"{tf}={last_dates[tf]}" for tf in mismatched)
+        pytest.skip(
+            f"720d K 线截止日期 {actual}，冻结计数仅适用于 {FROZEN_LAST_DATE}"
+        )
     fm = build_feature_matrix(kl15, 900_000, k5=kl5)
     tg = build_targets(kl15.t, kl15.o, kl15.h, kl15.l, kl15.c, kl15.cont,
                        [1], atr_series(kl15, 20))

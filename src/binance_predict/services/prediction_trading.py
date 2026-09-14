@@ -32,6 +32,9 @@ from ..config.settings import settings
 from ..db.engine import async_session_factory
 from ..db.models import TradeOrderModel
 from . import clock_sync
+from .live_execution_policy import evaluate_quote_execution_policy
+from .shadow_execution_store import get_or_create_runtime_assessment, patch_assessment
+from .shadow_execution_types import AssessmentPatch, ReasonCode, TerminalStage
 from .wechat_notifier import wechat_notifier
 
 # ---------------------------------------------------------------------------
@@ -893,8 +896,14 @@ class BinancePredictionTrader:
             end_ms = int(end_raw) if end_raw is not None else None
         except (TypeError, ValueError):
             end_ms = None
-        entry = {"end_date": end_ms, "up_token": None, "down_token": None,
-                 "up_price": None, "down_price": None}
+        entry = {
+            "market_id": market.get("marketTopicId"),
+            "end_date": end_ms,
+            "up_token": None,
+            "down_token": None,
+            "up_price": None,
+            "down_price": None,
+        }
         for sub_market in market.get("markets", []):
             for outcome in sub_market.get("outcomes", []):
                 name = outcome.get("name", "").upper()
@@ -1426,6 +1435,34 @@ class BinancePredictionTrader:
                 direction=prediction,
             )
 
+    async def _patch_signal_assessment(
+        self,
+        assessment_id: int | None,
+        stage: TerminalStage,
+        reason: ReasonCode,
+        **values: Any,
+    ) -> None:
+        """Persist observation facts without ever affecting the real trade path."""
+        if assessment_id is None:
+            return
+        try:
+            async with async_session_factory() as db:
+                await patch_assessment(
+                    db,
+                    AssessmentPatch(
+                        assessment_id=assessment_id,
+                        stage=stage,
+                        reason=reason,
+                        **values,
+                    ),
+                )
+                await db.commit()
+        except Exception as exc:
+            logger.error(
+                "信号实盘：执行评估写入失败（不影响订单）| assessment={} | stage={} | {}",
+                assessment_id, stage.value, exc,
+            )
+
     async def execute_signal_trade(
         self,
         prediction: str,
@@ -1437,6 +1474,8 @@ class BinancePredictionTrader:
         scene_signal_id: int | None = None,
         entry_band_whitelist: tuple[tuple[float, float], ...] | None = None,
         order_type: str = "MARKET",
+        assessment_id: int | None = None,
+        assessment_context: dict | None = None,
     ) -> dict | None:
         """
         信号驱动实盘专用通道（多通道 LIVE：quote_edge/x4 用 5m，场景用 15m）：
@@ -1483,12 +1522,21 @@ class BinancePredictionTrader:
 
         async with self._trade_lock:
             # 先占位后下单：PENDING 行占住唯一键；重复窗口（含重启/并发）在花钱前拒绝。
+            reserve_kwargs = {
+                "direction": prediction,
+                "market_period": market_period,
+                "scene_signal_id": scene_signal_id,
+            }
+            if assessment_id is not None:
+                reserve_kwargs["assessment_id"] = assessment_id
+            if assessment_context is not None:
+                reserve_kwargs["assessment_context"] = assessment_context
             pending = await self._reserve_order_slot(
-                signal_version, window_start, direction=prediction,
-                market_period=market_period, scene_signal_id=scene_signal_id)
+                signal_version, window_start, **reserve_kwargs)
             if pending is None:
                 logger.info("信号实盘：窗口 {} 已有订单占位，跳过（每窗一单）", window_start)
                 return None
+            assessment_id = getattr(pending, "assessment_id", assessment_id)
 
             await self.list_markets()
 
@@ -1565,15 +1613,36 @@ class BinancePredictionTrader:
                             window_start, cache_start)
 
             if not token_id:
+                await self._patch_signal_assessment(
+                    assessment_id,
+                    TerminalStage.EXECUTION,
+                    ReasonCode.MARKET_NOT_FOUND,
+                    execution_eligible=False,
+                )
                 return await self._update_signal_order(
                     pending, "FAILED", direction=prediction,
                     error_message=f"未找到 {market_period} 市场 {prediction} 方向的 token")
+
+            market_id = ((entry or {}).get("market_id") if entry else None)
+            if market_id is None and market_period == "5m" and self._active_market:
+                market_id = self._active_market.get("marketTopicId")
 
             # P1 余额预检：手工单/划转把 CeDeFi 可用余额打穿时，币安要到报价
             # 阶段才回 -9000，文案泛化难归因（2026-09-04 12:45 生产实证）。
             # 预检不过即弃单（未提交币安，不产生废单）；查询失败保守放行。
             bal_ok, bal_free, bal_why = await self._preflight_balance(amount_usdt)
             if not bal_ok:
+                await self._patch_signal_assessment(
+                    assessment_id,
+                    TerminalStage.EXECUTION,
+                    ReasonCode.BALANCE_INSUFFICIENT,
+                    execution_eligible=False,
+                    market_id=market_id,
+                    token_id=token_id,
+                    balance_available=bal_free,
+                    balance_required=amount_usdt,
+                    decision_snapshot={"balance_reason": bal_why},
+                )
                 logger.error("信号实盘：余额预检未过，弃单 | signal={} | window={} | {}",
                              signal_version, window_start, bal_why)
                 return await self._update_signal_order(
@@ -1595,28 +1664,59 @@ class BinancePredictionTrader:
                 detail = self.last_api_error or "无详情（网络异常？）"
                 # 错误分类（P1）：-9000 是币安的余额不足文案，预检放行但下单时
                 # 余额被并发手工单抽走时会走到这里，归因文案直接点名余额。
+                quote_reason = ReasonCode.QUOTE_UNAVAILABLE
                 if "-9000" in detail or "enough USDT" in detail:
                     detail = f"余额不足（币安 -9000）| {detail}"
+                    quote_reason = ReasonCode.BALANCE_INSUFFICIENT
+                await self._patch_signal_assessment(
+                    assessment_id,
+                    TerminalStage.EXECUTION,
+                    quote_reason,
+                    execution_eligible=False,
+                    token_id=token_id,
+                    balance_available=bal_free,
+                    balance_required=amount_usdt,
+                    decision_snapshot={"quote_error": detail, "balance_reason": bal_why},
+                )
                 return await self._update_signal_order(
                     pending, "FAILED", direction=prediction,
                     error_message=f"获取报价失败 | {detail}",
                 )
 
-            # ✅ 修复#2: 统一提取报价均价（MARKET/LIMIT共用）
             try:
                 avg_price = float(quote.get("averagePrice") or 0.0)
             except (TypeError, ValueError):
                 avg_price = 0.0
-            
-            # 市价单模式检查护栏与白名单（MARKET only）
-            if not is_limit:
-                try:
-                    avg_price = float(quote.get("averagePrice") or 0.0)
-                except (TypeError, ValueError):
-                    avg_price = 0.0
-                # 护栏含贴线（>=）：报价=护栏价时滑点空间为 0，币安拒收
-                # slippageBps=0（-1102，2026-08-29 id=100 实证），贴线单无法安全提交。
-                if max_exec_price is not None and (avg_price <= 0 or avg_price >= max_exec_price):
+            quote_policy = evaluate_quote_execution_policy(
+                order_type=order_type,
+                avg_price=avg_price,
+                max_exec_price=max_exec_price,
+                entry_bands=entry_band_whitelist,
+            )
+            assessment_quote_values = {
+                "execution_eligible": quote_policy.eligible,
+                "guard_applied": quote_policy.guard_applied,
+                "market_id": market_id,
+                "token_id": token_id,
+                "balance_available": bal_free,
+                "balance_required": amount_usdt,
+                "quote_average_price": avg_price,
+                "quote_snapshot": quote,
+                "decision_snapshot": {
+                    "order_type": order_type,
+                    "whitelist_applied": quote_policy.whitelist_applied,
+                    "slippage_bps": quote_policy.slippage_bps,
+                    "balance_reason": bal_why,
+                },
+            }
+            if not quote_policy.eligible:
+                await self._patch_signal_assessment(
+                    assessment_id,
+                    TerminalStage.EXECUTION,
+                    ReasonCode(quote_policy.reason),
+                    **assessment_quote_values,
+                )
+                if quote_policy.reason == ReasonCode.EXEC_PRICE_GUARD.value:
                     wechat_notifier.notify_order_abandoned(
                         channel=signal_version,
                         direction=prediction,
@@ -1629,46 +1729,20 @@ class BinancePredictionTrader:
                         pending, "FAILED", direction=prediction,
                         error_message=f"执行价护栏弃单 | averagePrice={avg_price} >= {max_exec_price}（贴线无滑点空间）",
                         quote_json=quote)
+                wechat_notifier.notify_order_abandoned(
+                    channel=signal_version,
+                    direction=prediction,
+                    window_start=window_start,
+                    quote_price=avg_price,
+                    guard_price=max_exec_price,
+                    reason=f"成交均价 {avg_price} 不在入场白名单区间 {entry_band_whitelist}",
+                )
+                return await self._update_signal_order(
+                    pending, "FAILED", direction=prediction,
+                    error_message=f"入场价白名单弃单 | averagePrice={avg_price} 不在 {entry_band_whitelist}",
+                    quote_json=quote)
 
-                # ✅ 修复#2: LIMIT 订单也加 quote-level 护栏检查
-                # 挂单虽不即时成交，但报价 avg_price 远超 guard 说明市场已大幅偏离，
-                # 提交此挂单大概率成交在更差价位或根本无人接单，不如直接弃单
-                if max_exec_price is not None and (avg_price <= 0 or avg_price >= max_exec_price):
-                    wechat_notifier.notify_order_abandoned(
-                        channel=signal_version,
-                        direction=prediction,
-                        window_start=window_start,
-                        quote_price=avg_price,
-                        guard_price=max_exec_price,
-                        reason=f"LIMIT 挂单报价 {avg_price} 超出或贴线护栏上限 {max_exec_price}",
-                    )
-                    return await self._update_signal_order(
-                        pending, "FAILED", direction=prediction,
-                        error_message=f"LIMIT 执行价护栏弃单 | averagePrice={avg_price} >= {max_exec_price}（报价已破护栏）",
-                        quote_json=quote)
-
-                # 入场价白名单（x4_v3 下单层主护栏）：报价后、下单前检查——白名单依赖
-                # 决策点才可知的成交均价，与执行价护栏相互独立（白名单过、护栏超 →
-                # 仍弃单；反之亦然）。avg≤0 已被纯函数 fail-safe 拦截。
-                if not in_entry_band_whitelist(avg_price, entry_band_whitelist):
-                    wechat_notifier.notify_order_abandoned(
-                        channel=signal_version,
-                        direction=prediction,
-                        window_start=window_start,
-                        quote_price=avg_price,
-                        guard_price=max_exec_price,
-                        reason=f"成交均价 {avg_price} 不在入场白名单区间 {entry_band_whitelist}",
-                    )
-                    return await self._update_signal_order(
-                        pending, "FAILED", direction=prediction,
-                        error_message=f"入场价白名单弃单 | averagePrice={avg_price} 不在 {entry_band_whitelist}",
-                        quote_json=quote)
-
-            # 动态滑点收紧（CodeReview Medium#2）：FOK 成交价不得突破护栏价
-            slippage_bps = 1200
-            if not is_limit and max_exec_price is not None and avg_price > 0:
-                cap = int((max_exec_price / avg_price - 1.0) * 10000)
-                slippage_bps = max(0, min(1200, cap))
+            slippage_bps = quote_policy.slippage_bps
 
             tif = "GTC" if is_limit else "FOK"
             if is_limit:
@@ -1682,9 +1756,16 @@ class BinancePredictionTrader:
             else:
                 order_result = await self.place_order(quote, slippage_bps=slippage_bps)
             if not order_result:
-                return await self._update_signal_order(
+                snapshot = await self._update_signal_order(
                     pending, "FAILED", direction=prediction,
                     error_message="下单失败", quote_json=quote)
+                await self._patch_signal_assessment(
+                    assessment_id,
+                    TerminalStage.ORDER,
+                    ReasonCode.ORDER_SUBMIT_FAILED,
+                    **assessment_quote_values,
+                )
+                return snapshot
 
             order_id = order_result.get("orderId")
 
@@ -1693,14 +1774,38 @@ class BinancePredictionTrader:
                 logger.info(
                     "信号实盘：限价 GTC 挂单已提交至币安撮合簿 | signal={} | window={} | orderId={} | limitPrice={}",
                     signal_version, window_start, order_id, limit_price)
-                return await self._update_signal_order(
+                snapshot = await self._update_signal_order(
                     pending, "PENDING",
                     direction=prediction,
                     token_id=token_id,
                     order_id=order_id,
                     quote_json=quote,
                 )
+                await self._patch_signal_assessment(
+                    assessment_id,
+                    TerminalStage.ORDER,
+                    ReasonCode.ORDER_PENDING,
+                    **assessment_quote_values,
+                )
+                return snapshot
             confirmed = await self._confirm_with_backfill(order_id)
+            execution_attempts = [{
+                "attempt": 0,
+                "order_id": order_id,
+                "quote_average_price": avg_price,
+                "guard_applied": quote_policy.guard_applied,
+                "whitelist_applied": quote_policy.whitelist_applied,
+                "slippage_bps": slippage_bps,
+                "terminal_status": (confirmed or {}).get("status"),
+            }]
+
+            def _market_assessment_values() -> dict[str, Any]:
+                values = dict(assessment_quote_values)
+                values["decision_snapshot"] = {
+                    **assessment_quote_values["decision_snapshot"],
+                    "attempts": execution_attempts,
+                }
+                return values
 
             # FOK 未成交即时重试（成交率改进，2026-08-30 S1 实证）：15m 开盘瞬间
             # 盘口极薄（成交量仅 $37 量级），首轮保守滑点常吃不满护栏以内的 ask
@@ -1719,6 +1824,10 @@ class BinancePredictionTrader:
                     signal_version, window_start, order_id)
                 retry_quote = await self.get_quote(token_id, "BUY", amount_usdt=amount_usdt)
                 if not retry_quote:
+                    execution_attempts.append({
+                        "attempt": retries,
+                        "result": "QUOTE_UNAVAILABLE",
+                    })
                     break  # 重新报价失败 → 保持 FOK 失败终态，不伪报
                 try:
                     retry_avg = float(retry_quote.get("averagePrice") or 0.0)
@@ -1728,21 +1837,45 @@ class BinancePredictionTrader:
                 # error 带上首次单 orderId 便于对账追溯。
                 if max_exec_price is not None and (
                         retry_avg <= 0 or retry_avg >= max_exec_price):
-                    return await self._update_signal_order(
+                    execution_attempts.append({
+                        "attempt": retries,
+                        "quote_average_price": retry_avg,
+                        "result": ReasonCode.EXEC_PRICE_GUARD.value,
+                    })
+                    snapshot = await self._update_signal_order(
                         pending, "FAILED", direction=prediction, token_id=token_id,
                         order_id=order_id, quote_json=retry_quote,
                         error_message=(
                             f"重试执行价护栏弃单 | averagePrice={retry_avg} "
                             f">= {max_exec_price}（贴线无滑点空间）"))
+                    await self._patch_signal_assessment(
+                        assessment_id,
+                        TerminalStage.FILL,
+                        ReasonCode.ORDER_FAILED,
+                        **_market_assessment_values(),
+                    )
+                    return snapshot
                 # 白名单复检：重试换价必须重查（首检只看首报价，重试新报价可能
                 # 跳出白名单带——跳过复检会绕过 x4_v3 主护栏）。
                 if not in_entry_band_whitelist(retry_avg, entry_band_whitelist):
-                    return await self._update_signal_order(
+                    execution_attempts.append({
+                        "attempt": retries,
+                        "quote_average_price": retry_avg,
+                        "result": ReasonCode.ENTRY_BAND_REJECTED.value,
+                    })
+                    snapshot = await self._update_signal_order(
                         pending, "FAILED", direction=prediction, token_id=token_id,
                         order_id=order_id, quote_json=retry_quote,
                         error_message=(
                             f"重试入场价白名单弃单 | averagePrice={retry_avg} "
                             f"不在 {entry_band_whitelist}"))
+                    await self._patch_signal_assessment(
+                        assessment_id,
+                        TerminalStage.FILL,
+                        ReasonCode.ORDER_FAILED,
+                        **_market_assessment_values(),
+                    )
+                    return snapshot
                 # 重试轮滑点 = 护栏全空间（不再钳 1200）；必须 ≥1（币安拒收 0，-1102）
                 retry_slippage = 1200
                 if max_exec_price is not None and retry_avg > 0:
@@ -1750,18 +1883,40 @@ class BinancePredictionTrader:
                         1, int((max_exec_price / retry_avg - 1.0) * 10000))
                 retry_result = await self.place_order(retry_quote, slippage_bps=retry_slippage)
                 if not retry_result:
+                    execution_attempts.append({
+                        "attempt": retries,
+                        "quote_average_price": retry_avg,
+                        "slippage_bps": retry_slippage,
+                        "result": "ORDER_SUBMIT_FAILED",
+                    })
                     break  # 重试单提交失败 → 保持 FOK 失败终态
                 quote, order_result = retry_quote, retry_result
                 order_id = order_result.get("orderId")
                 confirmed = await self._confirm_with_backfill(order_id)
+                execution_attempts.append({
+                    "attempt": retries,
+                    "order_id": order_id,
+                    "quote_average_price": retry_avg,
+                    "guard_applied": max_exec_price is not None,
+                    "whitelist_applied": entry_band_whitelist is not None,
+                    "slippage_bps": retry_slippage,
+                    "terminal_status": (confirmed or {}).get("status"),
+                })
 
             if confirmed is not None and confirmed.get("status") in RETRYABLE_ORDER_STATUSES:
-                return await self._update_signal_order(
+                snapshot = await self._update_signal_order(
                     pending, "FAILED", direction=prediction, token_id=token_id,
                     order_id=order_id, quote_json=quote,
                     error_message=(
                         f"币安侧订单终态 {confirmed.get('status')}"
                         f"（FOK 未成交，已重试 {retries} 次）"))
+                await self._patch_signal_assessment(
+                    assessment_id,
+                    TerminalStage.FILL,
+                    ReasonCode.ORDER_FAILED,
+                    **_market_assessment_values(),
+                )
+                return snapshot
 
             # FILLED → 落成交（quote_json 回填实际成交均价，2026-08-28）；
             # 暂未确认 → 保持 PENDING 交 sync-binance 对账
@@ -1778,6 +1933,12 @@ class BinancePredictionTrader:
                 order_id=order_id,
                 quote_json=quote,
             )
+            await self._patch_signal_assessment(
+                assessment_id,
+                TerminalStage.FILL if status == "FILLED" else TerminalStage.ORDER,
+                ReasonCode.ORDER_FILLED if status == "FILLED" else ReasonCode.ORDER_PENDING,
+                **_market_assessment_values(),
+            )
             if status == "PENDING":
                 logger.warning("信号实盘：币安侧终态暂未确认，落 PENDING 待对账 | signal={} | window={} | orderId={}",
                                signal_version, window_start, order_id)
@@ -1792,6 +1953,8 @@ class BinancePredictionTrader:
         direction: str | None = None,
         market_period: str = "5m",
         scene_signal_id: int | None = None,
+        assessment_id: int | None = None,
+        assessment_context: dict | None = None,
     ) -> TradeOrderModel | None:
         """先占位后下单（CodeReview High#1）：place_order 前先插 PENDING 行。
 
@@ -1799,12 +1962,44 @@ class BinancePredictionTrader:
         重复窗口（重启/并发）捕获 IntegrityError 返回 None，调用方放弃下单。
         direction 占位即落库（结算判赢依赖；NULL 仅限旧数据）；
         market_period/scene_signal_id 同事务落库（15m 结算分流依据）。
+        assessment_context 若存在，在同一事务的 savepoint 内建账并绑定；观测失败
+        只回滚 savepoint，订单占位和后续真钱路径保持原语义。
         """
         from sqlalchemy.exc import IntegrityError
         try:
             async with async_session_factory() as db:
+                if assessment_id is None and assessment_context is not None:
+                    try:
+                        async with db.begin_nested():
+                            identity = {
+                                key: assessment_context[key]
+                                for key in (
+                                    "source_type", "signal_version", "target_window_start",
+                                    "market_period", "direction",
+                                )
+                            }
+                            assessment = await get_or_create_runtime_assessment(
+                                db, **identity)
+                            assessment_id = int(assessment.id)
+                            await patch_assessment(
+                                db,
+                                AssessmentPatch(
+                                    assessment_id=assessment_id,
+                                    stage=TerminalStage.OPERATIONAL,
+                                    reason=ReasonCode.PASSED,
+                                    **assessment_context["patch_values"],
+                                ),
+                            )
+                    except Exception as exc:
+                        assessment_id = None
+                        logger.error(
+                            "信号实盘：订单占位内执行评估建账失败（不影响下单）| "
+                            "signal={} | window={} | {}",
+                            signal_version, window_start, exc,
+                        )
                 order = TradeOrderModel(
                     prediction_id=None,
+                    assessment_id=assessment_id,
                     market_id=self._active_market.get("marketTopicId") if self._active_market else None,
                     token_id="",
                     side="BUY",

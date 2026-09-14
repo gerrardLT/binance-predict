@@ -63,6 +63,11 @@ def test_api_without_token_401(client, login_password):
     assert resp.status_code == 401
 
 
+def test_execution_comparison_without_token_401(client, login_password):
+    resp = client.get("/api/signals/execution-comparison")
+    assert resp.status_code == 401
+
+
 def test_api_with_wrong_token_401(client, login_password):
     resp = client.get(
         "/api/fake-breakout/status",

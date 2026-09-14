@@ -22,6 +22,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -52,9 +53,19 @@ class TradeOrderModel(Base):
             name="uq_trade_orders_version_window",
         ),
         Index("ix_trade_orders_signal_version", "signal_version"),
+        Index("ix_trade_orders_assessment_id", "assessment_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    assessment_id: Mapped[int | None] = mapped_column(
+        ForeignKey(
+            "shadow_execution_assessments.id",
+            name="fk_trade_orders_assessment_id",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+        comment="关联的统一影子/实盘执行评估记录",
+    )
     prediction_id: Mapped[int | None] = mapped_column(
         Integer, nullable=True, comment="关联的预测 ID（旧 K 线决策路径，退役后不再写入）"
     )
@@ -1574,4 +1585,85 @@ class ShadowVersionOverride(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(),
         comment="最后一次 toggle 时刻（审计）"
+    )
+
+
+class ShadowExecutionAssessment(Base):
+    """统一影子/实盘可执行性评估账本；由低频 projector 幂等维护。"""
+
+    __tablename__ = "shadow_execution_assessments"
+    __table_args__ = (
+        Index(
+            "uq_shadow_exec_source_policy",
+            "source_type", "source_id", "policy_version",
+            unique=True,
+            postgresql_where=text("source_id IS NOT NULL"),
+        ),
+        UniqueConstraint(
+            "signal_version", "target_window_start", "market_period", "policy_version",
+            name="uq_shadow_exec_event_policy",
+        ),
+        Index("ix_shadow_exec_version_window", "signal_version", "target_window_start"),
+        Index("ix_shadow_exec_stage_reason", "terminal_stage", "reason_code"),
+        Index("ix_shadow_exec_policy_period", "policy_version", "market_period"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    source_type: Mapped[str] = mapped_column(String(24), nullable=False)
+    source_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    signal_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    config_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_window_start: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    target_window_start: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    market_period: Mapped[str] = mapped_column(String(8), nullable=False)
+    direction: Mapped[str] = mapped_column(String(8), nullable=False)
+    trigger_ts: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    evaluation_ts: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    strategy_eligible: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    operational_eligible: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    execution_eligible: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    terminal_stage: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason_code: Mapped[str] = mapped_column(String(48), nullable=False)
+    legacy_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    live_channel: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    channel_mapped: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    enabled: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    retired: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    order_type: Mapped[str | None] = mapped_column(String(12), nullable=True)
+    amount_usdt: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_daily_orders: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    effective_max_exec_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    guard_applied: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    exclusive_blocker_channel: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    market_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    token_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    balance_available: Mapped[float | None] = mapped_column(Float, nullable=True)
+    balance_required: Mapped[float | None] = mapped_column(Float, nullable=True)
+    quote_average_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    quote_ts: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    source_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    theoretical_win: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    theoretical_outcome: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    theoretical_entry_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    theoretical_realized_return: Mapped[float | None] = mapped_column(Float, nullable=True)
+    theoretical_settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    source_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    config_snapshot: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"),
+    )
+    input_snapshot: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"),
+    )
+    decision_snapshot: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"),
+    )
+    quote_snapshot: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now(),
     )
