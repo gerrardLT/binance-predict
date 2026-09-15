@@ -2314,6 +2314,120 @@ async def test_live_pnl_curve_endpoint_empty(monkeypatch) -> None:
     assert out["total"] == {"settled_count": 0, "total_pnl": 0, "total_cost": 0, "win_rate": None, "roi": None}
 
 
+@pytest.mark.asyncio
+async def test_live_performance_summary_duplicate_window_and_period_keys(monkeypatch) -> None:
+    import binance_predict.main as m
+    from binance_predict.services.live_performance import LiveOrder
+
+    rows = [
+        LiveOrder(id=1, channel="firsthit_down_g7_v1", market_period="5m",
+                  window_start=1000, direction="DOWN", settle_outcome="DOWN", win=True,
+                  pnl=3, amount_in=str(2 * 10**18), assessment_id=11,
+                  quote_json={"amountIn": str(2 * 10**18), "filledShareQty": 4}),
+        LiveOrder(id=2, channel="g7_streak_v1", market_period="5m",
+                  window_start=1000, direction="DOWN", settle_outcome="DOWN", win=False,
+                  pnl=-3, amount_in=str(3 * 10**18)),
+        LiveOrder(id=3, channel="s2_cond_t4_v1", market_period="15m",
+                  window_start=1000, direction="UP", settle_outcome="UP", win=True,
+                  pnl=1, amount_in=str(10**18)),
+    ]
+
+    async def load(*_args):
+        return rows
+
+    monkeypatch.setattr(m, "_load_live_performance_orders", load)
+    monkeypatch.setattr(m, "multi_live_trader", None)
+    out = await m.live_performance_summary(db=None)
+    assert out["coverage"]["order_count"] == 3
+    assert out["coverage"]["unique_window_count"] == 2
+    assert out["portfolio"]["total_cost"] == 6
+    assert out["portfolio"]["total_pnl"] == 1
+    assert out["portfolio"]["market_window_win_rate"]["point_estimate"] == 0.5
+    assert out["duplicate_exposure"]["duplicate_overlap_cost"] == 2
+    assert out["duplicate_exposure"]["duplicate_investment_ratio"] == pytest.approx(2 / 6)
+    assert out["portfolio"]["quote_edge"]["is_calibration_metric"] is False
+    assert out["portfolio"]["quote_edge"]["metric_semantics"] == (
+        "realized_outcome_minus_break_even_probability"
+    )
+    by_channel = {row["channel"]: row for row in out["channels"]}
+    assert by_channel["firsthit_down_g7_v1"]["latest"]["rolling20"]["n"] == 1
+    assert by_channel["firsthit_down_g7_v1"]["benchmark"]["win_rate"] == 0.192
+
+
+@pytest.mark.asyncio
+async def test_live_performance_summary_conflict_and_empty(monkeypatch) -> None:
+    import binance_predict.main as m
+    from binance_predict.services.live_performance import LiveOrder
+
+    conflict = [
+        LiveOrder(channel="x4_v2", market_period="5m", window_start=1,
+                  settle_outcome="UP", win=True, pnl=2, amount_in=str(10**18)),
+        LiveOrder(channel="x4_v3", market_period="5m", window_start=1,
+                  settle_outcome="DOWN", win=False, pnl=-1, amount_in=str(10**18)),
+    ]
+
+    async def load(*_args):
+        return conflict
+
+    monkeypatch.setattr(m, "_load_live_performance_orders", load)
+    monkeypatch.setattr(m, "multi_live_trader", None)
+    out = await m.live_performance_summary(db=None)
+    assert out["coverage"]["settlement_conflict_count"] == 1
+    assert out["portfolio"]["market_window_win_rate"]["point_estimate"] is None
+    assert out["portfolio_series"][0]["net_pnl"] == 1
+
+    async def empty(*_args):
+        return []
+
+    monkeypatch.setattr(m, "_load_live_performance_orders", empty)
+    out = await m.live_performance_summary(db=None)
+    assert out["coverage"]["order_count"] == 0
+    assert out["portfolio"]["total_cost"] == 0
+    assert out["portfolio"]["total_pnl"] == 0
+    assert out["portfolio"]["roi"] is None
+    assert out["portfolio_series"] == [] and out["channels"] == []
+
+
+@pytest.mark.asyncio
+async def test_live_channel_diagnostics_validation_and_segments(monkeypatch) -> None:
+    import binance_predict.main as m
+    from fastapi import HTTPException
+    from binance_predict.services.live_performance import LiveOrder
+
+    with pytest.raises(HTTPException) as unknown:
+        await m.live_channel_diagnostics(channel="unknown", db=None)
+    assert unknown.value.status_code == 422
+    with pytest.raises(HTTPException) as invalid:
+        await m.live_channel_diagnostics(channel="x4_v2", segment_by="bad", db=None)
+    assert invalid.value.status_code == 422
+
+    rows = [
+        LiveOrder(id=1, channel="x4_v2", market_period="5m", window_start=1000,
+                  win=True, pnl=1, amount_in=str(10**18), assessment_id=1,
+                  quote_json={"amountIn": str(10**18), "filledShareQty": 5},
+                  policy_version="p1", trigger_ts=121000),
+        LiveOrder(id=2, channel="x4_v2", market_period="5m", window_start=2000,
+                  win=False, pnl=-1, amount_in=str(10**18)),
+    ]
+
+    async def load(*_args):
+        return rows
+
+    monkeypatch.setattr(m, "_load_live_performance_orders", load)
+    monkeypatch.setattr(m, "multi_live_trader", None)
+    quote = await m.live_channel_diagnostics(channel="x4_v2", segment_by="quote", db=None)
+    assert {row["segment"] for row in quote["segments"]} == {"[0.2,0.3)", "LEGACY_UNKNOWN"}
+    assert quote["series"][0]["t"] == 1000
+    assert quote["series"][0]["pnl"] == 1 and quote["series"][0]["cost"] == 1
+    trigger = await m.live_channel_diagnostics(channel="x4_v2", segment_by="trigger_offset", db=None)
+    assert {row["segment"] for row in trigger["segments"]} == {"120-179", "LEGACY_UNKNOWN"}
+    policy = await m.live_channel_diagnostics(channel="x4_v2", segment_by="policy_version", db=None)
+    assert {row["segment"] for row in policy["segments"]} == {"p1", "LEGACY_UNKNOWN"}
+    deployment = await m.live_channel_diagnostics(channel="x4_v2", segment_by="deployment", db=None)
+    assert deployment["segments"][0]["segment"] == "LEGACY_UNKNOWN"
+    assert deployment["segments"][0]["n"] == 2
+
+
 # ============================================================
 # 组 8：execute_signal_trade（15m token 分流 + 5m 行为迁移）
 # ============================================================

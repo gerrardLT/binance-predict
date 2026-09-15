@@ -651,6 +651,16 @@ const api = {
   getQuotePreview: () => authFetch('/api/prediction/quote-preview').then(r => r.json()),
   // 盈利趋势（2026-08-31）：每实盘通道已结算订单累计盈亏曲线
   getLivePnlCurve: () => authFetch('/api/live/pnl-curve').then(r => r.json()),
+  getLivePerformanceSummary: (fromMs = 0, toMs = 0, onlyEnabled = false): Promise<LivePerformanceSummary> =>
+    authFetch(`/api/live/performance-summary?from_ms=${fromMs}&to_ms=${toMs}&only_enabled=${onlyEnabled}`).then(r => {
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      return r.json() as Promise<LivePerformanceSummary>
+    }),
+  getLiveChannelDiagnostics: (channel: string, segmentBy: DiagnosticSegmentBy): Promise<LiveChannelDiagnostics> =>
+    authFetch(`/api/live/channel-diagnostics?channel=${encodeURIComponent(channel)}&segment_by=${segmentBy}`).then(r => {
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      return r.json() as Promise<LiveChannelDiagnostics>
+    }),
   postSyncBinance: () => authFetch('/api/trades/sync-binance', { method: 'POST' }).then(r => r.json()),
   // 奖金领取（2026-08-23）：可领查询 + batch-redeem
   getRedeemable: () => authFetch('/api/prediction/redeemable').then(r => r.json()),
@@ -2682,302 +2692,104 @@ function FundsFlowCard({ orders }: { orders: Record<string, unknown>[] }) {
 }
 
 // ============================================================
-// 盈利趋势（2026-08-31）：每实盘通道已结算订单的累计盈亏曲线
-// 数据源 GET /api/live/pnl-curve（trade_orders 按通道分组逐单累计 pnl）
+// Phase 0 实盘表现诊断：组合决策 / 通道诊断 / 风险归因
 // ============================================================
 
-interface PnlPoint {
-  n: number
-  t: number
-  pnl: number
-  cum: number
-  cost?: number
-  cum_cost?: number
-  cum_roi?: number
-  win: boolean
+interface PnlPoint { n: number; t: number; pnl: number; cum: number; cost?: number; cum_cost?: number; cum_roi?: number; win: boolean }
+interface PnlChannel { channel: string; display_name: string; family: string | null; market_period: string | null; enabled: boolean; settled_count: number; win_count: number; win_rate: number | null; total_pnl: number; total_cost: number; roi: number | null; points: PnlPoint[] }
+interface PnlCurveData { channels: PnlChannel[]; total: { settled_count: number; total_pnl: number; total_cost: number; win_rate: number | null; roi: number | null } }
+interface PerformanceStat { window_size: number; n: number; wins: number; full_window: boolean; win_rate: number | null; wilson_95: [number, number] | null; jeffreys_95: [number, number] | null }
+interface PerformanceEvStat { window_size: number; n: number; full_window: boolean; realized_ev: number | null; pnl: number | null; actual_cost: number | null }
+interface ChannelBenchmark { channel: string; win_rate: number; source_ref: string; method_version: string; quality: string; sample_size: number | null }
+interface PerformanceChannel {
+  channel: string; display_name: string; family: string | null; market_period: string | null; enabled: boolean; order_count: number; win_count: number; total_cost: number; total_pnl: number; roi: number | null; benchmark: ChannelBenchmark | null
+  latest: { rolling20: PerformanceStat; rolling50: PerformanceStat; ewma: number | null; rolling_realized_ev_20: PerformanceEvStat; rolling_realized_ev_50: PerformanceEvStat; mean_break_even_20: number | null; mean_break_even_50: number | null; benchmark_gap_20: number | null; benchmark_gap_50: number | null }
+  break_even_coverage: { available_count: number; order_count: number; ratio: number }
 }
-interface PnlChannel {
-  channel: string
-  display_name: string
-  family: string | null
-  market_period: string | null
-  enabled: boolean
-  settled_count: number
-  win_count: number
-  win_rate: number | null
-  total_pnl: number
-  total_cost: number
-  roi: number | null
-  points: PnlPoint[]
+interface PortfolioSeriesPoint { t: number; order_count: number; net_pnl: number | null; gross_cost: number | null; cumulative_pnl: number; rolling_realized_ev_20: number | null; rolling_realized_ev_50: number | null; settlement_conflict: boolean }
+interface LivePerformanceSummary {
+  schema_version: string; metric_definitions_version: string; as_of: number
+  coverage: { order_count: number; unique_window_count: number; window_key_unavailable_count: number; settlement_conflict_count: number; break_even_available_count: number; assessment_linked_count: number; is_truncated: boolean }
+  portfolio: { total_cost: number; total_pnl: number; roi: number | null; order_win_rate: { point_estimate: number | null; rolling: Record<'20' | '50', PerformanceStat | null> }; market_window_win_rate: { point_estimate: number | null; rolling: Record<'20' | '50', PerformanceStat | null> }; rolling_realized_ev: Record<'20' | '50', PerformanceEvStat | null>; quote_edge: { display_name: string; metric_semantics: string; is_calibration_metric: boolean; mean: number | null } }
+  duplicate_exposure: { window_count: number; duplicate_window_count: number; duplicate_window_ratio: number | null; duplicate_overlap_cost: number; duplicate_investment_ratio: number | null; max_single_window_cost: number; max_channels_per_window: number; same_direction_overlap_count: number; opposite_direction_overlap_count: number; explicit_exclusive_conflict_count: number }
+  channels: PerformanceChannel[]; portfolio_series: PortfolioSeriesPoint[]; warnings: string[]
 }
-interface PnlCurveData {
-  channels: PnlChannel[]
-  total: {
-    settled_count: number
-    total_pnl: number
-    total_cost: number
-    win_rate: number | null
-    roi: number | null
-  }
-}
+type DiagnosticSegmentBy = 'quote' | 'trigger_offset' | 'policy_version' | 'trend_4h' | 'trend_24h' | 'volatility' | 'deployment'
+interface DiagnosticPoint { id: number | string; t: number; pnl: number | null; cost: number | null; win: boolean | null; direction: string | null; settle_outcome: string | null; policy_version: string | null; trigger_offset_seconds: number | null; cumulative_pnl: number | null; cumulative_cost: number | null; rolling: Record<'20' | '50', PerformanceStat>; ewma_win_rate: number | null; rolling_realized_ev: Record<'20' | '50', PerformanceEvStat>; break_even_probability: number | null; rolling_mean_break_even_probability: Record<'20' | '50', number | null>; benchmark_win_rate: number | null; benchmark_gap: Record<'20' | '50', number | null> }
+interface DiagnosticSegment { segment: string; n: number; wins: number; win_rate: number | null; total_cost: number; total_pnl: number; realized_ev: number | null; unique_window_count: number; data_quality: string | null }
+interface LiveChannelDiagnostics { channel: { channel: string; display_name: string; family: string | null; market_period: string | null; enabled: boolean }; benchmark: ChannelBenchmark | null; coverage: Record<string, number | boolean | null>; series: DiagnosticPoint[]; segments: DiagnosticSegment[]; warnings: string[] }
 
-// 通道曲线色板（按 total_pnl 排序后取色；12 色，通道数 >12 时按 idx % 12 循环复用）
-/* 逐通道盈亏曲线色 = chart-1..10。通道数 >10 时循环取色，
-   第 11 条起靠渲染层的「淡色 + 细线」区分；表格图例圆点同步降透明度以保持对应。 */
-const PNL_COLORS = Array.from({ length: 10 }, (_, i) => `var(--chart-${i + 1})`)
+type PerformanceView = 'portfolio' | 'channel' | 'risk'
+type PortfolioMetric = 'ev' | 'pnl' | 'edge'
+type ChannelSortField = 'channel' | 'order_count' | 'ev20' | 'win20' | 'benchmark' | 'break_even' | 'total_pnl'
+type IntervalKind = 'wilson' | 'beta'
+const SEGMENT_OPTIONS: { key: DiagnosticSegmentBy; label: string }[] = [{ key: 'quote', label: '报价档' }, { key: 'trigger_offset', label: '触发时点' }, { key: 'policy_version', label: '策略版本' }, { key: 'trend_4h', label: '4h趋势' }, { key: 'trend_24h', label: '24h趋势' }, { key: 'volatility', label: '波动率' }, { key: 'deployment', label: '部署版本' }]
+const performancePct = (v: number | null | undefined, digits = 1) => v == null ? '--' : `${(v * 100).toFixed(digits)}%`
+const performanceSigned = (v: number | null | undefined, suffix = '', digits = 2) => v == null ? '--' : `${v >= 0 ? '+' : ''}${v.toFixed(digits)}${suffix}`
+const performanceTime = (t: number) => new Date(t).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
 
-// 曲线指标切换：数据点已含 pnl/win，胜率趋势 = 截至第 n 笔的滚动胜率（前端派生），ROI = 滚动总收益率
-type PnlMetric = 'cum' | 'roi' | 'rate' | 'pnl'
-const PNL_METRICS: { key: PnlMetric; label: string }[] = [
-  { key: 'cum', label: '累计盈亏' },
-  { key: 'roi', label: '收益率趋势(ROI)' },
-  { key: 'rate', label: '胜率趋势' },
-  { key: 'pnl', label: '单笔盈亏' },
-]
-
-type PnlSortField = 'channel' | 'enabled' | 'settled_count' | 'total_cost' | 'win_rate' | 'total_pnl' | 'roi'
-
-function PnlCurveCard() {
-  const [data, setData] = useState<PnlCurveData | null>(null)
-  const [onlyEnabled, setOnlyEnabled] = useState(false)
-  const [metric, setMetric] = useState<PnlMetric>('cum')
-  const [sortField, setSortField] = useState<PnlSortField>('roi')
+function PnlCurveCard({ active }: { active: boolean }) {
+  const [summary, setSummary] = useState<LivePerformanceSummary | null>(null)
+  const [diagnostics, setDiagnostics] = useState<LiveChannelDiagnostics | null>(null)
+  const [view, setView] = useState<PerformanceView>('portfolio')
+  const [metric, setMetric] = useState<PortfolioMetric>('ev')
+  const [selectedChannel, setSelectedChannel] = useState('')
+  const [segmentBy, setSegmentBy] = useState<DiagnosticSegmentBy>('quote')
+  const [intervalKind, setIntervalKind] = useState<IntervalKind>('wilson')
+  const [sortField, setSortField] = useState<ChannelSortField>('total_pnl')
   const [sortAsc, setSortAsc] = useState(false)
+  const [summaryError, setSummaryError] = useState('')
+  const [diagnosticError, setDiagnosticError] = useState('')
+  const loadSummary = useCallback(() => {
+    if (!active) return
+    api.getLivePerformanceSummary().then(data => { setSummary(data); setSummaryError(''); setSelectedChannel(current => current || data.channels[0]?.channel || '') }).catch(e => setSummaryError(`汇总加载失败：${(e as Error).message}`))
+  }, [active])
+  useEffect(() => { if (!active) return; loadSummary(); const timer = setInterval(loadSummary, 30_000); return () => clearInterval(timer) }, [active, loadSummary])
   useEffect(() => {
-    const load = () => api.getLivePnlCurve().then(setData).catch(() => {})
-    load()
-    const timer = setInterval(load, 30000)
-    return () => clearInterval(timer)
-  }, [])
-
-  const allChans = data?.channels ?? []
-  const chans = allChans.filter(c => !onlyEnabled || c.enabled)
-  // 按笔序对齐：第 n 行 = 各通道第 n 笔已结算单的当前指标值（不足为 null，线段断开）
-  const maxLen = chans.reduce((m, c) => Math.max(m, c.points.length), 0)
-  const winSoFar: Record<string, number> = {}
-  for (const c of chans) winSoFar[c.display_name] = 0
-  const rows = Array.from({ length: maxLen }, (_, i) => {
-    const row: Record<string, number | null> = { n: i + 1 }
-    for (const c of chans) {
-      const p = c.points[i]
-      if (!p) { row[c.display_name] = null; continue }
-      if (p.win) winSoFar[c.display_name] += 1
-      if (metric === 'rate') {
-        row[c.display_name] = Math.round((winSoFar[c.display_name] / (i + 1)) * 1000) / 10
-      } else if (metric === 'roi') {
-        const curRoi = p.cum_roi != null
-          ? p.cum_roi
-          : (p.cum_cost && p.cum_cost > 0 ? p.cum / p.cum_cost : 0)
-        row[c.display_name] = Math.round(curRoi * 1000) / 10
-      } else if (metric === 'pnl') {
-        row[c.display_name] = p.pnl
-      } else {
-        row[c.display_name] = p.cum
-      }
-    }
-    return row
-  })
-  const sumPnl = chans.reduce((s, c) => s + c.total_pnl, 0)
-  const sumCost = chans.reduce((s, c) => s + (c.total_cost ?? 0), 0)
-  const sumCount = chans.reduce((s, c) => s + c.settled_count, 0)
-  const sumWin = chans.reduce((s, c) => s + c.win_count, 0)
-  const totalRoi = sumCost > 0 ? (sumPnl / sumCost) * 100 : null
-  const statBox = 'rounded-card border border-line bg-card px-3 py-2'
-  const metricLabel = PNL_METRICS.find(m => m.key === metric)?.label ?? '累计盈亏'
-
-  // 通道表格排序
-  const sortedChans = [...chans].sort((a, b) => {
-    let cmp = 0
-    if (sortField === 'channel') {
-      cmp = a.display_name.localeCompare(b.display_name)
-    } else if (sortField === 'enabled') {
-      cmp = (a.enabled === b.enabled ? 0 : a.enabled ? 1 : -1)
-    } else if (sortField === 'settled_count') {
-      cmp = a.settled_count - b.settled_count
-    } else if (sortField === 'total_cost') {
-      cmp = (a.total_cost ?? 0) - (b.total_cost ?? 0)
-    } else if (sortField === 'win_rate') {
-      cmp = (a.win_rate ?? -1) - (b.win_rate ?? -1)
-    } else if (sortField === 'total_pnl') {
-      cmp = a.total_pnl - b.total_pnl
-    } else if (sortField === 'roi') {
-      cmp = (a.roi ?? -999) - (b.roi ?? -999)
-    }
+    if (!active || !selectedChannel || view === 'portfolio') return
+    let cancelled = false
+    api.getLiveChannelDiagnostics(selectedChannel, segmentBy).then(data => { if (!cancelled) { setDiagnostics(data); setDiagnosticError('') } }).catch(e => { if (!cancelled) setDiagnosticError(`诊断加载失败：${(e as Error).message}`) })
+    return () => { cancelled = true }
+  }, [active, selectedChannel, segmentBy, view])
+  const sortedChannels = useMemo(() => [...(summary?.channels ?? [])].sort((a, b) => {
+    const value = (c: PerformanceChannel): string | number | null | undefined => sortField === 'channel' ? c.display_name : sortField === 'ev20' ? c.latest.rolling_realized_ev_20.realized_ev : sortField === 'win20' ? c.latest.rolling20.win_rate : sortField === 'benchmark' ? c.benchmark?.win_rate : sortField === 'break_even' ? c.latest.mean_break_even_20 : c[sortField]
+    const av = value(a), bv = value(b); const cmp = typeof av === 'string' && typeof bv === 'string' ? av.localeCompare(bv) : Number(av ?? -Infinity) - Number(bv ?? -Infinity)
     return sortAsc ? cmp : -cmp
-  })
+  }), [summary, sortField, sortAsc])
+  const chartRows = useMemo(() => (diagnostics?.series ?? []).map(point => {
+    const stat = point.rolling['20']; const interval = intervalKind === 'wilson' ? stat?.wilson_95 : stat?.jeffreys_95
+    return { ...point, rolling20: stat?.win_rate ?? null, rolling50: point.rolling['50']?.win_rate ?? null, intervalLow: interval?.[0] ?? null, intervalBand: interval ? interval[1] - interval[0] : null, breakEven20: point.rolling_mean_break_even_probability['20'] }
+  }), [diagnostics, intervalKind])
+  const buttonClass = (on: boolean) => `px-3 py-1 text-xs font-bold rounded-sm border transition-colors ${on ? 'bg-brand text-white border-brand' : 'bg-card text-ink-55 border-line hover:border-brand'}`
+  const statBox = 'rounded-card border border-line bg-card px-3 py-2 min-w-0'
+  const portfolio = summary?.portfolio, coverage = summary?.coverage, duplicate = summary?.duplicate_exposure
+  const chooseSort = (field: ChannelSortField) => { if (field === sortField) setSortAsc(v => !v); else { setSortField(field); setSortAsc(false) } }
 
-  const toggleSort = (field: PnlSortField) => {
-    if (sortField === field) {
-      setSortAsc(!sortAsc)
-    } else {
-      setSortField(field)
-      setSortAsc(false)
-    }
-  }
-
-  return (
-    <Card title={`盈利趋势（每通道${metricLabel}）`}>
-      <div className="flex items-center justify-between mb-3 gap-2 flex-wrap">
-        <div className="flex items-center gap-1 flex-wrap">
-          {PNL_METRICS.map(mt => (
-            <button key={mt.key} onClick={() => setMetric(mt.key)}
-              className={`px-2 py-0.5 rounded-full text-[11px] border font-bold transition-colors ${metric === mt.key
-                ? 'bg-brand text-white border-brand'
-                : 'bg-card text-ink-55 border-line hover:border-brand'}`}>
-              {mt.label}
-            </button>
-          ))}
-          <label className="ml-2 flex items-center gap-1.5 text-xs text-ink-80 cursor-pointer select-none">
-            <input type="checkbox" checked={onlyEnabled}
-              onChange={e => setOnlyEnabled(e.target.checked)}
-              className="accent-brand" />
-            仅当前开启实盘的通道
-          </label>
-        </div>
-        <span className="text-[10px] text-ink-55">
-          口径：当前注册实盘通道的已结算成交单（本地估算 pnl，赢=股数−成本，输=−投入）；
-          不含 manual_test / 已退役通道历史 / NOISE·EXPIRED / 失败未成交；ROI=累计净盈亏/累计本金投入；每 30s 刷新
-        </span>
+  return <Card title="实盘表现诊断">
+    <div className="flex gap-1.5 flex-wrap mb-3"><button className={buttonClass(view === 'portfolio')} onClick={() => setView('portfolio')}>组合决策</button><button className={buttonClass(view === 'channel')} onClick={() => setView('channel')}>通道诊断</button><button className={buttonClass(view === 'risk')} onClick={() => setView('risk')}>风险归因</button><span className="ml-auto text-[10px] text-ink-55 self-center">仅打开时加载 · 汇总每 30s 刷新</span></div>
+    {summaryError && <div className="mb-2 text-xs text-negative bg-negative-soft rounded-sm px-2 py-1">{summaryError}</div>}
+    {!summary && !summaryError && <div className="text-sm text-ink-55 py-8 text-center">正在加载实盘表现…</div>}
+    {summary && view === 'portfolio' && <>
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-3">
+        <div className={statBox}><div className="text-xs text-ink-55">实现 EV20 <HelpHint text="实现 EV=真实净 PnL / 实际投入，不是预测概率；EV50 是更慢的次级观察窗。" /></div><div className="font-mono font-bold text-lg">{performancePct(portfolio?.rolling_realized_ev['20']?.realized_ev)}</div><div className="text-[10px] text-ink-55">EV50 {performancePct(portfolio?.rolling_realized_ev['50']?.realized_ev)}</div></div>
+        <div className={statBox}><div className="text-xs text-ink-55">真实 PnL / ROI</div><div className={`font-mono font-bold text-lg ${(portfolio?.total_pnl ?? 0) >= 0 ? 'text-positive' : 'text-negative'}`}>{performanceSigned(portfolio?.total_pnl, ' U')}</div><div className="text-[10px] text-ink-55">ROI {performancePct(portfolio?.roi)}</div></div>
+        <div className={statBox}><div className="text-xs text-ink-55">唯一窗口净盈利率 <HelpHint text="同一市场窗口的多笔订单先合并净 PnL，再判断该窗口是否盈利。" /></div><div className="font-mono font-bold text-lg">{performancePct(portfolio?.market_window_win_rate.point_estimate)}</div><div className="text-[10px] text-ink-55">{coverage?.unique_window_count ?? '--'} 个唯一窗口</div></div>
+        <div className={statBox}><div className="text-xs text-ink-55">重复投入占比 <HelpHint text="重复窗口中的重叠投入 / 总投入，用于识别通道同时下注造成的组合暴露。" /></div><div className="font-mono font-bold text-lg">{performancePct(duplicate?.duplicate_investment_ratio)}</div><div className="text-[10px] text-ink-55">{duplicate?.duplicate_window_count ?? '--'} 个重复窗口</div></div>
       </div>
-      {allChans.length === 0 ? (
-        <p className="text-sm text-ink-55 py-6 text-center">
-          暂无已结算的实盘订单——开启通道实盘并等订单结算后生成曲线
-        </p>
-      ) : (
-        <>
-          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-2 mb-3 text-xs">
-            <div className={statBox}>
-              <div className="text-ink-55 mb-0.5">累计盈亏（USDT）</div>
-              <div className={`text-base font-bold font-mono ${sumPnl >= 0 ? 'text-positive' : 'text-negative'}`}>
-                {sumPnl >= 0 ? '+' : ''}{sumPnl.toFixed(2)}
-              </div>
-            </div>
-            <div className={statBox}>
-              <div className="text-ink-55 mb-0.5">总收益率 (ROI)</div>
-              <div className={`text-base font-bold font-mono ${totalRoi != null && totalRoi >= 0 ? 'text-positive' : totalRoi != null ? 'text-negative' : 'text-ink-55'}`}>
-                {totalRoi != null ? `${totalRoi >= 0 ? '+' : ''}${totalRoi.toFixed(1)}%` : '--'}
-              </div>
-              <div className="text-[10px] font-mono text-ink-55">投入 {sumCost.toFixed(2)} U</div>
-            </div>
-            <div className={statBox}>
-              <div className="text-ink-55 mb-0.5">总胜率</div>
-              <div className="text-base font-bold font-mono text-ink-95">
-                {sumCount > 0 ? `${((sumWin / sumCount) * 100).toFixed(0)}%` : '--'}
-                <span className="text-[10px] font-normal text-ink-55 ml-1">{sumWin}胜/{sumCount - sumWin}负</span>
-              </div>
-            </div>
-            <div className={statBox}>
-              <div className="text-ink-55 mb-0.5">已结算单数</div>
-              <div className="text-base font-bold font-mono text-ink-95">{sumCount}</div>
-            </div>
-            <div className={statBox}>
-              <div className="text-ink-55 mb-0.5">有单通道</div>
-              <div className="text-base font-bold font-mono text-ink-95">
-                {chans.length}<span className="text-[10px] font-normal text-ink-55 ml-1">/ {allChans.length}</span>
-              </div>
-            </div>
-          </div>
-          {maxLen > 0 ? (
-            <ResponsiveContainer width="100%" height={260}>
-              <LineChart data={rows} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
-                <CartesianGrid stroke="var(--line-soft)" />
-                <XAxis dataKey="n" tick={{ fontSize: 11, fill: 'var(--ink-55)', fontFamily: 'var(--font-stack-mono)' }} stroke="var(--ink-55)"
-                  label={{ value: '已结算单序号', position: 'insideBottomRight', offset: -2, fontSize: 10, fill: 'var(--ink-55)' }} />
-                <YAxis tick={{ fontSize: 11, fill: 'var(--ink-55)', fontFamily: 'var(--font-stack-mono)' }} stroke="var(--ink-55)" width={56}
-                  domain={metric === 'rate' ? [0, 100] : undefined}
-                  tickFormatter={(v: number) => (metric === 'rate' || metric === 'roi') ? `${v}%` : v.toFixed(1)} />
-                <Tooltip
-                  contentStyle={TOOLTIP_STYLE} labelStyle={TOOLTIP_LABEL_STYLE} itemStyle={TOOLTIP_ITEM_STYLE}
-                  formatter={(v) => {
-                    const num = Number(v)
-                    if (metric === 'rate') return [`${num.toFixed(1)}%`, undefined]
-                    if (metric === 'roi') return [`${num >= 0 ? '+' : ''}${num.toFixed(1)}%`, undefined]
-                    return [`${num >= 0 ? '+' : ''}${num.toFixed(2)} USDT`, undefined]
-                  }}
-                  labelFormatter={(n) => `第 ${n} 笔已结算单`} />
-                <Legend wrapperStyle={{ fontSize: 11 }} />
-                <ReferenceLine y={metric === 'rate' ? 50 : 0} stroke="var(--line)" strokeDasharray={metric === 'roi' ? '3 3' : undefined} />
-                {chans.map((c, i) => (
-                  <Line key={c.channel} type="monotone" dataKey={c.display_name}
-                    stroke={PNL_COLORS[i % PNL_COLORS.length]}
-                    strokeWidth={i >= 10 ? 1.5 : 2} strokeOpacity={i >= 10 ? 0.55 : 1}
-                    dot={false} connectNulls isAnimationActive={false} />
-                ))}
-              </LineChart>
-            </ResponsiveContainer>
-          ) : (
-            <p className="text-sm text-ink-55 py-4 text-center">所选通道暂无已结算订单</p>
-          )}
-          <div className="overflow-x-auto max-h-56 overflow-y-auto mt-2">
-            <table className="w-full text-xs">
-              <thead className="sticky top-0 bg-card select-none">
-                <tr className="text-left text-ink-55 border-b border-line-soft">
-                  <th className="py-1.5 pr-2 cursor-pointer hover:text-brand" onClick={() => toggleSort('channel')}>
-                    通道 {sortField === 'channel' ? (sortAsc ? '▲' : '▼') : ''}
-                  </th>
-                  <th className="py-1.5 pr-2 cursor-pointer hover:text-brand" onClick={() => toggleSort('enabled')}>
-                    状态 {sortField === 'enabled' ? (sortAsc ? '▲' : '▼') : ''}
-                  </th>
-                  <th className="py-1.5 pr-2 text-right cursor-pointer hover:text-brand" onClick={() => toggleSort('settled_count')}>
-                    已结算 {sortField === 'settled_count' ? (sortAsc ? '▲' : '▼') : ''}
-                  </th>
-                  <th className="py-1.5 pr-2 text-right cursor-pointer hover:text-brand" onClick={() => toggleSort('total_cost')}>
-                    总投入(U) {sortField === 'total_cost' ? (sortAsc ? '▲' : '▼') : ''}
-                  </th>
-                  <th className="py-1.5 pr-2 text-right cursor-pointer hover:text-brand" onClick={() => toggleSort('win_rate')}>
-                    胜率 {sortField === 'win_rate' ? (sortAsc ? '▲' : '▼') : ''}
-                  </th>
-                  <th className="py-1.5 pr-2 text-right cursor-pointer hover:text-brand" onClick={() => toggleSort('total_pnl')}>
-                    累计盈亏(U) {sortField === 'total_pnl' ? (sortAsc ? '▲' : '▼') : ''}
-                  </th>
-                  <th className="py-1.5 pr-2 text-right cursor-pointer hover:text-brand" onClick={() => toggleSort('roi')}>
-                    盈利率(ROI) {sortField === 'roi' ? (sortAsc ? '▲' : '▼') : ''}
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                {sortedChans.map(c => {
-                  const info = SIGNAL_INFO[c.channel]
-                  const ci = chans.findIndex(x => x.channel === c.channel)
-                  const color = PNL_COLORS[ci % PNL_COLORS.length]
-                  // 圆点与曲线同序淡化，否则第 11 条起的图例色块会与前三条撞色
-                  const faded = ci >= 10
-                  const roiPct = c.roi != null ? c.roi * 100 : (c.total_cost > 0 ? (c.total_pnl / c.total_cost) * 100 : null)
-                  return (
-                    <tr key={c.channel} className="border-b border-line-soft hover:bg-card-hover transition-colors">
-                      <td className="py-1.5 pr-2">
-                        <span className="inline-block w-2 h-2 rounded-full mr-1.5 shrink-0" style={{ background: color, opacity: faded ? 0.55 : 1 }} />
-                        <span className="text-ink-95 font-medium">{info?.name ?? c.display_name}</span>
-                      </td>
-                      <td className="py-1.5 pr-2">
-                        <span className={`px-1.5 py-0.5 text-[10px] font-bold rounded-pill border ${c.enabled ? 'bg-positive-soft text-positive border-positive' : 'bg-sunken text-ink-55 border-line'}`}>
-                          {c.enabled ? '实盘中' : '已停火'}
-                        </span>
-                      </td>
-                      <td className="py-1.5 pr-2 text-right font-mono text-ink-80">{c.settled_count}</td>
-                      <td className="py-1.5 pr-2 text-right font-mono text-ink-80">
-                        {c.total_cost != null ? c.total_cost.toFixed(2) : '--'}
-                      </td>
-                      <td className="py-1.5 pr-2 text-right font-mono text-ink-80">
-                        {c.win_rate == null ? '--' : `${(c.win_rate * 100).toFixed(0)}%`}
-                      </td>
-                      <td className={`py-1.5 pr-2 text-right font-mono font-bold ${c.total_pnl >= 0 ? 'text-positive' : 'text-negative'}`}>
-                        {c.total_pnl >= 0 ? '+' : ''}{c.total_pnl.toFixed(2)}
-                      </td>
-                      <td className={`py-1.5 pr-2 text-right font-mono font-bold ${roiPct != null && roiPct >= 0 ? 'text-positive' : roiPct != null ? 'text-negative' : 'text-ink-55'}`}>
-                        {roiPct != null ? `${roiPct >= 0 ? '+' : ''}${roiPct.toFixed(1)}%` : '--'}
-                      </td>
-                    </tr>
-                  )
-                })}
-              </tbody>
-            </table>
-          </div>
-        </>
-      )}
-    </Card>
-  )
+      <div className="flex flex-wrap gap-2 mb-2 text-xs"><span>订单数 <b className="font-mono">{coverage?.order_count ?? '--'}</b> / 唯一窗口数 <b className="font-mono">{coverage?.unique_window_count ?? '--'}</b></span><span className="text-ink-55">当前注册通道内真实 PnL 按订单全计；胜率按唯一窗口净 PnL 去重。</span></div>
+      <div className="flex gap-1 mb-2">{([['ev', '实现EV'], ['pnl', '累计PnL'], ['edge', '保本缺口']] as const).map(([key, label]) => <button key={key} className={buttonClass(metric === key)} onClick={() => setMetric(key)}>{label}</button>)}</div>
+      {metric === 'edge' ? <div className="h-[260px] rounded-card border border-line bg-sunken flex flex-col items-center justify-center text-center px-6"><div className="text-xs text-ink-55">实际胜负（0/1）减逐笔保本概率的汇总均值</div><div className="font-mono text-2xl font-bold mt-1">{performancePct(portfolio?.quote_edge.mean)}</div><div className="text-xs text-ink-55 mt-2">正值表示样本命中超过成交成本要求；P0 暂无该指标的时间序列，且它不是预测概率校准。</div><div className="w-full mt-5 border-t border-dashed border-line"><span className="relative -top-2 bg-sunken px-2 text-[10px] text-ink-55">0 = 样本命中刚好覆盖保本要求</span></div></div> : <ResponsiveContainer width="100%" height={260}><LineChart data={summary.portfolio_series}><CartesianGrid stroke="var(--line-soft)"/><XAxis dataKey="t" tickFormatter={performanceTime} minTickGap={40} tick={{ fontSize: 10, fill: 'var(--ink-55)' }}/><YAxis tick={{ fontSize: 10, fill: 'var(--ink-55)' }} tickFormatter={(v: number) => metric === 'ev' ? `${(v * 100).toFixed(0)}%` : v.toFixed(1)}/><Tooltip contentStyle={TOOLTIP_STYLE} labelStyle={TOOLTIP_LABEL_STYLE} itemStyle={TOOLTIP_ITEM_STYLE} labelFormatter={v => performanceTime(Number(v))} formatter={(v, n) => [metric === 'ev' ? performancePct(Number(v)) : performanceSigned(Number(v), ' U'), n]}/><Legend/><ReferenceLine y={0} stroke="var(--line)" strokeDasharray="3 3"/>{metric === 'ev' ? <><Line name="实现EV20" dataKey="rolling_realized_ev_20" stroke="var(--chart-1)" strokeWidth={2} dot={false} connectNulls isAnimationActive={false}/><Line name="实现EV50" dataKey="rolling_realized_ev_50" stroke="var(--chart-3)" strokeWidth={2} dot={false} connectNulls isAnimationActive={false}/></> : <Line name="累计PnL" dataKey="cumulative_pnl" stroke="var(--positive)" strokeWidth={2} dot={false} connectNulls isAnimationActive={false}/>}</LineChart></ResponsiveContainer>}
+    </>}
+    {summary && view !== 'portfolio' && <>
+      <div className="overflow-x-auto max-h-56 overflow-y-auto mb-3"><table className="w-full min-w-[680px] text-xs"><thead className="sticky top-0 bg-card"><tr className="text-ink-55 border-b border-line-soft">{([['channel','通道'],['order_count','n'],['ev20','EV20'],['win20','滚动20胜率'],['benchmark','冻结基准'],['break_even','保本20'],['total_pnl','PnL']] as [ChannelSortField,string][]).map(([key,label]) => <th key={key} className={`py-1.5 px-2 cursor-pointer ${key === 'channel' ? 'text-left' : 'text-right'}`} onClick={() => chooseSort(key)}>{label}{sortField === key ? (sortAsc ? ' ▲' : ' ▼') : ''}</th>)}</tr></thead><tbody>{sortedChannels.map(c => <tr key={c.channel} onClick={() => setSelectedChannel(c.channel)} className={`border-b border-line-soft cursor-pointer ${selectedChannel === c.channel ? 'bg-brand-soft' : 'hover:bg-card-hover'}`}><td className="py-1.5 px-2 whitespace-nowrap"><span className="font-medium">{SIGNAL_INFO[c.channel]?.name ?? c.display_name}</span> <HelpHint text={`${c.family ?? '--'} · ${c.market_period ?? '--'}`} /></td><td className="py-1.5 px-2 text-right font-mono">{c.order_count}<div className="text-[9px] text-warning">{c.order_count < 20 ? `${c.order_count}/20 积累中` : ''}</div></td><td className="px-2 text-right font-mono">{performancePct(c.latest.rolling_realized_ev_20?.realized_ev)}</td><td className="px-2 text-right font-mono">{performancePct(c.latest.rolling20?.win_rate)}</td><td className="px-2 text-right font-mono">{performancePct(c.benchmark?.win_rate)}</td><td className="px-2 text-right font-mono">{performancePct(c.latest.mean_break_even_20)}</td><td className={`px-2 text-right font-mono font-bold ${c.total_pnl >= 0 ? 'text-positive' : 'text-negative'}`}>{performanceSigned(c.total_pnl)}</td></tr>)}</tbody></table></div>
+      {diagnosticError && <div className="mb-2 text-xs text-negative bg-negative-soft rounded-sm px-2 py-1">{diagnosticError}</div>}
+      {view === 'channel' && diagnostics?.channel.channel === selectedChannel && <><div className="flex flex-wrap items-center gap-2 mb-2 text-xs"><b>{SIGNAL_INFO[selectedChannel]?.name ?? diagnostics.channel.display_name}</b><span className="text-ink-55">置信区间</span><button className={buttonClass(intervalKind === 'wilson')} onClick={() => setIntervalKind('wilson')}>Wilson</button><button className={buttonClass(intervalKind === 'beta')} onClick={() => setIntervalKind('beta')}>Beta</button><HelpHint text="Wilson 是频率学派二项比例区间；Jeffreys Beta 是 Beta(1/2,1/2) 先验的贝叶斯可信区间，均适合小样本。" /><HelpHint text="实现 EV 是真实净 PnL / 实际投入；保本率是按成交成本推导的最低胜率。" /></div><ResponsiveContainer width="100%" height={300}><ComposedChart data={chartRows}><CartesianGrid stroke="var(--line-soft)"/><XAxis dataKey="t" tickFormatter={performanceTime} minTickGap={40} tick={{ fontSize: 10, fill: 'var(--ink-55)' }}/><YAxis domain={[0, 1]} tickFormatter={(v: number) => `${Math.round(v * 100)}%`} tick={{ fontSize: 10, fill: 'var(--ink-55)' }}/><Tooltip contentStyle={TOOLTIP_STYLE} labelStyle={TOOLTIP_LABEL_STYLE} itemStyle={TOOLTIP_ITEM_STYLE} labelFormatter={v => performanceTime(Number(v))} formatter={(v, n) => [performancePct(Number(v)), n]}/><Legend/><Area name={`${intervalKind === 'wilson' ? 'Wilson' : 'Jeffreys Beta'} 下界`} dataKey="intervalLow" stackId="ci" stroke="none" fill="transparent"/><Area name="滚动20 95%区间" dataKey="intervalBand" stackId="ci" stroke="none" fill="var(--brand-soft)" fillOpacity={0.7}/>{diagnostics.benchmark != null && <ReferenceLine y={diagnostics.benchmark.win_rate} stroke="var(--warning)" strokeDasharray="6 4" label="冻结基准"/>}<Line name="滚动20" dataKey="rolling20" stroke="var(--chart-1)" strokeWidth={2} dot={false}/><Line name="滚动50" dataKey="rolling50" stroke="var(--chart-3)" strokeWidth={2} dot={false}/><Line name="EWMA" dataKey="ewma_win_rate" stroke="var(--chart-5)" strokeWidth={2} dot={false}/><Line name="动态保本率" dataKey="breakEven20" stroke="var(--negative)" strokeDasharray="2 4" strokeWidth={2} dot={false}/></ComposedChart></ResponsiveContainer></>}
+      {view === 'risk' && <><div className="flex flex-wrap items-center gap-2 mb-2"><label className="text-xs text-ink-55" htmlFor="risk-segment">归因维度</label><select id="risk-segment" value={segmentBy} onChange={e => setSegmentBy(e.target.value as DiagnosticSegmentBy)} className="bg-card border border-line rounded-sm px-2 py-1 text-xs">{SEGMENT_OPTIONS.map(o => <option key={o.key} value={o.key}>{o.label}</option>)}</select><span className="text-[10px] text-ink-55">趋势、波动率与部署版本只展示实际捕获值。</span></div>{diagnostics?.channel.channel === selectedChannel && <div className="overflow-x-auto"><table className="w-full min-w-[620px] text-xs"><thead><tr className="text-ink-55 border-b border-line-soft"><th className="text-left py-1.5 px-2">分桶</th><th className="text-right px-2">n</th><th className="text-right px-2">唯一窗口</th><th className="text-right px-2">实现EV</th><th className="text-right px-2">PnL</th><th className="text-right px-2">胜率</th><th className="text-left px-2">质量</th></tr></thead><tbody>{diagnostics.segments.map(row => <tr key={row.segment} className="border-b border-line-soft"><td className="py-1.5 px-2 font-medium">{row.segment === 'LEGACY_UNKNOWN' ? <span className="text-warning">历史未捕获</span> : row.segment}</td><td className="text-right px-2 font-mono">{row.n}</td><td className="text-right px-2 font-mono">{row.unique_window_count}</td><td className="text-right px-2 font-mono">{performancePct(row.realized_ev)}</td><td className={`text-right px-2 font-mono ${row.total_pnl >= 0 ? 'text-positive' : 'text-negative'}`}>{performanceSigned(row.total_pnl)}</td><td className="text-right px-2 font-mono">{performancePct(row.win_rate)}</td><td className="px-2 text-ink-55">{row.data_quality ?? '--'}</td></tr>)}</tbody></table></div>}</>}
+    </>}
+    {(summary?.warnings.length ?? 0) > 0 && <div className="mt-2 text-[10px] text-warning">{summary?.warnings.join('；')}</div>}
+  </Card>
 }
+
 
 // 右侧抽屉（2026-08-28 从主布局移入；2026-08-29 双 tab；2026-08-31 增至三 tab：
 // K 线对照 / 资金变化 / 盈利趋势）：
@@ -3019,7 +2831,7 @@ function ChartDrawer({ orders }: { orders: Record<string, unknown>[] }) {
         <div className="flex-1 min-h-0 overflow-auto p-3">
           <div className={tab === 'chart' ? '' : 'hidden'}><LiveOrderChartCard orders={orders} /></div>
           <div className={tab === 'funds' ? '' : 'hidden'}><FundsFlowCard orders={orders} /></div>
-          <div className={tab === 'pnl' ? '' : 'hidden'}><PnlCurveCard /></div>
+          <div className={tab === 'pnl' ? '' : 'hidden'}><PnlCurveCard active={open && tab === 'pnl'} /></div>
         </div>
       </div>
     </>

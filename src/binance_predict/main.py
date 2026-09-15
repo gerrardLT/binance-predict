@@ -90,6 +90,16 @@ from .services.prediction_market_data import PredictionMarketDataService, Market
 from .services.sentiment_agent import SentimentAgent
 from .services.signal_notify import set_live_enabled_resolver
 from .services.metrics import metrics_collector
+from .services.live_channel_benchmarks import CHANNEL_BENCHMARKS, benchmark_dict
+from .services.live_performance import (
+    LiveOrder,
+    actual_cost,
+    analyze_live_performance,
+    break_even,
+    channel_series,
+    portfolio_window_series,
+    segment_orders,
+)
 
 # ============================================================
 # 全局服务实例
@@ -2727,6 +2737,204 @@ async def live_pnl_curve(
     }
 
 
+_LIVE_PERFORMANCE_SCHEMA = "live_performance_v1"
+_LIVE_METRICS_VERSION = "2026-09-15.v1"
+_DIAGNOSTIC_SEGMENTS = {
+    "quote", "trigger_offset", "policy_version", "trend_4h", "trend_24h",
+    "volatility", "deployment",
+}
+
+
+async def _live_channel_meta() -> dict[str, dict]:
+    from .services.live_channels import LIVE_CHANNELS
+
+    meta: dict[str, dict] = {}
+    if multi_live_trader is not None:
+        try:
+            meta = {row["channel"]: row for row in
+                    (await multi_live_trader.status_async())["channels"]}
+        except Exception as exc:
+            logger.warning("live-performance 通道状态查询失败，回落注册表元数据 | {}", exc)
+    for channel, spec in LIVE_CHANNELS.items():
+        meta.setdefault(channel, {
+            "channel": channel, "display_name": spec.display_name,
+            "family": spec.family, "market_period": spec.market_period,
+            "enabled": False,
+        })
+    return meta
+
+
+async def _load_live_performance_orders(
+    db: AsyncSession, from_ms: int, to_ms: int, channels: list[str],
+) -> list[LiveOrder]:
+    from sqlalchemy import select as sa_select
+    from .db.models import ShadowExecutionAssessment, TradeOrderModel
+
+    stmt = sa_select(
+        TradeOrderModel.id, TradeOrderModel.market_id, TradeOrderModel.assessment_id,
+        TradeOrderModel.signal_version, TradeOrderModel.window_start,
+        TradeOrderModel.market_period, TradeOrderModel.direction,
+        TradeOrderModel.settle_outcome, TradeOrderModel.win, TradeOrderModel.pnl,
+        TradeOrderModel.amount_in, TradeOrderModel.quote_json,
+        TradeOrderModel.settled_at, TradeOrderModel.created_at,
+        ShadowExecutionAssessment.policy_version, ShadowExecutionAssessment.trigger_ts,
+    ).outerjoin(
+        ShadowExecutionAssessment,
+        TradeOrderModel.assessment_id == ShadowExecutionAssessment.id,
+    ).where(
+        TradeOrderModel.signal_version.in_(channels),
+        TradeOrderModel.status == "FILLED",
+        TradeOrderModel.win.isnot(None),
+        TradeOrderModel.pnl.isnot(None),
+    )
+    if from_ms:
+        stmt = stmt.where(TradeOrderModel.window_start >= from_ms)
+    if to_ms:
+        stmt = stmt.where(TradeOrderModel.window_start <= to_ms)
+    rows = (await db.execute(stmt.order_by(
+        TradeOrderModel.window_start.asc(), TradeOrderModel.id.asc(),
+    ))).all()
+
+    def epoch_ms(value):
+        return int(value.timestamp() * 1000) if hasattr(value, "timestamp") else value
+
+    return [LiveOrder(
+        id=row[0], market_id=row[1], assessment_id=row[2], channel=row[3],
+        window_start=row[4], market_period=row[5], direction=row[6],
+        settle_outcome=row[7], win=row[8], pnl=row[9], amount_in=row[10],
+        quote_json=row[11], settled_at=epoch_ms(row[12]), created_at=epoch_ms(row[13]),
+        policy_version=row[14], trigger_ts=row[15],
+    ) for row in rows]
+
+
+@app.get("/api/live/performance-summary")
+async def live_performance_summary(
+    from_ms: int = 0, to_ms: int = 0, only_enabled: bool = False,
+    _: None = Depends(_require_auth), db: AsyncSession = Depends(get_db),
+):
+    from .services.live_channels import LIVE_CHANNELS
+
+    meta = await _live_channel_meta()
+    selected = [channel for channel in LIVE_CHANNELS
+                if not only_enabled or bool(meta[channel].get("enabled"))]
+    orders = await _load_live_performance_orders(db, from_ms, to_ms, selected)
+    report = analyze_live_performance(orders, include_channel_series=False)
+    windows = report["windows"]
+    costs = [cost for row in orders if (cost := actual_cost(row)) is not None]
+    total_cost = sum(costs)
+    total_pnl = sum(float(row.pnl) for row in orders if row.pnl is not None)
+    available_be = [break_even(row)["break_even_probability"] for row in orders]
+    available_be = [value for value in available_be if value is not None]
+
+    channels_out = []
+    for channel in selected:
+        rows = [row for row in orders if row.channel == channel]
+        if not rows:
+            continue
+        series = channel_series(rows)
+        latest = series[-1]
+        channel_cost = sum(cost for row in rows if (cost := actual_cost(row)) is not None)
+        channel_pnl = sum(float(row.pnl) for row in rows if row.pnl is not None)
+        channel_be = [break_even(row)["break_even_probability"] for row in rows]
+        channel_be = [value for value in channel_be if value is not None]
+        m = meta[channel]
+        channels_out.append({
+            "channel": channel, "display_name": m.get("display_name", channel),
+            "family": m.get("family"), "market_period": m.get("market_period"),
+            "enabled": bool(m.get("enabled")), "order_count": len(rows),
+            "win_count": sum(bool(row.win) for row in rows), "total_cost": channel_cost,
+            "total_pnl": channel_pnl,
+            "roi": channel_pnl / channel_cost if channel_cost > 0 else None,
+            "benchmark": benchmark_dict(channel), "latest": {
+                "rolling20": latest["rolling"]["20"], "rolling50": latest["rolling"]["50"],
+                "ewma": latest["ewma_win_rate"],
+                "rolling_realized_ev_20": latest["rolling_realized_ev"]["20"],
+                "rolling_realized_ev_50": latest["rolling_realized_ev"]["50"],
+                "mean_break_even_20": latest["rolling_mean_break_even_probability"]["20"],
+                "mean_break_even_50": latest["rolling_mean_break_even_probability"]["50"],
+                "benchmark_gap_20": latest["benchmark_gap"]["20"],
+                "benchmark_gap_50": latest["benchmark_gap"]["50"],
+            },
+            "break_even_coverage": {"available_count": len(channel_be), "order_count": len(rows),
+                                    "ratio": len(channel_be) / len(rows)},
+        })
+    channels_out.sort(key=lambda row: row["total_pnl"], reverse=True)
+    window_wins = [row["window_win"] for row in windows]
+    return {
+        "schema_version": _LIVE_PERFORMANCE_SCHEMA,
+        "metric_definitions_version": _LIVE_METRICS_VERSION,
+        "as_of": int(time.time() * 1000),
+        "filters": {"from_ms": from_ms, "to_ms": to_ms, "only_enabled": only_enabled},
+        "coverage": {
+            "order_count": len(orders), "unique_window_count": len(windows),
+            "window_key_unavailable_count": len(orders) - sum(row["order_count"] for row in windows),
+            "settlement_conflict_count": sum(row["settlement_conflict"] for row in windows),
+            "break_even_available_count": len(available_be),
+            "assessment_linked_count": sum(row.assessment_id is not None for row in orders),
+            "is_truncated": False,
+        },
+        "portfolio": {
+            "total_cost": total_cost, "total_pnl": total_pnl,
+            "roi": total_pnl / total_cost if total_cost > 0 else None,
+            "order_win_rate": {"point_estimate": sum(bool(row.win) for row in orders) / len(orders) if orders else None,
+                               "rolling": report["order_stats"]},
+            "market_window_win_rate": {
+                "point_estimate": sum(bool(value) for value in window_wins if value is not None)
+                                  / sum(value is not None for value in window_wins) if any(value is not None for value in window_wins) else None,
+                "rolling": report["window_stats"],
+            },
+            "rolling_realized_ev": report["rolling_realized_ev"],
+            "quote_edge": {
+                "display_name": "样本命中减保本率",
+                "metric_semantics": "realized_outcome_minus_break_even_probability",
+                "is_calibration_metric": False,
+                "mean": sum(float(row.win) - break_even(row)["break_even_probability"] for row in orders
+                            if break_even(row)["break_even_probability"] is not None) / len(available_be)
+                        if available_be else None,
+            },
+        },
+        "duplicate_exposure": report["duplicate_risk"], "channels": channels_out,
+        "portfolio_series": portfolio_window_series(orders),
+        "warnings": [
+            "P0 quote_edge 是 realized_outcome_minus_break_even_probability 描述指标，不是 calibration metric。",
+            "部署与 regime 事实未捕获时统一返回 LEGACY_UNKNOWN。",
+        ],
+    }
+
+
+@app.get("/api/live/channel-diagnostics")
+async def live_channel_diagnostics(
+    channel: str, segment_by: str = "quote", from_ms: int = 0, to_ms: int = 0,
+    _: None = Depends(_require_auth), db: AsyncSession = Depends(get_db),
+):
+    from .services.live_channels import LIVE_CHANNELS
+
+    if channel not in LIVE_CHANNELS:
+        raise HTTPException(status_code=422, detail=f"未知实盘通道: {channel}")
+    if segment_by not in _DIAGNOSTIC_SEGMENTS:
+        raise HTTPException(status_code=422, detail=f"不支持的分桶维度: {segment_by}")
+    meta = await _live_channel_meta()
+    orders = await _load_live_performance_orders(db, from_ms, to_ms, [channel])
+    available_be = sum(break_even(row)["break_even_probability"] is not None for row in orders)
+    m = meta[channel]
+    return {
+        "schema_version": _LIVE_PERFORMANCE_SCHEMA,
+        "metric_definitions_version": _LIVE_METRICS_VERSION,
+        "as_of": int(time.time() * 1000),
+        "filters": {"channel": channel, "segment_by": segment_by,
+                    "from_ms": from_ms, "to_ms": to_ms},
+        "channel": {"channel": channel, "display_name": m.get("display_name", channel),
+                    "family": m.get("family"), "market_period": m.get("market_period"),
+                    "enabled": bool(m.get("enabled"))},
+        "benchmark": benchmark_dict(channel),
+        "coverage": {"order_count": len(orders), "break_even_available_count": available_be,
+                     "assessment_linked_count": sum(row.assessment_id is not None for row in orders),
+                     "is_truncated": False},
+        "series": channel_series(orders), "segments": segment_orders(orders, segment_by),
+        "warnings": ["P0 不重算 trend/volatility/deployment；未捕获事实统一为 LEGACY_UNKNOWN。"],
+    }
+
+
 @app.post("/api/prediction/transfer-in")
 async def prediction_transfer_in(
     req: TransferInboundRequest,
@@ -3735,6 +3943,10 @@ SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     "ih_inside_15m_v2": (0.546, None, "15m孕线倒垂线: 前置低点大阴+Inside Bar+上影≥45%下影≤10% → 押次根15m UP（720d n=183 胜率54.6%，30d 77.8%；EV按目标窗真实报价前向现算）"),
     "hm_inside_5m_v2": (0.585, None, "5m孕线上吊线精选: 前置高点大阳+Inside Bar+下影[75%,90%)上影≤10% → 押次根5m DOWN（720d n=371 胜率58.5%，30d 71.4%；EV按目标窗真实报价前向现算）"),
 }
+for _channel, _benchmark in CHANNEL_BENCHMARKS.items():
+    if _channel in SHADOW_BENCH:
+        _, _ev, _desc = SHADOW_BENCH[_channel]
+        SHADOW_BENCH[_channel] = (_benchmark.win_rate, _ev, _desc)
 # 周期切分点：08-19 00:00 UTC（三根大阳起点）；< 为震荡期（大涨前），≥ 为大涨期
 PUMP_TS_MS = int(datetime(2026, 8, 19, tzinfo=timezone.utc).timestamp() * 1000)
 
