@@ -65,6 +65,7 @@ from .models.schemas import (
 from .services.absorption_shadow_detector import AbsorptionShadowDetector
 from .services.agent_scheduler import AgentScheduler
 from .services.combo_shadow_detector import ComboShadowDetector
+from .services.candlestick_shadow_detector import CandlestickShadowDetector
 from .services.data_collector import BinanceDataCollector
 from .services.fake_breakout_detector import FakeBreakoutDetector
 from .services.firsthit_shadow_detector import FirstHitShadowDetector
@@ -190,6 +191,10 @@ nextbar_shadow_detector: NextbarShadowDetector | None = None
 
 # 组合条件影子检测器全局实例（combo 族：45 维大搜索存活 5 组合，只记录不下注）
 combo_shadow_detector: ComboShadowDetector | None = None
+
+# 长影短实体组合影子检测器：5m/15m 每根只落一个事件，18 个冻结版本作标签；
+# record-only，无实盘回调且不注册 LIVE_CHANNELS。
+candlestick_shadow_detector: CandlestickShadowDetector | None = None
 
 # 吸收/欠反应跟随影子检测器全局实例（absorption_follow_v1 族：TD120/150 双 variant
 # trailing 14d 滚动标定，报价对 BTC 位移欠反应→跟随补涨，只记录不下注）
@@ -1055,6 +1060,10 @@ async def lifespan(app: FastAPI):
                 "ALTER TABLE trade_orders ADD COLUMN IF NOT EXISTS signal_version VARCHAR(40)",
                 "ALTER TABLE trade_orders ADD COLUMN IF NOT EXISTS window_start BIGINT",
                 "ALTER TABLE trade_orders ADD COLUMN IF NOT EXISTS signal_id INTEGER",
+                # 长影组合使用长逻辑标签；物理 K 线事件版本与 gate 覆盖键同步扩宽。
+                "ALTER TABLE kline_shadow_signals ALTER COLUMN version TYPE VARCHAR(64)",
+                "ALTER TABLE kline_shadow_signals ALTER COLUMN discovery_id TYPE VARCHAR(32)",
+                "ALTER TABLE shadow_version_overrides ALTER COLUMN version TYPE VARCHAR(80)",
                 "ALTER TABLE trade_orders ADD CONSTRAINT uq_trade_orders_version_window UNIQUE (signal_version, window_start)",
                 "CREATE INDEX IF NOT EXISTS ix_trade_orders_signal_version ON trade_orders (signal_version)",
                 # token_id 扩宽（与 alembic 迁移 w7a8b9c0d1e2 等价，存量 dev 库安全网；重复执行幂等）
@@ -1286,6 +1295,19 @@ async def lifespan(app: FastAPI):
         await combo_shadow_detector.start()
         logger.info("combo 组合影子检测器已启动（5 组合 3DOWN/2UP，720d 62.7~68.7% / oos 59.4~64.8%，影子模式不下注）")
 
+    # 长影短实体组合：4 主/对照 + 4 归因组件 + 10 预注册潜力标签。
+    # 每周期每根只落一个物理事件，逻辑版本保存在 feature_snapshot，避免重复计数；
+    # 检测器无 _on_live_fire，且全部版本不在 LIVE_CHANNELS，物理隔离真钱链路。
+    global candlestick_shadow_detector
+    if settings.candlestick_shadow_enabled:
+        candlestick_shadow_detector = CandlestickShadowDetector(
+            collector=collector,
+            pm_15m_latest=_pm_15m_latest,
+            pm_5m_info=_pm_market_info,
+        )
+        await candlestick_shadow_detector.start()
+        logger.info("蜡烛组合影子检测器已启动（5m/15m 单事件多标签，18 个冻结逻辑版本，record-only）")
+
     # 吸收/欠反应跟随影子信号（absorption_follow_v1 族，2026-09-04；2026-09-06 promote）：
     # 5m 窗内报价对 BTC 位移「欠反应」（知情者吸筹脚印）→ 跟随 btc 方向补涨押注的影子
     # 重放。双 variant（TD=120/150）各维护独立 trailing 14 天滚动标定缓冲（k/b/位移门
@@ -1455,6 +1477,9 @@ async def lifespan(app: FastAPI):
     # 停止组合条件影子检测器
     if combo_shadow_detector is not None:
         await combo_shadow_detector.stop()
+    # 停止长影短实体组合影子检测器
+    if candlestick_shadow_detector is not None:
+        await candlestick_shadow_detector.stop()
     # 停止吸收/欠反应跟随影子检测器
     if absorption_shadow_detector is not None:
         await absorption_shadow_detector.stop()
@@ -3950,6 +3975,25 @@ for _channel, _benchmark in CHANNEL_BENCHMARKS.items():
 # 周期切分点：08-19 00:00 UTC（三根大阳起点）；< 为震荡期（大涨前），≥ 为大涨期
 PUMP_TS_MS = int(datetime(2026, 8, 19, tzinfo=timezone.utc).timestamp() * 1000)
 
+# 长影短实体组合按 timeframe 单事件落库，以下冻结 bench 用于逻辑标签展开后的前向统计。
+from .services.candlestick_shadow_detector import CANDLESTICK_LOGICAL_SPECS
+_CANDLE_BENCH = {
+    "candle_hm_bull_5m_consensus2_shadow_v1": (0.57425743, 0.14695252, "5m主影子：三趋势至少2个上涨，阳线长下影→DOWN"),
+    "candle_hm_bull_5m_consensus3_shadow_v1": (0.59067358, 0.17651603, "5m严格对照：三趋势全部上涨；主版本子集"),
+    "candle_hm_bull_15m_union_shadow_v1": (0.66197183, 0.26975357, "15m主影子：三趋势任1上涨，阳线长下影→DOWN"),
+    "candle_hm_bull_15m_consensus3_shadow_v1": (0.73333333, 0.40197905, "15m严格对照：三趋势全部上涨；主版本子集"),
+    "candle_hm_bull_5m_ret5_majority_component_shadow_v1": (0.58, 0.15746431, "5m ret5_majority 归因组件"),
+    "candle_hm_bull_5m_ret3_component_shadow_v1": (0.56804734, 0.13265524, "5m ret3 归因组件"),
+    "candle_hm_bull_15m_ret3_component_shadow_v1": (0.70175439, 0.35381524, "15m ret3 归因组件"),
+    "candle_hm_bull_15m_ma10_component_shadow_v1": (0.69811321, 0.3298541, "15m ma10 归因组件"),
+}
+for _candle_spec in CANDLESTICK_LOGICAL_SPECS:
+    _candle_id = _candle_spec["signal_id"]
+    SHADOW_BENCH[_candle_id] = _CANDLE_BENCH.get(
+        _candle_id,
+        (None, None, "预注册潜力标签：仅 record-only 前向观察，不具备实盘映射"),
+    )
+
 # BTC K 线图表缓存：interval:档位 -> (缓存时刻, klines)，避免前端轮询打爆 Binance。
 # limit 就近向上归档到固定档位，防止任意 limit 枚举缓存键绕过保护。
 _BTC_KLINE_LIMIT_TIERS = (30, 60, 120, 168, 200)
@@ -4077,10 +4121,31 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
             KlineShadowSignal.entry_down_price.label("entry_down_price"),
             KlineShadowSignal.entry_up_price.label("entry_up_price"),
             KlineShadowSignal.direction.label("direction"),
+            KlineShadowSignal.feature_snapshot.label("feature_snapshot"),
         )
         .where(KlineShadowSignal.status == "SETTLED")
         .order_by(KlineShadowSignal.target_bar_start)
     )).all()
+    # 蜡烛组合主/对照/组件/潜力版本共享同一物理事件。统计层按标签展开只读视图，
+    # 保留各冻结 ID 的独立前向曲线，但原始表仍每周期每根至多一行。
+    candle_event_versions = {"candle_hm_bull_5m_event_v1", "candle_hm_bull_15m_event_v1"}
+    expanded_krev_rows = []
+    for row in krev_rows:
+        if row.version not in candle_event_versions:
+            expanded_krev_rows.append(row)
+            continue
+        from types import SimpleNamespace
+        for logical_version in (getattr(row, "feature_snapshot", None) or {}).get("matched_signal_ids", []):
+            expanded_krev_rows.append(SimpleNamespace(
+                version=logical_version,
+                window_start=row.window_start,
+                win=row.win,
+                ev_at_entry=row.ev_at_entry,
+                entry_down_price=row.entry_down_price,
+                entry_up_price=row.entry_up_price,
+                direction=row.direction,
+            ))
+    krev_rows = expanded_krev_rows
     # HM 上吊线反弹入场（pattern_shadow_signals 表，2026-09-01 并入）：窗内触价入场影子，
     # 结算口径=目标根收阴（押 DOWN），入场报价=触及时刻 DOWN 真实报价；仅 TOUCHED 行
     # 进 SETTLED（其余入场态无结算不进面板）。逐笔 EV 未落库（ev 恒 None），
@@ -4135,9 +4200,13 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
     )).all()
     sh_rows = sh_rows + list(firsthit_rows)
     # 版本顺序以统一注册表为权威口径；历史未知版本仍追加，避免旧数据从 API 消失。
-    from .services.shadow_execution_registry import SHADOW_VERSIONS
+    from .services.shadow_execution_registry import SHADOW_VERSION_SPECS, SHADOW_VERSIONS
+    from .services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
 
-    versions = list(SHADOW_VERSIONS)
+    # 物理 candle event 不直接展示；前端只看由标签还原的 18 个逻辑版本。
+    event_versions = {"candle_hm_bull_5m_event_v1", "candle_hm_bull_15m_event_v1"}
+    versions = [version for version in SHADOW_VERSIONS if version not in event_versions]
+    versions += list(CANDLESTICK_SIGNAL_IDS)
     versions += sorted({s.version for s in sh_rows} - set(versions))
     # 影子版本 → 实盘通道状态（version==通道名，2026-09-06 promote + x4_v3 注册后 13 通道；
     # 一次 status_async 拉全量按 channel 建索引，执行器未装配/查询失败 → 空表兜底）
@@ -4186,6 +4255,19 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
                 # retired=永久退役（代码级硬闸，toggle 拒改，前端不可点开关）
                 "enabled": shadow_gate.is_enabled(v),
                 "retired": shadow_gate.is_retired(v),
+                "collection_mode": "RECORD_ONLY",
+                "execution_mode": (
+                    "LIVE_RETIRED" if shadow_gate.is_retired(v) else
+                    "LIVE_ACTIVE" if live_by_ch.get(v, {}).get("enabled") else
+                    "LIVE_AVAILABLE" if v in live_by_ch else "SHADOW_ONLY"
+                ),
+                "family": (
+                    "candlestick_reversal" if v.startswith(("candle_hm_", "candidate_"))
+                    else getattr(SHADOW_VERSION_SPECS.get(v), "family", "legacy")
+                ),
+                "role": (
+                    next((spec["role"] for spec in CANDLESTICK_LOGICAL_SPECS if spec["signal_id"] == v), "STRATEGY")
+                ),
                 # 实盘通道状态（version==通道名时非 None，前端「实盘」列按钮数据源）：
                 # enabled=下单开关、amount/max_daily/max_exec=确认弹窗展示的护栏三件套
                 "live_channel": (
@@ -4237,6 +4319,13 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
             })
         n = len(rows_pt)
         quote_n = len(evs)
+        scene_channel = {
+            "bull_exhaust": "scene_bull_exhaust",
+            "bull_exhaust_confirm": "scene_bull_exhaust_confirm",
+            "bear_exhaust": "scene_bear_exhaust",
+            "momentum_fade": "scene_momentum_fade",
+        }.get(pt)
+        scene_live = live_by_ch.get(scene_channel or "")
         scene[pt] = {
             "summary": {
                 "n": n,
@@ -4246,6 +4335,13 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
                 "avg_ev": sum(evs) / quote_n if quote_n else None,
                 "cum_ev": round(cum_ev, 4) if quote_n else None,
                 "bench_winrate": RESEARCH_WIN_RATES.get(pt),
+                "collection_mode": "SIGNAL_RECORD",
+                "execution_mode": "LIVE_ACTIVE" if scene_live and scene_live["enabled"] else (
+                    "LIVE_AVAILABLE" if scene_channel else "RESEARCH_ONLY"
+                ),
+                "family": "scene",
+                "role": "STRATEGY",
+                "live_channel": scene_channel,
             },
             "curve": curve[-_CURVE_MAX_POINTS:],
         }

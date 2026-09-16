@@ -289,6 +289,10 @@ interface ShadowVersionBlock {
     live_channel?: {
       enabled: boolean; amount_usdt: number; max_daily_orders: number; max_exec_price: number
     } | null
+    collection_mode?: 'RECORD_ONLY'
+    execution_mode?: 'SHADOW_ONLY' | 'LIVE_AVAILABLE' | 'LIVE_ACTIVE' | 'LIVE_RETIRED'
+    family?: string
+    role?: 'PRIMARY' | 'CONTROL' | 'COMPONENT' | 'HYPOTHESIS' | 'STRATEGY'
   }
   curve: AnalyticsCurvePoint[]
 }
@@ -296,6 +300,11 @@ interface SceneTypeBlock {
   summary: {
     n: number; winrate: number | null; avg_ev: number | null; cum_ev: number | null
     bench_winrate: number | null
+    collection_mode?: 'SIGNAL_RECORD'
+    execution_mode?: 'RESEARCH_ONLY' | 'LIVE_AVAILABLE' | 'LIVE_ACTIVE'
+    family?: 'scene'
+    role?: 'STRATEGY'
+    live_channel?: string | null
   }
   curve: AnalyticsCurvePoint[]
 }
@@ -781,166 +790,182 @@ function HelpHint({ text }: { text: string }) {
 }
 
 // 线上信号通道说明（口径源：services/live_channels.py 注册表 + quote_edge_detector 冻结规则）
-// 2026-08-24 多通道实盘改造：全部通道支持实盘下单（liveOk），各自独立金额/日限/护栏，
+// 实盘资格不再放在本地 kind 字段；运行态唯一依据是后端 live_channel / execution_mode。
 // 通道运行状态（开关/金额/日限/护栏/今日成交）来自后端 multi_live_trader.status_async()。
 // 2026-09-04 退役 8 通道（retired）：已从 live_channels.LIVE_CHANNELS 与
 // shadow_version_gate.RETIRED_VERSIONS 移除，不再开火/不再采集。条目必须保留：
 // 历史订单行仍带这些 signal_version，删了会让订单表退回成裸版本串。
-const SIGNAL_INFO: Record<string, { name: string; kind: '实盘' | '影子' | '场景'; desc: string; liveOk?: boolean; retired?: boolean }> = {
+const SIGNAL_INFO: Record<string, { name: string; desc: string; retired?: boolean }> = {
   quote_contrarian_v1: {
-    name: '报价反向（B格逆势）', kind: '实盘', liveOk: true, retired: true,
+    name: '报价反向（B格逆势）', retired: true,
     desc: '【2026-09-04 已退役：被 quote_contrarian_v2 严格支配（v2 = v1 触发集纯子集 + BTC 门禁）】5 分钟窗口开始后 45~60 秒内，DOWN token 报价首次跌入 [0.15, 0.25)（明显便宜）时买入 DOWN。低胜率高赔付：回测胜率 24%、EV +0.155（赢一次约赚 4 倍）。通道护栏 0.28（区间上界+0.03），每窗至多一单。',
   },
   quote_momentum_v1: {
-    name: '报价动量（A格顺势）', kind: '影子', liveOk: true, retired: true,
+    name: '报价动量（A格顺势）', retired: true,
     desc: '【2026-09-04 已退役：「深折价顺势」假设被前向数据证伪】5 分钟窗口 90~120 秒内，DOWN token 报价首次进入 [0.69, 0.75)（强势确认）时押 DOWN。回测胜率 79.9%、EV +0.097。通道护栏 0.78，每窗至多一单。',
   },
   quote_contrarian_v2: {
-    name: '报价反向·门禁版', kind: '影子', liveOk: true,
+    name: '报价反向·门禁版',
     desc: 'v1 区间 + BTC 价格门禁：触发时点 BTC 未高于窗口开盘 ≥0.10%（只接「假冲高」，归因显示平盘窗贡献 86% 利润）。实盘已解锁（实时 BTC 喂价门禁），通道护栏 0.28。注：触发区间仍引用已退役 v1 的冻结回测口径（QUOTE_EDGE_RULES 是口径事实源，整体保留）。',
   },
   quote_momentum_v2: {
-    name: '报价动量·门禁版', kind: '影子', liveOk: true, retired: true,
+    name: '报价动量·门禁版', retired: true,
     desc: '【2026-09-04 已退役：随 momentum 族整体下线】v1 区间 + BTC 价格门禁：触发时点 BTC 已低于窗口开盘 ≥0.10%（剔「假恐慌」，真跌段胜率 85% vs 假恐慌段 40%）。实盘已解锁（实时 BTC 喂价门禁），通道护栏 0.78。',
   },
   quote_momentum_v3: {
-    name: '报价动量·非连涨门禁版', kind: '影子', liveOk: true, retired: true,
+    name: '报价动量·非连涨门禁版', retired: true,
     desc: '【2026-09-04 已退役：修正未来函数后门禁效应≈0（+3.8pp，CI 重叠），不值得占实盘额度】v1 区间（t90~120s q∈[0.69,0.75)）∩ 触发时点末收 15m 非连涨（close≤前根，严格 ex-ante）。回测 80.2% vs 连涨 76.4%。与 v1/v2 同窗互斥（至多一单成交），通道护栏 0.78。',
   },
   quote_contrarian_v3a: {
-    name: '报价反向·交替环境版', kind: '影子', liveOk: true, retired: true,
+    name: '报价反向·交替环境版', retired: true,
     desc: '【2026-09-04 已退役：环境门禁未兑现，被 contrarian_v2 支配】contrarian v1 区间 + v2 价格门禁 + 环境门禁：前窗结算 DOWN（交替环境：前窗跌+本窗涨=V 反弹假冲高）。真实回测 n=85 胜率 31.8%、EV +0.528。实盘已解锁（前窗 outcome 异步 DB 核验，缺失弃单），通道护栏 0.28。',
   },
   quote_contrarian_v3b: {
-    name: '报价反向·日高回落版', kind: '影子', liveOk: true, retired: true,
+    name: '报价反向·日高回落版', retired: true,
     desc: '【2026-09-04 已退役：同 v3a，门禁未兑现】v3a + 触发时点 BTC 距当日高点回落 ≥0.30%（含边界，震荡日冲高更易衰竭）。真实回测 n=65 胜率 33.8%、EV +0.646（单笔 EV 最优）。实盘已解锁（日高异步 DB 核验，缺失弃单），通道护栏 0.28。',
   },
   quote_contrarian_v4: {
-    name: '报价反向·下跌周期版', kind: '影子', liveOk: true, retired: true,
+    name: '报价反向·下跌周期版', retired: true,
     desc: '【2026-09-04 已退役：regime 门禁未兑现，被 contrarian_v2 支配】contrarian v1 区间 + regime 门禁：触发时点过去 24h BTC 收益 ≤ −1.0%（含边界，只在下跌周期开火）。62 天真实订单簿回测：down 段 n=413 胜率 30.3%、EV +0.372（CI 下界过盈亏平衡线），up/range 段 EV≈0——正边际集中在下跌周期。5m K 线严格 ex-ante 口径（影子/实盘同源，缺失保守弃单），每窗至多一单，通道护栏 0.28。',
   },
   x4_v1: {
-    name: '情绪错位（收阳押次窗DOWN）', kind: '影子', liveOk: true, retired: true,
+    name: '情绪错位（收阳押次窗DOWN）', retired: true,
     desc: '【2026-09-04 已退役：被 x4_v2 严格支配（v2 = v1 触发集纯子集 + 平静市门禁）】本窗收阳但 15m 市场收尾情绪 ≤40 的错位 → 次窗 +150s 决策点押 DOWN（回测合并胜率 63.5%、EV +0.254）。实盘已解锁：PENDING 信号轮询→决策点下单，护栏 0.45，错过决策点不追单。',
   },
   x4_v2: {
-    name: '情绪错位·平静市门禁版', kind: '影子', liveOk: true,
+    name: '情绪错位·平静市门禁版',
     desc: 'x4_v1 + 平静市门禁（回测胜率 45.3%，仅平静市况触发）。实盘已解锁：同 x4_v1 决策点机制，护栏 0.50，错过决策点不追单。',
   },
   x4_v3: {
-    name: '情绪错位·趋势过滤版', kind: '影子', liveOk: true,
+    name: '情绪错位·趋势过滤版',
     desc: 'x4_v2 门禁 + 双趋势门禁：触发时点 BTC 过去 4h 跌超 1%（急跌不接刀）或过去 24h 涨超 2%（过热不追空）均不触发，K 线数据缺失同不触发；另有下单层入场价白名单 [0,0.2)∪[0.3,0.4)（决策点成交均价超带弃单，护栏 0.50 兜底）。与 x4_v2 同窗并行对比（各自独立下单），实盘默认关闭需手动开启。回测 C3 保留段 40 笔胜率 42.5%、EV +1.629。',
   },
   scene_bull_exhaust: {
-    name: '场景S1 多头耗尽（押DOWN）', kind: '场景', liveOk: true,
+    name: '场景S1 多头耗尽（押DOWN）',
     desc: '15m 周期刺破 4h 阻力 + 光头阳收盘确认 → 次周期开盘押 DOWN（真 OOS 胜率 64.4%，盈亏平衡 0.63）。实盘已解锁：15m 市场次周期开盘下单，护栏 0.60。',
   },
   scene_bull_exhaust_confirm: {
-    name: '场景S5 确认入场（押DOWN）', kind: '场景', liveOk: true,
+    name: '场景S5 确认入场（押DOWN）',
     desc: 'S1 信号 +5min 确认（次周期第 1 根 5m K 收盘 < 开盘）才买 DOWN（确认组胜率 78.5%，盈亏平衡 0.77）。实盘已解锁：确认时刻 15m 市场下单，护栏 0.75。',
   },
   scene_bear_exhaust: {
-    name: '场景S2 空头耗尽（押UP）', kind: '场景', liveOk: true,
+    name: '场景S2 空头耗尽（押UP）',
     desc: '15m 周期跌破 4h 支撑 + 收阴 + 放量 → 次周期开盘押 UP（胜率 53.6%，盈亏平衡 0.525）。护栏 0.55：跌态 UP 报价常在 0.79+，超护栏保护性弃单（负 EV 保护，属正确行为）。',
   },
   scene_momentum_fade: {
-    name: '场景S4 动量衰竭（押DOWN）', kind: '场景', liveOk: true,
+    name: '场景S4 动量衰竭（押DOWN）',
     desc: '连阳 ≥3 根 + 光头阳的动量衰竭 → 次周期开盘押 DOWN（胜率 55.4%，盈亏平衡 0.54）。实盘已解锁：15m 市场次周期开盘下单，护栏 0.55。',
   },
   s5_deep_z20_v1: {
-    name: 'S5深档·深回落门禁版', kind: '场景', liveOk: true,
+    name: 'S5深档·深回落门禁版',
     desc: 'S1 + 5min 回落确认且 z5≤−20bp 的深回落子集 → +5min 确认即押次周期 15m DOWN（回测 ~91.3%，EV 偏乐观含机械成分；盈亏平衡 ~86.7%）。小金额实盘前向验证，护栏 0.88；与 S5 确认通道同窗互斥（至多一单成交）。',
   },
   // ---- 2026-09-06 影子 promote 5 通道（口径源：services/live_channels.py + 各检测器冻结研究口径）----
   s2_cond_t4_v1: {
-    name: 'S2条件单·t4价<开（押UP）', kind: '影子', liveOk: true,
+    name: 'S2条件单·t4价<开（押UP）',
     desc: '实盘 S2（bear_exhaust，破 4h 支撑+收阴+放量）派生：次周期 t=4(+240s) 1m 收盘 < 周期开盘（全深度回落）→ 当刻买 UP 押次周期 15m 收阳（价跌时 UP 变便宜，低买 UP 的正 EV 来自入场价而非胜率，真实 EV 由生产报价前向现算）。720d 触发 1069/2176（49.1%，1.48/天），价-only 胜率 38.9%；通道护栏 0.38（38.9%×0.98 平衡价略下方）。与 t5 剔深同窗互斥（至多一单成交）。',
   },
   s2_cond_t5d_v1: {
-    name: 'S2条件单·t5剔深（押UP）', kind: '影子', liveOk: true,
+    name: 'S2条件单·t5剔深（押UP）',
     desc: '实盘 S2（bear_exhaust）派生：次周期 t=5(+300s) 0<回落<15bp（中度回落剔深，排除已深跌的接刀窗）→ 当刻买 UP 押次周期 15m 收阳。720d 触发 643/2176（29.5%，0.89/天），价-only 胜率 44.8%；通道护栏 0.44（44.8%×0.98）。与 t4 价<开同窗互斥（至多一单成交）。',
   },
   nb_smaslope_5m_v1: {
-    name: 'nextbar 5m动量误定价（押UP）', kind: '影子', liveOk: true,
+    name: 'nextbar 5m动量误定价（押UP）',
     desc: '5m sma_slope_atr_5 ≥ 1.66（动量急升）→ 押次根 5m 收阳 UP。研究自评：720d 次根收阳仅 47.43%（长样本反指），edge 依赖 7-8 月 regime——record-only 科学仪器非背书，影子期前向验证「动量误定价」是否持续。护栏 0.46（47.43%×0.98 下方）刻意只放行 UP 便宜窗，成交少是保命设计。仅目标根开盘 ≤90s 内的新鲜命中下单（冷启动回补天然排除）。',
   },
   absorption_follow_td120_v1: {
-    name: '吸收跟随·TD120（随BTC方向）', kind: '影子', liveOk: true,
+    name: '吸收跟随·TD120（随BTC方向）',
     desc: '5m 窗内 BTC 明显位移而 UP 报价欠跟随（粘滞=知情者顶住人群吸筹的脚印）→ 跟随 BTC 位移方向下注（btc 涨押 UP/跌押 DOWN）。窗开 120s 双快照判定；滚动 14 天标定（弹性 k/位移门 p50/欠反应门 p80，严格 ex-ante，与影子同源）。真实价复核 RECENT EV +0.065 CI[+0.006,+0.123]（胜率 79.8%）；护栏 0.78（79.8%×0.98 下方）。与 TD150 同窗互斥（至多一单成交）。',
   },
   absorption_follow_td150_v1: {
-    name: '吸收跟随·TD150（随BTC方向）', kind: '影子', liveOk: true,
+    name: '吸收跟随·TD150（随BTC方向）',
     desc: '同 TD120 机制，TD=窗开 150s（多给 30s 让报价反应，触发更少、欠反应更纯）。真实价复核 RECENT EV +0.105 CI[+0.050,+0.165]（胜率 88.5%）；护栏 0.86（88.5%×0.98 下方）。与 TD120 同窗互斥（至多一单成交）。',
   },
   firsthit_down_v1: {
-    name: '首触G0基底（押DOWN）', kind: '影子', liveOk: true,
+    name: '首触G0基底（押DOWN）',
     desc: '5m 窗内 DOWN 报价首次进入 (0.005,0.1] → 买 DOWN；实时重放本窗完整历史，只认真实第一触。默认关闭；开启后每通道每窗至多一单。G0/G1/G3 为用户确认的独立下单通道，同窗三门全中且全开启时最多 3 单。执行价护栏 0.08，实际成交均价高于护栏弃单，不追价。',
   },
   firsthit_down_body_v1: {
-    name: '首触G1小实体（押DOWN）', kind: '影子', liveOk: true,
+    name: '首触G1小实体（押DOWN）',
     desc: 'G0 + body_r≤0.35（首触前 BTC 路径归一实体小，震荡而非单边跑出去）。默认关闭；与 G0/G3 独立下单，不做跨版本互斥，每通道每窗至多一单。执行价护栏 0.12，实际成交均价高于护栏弃单。confirm 段已 burned，护栏非前向胜率背书。',
   },
   firsthit_down_chg_v1: {
-    name: '首触G3偏离（押DOWN）', kind: '影子', liveOk: true,
+    name: '首触G3偏离（押DOWN）',
     desc: 'G0 + chg≤+2.82bp（首触时 BTC 相对窗开盘涨幅有限，深折价更像报价错杀而非信息驱动）。默认关闭；与 G0/G1 独立下单，不做跨版本互斥，每通道每窗至多一单。执行价护栏 0.09，实际成交均价高于护栏弃单。confirm 段已 burned，护栏非前向胜率背书。',
   },
   firsthit_down_g4_v1: {
-    name: '首触G4交互门（押DOWN）', kind: '影子', liveOk: true,
+    name: '首触G4交互门（押DOWN）',
     desc: 'G0 + 小实体(body_r≤0.35) ∧ 价格偏离(chg≤+2.82bp)，即 G1∩G3。冻结扫描 calib n=214 P=12.6% EV+1.03 CI[+0.08,+2.22]；confirm n=86 P=23.3% EV+1.85 CI[+0.35,+3.44]；BH-FDR q=0.063 STRICT_PASS。执行价护栏 0.12。⚠️非独立暴露：G4⊂G1 且 G4⊂G3，同窗三门全中即同一注重复下注。⚠️功效偏紧：calib EV(+1.03) 与前向 CI 半宽(≈1.08) 接近，前向通过概率约 50%，FAIL 时应延长观察期而非直接否决。默认关闭，每通道每窗至多一单。',
   },
   firsthit_down_g7_v1: {
-    name: '首触G7基底（押DOWN）', kind: '影子', liveOk: true,
+    name: '首触G7基底（押DOWN）',
     desc: 'G0 + 小实体(body_r≤0.35) ∧ 上影拒绝(wick01=1)。40d 全量回测胜率 19%~20%，EV +1.98~+2.34（FDR q=0.0002）。默认关闭，执行价护栏 0.10，每通道每窗至多一单。',
   },
   g7_streak_v1: {
-    name: '首触G7+非强连阳（押DOWN）', kind: '影子', liveOk: true,
+    name: '首触G7+非强连阳（押DOWN）',
     desc: 'G7 组合 + 前驱 5m 连阳≤1 根（排除多头单边大势逆势送命）。回测胜率 18.2%~20.0%，日均 5.1 单，FDR q=0.0004。默认关闭，执行价护栏 0.10，每通道每窗至多一单。',
   },
   g7_wick20_v1: {
-    name: '首触G7+长上影（押DOWN）', kind: '影子', liveOk: true,
+    name: '首触G7+长上影（押DOWN）',
     desc: 'G7 组合 + 上影线长度≥2.0bp（密集高位拒绝）。回测胜率 17.8%~24.1%，EV +1.84~+3.06。默认关闭，执行价护栏 0.12，每通道每窗至多一单。',
   },
   g7_strict_v1: {
-    name: '首触G7严格版（押DOWN）', kind: '影子', liveOk: true,
+    name: '首触G7严格版（押DOWN）',
     desc: 'G7 组合 + streak≤1 ∧ upper_wick≥1.5bp。双重强化，回测胜率 20.8%~23.0%，EV +2.68~+3.27。默认关闭，执行价护栏 0.12，每通道每窗至多一单。',
   },
   g7_q05_v1: {
-    name: '首触G7+深折价（押DOWN）', kind: '影子', liveOk: true,
+    name: '首触G7+深折价（押DOWN）',
     desc: 'G7 组合 + 进场报价 q≤0.05（极端赔率凸性档）。回测单注 EV +4.10~+5.77。默认关闭，执行价护栏 0.05，每通道每窗至多一单。',
   },
   g7_t270_v1: {
-    name: '首触G7+非极晚（押DOWN）', kind: '影子', liveOk: true,
+    name: '首触G7+非极晚（押DOWN）',
     desc: 'G7 组合 + 触发时刻 t≤270s（保留均值回归扩散时间窗口）。回测胜率 27.9%~30.4%，EV +3.08~+4.41。默认关闭，执行价护栏 0.10，每通道每窗至多一单。',
   },
   late_night_contrarian_v2: {
-    name: '深夜逆势·日高回落门禁版（押 DOWN）', kind: '影子', liveOk: true,
+    name: '深夜逆势·日高回落门禁版（押 DOWN）',
     desc: 'quote_edge 族深夜变体 v2：t∈[45,90)s 且报价 q∈[0.25,0.30) ∩ 北京时间窗 (22~24 时) ∩ 触发时点距当日高点回落≥0.30%。OOS n=50 wr 44.0% CI[31.2%,57.7%] vs 盈亏平衡≈27%；门禁数据缺失→不落表（保守跳过，v1 不受影响）。护栏 0.33（区间上界 0.30+0.03 容忍），开启后每通道每窗至多一单。⚠️纪律推翻：原 docstring"纯影子前向攒样本"被用户拍板改为实盘注册（线上已开启下单）。',
   },
   hm_inside_5m_v2: {
-    name: '5m孕线上吊线精选反转（押DOWN）', kind: '影子', liveOk: true,
+    name: '5m孕线上吊线精选反转（押DOWN）',
     desc: '5m Rev2 精选反转：前置 4 根高点最长实体阳线 + 信号柱完全被包裹（Inside Bar）+ 下影占比 75%~90%、上影占比≤10% → 押次根 5m 收阴 DOWN。默认挂单护栏 0.30，可通过实盘通道热配置下调。',
   },
   hm_inside_15m_v2: {
-    name: '15m孕线上吊线反转（押DOWN）', kind: '影子', liveOk: true,
+    name: '15m孕线上吊线反转（押DOWN）',
     desc: '15m Ver2 经典反转：前置 4 根高点最长实体阳线 + 信号柱完全被包裹（Inside Bar）+ 顶部长下影上吊线、短上影≤10% → 押次根 15m 收阴 DOWN（720d 胜率 56.6%，30d 胜率 65.4%）。默认挂单护栏 0.30，可通过实盘通道热配置下调。',
   },
   ih_inside_15m_v2: {
-    name: '15m孕线倒垂线反转（押UP）', kind: '影子', liveOk: true,
+    name: '15m孕线倒垂线反转（押UP）',
     desc: '15m Ver2 经典反转：前置 4 根低点最长实体阴线 + 信号柱完全被包裹（Inside Bar）+ 底部长上影倒垂线、短下影≤10% → 押次根 15m 收阳 UP（720d 胜率 52.5%，30d 胜率 62.5%）。默认挂单护栏 0.30，可通过实盘通道热配置下调。',
   },
 }
 
-/* ==========================================================================
-   SIGNAL_KIND_BADGE — DESIGN.md 规格
-   - 实盘=绿 / 影子=紫 / 场景=靛蓝（映射冻结）
-   - pill + 语义色浅底 + 同色字，无边框
-   - text-[10px] → text-[11px]（统一徽章字号），移除 rounded border
-   ========================================================================== */
-const SIGNAL_KIND_BADGE: Record<string, string> = {
-  '实盘': 'ds-badge-up',
-  '影子': 'ds-badge-violet',
-  '场景': 'ds-badge-indigo',
+/* 信号分类拆成独立维度：采集层始终可记录；执行层才决定是否真金下单。 */
+const EXECUTION_BADGE: Record<string, { label: string; cls: string }> = {
+  SHADOW_ONLY: { label: '仅影子', cls: 'ds-badge-violet' },
+  LIVE_AVAILABLE: { label: '可实盘·未开', cls: 'ds-badge-warn' },
+  LIVE_ACTIVE: { label: '实盘中', cls: 'ds-badge-up' },
+  LIVE_RETIRED: { label: '已退役', cls: 'ds-badge-neutral' },
+  RESEARCH_ONLY: { label: '仅研究', cls: 'ds-badge-indigo' },
 }
+const FAMILY_LABELS: Record<string, string> = {
+  candlestick_reversal: '蜡烛反转', kline_reversal: 'K线反转', combo: '组合条件',
+  kline: 'K线/组合', misalignment: '情绪/报价', pattern: '形态触价',
+  absorption: '吸收跟随', firsthit: '首触反转',
+  scene: '场景突破', quote_edge: '报价边缘', x4: '情绪错位',
+  s2_cond: 'S2条件', nextbar: '次根方向', legacy: '其他',
+}
+const ROLE_LABELS: Record<string, string> = {
+  PRIMARY: '主版本', CONTROL: '严格对照', COMPONENT: '归因组件',
+  HYPOTHESIS: '预注册潜力', STRATEGY: '策略',
+}
+const FAMILY_ORDER = ['candlestick_reversal', 'scene', 'quote_edge', 'x4', 's2_cond', 'nextbar', 'absorption', 'firsthit', 'combo', 'kline_reversal', 'pattern', 'misalignment', 'kline', 'legacy']
+const familyRank = (family: string) => {
+  const rank = FAMILY_ORDER.indexOf(family)
+  return rank < 0 ? FAMILY_ORDER.length : rank
+}
+const inferLegacyExecution = (info: { retired?: boolean } | undefined) =>
+  info?.retired ? 'LIVE_RETIRED' : 'LIVE_ACTIVE'
+const signalFamilyLabel = (family: string | undefined) => FAMILY_LABELS[family ?? 'legacy'] ?? family ?? '其他'
 
 /* ==========================================================================
    Card — DESIGN.md 规格
@@ -977,7 +1002,8 @@ interface LiveOrderMarker {
   channel: string
   channelName: string
   channelDesc?: string
-  channelKind?: '实盘' | '影子' | '场景'
+  executionMode?: string
+  family?: string
   direction: string
   status: string
   orderId: string | null
@@ -1250,7 +1276,8 @@ function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[
         channel: ver,
         channelName: info?.name ?? ver,
         channelDesc: info?.desc,
-        channelKind: info?.kind,
+        executionMode: inferLegacyExecution(info),
+        family: 'live_order',
         direction: dir,
         status: stat,
         orderId: o.order_id ? String(o.order_id) : null,
@@ -1326,9 +1353,9 @@ function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[
               <div className="flex items-center justify-between gap-2 flex-wrap border-b border-line-soft pb-1.5">
                 <div className="flex items-center gap-2 flex-wrap">
                   <span className="font-mono font-bold text-ink-95">#{String(activeMarker.id)}</span>
-                  {activeMarker.channelKind && (
-                    <span className={`ds-badge ${SIGNAL_KIND_BADGE[activeMarker.channelKind] || 'ds-badge-neutral'}`}>
-                      {activeMarker.channelKind}
+                  {activeMarker.executionMode && (
+                    <span className={`ds-badge ${EXECUTION_BADGE[activeMarker.executionMode]?.cls ?? 'ds-badge-neutral'}`}>
+                      {EXECUTION_BADGE[activeMarker.executionMode]?.label ?? activeMarker.executionMode}
                     </span>
                   )}
                   <span className="font-semibold text-ink-95">{activeMarker.channelName}</span>
@@ -2169,7 +2196,7 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
                 title="该通道已于 2026-09-04 永久退役（不再开火）；本行为历史订单，保留可追溯"
               >已退役</span>
             )}
-            <HelpHint text={`${ver}（${info.kind}${info.retired ? '·已退役' : ''}）：${info.desc}`} />
+            <HelpHint text={`${ver}（实盘订单${info.retired ? '·通道已退役' : ''}）：${info.desc}`} />
           </span>
         ) : (
           <span className="font-mono text-ink-80">{ver || '--'}</span>
@@ -3406,7 +3433,7 @@ function LiveTradeTab() {
           <div className="flex justify-between gap-2 items-center">
             <span className="text-ink-55 shrink-0 flex items-center">
               信号实盘通道
-              <HelpHint text="10 个信号通道独立实盘：每通道独立开关/单笔金额/日限/执行价护栏。命中信号即下真实订单（FOK），重启回落 LIVE_CHANNELS_JSON 配置。" />
+              <HelpHint text="后端注册表中的实盘通道：每通道独立开关、金额、日限和执行价护栏。是否实盘只以后端通道状态为准；影子采集开关不等于真钱开关。" />
             </span>
             {liveChannels.length > 0
               ? <span className="flex items-baseline gap-1.5 text-right">
@@ -3432,7 +3459,7 @@ function LiveTradeTab() {
                     className={`flex items-center gap-2 px-2 py-1.5 rounded-sm border text-xs ${ch.enabled ? 'border-positive bg-positive-soft' : 'border-line bg-card'}`}
                   >
                     <span className="flex items-center gap-1.5 min-w-0 flex-1">
-                      <span className={`ds-badge shrink-0 ${SIGNAL_KIND_BADGE[info?.kind ?? '影子']}`}>{info?.kind ?? '影子'}</span>
+                      <span className="ds-badge ds-badge-up shrink-0">实盘通道</span>
                       <span className={`px-1.5 py-0.5 text-[10px] font-semibold rounded-pill border shrink-0 ${ch.order_type === 'LIMIT' ? 'bg-brand-soft text-brand border-brand/30' : 'bg-sunken text-ink-70 border-line'}`} title={ch.order_type === 'LIMIT' ? '限价挂单模式（GTC 长效挂单被动撮合）' : '市价模式（FOK 询价即时成交）'}>
                         {ch.order_type === 'LIMIT' ? '限价GTC' : '市价FOK'}
                       </span>
@@ -3530,12 +3557,8 @@ function LiveTradeTab() {
       </Card>
       </div>
 
-      {/* 实盘订单与行情对照图表区（位于信号实盘通道与订单记录之间） */}
-      <div className="lg:col-span-2">
-        <LiveOrderChartCard orders={orders} />
-      </div>
-
-      {/* 最近订单：主区账户状态下方（2026-08-28 用户要求回归页面展示） */}
+      {/* 行情/K线/下单点只保留右侧抽屉一个入口，避免主区重复渲染同一图表。 */}
+      {/* 最近订单：主区账户状态下方 */}
       <div className="lg:col-span-2">
         <OrdersCard orders={orders} syncing={syncing} syncResult={syncResult} onSyncBinance={handleSyncBinance} />
       </div>
@@ -4060,7 +4083,7 @@ function NotifyConfigTab() {
                     onClick={() => setExpanded(p => ({ ...p, [ch.channel]: !open }))}
                     className="text-xs text-ink-55 w-5"
                   >{open ? '▾' : '▸'}</button>
-                  <span className={`ds-badge ${SIGNAL_KIND_BADGE[info?.kind ?? '影子']}`}>{info?.kind ?? ch.family_label}</span>
+                  <span className="ds-badge ds-badge-neutral">{ch.family_label}</span>
                   <span className="text-sm font-medium text-ink-95">{info?.name ?? ch.display_name}</span>
                   <HelpHint text={info?.desc ?? ch.display_name} />
                   <span className="text-[10px] font-mono text-ink-55 hidden md:inline">{ch.channel}</span>
@@ -5967,6 +5990,25 @@ const TOOLTIP_ITEM_STYLE = { color: 'var(--on-ink)' } as const
    第 11 条起与第 1..10 条同色，靠渲染层的「淡色 + 细线」区分（见 shadowEntries.map）。
    label 是 recharts 的 dataKey 本身，改 label 会同时改曲线与图例，故一字未动。 */
 const SHADOW_META: Record<string, { label: string; color: string }> = {
+  // 长影短实体反转：主事件只落一次，下列逻辑版本由标签还原。
+  candle_hm_bull_5m_consensus2_shadow_v1: { label: '5m 长下影·至少2趋势→DOWN', color: 'var(--chart-1)' },
+  candle_hm_bull_5m_consensus3_shadow_v1: { label: '5m 长下影·三趋势对照→DOWN', color: 'var(--chart-2)' },
+  candle_hm_bull_15m_union_shadow_v1: { label: '15m 长下影·任一趋势→DOWN', color: 'var(--chart-3)' },
+  candle_hm_bull_15m_consensus3_shadow_v1: { label: '15m 长下影·三趋势对照→DOWN', color: 'var(--chart-4)' },
+  candle_hm_bull_5m_ret5_majority_component_shadow_v1: { label: '5m ret5归因组件', color: 'var(--chart-5)' },
+  candle_hm_bull_5m_ret3_component_shadow_v1: { label: '5m ret3归因组件', color: 'var(--chart-6)' },
+  candle_hm_bull_15m_ret3_component_shadow_v1: { label: '15m ret3归因组件', color: 'var(--chart-7)' },
+  candle_hm_bull_15m_ma10_component_shadow_v1: { label: '15m ma10归因组件', color: 'var(--chart-8)' },
+  candle_hm_bull_5m_volume_mid_high_shadow_hyp_v1: { label: '5m 长下影+中高量能', color: 'var(--chart-9)' },
+  candle_hm_bull_5m_trend4h_up_shadow_hyp_v1: { label: '5m 长下影+4h上涨', color: 'var(--chart-10)' },
+  candle_hm_bull_5m_asia_shadow_hyp_v1: { label: '5m 长下影+亚洲时段', color: 'var(--chart-1)' },
+  candle_hm_bull_15m_q45_55_shadow_hyp_v1: { label: '15m 长下影+DOWN报价0.45~0.55', color: 'var(--chart-2)' },
+  candle_hm_bull_15m_trend1h_up_shadow_hyp_v1: { label: '15m 长下影+1h上涨', color: 'var(--chart-3)' },
+  candle_hm_bull_15m_asia_shadow_hyp_v1: { label: '15m 长下影+亚洲时段', color: 'var(--chart-4)' },
+  candidate_5m_ret5_majority_up_upper_bull_l70b30m10_shadow_hyp_v1: { label: '5m 上涨阳线长上影潜力', color: 'var(--chart-5)' },
+  candidate_5m_ret3_up_lower_bear_l50b50m0_shadow_hyp_v1: { label: '5m 严格0上影阴线长下影', color: 'var(--chart-6)' },
+  candidate_15m_ret5_majority_up_lower_bull_l50b40m10_shadow_hyp_v1: { label: '15m ret5阳线长下影潜力', color: 'var(--chart-7)' },
+  candidate_15m_ret3_down_upper_bull_l50b40m10_shadow_hyp_v1: { label: '15m 下跌阳线长上影→UP', color: 'var(--chart-8)' },
   x4_v1: { label: 'X4 情绪错位→DOWN', color: 'var(--chart-1)' },
   quote_momentum_v1: { label: 'A 报价动量→DOWN', color: 'var(--chart-2)' },
   quote_contrarian_v1: { label: 'B 报价反向→DOWN', color: 'var(--chart-3)' },
@@ -6055,6 +6097,24 @@ const ANALYTICS_EXTRA_DESC: Record<string, string> = {
   hm_inside_15m_v2: '15m 经典孕线上吊线反转：前置 4 根高点最长实体阳线 + 信号柱完全包裹(Inside Bar) + 顶部长下影上吊线(lower_r≥45%)、短上影 upper_r≤10% → 押次根 15m 收阴 DOWN。落表 kline_shadow_signals。720d 全样本回测 n=237 胜率 55.7%，30d 胜率 60.0%。实盘默认 LIMIT 挂单护栏 0.30。EV 按目标窗真实报价前向现算。',
   ih_inside_15m_v2: '15m 经典孕线倒垂线反转：前置 4 根低点最长实体阴线 + 信号柱完全包裹(Inside Bar) + 底部长上影倒垂线(upper_r≥45%)、短下影 lower_r≤10% → 押次根 15m 收阳 UP。落表 kline_shadow_signals。720d 全样本回测 n=183 胜率 54.6%，30d 胜率 77.8%。实盘默认 LIMIT 挂单护栏 0.30。EV 按目标窗真实报价前向现算。',
   hm_inside_5m_v2: '5m 孕线上吊线精选反转：前置 4 根高点最长实体阳线 + 信号柱完全包裹(Inside Bar) + 下影占比 [75%,90%)、短上影 upper_r≤10% → 押次根 5m 收阴 DOWN。落表 kline_shadow_signals。720d 全样本回测 n=371 胜率 58.5%，30d 胜率 71.4%。实盘默认 LIMIT 挂单护栏 0.30。EV 按目标窗真实报价前向现算。',
+  candle_hm_bull_5m_consensus2_shadow_v1: '5m 主影子：阳线、下影≥50%、实体≤50%、上影≤10%，且 ret3/ret5_majority/ma10 至少两种上涨，预测次根 DOWN。只记录不下注。',
+  candle_hm_bull_5m_consensus3_shadow_v1: '5m 严格对照：主影子的三趋势全同意子集。与主版本共用一个物理事件，不代表第二笔独立暴露。',
+  candle_hm_bull_15m_union_shadow_v1: '15m 主影子：同一长下影阳线形态，三趋势任一种上涨即记录，预测次根 DOWN。只记录不下注。',
+  candle_hm_bull_15m_consensus3_shadow_v1: '15m 严格对照：主版本的三趋势全同意子集；共用物理事件。',
+  candle_hm_bull_5m_ret5_majority_component_shadow_v1: '5m ret5_majority 单趋势归因标签；仅解释边际贡献，不增加事件或暴露。',
+  candle_hm_bull_5m_ret3_component_shadow_v1: '5m ret3 单趋势归因标签；仅解释边际贡献，不增加事件或暴露。',
+  candle_hm_bull_15m_ret3_component_shadow_v1: '15m ret3 单趋势归因标签；仅解释边际贡献，不增加事件或暴露。',
+  candle_hm_bull_15m_ma10_component_shadow_v1: '15m ma10 单趋势归因标签；仅解释边际贡献，不增加事件或暴露。',
+  candle_hm_bull_5m_volume_mid_high_shadow_hyp_v1: '预注册潜力：5m 主形态 + 0.75≤volume/median20<2。后验 regime 假设，只能用新数据前向验证。',
+  candle_hm_bull_5m_trend4h_up_shadow_hyp_v1: '预注册潜力：5m 主形态 + 前4h上涨。只作标签，不替代主影子。',
+  candle_hm_bull_5m_asia_shadow_hyp_v1: '预注册潜力：5m 主形态 + UTC 00~08 亚洲时段。只作标签。',
+  candle_hm_bull_15m_q45_55_shadow_hyp_v1: '预注册潜力：15m 主形态 + 首个完整 DOWN 报价落在 [0.45,0.55)。只作标签。',
+  candle_hm_bull_15m_trend1h_up_shadow_hyp_v1: '预注册潜力：15m 主形态 + 前1h上涨。只作标签。',
+  candle_hm_bull_15m_asia_shadow_hyp_v1: '预注册潜力：15m 主形态 + UTC 00~08 亚洲时段。低样本，只作标签。',
+  candidate_5m_ret5_majority_up_upper_bull_l70b30m10_shadow_hyp_v1: '独立潜力：5m ret5上涨、阳线长上影≥70%、实体≤30%、下影≤10%，预测 DOWN。',
+  candidate_5m_ret3_up_lower_bear_l50b50m0_shadow_hyp_v1: '独立潜力：5m ret3上涨、阴线长下影≥50%、实体≤50%、原始 OHLC 严格零上影，预测 DOWN。',
+  candidate_15m_ret5_majority_up_lower_bull_l50b40m10_shadow_hyp_v1: '独立潜力：15m ret5上涨、阳线长下影≥50%、实体≤40%、上影≤10%，预测 DOWN。',
+  candidate_15m_ret3_down_upper_bull_l50b40m10_shadow_hyp_v1: '独立潜力：15m ret3下跌、阳线长上影≥50%、实体≤40%、下影≤10%，预测 UP。',
 }
 const signalDescFor = (kind: 'scene' | 'shadow', key: string): string => {
   if (ANALYTICS_EXTRA_DESC[key]) return ANALYTICS_EXTRA_DESC[key]
@@ -6495,6 +6555,8 @@ function ShadowSignalCard({
 }) {
   const [kw, setKw] = useState('')
   const [statusFilter, setStatusFilter] = useState<'ALL' | 'ONLINE' | 'OFFLINE' | 'LIVE'>('ALL')
+  const [familyFilter, setFamilyFilter] = useState('ALL')
+  const [roleFilter, setRoleFilter] = useState('ALL')
   const [sortCol, setSortCol] = useState<string>('default')
   const [sortAsc, setSortAsc] = useState<boolean>(false)
 
@@ -6546,6 +6608,8 @@ function ShadowSignalCard({
     const online = s.enabled !== false
     const retired = s.retired === true
     const live = retired ? null : (s.live_channel ?? null)
+    if (familyFilter !== 'ALL' && (s.family ?? 'legacy') !== familyFilter) return false
+    if (roleFilter !== 'ALL' && (s.role ?? 'STRATEGY') !== roleFilter) return false
     if (statusFilter === 'ONLINE') {
       if (retired || !online) return false
     } else if (statusFilter === 'OFFLINE') {
@@ -6592,7 +6656,9 @@ function ShadowSignalCard({
     return sortAsc ? diff : -diff
   })
 
-  const filterActive = search !== '' || statusFilter !== 'ALL'
+  const familyOptions = Array.from(new Set(entries.map(([k]) => analytics.shadow[k]?.summary.family ?? 'legacy')))
+    .sort((a, b) => familyRank(a) - familyRank(b))
+  const filterActive = search !== '' || statusFilter !== 'ALL' || familyFilter !== 'ALL' || roleFilter !== 'ALL'
   const selectCls = 'px-1.5 py-0.5 border border-line rounded-sm text-xs text-ink-80 bg-card'
 
   return (
@@ -6607,6 +6673,14 @@ function ShadowSignalCard({
             onChange={e => setKw(e.target.value)}
             className={`${selectCls} w-44`}
           />
+          <select value={familyFilter} onChange={e => setFamilyFilter(e.target.value)} className={selectCls}>
+            <option value="ALL">全部策略族</option>
+            {familyOptions.map(family => <option key={family} value={family}>{signalFamilyLabel(family)}</option>)}
+          </select>
+          <select value={roleFilter} onChange={e => setRoleFilter(e.target.value)} className={selectCls}>
+            <option value="ALL">全部角色</option>
+            {Object.entries(ROLE_LABELS).map(([role, label]) => <option key={role} value={role}>{label}</option>)}
+          </select>
           {!isRetired && (
             <select
               value={statusFilter}
@@ -6621,7 +6695,7 @@ function ShadowSignalCard({
           )}
           {filterActive && (
             <button
-              onClick={() => { setKw(''); setStatusFilter('ALL') }}
+              onClick={() => { setKw(''); setStatusFilter('ALL'); setFamilyFilter('ALL'); setRoleFilter('ALL') }}
               className="px-1.5 py-0.5 text-xs text-brand hover:underline"
             >清除筛选</button>
           )}
@@ -6641,12 +6715,20 @@ function ShadowSignalCard({
         <div className="text-center text-ink-55 py-6 text-xs">当前筛选条件下无匹配版本</div>
       ) : (
         <>
-          <div className="overflow-x-auto mb-3">
+          <div className="space-y-4 mb-3">
+          {Array.from(new Set(sorted.map(([k]) => analytics.shadow[k].summary.family ?? 'legacy')))
+            .sort((a, b) => familyRank(a) - familyRank(b))
+            .map(family => {
+              const familyRows = sorted.filter(([k]) => (analytics.shadow[k].summary.family ?? 'legacy') === family)
+              return <div key={family} className="overflow-x-auto border border-line rounded-sm">
+                <div className="px-3 py-2 bg-sunken text-xs font-bold text-ink-95 flex items-center justify-between">
+                  <span>{signalFamilyLabel(family)}</span><span className="font-mono text-ink-55">{familyRows.length} 版</span>
+                </div>
             <table className="w-full text-xs">
               <thead>
                 <tr className="border-b border-line text-ink-55">
-                  {thSort('ver', '版本', 'left')}
-                  {thSort('status', '状态', 'center')}
+                  {thSort('ver', '版本 / 分类', 'left')}
+                  {thSort('status', '影子采集', 'center')}
                   {thSort('live', '实盘', 'center')}
                   {thSort('n', 'n', 'right')}
                   {thSort('win_rate', '胜率', 'right')}
@@ -6658,7 +6740,8 @@ function ShadowSignalCard({
                 </tr>
               </thead>
               <tbody>
-                {sorted.map(([k, m], i) => {
+                {familyRows.map(([k, m]) => {
+                  const i = sorted.findIndex(([version]) => version === k)
                   const s = analytics.shadow[k].summary
                   // 与图表同序：本区第 11 条起降透明度，保证表格色块与曲线一一对应
                   const faded = i >= 10
@@ -6669,8 +6752,13 @@ function ShadowSignalCard({
                   return (
                     <tr key={k} className={`border-b border-line-soft hover:bg-sunken ${online ? '' : 'opacity-45'}`}>
                       <td className="py-1 px-2 font-medium" style={{ color: m.color, opacity: faded ? 0.6 : 1 }} title={s.desc}>
-                        <span className="inline-flex items-center gap-1">
+                        <span className="inline-flex items-center gap-1 flex-wrap">
                           {m.label}
+                          <span className="ds-badge ds-badge-neutral">{signalFamilyLabel(s.family)}</span>
+                          {s.role && s.role !== 'STRATEGY' && <span className="ds-badge ds-badge-indigo">{ROLE_LABELS[s.role] ?? s.role}</span>}
+                          <span className={`ds-badge ${EXECUTION_BADGE[s.execution_mode ?? 'SHADOW_ONLY']?.cls ?? 'ds-badge-neutral'}`}>
+                            {EXECUTION_BADGE[s.execution_mode ?? 'SHADOW_ONLY']?.label ?? '仅影子'}
+                          </span>
                           {signalDescFor('shadow', k) && <HelpHint text={`${k}：${signalDescFor('shadow', k)}`} />}
                         </span>
                       </td>
@@ -6746,6 +6834,8 @@ function ShadowSignalCard({
                 })}
               </tbody>
             </table>
+              </div>
+            })}
           </div>
           <ResponsiveContainer width="100%" height={240}>
             <LineChart data={rows} margin={{ top: 6, right: 12, left: 0, bottom: 0 }}>
@@ -6868,7 +6958,7 @@ function SceneSignalsCard({
   const selectCls = 'px-1.5 py-0.5 border border-line rounded-sm text-xs text-ink-80 bg-card'
 
   return (
-    <Card title="场景信号（FakeBreakout 正式信号）：累计胜率 vs 回测冻结基准">
+    <Card title="场景突破策略：采集记录与实盘执行状态">
       <div className="flex items-center justify-between mb-3 gap-2 flex-wrap text-xs">
         <div className="flex items-center gap-2 flex-wrap">
           <input
@@ -6920,8 +7010,12 @@ function SceneSignalsCard({
                   return (
                     <tr key={k} className="border-b border-line-soft hover:bg-sunken">
                       <td className="py-1 px-2 font-medium" style={{ color: m.color }}>
-                        <span className="inline-flex items-center gap-1">
+                        <span className="inline-flex items-center gap-1 flex-wrap">
                           {m.label}
+                          <span className="ds-badge ds-badge-neutral">{signalFamilyLabel(s.family)}</span>
+                          <span className={`ds-badge ${EXECUTION_BADGE[s.execution_mode ?? 'RESEARCH_ONLY']?.cls ?? 'ds-badge-neutral'}`}>
+                            {EXECUTION_BADGE[s.execution_mode ?? 'RESEARCH_ONLY']?.label ?? '仅研究'}
+                          </span>
                           {signalDescFor('scene', k) && <HelpHint text={`${k}：${signalDescFor('scene', k)}`} />}
                         </span>
                       </td>
@@ -7137,8 +7231,14 @@ function RegimeByVersionTable({
         {err && <span className="text-negative">{err}</span>}
       </div>
 
-      {/* BTC K线背景 */}
-      <Card title={`BTC K线背景（${kinterval === '1d' ? '日线 × 30' : '1小时 × 168'}，UTC 已收盘）`}>
+      {/* 仅保留一个总览入口：类型统计替代重复的 BTC 背景图（实盘抽屉已有更完整 K 线/报价/下单点对照）。 */}
+      {analytics && <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+        <div className="ds-card p-3"><div className="text-xs text-ink-55">实盘执行中</div><div className="text-xl font-bold font-mono text-positive">{[...Object.values(analytics.shadow), ...Object.values(analytics.scene)].filter(block => block.summary.execution_mode === 'LIVE_ACTIVE').length}</div></div>
+        <div className="ds-card p-3"><div className="text-xs text-ink-55">仅影子 / 研究</div><div className="text-xl font-bold font-mono text-violet">{[...Object.values(analytics.shadow), ...Object.values(analytics.scene)].filter(block => ['SHADOW_ONLY', 'RESEARCH_ONLY'].includes(block.summary.execution_mode ?? '')).length}</div></div>
+        <div className="ds-card p-3"><div className="text-xs text-ink-55">蜡烛反转逻辑版本</div><div className="text-xl font-bold font-mono text-brand">{Object.values(analytics.shadow).filter(block => block.summary.family === 'candlestick_reversal').length}</div><div className="text-[10px] text-ink-55">同窗按单事件多标签去重</div></div>
+      </div>}
+
+      <Card title={`信号位置概览（${kinterval === '1d' ? '日线 × 30' : '1小时 × 168'}，UTC 已收盘）`}>
         <div className="flex items-center gap-3 mb-2 text-xs">
           {(['1d', '1h'] as const).map(iv => (
             <button
@@ -7221,8 +7321,11 @@ function RegimeByVersionTable({
         />
       )}
 
-      {/* 理论影子到实盘结算的只读执行对比；端点缺失时独立降级，不影响既有分析 */}
-      <ShadowExecutionComparisonCard data={executionComparison} unavailable={executionUnavailable} />
+      {/* 执行漏斗已与“实盘表现诊断”高度重叠，默认收进 details，保留审计能力但不再占主页面。 */}
+      <details className="ds-card">
+        <summary className="cursor-pointer px-4 py-3 text-sm font-semibold text-ink-95">高级审计：理论影子 → 实盘执行漏斗</summary>
+        <div className="px-2 pb-2"><ShadowExecutionComparisonCard data={executionComparison} unavailable={executionUnavailable} /></div>
+      </details>
 
       {/* 影子退役区：momentum 族 / contrarian v1系 / x4_v1 / HM 族 已于 2026-09-04 永久下线，
           只作历史审计（代码级硬闸停发，toggle API 拒绝上线），不与在线版本混排 */}
@@ -7245,8 +7348,10 @@ function RegimeByVersionTable({
         />
       )}
 
-      {/* 周期归因 */}
-      <Card title={`周期归因：大涨前 vs 大涨期（${pumpTs != null ? `${utcMD(pumpTs)} 00:00` : '—'} UTC 分界，场景+影子全部信号）`}>
+      {/* 固定 2026-08-19 的历史大涨切片已过时且与现有 regime 分析重叠，仅保留折叠审计。 */}
+      <details className="ds-card">
+        <summary className="cursor-pointer px-4 py-3 text-sm font-semibold text-ink-95">历史审计：大涨前后切片</summary>
+      <Card title={`大涨前 vs 大涨期（${pumpTs != null ? `${utcMD(pumpTs)} 00:00` : '—'} UTC 分界）`}>
         {analytics && (
           <>
             <div className="flex flex-wrap gap-4 mb-4">
@@ -7300,6 +7405,7 @@ function RegimeByVersionTable({
           </>
         )}
       </Card>
+      </details>
     </div>
   )
 }

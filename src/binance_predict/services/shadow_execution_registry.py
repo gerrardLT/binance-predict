@@ -17,6 +17,9 @@ class ShadowVersionSpec:
     live_channel: str | None
     live_retired: bool = False
     policy_version: str = EXECUTION_POLICY_VERSION
+    family: str = "legacy"
+    role: str = "STRATEGY"
+    display_name: str | None = None
 
 
 # Order is API behavior: keep additions explicit rather than sorting this registry.
@@ -65,6 +68,10 @@ _VERSION_ROWS: tuple[tuple[str, SourceType, str, str, str], ...] = (
     ("hm_inside_15m_v2", SourceType.KLINE, "15m", "target_bar", "row"),
     ("ih_inside_15m_v2", SourceType.KLINE, "15m", "target_bar", "row"),
     ("hm_inside_5m_v2", SourceType.KLINE, "5m", "target_bar", "row"),
+    # 长影短实体检测器按 timeframe 只落一个物理事件；18 个冻结逻辑版本作为标签，
+    # 不在此投影表重复展开，避免同窗主版本/严格子集/组件被统计成多次事件。
+    ("candle_hm_bull_5m_event_v1", SourceType.KLINE, "5m", "target_bar", "row"),
+    ("candle_hm_bull_15m_event_v1", SourceType.KLINE, "15m", "target_bar", "row"),
 )
 
 
@@ -76,18 +83,43 @@ def _live_mapping(version: str) -> tuple[str | None, bool]:
     return None, False
 
 
+def _family_of(version: str, source: SourceType) -> str:
+    if version.startswith("candle_hm_bull_"):
+        return "candlestick_reversal"
+    if version.startswith(("quote_", "late_night_")):
+        return "quote_edge"
+    if version.startswith("x4_"):
+        return "x4"
+    if version.startswith(("firsthit_", "g7_")):
+        return "firsthit"
+    if version.startswith("absorption_"):
+        return "absorption"
+    if version.startswith("s2_cond_"):
+        return "s2_cond"
+    if version.startswith("combo_"):
+        return "combo"
+    if version.startswith(("nb_", "hm_inside_", "ih_inside_")):
+        return "nextbar"
+    if version.startswith(("krev_", "rev_")):
+        return "kline_reversal"
+    if version.startswith(("hm_touch_", "s5_deep_")):
+        return "pattern"
+    return source.value
+
 SHADOW_VERSION_SPECS: dict[str, ShadowVersionSpec] = {}
 for _version, _source, _period, _target, _direction in _VERSION_ROWS:
     _live, _retired = _live_mapping(_version)
     SHADOW_VERSION_SPECS[_version] = ShadowVersionSpec(
         _version, _source, _period, _target, _direction, _live, _retired,
+        family=_family_of(_version, _source),
+        role=("EVENT" if _version.startswith("candle_hm_bull_") else "STRATEGY"),
     )
 SHADOW_VERSIONS: tuple[str, ...] = tuple(SHADOW_VERSION_SPECS)
 
 
 def _validate() -> None:
-    if len(_VERSION_ROWS) != 44 or len(SHADOW_VERSION_SPECS) != 44:
-        raise RuntimeError("shadow execution registry must contain exactly 44 unique versions")
+    if len(_VERSION_ROWS) != len(SHADOW_VERSION_SPECS):
+        raise RuntimeError("shadow execution registry must contain unique versions")
     if {spec.source_type for spec in SHADOW_VERSION_SPECS.values()} != set(SourceType):
         raise RuntimeError("shadow execution registry must cover every source type")
     valid_targets = {"same_window", "next_window", "target_bar", "same_window_first_touch"}

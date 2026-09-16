@@ -446,6 +446,10 @@ class Settings(BaseSettings):
     # hm_inside_15m_v2 / ih_inside_15m_v2 挂钩。
     rev2_inside_shadow_enabled: bool = True
 
+    # --- 5m/15m 长影短实体反转（18 个冻结逻辑版本，单事件多标签）---
+    # 只落 record-only 影子事件，不注册 LIVE_CHANNELS、不提供实盘回调。
+    candlestick_shadow_enabled: bool = True
+
     # --- 多通道实盘（MultiLiveTrader，2026-08-24，取代旧单版本 quote_edge 实盘字段）---
     # 13 通道（quote_edge 族 1：contrarian_v2；x4 × 2：x4_v2/x4_v3；
     # 场景 5：S1/S2/S4/S5 + s5_deep；2026-09-06 影子 promote 5：

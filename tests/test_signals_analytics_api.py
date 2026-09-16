@@ -229,6 +229,27 @@ async def test_analytics_shadow_curve_and_breakeven() -> None:
 
 
 @pytest.mark.asyncio
+async def test_analytics_expands_one_candlestick_event_into_logical_labels() -> None:
+    """蜡烛组合物理事件只存一行，API 按 matched_signal_ids 还原逻辑版本。"""
+    import binance_predict.main as m
+
+    row = _krev_row(
+        version="candle_hm_bull_5m_event_v1",
+        feature_snapshot={"matched_signal_ids": [
+            "candle_hm_bull_5m_consensus2_shadow_v1",
+            "candle_hm_bull_5m_consensus3_shadow_v1",
+        ]},
+        direction="DOWN",
+        entry_down_price=0.4,
+    )
+    out = await m.get_signals_analytics(_make_db([], [], krev_rows=[row]))
+
+    assert out["shadow"]["candle_hm_bull_5m_consensus2_shadow_v1"]["summary"]["n"] == 1
+    assert out["shadow"]["candle_hm_bull_5m_consensus3_shadow_v1"]["summary"]["n"] == 1
+    assert "candle_hm_bull_5m_event_v1" not in out["shadow"]
+
+
+@pytest.mark.asyncio
 async def test_analytics_scene_curve_prefers_db_fields() -> None:
     """场景曲线优先 DB 落库 cumulative_winrate；胜负按 side→方向映射；EV 审计口径现算。"""
     import binance_predict.main as m
@@ -327,7 +348,7 @@ async def test_analytics_empty_db() -> None:
     db = _make_db([], [])
     out = await m.get_signals_analytics(db)
 
-    assert set(out["shadow"].keys()) == {
+    expected = {
         "x4_v1", "quote_momentum_v1", "quote_contrarian_v1",
         "x4_v2", "x4_v3", "quote_momentum_v2", "quote_contrarian_v2",
         "quote_contrarian_v3a", "quote_contrarian_v3b", "quote_contrarian_v4",
@@ -347,6 +368,14 @@ async def test_analytics_empty_db() -> None:
         # rev2 孕线反转族
         "hm_inside_15m_v2", "ih_inside_15m_v2", "hm_inside_5m_v2",
     }
+    from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
+    assert set(out["shadow"].keys()) == expected | set(CANDLESTICK_SIGNAL_IDS)
+    assert "candle_hm_bull_5m_event_v1" not in out["shadow"]
+    for version in CANDLESTICK_SIGNAL_IDS:
+        summary = out["shadow"][version]["summary"]
+        assert summary["collection_mode"] == "RECORD_ONLY"
+        assert summary["execution_mode"] == "SHADOW_ONLY"
+        assert summary["family"] == "candlestick_reversal"
     for v, blk in out["shadow"].items():
         assert blk["summary"]["n"] == 0
         assert blk["summary"]["win_rate"] is None

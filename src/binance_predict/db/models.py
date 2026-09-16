@@ -923,12 +923,12 @@ class KlineShadowSignal(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     version: Mapped[str] = mapped_column(
-        String(24), nullable=False,
-        comment="信号口径版本：krev_a_v1 / krev_b_v1（与冻结注册表条件一一对应）",
+        String(64), nullable=False,
+        comment="物理事件版本；蜡烛组合以 timeframe 主事件落一行，逻辑版本保存在 feature_snapshot",
     )
     discovery_id: Mapped[str] = mapped_column(
-        String(16), nullable=False,
-        comment="冻结注册表 discovery_id（krev_a=fd191c44fb5c36 / krev_b=5c5e4c78ab4c3f）",
+        String(32), nullable=False,
+        comment="冻结注册表 discovery_id 或 record-only 检测器标识",
     )
     condition_text: Mapped[str] = mapped_column(
         Text, nullable=False,
@@ -1575,8 +1575,8 @@ class ShadowVersionOverride(Base):
     __tablename__ = "shadow_version_overrides"
 
     version: Mapped[str] = mapped_column(
-        String(24), primary_key=True,
-        comment="影子版本名（SHADOW_BENCH 白名单，如 hm_touch_down_v1 / combo_p1_v1）"
+        String(80), primary_key=True,
+        comment="影子逻辑版本名（含只作标签的长 ID）"
     )
     enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True,

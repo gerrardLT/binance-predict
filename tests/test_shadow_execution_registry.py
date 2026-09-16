@@ -28,12 +28,18 @@ EXPECTED_ANALYTICS_VERSIONS = (
     "firsthit_down_g4_v1", "firsthit_down_g7_v1", "g7_streak_v1",
     "g7_wick20_v1", "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",
     "hm_inside_15m_v2", "ih_inside_15m_v2", "hm_inside_5m_v2",
+    "candle_hm_bull_5m_event_v1", "candle_hm_bull_15m_event_v1",
 )
 
 
-def test_registry_matches_all_44_analytics_versions_in_order() -> None:
+def test_registry_matches_all_physical_shadow_versions_in_order() -> None:
     assert SHADOW_VERSIONS == EXPECTED_ANALYTICS_VERSIONS
-    assert len(SHADOW_VERSION_SPECS) == 44
+    assert len(SHADOW_VERSION_SPECS) == 46
+    for version in ("candle_hm_bull_5m_event_v1", "candle_hm_bull_15m_event_v1"):
+        spec = SHADOW_VERSION_SPECS[version]
+        assert spec.family == "candlestick_reversal"
+        assert spec.role == "EVENT"
+        assert spec.live_channel is None
 
 
 def test_registry_covers_every_source_adapter() -> None:

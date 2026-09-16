@@ -131,7 +131,13 @@ class ShadowSourceAdapter:
             theoretical_entry_price=entry,
             theoretical_realized_return=_realized_return(row, entry, signal_version),
             theoretical_settled_at=self.settled_at(row),
-            source_payload={"source_table": self.model.__tablename__},
+            source_payload={
+                "source_table": self.model.__tablename__,
+                "matched_signal_ids": (
+                    list((getattr(row, "feature_snapshot", None) or {}).get("matched_signal_ids", []))
+                    if self.source_type is SourceType.KLINE else []
+                ),
+            },
         )
 
 
