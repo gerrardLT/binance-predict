@@ -113,7 +113,7 @@ class TradeOrderModel(Base):
     )
     # --- 报价 edge 实盘关联（quote_momentum_v1 LIVE，2026-08-20）---
     signal_version: Mapped[str | None] = mapped_column(
-        String(40), nullable=True,
+        String(80), nullable=True,
         comment="触发信号版本（quote_momentum_v1 等）；NULL=非信号驱动订单（旧路径）",
     )
     window_start: Mapped[int | None] = mapped_column(
@@ -1520,7 +1520,7 @@ class LiveChannelOverride(Base):
     __tablename__ = "live_channel_overrides"
 
     channel: Mapped[str] = mapped_column(
-        String(64), primary_key=True,
+        String(80), primary_key=True,
         comment="通道名（LIVE_CHANNELS 白名单，如 quote_contrarian_v2）"
     )
     enabled: Mapped[bool] = mapped_column(
@@ -1548,7 +1548,7 @@ class NotificationChannelOverride(Base):
     __tablename__ = "notification_channel_overrides"
 
     channel: Mapped[str] = mapped_column(
-        String(64), primary_key=True,
+        String(80), primary_key=True,
         comment="LIVE_CHANNELS 通道名；__global__ 为全局渠道/低余额配置",
     )
     enabled: Mapped[bool] = mapped_column(
@@ -1611,7 +1611,7 @@ class ShadowExecutionAssessment(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     source_type: Mapped[str] = mapped_column(String(24), nullable=False)
     source_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    signal_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    signal_version: Mapped[str] = mapped_column(String(80), nullable=False)
     policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
     config_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     source_window_start: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -1626,7 +1626,7 @@ class ShadowExecutionAssessment(Base):
     terminal_stage: Mapped[str] = mapped_column(String(32), nullable=False)
     reason_code: Mapped[str] = mapped_column(String(48), nullable=False)
     legacy_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
-    live_channel: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    live_channel: Mapped[str | None] = mapped_column(String(80), nullable=True)
     channel_mapped: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     enabled: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     retired: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
@@ -1635,7 +1635,7 @@ class ShadowExecutionAssessment(Base):
     max_daily_orders: Mapped[int | None] = mapped_column(Integer, nullable=True)
     effective_max_exec_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     guard_applied: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
-    exclusive_blocker_channel: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    exclusive_blocker_channel: Mapped[str | None] = mapped_column(String(80), nullable=True)
     market_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     token_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     balance_available: Mapped[float | None] = mapped_column(Float, nullable=True)

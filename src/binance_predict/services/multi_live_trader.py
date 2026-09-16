@@ -235,7 +235,7 @@ class MultiLiveTrader:
         spec = SHADOW_VERSION_SPECS.get(channel)
         live_spec = self._specs.get(channel)
         cfg = self._configs.get(channel)
-        if spec is None or live_spec is None or cfg is None:
+        if live_spec is None or cfg is None:
             return None
         max_exec_price = resolve_max_exec(live_spec, cfg)
         config_snapshot = {
@@ -247,7 +247,7 @@ class MultiLiveTrader:
             "entry_band_whitelist": live_spec.entry_band_whitelist,
         }
         return {
-            "source_type": spec.source_type.value,
+            "source_type": spec.source_type.value if spec is not None else "kline",
             "signal_version": channel,
             "target_window_start": window_start,
             "market_period": live_spec.market_period,
@@ -1353,6 +1353,22 @@ class MultiLiveTrader:
         except Exception as exc:
             logger.warning("多通道实盘：S2 条件单钩子异常（不影响检测循环）| {}", exc)
 
+    def on_candlestick_signal(self, sig: dict) -> None:
+        """蜡烛组合逻辑标签钩子；注册通道默认 OFF，手工开启后才派单。"""
+        try:
+            channel = str(sig.get("version") or "")
+            market_start = int(sig["market_start"])
+            if not self._hook_gate(channel, "candlestick_reversal", market_start):
+                return
+            task = asyncio.create_task(
+                self._fire_nextbar(channel, sig),
+                name=f"live_candlestick_{channel}_{market_start}",
+            )
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+        except Exception as exc:
+            logger.warning("多通道实盘：蜡烛组合钩子异常（不影响影子采集）| {}", exc)
+
     def on_nextbar_signal(self, sig: dict) -> None:
         """NextbarShadowDetector 新根收盘钩子（同步接口，fire-and-forget）。
 
@@ -1425,7 +1441,7 @@ class MultiLiveTrader:
             if not proceed:
                 return
             logger.info(
-                "多通道实盘开火 | {} | nextbar 新根命中押 {} | 窗口 {} | 金额 {} | 护栏 {}",
+                "多通道实盘开火 | {} | K线次根信号押 {} | 窗口 {} | 金额 {} | 护栏 {}",
                 channel, prediction, _fmt_win(market_start), cfg.amount_usdt,
                 resolve_max_exec(spec, cfg))
             order = await self._exec_with_exclusive(

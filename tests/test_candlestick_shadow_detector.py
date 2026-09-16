@@ -191,6 +191,7 @@ async def test_record_signal_is_idempotent_and_stores_one_physical_event(monkeyp
     event = fresh.added[0]
     assert event.version == EVENT_VERSION_BY_TF["5m"]
     assert event.feature_snapshot["matched_signal_ids"] == hit["matched_signal_ids"]
+    assert event.feature_snapshot["all_matched_signal_ids"] == hit["matched_signal_ids"]
     assert event.direction == "DOWN"
 
 
@@ -206,6 +207,7 @@ async def test_settlement_updates_labels_quotes_and_down_result(monkeypatch) -> 
         entry_up_price=None, entry_down_price=None, entry_quote_ts=None,
         feature_snapshot={
             "matched_signal_ids": ["candle_hm_bull_15m_union_shadow_v1"],
+            "all_matched_signal_ids": ["candle_hm_bull_15m_union_shadow_v1"],
             "quote_snapshots": {},
         },
     )
@@ -233,8 +235,48 @@ def test_all_18_logical_versions_are_record_only_and_physically_isolated() -> No
 
     assert len(CANDLESTICK_SIGNAL_IDS) == 18
     assert len(CANDLESTICK_LOGICAL_SPECS) == 18
-    assert not (set(CANDLESTICK_SIGNAL_IDS) & set(LIVE_CHANNELS))
+    assert set(CANDLESTICK_SIGNAL_IDS) <= set(LIVE_CHANNELS)
     assert not (set(CANDLESTICK_SIGNAL_IDS) & set(X4_VERSIONS))
     assert not (set(EVENT_VERSION_BY_TF.values()) & set(LIVE_CHANNELS))
     detector = CandlestickShadowDetector(None, {}, {})
-    assert not hasattr(detector, "_on_live_fire")
+    assert hasattr(detector, "_on_live_fire")
+    assert detector._on_live_fire is None
+
+
+@pytest.mark.asyncio
+async def test_cold_start_backscan_never_dispatches_live(monkeypatch) -> None:
+    rows = _rows("5m")
+    _bull_lower_signal(rows)
+    session = _FakeSession(scalar=None)
+    detector = CandlestickShadowDetector(None, {}, {})
+    detector._on_live_fire = AsyncMock()
+    monkeypatch.setattr(csd, "async_session_factory", lambda: _SessionCtx(session))
+    monkeypatch.setattr(csd.shadow_gate, "is_enabled", lambda _version: True)
+    monkeypatch.setattr(csd.time, "time", lambda: (int(rows[-1]["open_time"]) + BAR_MS["5m"] + 30_000) / 1000)
+
+    await detector._evaluate_new_bars("5m", rows)
+
+    detector._on_live_fire.assert_not_called()
+    assert len(session.added) == 1
+
+
+@pytest.mark.asyncio
+async def test_live_payloads_are_dispatched_once_per_logical_label(monkeypatch) -> None:
+    rows = _rows("5m")
+    _bull_lower_signal(rows)
+    hit = evaluate_candlestick_patterns(rows, "5m", 1)[0]
+    fresh = _FakeSession(scalar=None)
+    detector = CandlestickShadowDetector(None, {}, {})
+    fired: list[dict] = []
+    detector._on_live_fire = fired.append
+    monkeypatch.setattr(csd.shadow_gate, "is_enabled", lambda _version: True)
+    monkeypatch.setattr(csd.time, "time", lambda: (int(rows[-1]["open_time"]) + BAR_MS["5m"] + 30_000) / 1000)
+
+    payloads: list[dict] = []
+    assert await detector._record_signal(fresh, hit, rows[-1], payloads) is True
+    detector._dispatch_live(payloads)
+    assert {payload["version"] for payload in fired} == set(hit["matched_signal_ids"])
+    assert {payload["market_start"] for payload in fired} == {
+        int(rows[-1]["open_time"]) + BAR_MS["5m"]
+    }
+    assert all(payload["direction"] == "DOWN" for payload in fired)

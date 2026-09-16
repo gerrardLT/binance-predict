@@ -193,7 +193,7 @@ nextbar_shadow_detector: NextbarShadowDetector | None = None
 combo_shadow_detector: ComboShadowDetector | None = None
 
 # 长影短实体组合影子检测器：5m/15m 每根只落一个事件，18 个冻结版本作标签；
-# record-only，无实盘回调且不注册 LIVE_CHANNELS。
+# 同名实盘通道已注册但默认全 OFF，只有手工开启后才下单。
 candlestick_shadow_detector: CandlestickShadowDetector | None = None
 
 # 吸收/欠反应跟随影子检测器全局实例（absorption_follow_v1 族：TD120/150 双 variant
@@ -1057,13 +1057,19 @@ async def lifespan(app: FastAPI):
                 "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS quote5m_up_15m FLOAT",
                 "ALTER TABLE fake_breakout_signals ADD COLUMN IF NOT EXISTS quote5m_ts_15m BIGINT",
                 # 信号关联字段 + 唯一约束/索引（与 alembic 迁移 u6f7g8h9i0j1 等价，存量 dev 库安全网）
-                "ALTER TABLE trade_orders ADD COLUMN IF NOT EXISTS signal_version VARCHAR(40)",
+                "ALTER TABLE trade_orders ADD COLUMN IF NOT EXISTS signal_version VARCHAR(80)",
                 "ALTER TABLE trade_orders ADD COLUMN IF NOT EXISTS window_start BIGINT",
                 "ALTER TABLE trade_orders ADD COLUMN IF NOT EXISTS signal_id INTEGER",
                 # 长影组合使用长逻辑标签；物理 K 线事件版本与 gate 覆盖键同步扩宽。
                 "ALTER TABLE kline_shadow_signals ALTER COLUMN version TYPE VARCHAR(64)",
                 "ALTER TABLE kline_shadow_signals ALTER COLUMN discovery_id TYPE VARCHAR(32)",
                 "ALTER TABLE shadow_version_overrides ALTER COLUMN version TYPE VARCHAR(80)",
+                "ALTER TABLE trade_orders ALTER COLUMN signal_version TYPE VARCHAR(80)",
+                "ALTER TABLE live_channel_overrides ALTER COLUMN channel TYPE VARCHAR(80)",
+                "ALTER TABLE notification_channel_overrides ALTER COLUMN channel TYPE VARCHAR(80)",
+                "ALTER TABLE shadow_execution_assessments ALTER COLUMN signal_version TYPE VARCHAR(80)",
+                "ALTER TABLE shadow_execution_assessments ALTER COLUMN live_channel TYPE VARCHAR(80)",
+                "ALTER TABLE shadow_execution_assessments ALTER COLUMN exclusive_blocker_channel TYPE VARCHAR(80)",
                 "ALTER TABLE trade_orders ADD CONSTRAINT uq_trade_orders_version_window UNIQUE (signal_version, window_start)",
                 "CREATE INDEX IF NOT EXISTS ix_trade_orders_signal_version ON trade_orders (signal_version)",
                 # token_id 扩宽（与 alembic 迁移 w7a8b9c0d1e2 等价，存量 dev 库安全网；重复执行幂等）
@@ -1297,7 +1303,7 @@ async def lifespan(app: FastAPI):
 
     # 长影短实体组合：4 主/对照 + 4 归因组件 + 10 预注册潜力标签。
     # 每周期每根只落一个物理事件，逻辑版本保存在 feature_snapshot，避免重复计数；
-    # 检测器无 _on_live_fire，且全部版本不在 LIVE_CHANNELS，物理隔离真钱链路。
+    # 18 个同名实盘通道均默认 OFF，只有用户手工开启后才经独立钩子下单。
     global candlestick_shadow_detector
     if settings.candlestick_shadow_enabled:
         candlestick_shadow_detector = CandlestickShadowDetector(
@@ -1305,8 +1311,11 @@ async def lifespan(app: FastAPI):
             pm_15m_latest=_pm_15m_latest,
             pm_5m_info=_pm_market_info,
         )
+        # 必须在 start() 的冷启动回补前挂钩；否则已开启通道会漏掉部署边界的新鲜命中。
+        if multi_live_trader is not None:
+            candlestick_shadow_detector._on_live_fire = multi_live_trader.on_candlestick_signal
         await candlestick_shadow_detector.start()
-        logger.info("蜡烛组合影子检测器已启动（5m/15m 单事件多标签，18 个冻结逻辑版本，record-only）")
+        logger.info("蜡烛组合影子检测器已启动（5m/15m 单事件多标签，18 个冻结逻辑版本；实盘通道默认全 OFF）")
 
     # 吸收/欠反应跟随影子信号（absorption_follow_v1 族，2026-09-04；2026-09-06 promote）：
     # 5m 窗内报价对 BTC 位移「欠反应」（知情者吸筹脚印）→ 跟随 btc 方向补涨押注的影子
@@ -1399,8 +1408,8 @@ async def lifespan(app: FastAPI):
             fake_breakout_detector._on_s5_deep_fired = (
                 multi_live_trader.on_s5_deep_signal)
         # 影子 promote 实盘钩子（2026-09-06）：s2_cond 判价命中 / nextbar 新根命中 →
-        # 真单（各检测器内钩子独立于影子 gate；影子检测关闭 = 钩子保持 None 纯影子，
-        # 通道即使开启也无触发源——fail-safe 同 scene 族）
+        # 真单（各检测器内钩子独立于影子 gate；检测器关闭则通道无触发源，fail-safe 同 scene 族）。
+        # candlestick 钩子已在其 start() 前注入，避免冷启动时序漏单，故这里不重复赋值。
         if s2_cond_shadow_detector is not None:
             s2_cond_shadow_detector._on_live_fire = multi_live_trader.on_s2_cond_signal
         if nextbar_shadow_detector is not None:
@@ -3975,23 +3984,18 @@ for _channel, _benchmark in CHANNEL_BENCHMARKS.items():
 # 周期切分点：08-19 00:00 UTC（三根大阳起点）；< 为震荡期（大涨前），≥ 为大涨期
 PUMP_TS_MS = int(datetime(2026, 8, 19, tzinfo=timezone.utc).timestamp() * 1000)
 
-# 长影短实体组合按 timeframe 单事件落库，以下冻结 bench 用于逻辑标签展开后的前向统计。
-from .services.candlestick_shadow_detector import CANDLESTICK_LOGICAL_SPECS
-_CANDLE_BENCH = {
-    "candle_hm_bull_5m_consensus2_shadow_v1": (0.57425743, 0.14695252, "5m主影子：三趋势至少2个上涨，阳线长下影→DOWN"),
-    "candle_hm_bull_5m_consensus3_shadow_v1": (0.59067358, 0.17651603, "5m严格对照：三趋势全部上涨；主版本子集"),
-    "candle_hm_bull_15m_union_shadow_v1": (0.66197183, 0.26975357, "15m主影子：三趋势任1上涨，阳线长下影→DOWN"),
-    "candle_hm_bull_15m_consensus3_shadow_v1": (0.73333333, 0.40197905, "15m严格对照：三趋势全部上涨；主版本子集"),
-    "candle_hm_bull_5m_ret5_majority_component_shadow_v1": (0.58, 0.15746431, "5m ret5_majority 归因组件"),
-    "candle_hm_bull_5m_ret3_component_shadow_v1": (0.56804734, 0.13265524, "5m ret3 归因组件"),
-    "candle_hm_bull_15m_ret3_component_shadow_v1": (0.70175439, 0.35381524, "15m ret3 归因组件"),
-    "candle_hm_bull_15m_ma10_component_shadow_v1": (0.69811321, 0.3298541, "15m ma10 归因组件"),
-}
+# 长影短实体组合按 timeframe 单事件落库；18 个逻辑标签的冻结真实报价期基准
+# 统一来自部署裁决表（quote_n/quote_win_rate/ev_per_trade_r）。
+from .services.candlestick_shadow_detector import (
+    CANDLESTICK_BACKTEST, CANDLESTICK_DISPLAY_NAMES, CANDLESTICK_LOGICAL_SPECS,
+)
 for _candle_spec in CANDLESTICK_LOGICAL_SPECS:
     _candle_id = _candle_spec["signal_id"]
-    SHADOW_BENCH[_candle_id] = _CANDLE_BENCH.get(
-        _candle_id,
-        (None, None, "预注册潜力标签：仅 record-only 前向观察，不具备实盘映射"),
+    _wr, _ev, _n = CANDLESTICK_BACKTEST[_candle_id]
+    SHADOW_BENCH[_candle_id] = (
+        _wr,
+        _ev,
+        f"{CANDLESTICK_DISPLAY_NAMES[_candle_id]}（冻结真实报价样本 n={_n}；前向胜率/EV 由上线后样本独立累计）",
     )
 
 # BTC K 线图表缓存：interval:档位 -> (缓存时刻, klines)，避免前端轮询打爆 Binance。
@@ -4250,7 +4254,11 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
                 "avg_ev": sum(evs) / len(evs) if evs else None,
                 "cum_ev": round(cum_ev, 4) if evs else None,
                 "avg_breakeven": sum(bes) / len(bes) if bes else None,
-                "bench_winrate": bwr, "bench_ev": bev, "desc": desc,
+                "bench_winrate": bwr,
+                "bench_ev": bev,
+                # 回测胜率可支持的费后理论最高入场价；不同于前向真实报价推导的 avg_breakeven。
+                "bench_max_entry_price": bwr * 0.98 if bwr is not None else None,
+                "desc": desc,
                 # 影子开关状态（前端手动下线能力）：下线版本置灰+可重新上线；
                 # retired=永久退役（代码级硬闸，toggle 拒改，前端不可点开关）
                 "enabled": shadow_gate.is_enabled(v),

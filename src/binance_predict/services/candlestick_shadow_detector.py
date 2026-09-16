@@ -1,9 +1,9 @@
-"""5m/15m 长影短实体反转的 record-only 检测器。
+"""5m/15m 长影短实体反转检测器。
 
 每根 K 线、每周期只落一个物理事件；18 个冻结研究版本以
 ``feature_snapshot.matched_signal_ids`` 标签保存，避免主版本、严格子集、
-归因组件和后验假设被误当成多笔独立信号。模块没有实盘回调，版本也不注册
-``LIVE_CHANNELS``，因此只能采集、结算和分析。
+归因组件和后验假设被误当成多笔独立信号。逻辑版本可注册实盘通道，但全部
+默认关闭；检测器只分派新鲜命中，是否下单由 MultiLiveTrader 独立门禁。
 """
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from sqlalchemy import select as sa_select
 
 from binance_predict.db.engine import async_session_factory
 from binance_predict.db.models import KlineShadowSignal, PredictionMarketSample
+from binance_predict.services.shadow_entry_quote import snapshot_entry_quote
 from binance_predict.services.shadow_version_gate import shadow_gate
 
 BAR_MS = {"5m": 300_000, "15m": 900_000}
@@ -59,7 +60,52 @@ CANDLESTICK_LOGICAL_SPECS: tuple[dict[str, str], ...] = (
 )
 CANDLESTICK_SIGNAL_IDS = tuple(spec["signal_id"] for spec in CANDLESTICK_LOGICAL_SPECS)
 LOGICAL_SPEC_BY_ID = {spec["signal_id"]: spec for spec in CANDLESTICK_LOGICAL_SPECS}
+CANDLESTICK_BACKTEST: dict[str, tuple[float, float, int]] = {
+    "candle_hm_bull_5m_consensus2_shadow_v1": (0.57425743, 0.14695252, 303),
+    "candle_hm_bull_5m_consensus3_shadow_v1": (0.59067358, 0.17651603, 193),
+    "candle_hm_bull_15m_union_shadow_v1": (0.66197183, 0.26975357, 71),
+    "candle_hm_bull_15m_consensus3_shadow_v1": (0.73333333, 0.40197905, 30),
+    "candle_hm_bull_5m_ret5_majority_component_shadow_v1": (0.58, 0.15746431, 250),
+    "candle_hm_bull_5m_ret3_component_shadow_v1": (0.56804734, 0.13265524, 338),
+    "candle_hm_bull_15m_ret3_component_shadow_v1": (0.70175439, 0.35381524, 57),
+    "candle_hm_bull_15m_ma10_component_shadow_v1": (0.69811321, 0.3298541, 53),
+    "candle_hm_bull_5m_volume_mid_high_shadow_hyp_v1": (0.70322581, 0.39753211, 155),
+    "candle_hm_bull_5m_trend4h_up_shadow_hyp_v1": (0.59585492, 0.18858136, 193),
+    "candle_hm_bull_5m_asia_shadow_hyp_v1": (0.60169492, 0.19644278, 118),
+    "candle_hm_bull_15m_q45_55_shadow_hyp_v1": (0.70588235, 0.41624235, 51),
+    "candle_hm_bull_15m_trend1h_up_shadow_hyp_v1": (0.66666667, 0.26751519, 51),
+    "candle_hm_bull_15m_asia_shadow_hyp_v1": (0.75, 0.44002248, 24),
+    "candidate_5m_ret5_majority_up_upper_bull_l70b30m10_shadow_hyp_v1": (0.58870968, 0.15388355, 124),
+    "candidate_5m_ret3_up_lower_bear_l50b50m0_shadow_hyp_v1": (0.55555556, 0.11314249, 135),
+    "candidate_15m_ret5_majority_up_lower_bull_l50b40m10_shadow_hyp_v1": (0.6, 0.14612602, 40),
+    "candidate_15m_ret3_down_upper_bull_l50b40m10_shadow_hyp_v1": (0.61290323, 0.13982741, 31),
+}
+CANDLESTICK_DISPLAY_NAMES = {
+    "candle_hm_bull_5m_consensus2_shadow_v1": "5m长下影·至少2趋势",
+    "candle_hm_bull_5m_consensus3_shadow_v1": "5m长下影·三趋势对照",
+    "candle_hm_bull_15m_union_shadow_v1": "15m长下影·任一趋势",
+    "candle_hm_bull_15m_consensus3_shadow_v1": "15m长下影·三趋势对照",
+    "candle_hm_bull_5m_ret5_majority_component_shadow_v1": "5m ret5归因组件",
+    "candle_hm_bull_5m_ret3_component_shadow_v1": "5m ret3归因组件",
+    "candle_hm_bull_15m_ret3_component_shadow_v1": "15m ret3归因组件",
+    "candle_hm_bull_15m_ma10_component_shadow_v1": "15m ma10归因组件",
+    "candle_hm_bull_5m_volume_mid_high_shadow_hyp_v1": "5m长下影·中高量能",
+    "candle_hm_bull_5m_trend4h_up_shadow_hyp_v1": "5m长下影·4h上涨",
+    "candle_hm_bull_5m_asia_shadow_hyp_v1": "5m长下影·亚洲时段",
+    "candle_hm_bull_15m_q45_55_shadow_hyp_v1": "15m长下影·报价0.45~0.55",
+    "candle_hm_bull_15m_trend1h_up_shadow_hyp_v1": "15m长下影·1h上涨",
+    "candle_hm_bull_15m_asia_shadow_hyp_v1": "15m长下影·亚洲时段",
+    "candidate_5m_ret5_majority_up_upper_bull_l70b30m10_shadow_hyp_v1": "5m上涨阳线长上影",
+    "candidate_5m_ret3_up_lower_bear_l50b50m0_shadow_hyp_v1": "5m严格零上影阴线长下影",
+    "candidate_15m_ret5_majority_up_lower_bull_l50b40m10_shadow_hyp_v1": "15m ret5阳线长下影",
+    "candidate_15m_ret3_down_upper_bull_l50b40m10_shadow_hyp_v1": "15m下跌阳线长上影",
+}
+CANDLESTICK_DIRECTIONS = {
+    signal_id: ("UP" if signal_id == "candidate_15m_ret3_down_upper_bull_l50b40m10_shadow_hyp_v1" else "DOWN")
+    for signal_id in CANDLESTICK_SIGNAL_IDS
+}
 VERSIONS_BY_TF = {tf: [EVENT_VERSION_BY_TF[tf]] for tf in TIMEFRAMES}
+CANDLESTICK_LIVE_MAX_LAG_MS = 90_000
 
 
 def _ratios(bar: dict) -> tuple[float, float, float] | None:
@@ -249,7 +295,7 @@ def apply_quote_labels(timeframe: str, labels: list[str], down_quote: float | No
 
 
 class CandlestickShadowDetector:
-    """轮询已收盘 K 线，单事件落库并在次根收盘结算；永不触发实盘。"""
+    """轮询已收盘 K 线，单事件落库、分派新鲜逻辑命中并在次根收盘结算。"""
 
     def __init__(self, collector, pm_15m_latest: dict, pm_5m_info: dict) -> None:
         self._collector = collector
@@ -259,6 +305,8 @@ class CandlestickShadowDetector:
         self._last_evaluated_bar: dict[str, int | None] = {tf: None for tf in TIMEFRAMES}
         self._trigger_count = 0
         self._settle_count = 0
+        # 注册实盘通道后由 main 注入；通道默认全 OFF，未注入仍是纯影子。
+        self._on_live_fire = None
 
     async def start(self) -> None:
         if self._running:
@@ -269,7 +317,7 @@ class CandlestickShadowDetector:
         except Exception as exc:
             logger.warning("蜡烛组合影子：冷启动回补失败（循环内自愈）| {}", exc)
         self._task = asyncio.create_task(self._loop(), name="candlestick_shadow_detector")
-        logger.info("蜡烛组合影子检测器启动 | 18 个冻结逻辑版本 | record-only 单事件多标签")
+        logger.info("蜡烛组合影子检测器启动 | 18 个冻结逻辑版本 | 单事件多标签（实盘通道默认关闭）")
 
     async def stop(self) -> None:
         self._running = False
@@ -306,6 +354,8 @@ class CandlestickShadowDetector:
             await self._expire_stale_pending(tf)
 
     async def _evaluate_new_bars(self, tf: str, closed: list[dict]) -> None:
+        # 冷启动回补只补影子事实，绝不追下真钱单；正常轮询才收集新鲜实盘 payload。
+        collect_live = self._last_evaluated_bar[tf] is not None
         if self._last_evaluated_bar[tf] is None:
             n_tail = BACKSCAN_BARS
         else:
@@ -318,17 +368,21 @@ class CandlestickShadowDetector:
         hits = evaluate_candlestick_patterns(closed, tf, n_tail)
         if not hits:
             return
+        live_payloads: list[dict] = []
         async with async_session_factory() as session:
             added = 0
             for hit in hits:
-                if await self._record_signal(session, hit, closed[hit["idx"]]):
+                payloads = live_payloads if collect_live else None
+                if await self._record_signal(session, hit, closed[hit["idx"]], payloads):
                     added += 1
             if added:
                 await session.commit()
                 self._trigger_count += added
                 logger.info("蜡烛组合影子触发 +{} | {} | 单事件多标签", added, tf)
+        self._dispatch_live(live_payloads)
 
-    async def _record_signal(self, session, hit: dict, bar: dict) -> bool:
+    async def _record_signal(self, session, hit: dict, bar: dict,
+                             live_payloads: list[dict] | None = None) -> bool:
         tf = hit["timeframe"]
         event_version = EVENT_VERSION_BY_TF[tf]
         start = int(bar["open_time"])
@@ -340,11 +394,28 @@ class CandlestickShadowDetector:
         )).scalar_one_or_none()
         if exists is not None:
             return False
-        labels = _enabled_labels(hit["matched_signal_ids"])
-        if not labels:
-            return False
+        # 返回值仅表示物理事件是否可落库；实盘分派独立于影子 gate，避免「下线采集」
+        # 意外变成真钱开关。即便全部逻辑版本暂停采集，新鲜命中仍交给 trader 的 enabled 门禁。
         target = start + BAR_MS[tf]
-        snapshot = {**hit["snapshot"], "matched_signal_ids": labels, "quote_snapshots": {}}
+        up_q, down_q, quote_ts = snapshot_entry_quote(self._pm_by_tf.get(tf), target)
+        if up_q is not None and down_q is not None and not (QUOTE_SUM_MIN <= up_q + down_q <= QUOTE_SUM_MAX):
+            up_q = down_q = quote_ts = None
+        live_labels = apply_quote_labels(tf, hit["matched_signal_ids"], down_q)
+        if live_payloads is not None and 0 <= int(time.time() * 1000) - target <= CANDLESTICK_LIVE_MAX_LAG_MS:
+            live_payloads.extend({
+                "version": version,
+                "market_start": target,
+                "market_end": target + BAR_MS[tf],
+                "direction": CANDLESTICK_DIRECTIONS[version],
+                "signal_bar_start": start,
+            } for version in live_labels)
+        labels = _enabled_labels(live_labels)
+        snapshot = {
+            **hit["snapshot"],
+            "matched_signal_ids": labels,
+            "all_matched_signal_ids": live_labels,
+            "quote_snapshots": {},
+        }
         session.add(KlineShadowSignal(
             version=event_version,
             discovery_id="candle_hm_bull_v1",
@@ -355,9 +426,22 @@ class CandlestickShadowDetector:
             direction=hit["direction"],
             target_bar_start=target,
             feature_snapshot=snapshot,
+            entry_up_price=up_q,
+            entry_down_price=down_q,
+            entry_quote_ts=quote_ts,
             status="PENDING",
         ))
         return True
+
+    def _dispatch_live(self, payloads: list[dict]) -> None:
+        hook = self._on_live_fire
+        if hook is None:
+            return
+        for payload in payloads:
+            try:
+                hook(payload)
+            except Exception as exc:
+                logger.warning("蜡烛组合：实盘开火分派异常（不影响影子采集）| {} | {}", payload["version"], exc)
 
     async def _load_quote_points(self, tf: str, target_start: int) -> list[Any]:
         async with async_session_factory() as session:
@@ -393,9 +477,13 @@ class CandlestickShadowDetector:
                 feature_snapshot = dict(signal.feature_snapshot or {})
                 first = snapshots["first"]
                 labels = list(feature_snapshot.get("matched_signal_ids", []))
-                enriched = apply_quote_labels(tf, labels, first["down_price"] if first else None)
-                added_labels = [label for label in enriched if label not in labels and shadow_gate.is_enabled(label)]
-                feature_snapshot["matched_signal_ids"] = labels + added_labels
+                all_labels = list(feature_snapshot.get("all_matched_signal_ids", labels))
+                enriched = apply_quote_labels(tf, all_labels, first["down_price"] if first else None)
+                newly_derived = [label for label in enriched if label not in all_labels]
+                feature_snapshot["all_matched_signal_ids"] = enriched
+                feature_snapshot["matched_signal_ids"] = list(dict.fromkeys(
+                    labels + [label for label in newly_derived if shadow_gate.is_enabled(label)]
+                ))
                 feature_snapshot["quote_snapshots"] = snapshots
                 signal.feature_snapshot = feature_snapshot
                 if first:
@@ -449,4 +537,5 @@ class CandlestickShadowDetector:
             "event_versions": dict(EVENT_VERSION_BY_TF),
             "logical_versions": list(CANDLESTICK_SIGNAL_IDS),
             "record_only": True,
+            "live_channels_registered": True,
         }

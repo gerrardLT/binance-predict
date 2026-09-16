@@ -376,6 +376,9 @@ async def test_analytics_empty_db() -> None:
         assert summary["collection_mode"] == "RECORD_ONLY"
         assert summary["execution_mode"] == "SHADOW_ONLY"
         assert summary["family"] == "candlestick_reversal"
+        assert summary["bench_winrate"] is not None
+        assert summary["bench_max_entry_price"] == pytest.approx(
+            summary["bench_winrate"] * 0.98, abs=1e-9)
     for v, blk in out["shadow"].items():
         assert blk["summary"]["n"] == 0
         assert blk["summary"]["win_rate"] is None

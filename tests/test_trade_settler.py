@@ -85,6 +85,7 @@ def _shadow(settle_outcome: str | None, *, status: str = "SETTLED",
         version="s2_cond_t4_v1", target_bar_start=WS,
         settle_outcome=settle_outcome, win=win, status=status,
         settle_open=settle_open, settle_close=settle_close,
+        feature_snapshot={},
         created_at=created_at or (datetime.now(timezone.utc) - timedelta(hours=1)),
     )
 
@@ -374,6 +375,39 @@ async def test_rev2_5m_uses_sentiment_window_settlement(monkeypatch) -> None:
     assert p["settle_outcome"] == "DOWN"
     assert p["win"] is True
     assert p["settle_price"] == pytest.approx(43100.0)
+
+
+@pytest.mark.asyncio
+async def test_candlestick_logical_channel_settles_from_tagged_physical_event(monkeypatch) -> None:
+    """长逻辑通道订单回读同周期物理事件标签，5m 也不得误走 SentimentWindow。"""
+    version = "candle_hm_bull_5m_consensus2_shadow_v1"
+    shadow = _shadow("DOWN", settle_close=78500.0)
+    shadow.feature_snapshot = {
+        "matched_signal_ids": [],
+        "all_matched_signal_ids": [version],
+    }
+    db = _Db([_row(signal_version=version, market_period="5m", direction="DOWN")],
+             _window("UP"), shadow=shadow)
+    _stub_db(monkeypatch, db)
+
+    assert await TradeSettler().poll_once() == 1
+    p = _params(db.updates[0])
+    assert p["settle_outcome"] == "DOWN"
+    assert p["win"] is True
+
+
+@pytest.mark.asyncio
+async def test_candlestick_logical_channel_requires_matching_physical_tag(monkeypatch) -> None:
+    """同窗口其他蜡烛标签不能被拿来结算本逻辑通道订单。"""
+    version = "candle_hm_bull_5m_consensus2_shadow_v1"
+    shadow = _shadow("DOWN")
+    shadow.feature_snapshot = {"matched_signal_ids": ["candle_hm_bull_5m_asia_shadow_hyp_v1"]}
+    db = _Db([_row(signal_version=version, market_period="5m", direction="DOWN")],
+             None, shadow=shadow)
+    _stub_db(monkeypatch, db)
+
+    assert await TradeSettler().poll_once() == 0
+    assert db.updates == []
 
 
 @pytest.mark.asyncio

@@ -53,6 +53,7 @@ from sqlalchemy import select as sa_select, update as sa_update
 
 from binance_predict.db.engine import async_session_factory
 from binance_predict.db.models import FakeBreakoutSignal, KlineShadowSignal, SentimentWindow, TradeOrderModel
+from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS, EVENT_VERSION_BY_TF
 from binance_predict.services.shadow_execution_store import patch_assessment
 from binance_predict.services.shadow_execution_types import AssessmentPatch, ReasonCode, TerminalStage
 from binance_predict.services.wechat_notifier import wechat_notifier
@@ -159,6 +160,8 @@ class TradeSettler:
         # CRITICAL + EXPIRED/pnl=0 —— FILLED 真单的真实盈亏被抹平（2026-09-10 生产
         # 实锤 id=466 真实 -1.00 记为 +0.00，且 EXPIRED 语义让「已成交」显示为过期）。
         # 按「有无 scene_signal_id」分流而非硬编码通道名：新增 15m 影子族通道无需改此处。
+        if getattr(row, "signal_version", None) in CANDLESTICK_SIGNAL_IDS:
+            return await self._settle_kline_shadow_row(row)
         if row.market_period == "15m" and row.scene_signal_id is None:
             return await self._settle_kline_shadow_row(row)
         if row.market_period == "15m" or row.scene_signal_id is not None:
@@ -394,12 +397,21 @@ class TradeSettler:
         市场结算价同源）。
         """
         now_dt = datetime.now(timezone.utc)
+        logical_candle = row.signal_version in CANDLESTICK_SIGNAL_IDS
+        lookup_version = (
+            EVENT_VERSION_BY_TF[row.market_period] if logical_candle else row.signal_version
+        )
         async with async_session_factory() as session:
             stmt = sa_select(KlineShadowSignal).where(
-                KlineShadowSignal.version == row.signal_version,
+                KlineShadowSignal.version == lookup_version,
                 KlineShadowSignal.target_bar_start == row.window_start,
             )
             sig = (await session.execute(stmt)).scalar_one_or_none()
+        if logical_candle and sig is not None:
+            snapshot = sig.feature_snapshot or {}
+            labels = snapshot.get("all_matched_signal_ids", snapshot.get("matched_signal_ids", []))
+            if row.signal_version not in labels:
+                sig = None
 
         if sig is None:
             # 影子行缺失：影子 gate 被手动下线 / 检测器重启未回补 / 通道名与

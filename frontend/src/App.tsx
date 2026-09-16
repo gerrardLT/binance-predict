@@ -278,6 +278,7 @@ interface ShadowVersionBlock {
   summary: {
     n: number; win_rate: number | null; avg_ev: number | null; cum_ev: number | null
     avg_breakeven: number | null; bench_winrate: number | null; bench_ev: number | null
+    bench_max_entry_price: number | null
     desc: string
     // 影子开关（2026-09-04 前端手动下线能力）：下线=停采集+置灰，历史保留
     enabled?: boolean
@@ -2909,6 +2910,7 @@ function LiveTradeTab() {
   const [redeeming, setRedeeming] = useState(false)
   const [redeemResult, setRedeemResult] = useState<Record<string, unknown> | null>(null)
   const [showRedeemDetails, setShowRedeemDetails] = useState(false)
+  const [showStoppedChannels, setShowStoppedChannels] = useState(false)
   // 通道盈亏与 ROI 数据（2026-09-09：在实盘通道卡片中直观映射实盘战绩与盈利率）
   const [pnlData, setPnlData] = useState<PnlCurveData | null>(null)
 
@@ -2942,7 +2944,9 @@ function LiveTradeTab() {
   const regTs = wallet?.registered_time as number | undefined
   // 多通道实盘：live = live_channels status（channels[] 见 LiveChannelStatus）
   const liveChannels = Array.isArray(live?.channels) ? live.channels as LiveChannelStatus[] : []
-  const enabledCount = liveChannels.filter(c => c.enabled).length
+  const activeLiveChannels = liveChannels.filter(c => c.enabled)
+  const stoppedLiveChannels = liveChannels.filter(c => !c.enabled)
+  const enabledCount = activeLiveChannels.length
   const liveDefaults = (live?.defaults ?? {}) as Record<string, unknown>
 
   // 通道 pnl 快速索引
@@ -3438,7 +3442,7 @@ function LiveTradeTab() {
             {liveChannels.length > 0
               ? <span className="flex items-baseline gap-1.5 text-right">
                   <span className={enabledCount > 0 ? 'text-positive font-semibold' : 'text-warning font-semibold'}>
-                    {enabledCount > 0 ? `${enabledCount}/${String(liveChannels.length)} 通道开启` : '全部关闭（不开火）'}
+                    {enabledCount > 0 ? `${enabledCount} 个通道实盘中` : '全部关闭（不开火）'}
                   </span>
                   <span className="text-[10px] text-ink-55">
                     默认 {String(liveDefaults.amount_usdt ?? '--')}U/单 · 在途任务 {String(live?.pending_tasks ?? 0)}
@@ -3446,10 +3450,13 @@ function LiveTradeTab() {
                 </span>
               : <span className="text-ink-55">未装配（启动异常，详见后端日志）</span>}
           </div>
-          {/* 通道管理面板：每通道一行「信号名/护栏/今日成交/累计开火/金额输入+保存/开关」，独立 toggle + 金额热调 */}
+          {/* 主区只展示实际 enabled 通道；关闭项折叠到管理区，避免停火通道被误读为正在实盘。 */}
           {liveChannels.length > 0 && (
             <div className="bg-sunken border border-line rounded-sm p-2 space-y-1">
-              {liveChannels.map(ch => {
+              {activeLiveChannels.length === 0 && (
+                <div className="py-2 text-center text-xs text-ink-55">当前没有正在实盘的信号通道</div>
+              )}
+              {activeLiveChannels.map(ch => {
                 const info = SIGNAL_INFO[ch.channel]
                 const draft = amountDrafts[ch.channel]
                 const dirty = draft != null && draft !== String(ch.amount_usdt)
@@ -3548,8 +3555,72 @@ function LiveTradeTab() {
                   </div>
                 )
               })}
+              {stoppedLiveChannels.length > 0 && (
+                <div className="border-t border-line-soft mt-2 pt-2">
+                  <button
+                    onClick={() => setShowStoppedChannels(v => !v)}
+                    className="w-full flex items-center justify-between text-xs text-ink-70 hover:text-brand"
+                  >
+                    <span>已停火 / 待启用通道（{stoppedLiveChannels.length}）</span>
+                    <span>{showStoppedChannels ? '收起 ▲' : '展开 ▼'}</span>
+                  </button>
+                  {showStoppedChannels && (
+                    <div className="mt-2 space-y-1">
+                      {stoppedLiveChannels.map(ch => {
+                        const info = SIGNAL_INFO[ch.channel]
+                        const amountDraft = amountDrafts[ch.channel]
+                        const amountDirty = amountDraft != null && amountDraft !== String(ch.amount_usdt)
+                        return (
+                          <div key={ch.channel} className="flex items-center gap-2 px-2 py-1.5 rounded-sm border border-line bg-card text-xs">
+                            <span className="flex items-center gap-1.5 min-w-0 flex-1">
+                              <span className="ds-badge ds-badge-neutral shrink-0">已停火</span>
+                              <span className="text-ink-95 font-medium truncate">{info?.name ?? ch.display_name}</span>
+                              <span className="text-[10px] text-ink-55 font-mono shrink-0 hidden md:inline">{ch.channel}</span>
+                              <HelpHint text={info?.desc ?? ch.display_name} />
+                            </span>
+                            <span className="shrink-0 flex items-center gap-1">
+                              <span className="text-[10px] text-ink-55">护栏</span>
+                              <input
+                                type="number" min={0.01} max={0.99} step={0.01}
+                                value={guardDrafts[ch.channel] ?? String(ch.max_exec_price)}
+                                onChange={e => setGuardDrafts(prev => ({ ...prev, [ch.channel]: e.target.value }))}
+                                disabled={togglingLive}
+                                className="ds-input ds-input-sm ds-input-numeric w-14"
+                              />
+                              <button
+                                onClick={() => handleChannelGuard(ch)}
+                                disabled={togglingLive || guardDrafts[ch.channel] == null || guardDrafts[ch.channel] === String(ch.max_exec_price)}
+                                className="px-1.5 py-0.5 rounded-pill border border-brand bg-card text-brand font-semibold text-[10px] disabled:opacity-40"
+                              >存</button>
+                            </span>
+                            <span className="shrink-0 flex items-center gap-1">
+                              <input
+                                type="number" min={0.1} max={50} step={0.5}
+                                value={amountDraft ?? String(ch.amount_usdt)}
+                                onChange={e => setAmountDrafts(prev => ({ ...prev, [ch.channel]: e.target.value }))}
+                                disabled={togglingLive}
+                                className="ds-input ds-input-sm ds-input-numeric w-16"
+                              />
+                              <button
+                                onClick={() => handleChannelAmount(ch)}
+                                disabled={togglingLive || !amountDirty}
+                                className="px-1.5 py-0.5 rounded-pill border border-brand bg-card text-brand font-semibold disabled:opacity-40"
+                              >存</button>
+                            </span>
+                            <button
+                              onClick={() => handleChannelToggle(ch)}
+                              disabled={togglingLive}
+                              className="shrink-0 px-2 py-0.5 rounded-pill font-bold text-white bg-positive disabled:opacity-50"
+                            >开火</button>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
               <p className="text-[10px] text-ink-55 pt-0.5">
-                金额/护栏输入后点「存」热调（立即生效，重启不丢）；护栏=报价均价上限（≥ 即弃单含贴线），「↺」回落通道预设；开关各通道独立互不影响。5m 通道随窗触发，15m 场景通道次周期开盘入场。
+                主区仅显示实际开启通道；停火通道收进管理折叠区。金额/护栏热调仅对已开启通道显示，设置重启不丢。
               </p>
             </div>
           )}
@@ -6732,8 +6803,9 @@ function ShadowSignalCard({
                   {thSort('live', '实盘', 'center')}
                   {thSort('n', 'n', 'right')}
                   {thSort('win_rate', '胜率', 'right')}
-                  {thSort('breakeven', '盈亏平衡', 'right')}
-                  {thSort('bench', '回测', 'right')}
+                  {thSort('breakeven', '前向保本率', 'right', '按上线后真实入场报价计算；暂无报价样本时显示—')}
+                  <th className="py-1 px-2 text-right" title="冻结回测胜率×0.98：费后理论允许的最高入场价">回测保本价</th>
+                  {thSort('bench', '回测胜率', 'right')}
                   {thSort('dev', '偏离', 'right')}
                   {thSort('avg_ev', '平均EV', 'right')}
                   {thSort('cum_ev', '累计EV', 'right')}
@@ -6822,7 +6894,8 @@ function ShadowSignalCard({
                       </td>
                       <td className="py-1 px-2 text-right font-mono">{s.n}</td>
                       <td className="py-1 px-2 text-right font-mono font-bold">{pct1(s.win_rate)}</td>
-                      <td className="py-1 px-2 text-right font-mono text-ink-55">{pct1(s.avg_breakeven)}</td>
+                      <td className="py-1 px-2 text-right font-mono text-ink-55" title={s.avg_breakeven == null ? '暂无前向真实报价样本' : '前向真实入场报价对应的平均保本胜率'}>{pct1(s.avg_breakeven)}</td>
+                      <td className="py-1 px-2 text-right font-mono text-ink-55">{pct1(s.bench_max_entry_price)}</td>
                       <td className="py-1 px-2 text-right font-mono text-ink-55">{pct1(s.bench_winrate)}</td>
                       <td className={`py-1 px-2 text-right font-mono ${dev == null ? 'text-ink-55' : dev >= 0 ? 'text-positive' : 'text-negative'}`}>
                         {dev == null ? '—' : `${dev >= 0 ? '+' : ''}${(dev * 100).toFixed(1)}pp`}
@@ -7305,7 +7378,7 @@ function RegimeByVersionTable({
       {/* 影子在线区（2026-09-07 与退役区分开）：只看仍在采集的版本前向进展 */}
       {analytics && (
         <ShadowSignalCard
-          title={`影子信号·在线采集（${activeShadowEntries.length} 版）：累计胜率 vs 回测基准 vs 盈亏平衡`}
+          title={`影子信号·在线采集（${activeShadowEntries.length} 版）：前向胜率 vs 回测基准 vs 保本线`}
           entries={activeShadowEntries}
           rows={activeShadowRows}
           analytics={analytics}
@@ -7313,9 +7386,9 @@ function RegimeByVersionTable({
           pumpTs={pumpTs}
           footnote={
             <>
-              实线=线上累计胜率；同色虚线=回测冻结基准；同色点线=逐版本平均盈亏平衡（x4 含溢价 0.01 口径，其余无溢价）。
+              实线=线上累计胜率；同色虚线=回测冻结胜率；同色点线=前向真实报价对应的平均保本率（没有前向报价样本时不绘制）。
               第 11 条起复用前十色相并降为淡色细线（克制色板做不出 22 个可区分色相），表格中的版本名同步淡化以保持对应。
-              本区版本仍在采集，曲线末端=最新前向进展；「回测」列为冻结基准（无冻结基准的新版本显示 —，由前向数据自行裁决）。
+              本区版本仍在采集，曲线末端=最新前向进展；「回测保本价」=冻结胜率×0.98，与前向保本率不是同一指标。
             </>
           }
         />

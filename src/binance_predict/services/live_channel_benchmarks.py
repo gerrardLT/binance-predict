@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
+from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_BACKTEST
 from binance_predict.services.fake_breakout_detector import RESEARCH_WIN_RATES
 from binance_predict.services.live_channels import LIVE_CHANNELS
 
@@ -43,6 +44,8 @@ _FROZEN_BENCHMARKS: dict[str, tuple[float, int | None]] = {
     "hm_inside_15m_v2": (0.557, 237),
     "ih_inside_15m_v2": (0.546, 183),
     "hm_inside_5m_v2": (0.585, 371),
+    **{channel: (win_rate, sample_size)
+       for channel, (win_rate, _ev, sample_size) in CANDLESTICK_BACKTEST.items()},
 }
 
 _SCENE_PATTERNS = {

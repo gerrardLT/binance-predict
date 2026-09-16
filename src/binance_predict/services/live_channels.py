@@ -35,6 +35,13 @@ from loguru import logger
 
 from binance_predict.config.settings import settings
 
+from .candlestick_shadow_detector import (
+    CANDLESTICK_BACKTEST,
+    CANDLESTICK_DIRECTIONS,
+    CANDLESTICK_DISPLAY_NAMES,
+    CANDLESTICK_LOGICAL_SPECS,
+    CANDLESTICK_SIGNAL_IDS,
+)
 from .quote_edge_detector import QUOTE_EDGE_RULES
 
 MAX_ORDER_AMOUNT_USDT = 50.0    # 单笔金额硬上限（配置误写拒绝启动，不靠自律）
@@ -253,6 +260,19 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     ),
 }
 
+# 蜡烛逻辑版本共享 5m/15m 物理事件，但各自可独立注册/热调。默认配置仍全 OFF；
+# 护栏取冻结报价期胜率 × 0.98（费后理论最大保本入场价），不因注册自动下单。
+for _candle_spec in CANDLESTICK_LOGICAL_SPECS:
+    _version = _candle_spec["signal_id"]
+    LIVE_CHANNELS[_version] = ChannelSpec(
+        _version,
+        "candlestick_reversal",
+        _candle_spec["timeframe"],
+        CANDLESTICK_DIRECTIONS[_version],
+        round(CANDLESTICK_BACKTEST[_version][0] * 0.98, 4),
+        CANDLESTICK_DISPLAY_NAMES[_version],
+    )
+
 
 # ---------------------------------------------------------------------------
 # 已退役通道（2026-09-04 用户拍板「信号直接不要了」）：不在 LIVE_CHANNELS
@@ -307,6 +327,9 @@ RETIRED_CHANNELS: frozenset[str] = frozenset(RETIRED_CHANNEL_SPECS)
 #   自拦深档高报价窗），互斥防未来护栏调高后叠加。
 # momentum 族 v1/v2/v3 互斥组已随三成员全退役而移除（见
 # RETIRED_SAME_WINDOW_EXCLUSIVE，仅留作机制测试 fixture）。
+_CANDLE_5M_CHANNELS = frozenset(v for v in CANDLESTICK_SIGNAL_IDS if "_5m_" in v)
+_CANDLE_15M_CHANNELS = frozenset(v for v in CANDLESTICK_SIGNAL_IDS if "_15m_" in v)
+
 SAME_WINDOW_EXCLUSIVE: tuple[frozenset[str], ...] = (
     frozenset({"scene_bull_exhaust_confirm", "s5_deep_z20_v1"}),
     # S2 条件单双变体同源（同一实盘 S2 事件、同一目标周期；t=4/t=5 判价高度重叠），
@@ -315,6 +338,9 @@ SAME_WINDOW_EXCLUSIVE: tuple[frozenset[str], ...] = (
     # 吸收跟随双变体同窗同假设（TD120/TD150 只是判定时点不同，欠反应状态连续），
     # 防同窗双成交（2026-09-06 promote）。
     frozenset({"absorption_follow_td120_v1", "absorption_follow_td150_v1"}),
+    # 同周期蜡烛逻辑版本共享物理事件，避免主版/对照/组件/潜力标签重复暴露。
+    _CANDLE_5M_CHANNELS,
+    _CANDLE_15M_CHANNELS,
     # 2026-09-12：解除 firsthit 全族同窗互斥，允许各 G 系列及 G7 变体按门禁独立下单对比实盘效果
 )
 

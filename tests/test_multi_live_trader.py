@@ -201,16 +201,36 @@ def _stub_select_db(monkeypatch, rows: list) -> None:
 # ============================================================
 
 def test_parse_defaults_all_off(monkeypatch) -> None:
-    """默认：全 26 在线通道 OFF、金额/日限取全局默认（用户拍板 2U / 100 单）。"""
+    """默认：全部注册通道 OFF、金额/日限取全局默认（用户拍板 2U / 100 单）。"""
+    from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
+
     monkeypatch.setattr(settings, "live_default_amount_usdt", 2.0)
     monkeypatch.setattr(settings, "live_default_max_daily_orders", 100)
     monkeypatch.setattr(settings, "live_channels_json", "")
     cfgs = parse_channel_config()
-    assert len(cfgs) == 27  # G0/G1/G3+G4+G7 族 6 变体 + late_night v2 + Rev2 5m/15m 三通道 = 27
+    assert len(cfgs) == 27 + len(CANDLESTICK_SIGNAL_IDS)
+    assert set(CANDLESTICK_SIGNAL_IDS) <= set(cfgs)
     assert all(not c.enabled for c in cfgs.values())
     assert all(c.amount_usdt == 2.0 for c in cfgs.values())
     assert all(c.max_daily_orders == 100 for c in cfgs.values())
     assert all(c.max_exec_price is None for c in cfgs.values())  # 缺省回落 auto
+
+
+def test_long_candlestick_channel_ids_fit_persisted_models() -> None:
+    """最长 65 字符逻辑 ID 必须可写订单、覆盖表和执行账本。"""
+    from binance_predict.db.models import (
+        LiveChannelOverride, NotificationChannelOverride,
+        ShadowExecutionAssessment, TradeOrderModel,
+    )
+    from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
+
+    assert max(map(len, CANDLESTICK_SIGNAL_IDS)) == 65
+    assert TradeOrderModel.__table__.c.signal_version.type.length >= 65
+    assert LiveChannelOverride.__table__.c.channel.type.length >= 65
+    assert NotificationChannelOverride.__table__.c.channel.type.length >= 65
+    assert ShadowExecutionAssessment.__table__.c.signal_version.type.length >= 65
+    assert ShadowExecutionAssessment.__table__.c.live_channel.type.length >= 65
+    assert ShadowExecutionAssessment.__table__.c.exclusive_blocker_channel.type.length >= 65
 
 
 def test_parse_overrides_applied(monkeypatch) -> None:
@@ -299,8 +319,10 @@ def test_parse_non_int_daily_rejected(monkeypatch) -> None:
 
 
 def test_channels_registry_shape() -> None:
-    """注册表形状（2026-09-09 15m Ver2 接入后）：26 在线 + 8 退役，两者不交。"""
-    assert set(LIVE_CHANNELS) == {
+    """注册表形状：既有通道 + 18 个蜡烛逻辑通道，退役通道不混入。"""
+    from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
+
+    expected_existing = {
         "quote_contrarian_v2",
         "late_night_contrarian_v2",
         "x4_v2",
@@ -322,6 +344,7 @@ def test_channels_registry_shape() -> None:
         # 2026-09-09 15m 经典孕线反转双通道 + 2026-09-13 5m HM 精选通道（默认全 OFF）
         "hm_inside_5m_v2", "hm_inside_15m_v2", "ih_inside_15m_v2",
     }
+    assert set(LIVE_CHANNELS) == expected_existing | set(CANDLESTICK_SIGNAL_IDS)
     assert set(RETIRED_CHANNELS) == {
         "quote_momentum_v1", "quote_contrarian_v1",
         "quote_momentum_v2",
@@ -383,6 +406,13 @@ def test_channels_registry_shape() -> None:
     assert all(not s.v3_env and not s.regime_gate and not s.streak_gate
                for s in LIVE_CHANNELS.values())
     assert all(s.v2_guard in (None, "max_rise") for s in LIVE_CHANNELS.values())
+    from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_BACKTEST
+    for version in CANDLESTICK_SIGNAL_IDS:
+        spec = LIVE_CHANNELS[version]
+        assert spec.family == "candlestick_reversal"
+        assert spec.market_period in {"5m", "15m"}
+        assert spec.order_type == "MARKET"
+        assert spec.auto_max_exec == pytest.approx(CANDLESTICK_BACKTEST[version][0] * 0.98, abs=5e-5)
     # 同窗互斥组：S5、S2 condition 与 absorption（firsthit 全族已于 2026-09-12 解除互斥以支持独立实盘测试）
     from binance_predict.services.live_channels import exclusive_group
     g_s5 = exclusive_group("s5_deep_z20_v1")
@@ -400,6 +430,10 @@ def test_channels_registry_shape() -> None:
     assert exclusive_group("quote_momentum_v3") is None   # 退役组不参与生产判定
     assert RETIRED_SAME_WINDOW_EXCLUSIVE == (
         frozenset({"quote_momentum_v1", "quote_momentum_v2", "quote_momentum_v3"}),)
+    candle_5m = {v for v in CANDLESTICK_SIGNAL_IDS if "_5m_" in v}
+    candle_15m = set(CANDLESTICK_SIGNAL_IDS) - candle_5m
+    assert exclusive_group(next(iter(candle_5m))) == frozenset(candle_5m)
+    assert exclusive_group(next(iter(candle_15m))) == frozenset(candle_15m)
 
 
 def test_retired_channel_specs_match_retired_versions() -> None:
@@ -1357,6 +1391,55 @@ async def test_nextbar_hook_fires_5m(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_candlestick_live_channel_defaults_off_and_fires_only_when_enabled(monkeypatch) -> None:
+    """蜡烛通道注册但默认停火；手工启用后才经统一交易链路开火。"""
+    version = "candle_hm_bull_5m_consensus2_shadow_v1"
+    sig = {
+        "version": version,
+        "market_start": WINDOW_START,
+        "market_end": WINDOW_END,
+        "direction": "DOWN",
+        "signal_bar_start": WINDOW_START - 300_000,
+    }
+    disabled_fake = _FakeTrader()
+    disabled = _make_trader(monkeypatch, disabled_fake, channels=[])
+    disabled.on_candlestick_signal(sig)
+    await _drain(disabled)
+    assert disabled_fake.calls == []
+
+    enabled_fake = _FakeTrader()
+    enabled = _make_trader(monkeypatch, enabled_fake, channels=[version])
+    enabled.on_candlestick_signal(sig)
+    await _drain(enabled)
+    assert len(enabled_fake.calls) == 1
+    call = enabled_fake.calls[0]
+    assert call["signal_version"] == version
+    assert call["prediction"] == "DOWN"
+    assert call["market_period"] == "5m"
+
+
+@pytest.mark.asyncio
+async def test_candlestick_same_window_labels_share_one_fill(monkeypatch) -> None:
+    """同一物理蜡烛事件多标签命中时，同周期最多成交一笔。"""
+    primary = "candle_hm_bull_5m_consensus2_shadow_v1"
+    component = "candle_hm_bull_5m_ret3_component_shadow_v1"
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=[primary, component])
+    base = {
+        "market_start": WINDOW_START,
+        "market_end": WINDOW_END,
+        "direction": "DOWN",
+        "signal_bar_start": WINDOW_START - 300_000,
+    }
+    t.on_candlestick_signal({**base, "version": primary})
+    t.on_candlestick_signal({**base, "version": component})
+    await _drain(t)
+
+    assert len(fake.calls) == 1
+    assert fake.calls[0]["signal_version"] in {primary, component}
+
+
+@pytest.mark.asyncio
 async def test_nextbar_disabled_and_stopped_no_fire(monkeypatch) -> None:
     """nextbar：通道关 / stopped → 零下单（冷启动回补由检测器侧时间窗守卫排除）。"""
     fake = _FakeTrader()
@@ -2008,7 +2091,8 @@ def test_status_shape(monkeypatch) -> None:
     assert s["amount_cap"] == 50
     assert s["defaults"]["amount_usdt"] == 2.0
     assert s["defaults"]["max_daily_orders"] == 100
-    assert len(s["channels"]) == 35   # 既有 24 + G7(6) + G4(1) + late_night(1) + Rev2 5m/15m(3) = 35
+    from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
+    assert len(s["channels"]) == 35 + len(CANDLESTICK_SIGNAL_IDS)
     by = {c["channel"]: c for c in s["channels"]}
     c = by["quote_contrarian_v1"]
     assert c["enabled"] is True and c["enabled_at_startup"] is True
@@ -3691,7 +3775,7 @@ def _scene_row(**over) -> SimpleNamespace:
         id=21, status="FILLED", settled_at=None, window_start=WS_15M,
         created_at=datetime.now(timezone.utc) - timedelta(hours=2),
         direction="DOWN", amount_in=str(2 * 10 ** 18),  # 2 USDT
-        quote_json={"averagePrice": 0.6},
+        quote_json={"averagePrice": 0.6}, signal_version="scene_bull_exhaust",
         market_period="15m", scene_signal_id=7,
     )
     base.update(over)
