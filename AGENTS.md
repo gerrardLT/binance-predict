@@ -53,6 +53,8 @@ BTC 预测市场（Binance Prediction）自动化交易系统。**真金实盘�
 - `push main` = 自动部署（CI：test → build 镜像 → 部署 VPS）。提交前确认改动可上线
 - 不改 `.github/workflows/*`、`docker/*`、`nginx.conf`，除非任务明确要求
 - 临时脚本放 `.pytest_tmp/`（已在 .gitignore），不要散落根目录
+- 研究产物（图表/截图/HTML/导出 JSON）同样放 `.pytest_tmp/`，不要新建根目录 `figures/` 之类
+- 编辑源码的备份副本（`temp_edit.txt`、`*.bak`）不落仓库根目录：源码在 git 里，用完即删
 
 ## Git 与交付
 

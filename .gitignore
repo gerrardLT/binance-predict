@@ -46,6 +46,12 @@ output/
 review_diff.txt
 semantic-review/
 
+# 研究评审产物（本地生成，可再生）
+# figures/：研究图表/HTML（应放 .pytest_tmp/，历史遗留目录直接忽略）
+figures/
+# .impeccable/review/：UI 审查截图（design.json 仍跟踪）
+.impeccable/review/
+
 # Kiro IDE 自动生成的 specs
 .kiro/
 
