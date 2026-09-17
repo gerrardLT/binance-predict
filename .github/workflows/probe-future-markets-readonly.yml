@@ -135,7 +135,7 @@ jobs:
                                     token = entry.get(token_key)
                                     if not token:
                                         continue
-                                    quote = await trader.get_quote(token, amount_usdt=0.1)
+                                    quote = await trader.get_quote(token, amount_usdt=2.0)
                                     row[f"{direction}_quote_ok"] = quote is not None
                                     if quote is not None:
                                         row[f"{direction}_average_price"] = quote.get("averagePrice")
