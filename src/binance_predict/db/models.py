@@ -1307,6 +1307,63 @@ class FirstHitShadowSignal(Base):
 
 
 # ============================================================
+# 冻结首触规则前向 record-only 事件表
+# ============================================================
+
+class FirstHitForwardEvent(Base):
+    """5m UP/DOWN q≤0.10 首触的无选择前向采集；每侧每窗最多一行。
+
+    labels 同时保存 DOWN q-only 对照、DOWN recovery 主候选和 UP 镜像；
+    本表不被任何下单代码引用。
+    """
+
+    __tablename__ = "firsthit_forward_events"
+    __table_args__ = (
+        UniqueConstraint("side", "window_start", name="uq_fh_forward_side_window"),
+        Index("ix_fh_forward_window_start", "window_start"),
+        Index("ix_fh_forward_status", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    schema_version: Mapped[str] = mapped_column(String(48), nullable=False)
+    capture_mode: Mapped[str] = mapped_column(String(20), nullable=False)
+    window_start: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    window_end: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    side: Mapped[str] = mapped_column(String(4), nullable=False)
+    trigger_ts: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    td_sec: Mapped[int] = mapped_column(Integer, nullable=False)
+    trigger_q: Mapped[float] = mapped_column(Float, nullable=False)
+    opposite_q: Mapped[float | None] = mapped_column(Float, nullable=True)
+    quote_sum: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    btc_open: Mapped[float | None] = mapped_column(Float, nullable=True)
+    btc_adverse_extreme: Mapped[float | None] = mapped_column(Float, nullable=True)
+    btc_trigger: Mapped[float | None] = mapped_column(Float, nullable=True)
+    btc_signed_return_bps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    btc_signed_min_bps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    btc_recovery_bps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    btc_recovery_frac: Mapped[float | None] = mapped_column(Float, nullable=True)
+    recovery_pass: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    atr_bps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    current_move_atr: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    labels: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    trigger_features: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    future_quotes: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    execution_quotes: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    post_features: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    retrospective: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    data_missing: Mapped[list] = mapped_column(JSONB, nullable=False)
+
+    settle_outcome: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    win: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    ev_at_entry: Mapped[float | None] = mapped_column(Float, nullable=True)
+    status: Mapped[str] = mapped_column(String(12), nullable=False, default="PENDING")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+# ============================================================
 # 首触研究账本：全窗口审计层
 # ============================================================
 

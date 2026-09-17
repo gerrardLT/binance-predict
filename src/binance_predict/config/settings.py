@@ -426,6 +426,12 @@ class Settings(BaseSettings):
     # 隔离下单路径。
     firsthit_shadow_enabled: bool = True
 
+    # --- 冻结首触反转前向实验（2026-09-18）---
+    # 5m 每侧首次 q≤0.10 母事件无选择落表；DOWN 同时标记 btc recovery≥25% 主候选
+    # 与 q-only 对照，UP 作镜像。实时触达保存 1/5/10U 只读可执行报价，归档后补路径与结算。
+    # 只记录不下注，不进 LIVE_CHANNELS；实验期不得改阈值/首次触达/入场时点。
+    firsthit_forward_enabled: bool = True
+
     # --- S2 条件单影子信号（s2_cond 族，2026-09-06）---
     # 研究结论落地：S2（bear_exhaust，破 4h 支撑+收阴+放量）开盘即买 UP 的 EV≈−0.042
     # 不赚钱；等次周期窗内 t=4/t=5 判价的条件单更优（价跌时 UP token 变便宜，低买 UP 的

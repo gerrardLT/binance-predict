@@ -69,6 +69,7 @@ from .services.candlestick_shadow_detector import CandlestickShadowDetector
 from .services.data_collector import BinanceDataCollector
 from .services.fake_breakout_detector import FakeBreakoutDetector
 from .services.firsthit_shadow_detector import FirstHitShadowDetector
+from .services.firsthit_forward_recorder import FirstHitForwardRecorder
 from .services.hm_shadow_detector import HmShadowDetector
 from .services.kline_shadow_detector import KlineShadowDetector
 from .services.misalignment_detector import MisalignmentDetector
@@ -209,6 +210,10 @@ s2_cond_shadow_detector: S2CondShadowDetector | None = None
 # G0 基底 / G1 body_r≤0.35 / G3 chg≤+2.82bp，归档后处理落 SETTLED，只记录不下注，
 # 前向验证 4 周——通过标准见 detector docstring 预注册）
 firsthit_shadow_detector: FirstHitShadowDetector | None = None
+
+# 冻结首触反转前向实验：q-only 对照 + DOWN recovery 主候选 + UP 镜像；
+# 只记录不下注，实时触达后保存只读可执行报价，归档后补路径与结算。
+firsthit_forward_recorder: FirstHitForwardRecorder | None = None
 
 # Rev2 孕线反转影子检测器：5m / 15m 独立实例，支持实盘开火钩子
 rev2_inside_shadow_detector: Rev2InsideShadowDetector | None = None
@@ -562,27 +567,45 @@ async def _prediction_market_tracker() -> None:
                 # up_open（_pm_history 本窗首个有效 UP 采样，窗开基准，与影子
                 # _first(up_p) 同源；窗口切换 clear + 冷启动 DB 回读保证是本窗点）+
                 # _window_entry_price 作 btc_open（TD 秒实时双快照判定）。
-                if multi_live_trader is not None and _current_window_end is not None:
-                    multi_live_trader.check(
-                        int(_current_window_end) - 300_000,
-                        int(_current_window_end),
-                        aligned_ts,
-                        down_price,
-                        btc_price=_btc_mid,
-                        window_entry_price=_window_entry_price,
-                        window_btc_curve=[
-                            {"t": p["timestamp"], "v": p["btc_price"]}
-                            for p in _pm_history if p.get("btc_price")
-                        ],
-                        up_price=up_price,
-                        up_open=next(
-                            (p["up_price"] for p in _pm_history
-                             if p.get("up_price") is not None), None),
-                        window_down_curve=[
-                            {"t": p["timestamp"], "v": p["down_price"]}
-                            for p in _pm_history if p.get("down_price") is not None
-                        ],
-                    )
+                if _current_window_end is not None:
+                    _window_start = int(_current_window_end) - 300_000
+                    _window_btc_curve = [
+                        {"t": p["timestamp"], "v": p["btc_price"]}
+                        for p in _pm_history if p.get("btc_price")
+                    ]
+                    _window_down_curve = [
+                        {"t": p["timestamp"], "v": p["down_price"]}
+                        for p in _pm_history if p.get("down_price") is not None
+                    ]
+                    _window_up_curve = [
+                        {"t": p["timestamp"], "v": p["up_price"]}
+                        for p in _pm_history if p.get("up_price") is not None
+                    ]
+                    if firsthit_forward_recorder is not None:
+                        firsthit_forward_recorder.observe_sample(
+                            window_start=_window_start,
+                            window_end=int(_current_window_end),
+                            ts_ms=aligned_ts,
+                            btc_open=_window_entry_price,
+                            up_curve=_window_up_curve,
+                            down_curve=_window_down_curve,
+                            btc_curve=_window_btc_curve,
+                        )
+                    if multi_live_trader is not None:
+                        multi_live_trader.check(
+                            _window_start,
+                            int(_current_window_end),
+                            aligned_ts,
+                            down_price,
+                            btc_price=_btc_mid,
+                            window_entry_price=_window_entry_price,
+                            window_btc_curve=_window_btc_curve,
+                            up_price=up_price,
+                            up_open=next(
+                                (p["up_price"] for p in _pm_history
+                                 if p.get("up_price") is not None), None),
+                            window_down_curve=_window_down_curve,
+                        )
 
         except asyncio.CancelledError:
             break
@@ -1366,6 +1389,14 @@ async def lifespan(app: FastAPI):
         await firsthit_shadow_detector.start()
         logger.info("首触反转影子检测器已启动（G0 基底 / G1 body_r≤0.35 / G3 chg≤+2.82bp 三 version；前向验证 4 周，通过标准已预注册；影子只记录不下注）")
 
+    # 冻结首触反转前向实验：实时首次 q≤0.10 无选择留痕，归档后补齐路径与结算。
+    # get_quote 仅用于 1/5/10U 可执行报价快照；采集器没有 place_order 调用。
+    global firsthit_forward_recorder
+    if settings.firsthit_forward_enabled:
+        firsthit_forward_recorder = FirstHitForwardRecorder(collector=collector)
+        await firsthit_forward_recorder.start()
+        logger.info("首触前向 record-only 采集已启动（DOWN recovery≥25% 主候选 + q-only 对照 + UP 镜像；阈值冻结，不下注）")
+
     # Rev2 孕线反转：5m / 15m 各自读取同周期 K 线与预测市场报价缓存
     global rev2_inside_shadow_detector, rev2_inside_5m_shadow_detector
     if settings.rev2_inside_shadow_enabled:
@@ -1498,6 +1529,9 @@ async def lifespan(app: FastAPI):
     # 停止 5m DOWN 首触反转影子检测器
     if firsthit_shadow_detector is not None:
         await firsthit_shadow_detector.stop()
+    # 停止冻结首触前向 record-only 采集器
+    if firsthit_forward_recorder is not None:
+        await firsthit_forward_recorder.stop()
     # 停止影子版本开关 gate（所有影子检测器已停，最后收后台刷新任务）
     await shadow_gate.stop()
     await notify_config.stop()
