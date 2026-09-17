@@ -69,7 +69,7 @@ async def test_source_projector_does_not_query_orders_and_uses_explicit_policy()
 @pytest.mark.asyncio
 async def test_source_projector_classifies_no_mapping_and_retired() -> None:
     session = SimpleNamespace(execute=AsyncMock())
-    no_mapping = await build_assessment_values(session, _event("krev_a_v1"))
+    no_mapping = await build_assessment_values(session, _event("combo_p1_v1"))
     retired_version = next(
         version for version, spec in SHADOW_VERSION_SPECS.items() if spec.live_retired
     )

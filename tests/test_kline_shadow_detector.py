@@ -317,17 +317,59 @@ async def test_expire_stale_pending(monkeypatch) -> None:
     assert session.rows[0].status == "EXPIRED" and session.committed
 
 
+@pytest.mark.asyncio
+async def test_cold_start_backscan_never_dispatches_live(monkeypatch) -> None:
+    rows = _flat_then_drop_rows()
+    sub = _sub_rows_for_last_cycle(rows)
+    session = _FakeSession(scalar=None)
+    d = KlineShadowDetector(collector=None, pm_15m_latest={})
+    fired: list[dict] = []
+    d._on_live_fire = fired.append
+    monkeypatch.setattr(ksd, "async_session_factory", lambda: _FakeSessionCtx(session))
+    monkeypatch.setattr(ksd.shadow_gate, "is_enabled", lambda _version: True)
+    monkeypatch.setattr(
+        ksd.time, "time",
+        lambda: (int(rows[-1]["open_time"]) + ksd.BAR_MS_15M + 30_000) / 1000,
+    )
+
+    await d._evaluate_new_bars(rows, sub)
+
+    assert fired == []
+    assert session.added
+
+@pytest.mark.asyncio
+async def test_fresh_krev_hit_dispatches_live_payload(monkeypatch) -> None:
+    rows = _flat_then_drop_rows()
+    sub = _sub_rows_for_last_cycle(rows)
+    session = _FakeSession(scalar=None)
+    d = KlineShadowDetector(collector=None, pm_15m_latest={})
+    d._last_evaluated_bar = int(rows[-2]["open_time"])
+    fired: list[dict] = []
+    d._on_live_fire = fired.append
+    monkeypatch.setattr(ksd, "async_session_factory", lambda: _FakeSessionCtx(session))
+    monkeypatch.setattr(ksd.shadow_gate, "is_enabled", lambda _version: True)
+    target = int(rows[-1]["open_time"]) + ksd.BAR_MS_15M
+    monkeypatch.setattr(ksd.time, "time", lambda: (target + 30_000) / 1000)
+
+    await d._evaluate_new_bars(rows, sub)
+
+    assert fired
+    assert {p["version"] for p in fired} <= {"krev_a_v1", "krev_b_v1"}
+    assert all(p["market_start"] == target and p["direction"] == "UP" for p in fired)
+
 # ============================================================
-# 物理隔离：影子版本绝不进入下单路径
+# 实盘注册：不进 X4 专用白名单，通道默认由统一配置关闭
 # ============================================================
 
-def test_versions_isolated_from_trading_path() -> None:
+def test_versions_registered_as_live_channels() -> None:
     from binance_predict.services.live_channels import LIVE_CHANNELS
     from binance_predict.services.multi_live_trader import X4_VERSIONS
     versions = [s["version"] for s in SHADOW_CONDITIONS]
     for v in versions:
-        assert v not in X4_VERSIONS, f"{v} 不得进入 X4 下单白名单"
-        assert v not in LIVE_CHANNELS, f"{v} 不得注册实盘通道"
+        assert v not in X4_VERSIONS
+        assert LIVE_CHANNELS[v].family == "kline_reversal"
+        assert LIVE_CHANNELS[v].market_period == "15m"
+        assert LIVE_CHANNELS[v].direction == "UP"
 
 
 def test_settings_default_on() -> None:

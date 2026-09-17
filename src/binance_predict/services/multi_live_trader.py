@@ -1376,19 +1376,26 @@ class MultiLiveTrader:
         market = 目标根（次根）市场窗口；时间窗守卫（检测器侧 ≤90s）已排除
         冷启动回补。任何异常只告警不抛（同 scene 钩子契约）。
         """
+        self._on_kline_signal(sig, "nextbar")
+
+    def on_kline_reversal_signal(self, sig: dict) -> None:
+        """KREV/P1/P2 新根收盘钩子；默认 OFF，启用后按冻结方向派单。"""
+        self._on_kline_signal(sig, "kline_reversal")
+
+    def _on_kline_signal(self, sig: dict, family: str) -> None:
         try:
             channel = str(sig.get("version") or "")
             market_start = int(sig["market_start"])
-            if not self._hook_gate(channel, "nextbar", market_start):
+            if not self._hook_gate(channel, family, market_start):
                 return
             task = asyncio.create_task(
                 self._fire_nextbar(channel, sig),
-                name=f"live_nextbar_{channel}_{market_start}",
+                name=f"live_{family}_{channel}_{market_start}",
             )
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
         except Exception as exc:
-            logger.warning("多通道实盘：nextbar 钩子异常（不影响检测循环）| {}", exc)
+            logger.warning("多通道实盘：{} 钩子异常（不影响检测循环）| {}", family, exc)
 
     async def _fire_s2_cond(self, channel: str, sig: dict) -> None:
         spec = self._specs[channel]

@@ -208,7 +208,7 @@ def test_parse_defaults_all_off(monkeypatch) -> None:
     monkeypatch.setattr(settings, "live_default_max_daily_orders", 100)
     monkeypatch.setattr(settings, "live_channels_json", "")
     cfgs = parse_channel_config()
-    assert len(cfgs) == 27 + len(CANDLESTICK_SIGNAL_IDS)
+    assert len(cfgs) == 31 + len(CANDLESTICK_SIGNAL_IDS)
     assert set(CANDLESTICK_SIGNAL_IDS) <= set(cfgs)
     assert all(not c.enabled for c in cfgs.values())
     assert all(c.amount_usdt == 2.0 for c in cfgs.values())
@@ -334,6 +334,8 @@ def test_channels_registry_shape() -> None:
         "s2_cond_t4_v1", "s2_cond_t5d_v1",
         "nb_smaslope_5m_v1",
         "absorption_follow_td120_v1", "absorption_follow_td150_v1",
+        # 2026-09-18 K线反转四通道（默认全 OFF，仅新鲜次根开盘派单）
+        "krev_a_v1", "krev_b_v1", "rev_p1_v1", "rev_p2_v1",
         # 2026-09-07 firsthit 三通道（默认全 OFF，用户确认独立下单）
         "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1",
         # 2026-09-08 firsthit G4 交互门（G1∩G3，默认 OFF；⚠非独立暴露，见 live_channels 注释）
@@ -395,6 +397,10 @@ def test_channels_registry_shape() -> None:
         ("s2_cond_t4_v1", "15m", "s2_cond", 0.38),
         ("s2_cond_t5d_v1", "15m", "s2_cond", 0.44),
         ("nb_smaslope_5m_v1", "5m", "nextbar", 0.46),
+        ("krev_a_v1", "15m", "kline_reversal", 0.629),
+        ("krev_b_v1", "15m", "kline_reversal", 0.621),
+        ("rev_p1_v1", "15m", "kline_reversal", 0.608),
+        ("rev_p2_v1", "15m", "kline_reversal", 0.612),
         ("absorption_follow_td120_v1", "5m", "absorption", 0.78),
         ("absorption_follow_td150_v1", "5m", "absorption", 0.86),
     ):
@@ -1391,6 +1397,52 @@ async def test_nextbar_hook_fires_5m(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("version", "direction", "guard"),
+    [
+        ("krev_a_v1", "UP", 0.629),
+        ("krev_b_v1", "UP", 0.621),
+        ("rev_p1_v1", "UP", 0.608),
+        ("rev_p2_v1", "DOWN", 0.612),
+    ],
+)
+@pytest.mark.asyncio
+async def test_kline_reversal_hook_fires_15m_with_frozen_direction_and_guard(
+        monkeypatch, version: str, direction: str, guard: float) -> None:
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=[version])
+    sig = {
+        "version": version,
+        "market_start": MARKET_START_15M,
+        "market_end": MARKET_START_15M + 900_000,
+        "direction": direction,
+        "signal_bar_start": MARKET_START_15M - 900_000,
+    }
+    t.on_kline_reversal_signal(sig)
+    await _drain(t)
+    assert len(fake.calls) == 1
+    call = fake.calls[0]
+    assert call["signal_version"] == version
+    assert call["prediction"] == direction
+    assert call["market_period"] == "15m"
+    assert call["window_start"] == MARKET_START_15M
+    assert call["max_exec_price"] == guard
+
+
+@pytest.mark.asyncio
+async def test_kline_reversal_disabled_no_fire(monkeypatch) -> None:
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=[])
+    t.on_kline_reversal_signal({
+        "version": "krev_a_v1", "market_start": MARKET_START_15M,
+        "market_end": MARKET_START_15M + 900_000, "direction": "UP",
+        "signal_bar_start": MARKET_START_15M - 900_000,
+    })
+    await _drain(t)
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
 async def test_candlestick_live_channel_defaults_off_and_fires_only_when_enabled(monkeypatch) -> None:
     """蜡烛通道注册但默认停火；手工启用后才经统一交易链路开火。"""
     version = "candle_hm_bull_5m_consensus2_shadow_v1"
@@ -2092,7 +2144,7 @@ def test_status_shape(monkeypatch) -> None:
     assert s["defaults"]["amount_usdt"] == 2.0
     assert s["defaults"]["max_daily_orders"] == 100
     from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
-    assert len(s["channels"]) == 35 + len(CANDLESTICK_SIGNAL_IDS)
+    assert len(s["channels"]) == 39 + len(CANDLESTICK_SIGNAL_IDS)
     by = {c["channel"]: c for c in s["channels"]}
     c = by["quote_contrarian_v1"]
     assert c["enabled"] is True and c["enabled_at_startup"] is True

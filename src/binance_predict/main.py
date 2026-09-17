@@ -1255,15 +1255,15 @@ async def lifespan(app: FastAPI):
         await quote_edge_detector.start()
         logger.info("报价 edge 影子检测器已启动（A 79.9%/EV+0.097，B 24%/EV+0.155，影子模式不下注）")
 
-    # K 线科学发现影子信号（KREV 族）：720d 冻结注册表条件实时重放——
-    # 15m bar 收盘后复用离线特征管道求值注册表条件原文，次根收盘按回测
-    # 口径结算；只记录不下注，物理隔离于下单路径（新表不进 X4_VERSIONS/
-    # LIVE_CHANNELS）。默认开关关闭，口径保真测试全绿后 .env 显式开启。
+    # KREV 族：15m 收盘后复用离线特征管道求值冻结条件，影子照常落表；
+    # 同名实盘通道默认 OFF，仅正常轮询中新鲜命中经钩子派到下一根 15m 市场。
     global kline_shadow_detector
     if settings.kline_shadow_enabled:
         kline_shadow_detector = KlineShadowDetector(collector=collector, pm_15m_latest=_pm_15m_latest)
+        if multi_live_trader is not None:
+            kline_shadow_detector._on_live_fire = multi_live_trader.on_kline_reversal_signal
         await kline_shadow_detector.start()
-        logger.info("KREV K线影子检测器已启动（720d v2 Top3/Top4 反转做多，holdout 64.2%/63.4%，影子模式不下注）")
+        logger.info("KREV K线检测器已启动（holdout 64.2%/63.4%；影子落表 + 实盘通道默认 OFF）")
 
     # HM 上吊线反弹入场影子信号（2026-09-01）：弱收盘上吊线 → 次 15m 周期内
     # 等反弹触及 +0.25×ATR（2s 轮询 mid 裁决）→ 记录押 DOWN 的虚拟入场。
@@ -1280,15 +1280,15 @@ async def lifespan(app: FastAPI):
         await hm_shadow_detector.start()
         logger.info("HM 影子检测器已启动（hm_touch_down_v1/v2 已于 2026-09-04 退役：停发新信号，仅结算存量行）")
 
-    # 反转形态影子信号（P1/P2，2026-09-03）：15m 连跌4+弱阴收+量正常→押 UP /
-    # 连涨5+弱阳收贴最高→押 DOWN，rev_common 几何口径实时重放，次根收盘按 direction
-    # 结算。只记录不下注，物理隔离于下单路径（与 KREV 共表 kline_shadow_signals，
-    # version 隔离）。默认开关开启，与其他影子一致。
+    # P1/P2：rev_common 几何口径实时重放，影子照常落表；同名实盘通道默认 OFF，
+    # 仅正常轮询中新鲜命中经钩子派到下一根 15m 市场。
     global reversal_shadow_detector
     if settings.reversal_shadow_enabled:
         reversal_shadow_detector = ReversalShadowDetector(collector=collector, pm_15m_latest=_pm_15m_latest)
+        if multi_live_trader is not None:
+            reversal_shadow_detector._on_live_fire = multi_live_trader.on_kline_reversal_signal
         await reversal_shadow_detector.start()
-        logger.info("反转 K线影子检测器已启动（P1 连跌弱阴→UP 62.0% / P2 连涨弱阳→DOWN 62.4%，影子模式不下注）")
+        logger.info("反转 K线检测器已启动（P1→UP 62.0% / P2→DOWN 62.4%；影子落表 + 实盘通道默认 OFF）")
 
     # 下一根 K 线方向影子信号（nextbar 族，2026-09-03；2026-09-06 promote）：H=1 方向
     # 研究冻结条件实时重放——15m 冠军（zscore_10+zscore_5+ret_3 深超卖反转，holdout
@@ -1456,8 +1456,7 @@ async def lifespan(app: FastAPI):
         _enabled = [c["channel"] for c in _live_status["channels"] if c["enabled"]]
         logger.info(
             "多通道实盘执行器已加载（真单！）| 通道 {}/{} 启用 {} | 默认 {} USDT/单"
-            " | 2026-09-06 promote：s2_cond t4/t5d、nextbar smaslope、absorption"
-            " td120/td150（默认全 OFF，面板「加入实盘通道」开启）",
+            " | promote 通道含 KREV-A/B、P1/P2（默认全 OFF，面板「加入实盘通道」开启）",
             len(_enabled), len(_live_status["channels"]),
             _enabled or "（无，toggle 可开）",
             _live_status["defaults"]["amount_usdt"],

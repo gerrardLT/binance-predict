@@ -437,17 +437,59 @@ async def test_backscan_records_and_advances_cursor(monkeypatch) -> None:
     assert d._trigger_count == 1
 
 
+@pytest.mark.asyncio
+async def test_cold_start_backscan_never_dispatches_live(monkeypatch) -> None:
+    rows = _p1_rows(n=rsd.WARMUP_BARS)
+    session = _FakeSession(rows=[], scalar=None)
+    d = ReversalShadowDetector(collector=_FakeCollector(rows), pm_15m_latest={})
+    fired: list[dict] = []
+    d._on_live_fire = fired.append
+    monkeypatch.setattr(rsd, "async_session_factory", lambda: _FakeSessionCtx(session))
+    monkeypatch.setattr(rsd.shadow_gate, "is_enabled", lambda _version: True)
+    monkeypatch.setattr(
+        rsd.time, "time",
+        lambda: (int(rows[-1]["open_time"]) + BAR_MS_15M + 30_000) / 1000,
+    )
+
+    await d._backscan()
+
+    assert fired == []
+    assert session.added
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("spec", "rows_factory"), [(P1, _p1_rows), (P2, _p2_rows)])
+async def test_fresh_reversal_hit_dispatches_frozen_direction(
+        monkeypatch, spec: dict, rows_factory) -> None:
+    rows = rows_factory(n=rsd.WARMUP_BARS)
+    session = _FakeSession(rows=[], scalar=None)
+    d = ReversalShadowDetector(collector=None, pm_15m_latest={})
+    d._last_evaluated_bar = int(rows[-2]["open_time"])
+    fired: list[dict] = []
+    d._on_live_fire = fired.append
+    monkeypatch.setattr(rsd, "async_session_factory", lambda: _FakeSessionCtx(session))
+    monkeypatch.setattr(rsd.shadow_gate, "is_enabled", lambda _version: True)
+    target = int(rows[-1]["open_time"]) + BAR_MS_15M
+    monkeypatch.setattr(rsd.time, "time", lambda: (target + 30_000) / 1000)
+
+    await d._evaluate_new_bars(rows)
+
+    payload = next(p for p in fired if p["version"] == spec["version"])
+    assert payload["market_start"] == target
+    assert payload["direction"] == spec["direction"]
+
 # ============================================================
-# 物理隔离 + 开关默认
+# 实盘注册 + 开关默认
 # ============================================================
 
-def test_versions_isolated_from_trading_path() -> None:
-    """影子 version 绝不进入下单白名单/实盘通道（物理隔离红线）。"""
+def test_versions_registered_as_live_channels() -> None:
     from binance_predict.services.live_channels import LIVE_CHANNELS
     from binance_predict.services.multi_live_trader import X4_VERSIONS
-    for v in REVERSAL_VERSIONS:
-        assert v not in X4_VERSIONS, f"{v} 不得进入 X4 下单白名单"
-        assert v not in LIVE_CHANNELS, f"{v} 不得注册实盘通道"
+    expected = {spec["version"]: spec["direction"] for spec in REVERSAL_SHADOW_SPECS}
+    for version, direction in expected.items():
+        assert version not in X4_VERSIONS
+        assert LIVE_CHANNELS[version].family == "kline_reversal"
+        assert LIVE_CHANNELS[version].market_period == "15m"
+        assert LIVE_CHANNELS[version].direction == direction
 
 
 def test_settings_default_on() -> None:

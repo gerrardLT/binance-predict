@@ -8,7 +8,8 @@
 - scene：fake_breakout_detector fire 钩子 → 次周期开盘下单（15m 市场）；
 - s2_cond：S2CondShadowDetector 实时判价钩子（实盘 S2 派生窗内 t=4/t=5 1m 收盘<周期开盘）
   → 当刻真单押 UP（15m 市场，次周期中段入场）；
-- nextbar：NextbarShadowDetector 新根收盘钩子 → 次根 5m 市场开盘后 90s 内下单押 UP；
+- nextbar：NextbarShadowDetector / KREV / P1-P2 检测器的新根收盘钩子 → 次根市场开盘后
+  90s 内按冻结方向下单；
 - absorption：5m 采样循环喂价内联判定（窗开快照 + TD 秒双快照，标定来自
   AbsorptionShadowDetector 滚动缓冲）→ 跟随 BTC 位移方向押注（动态 UP/DOWN，5m 市场）。
 - firsthit：5m 采样循环按本窗完整历史重放 DOWN 首次进入 (0.005,0.1] 的触发点，
@@ -161,6 +162,25 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     # 只在 UP 便宜（市场看衰而条件看涨）时成交，成交率低是保命设计非 bug。
     "nb_smaslope_5m_v1": ChannelSpec(
         "nb_smaslope_5m_v1", "nextbar", "5m", "UP", 0.46, "nextbar 5m动量误定价（押UP）",
+    ),
+    # --- K线反转族（2026-09-18 影子 promote）：KREV-A/B 与 P1/P2 均在 15m 信号根
+    # 收盘后预测次根方向；仅目标根开盘后 90s 内的新鲜命中经检测器钩子派单，冷启动
+    # 回补不追单。默认全部 OFF；护栏 = 冻结回测胜率 × 0.98（2% 费用保本价）。
+    "krev_a_v1": ChannelSpec(
+        "krev_a_v1", "kline_reversal", "15m", "UP", 0.629,
+        "KREV-A 反转（押UP）",
+    ),
+    "krev_b_v1": ChannelSpec(
+        "krev_b_v1", "kline_reversal", "15m", "UP", 0.621,
+        "KREV-B 反转（押UP）",
+    ),
+    "rev_p1_v1": ChannelSpec(
+        "rev_p1_v1", "kline_reversal", "15m", "UP", 0.608,
+        "P1 连跌弱阴反转（押UP）",
+    ),
+    "rev_p2_v1": ChannelSpec(
+        "rev_p2_v1", "kline_reversal", "15m", "DOWN", 0.612,
+        "P2 连涨弱阳反转（押DOWN）",
     ),
     # --- absorption 族（2026-09-06 影子 promote）：采样循环喂价内联判定（窗开快照 +
     # TD 秒实时双快照），标定 k/b/位移门/欠反应门复用 AbsorptionShadowDetector 滚动

@@ -17,9 +17,9 @@
     path3_all_down 需该 15m 周期内 3 根 5m 子 K 齐全才可判定（_cycle_path
     full3 守卫）；子根缺失/特征 NaN/缺特征一律保守不触发。
 
-影子纪律：只记录不下注、不注册 LIVE_CHANNELS、不进 X4_VERSIONS，新表不被
-任何下单代码引用（物理隔离）。结算口径与回测 reversal_1 一致：次根收阳
-（close>open）即赢；平盘 → NOISE/EXPIRED。
+采集与执行解耦：影子信号照常落表；同名实盘通道默认关闭。仅正常轮询中新收盘根、
+且目标根开盘后 90 秒内的新鲜命中才通过钩子交给 MultiLiveTrader；冷启动回补不追单。
+结算口径与回测 reversal_1 一致：次根收阳（close>open）即赢；平盘 → NOISE/EXPIRED。
 
 数据流：
     1. 每 60s 轮询；fetch_recent_klines 按币安服务器时间只返回已收盘 K，
@@ -77,6 +77,7 @@ BACKSCAN_BARS = 12              # 冷启动/追赶回补根数（3 小时）
 K5_REALTIME_BARS = 4            # 实时评估只需当周期 3 根 5m 子根 + 1 余量
 K5_BACKSCAN_BARS = 40           # 回补窗口 12×3=36 根 5m + 余量
 PENDING_EXPIRE_MS = 4 * 3_600_000  # 目标根起点后 4h 仍未结算 → EXPIRED（数据缺失兜底）
+KREV_LIVE_MAX_LAG_MS = 90_000      # 目标根开盘后 90s 内的新鲜命中才派实盘
 # 审计快照特征（两条条件涉及的全部特征 + path3）
 SNAPSHOT_FEATURES = ("dist_prior_low_atr_5", "efficiency_5", "range_pos_prior_5", "path3_all_down")
 # 本检测器负责的 version（结算/超时只认这些）——kline_shadow_signals 表另被反转影子
@@ -139,6 +140,7 @@ class KlineShadowDetector:
         self._settle_count = 0
         # 条件预解析（注册表原文 → 原子片段），启动时一次性暴露格式错误
         self._specs = [{**s, "parts": parse_condition(s["condition"])} for s in SHADOW_CONDITIONS]
+        self._on_live_fire = None
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -211,8 +213,9 @@ class KlineShadowDetector:
         kl15 = _to_klines(closed_15m, BAR_MS_15M)
         kl5 = _to_klines(closed_5m, BAR_MS_5M)
         fm = build_feature_matrix(kl15, BAR_MS_15M, k5=kl5)
+        collect_live = self._last_evaluated_bar is not None
         if self._last_evaluated_bar is None:
-            n_tail = BACKSCAN_BARS  # 冷启动：回补最近 12 根
+            n_tail = BACKSCAN_BARS  # 冷启动：回补最近 12 根，不追真钱单
         else:
             starts = [int(r["open_time"]) for r in closed_15m]
             try:
@@ -226,21 +229,33 @@ class KlineShadowDetector:
         hits = evaluate_conditions(fm, self._specs, n_tail)
         if not hits:
             return
+        live_payloads: list[dict] = []
         async with async_session_factory() as session:
             added = 0
             for hit in hits:
                 bar = closed_15m[hit["idx"]]
-                if await self._record_signal(session, hit["spec"], bar, fm, hit["idx"]):
+                payloads = live_payloads if collect_live else None
+                if await self._record_signal(session, hit["spec"], bar, fm, hit["idx"], payloads):
                     added += 1
             if added:
                 await session.commit()
                 self._trigger_count += added
                 logger.info("KREV 影子触发 +{} | 信号根 {}", added, int(bar["open_time"]))
+        self._dispatch_live(live_payloads)
 
-    async def _record_signal(self, session, spec: dict, bar: dict, fm, idx: int) -> bool:
-        """幂等落 PENDING：唯一约束 (version, signal_bar_start) + 先查后插。"""
-        if not shadow_gate.is_enabled(spec["version"]):
-            return False  # 手动下线：停止采集新信号（历史数据保留）
+    def _dispatch_live(self, payloads: list[dict]) -> None:
+        hook = self._on_live_fire
+        if hook is None:
+            return
+        for payload in payloads:
+            try:
+                hook(payload)
+            except Exception as exc:
+                logger.warning("KREV：实盘开火分派异常（不影响影子采集）| {}", exc)
+
+    async def _record_signal(self, session, spec: dict, bar: dict, fm, idx: int,
+                             live_payloads: list[dict] | None = None) -> bool:
+        """幂等落 PENDING，并为正常轮询中的新鲜命中收集实盘 payload。"""
         start_ms = int(bar["open_time"])
         exists = (await session.execute(
             sa_select(KlineShadowSignal.id).where(
@@ -250,13 +265,24 @@ class KlineShadowDetector:
         )).scalar_one_or_none()
         if exists is not None:
             return False
+        target_bar_start = start_ms + BAR_MS_15M
+        if live_payloads is not None and (
+                0 <= int(time.time() * 1000) - target_bar_start <= KREV_LIVE_MAX_LAG_MS):
+            live_payloads.append({
+                "version": spec["version"],
+                "market_start": target_bar_start,
+                "market_end": target_bar_start + BAR_MS_15M,
+                "direction": "UP",
+                "signal_bar_start": start_ms,
+            })
+        if not shadow_gate.is_enabled(spec["version"]):
+            return False  # 手动下线只停影子采集；实盘由 trader enabled 独立控制
         snapshot = {}
         for feat in SNAPSHOT_FEATURES:
             col = fm.cols.get(feat)
             if col is not None and idx < len(col):
                 val = col[idx]
                 snapshot[feat] = bool(val) if isinstance(val, (bool, np.bool_)) else float(val)
-        target_bar_start = start_ms + BAR_MS_15M
         # 目标窗入场报价快照（窗口对齐+近开盘守卫；缺失/回补 → None，该笔 EV 不计）
         up_q, down_q, q_ts = snapshot_entry_quote(self._pm_15m, target_bar_start)
         session.add(KlineShadowSignal(
@@ -365,4 +391,5 @@ class KlineShadowDetector:
             "trigger_count": self._trigger_count,
             "settle_count": self._settle_count,
             "versions": [s["version"] for s in self._specs],
+            "live_channels_registered": True,
         }

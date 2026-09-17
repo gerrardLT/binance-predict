@@ -19,8 +19,8 @@
 version（rev_p1_v1 / rev_p2_v1），杜绝跨 version 误结算——KREV 硬编码 UP 语义，
 本族按 direction 判 win（UP→收阳赢 / DOWN→收阴赢），若不过滤会互相污染。
 
-影子纪律：只记录不下注、不注册 LIVE_CHANNELS、不进 X4_VERSIONS，本表不被任何下单
-代码引用（物理隔离）。攒 2~3 周真实样本复核后人工 promote 才可上线。
+采集与执行解耦：影子信号照常落表；同名实盘通道默认关闭。仅正常轮询中新收盘根、
+且目标根开盘后 90 秒内的新鲜命中才通过钩子交给 MultiLiveTrader；冷启动回补不追单。
 
 数据流：
     1. 每 60s 轮询；fetch_recent_klines 按币安服务器时间只返回已收盘 K，
@@ -82,6 +82,7 @@ POLL_INTERVAL = 60.0            # 轮询间隔（秒）
 WARMUP_BARS = 40
 BACKSCAN_BARS = 12              # 冷启动/追赶回补根数（3 小时）
 PENDING_EXPIRE_MS = 4 * 3_600_000  # 目标根起点后 4h 仍未结算 → EXPIRED（数据缺失兜底）
+REVERSAL_LIVE_MAX_LAG_MS = 90_000  # 目标根开盘后 90s 内的新鲜命中才派实盘
 # 审计快照特征（几何实际值，供实时值与研究口径对照）
 SNAPSHOT_FEATURES = ("streak", "close_pos", "vol_ratio")
 
@@ -224,6 +225,7 @@ class ReversalShadowDetector:
         self._last_evaluated_bar: int | None = None  # 已评估过的最大 15m open_time
         self._trigger_count = 0
         self._settle_count = 0
+        self._on_live_fire = None
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -291,8 +293,9 @@ class ReversalShadowDetector:
         """评估 _last_evaluated_bar 之后的新收盘根（含冷启动回补的末 12 根）。"""
         kl15 = _to_klines(closed_15m, BAR_MS_15M)
         geo = compute_geometry(kl15, BAR_MS_15M)
+        collect_live = self._last_evaluated_bar is not None
         if self._last_evaluated_bar is None:
-            n_tail = BACKSCAN_BARS  # 冷启动：回补最近 12 根
+            n_tail = BACKSCAN_BARS  # 冷启动：回补最近 12 根，不追真钱单
         else:
             starts = [int(r["open_time"]) for r in closed_15m]
             try:
@@ -306,23 +309,35 @@ class ReversalShadowDetector:
         hits = evaluate_reversals(geo, REVERSAL_SHADOW_SPECS, n_tail)
         if not hits:
             return
+        live_payloads: list[dict] = []
         async with async_session_factory() as session:
             added = 0
             last_bar = None
             for hit in hits:
                 bar = closed_15m[hit["idx"]]
                 last_bar = bar
-                if await self._record_signal(session, hit["spec"], bar, geo, hit["idx"]):
+                payloads = live_payloads if collect_live else None
+                if await self._record_signal(session, hit["spec"], bar, geo, hit["idx"], payloads):
                     added += 1
             if added:
                 await session.commit()
                 self._trigger_count += added
                 logger.info("反转影子触发 +{} | 信号根 {}", added, int(last_bar["open_time"]))
+        self._dispatch_live(live_payloads)
 
-    async def _record_signal(self, session, spec: dict, bar: dict, geo: dict, idx: int) -> bool:
-        """幂等落 PENDING：唯一约束 (version, signal_bar_start) + 先查后插。"""
-        if not shadow_gate.is_enabled(spec["version"]):
-            return False  # 手动下线：停止采集新信号（历史数据保留）
+    def _dispatch_live(self, payloads: list[dict]) -> None:
+        hook = self._on_live_fire
+        if hook is None:
+            return
+        for payload in payloads:
+            try:
+                hook(payload)
+            except Exception as exc:
+                logger.warning("反转K线：实盘开火分派异常（不影响影子采集）| {}", exc)
+
+    async def _record_signal(self, session, spec: dict, bar: dict, geo: dict, idx: int,
+                             live_payloads: list[dict] | None = None) -> bool:
+        """幂等落 PENDING，并为正常轮询中的新鲜命中收集实盘 payload。"""
         start_ms = int(bar["open_time"])
         exists = (await session.execute(
             sa_select(KlineShadowSignal.id).where(
@@ -332,6 +347,18 @@ class ReversalShadowDetector:
         )).scalar_one_or_none()
         if exists is not None:
             return False
+        target_bar_start = start_ms + BAR_MS_15M
+        if live_payloads is not None and (
+                0 <= int(time.time() * 1000) - target_bar_start <= REVERSAL_LIVE_MAX_LAG_MS):
+            live_payloads.append({
+                "version": spec["version"],
+                "market_start": target_bar_start,
+                "market_end": target_bar_start + BAR_MS_15M,
+                "direction": spec["direction"],
+                "signal_bar_start": start_ms,
+            })
+        if not shadow_gate.is_enabled(spec["version"]):
+            return False  # 手动下线只停影子采集；实盘由 trader enabled 独立控制
         snapshot: dict = {}
         for feat in SNAPSHOT_FEATURES:
             val = geo[feat][idx]
@@ -340,7 +367,6 @@ class ReversalShadowDetector:
             else:
                 fv = float(val)
                 snapshot[feat] = None if np.isnan(fv) else round(fv, 6)
-        target_bar_start = start_ms + BAR_MS_15M
         # 目标窗入场报价快照（窗口对齐+近开盘守卫；缺失/回补 → None，该笔 EV 不计）
         up_q, down_q, q_ts = snapshot_entry_quote(self._pm_15m, target_bar_start)
         session.add(KlineShadowSignal(
@@ -450,4 +476,5 @@ class ReversalShadowDetector:
             "trigger_count": self._trigger_count,
             "settle_count": self._settle_count,
             "versions": list(REVERSAL_VERSIONS),
+            "live_channels_registered": True,
         }

@@ -540,6 +540,28 @@ async def test_nextbar_15m_down_direction(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("version", "direction", "outcome"),
+    [
+        ("krev_a_v1", "UP", "UP"),
+        ("krev_b_v1", "UP", "UP"),
+        ("rev_p1_v1", "UP", "UP"),
+        ("rev_p2_v1", "DOWN", "DOWN"),
+    ],
+)
+async def test_kline_reversal_15m_orders_use_shadow_settlement(
+        monkeypatch, version: str, direction: str, outcome: str) -> None:
+    shadow = _shadow(outcome, win=True, settle_close=78500.0)
+    db = _Db([_row15(signal_version=version, direction=direction)], None, shadow=shadow)
+    _stub_db(monkeypatch, db)
+
+    assert await TradeSettler().poll_once() == 1
+    params = _params(db.updates[0])
+    assert params["settle_outcome"] == outcome
+    assert params["win"] is True
+
+
+@pytest.mark.asyncio
 async def test_15m_with_scene_signal_id_uses_fake_breakout(monkeypatch) -> None:
     """15m + 有 scene_signal_id → 走 FakeBreakoutSignal（scene 族），非影子路径。
 

@@ -765,9 +765,9 @@ async def test_btc_klines_failure_negative_cache(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_analytics_live_channel_field(monkeypatch) -> None:
-    """影子 summary 下发 live_channel（2026-09-06 promote）：version==通道名 →
+    """影子 summary 下发 live_channel：version==通道名 →
     {enabled, amount_usdt, max_daily_orders, max_exec_price} 护栏三件套；
-    无对应通道（如 KREV 影子）→ None，前端显示「未注册」样式。
+    未出现在执行器状态里的版本 → None，前端显示「未注册」样式。
 
     multi_live_trader 替身模拟执行器装配；未装配（模块级默认 None）→
     全版本 live_channel=None 且不碰 status_async。
@@ -779,11 +779,14 @@ async def test_analytics_live_channel_field(monkeypatch) -> None:
     assert all(b["summary"]["live_channel"] is None
                for b in out["shadow"].values())
 
-    # 装配替身：nb_smaslope_5m_v1 通道在册（状态直通下发，不查 DB）
+    # 装配替身：nextbar + KREV 通道在册（状态直通下发，不查 DB）
     fake = SimpleNamespace(status_async=AsyncMock(return_value={
         "channels": [{
             "channel": "nb_smaslope_5m_v1", "enabled": False,
             "amount_usdt": 2.0, "max_daily_orders": 100, "max_exec_price": 0.46,
+        }, {
+            "channel": "krev_a_v1", "enabled": False,
+            "amount_usdt": 2.0, "max_daily_orders": 100, "max_exec_price": 0.629,
         }],
     }))
     monkeypatch.setattr(m, "multi_live_trader", fake)
@@ -792,6 +795,11 @@ async def test_analytics_live_channel_field(monkeypatch) -> None:
         "enabled": False, "amount_usdt": 2.0,
         "max_daily_orders": 100, "max_exec_price": 0.46,
     }
-    # 无通道版本仍为 None；status_async 恰好被调一次（索引构建，非逐版本）
-    assert out2["shadow"]["krev_a_v1"]["summary"]["live_channel"] is None
+    assert out2["shadow"]["krev_a_v1"]["summary"]["live_channel"] == {
+        "enabled": False, "amount_usdt": 2.0,
+        "max_daily_orders": 100, "max_exec_price": 0.629,
+    }
+    assert out2["shadow"]["krev_a_v1"]["summary"]["execution_mode"] == "LIVE_AVAILABLE"
+    # 未出现在执行器状态中的版本仍为 None；状态只拉一次，非逐版本查询。
+    assert out2["shadow"]["combo_p1_v1"]["summary"]["live_channel"] is None
     assert fake.status_async.await_count == 1
