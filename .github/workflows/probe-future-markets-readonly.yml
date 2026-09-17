@@ -1,0 +1,165 @@
+name: Probe Future Prediction Markets (Readonly)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: probe-future-markets-readonly
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    name: Probe future 5m and 15m markets without ordering
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Run read-only probe on VPS
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
+          command_timeout: 10m
+          script: |
+            set -euo pipefail
+            cd /www/wwwroot/binance-predict
+            docker compose -f docker-compose.prod.yml exec -T backend python - <<'PY'
+            import asyncio
+            import json
+            from urllib.parse import urlparse
+
+            from binance_predict.services import clock_sync
+            from binance_predict.services.prediction_trading import BinancePredictionTrader
+
+
+            class CachedClient:
+                """Cache signed GET responses so each market detail ID is fetched once."""
+
+                def __init__(self, inner):
+                    self.inner = inner
+                    self.cache = {}
+
+                @property
+                def is_closed(self):
+                    return self.inner.is_closed
+
+                async def get(self, url, **kwargs):
+                    params = kwargs.get("params") or {}
+                    path = urlparse(url).path
+                    if path.endswith("/market/detail"):
+                        key = (path, "detail", str(params.get("marketTopicId")))
+                    elif path.endswith("/market/list"):
+                        key = (
+                            path,
+                            "list",
+                            str(params.get("limit")),
+                            str(params.get("offset")),
+                        )
+                    else:
+                        return await self.inner.get(url, **kwargs)
+                    if key not in self.cache:
+                        self.cache[key] = await self.inner.get(url, **kwargs)
+                    return self.cache[key]
+
+                async def post(self, url, **kwargs):
+                    return await self.inner.post(url, **kwargs)
+
+                async def aclose(self):
+                    await self.inner.aclose()
+
+
+            async def main():
+                trader = BinancePredictionTrader()
+                await clock_sync.sync_server_time(force=True)
+                wallet = await trader.fetch_wallet_info()
+                if not wallet:
+                    raise RuntimeError("prediction wallet unavailable")
+
+                real_client = trader._get_client()
+                trader._client = CachedClient(real_client)
+
+                async def forbidden_place_order(*args, **kwargs):
+                    raise RuntimeError("SAFETY: place_order is forbidden in readonly probe")
+
+                trader.place_order = forbidden_place_order
+                try:
+                    await trader.list_markets()
+                    now_ms = clock_sync.now_ms()
+                    results = {}
+                    ranges = (("5m", 300_000, 18), ("15m", 900_000, 12))
+                    for period, step_ms, max_offset in ranges:
+                        current_start = now_ms // step_ms * step_ms
+                        rows = []
+                        consecutive_misses = 0
+                        seen_found = False
+                        for offset in range(max_offset + 1):
+                            target = current_start + offset * step_ms
+                            entry = None
+                            source = None
+                            if period == "15m":
+                                entry = trader._15m_markets.get(target)
+                                if entry is not None:
+                                    source = "market/list"
+                            else:
+                                try:
+                                    cache_start = int(trader._5m_start_date)
+                                except (TypeError, ValueError):
+                                    cache_start = None
+                                if cache_start is not None and abs(cache_start - target) <= 2_000:
+                                    entry = {
+                                        "up_token": trader._up_token_id,
+                                        "down_token": trader._down_token_id,
+                                    }
+                                    source = "market/list"
+                            if entry is None:
+                                entry = await trader._fetch_market_via_detail(period, target)
+                                if entry is not None:
+                                    source = "market/detail"
+
+                            row = {
+                                "offset": offset,
+                                "starts_in_sec": round((target - now_ms) / 1000, 1),
+                                "market_found": entry is not None,
+                                "source": source,
+                                "up_quote_ok": False,
+                                "down_quote_ok": False,
+                                "up_average_price": None,
+                                "down_average_price": None,
+                            }
+                            if entry is not None:
+                                seen_found = True
+                                consecutive_misses = 0
+                                for direction, token_key in (("up", "up_token"), ("down", "down_token")):
+                                    token = entry.get(token_key)
+                                    if not token:
+                                        continue
+                                    quote = await trader.get_quote(token, amount_usdt=0.1)
+                                    row[f"{direction}_quote_ok"] = quote is not None
+                                    if quote is not None:
+                                        row[f"{direction}_average_price"] = quote.get("averagePrice")
+                            else:
+                                consecutive_misses += 1
+                            rows.append(row)
+                            if seen_found and consecutive_misses >= 3:
+                                break
+                        future_quoteable = [
+                            r["offset"] for r in rows
+                            if r["offset"] > 0 and r["up_quote_ok"] and r["down_quote_ok"]
+                        ]
+                        contiguous = 0
+                        while contiguous + 1 in future_quoteable:
+                            contiguous += 1
+                        results[period] = {
+                            "contiguous_future_quoteable_periods": contiguous,
+                            "max_future_quoteable_offset": max(future_quoteable, default=0),
+                            "rows": rows,
+                        }
+                    print("READONLY_PROBE_RESULT=" + json.dumps(results, ensure_ascii=False))
+                finally:
+                    await trader.aclose()
+
+
+            asyncio.run(main())
+            PY
