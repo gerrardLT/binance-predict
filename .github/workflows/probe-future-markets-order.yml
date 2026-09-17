@@ -27,6 +27,14 @@ on:
         description: "market/detail 向前扫描的 ID 数量（验证扫描预算假设）"
         required: false
         default: "200"
+      periods:
+        description: "要探测/下单的周期，逗号分隔（如 5m 或 5m,15m）"
+        required: false
+        default: "5m,15m"
+      min_ahead_sec:
+        description: "目标窗口最少要提前多少秒开盘；不够则自动往后推一个周期"
+        required: false
+        default: "60"
 
 concurrency:
   group: probe-future-markets-order
@@ -54,8 +62,11 @@ jobs:
             PROBE_CONFIRM="${{ inputs.confirm_phrase }}" \
             PROBE_OFFSET="${{ inputs.target_offset }}" \
             PROBE_SCAN="${{ inputs.detail_scan }}" \
+            PROBE_PERIODS="${{ inputs.periods }}" \
+            PROBE_MIN_AHEAD="${{ inputs.min_ahead_sec }}" \
             docker compose -f docker-compose.prod.yml exec -T \
               -e PROBE_MODE -e PROBE_CONFIRM -e PROBE_OFFSET -e PROBE_SCAN \
+              -e PROBE_PERIODS -e PROBE_MIN_AHEAD \
               backend python - <<'PY'
             import asyncio
             import json
@@ -70,9 +81,14 @@ jobs:
             CONFIRM = (os.environ.get("PROBE_CONFIRM") or "").strip()
             TARGET_OFFSET = int(os.environ.get("PROBE_OFFSET") or "1")
             DETAIL_SCAN = int(os.environ.get("PROBE_SCAN") or "200")
-            TEST_AMOUNT_USDT = 1.0
-
             STEP_MS = {"5m": 300_000, "15m": 900_000}
+            PERIODS = tuple(
+                p.strip()
+                for p in (os.environ.get("PROBE_PERIODS") or "5m,15m").split(",")
+                if p.strip() in STEP_MS
+            )
+            MIN_AHEAD_SEC = float(os.environ.get("PROBE_MIN_AHEAD") or "60")
+            TEST_AMOUNT_USDT = 1.0
 
 
             class CachedClient:
@@ -265,17 +281,31 @@ jobs:
                     print("DETAIL_SCAN=" + json.dumps(scan, ensure_ascii=False))
 
                     # ---------- Phase C: quote (and optionally order) a future window ----------
-                    for period in ("5m", "15m"):
+                    for period in PERIODS:
                         step = STEP_MS[period]
                         current_start = now_ms // step * step
-                        target = current_start + TARGET_OFFSET * step
+                        # 提前量守卫：offset 往后推，直到目标窗口至少提前
+                        # MIN_AHEAD_SEC 秒开盘。否则可能踩线（窗口已开始才下单），
+                        # 证明不了「提前下单」这件事。
+                        offset = TARGET_OFFSET
+                        target = current_start + offset * step
+                        while (target - now_ms) / 1000 < MIN_AHEAD_SEC and offset < 40:
+                            offset += 1
+                            target = current_start + offset * step
                         entry = None
                         source = None
+                        hit_slug = None
+                        hit_tid = None
+                        # 周期过滤：同一 epoch 可能同时是 5m 与 15m 的边界
+                        # （能被 300 和 900 同时整除），只按 startDate 匹配会把
+                        # 15m 的 token 当成 5m 下单（2026-09-17 实测踩到这个坑）。
+                        prefix = "btc-updown-%s-" % period
                         hit = next(
                             (h for h in scan["btc_hits"]
-                             if h["start"] and abs(h["start"] - target) <= 2000), None)
+                             if h["start"] and abs(h["start"] - target) <= 2000
+                             and (h["slug"] or "").startswith(prefix)), None)
                         if hit and hit["trading_status"] == "OPEN" and hit["has_up_token"]:
-                            entry = {"up_token": None, "down_token": None}
+                            hit_slug, hit_tid = hit["slug"], hit["topic_id"]
                             d = await detail(hit["topic_id"])
                             parsed = trader._parse_15m_entry(d) if d else None
                             if parsed:
@@ -287,10 +317,13 @@ jobs:
                                 entry, source = cached, "market/list"
                         result = {
                             "period": period,
+                            "offset_used": offset,
                             "target_start": target,
                             "ahead_sec": round((target - now_ms) / 1000, 1),
                             "found": bool(entry and entry.get("up_token")),
                             "source": source,
+                            "market_slug": hit_slug,
+                            "topic_id": hit_tid,
                             "up_quote": None,
                             "down_quote": None,
                             "ordered": False,
@@ -323,6 +356,7 @@ jobs:
                                     else:
                                         oid = order.get("orderId")
                                         confirmed = await trader.confirm_order_status(oid)
+                                        conf_slug = (confirmed or {}).get("slug") or ""
                                         result["ordered"] = True
                                         result["order"] = {
                                             "order_id": oid,
@@ -330,6 +364,10 @@ jobs:
                                             "confirmed": confirmed,
                                             "token_id_tail": str(token)[-12:],
                                             "window_start": target,
+                                            # 自检：币安回执的 slug 必须属于本周期，
+                                            # 否则说明又押错周期了
+                                            "confirmed_slug": conf_slug,
+                                            "period_matches": conf_slug.startswith(prefix),
                                         }
                         print(f"ORDER_PROBE_{period}=" + json.dumps(result, ensure_ascii=False))
                 finally:
