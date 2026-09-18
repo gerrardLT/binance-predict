@@ -1855,3 +1855,135 @@ async def test_sync_binance_claimed_exclusion_from_window_fallback(monkeypatch) 
     # row_b 的候选=A-X，但它已被 claim → 保持 PENDING
     assert row_b.status == "PENDING" and row_b.order_id is None
 
+
+# ============================================================
+# 2026-09-18 手动下单模态框：market_period / window_start / max_exec_price /
+# 踩线兜底 / 响应增补（WS2）
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_trade_test_market_period_invalid_rejected(monkeypatch) -> None:
+    """market_period 非 5m/15m → 拒绝且不碰 trader。"""
+    import binance_predict.main as m
+
+    async def _exec(**kw):  # pragma: no cover
+        raise AssertionError("非法周期不应触达 trader")
+
+    monkeypatch.setattr(m.prediction_trader, "execute_signal_trade", _exec)
+    out = await m.manual_trade_test(
+        ManualTradeTestRequest(amount_usdt=1.0, market_period="1h"), _=None)
+    assert "market_period" in out["error"]
+
+
+@pytest.mark.asyncio
+async def test_trade_test_window_start_misaligned_rejected(monkeypatch) -> None:
+    """window_start 不对齐周期网格 → 拒绝。"""
+    import binance_predict.main as m
+
+    async def _exec(**kw):  # pragma: no cover
+        raise AssertionError("不对齐窗口不应触达 trader")
+
+    monkeypatch.setattr(m.prediction_trader, "execute_signal_trade", _exec)
+    now_ms = int(m.time.time() * 1000)
+    cur = now_ms // 300_000 * 300_000
+    out = await m.manual_trade_test(
+        ManualTradeTestRequest(amount_usdt=1.0, window_start=cur + 1), _=None)
+    assert "对齐" in out["error"]
+
+
+@pytest.mark.asyncio
+async def test_trade_test_window_start_past_rejected(monkeypatch) -> None:
+    """window_start 早于当前窗 → 拒绝。"""
+    import binance_predict.main as m
+
+    async def _exec(**kw):  # pragma: no cover
+        raise AssertionError("过去窗口不应触达 trader")
+
+    monkeypatch.setattr(m.prediction_trader, "execute_signal_trade", _exec)
+    now_ms = int(m.time.time() * 1000)
+    cur = now_ms // 300_000 * 300_000
+    out = await m.manual_trade_test(
+        ManualTradeTestRequest(amount_usdt=1.0, window_start=cur - 300_000), _=None)
+    assert "不能早于当前窗口" in out["error"]
+
+
+@pytest.mark.asyncio
+async def test_trade_test_window_start_beyond_horizon_rejected(monkeypatch) -> None:
+    """window_start 超 now+80min → 拒绝（贴 horizon 内则放行）。"""
+    import binance_predict.main as m
+
+    seen = {}
+
+    async def _exec(**kw):
+        seen.update(kw)
+        return _order()
+
+    monkeypatch.setattr(m.prediction_trader, "execute_signal_trade", _exec)
+    now_ms = int(m.time.time() * 1000)
+    cur = now_ms // 300_000 * 300_000
+    out_far = await m.manual_trade_test(
+        ManualTradeTestRequest(amount_usdt=1.0, window_start=cur + 17 * 300_000), _=None)
+    assert "horizon" in out_far["error"]
+    # 贴 horizon 内（+75min，5m 对齐）应放行
+    ok_ws = cur + 15 * 300_000
+    out_ok = await m.manual_trade_test(
+        ManualTradeTestRequest(amount_usdt=1.0, window_start=ok_ws), _=None)
+    assert out_ok["status"] == "FILLED"
+    assert seen["window_start"] == ok_ws
+
+
+@pytest.mark.asyncio
+async def test_trade_test_step_line_guard_rejects(monkeypatch) -> None:
+    """目标为当前窗且距收盘 <5s → 拒单（C12 兜底）。"""
+    import binance_predict.main as m
+
+    async def _exec(**kw):  # pragma: no cover
+        raise AssertionError("踩线不应触达 trader")
+
+    monkeypatch.setattr(m.prediction_trader, "execute_signal_trade", _exec)
+    # 固定时钟：当前 5m 窗只剩 3s
+    base = 1_789_670_100  # 任意 5m 对齐 epoch 秒
+    monkeypatch.setattr(m.time, "time", lambda: base + 300 - 3)
+    out = await m.manual_trade_test(
+        ManualTradeTestRequest(amount_usdt=1.0), _=None)
+    assert "距收盘不足 5 秒" in out["error"]
+
+
+@pytest.mark.asyncio
+async def test_trade_test_max_exec_price_bounds_and_passthrough(monkeypatch) -> None:
+    """max_exec_price 越界拒绝；合法时 MARKET 透传为护栏。"""
+    import binance_predict.main as m
+
+    seen = {}
+
+    async def _exec(**kw):
+        seen.update(kw)
+        return _order()
+
+    monkeypatch.setattr(m.prediction_trader, "execute_signal_trade", _exec)
+    out_bad = await m.manual_trade_test(
+        ManualTradeTestRequest(amount_usdt=1.0, max_exec_price=1.5), _=None)
+    assert "max_exec_price" in out_bad["error"]
+    out_ok = await m.manual_trade_test(
+        ManualTradeTestRequest(amount_usdt=1.0, max_exec_price=0.6), _=None)
+    assert out_ok["status"] == "FILLED"
+    assert seen["max_exec_price"] == 0.6
+    assert seen["market_period"] == "5m"
+
+
+@pytest.mark.asyncio
+async def test_trade_test_response_enriched_fields(monkeypatch) -> None:
+    """响应增补 window_end/market_period/filled_shares/provider_fee（C8）。"""
+    import binance_predict.main as m
+
+    async def _exec(**kw):
+        return _order(quote_json={"filledShareQty": 1.92, "marketProviderFee": 0.0377})
+
+    monkeypatch.setattr(m.prediction_trader, "execute_signal_trade", _exec)
+    out = await m.manual_trade_test(
+        ManualTradeTestRequest(amount_usdt=1.0, market_period="15m"), _=None)
+    assert out["market_period"] == "15m"
+    assert out["window_end"] == out["window_start"] + 900_000
+    assert out["filled_shares"] == 1.92
+    assert out["provider_fee"] == 0.0377
+

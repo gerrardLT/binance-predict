@@ -274,6 +274,22 @@ class ManualTradeTestRequest(BaseModel):
     price_limit: float | None = Field(
         default=None, description="限价价格（当 order_type=LIMIT 时传入，如 0.25）"
     )
+    market_period: str = Field(
+        default="5m", description="市场周期 5m | 15m（手动下单模态框周期切换）"
+    )
+    window_start: int | None = Field(
+        default=None,
+        description="目标窗口起点 ms（缺省=该周期当前窗）；必须对齐周期网格且不早于当前窗",
+    )
+    max_exec_price: float | None = Field(
+        default=None, description="执行价护栏（0~1）；超价/贴线弃单，None=不设护栏"
+    )
+
+
+class ClosePositionRequest(BaseModel):
+    """平仓请求（POST /api/trade/close，SELL 平掉未结算 BUY 持仓）。"""
+
+    order_id: int = Field(description="待平仓的 BUY 订单行 id（trade_orders.id）")
 
 
 class TransferInboundRequest(BaseModel):

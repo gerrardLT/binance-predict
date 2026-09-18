@@ -175,6 +175,13 @@ class BinancePredictionTrader:
         # 市场的 token，场景单必押错周期（审计发现）
         self._15m_markets: dict[int, dict] = {}
 
+        # 未来周期市场扫描缓存（GET /api/prediction/future-markets 用）：
+        # {period: (ts_ms, windows)}；TTL 30s + 每 period 单飞锁合并并发打开，
+        # 避免模态框频繁打开打满币安 detail 配额
+        self._future_cache: dict[str, tuple[int, list[dict]]] = {}
+        self._future_locks: dict[str, asyncio.Lock] = {}
+        self._future_cache_ttl_ms = 30_000
+
         if not self._api_key or not self._api_secret:
             logger.warning("Binance API Key/Secret 未配置，预测交易功能不可用")
         else:
@@ -917,8 +924,279 @@ class BinancePredictionTrader:
                     entry["down_price"] = float(price) if price is not None else None
         return start_ms, entry
 
+    async def _detail_one(self, topic_id: int) -> dict | None:
+        """通用 detail 调用（供 _fetch_market_via_detail / scan_future_markets 共用）。
+
+        Args:
+            topic_id: marketTopicId
+
+        Returns:
+            market/detail JSON 响应或 None（异常/非 200）
+        """
+        client = self._get_client()
+        try:
+            signed = self._sign_request({"marketTopicId": topic_id})
+            resp = await client.get(
+                f"{self.BASE_URL}/sapi/v1/w3w/wallet/prediction/market/detail",
+                params=signed,
+                headers={"X-MBX-APIKEY": self._api_key},
+            )
+            return resp.json() if resp.status_code == 200 else None
+        except Exception:
+            return None
+
+    async def _list_btc_anchor(self, period: str) -> tuple[int, int] | None:
+        """从 list 首页找当前周期的 BTC 市场锚点 tid。
+
+        Args:
+            period: '5m' 或 '15m'
+
+        Returns:
+            (anchor_tid, fallback_tid_for_other_period) 或 None
+        """
+        client = self._get_client()
+        other_period = "5m" if period == "15m" else "15m"
+        anchor = fallback = None
+        try:
+            signed = self._sign_request({"limit": 100, "offset": 0})
+            resp = await client.get(
+                f"{self.BASE_URL}/sapi/v1/w3w/wallet/prediction/market/list",
+                params=signed,
+                headers={"X-MBX-APIKEY": self._api_key},
+            )
+            resp.raise_for_status()
+            for m in resp.json().get("marketTopics", []):
+                if (
+                    m.get("chartType") != "CRYPTO_UP_DOWN"
+                    or m.get("symbol") != "BTCUSDT"
+                ):
+                    continue
+                m_period = self._classify_period(m)
+                if m_period == period and anchor is None:
+                    anchor = m.get("marketTopicId")
+                elif m_period == other_period and fallback is None:
+                    fallback = m.get("marketTopicId")
+        except Exception as e:
+            logger.warning(f"锚点查询失败 | period={period} | {e}")
+        return (anchor or fallback, fallback or anchor) if anchor or fallback else None
+
+    async def scan_future_markets(
+        self, period: str, count: int = 10, budget: int = 160
+    ) -> list[dict]:
+        """扫描未来周期市场（并发分块 + 提前终止）。
+
+        Args:
+            period: '5m' 或 '15m'
+            count: 期望返回的未来窗数量
+            budget: 向前扫描的 ID 预算（默认 160）
+
+        Returns:
+            未来窗列表（按 start_ms 升序，最多 count 个），含 window_start/window_end/
+            ahead_sec/trading_status/up_price/down_price/topic_id/available
+        """
+        now_ms = int(time.time() * 1000)
+        anchor_tuple = await self._list_btc_anchor(period)
+        if not anchor_tuple:
+            return []
+        anchor, _ = anchor_tuple
+
+        prefix = f"btc-updown-{period}-"
+        tids = list(range(anchor + 1, anchor + budget + 1))
+        WAVE = 20  # 每波并发 20 个 detail；波间检查是否已凑够，凑够即停
+        collected: list[dict] = []
+
+        def _to_row(tid: int, d: dict | None) -> dict | None:
+            if not d:
+                return None
+            slug = d.get("slug") or ""
+            if not slug.startswith(prefix):
+                return None
+            subs = d.get("markets", [])
+            trading = subs[0].get("tradingStatus") if subs else None
+            if trading != "OPEN":
+                return None
+            parsed = self._parse_15m_entry(d)
+            if parsed is None:
+                return None
+            entry_start, entry = parsed
+            if entry_start <= now_ms:
+                return None  # 只返回未来窗
+            return {
+                "window_start": entry_start,
+                "window_end": entry["end_date"],
+                "ahead_sec": round((entry_start - now_ms) / 1000, 1),
+                "trading_status": trading,
+                "up_price": entry.get("up_price"),
+                "down_price": entry.get("down_price"),
+                "topic_id": tid,
+                "available": True,
+            }
+
+        try:
+            for i in range(0, len(tids), WAVE):
+                wave = tids[i:i + WAVE]
+                details = await asyncio.gather(
+                    *(self._detail_one(t) for t in wave), return_exceptions=True)
+                for tid, d in zip(wave, details):
+                    if isinstance(d, BaseException):
+                        continue
+                    row = _to_row(tid, d)
+                    if row is not None:
+                        collected.append(row)
+                if len(collected) >= count:
+                    break  # 提前终止：已凑够，不再打后续波
+        except Exception as e:
+            logger.warning("scan_future_markets | {} | {}", period, e)
+
+        collected.sort(key=lambda r: r["window_start"])
+        return collected[:count]
+
+    def _future_lock(self, period: str) -> asyncio.Lock:
+        """每 period 一把单飞锁：并发打开模态框时合并为一次扫描。"""
+        return self._future_locks.setdefault(period, asyncio.Lock())
+
+    async def get_future_markets_cached(
+        self, period: str, count: int = 8
+    ) -> tuple[list[dict], float]:
+        """带 TTL 缓存 + 单飞的未来窗查询。
+
+        Returns:
+            (windows, cached_age_sec)：windows 为未来窗列表（升序，最多 count 个）；
+            cached_age_sec 为缓存年龄（秒），新扫描为 0.0
+        """
+        now = int(time.time() * 1000)
+        hit = self._future_cache.get(period)
+        if hit and now - hit[0] < self._future_cache_ttl_ms:
+            return hit[1][:count], (now - hit[0]) / 1000
+        async with self._future_lock(period):
+            # 双检：等锁期间可能已被别的请求刷新
+            now = int(time.time() * 1000)
+            hit = self._future_cache.get(period)
+            if hit and now - hit[0] < self._future_cache_ttl_ms:
+                return hit[1][:count], (now - hit[0]) / 1000
+            windows = await self.scan_future_markets(period, count=count)
+            self._future_cache[period] = (int(time.time() * 1000), windows)
+            return windows[:count], 0.0
+
+    async def close_position(self, order_id: int) -> dict:
+        """平仓（SELL）：平掉指定未结算 FILLED BUY 行的全部股数。
+
+        语义（2026-09-18 手动下单模态框 A8）：卖出即实现盈亏——成交后
+        立即在原 BUY 行写 settled_at/settle_outcome="SOLD"/win/pnl/settle_price，
+        并插一条 side="SELL" 记录行（signal_version="manual_close" 避开
+        (signal_version,window_start) 唯一键）。结算器只扫 settled_at IS NULL，
+        故两行均天然跳过，无需改 settler。
+
+        Args:
+            order_id: 待平仓的 BUY 订单行 id
+
+        Returns:
+            dict：成功含 {status:"CLOSED", proceeds, pnl, sell_price, sell_order_id}；
+            失败含 {error}
+        """
+        from datetime import datetime, timezone
+        from sqlalchemy import select
+
+        async with async_session_factory() as db:
+            row = (await db.execute(
+                select(TradeOrderModel).where(TradeOrderModel.id == order_id)
+            )).scalar_one_or_none()
+            if row is None:
+                return {"error": f"订单 {order_id} 不存在"}
+            if row.status != "FILLED":
+                return {"error": f"订单状态 {row.status} 非 FILLED，不可平仓"}
+            if row.settled_at is not None:
+                return {"error": "订单已结算/已平仓，不可重复平仓"}
+            if (row.side or "BUY") != "BUY":
+                return {"error": "仅 BUY 持仓可平仓"}
+            token = row.token_id
+            if not token:
+                return {"error": "订单缺 token_id，无法平仓"}
+            cost = int(row.amount_in or 0) / 1e18
+            qj = row.quote_json if isinstance(row.quote_json, dict) else {}
+            shares = qj.get("filledShareQty")
+            if shares is None:
+                avg = qj.get("averagePrice") or qj.get("price")
+                shares = (cost / float(avg)) if avg else None
+            if not shares or float(shares) <= 0:
+                return {"error": "无法确定持仓股数（quote_json 缺 filledShareQty）"}
+            shares = float(shares)
+            # 快照待更新字段（会话关闭后 row 脱离，先取值）
+            snap = {
+                "window_start": row.window_start,
+                "market_period": row.market_period,
+                "direction": row.direction,
+            }
+
+        # 真金路径：报价（SELL）→ 下单 → 回查终态
+        quote = await self.get_quote(token, side="SELL", amount_usdt=shares)
+        if not quote:
+            return {"error": f"SELL 报价失败 | {self.last_api_error or '无详情'}"}
+        order_result = await self.place_order(quote, slippage_bps=1200)
+        if not order_result:
+            return {"error": f"SELL 下单失败 | {self.last_api_error or '无详情'}"}
+        sell_order_id = order_result.get("orderId")
+        confirmed = await self._confirm_with_backfill(sell_order_id)
+        if not confirmed or confirmed.get("status") != "FILLED":
+            return {
+                "error": "SELL 未成交（终态非 FILLED），持仓未变动",
+                "sell_order_id": sell_order_id,
+                "raw_status": (confirmed or {}).get("status"),
+            }
+        proceeds = float(confirmed.get("filledUsdtAmount") or 0.0)
+        if proceeds <= 0:
+            proceeds = float(quote.get("amountOut") or 0) / 1e18
+        sell_price = confirmed.get("price") or quote.get("averagePrice")
+        sell_price = float(sell_price) if sell_price else None
+        pnl = proceeds - cost
+        now_dt = datetime.now(timezone.utc)
+
+        async with async_session_factory() as db:
+            buy_row = (await db.execute(
+                select(TradeOrderModel).where(TradeOrderModel.id == order_id)
+            )).scalar_one_or_none()
+            if buy_row is None or buy_row.settled_at is not None:
+                return {"error": "平仓期间持仓状态已变化，放弃落库"}
+            # 原 BUY 行：卖出即实现盈亏
+            buy_row.settled_at = now_dt
+            buy_row.settle_outcome = "SOLD"
+            buy_row.win = proceeds > cost
+            buy_row.pnl = pnl
+            buy_row.settle_price = sell_price
+            # SELL 记录行（manual_close 避开唯一键）
+            db.add(TradeOrderModel(
+                prediction_id=None,
+                token_id=token,
+                side="SELL",
+                amount_in=str(int(shares * 1e18)),
+                amount_out=str(int(proceeds * 1e18)),
+                order_id=str(sell_order_id),
+                status="FILLED",
+                quote_json=quote,
+                signal_version="manual_close",
+                window_start=snap["window_start"],
+                market_period=snap["market_period"] or "5m",
+                direction=snap["direction"],
+                settle_outcome="SOLD",
+                win=None,
+                pnl=0.0,
+                settle_price=sell_price,
+                settled_at=now_dt,
+            ))
+            await db.commit()
+        return {
+            "status": "CLOSED",
+            "buy_order_id": order_id,
+            "sell_order_id": sell_order_id,
+            "shares": shares,
+            "cost": cost,
+            "proceeds": proceeds,
+            "pnl": pnl,
+            "sell_price": sell_price,
+        }
+
     async def _fetch_market_via_detail(
-        self, period: str, start_ms: int
+        self, period: str, start_ms: int, scan_budget: int = 48
     ) -> dict | None:
         """
         list 端点兜底：按 marketTopicId 锚点 + market/detail 向前扫描预取市场。
@@ -933,22 +1211,18 @@ class BinancePredictionTrader:
         slug `btc-updown-{period}-{epoch}` 精确匹配；命中即解析返回（同
         _parse_15m_entry 结构），并要求 tradingStatus=OPEN。
         列表无同周期锚点时（2026-08-30：周期边界 15m 整体空窗）回退用另一周期
-        的 BTC 市场 topicId 作扫描起点，前向+后向各扫 48（目标 ID 可能在锚点之前）。
+        的 BTC 市场 topicId 作扫描起点，前向 + 后向各扫 48（目标 ID 可能在锚点之前）。
+
+        Args:
+            period: '5m' 或 '15m'
+            start_ms: 目标窗口起点 ms
+            scan_budget: 向前扫描的 ID 数量（默认 48 保持热路径不变；手动/扫描路径可传更大值）
+
+        Returns:
+            parsed entry dict 或 None
         """
         slug_want = f"btc-updown-{period}-{start_ms // 1000}"
         client = self._get_client()
-
-        async def _detail(topic_id: int) -> dict | None:
-            try:
-                signed = self._sign_request({"marketTopicId": topic_id})
-                resp = await client.get(
-                    f"{self.BASE_URL}/sapi/v1/w3w/wallet/prediction/market/detail",
-                    params=signed,
-                    headers={"X-MBX-APIKEY": self._api_key},
-                )
-                return resp.json() if resp.status_code == 200 else None
-            except Exception:
-                return None
 
         # 锚点：list 首页找已开盘的 BTC 市场（优先同周期；整体空窗时回退另一周期，2026-08-30）
         anchor = None
@@ -985,13 +1259,13 @@ class BinancePredictionTrader:
             # 回退锚点与目标的 ID 距离方向未知（目标可能在锚点之前创建）：
             # 前向+后向各 48（约 2× 单向预算，回退路径低频可接受）；
             # 向后扫同样只命中 slug 才采，不会押错周期。
-            scan_ids = [tid for tid in range(anchor + 1, anchor + 49) if tid > 0]
-            scan_ids += [tid for tid in range(anchor - 48, anchor) if tid > 0]
+            scan_ids = [tid for tid in range(anchor + 1, anchor + scan_budget) if tid > 0]
+            scan_ids += [tid for tid in range(anchor - scan_budget + 1, anchor) if tid > 0]
         else:
-            scan_ids = list(range(anchor + 1, anchor + 49))
+            scan_ids = list(range(anchor + 1, anchor + scan_budget))
 
         for tid in scan_ids:
-            d = await _detail(tid)
+            d = await self._detail_one(tid)
             if not d or d.get("slug") != slug_want:
                 continue
             subs = d.get("markets", [])
