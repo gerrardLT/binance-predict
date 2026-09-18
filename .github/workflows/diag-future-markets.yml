@@ -31,6 +31,7 @@ jobs:
             docker compose -f docker-compose.prod.yml exec -T backend python - <<'PY'
             import asyncio
             import json
+            import time
 
             from binance_predict.services import clock_sync
             from binance_predict.services.prediction_trading import BinancePredictionTrader
