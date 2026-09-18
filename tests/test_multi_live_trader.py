@@ -2591,7 +2591,7 @@ def _make_real_trader(monkeypatch, with_15m: bool = True) -> BinancePredictionTr
     monkeypatch.setattr(trader, "list_markets", _list)
 
     # detail 预取默认不命中（避免单测触网；命中路径有独立用例覆盖）
-    async def _no_detail(_period, _start_ms):
+    async def _no_detail(_period, _start_ms, **_kw):
         return None
 
     monkeypatch.setattr(trader, "_fetch_market_via_detail", _no_detail)
@@ -2631,7 +2631,7 @@ async def test_signal_trade_market_success_external_call_baseline(monkeypatch) -
         calls["list"] += 1
         return await original_list()
 
-    async def _detail(period, start_ms):
+    async def _detail(period, start_ms, **_kw):
         calls["detail"] += 1
         return await original_detail(period, start_ms)
 
@@ -3053,7 +3053,7 @@ async def test_signal_trade_15m_detail_prefetch_fallback(monkeypatch) -> None:
     quote_tokens: list[str] = []
     fetched: list[tuple] = []
 
-    async def _detail(period, start_ms):
+    async def _detail(period, start_ms, **_kw):
         fetched.append((period, start_ms))
         return {"end_date": start_ms + 900_000, "up_token": "T-FUT-UP",
                 "down_token": "T-FUT-DOWN", "up_price": 0.5, "down_price": 0.5}
@@ -3097,7 +3097,7 @@ async def test_signal_trade_5m_anchor_mismatch_prefetch(monkeypatch) -> None:
     trader._5m_start_date = WINDOW_START - 300_000  # 缓存属上一周期
     quote_tokens: list[str] = []
 
-    async def _detail(period, start_ms):
+    async def _detail(period, start_ms, **_kw):
         return {"end_date": start_ms + 300_000, "up_token": "T5-UP",
                 "down_token": "T5-DOWN", "up_price": 0.5, "down_price": 0.5}
 
@@ -5281,6 +5281,196 @@ async def test_channel_gate_exception_does_not_skip_absorption_section(monkeypat
         "absorption 段应已执行并建立窗开快照；"
         "缺失说明 quote_edge 循环的异常中断了整个 check() sweep")
     assert t._abs_open[WINDOW_START] == (0.70, 10000.0)
+
+
+# ============================================================
+# 2026-09-18 手动下单模态框：scan_budget 参数化 + close_position 平仓（WS1/WS3）
+# ============================================================
+
+class _FakeResp:
+    def __init__(self, payload, status=200):
+        self._p = payload
+        self.status_code = status
+
+    def json(self):
+        return self._p
+
+    def raise_for_status(self):
+        return None
+
+
+class _FakeClient:
+    """list 端点返回一个 5m 锚点市场（topicId=5000）。"""
+
+    async def get(self, url, **kw):
+        return _FakeResp({"marketTopics": [
+            {"chartType": "CRYPTO_UP_DOWN", "symbol": "BTCUSDT",
+             "title": "BTC 5m up down", "marketTopicId": 5000},
+        ]})
+
+    async def aclose(self):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_fetch_market_via_detail_scan_budget_parameterized(monkeypatch) -> None:
+    """scan_budget 默认 48（热路径不变）；手动传 160 扫更远（WS1）。"""
+    trader = pt.BinancePredictionTrader()
+    probed: list[int] = []
+
+    async def _detail_one(tid):
+        probed.append(tid)
+        return None
+
+    monkeypatch.setattr(trader, "_detail_one", _detail_one)
+    monkeypatch.setattr(trader, "_get_client", lambda: _FakeClient())
+    monkeypatch.setattr(trader, "_sign_request", lambda p: dict(p))
+
+    await trader._fetch_market_via_detail("5m", 1_789_670_400_000)
+    assert min(probed) == 5001 and max(probed) == 5000 + 48
+    probed.clear()
+    await trader._fetch_market_via_detail("5m", 1_789_670_400_000, scan_budget=160)
+    assert max(probed) == 5000 + 160
+
+
+class _FakeScalar:
+    def __init__(self, row):
+        self._row = row
+
+    def scalar_one_or_none(self):
+        return self._row
+
+
+class _FakeDB:
+    def __init__(self, row):
+        self.row = row
+        self.added: list = []
+        self.committed = False
+
+    async def execute(self, stmt):
+        return _FakeScalar(self.row)
+
+    def add(self, obj):
+        self.added.append(obj)
+
+    async def commit(self):
+        self.committed = True
+
+
+def _buy_row():
+    return SimpleNamespace(
+        id=77, status="FILLED", settled_at=None, side="BUY", token_id="TOK",
+        amount_in=str(int(1 * 1e18)),
+        quote_json={"filledShareQty": 1.92, "averagePrice": 0.5},
+        window_start=1_789_670_400_000, market_period="5m", direction="UP",
+        settle_outcome=None, win=None, pnl=None, settle_price=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_close_position_filled_realizes_pnl_and_sell_row(monkeypatch) -> None:
+    """平仓成交：BUY 行写 SOLD/settled_at/pnl，插 SELL 行（manual_close），提交。"""
+    trader = pt.BinancePredictionTrader()
+    row = _buy_row()
+    db = _FakeDB(row)
+
+    @asynccontextmanager
+    async def _factory():
+        yield db
+
+    monkeypatch.setattr(pt, "async_session_factory", _factory)
+    monkeypatch.setattr(trader, "get_quote",
+                        AsyncMock(return_value={"quoteId": "q", "averagePrice": 0.5,
+                                                 "amountOut": str(int(0.95 * 1e18))}))
+    monkeypatch.setattr(trader, "place_order",
+                        AsyncMock(return_value={"orderId": "SELL-1"}))
+    monkeypatch.setattr(trader, "_confirm_with_backfill",
+                        AsyncMock(return_value={"status": "FILLED",
+                                                "filledUsdtAmount": "0.95",
+                                                "price": "0.5"}))
+
+    out = await trader.close_position(77)
+
+    assert out["status"] == "CLOSED"
+    assert out["sell_order_id"] == "SELL-1"
+    assert out["proceeds"] == 0.95
+    assert abs(out["pnl"] - (0.95 - 1.0)) < 1e-9
+    # BUY 行卖出即实现盈亏 → 结算器（只扫 settled_at IS NULL）天然跳过
+    assert row.settled_at is not None
+    assert row.settle_outcome == "SOLD"
+    assert row.win is False  # 0.95 < 1.0 亏
+    assert row.settle_price == 0.5
+    assert row.redeemed_at is not None  # 已卖 token 不再进可赎回集合
+    # SELL 记录行：signal_version 带 BUY id 避唯一键；amount_in 为 USDT 口径
+    assert len(db.added) == 1
+    sell = db.added[0]
+    assert sell.side == "SELL"
+    assert sell.signal_version == "manual_close:77"
+    assert sell.amount_in == str(int(0.95 * 1e18))
+    assert sell.quote_json["soldShareQty"] == 1.92
+    assert sell.window_start == row.window_start
+    assert db.committed is True
+
+
+@pytest.mark.asyncio
+async def test_close_position_not_filled_no_db_change(monkeypatch) -> None:
+    """SELL 未成交 → 返回 error，不改库、不插行。"""
+    trader = pt.BinancePredictionTrader()
+    row = _buy_row()
+    db = _FakeDB(row)
+
+    @asynccontextmanager
+    async def _factory():
+        yield db
+
+    monkeypatch.setattr(pt, "async_session_factory", _factory)
+    monkeypatch.setattr(trader, "get_quote",
+                        AsyncMock(return_value={"quoteId": "q", "averagePrice": 0.5}))
+    monkeypatch.setattr(trader, "place_order",
+                        AsyncMock(return_value={"orderId": "SELL-2"}))
+    monkeypatch.setattr(trader, "_confirm_with_backfill",
+                        AsyncMock(return_value={"status": "FAILED"}))
+
+    out = await trader.close_position(77)
+
+    assert "error" in out
+    assert row.settled_at is None and row.settle_outcome is None
+    assert db.added == [] and db.committed is False
+
+
+@pytest.mark.asyncio
+async def test_close_position_guards_reject(monkeypatch) -> None:
+    """非 FILLED / 已结算 / 非 BUY / 缺 token → 拒绝且不触真金路径。"""
+    trader = pt.BinancePredictionTrader()
+
+    async def _no_quote(*a, **kw):  # pragma: no cover
+        raise AssertionError("守卫拒单不应触达报价")
+
+    monkeypatch.setattr(trader, "get_quote", _no_quote)
+
+    for bad in (
+        SimpleNamespace(id=1, status="PENDING", settled_at=None, side="BUY",
+                        token_id="T", amount_in="1", quote_json={},
+                        window_start=1, market_period="5m", direction="UP"),
+        SimpleNamespace(id=2, status="FILLED", settled_at=datetime.now(timezone.utc),
+                        side="BUY", token_id="T", amount_in="1", quote_json={},
+                        window_start=1, market_period="5m", direction="UP"),
+        SimpleNamespace(id=3, status="FILLED", settled_at=None, side="SELL",
+                        token_id="T", amount_in="1", quote_json={},
+                        window_start=1, market_period="5m", direction="UP"),
+        SimpleNamespace(id=4, status="FILLED", settled_at=None, side="BUY",
+                        token_id=None, amount_in="1", quote_json={},
+                        window_start=1, market_period="5m", direction="UP"),
+    ):
+        db = _FakeDB(bad)
+
+        @asynccontextmanager
+        async def _factory(db=db):
+            yield db
+
+        monkeypatch.setattr(pt, "async_session_factory", _factory)
+        out = await trader.close_position(bad.id)
+        assert "error" in out
 
 
 

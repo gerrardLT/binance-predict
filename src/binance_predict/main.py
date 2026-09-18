@@ -52,6 +52,7 @@ from .db.models import (
 )
 from .models.schemas import (
     CommitDeepLearnRequest,
+    ClosePositionRequest,
     LoginRequest,
     ManualTradeTestRequest,
     RedeemRequest,
@@ -2283,6 +2284,7 @@ async def get_recent_trades(
                 # 「按这个价买到了」（2026-09-04 id=285 归因时踩到）。
                 "price_kind": _order_price_kind(o),
                 "direction": o.direction,
+                "side": o.side,
                 "settle_outcome": o.settle_outcome,
                 "settle_price": getattr(o, "settle_price", None),
                 "win": o.win,
@@ -2314,7 +2316,13 @@ async def get_trades_fund_flow(
     from .db.models import TradeOrderModel
 
     limit = max(1, min(int(limit), 5000))
-    stmt = select(TradeOrderModel).order_by(TradeOrderModel.created_at.asc()).limit(limit)
+    stmt = (
+        select(TradeOrderModel)
+        # 平仓 SELL 记录行不参与资金流水：BUY 的 SOLD 行已带实现盈亏，
+        # 前端按 settled+pnl 算回流即正确；SELL 行会造成 phantom 流出（Medium#4）
+        .where(TradeOrderModel.side.is_distinct_from("SELL"))
+        .order_by(TradeOrderModel.created_at.asc()).limit(limit)
+    )
     if since_ms > 0:
         since_dt = datetime.fromtimestamp(int(since_ms) / 1000, tz=timezone.utc)
         stmt = stmt.where(TradeOrderModel.created_at >= since_dt)
@@ -2452,12 +2460,17 @@ async def get_quote_preview(_: None = Depends(_require_auth)):
     """
     async with _state_lock:
         snap = dict(_pm_market_info)
+    # BTC 现货参考（C4/A3）：当前 mid 与窗口开盘价（_window_entry_price 在窗口
+    # 起点快照）；源不可用时为 null，前端据此算本窗涨跌幅
+    btc_mid = collector.store.mid_price or None
     if not snap:
         return {
             "window_start": None,
             "window_end": None,
             "up_price": None,
             "down_price": None,
+            "btc_price": btc_mid,
+            "window_open_btc": _window_entry_price,
             "server_now_ms": int(time.time() * 1000),
             "stale": True,
         }
@@ -2467,8 +2480,51 @@ async def get_quote_preview(_: None = Depends(_require_auth)):
         "window_end": int(end) if end is not None else None,
         "up_price": snap.get("up_price"),
         "down_price": snap.get("down_price"),
+        "btc_price": btc_mid,
+        "window_open_btc": _window_entry_price,
         "server_now_ms": int(time.time() * 1000),
         "stale": False,
+    }
+
+
+@app.get("/api/prediction/future-markets")
+async def get_future_markets(
+    period: str = "5m",
+    count: int = 8,
+    _: None = Depends(_require_auth),
+):
+    """未来周期市场列表（手动下单模态框周期选择条用）。
+
+    market/list 不返回未来周期（2026-09-17 实测），只能靠 market/detail 按
+    topicId 扫描（slug 可预测 btc-updown-{period}-{epoch}）。本端点带 TTL 30s
+    缓存 + 每 period 单飞锁，避免模态框频繁打开打满配额。仅返回未来窗
+    （ahead>0）；价格直接取 detail 的 outcome price，不调 get_quote。
+    """
+    if period not in ("5m", "15m"):
+        return {"error": "period 仅允许 5m/15m"}
+    if not (1 <= count <= 8):
+        return {"error": "count 仅允许 1~8"}
+    windows, cached_age = await prediction_trader.get_future_markets_cached(
+        period, count=count)
+    # 当前窗报价/起止（Medium#8）：quote-preview 仅 5m，15m 当前窗价/倒计时
+    # 改由本端点从 list_markets 缓存提供
+    if period == "5m":
+        cs, ce = prediction_trader._5m_start_date, prediction_trader._5m_end_date
+        cu, cd = prediction_trader._5m_up_price, prediction_trader._5m_down_price
+    else:
+        cs, ce = prediction_trader._15m_start_date, prediction_trader._15m_end_date
+        cu, cd = prediction_trader._15m_up_price, prediction_trader._15m_down_price
+    current = (
+        {"window_start": int(cs), "window_end": int(ce) if ce else None,
+         "up_price": cu, "down_price": cd}
+        if cs is not None else None
+    )
+    return {
+        "period": period,
+        "server_now_ms": int(time.time() * 1000),
+        "cached_age_sec": round(cached_age, 1),
+        "current": current,
+        "windows": windows,
     }
 
 
@@ -2480,43 +2536,111 @@ async def manual_trade_test(
     """实盘链路人工测试单：钱包→市场→报价→下单→落库全链路验证。
 
     与信号实盘共用 execute_signal_trade（先占位后下单），signal_version="manual_test"：
-    同一 5m 窗口至多一单（唯一键防重），订单落 trade_orders 表可追溯。
-    金额硬限 0.1~50 USDT（与实盘单笔硬上限 MAX_ORDER_AMOUNT_USDT 对齐）；
-    不设执行价护栏。"""
+    同一窗口至多一单（唯一键防重），订单落 trade_orders 表可追溯。
+    金额硬限 0.1~50 USDT（与实盘单笔硬上限 MAX_ORDER_AMOUNT_USDT 对齐）。
+    支持 market_period（5m/15m）与 window_start（未来窗）选择，以及
+    max_exec_price 执行价护栏（超价/贴线弃单）。
+    """
     if not (0.1 <= req.amount_usdt <= 50.0):
         return {"error": "amount_usdt 仅允许 0.1~50（与实盘单笔硬上限一致）"}
     if req.prediction not in ("UP", "DOWN"):
         return {"error": "prediction 仅允许 UP/DOWN"}
+    if req.market_period not in ("5m", "15m"):
+        return {"error": "market_period 仅允许 5m/15m"}
+    if req.max_exec_price is not None and not (0.0 < req.max_exec_price < 1.0):
+        return {"error": "max_exec_price 仅允许 0~1 开区间"}
+    if req.price_limit is not None and not (0.0 < req.price_limit < 1.0):
+        return {"error": "price_limit 仅允许 0~1 开区间"}
+    # LIMIT 的限价值与护栏共用 max_exec_price（execute_signal_trade line: limit_price=max_exec_price）；
+    # MARKET 则仅用 max_exec_price 作护栏
+    effective_guard = (
+        req.price_limit if req.order_type == "LIMIT" else req.max_exec_price
+    )
 
-    window_start = int(time.time() * 1000) // 300_000 * 300_000  # 当前 5m 窗口起点
+    step_ms = 300_000 if req.market_period == "5m" else 900_000
+    now_ms = int(time.time() * 1000)
+    current_start = now_ms // step_ms * step_ms
+    if req.window_start is None:
+        window_start = current_start
+    else:
+        window_start = int(req.window_start)
+        if window_start % step_ms != 0:
+            return {"error": f"window_start 必须对齐 {req.market_period} 网格（{step_ms}ms）"}
+        if window_start < current_start:
+            return {"error": "window_start 不能早于当前窗口"}
+        if window_start > now_ms + 80 * 60_000:
+            return {"error": "window_start 超出扫描 horizon（now+80min）"}
+
+    # 踩线兜底（C12，Medium#5 统一）：当前窗距收盘 <5s 拒单；
+    # 未来窗距开盘 <5s 同样拒单（旧版只判当前窗，领先 1ms 的未来窗无守卫）
+    if window_start == current_start:
+        if window_start + step_ms - now_ms < 5_000:
+            return {"error": "距收盘不足 5 秒，请改选下一窗口"}
+    elif window_start - now_ms < 5_000:
+        return {"error": "距开盘不足 5 秒，请改选下一窗口"}
+
     order = await prediction_trader.execute_signal_trade(
         prediction=req.prediction,
         amount_usdt=req.amount_usdt,
         signal_version="manual_test",
         window_start=window_start,
-        max_exec_price=req.price_limit if req.order_type == "LIMIT" else None,
+        max_exec_price=effective_guard,
+        market_period=req.market_period,
         order_type=req.order_type,
+        scan_budget=160,  # 手动远窗需更大扫描预算（Medium#6）
     )
     if order is None:
         return {
-            "error": "下单未执行（API Key 未配置 / 钱包获取失败 / 本窗口已有测试单）",
+            "error": "下单未执行（API Key 未配置 / 钱包获取失败 / 本窗口已有测试单 / 护栏弃单）",
             "window_start": window_start,
         }
     # 产生订单即作废余额缓存（下单扣预测钱包余额；与划转端点同款失效逻辑）
     _wallet_view_ts["balance"] = 0.0
     # order 为 dict 快照（execute_signal_trade 不再返回 ORM 对象，
     # 避免会话关闭后访问属性报 DetachedInstanceError）
+    # 从 quote_json 抽取成交股数/手续费（C8 结果区增强）
+    qj = order.get("quote_json")
+    if isinstance(qj, str):
+        try:
+            import json as _json
+            qj = _json.loads(qj)
+        except Exception:
+            qj = None
+    qj = qj if isinstance(qj, dict) else {}
     return {
         "status": order.get("status"),
         "order_id": order.get("order_id"),
         "direction": order.get("direction"),
         "signal_version": order.get("signal_version"),
         "window_start": order.get("window_start"),
+        "window_end": (order.get("window_start") or 0) + step_ms,
+        "market_period": req.market_period,
         "token_id": order.get("token_id") or None,
         "average_price": order.get("average_price"),
         "amount_in": order.get("amount_in"),
+        "filled_shares": qj.get("filledShareQty"),
+        "provider_fee": qj.get("marketProviderFee"),
         "error_message": order.get("error_message"),
     }
+
+
+@app.post("/api/trade/close")
+async def close_position(
+    req: ClosePositionRequest,
+    _: None = Depends(_require_auth),
+):
+    """平仓（SELL）：平掉指定未结算 FILLED BUY 持仓的全部股数。
+
+    卖出即实现盈亏：成交后原 BUY 行写 settled_at/settle_outcome="SOLD"/win/pnl，
+    并插一条 side="SELL" 记录行；结算器只扫 settled_at IS NULL 故天然跳过。
+    未成交则不改库、仅回显错误。
+    """
+    result = await prediction_trader.close_position(req.order_id)
+    if result.get("error"):
+        return result
+    # 平仓成功：作废余额缓存（SELL 回款入预测钱包）
+    _wallet_view_ts["balance"] = 0.0
+    return result
 
 
 @app.post("/api/live/toggle")
@@ -3124,6 +3248,8 @@ async def prediction_redeemable(_: None = Depends(_require_auth)):
             .where(TradeOrderModel.redeemed_at.is_(None))
             .where(TradeOrderModel.token_id.isnot(None))
             .where(TradeOrderModel.token_id != "")
+            # 手动平仓（SOLD）的 token 已不在钱包，不得计入可赎回（Medium#3）
+            .where(TradeOrderModel.settle_outcome.is_distinct_from("SOLD"))
             .order_by(TradeOrderModel.id.desc())
         )).all()
     db_tokens = [r.token_id for r in rows]
@@ -3210,6 +3336,8 @@ async def prediction_redeem(
                 .where(TradeOrderModel.redeemed_at.is_(None))
                 .where(TradeOrderModel.token_id.isnot(None))
                 .where(TradeOrderModel.token_id != "")
+                # 手动平仓（SOLD）token 已卖出，送 batch-redeem 会 400（Medium#3）
+                .where(TradeOrderModel.settle_outcome.is_distinct_from("SOLD"))
             )).all()
         token_ids = [r.token_id for r in rows]
     if not token_ids:
