@@ -954,6 +954,80 @@ const SIGNAL_INFO: Record<string, { name: string; desc: string; retired?: boolea
     name: '15m孕线倒垂线反转（押UP）',
     desc: '15m Ver2 经典反转：前置 4 根低点最长实体阴线 + 信号柱完全被包裹（Inside Bar）+ 底部长上影倒垂线、短下影≤10% → 押次根 15m 收阳 UP（720d 胜率 52.5%，30d 胜率 62.5%）。默认挂单护栏 0.30，可通过实盘通道热配置下调。',
   },
+  // --- 蜡烛反转族 18 逻辑版本（中文名与后端 candlestick_shadow_detector.CANDLESTICK_DISPLAY_NAMES 对齐）---
+  // 共享 5m/15m 物理事件，各逻辑版本独立注册实盘；不收录会让订单表/通道面板退回裸英文 ID。
+  candle_hm_bull_5m_consensus2_shadow_v1: {
+    name: '5m长下影·至少2趋势',
+    desc: '蜡烛反转族 5m 主影子：阳线、下影≥50%、实体≤50%、上影≤10%，且 ret3/ret5_majority/ma10 至少两种上涨 → 押次根 5m DOWN。与对照/归因版本共享物理事件，实盘按逻辑版本独立派单。',
+  },
+  candle_hm_bull_5m_consensus3_shadow_v1: {
+    name: '5m长下影·三趋势对照',
+    desc: '蜡烛反转族 5m 严格对照：主影子的三趋势全同意子集；与主版本共用一个物理事件，不代表第二笔独立暴露。',
+  },
+  candle_hm_bull_15m_union_shadow_v1: {
+    name: '15m长下影·任一趋势',
+    desc: '蜡烛反转族 15m 主影子：同一长下影阳线形态，三趋势任一种上涨即触发 → 押次根 15m DOWN。',
+  },
+  candle_hm_bull_15m_consensus3_shadow_v1: {
+    name: '15m长下影·三趋势对照',
+    desc: '蜡烛反转族 15m 严格对照：主版本的三趋势全同意子集；共用物理事件。',
+  },
+  candle_hm_bull_5m_ret5_majority_component_shadow_v1: {
+    name: '5m ret5归因组件',
+    desc: '蜡烛反转族 5m ret5_majority 单趋势归因标签；仅解释边际贡献，与主影子共享物理事件。',
+  },
+  candle_hm_bull_5m_ret3_component_shadow_v1: {
+    name: '5m ret3归因组件',
+    desc: '蜡烛反转族 5m ret3 单趋势归因标签；仅解释边际贡献，与主影子共享物理事件。',
+  },
+  candle_hm_bull_15m_ret3_component_shadow_v1: {
+    name: '15m ret3归因组件',
+    desc: '蜡烛反转族 15m ret3 单趋势归因标签；仅解释边际贡献，与主影子共享物理事件。',
+  },
+  candle_hm_bull_15m_ma10_component_shadow_v1: {
+    name: '15m ma10归因组件',
+    desc: '蜡烛反转族 15m ma10 单趋势归因标签；仅解释边际贡献，与主影子共享物理事件。',
+  },
+  candle_hm_bull_5m_volume_mid_high_shadow_hyp_v1: {
+    name: '5m长下影·中高量能',
+    desc: '蜡烛反转族预注册潜力：5m 主形态 + 0.75≤volume/median20<2（中高量能）；后验 regime 假设，只能用新数据前向验证。',
+  },
+  candle_hm_bull_5m_trend4h_up_shadow_hyp_v1: {
+    name: '5m长下影·4h上涨',
+    desc: '蜡烛反转族预注册潜力：5m 主形态 + 前 4h 上涨；只作标签，不替代主影子。',
+  },
+  candle_hm_bull_5m_asia_shadow_hyp_v1: {
+    name: '5m长下影·亚洲时段',
+    desc: '蜡烛反转族预注册潜力：5m 主形态 + UTC 00~08 亚洲时段；只作标签。',
+  },
+  candle_hm_bull_15m_q45_55_shadow_hyp_v1: {
+    name: '15m长下影·报价0.45~0.55',
+    desc: '蜡烛反转族预注册潜力：15m 主形态 + 首个完整 DOWN 报价落在 [0.45,0.55)；只作标签。',
+  },
+  candle_hm_bull_15m_trend1h_up_shadow_hyp_v1: {
+    name: '15m长下影·1h上涨',
+    desc: '蜡烛反转族预注册潜力：15m 主形态 + 前 1h 上涨；只作标签。',
+  },
+  candle_hm_bull_15m_asia_shadow_hyp_v1: {
+    name: '15m长下影·亚洲时段',
+    desc: '蜡烛反转族预注册潜力：15m 主形态 + UTC 00~08 亚洲时段；低样本，只作标签。',
+  },
+  candidate_5m_ret5_majority_up_upper_bull_l70b30m10_shadow_hyp_v1: {
+    name: '5m上涨阳线长上影',
+    desc: '独立潜力：5m ret5 上涨、阳线长上影≥70%、实体≤30%、下影≤10% → 押 DOWN。',
+  },
+  candidate_5m_ret3_up_lower_bear_l50b50m0_shadow_hyp_v1: {
+    name: '5m严格零上影阴线长下影',
+    desc: '独立潜力：5m ret3 上涨、阴线长下影≥50%、实体≤50%、原始 OHLC 严格零上影 → 押 DOWN。',
+  },
+  candidate_15m_ret5_majority_up_lower_bull_l50b40m10_shadow_hyp_v1: {
+    name: '15m ret5阳线长下影',
+    desc: '独立潜力：15m ret5 上涨、阳线长下影≥50%、实体≤40%、上影≤10% → 押 DOWN。',
+  },
+  candidate_15m_ret3_down_upper_bull_l50b40m10_shadow_hyp_v1: {
+    name: '15m下跌阳线长上影',
+    desc: '独立潜力：15m ret3 下跌、阳线长上影≥50%、实体≤40%、下影≤10% → 押 UP。',
+  },
 }
 
 /* 信号分类拆成独立维度：采集层始终可记录；执行层才决定是否真金下单。 */
@@ -3487,7 +3561,7 @@ function LiveTradeTab() {
                         {ch.order_type === 'LIMIT' ? '限价GTC' : '市价FOK'}
                       </span>
                       <span className="text-ink-95 font-medium truncate">{info?.name ?? ch.display_name}</span>
-                      <span className="text-[10px] text-ink-55 font-mono shrink-0 hidden md:inline">{ch.channel}</span>
+                      <span className="text-[10px] text-ink-55 font-mono hidden md:inline truncate max-w-[10em]" title={ch.channel}>{ch.channel}</span>
                       <HelpHint text={info?.desc ?? ch.display_name} />
                     </span>
                     <span className="shrink-0 flex items-center gap-1">
@@ -3591,7 +3665,7 @@ function LiveTradeTab() {
                             <span className="flex items-center gap-1.5 min-w-0 flex-1">
                               <span className="ds-badge ds-badge-neutral shrink-0">已停火</span>
                               <span className="text-ink-95 font-medium truncate">{info?.name ?? ch.display_name}</span>
-                              <span className="text-[10px] text-ink-55 font-mono shrink-0 hidden md:inline">{ch.channel}</span>
+                              <span className="text-[10px] text-ink-55 font-mono hidden md:inline truncate max-w-[10em]" title={ch.channel}>{ch.channel}</span>
                               <HelpHint text={info?.desc ?? ch.display_name} />
                             </span>
                             <span className="shrink-0 flex items-center gap-1">
