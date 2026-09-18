@@ -2148,27 +2148,89 @@ function KlineMini({ period, nowMs }: { period: '5m' | '15m'; nowMs: number }) {
     }
   }, [period])
 
+  // ---- 交互状态：滚轮/按钮缩放 + 拖拽平移 + 悬停十字线数据 ----
+  const W = 560
+  const H = 150
+  const n = bars.length
+  const [view, setView] = useState({ i0: 0, count: 60 })
+  const [hover, setHover] = useState<{ i: number; vx: number; vy: number } | null>(null)
+  const dragRef = useRef<{ x: number; i0: number } | null>(null)
+  const wrapRef = useRef<HTMLDivElement | null>(null)
+
+  const count = Math.max(15, Math.min(view.count, Math.max(n, 15)))
+  const i0 = Math.max(0, Math.min(view.i0, Math.max(0, n - count)))
+  const slice = bars.slice(i0, i0 + count)
+
+  // 新 K 线到达时若原本贴着右缘则继续贴右（用户已平移离开则不打断）
+  useEffect(() => {
+    setView(v => (v.i0 + v.count >= n - 1 ? { ...v, i0: Math.max(0, n - v.count) } : v))
+  }, [n])
+
+  // 滚轮缩放：非 passive 监听 + preventDefault，避免滚动模态框
+  useEffect(() => {
+    const el = wrapRef.current
+    if (!el) return
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault()
+      const rect = el.getBoundingClientRect()
+      const f = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width))
+      setView(v => {
+        const c = Math.max(15, Math.min(n, Math.round(v.count * (e.deltaY < 0 ? 0.8 : 1.25))))
+        const anchor = v.i0 + f * v.count
+        return { i0: Math.max(0, Math.min(n - c, Math.round(anchor - f * c))), count: c }
+      })
+    }
+    el.addEventListener('wheel', onWheel, { passive: false })
+    return () => el.removeEventListener('wheel', onWheel)
+  }, [n])
+
+  const onMove = (e: React.MouseEvent<SVGSVGElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect()
+    if (dragRef.current) {
+      const per = rect.width / count
+      const di = Math.round((e.clientX - dragRef.current.x) / per)
+      const base = dragRef.current.i0
+      setView(v => ({ ...v, i0: Math.max(0, Math.min(n - v.count, base - di)) }))
+      return
+    }
+    const vx = ((e.clientX - rect.left) / rect.width) * W
+    const vy = ((e.clientY - rect.top) / rect.height) * H
+    const i = Math.max(0, Math.min(slice.length - 1, Math.floor((vx / W) * count)))
+    setHover({ i, vx, vy })
+  }
+
   // 所选周期当前窗收盘倒计时
   const step = period === '5m' ? 300_000 : 900_000
   const remain = Math.max(0, Math.floor(((Math.floor(nowMs / step) + 1) * step - nowMs) / 1000))
 
-  // SVG 蜡烛图坐标
-  const W = 560
-  const H = 150
-  const n = bars.length
+  // 坐标（基于当前显示 slice）
   let lo = Infinity
   let hi = -Infinity
-  for (const b of bars) { if (b.l < lo) lo = b.l; if (b.h > hi) hi = b.h }
+  for (const b of slice) { if (b.l < lo) lo = b.l; if (b.h > hi) hi = b.h }
+  if (!Number.isFinite(lo)) { lo = 0; hi = 1 }
   const pad = (hi - lo) * 0.08 || 1
   lo -= pad; hi += pad
   const y = (v: number) => H - ((v - lo) / (hi - lo)) * H
-  const bw = n > 0 ? W / n : W
+  const bw = slice.length > 0 ? W / slice.length : W
   const last = n > 0 ? bars[n - 1] : null
+  const hoverBar = hover != null ? slice[hover.i] : null
 
   return (
     <div className="space-y-1">
       <div className="flex items-center gap-1.5">
         <span className="text-[11px] text-ink-55">BTC 实时 K 线</span>
+        <span className="flex items-center gap-0.5" title="滚轮缩放 · 拖拽平移 · 悬停看数据">
+          <button onClick={() => setView(v => {
+            const c = Math.max(15, Math.round(v.count * 0.8))
+            return { i0: Math.max(0, Math.min(n - c, v.i0 + Math.round((v.count - c) / 2))), count: c }
+          })} className="px-1 rounded border border-line text-[10px] text-ink-55 hover:border-brand">＋</button>
+          <button onClick={() => setView(v => {
+            const c = Math.min(Math.max(n, 15), Math.round(v.count * 1.25))
+            return { i0: Math.max(0, Math.min(n - c, v.i0)), count: c }
+          })} className="px-1 rounded border border-line text-[10px] text-ink-55 hover:border-brand">－</button>
+          <button onClick={() => setView({ i0: Math.max(0, n - 60), count: Math.min(60, Math.max(n, 15)) })}
+            className="px-1 rounded border border-line text-[10px] text-ink-55 hover:border-brand">重置</button>
+        </span>
         <span className="ml-auto font-mono text-[11px] font-bold tabular-nums" title="所选周期当前窗收盘倒计时">
           收盘 {fmtMMSS(remain)}
         </span>
@@ -2177,29 +2239,53 @@ function KlineMini({ period, nowMs }: { period: '5m' | '15m'; nowMs: number }) {
         </span>
       </div>
       {n > 1 ? (
-        <svg viewBox={`0 0 ${W} ${H}`} className="w-full rounded-sm bg-sunken" style={{ height: 150 }}>
-          {bars.map((b, i) => {
-            const cx = i * bw + bw / 2
-            const up = b.c >= b.o
-            const color = up ? 'var(--positive)' : 'var(--negative)'
-            const bodyTop = y(Math.max(b.o, b.c))
-            const bodyH = Math.max(1, Math.abs(y(b.o) - y(b.c)))
-            return (
-              <g key={b.t}>
-                <line x1={cx} x2={cx} y1={y(b.h)} y2={y(b.l)} stroke={color} strokeWidth={1} />
-                <rect x={cx - bw * 0.32} y={bodyTop} width={bw * 0.64} height={bodyH} fill={color} />
+        <div ref={wrapRef} className="relative select-none">
+          <svg viewBox={`0 0 ${W} ${H}`} className="w-full rounded-sm bg-sunken cursor-crosshair" style={{ height: 150 }}
+            onMouseMove={onMove}
+            onMouseLeave={() => { setHover(null); dragRef.current = null }}
+            onMouseDown={e => { dragRef.current = { x: e.clientX, i0 }; setHover(null) }}
+            onMouseUp={() => { dragRef.current = null }}
+          >
+            {slice.map((b, i) => {
+              const cx = i * bw + bw / 2
+              const up = b.c >= b.o
+              const color = up ? 'var(--positive)' : 'var(--negative)'
+              const bodyTop = y(Math.max(b.o, b.c))
+              const bodyH = Math.max(1, Math.abs(y(b.o) - y(b.c)))
+              return (
+                <g key={b.t}>
+                  <line x1={cx} x2={cx} y1={y(b.h)} y2={y(b.l)} stroke={color} strokeWidth={1} />
+                  <rect x={cx - bw * 0.32} y={bodyTop} width={bw * 0.64} height={bodyH} fill={color} />
+                </g>
+              )
+            })}
+            {last != null && (
+              <g>
+                <line x1={0} x2={W} y1={y(last.c)} y2={y(last.c)} stroke="var(--ink-55)" strokeDasharray="3 3" strokeWidth={0.8} />
+                <text x={W - 4} y={y(last.c) - 3} textAnchor="end" fontSize={10} fill="var(--ink-80)" fontFamily="monospace">
+                  {last.c.toFixed(1)}
+                </text>
               </g>
-            )
-          })}
-          {last != null && (
-            <g>
-              <line x1={0} x2={W} y1={y(last.c)} y2={y(last.c)} stroke="var(--ink-55)" strokeDasharray="3 3" strokeWidth={0.8} />
-              <text x={W - 4} y={y(last.c) - 3} textAnchor="end" fontSize={10} fill="var(--ink-80)" fontFamily="monospace">
-                {last.c.toFixed(1)}
-              </text>
-            </g>
+            )}
+            {hover != null && (
+              <g>
+                <line x1={hover.vx} x2={hover.vx} y1={0} y2={H} stroke="var(--ink-55)" strokeWidth={0.6} strokeDasharray="2 2" />
+                <line x1={0} x2={W} y1={hover.vy} y2={hover.vy} stroke="var(--ink-55)" strokeWidth={0.6} strokeDasharray="2 2" />
+              </g>
+            )}
+          </svg>
+          {hoverBar != null && hover != null && (
+            <div className="absolute z-10 pointer-events-none rounded-sm border border-line bg-card/95 px-2 py-1 text-[10px] font-mono text-ink-80 space-y-0.5"
+              style={{ left: `${Math.min(72, Math.max(0, (hover.vx / W) * 100))}%`, top: 4 }}>
+              <div>{new Date(hoverBar.t).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} · {period}</div>
+              <div>O {hoverBar.o.toFixed(1)} H {hoverBar.h.toFixed(1)}</div>
+              <div>L {hoverBar.l.toFixed(1)} C {hoverBar.c.toFixed(1)}</div>
+              <div className={hoverBar.c >= hoverBar.o ? 'text-positive' : 'text-negative'}>
+                {hoverBar.c >= hoverBar.o ? '+' : ''}{(((hoverBar.c - hoverBar.o) / hoverBar.o) * 100).toFixed(2)}%
+              </div>
+            </div>
           )}
-        </svg>
+        </div>
       ) : (
         <div className="h-[150px] flex items-center justify-center rounded-sm bg-sunken text-[11px] text-ink-55">
           K 线加载中…（网络不通时自动降级轮询）
