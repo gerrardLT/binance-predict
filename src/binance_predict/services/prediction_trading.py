@@ -103,6 +103,19 @@ def in_entry_band_whitelist(
     return any(lo <= avg_price < hi for lo, hi in bands)
 
 
+class DetailRateLimited(Exception):
+    """market/detail 响应 429/418（sapi 限流/封禁）：扫描方应中止本轮。
+
+    继续打波会升级为 418 IP 封禁，拖垮与下单热路径共享的同一把 Key/配额
+    （W#10）——捕获后立即停止发后续波，返回已收集结果。
+    """
+
+    def __init__(self, topic_id: int, status_code: int):
+        super().__init__(f"detail rate-limited tid={topic_id} status={status_code}")
+        self.topic_id = topic_id
+        self.status_code = status_code
+
+
 class BinancePredictionTrader:
     """
     Binance 预测市场交易服务
@@ -928,11 +941,17 @@ class BinancePredictionTrader:
     async def _detail_one(self, topic_id: int) -> dict | None:
         """通用 detail 调用（供 _fetch_market_via_detail / scan_future_markets 共用）。
 
+        限流时抛 DetailRateLimited（调用方中止本轮，不再继续加压，W#10）；
+        其余异常/非 200 返回 None。
+
         Args:
             topic_id: marketTopicId
 
         Returns:
             market/detail JSON 响应或 None（异常/非 200）
+
+        Raises:
+            DetailRateLimited: 响应 429/418（sapi 限流/封禁）
         """
         client = self._get_client()
         try:
@@ -943,10 +962,11 @@ class BinancePredictionTrader:
                 headers={"X-MBX-APIKEY": self._api_key},
             )
             if resp.status_code in (429, 418):
-                # 限流不能静默吞掉（否则热路径取不到市场却无告警，Low#11）
-                logger.warning("detail 限流 | tid={} | status={}", topic_id, resp.status_code)
-                return None
+                # 限流不能静默吞掉：抛异常让扫描方中止本轮（继续打会升级 418）
+                raise DetailRateLimited(topic_id, resp.status_code)
             return resp.json() if resp.status_code == 200 else None
+        except DetailRateLimited:
+            raise
         except Exception:
             return None
 
@@ -1007,7 +1027,7 @@ class BinancePredictionTrader:
 
         prefix = f"btc-updown-{period}-"
         tids = list(range(anchor + 1, anchor + budget + 1))
-        WAVE = 20  # 每波并发 20 个 detail；波间检查是否已凑够，凑够即停
+        WAVE = 10  # 每波并发 10 个 detail（W#10 降并发）；波间退避，凑够即停
         collected: list[dict] = []
 
         def _to_row(tid: int, d: dict | None) -> dict | None:
@@ -1038,12 +1058,16 @@ class BinancePredictionTrader:
             }
 
         miss_streak = 0
+        rate_limited = False
         try:
             for i in range(0, len(tids), WAVE):
                 wave = tids[i:i + WAVE]
                 details = await asyncio.gather(
                     *(self._detail_one(t) for t in wave), return_exceptions=True)
                 for tid, d in zip(wave, details):
+                    if isinstance(d, DetailRateLimited):
+                        rate_limited = True
+                        continue
                     if isinstance(d, BaseException):
                         miss_streak += 1
                         continue
@@ -1053,12 +1077,21 @@ class BinancePredictionTrader:
                         miss_streak = 0
                     else:
                         miss_streak += 1
+                if rate_limited:
+                    # 限流即中止本轮（W#10）：继续打波会升级 418 封禁，
+                    # 拖垮与下单热路径共享的 Key/配额；返回已收集结果
+                    logger.warning(
+                        "scan_future_markets | {} | 命中限流，中止本轮（已收集 {}）",
+                        period, len(collected))
+                    break
                 if len(collected) >= count:
                     break  # 提前终止：已凑够，不再打后续波
                 if miss_streak >= 60:
                     # 连续 60 个 ID 无 BTC 命中：已扫过未来市场创建前沿，
-                    # 止损退出，避免 15m 等稀硫周期每轮烧满 160 次签名请求（Low#11）
+                    # 止损退出，避免 15m 等稀疏周期每轮烧满 160 次签名请求（Low#11）
                     break
+                # 波间退避：平滑突发，避免 ~50 req/s 冲击 sapi 配额（W#10）
+                await asyncio.sleep(0.3)
         except Exception as e:
             logger.warning("scan_future_markets | {} | {}", period, e)
 
@@ -1079,28 +1112,35 @@ class BinancePredictionTrader:
             cached_age_sec 为缓存年龄（秒），新扫描为 0.0
         """
         now = int(time.time() * 1000)
-        key = f"{period}:{count}"  # 缓存键含 count，防小 count 截断大 count（Low#10）
-        hit = self._future_cache.get(key)
+        # 缓存按 period 单键、固定按最大 count=8 扫描，命中时切片返回：
+        # 避免按 count 分键导致变 count 即 miss 触发整轮扫描（Low#10 原修法反模式）
+        _MAX_COUNT = 8
+        hit = self._future_cache.get(period)
         if hit and now - hit[0] < self._future_cache_ttl_ms:
             return hit[1][:count], (now - hit[0]) / 1000
         async with self._future_lock(period):
             # 双检：等锁期间可能已被别的请求刷新
             now = int(time.time() * 1000)
-            hit = self._future_cache.get(key)
+            hit = self._future_cache.get(period)
             if hit and now - hit[0] < self._future_cache_ttl_ms:
                 return hit[1][:count], (now - hit[0]) / 1000
-            windows = await self.scan_future_markets(period, count=count)
-            self._future_cache[key] = (int(time.time() * 1000), windows)
+            windows = await self.scan_future_markets(period, count=_MAX_COUNT)
+            self._future_cache[period] = (int(time.time() * 1000), windows)
             return windows[:count], 0.0
 
     async def close_position(self, order_id: int) -> dict:
         """平仓（SELL）：平掉指定未结算 FILLED BUY 行的全部股数。
 
+        并发安全（CodeReview R2 Critical#2）：真金路径前先条件 UPDATE 原子占位
+        （settled_at=now + settle_outcome='SOLD'，win/pnl 留 NULL 作占位标记），
+        并发的第二次 close 占位失败直接拒绝，不会双卖；SELL 确定未成交时回滚占位。
+
         语义（2026-09-18 手动下单模态框 A8）：卖出即实现盈亏——成交后
         立即在原 BUY 行写 settled_at/settle_outcome="SOLD"/win/pnl/settle_price，
-        并插一条 side="SELL" 记录行（signal_version="manual_close" 避开
-        (signal_version,window_start) 唯一键）。结算器只扫 settled_at IS NULL，
-        故两行均天然跳过，无需改 settler。
+        并插一条 side="SELL" 记录行（signal_version="manual_close:<buy_id>"
+        避开 (signal_version,window_start) 唯一键）。终态未知（轮询未命中）
+        或回执解析失败时落 PENDING SELL 行交 sync-binance 对账（W#4/W#7），
+        不回滚占位——防止稍后成交时被窗口结算双计。
 
         Args:
             order_id: 待平仓的 BUY 订单行 id
@@ -1111,6 +1151,7 @@ class BinancePredictionTrader:
         """
         from datetime import datetime, timezone
         from sqlalchemy import select
+        from sqlalchemy import update as sa_update
 
         async with async_session_factory() as db:
             row = (await db.execute(
@@ -1143,26 +1184,123 @@ class BinancePredictionTrader:
                 "direction": row.direction,
             }
 
+        # 原子占位（Critical#2 防并发双卖）：条件 UPDATE 抢占本单——
+        # settled_at 置now + settle_outcome='SOLD'，win/pnl 留 NULL 作为
+        # 「占位中」标记（落库段据此区分自己的占位与真竞态）。占位后：
+        # 结算器（settled_at IS NULL）与断链重结算（已排除 SOLD）均跳过，
+        # 并发的第二次 close 此处 rowcount=0 直接拒绝，不会双卖。
+        now_dt = datetime.now(timezone.utc)
+        async with async_session_factory() as db:
+            claim = await db.execute(
+                sa_update(TradeOrderModel)
+                .where(
+                    TradeOrderModel.id == order_id,
+                    TradeOrderModel.settled_at.is_(None),
+                    TradeOrderModel.status == "FILLED",
+                    TradeOrderModel.side == "BUY",
+                )
+                .values(settled_at=now_dt, settle_outcome="SOLD")
+            )
+            await db.commit()
+        if claim.rowcount == 0:
+            return {"error": "订单已被平仓/结算或不可平仓（并发占用）"}
+
+        async def _rollback_claim() -> None:
+            """SELL 确定未成交时释放占位（限定自己的占位态，防误回滚）。"""
+            async with async_session_factory() as db:
+                await db.execute(
+                    sa_update(TradeOrderModel)
+                    .where(
+                        TradeOrderModel.id == order_id,
+                        TradeOrderModel.settle_outcome == "SOLD",
+                        TradeOrderModel.win.is_(None),
+                    )
+                    .values(settled_at=None, settle_outcome=None)
+                )
+                await db.commit()
+
+        async def _record_pending_sell(sell_order_id, note: str) -> dict:
+            """终态未知/解析失败时落 PENDING SELL 记录行，交 sync-binance 对账。
+
+            占位不回滚（BUY 行停在 SOLD/win=NULL，结算器/重结算均跳过，
+            防止稍后成交时被按「持有到期」双结算）；PENDING 行由对账场景一
+            按 order_id 回填终态、场景三订正金额后自动闭环。
+            """
+            est = 0.0
+            try:
+                est = float(quote.get("amountOut") or 0) / 1e18
+            except (TypeError, ValueError):
+                pass
+            async with async_session_factory() as db:
+                db.add(TradeOrderModel(
+                    prediction_id=None,
+                    token_id=token,
+                    side="SELL",
+                    amount_in=str(int(est * 1e18)),
+                    amount_out=str(int(est * 1e18)),
+                    order_id=str(sell_order_id) if sell_order_id else None,
+                    status="PENDING",
+                    quote_json={**quote, "soldShareQty": shares} if isinstance(quote, dict) else {"soldShareQty": shares},
+                    signal_version=f"manual_close:{order_id}",
+                    window_start=snap["window_start"],
+                    market_period=snap["market_period"] or "5m",
+                    direction=snap["direction"],
+                ))
+                try:
+                    await db.commit()
+                except Exception as exc:
+                    logger.critical(
+                        "平仓：终态未知且 PENDING SELL 行落库失败 | buy_id={} | "
+                        "sell_order_id={} | err={}", order_id, sell_order_id, exc)
+                    return {
+                        "error": f"SELL 终态未知且落库失败，请联系运维对账 | {exc}",
+                        "sell_order_id": sell_order_id,
+                        "sold_but_unrecorded": True,
+                    }
+            logger.critical(
+                "平仓：SELL 终态未知，已落 PENDING SELL 行交对账 | buy_id={} | "
+                "sell_order_id={} | {}", order_id, sell_order_id, note)
+            return {
+                "error": f"SELL 终态未知（已记录，待币安对账订正）| {note}",
+                "sell_order_id": sell_order_id,
+                "pending_reconcile": True,
+            }
+
         # 真金路径：报价（SELL）→ 下单 → 回查终态
         quote = await self.get_quote(token, side="SELL", amount_usdt=shares)
         if not quote:
+            await _rollback_claim()
             return {"error": f"SELL 报价失败 | {self.last_api_error or '无详情'}"}
         order_result = await self.place_order(quote, slippage_bps=1200)
         if not order_result:
+            await _rollback_claim()
             return {"error": f"SELL 下单失败 | {self.last_api_error or '无详情'}"}
         sell_order_id = order_result.get("orderId")
+        if not sell_order_id:
+            await _rollback_claim()
+            return {"error": "SELL 下单响应缺 orderId，已按未提交处理"}
         confirmed = await self._confirm_with_backfill(sell_order_id)
-        if not confirmed or confirmed.get("status") != "FILLED":
+        if confirmed is None:
+            # 终态未知 ≠ 未成交（W#4）：两轮轮询均未命中历史，按系统约定落
+            # PENDING 交对账，不回滚占位（防稍后成交被窗口结算双计）
+            return await _record_pending_sell(sell_order_id, "历史轮询未命中")
+        if confirmed.get("status") != "FILLED":
+            await _rollback_claim()
             return {
                 "error": "SELL 未成交（终态非 FILLED），持仓未变动",
                 "sell_order_id": sell_order_id,
-                "raw_status": (confirmed or {}).get("status"),
+                "raw_status": confirmed.get("status"),
             }
-        proceeds = float(confirmed.get("filledUsdtAmount") or 0.0)
-        if proceeds <= 0:
-            proceeds = float(quote.get("amountOut") or 0) / 1e18
-        sell_price = confirmed.get("price") or quote.get("averagePrice")
-        sell_price = float(sell_price) if sell_price else None
+        # 回款/卖价解析兑底（W#7）：脏数据不得在钱已卖出后抛 500 零落库
+        try:
+            proceeds = float(confirmed.get("filledUsdtAmount") or 0.0)
+            if proceeds <= 0:
+                proceeds = float(quote.get("amountOut") or 0) / 1e18
+            sell_price_raw = confirmed.get("price") or quote.get("averagePrice")
+            sell_price = float(sell_price_raw) if sell_price_raw else None
+        except (TypeError, ValueError) as exc:
+            return await _record_pending_sell(
+                sell_order_id, f"成交回执解析失败 {exc!r}")
         pnl = proceeds - cost
         now_dt = datetime.now(timezone.utc)
 
@@ -1170,7 +1308,11 @@ class BinancePredictionTrader:
             buy_row = (await db.execute(
                 select(TradeOrderModel).where(TradeOrderModel.id == order_id)
             )).scalar_one_or_none()
-            race = buy_row is None or buy_row.settled_at is not None
+            # 自己的占位态 = SOLD + win NULL（占位时留的标记）；
+            # 其余（被结算器按窗口结算/行缺失）均视为真竞态
+            race = not (buy_row is not None
+                        and buy_row.settle_outcome == "SOLD"
+                        and buy_row.win is None)
             if not race:
                 # 原 BUY 行：卖出即实现盈亏；redeemed_at 置_now 防已卖 token
                 # 进入“可赎回”集合（Medium#3）
@@ -1306,27 +1448,56 @@ class BinancePredictionTrader:
         else:
             scan_ids = list(range(anchor + 1, anchor + scan_budget + 1))
 
-        for tid in scan_ids:
-            d = await self._detail_one(tid)
+        # wave 并发扫描（W#6）：旧串行 for-await 在 execute_signal_trade 全局
+        # trade_lock 内最坏 160 次×（100~300ms）≈ 25-50s，阻塞全部信号通道开火。
+        # 与 scan_future_markets 同款分波并发（20/波），波间小歇退避。
+        WAVE = 20
+
+        def _match(tid: int, d: dict | None) -> tuple[int, dict] | None:
             if not d or d.get("slug") != slug_want:
-                continue
+                return None
             subs = d.get("markets", [])
             trading = subs[0].get("tradingStatus") if subs else None
             if trading != "OPEN":
-                logger.warning("detail 预取：命中但不可交易 | tid={} trading={}",
-                               tid, trading)
+                logger.warning("detail 预取：命中但不可交易 | trading={}", trading)
                 return None
             parsed = self._parse_15m_entry(d)
             if parsed is None:
                 return None
             entry_start, entry = parsed
             if abs(entry_start - start_ms) > 2000:
-                logger.warning("detail 预取：slug 命中但 startDate 偏差 {}ms | tid={}",
-                               entry_start - start_ms, tid)
+                logger.warning("detail 预取：slug 命中但 startDate 偏差 {}ms",
+                               entry_start - start_ms)
                 return None
-            logger.info("detail 预取成功 | {} | topicId={} | 距开盘 {:.0f}s",
-                        period, tid, (entry_start - int(time.time() * 1000)) / 1000)
-            return entry
+            return tid, entry
+
+        for i in range(0, len(scan_ids), WAVE):
+            wave = scan_ids[i:i + WAVE]
+            details = await asyncio.gather(
+                *(self._detail_one(t) for t in wave), return_exceptions=True)
+            hit = None
+            for tid, d in zip(wave, details):
+                if isinstance(d, DetailRateLimited):
+                    # 限流即中止（W#10）：锁内继续打会拖垮整个交易链路配额
+                    logger.warning(
+                        "detail 预取：命中限流，中止扫描 | status={} | 目标 {}",
+                        d.status_code, slug_want)
+                    return None
+                if isinstance(d, BaseException):
+                    continue
+                m = _match(tid, d)
+                if m is not None:
+                    hit = m
+                    break
+            if hit is not None:
+                tid, entry = hit
+                logger.info(
+                    "detail 预取成功 | {} | topicId={} | 距开盘 {:.0f}s",
+                    period, tid, (int(entry["end_date"] or 0) - int(time.time() * 1000)) / 1000
+                    if entry.get("end_date") else 0.0)
+                return entry
+            # 波间小歇：避免连续满并发冲击 sapi 配额（W#10 同源退避）
+            await asyncio.sleep(0.2)
         return None
 
     async def list_markets(self) -> list[dict]:
@@ -1606,12 +1777,18 @@ class BinancePredictionTrader:
             result = resp.json()
             logger.info("下单成功 | orderId={} | orderType={} | timeInForce={}",
                         result.get("orderId"), order_type, time_in_force)
+            self.last_api_error = None
             return result
         except httpx.HTTPStatusError as e:
             logger.error("下单失败 (HTTP {}): {}", e.response.status_code, e.response.text)
+            # S#3：不写 last_api_error 会让 close_position 的失败文案恒为「无详情」，
+            # 真金失败归因信息丢失
+            self.last_api_error = (
+                f"HTTP {e.response.status_code}: {e.response.text[:300]}")
             return None
         except Exception as e:
             logger.error("下单异常: {}", e)
+            self.last_api_error = f"{type(e).__name__}: {e}"
             return None
 
     async def execute_trade(

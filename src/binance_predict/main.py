@@ -2547,6 +2547,9 @@ async def manual_trade_test(
         return {"error": "prediction 仅允许 UP/DOWN"}
     if req.market_period not in ("5m", "15m"):
         return {"error": "market_period 仅允许 5m/15m"}
+    if req.order_type not in ("MARKET", "LIMIT"):
+        # 白名单（S#1）：否则垃圾值静默按 MARKET 语义执行
+        return {"error": "order_type 仅允许 MARKET/LIMIT"}
     if req.max_exec_price is not None and not (0.0 < req.max_exec_price < 1.0):
         return {"error": "max_exec_price 仅允许 0~1 开区间"}
     if req.price_limit is not None and not (0.0 < req.price_limit < 1.0):
@@ -2579,10 +2582,15 @@ async def manual_trade_test(
     elif window_start - now_ms < 5_000:
         return {"error": "距开盘不足 5 秒，请改选下一窗口"}
 
+    # signal_version 编码周期（W#8）：15m 网格起点必为 5m 网格点，
+    # 同起点的 5m/15m 手动单若共用 manual_test 会撞
+    # (signal_version, window_start) 唯一键，15m 单被模糊拒绝
+    manual_version = f"manual_test_{req.market_period}"
+
     order = await prediction_trader.execute_signal_trade(
         prediction=req.prediction,
         amount_usdt=req.amount_usdt,
-        signal_version="manual_test",
+        signal_version=manual_version,
         window_start=window_start,
         max_exec_price=effective_guard,
         market_period=req.market_period,
@@ -3718,6 +3726,16 @@ async def _sync_binance_orders_impl() -> dict:
         # 输=−amount）；filledShareQty 同步回填 quote_json（已扣 marketProviderFee，
         # 赢向无费口径比币安实现盈亏高约费用额，生产实锤 10.5 vs 10.27）。
         for row in filled_rows:
+            # 手动平仓产物不参与部分成交订正（W#5）：SOLD 行 pnl 是实现盈亏
+            # （proceeds−cost），按 shares−amt/−amt 重算会虚记（例：1U@0.5 买、
+            # 0.55 平 pnl=+0.05，回填 shares=1.92 后被改写 +0.92）；
+            # SELL 记录行 amount_in 是卖出所得，同样不可按买入口径订正。
+            # 股数/金额回填保留，只跳过 pnl/win 改写。
+            _is_manual_close = (
+                getattr(row, "settle_outcome", None) == "SOLD"
+                or str(getattr(row, "signal_version", None) or "").startswith("manual_close")
+                or str(getattr(row, "side", "BUY") or "BUY") != "BUY"
+            )
             bo = by_orderid.get(str(row.order_id))
             if not bo or bo.get("status") != "FILLED":
                 continue
@@ -3749,7 +3767,8 @@ async def _sync_binance_orders_impl() -> dict:
                 qj["filledShareQty"] = shares
                 row.quote_json = qj
             avg = TradeSettler._avg_price(row)
-            if row.settled_at is not None and row.win is not None:
+            if (not _is_manual_close
+                    and row.settled_at is not None and row.win is not None):
                 if row.win and shares:
                     row.pnl = shares - amt
                 elif row.win and avg is not None:

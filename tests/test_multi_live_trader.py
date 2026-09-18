@@ -5342,12 +5342,39 @@ class _FakeScalar:
 
 
 class _FakeDB:
-    def __init__(self, row):
+    """close_position 替身 DB：按调用序模拟「占位 UPDATE → 落库 SELECT → 写入」。
+
+    - execute(Update) → rowcount；首次 UPDATE 会同步把 row 置为占位态
+      （settled_at=now/settle_outcome='SOLD'/win 保持 None，模拟真实 DB 行为）
+    - execute(Select) → _FakeScalar(row)（返回当前 row 状态）
+    """
+
+    def __init__(self, row, update_rowcount: int = 1, apply_claim: bool = True):
         self.row = row
+        self.update_rowcount = update_rowcount
+        self.apply_claim = apply_claim
         self.added: list = []
         self.committed = False
+        self.executed: list = []
 
     async def execute(self, stmt):
+        kind = "update" if str(stmt).lstrip().upper().startswith("UPDATE") else "select"
+        self.executed.append(kind)
+        if kind == "update":
+            if (self.apply_claim and self.update_rowcount == 1
+                    and getattr(self.row, "settle_outcome", None) is None
+                    and getattr(self.row, "settled_at", None) is None):
+                # 第一次 UPDATE：模拟真实占位（settled_at=now + SOLD，win/pnl 保持 NULL）
+                self.row.settled_at = datetime.now(timezone.utc)
+                self.row.settle_outcome = "SOLD"
+            elif (self.apply_claim and self.update_rowcount == 1
+                    and self.executed.count("update") >= 2
+                    and getattr(self.row, "settle_outcome", None) == "SOLD"
+                    and getattr(self.row, "win", None) is None):
+                # 第二次 UPDATE（行已处于占位态）：回滚占位恢复未占位
+                self.row.settled_at = None
+                self.row.settle_outcome = None
+            return SimpleNamespace(rowcount=self.update_rowcount)
         return _FakeScalar(self.row)
 
     def add(self, obj):
@@ -5363,7 +5390,7 @@ def _buy_row():
         amount_in=str(int(1 * 1e18)),
         quote_json={"filledShareQty": 1.92, "averagePrice": 0.5},
         window_start=1_789_670_400_000, market_period="5m", direction="UP",
-        settle_outcome=None, win=None, pnl=None, settle_price=None,
+        settle_outcome=None, win=None, pnl=None, settle_price=None, redeemed_at=None,
     )
 
 
@@ -5434,8 +5461,12 @@ async def test_close_position_not_filled_no_db_change(monkeypatch) -> None:
     out = await trader.close_position(77)
 
     assert "error" in out
+    assert "终态非 FILLED" in out["error"]
+    # 回滚占位把行恢复为未占位态（settled_at=None/settle_outcome=None）
     assert row.settled_at is None and row.settle_outcome is None
-    assert db.added == [] and db.committed is False
+    # 回滚 UPDATE 发生
+    assert any(k == "update" for k in db.executed)
+    assert db.added == []
 
 
 @pytest.mark.asyncio
@@ -5471,6 +5502,174 @@ async def test_close_position_guards_reject(monkeypatch) -> None:
         monkeypatch.setattr(pt, "async_session_factory", _factory)
         out = await trader.close_position(bad.id)
         assert "error" in out
+
+
+@pytest.mark.asyncio
+async def test_close_position_concurrent_claim_rejected(monkeypatch) -> None:
+    """并发双卖防护（Critical#2）：占位 UPDATE rowcount=0 → 拒绝且不触真金路径。"""
+    trader = pt.BinancePredictionTrader()
+    row = _buy_row()
+    db = _FakeDB(row, update_rowcount=0)  # 第二个并发 close：占位被抢
+
+    @asynccontextmanager
+    async def _factory():
+        yield db
+
+    monkeypatch.setattr(pt, "async_session_factory", _factory)
+
+    async def _no_quote(*a, **kw):  # pragma: no cover
+        raise AssertionError("占位被抢不应触达真金路径")
+
+    monkeypatch.setattr(trader, "get_quote", _no_quote)
+
+    out = await trader.close_position(77)
+    assert "error" in out and "并发占用" in out["error"]
+    assert db.added == []
+
+
+@pytest.mark.asyncio
+async def test_close_position_unknown_terminal_records_pending_sell(monkeypatch) -> None:
+    """终态未知（confirm 返回 None）≠ 未成交（W#4）：落 PENDING SELL 行交对账，
+    占位不回滚（BUY 行保持 SOLD 占位态，防窗口结算双计）。"""
+    trader = pt.BinancePredictionTrader()
+    row = _buy_row()
+    db = _FakeDB(row)
+
+    @asynccontextmanager
+    async def _factory():
+        yield db
+
+    monkeypatch.setattr(pt, "async_session_factory", _factory)
+    monkeypatch.setattr(trader, "get_quote",
+                        AsyncMock(return_value={"quoteId": "q", "averagePrice": 0.5,
+                                                 "amountOut": str(int(0.9 * 1e18))}))
+    monkeypatch.setattr(trader, "place_order",
+                        AsyncMock(return_value={"orderId": "SELL-3"}))
+    monkeypatch.setattr(trader, "_confirm_with_backfill",
+                        AsyncMock(return_value=None))
+
+    out = await trader.close_position(77)
+
+    assert out.get("pending_reconcile") is True
+    assert "SELL-3" in str(out.get("sell_order_id"))
+    # PENDING SELL 行已落（交 sync-binance 对账）
+    assert len(db.added) == 1
+    sell = db.added[0]
+    assert sell.status == "PENDING"
+    assert sell.side == "SELL"
+    assert sell.signal_version == "manual_close:77"
+    assert db.committed is True
+
+
+@pytest.mark.asyncio
+async def test_settler_manual_15m_uses_patched_windows(monkeypatch) -> None:
+    """手动 15m 单结算分流（Critical#1）：用首尾 5m 窗拼开盘/收盘价判向。"""
+    import binance_predict.services.trade_settler as ts
+
+    settler = ts.TradeSettler()
+    t0 = 1_789_670_400_000  # 15m 对齐
+    row = SimpleNamespace(
+        id=99, signal_version="manual_test_15m", market_period="15m",
+        scene_signal_id=None, direction="UP", window_start=t0,
+        created_at=datetime.now(timezone.utc) - timedelta(hours=2),
+        amount_in=str(int(1 * 1e18)),
+        quote_json={"filledShareQty": 1.92, "averagePrice": 0.5},
+        settle_outcome=None, win=None, pnl=None, settle_price=None,
+    )
+
+    # 首窗 entry=100，尾窗 exit=105 → UP；direction=UP → 赢
+    w_first = SimpleNamespace(entry_price=100.0, exit_price=102.0)
+    w_last = SimpleNamespace(entry_price=103.0, exit_price=105.0)
+    monkeypatch.setattr(settler, "_find_window",
+                        AsyncMock(side_effect=[w_first, w_last]))
+    # 幂等 UPDATE（settler 内部二段式）
+    _sessions = []
+
+    @asynccontextmanager
+    async def _factory():
+        db = _FakeDB(None)
+        db.execute = AsyncMock(return_value=SimpleNamespace(rowcount=1))
+        _sessions.append(db)
+        yield db
+
+    monkeypatch.setattr(ts, "async_session_factory", _factory)
+    monkeypatch.setattr(settler, "_patch_settlement_assessment", AsyncMock())
+
+    ok = await settler._settle_manual_15m_row(row)
+    assert ok is True
+    # UPDATE 语句带 UP/win=True/pnl=1.92-1=0.92
+    upd = _sessions[0].execute.await_args.args[0]
+    upd_str = str(upd)
+    assert "UP" in upd_str and "settled_at" in upd_str
+
+
+@pytest.mark.asyncio
+async def test_settler_scan_excludes_sell_rows(monkeypatch) -> None:
+    """结算扫描排除 side='SELL'（W#SELL行不参与窗口结算）。"""
+    import binance_predict.services.trade_settler as ts
+    import inspect
+
+    src = inspect.getsource(ts.TradeSettler.poll_once)
+    assert 'TradeOrderModel.side == "BUY"' in src
+
+
+@pytest.mark.asyncio
+async def test_manual_test_signal_version_periodized(monkeypatch) -> None:
+    """W#8：signal_version 周期化 manual_test_5m/15m（同起点 5m/15m 不互撞）。"""
+    import binance_predict.main as m
+    from binance_predict.models.schemas import ManualTradeTestRequest
+
+    seen = {}
+
+    async def _exec(**kw):
+        seen.update(kw)
+        return dict(id=1, status="FILLED", order_id="O1",
+                    signal_version=kw["signal_version"],
+                    window_start=kw["window_start"], token_id="T",
+                    amount_in="1", average_price=0.5, error_message=None,
+                    direction="UP")
+
+    monkeypatch.setattr(m.prediction_trader, "execute_signal_trade", _exec)
+    await m.manual_trade_test(
+        ManualTradeTestRequest(amount_usdt=1.0, market_period="15m"), _=None)
+    assert seen["signal_version"] == "manual_test_15m"
+    await m.manual_trade_test(
+        ManualTradeTestRequest(amount_usdt=1.0), _=None)
+    assert seen["signal_version"] == "manual_test_5m"
+
+
+@pytest.mark.asyncio
+async def test_trade_test_order_type_whitelist(monkeypatch) -> None:
+    """S#1：order_type 垃圾值拒绝（不静默按 MARKET 执行）。"""
+    import binance_predict.main as m
+    from binance_predict.models.schemas import ManualTradeTestRequest
+
+    async def _exec(**kw):  # pragma: no cover
+        raise AssertionError("非法 order_type 不应触达 trader")
+
+    monkeypatch.setattr(m.prediction_trader, "execute_signal_trade", _exec)
+    out = await m.manual_trade_test(
+        ManualTradeTestRequest(amount_usdt=1.0, order_type="IOC"), _=None)
+    assert "order_type" in out["error"]
+
+
+@pytest.mark.asyncio
+async def test_trade_test_future_window_too_soon_rejected(monkeypatch) -> None:
+    """Medium#5：未来窗距开盘 <5s 拒单（旧版只判当前窗）。"""
+    import binance_predict.main as m
+    from binance_predict.models.schemas import ManualTradeTestRequest
+
+    async def _exec(**kw):  # pragma: no cover
+        raise AssertionError("踩线未来窗不应触达 trader")
+
+    monkeypatch.setattr(m.prediction_trader, "execute_signal_trade", _exec)
+    base = 1_789_670_100  # 5m 对齐 epoch 秒
+    # 当前时刻 = base+297s：下一个 5m 窗（base+300）距开盘仅 3s < 5s → 拒
+    monkeypatch.setattr(m.time, "time", lambda: base + 297)
+    out = await m.manual_trade_test(
+        ManualTradeTestRequest(amount_usdt=1.0,
+                               window_start=(base + 300) * 1000), _=None)
+    assert "距开盘不足 5 秒" in out["error"]
 
 
 

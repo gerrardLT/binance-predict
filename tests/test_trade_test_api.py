@@ -110,7 +110,7 @@ async def test_trade_test_limit_order_passthrough(monkeypatch) -> None:
     assert seen["order_type"] == "LIMIT"
     assert seen["max_exec_price"] == 0.25
     assert seen["amount_usdt"] == 0.5
-    assert seen["signal_version"] == "manual_test"
+    assert seen["signal_version"] == "manual_test_5m"  # W#8：周期化，同起点 15m 不互撞
     assert seen["window_start"] % 300_000 == 0  # 5m 窗口对齐
 
 
