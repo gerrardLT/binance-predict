@@ -180,7 +180,8 @@ class BinancePredictionTrader:
         # 避免模态框频繁打开打满币安 detail 配额
         self._future_cache: dict[str, tuple[int, list[dict]]] = {}
         self._future_locks: dict[str, asyncio.Lock] = {}
-        self._future_cache_ttl_ms = 30_000
+        # TTL 45s > 前端 30s 轮询间隔，避免每次轮询都 miss 重扫（Low#11）
+        self._future_cache_ttl_ms = 45_000
 
         if not self._api_key or not self._api_secret:
             logger.warning("Binance API Key/Secret 未配置，预测交易功能不可用")
@@ -941,6 +942,10 @@ class BinancePredictionTrader:
                 params=signed,
                 headers={"X-MBX-APIKEY": self._api_key},
             )
+            if resp.status_code in (429, 418):
+                # 限流不能静默吞掉（否则热路径取不到市场却无告警，Low#11）
+                logger.warning("detail 限流 | tid={} | status={}", topic_id, resp.status_code)
+                return None
             return resp.json() if resp.status_code == 200 else None
         except Exception:
             return None
@@ -1032,6 +1037,7 @@ class BinancePredictionTrader:
                 "available": True,
             }
 
+        miss_streak = 0
         try:
             for i in range(0, len(tids), WAVE):
                 wave = tids[i:i + WAVE]
@@ -1039,12 +1045,20 @@ class BinancePredictionTrader:
                     *(self._detail_one(t) for t in wave), return_exceptions=True)
                 for tid, d in zip(wave, details):
                     if isinstance(d, BaseException):
+                        miss_streak += 1
                         continue
                     row = _to_row(tid, d)
                     if row is not None:
                         collected.append(row)
+                        miss_streak = 0
+                    else:
+                        miss_streak += 1
                 if len(collected) >= count:
                     break  # 提前终止：已凑够，不再打后续波
+                if miss_streak >= 60:
+                    # 连续 60 个 ID 无 BTC 命中：已扫过未来市场创建前沿，
+                    # 止损退出，避免 15m 等稀硫周期每轮烧满 160 次签名请求（Low#11）
+                    break
         except Exception as e:
             logger.warning("scan_future_markets | {} | {}", period, e)
 
@@ -1065,17 +1079,18 @@ class BinancePredictionTrader:
             cached_age_sec 为缓存年龄（秒），新扫描为 0.0
         """
         now = int(time.time() * 1000)
-        hit = self._future_cache.get(period)
+        key = f"{period}:{count}"  # 缓存键含 count，防小 count 截断大 count（Low#10）
+        hit = self._future_cache.get(key)
         if hit and now - hit[0] < self._future_cache_ttl_ms:
             return hit[1][:count], (now - hit[0]) / 1000
         async with self._future_lock(period):
             # 双检：等锁期间可能已被别的请求刷新
             now = int(time.time() * 1000)
-            hit = self._future_cache.get(period)
+            hit = self._future_cache.get(key)
             if hit and now - hit[0] < self._future_cache_ttl_ms:
                 return hit[1][:count], (now - hit[0]) / 1000
             windows = await self.scan_future_markets(period, count=count)
-            self._future_cache[period] = (int(time.time() * 1000), windows)
+            self._future_cache[key] = (int(time.time() * 1000), windows)
             return windows[:count], 0.0
 
     async def close_position(self, order_id: int) -> dict:
@@ -1155,25 +1170,37 @@ class BinancePredictionTrader:
             buy_row = (await db.execute(
                 select(TradeOrderModel).where(TradeOrderModel.id == order_id)
             )).scalar_one_or_none()
-            if buy_row is None or buy_row.settled_at is not None:
-                return {"error": "平仓期间持仓状态已变化，放弃落库"}
-            # 原 BUY 行：卖出即实现盈亏
-            buy_row.settled_at = now_dt
-            buy_row.settle_outcome = "SOLD"
-            buy_row.win = proceeds > cost
-            buy_row.pnl = pnl
-            buy_row.settle_price = sell_price
-            # SELL 记录行（manual_close 避开唯一键）
+            race = buy_row is None or buy_row.settled_at is not None
+            if not race:
+                # 原 BUY 行：卖出即实现盈亏；redeemed_at 置_now 防已卖 token
+                # 进入“可赎回”集合（Medium#3）
+                buy_row.settled_at = now_dt
+                buy_row.settle_outcome = "SOLD"
+                buy_row.win = proceeds > cost
+                buy_row.pnl = pnl
+                buy_row.settle_price = sell_price
+                buy_row.redeemed_at = now_dt
+            else:
+                # 竞态：SELL 已成交但 BUY 行已被结算器结算。仍必须落 SELL 记录行
+                # 保留真金账本，并 CRITICAL 告警（High#2）
+                logger.critical(
+                    "平仓：SELL 已成交但 BUY 行状态已变化，仅落 SELL 记录行 | "
+                    "buy_id={} | sell_order_id={} | proceeds={}",
+                    order_id, sell_order_id, proceeds)
+            # SELL 记录行：signal_version 带 BUY 行 id 避免同窗二次平仓唯一键冲突（High#2）；
+            # amount_in 用 USDT（proceeds）口径，股数存 quote_json.soldShareQty（Medium#4）
+            sell_qj = dict(quote) if isinstance(quote, dict) else {}
+            sell_qj["soldShareQty"] = shares
             db.add(TradeOrderModel(
                 prediction_id=None,
                 token_id=token,
                 side="SELL",
-                amount_in=str(int(shares * 1e18)),
+                amount_in=str(int(proceeds * 1e18)),
                 amount_out=str(int(proceeds * 1e18)),
                 order_id=str(sell_order_id),
                 status="FILLED",
-                quote_json=quote,
-                signal_version="manual_close",
+                quote_json=sell_qj,
+                signal_version=f"manual_close:{order_id}",
                 window_start=snap["window_start"],
                 market_period=snap["market_period"] or "5m",
                 direction=snap["direction"],
@@ -1182,8 +1209,21 @@ class BinancePredictionTrader:
                 pnl=0.0,
                 settle_price=sell_price,
                 settled_at=now_dt,
+                redeemed_at=now_dt,
             ))
-            await db.commit()
+            try:
+                await db.commit()
+            except Exception as exc:
+                # 钱已出去而落库失败：CRITICAL 可追溯，不静默降级（High#2）
+                logger.critical(
+                    "平仓：SELL 已成交但落库失败 | buy_id={} | sell_order_id={} | "
+                    "proceeds={} | err={}", order_id, sell_order_id, proceeds, exc)
+                return {
+                    "error": f"SELL 已成交但落库失败，请联系运维对账 | {exc}",
+                    "sell_order_id": sell_order_id,
+                    "proceeds": proceeds,
+                    "sold_but_unrecorded": True,
+                }
         return {
             "status": "CLOSED",
             "buy_order_id": order_id,
@@ -1193,6 +1233,7 @@ class BinancePredictionTrader:
             "proceeds": proceeds,
             "pnl": pnl,
             "sell_price": sell_price,
+            "race": race,
         }
 
     async def _fetch_market_via_detail(
@@ -1257,12 +1298,13 @@ class BinancePredictionTrader:
                 "detail 预取：无同周期锚点，用 {} 市场 tid={} 双向扫描 | 目标 {}",
                 other_period, anchor, slug_want)
             # 回退锚点与目标的 ID 距离方向未知（目标可能在锚点之前创建）：
-            # 前向+后向各 48（约 2× 单向预算，回退路径低频可接受）；
+            # 前向+后向各 scan_budget（约 2× 单向预算，回退路径低频可接受）；
             # 向后扫同样只命中 slug 才采，不会押错周期。
-            scan_ids = [tid for tid in range(anchor + 1, anchor + scan_budget) if tid > 0]
-            scan_ids += [tid for tid in range(anchor - scan_budget + 1, anchor) if tid > 0]
+            # 注：range 上界 +1 保证恰好 scan_budget 个 ID（Medium#7 off-by-one）
+            scan_ids = [tid for tid in range(anchor + 1, anchor + scan_budget + 1) if tid > 0]
+            scan_ids += [tid for tid in range(anchor - scan_budget, anchor) if tid > 0]
         else:
-            scan_ids = list(range(anchor + 1, anchor + scan_budget))
+            scan_ids = list(range(anchor + 1, anchor + scan_budget + 1))
 
         for tid in scan_ids:
             d = await self._detail_one(tid)
@@ -1750,6 +1792,7 @@ class BinancePredictionTrader:
         order_type: str = "MARKET",
         assessment_id: int | None = None,
         assessment_context: dict | None = None,
+        scan_budget: int = 48,
     ) -> dict | None:
         """
         信号驱动实盘专用通道（多通道 LIVE：quote_edge/x4 用 5m，场景用 15m）：
@@ -1854,7 +1897,8 @@ class BinancePredictionTrader:
                         )
                         # list 只返回已开盘市场：新周期边界刚过时尚未可见。
                         # 经 market/detail 预取未来市场（提前创建且可交易，2026-08-28 实测）
-                        entry = await self._fetch_market_via_detail("15m", window_start)
+                        entry = await self._fetch_market_via_detail(
+                            "15m", window_start, scan_budget=scan_budget)
                         if entry:
                             self._15m_markets[window_start] = entry
                 
@@ -1878,7 +1922,8 @@ class BinancePredictionTrader:
                     token_id = (self._up_token_id if prediction == "UP"
                                 else self._down_token_id)
                 else:
-                    entry = await self._fetch_market_via_detail("5m", window_start)
+                    entry = await self._fetch_market_via_detail(
+                        "5m", window_start, scan_budget=scan_budget)
                     token_id = (entry["up_token"] if prediction == "UP"
                                 else entry["down_token"]) if entry else None
                     if entry is None:

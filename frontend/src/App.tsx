@@ -2311,7 +2311,7 @@ function PositionsMini({ orders, redeemable, onClose }: {
   const open = orders.filter(o => o.status === 'FILLED' && !o.settled_at)
   const pending = orders.filter(o => o.status === 'PENDING')
   const settled = orders.filter(o => o.settled_at)
-  const redeemCount = Array.isArray(redeemable?.positions) ? (redeemable!.positions as unknown[]).length : 0
+  const redeemCount = Number(redeemable?.claimable_count ?? 0)
   const rows = tab === 'open' ? open : tab === 'pending' ? pending : tab === 'settled' ? settled : []
   return (
     <div className="space-y-1">
@@ -2357,7 +2357,7 @@ function ConflictHint({ channels, period }: { channels: { channel: string; marke
 }
 
 // 悬浮快速下单（右下角 FAB）：表单状态自持有；报价/倒计时/钱包由 LiveTradeTab 传入。
-function TestTradeFab({ quote, remainSec, urgent, wallet, refresh, orders, activeChannels, redeemable }: {
+function TestTradeFab({ quote, remainSec, urgent, wallet, refresh, orders, activeChannels, redeemable, clockOffset }: {
   quote: Record<string, unknown> | null
   remainSec: number | null
   urgent: boolean
@@ -2366,13 +2366,13 @@ function TestTradeFab({ quote, remainSec, urgent, wallet, refresh, orders, activ
   orders: Record<string, unknown>[]
   activeChannels: { channel: string; market_period: string }[]
   redeemable: Record<string, unknown> | null
+  clockOffset: number
 }) {
   const [open, setOpen] = useState(false)
   const [period, setPeriod] = useState<'5m' | '15m'>('5m')
   const [selected, setSelected] = useState<number | 'current'>('current')
   const [future, setFuture] = useState<FutureWindow[]>([])
   const [futureLoading, setFutureLoading] = useState(false)
-  const [futureAt, setFutureAt] = useState(0)
   const [amount, setAmount] = useState('1')
   const [side, setSide] = useState<'UP' | 'DOWN'>('UP')
   const [orderType, setOrderType] = useState<'MARKET' | 'LIMIT'>('MARKET')
@@ -2384,28 +2384,42 @@ function TestTradeFab({ quote, remainSec, urgent, wallet, refresh, orders, activ
   const [busy, setBusy] = useState(false)
   const [results, setResults] = useState<Record<string, unknown>[]>([])
   const [klines, setKlines] = useState<BtcKline[]>([])
+  const [currentWin, setCurrentWin] = useState<Record<string, unknown> | null>(null)
 
+  const q = (v: unknown) => (typeof v === 'number' ? v : null)
+  const nowMs = Date.now() + clockOffset  // 服务端时钟校正（Medium#5）
   const step = period === '5m' ? 300_000 : 900_000
   const baseWindow = selected === 'current'
-    ? Math.floor(Date.now() / step) * step
+    ? Math.floor(nowMs / step) * step
     : selected
   const selWin = selected === 'current' ? null : future.find(w => w.window_start === selected) ?? null
-  // 指示价分流（决策 2）：当前 5m 用 quote-preview；其余用 future-markets detail 价
-  const isCurrent5m = selected === 'current' && period === '5m'
-  const up = isCurrent5m ? (typeof quote?.up_price === 'number' ? quote.up_price as number : null) : (selWin?.up_price ?? null)
-  const down = isCurrent5m ? (typeof quote?.down_price === 'number' ? quote.down_price as number : null) : (selWin?.down_price ?? null)
+  const isCurrent = selected === 'current'
+  // 指示价分流（决策 2 + Medium#8）：当前 5m 用 quote-preview；当前 15m 用
+  // future-markets 的 current；未来窗用 detail 价
+  const curSrc = isCurrent
+    ? (period === '5m'
+      ? { up: q(quote?.up_price), down: q(quote?.down_price), end: q(quote?.window_end) }
+      : { up: q(currentWin?.up_price), down: q(currentWin?.down_price), end: q(currentWin?.window_end) })
+    : { up: selWin?.up_price ?? null, down: selWin?.down_price ?? null, end: q(selWin?.window_end) }
+  const up = curSrc.up
+  const down = curSrc.down
   const price = side === 'UP' ? up : down
   const balance = typeof wallet?.prediction_usdt_free === 'number' ? wallet.prediction_usdt_free as number : null
   const freshSec = quote && !quote.stale && typeof quote.server_now_ms === 'number'
     ? Math.max(0, Math.round((Date.now() - (quote.server_now_ms as number)) / 1000)) : null
   const alreadyOrdered = orders.some(o =>
     o.signal_version === 'manual_test' && o.window_start === baseWindow && o.status !== 'FAILED')
-  // 踩线守卫（C12）
-  const tooLate = selected === 'current' && remainSec != null && remainSec < 10
-  const futureTooSoon = selWin != null && selWin.ahead_sec < 5
+  // 倒计时本地实时递减、跨周期正确（Medium#5/#8）；5m 回落 remainSec
+  const remainLocal = isCurrent ? (curSrc.end != null ? Math.max(0, Math.floor((curSrc.end - nowMs) / 1000)) : remainSec) : null
+  const aheadLocal = selWin != null ? Math.max(0, Math.floor((selWin.window_start - nowMs) / 1000)) : null
+  // 踩线守卫（C12 + Medium#5 实时化）
+  const tooLate = isCurrent && remainLocal != null && remainLocal < 10
+  const futureTooSoon = selWin != null && aheadLocal != null && aheadLocal < 5
   const amtNum = parseFloat(amount)
   const amtOk = Number.isFinite(amtNum) && amtNum >= 0.1 && amtNum <= 50
-  const canSubmit = amtOk && !busy && !tooLate && !futureTooSoon && (oneClick || confirmed)
+  // 无指示价且非限价/无护栏时禁止盲下真金市价单（Medium#8）
+  const priceKnown = price != null || orderType === 'LIMIT' || guard !== ''
+  const canSubmit = amtOk && !busy && !tooLate && !futureTooSoon && priceKnown && (oneClick || confirmed)
 
   // 打开/切周期/30s 刷新未来窗
   useEffect(() => {
@@ -2416,7 +2430,7 @@ function TestTradeFab({ quote, remainSec, urgent, wallet, refresh, orders, activ
       api.getFutureMarkets(period, 8).then((d: Record<string, unknown>) => {
         if (!alive) return
         setFuture(Array.isArray(d.windows) ? d.windows as FutureWindow[] : [])
-        setFutureAt(Date.now())
+        setCurrentWin((d.current ?? null) as Record<string, unknown> | null)
       }).catch(() => {}).finally(() => alive && setFutureLoading(false))
     }
     load()
@@ -2508,16 +2522,18 @@ function TestTradeFab({ quote, remainSec, urgent, wallet, refresh, orders, activ
             <PeriodStrip period={period} onPeriod={p => { setPeriod(p); setSelected('current') }}
               selected={selected} onSelect={setSelected} future={future} loading={futureLoading} />
 
-            {isCurrent5m && (quote == null || quote.stale) ? (
-              <div className="text-xs text-ink-55 rounded-pill bg-sunken px-2 py-1.5">报价不可用（等待 15s 采样器…）</div>
+            {isCurrent && up == null && down == null ? (
+              <div className="text-xs text-ink-55 rounded-pill bg-sunken px-2 py-1.5">报价不可用（等待采样器/市场列表…）</div>
             ) : (
-              <div className={`rounded-sm px-2 py-1.5 ${urgent && isCurrent5m ? 'bg-negative-soft' : 'bg-sunken'}`}>
+              <div className={`rounded-sm px-2 py-1.5 ${urgent && isCurrent ? 'bg-negative-soft' : 'bg-sunken'}`}>
                 <InfoRow up={up} down={down}
                   btc={typeof quote?.btc_price === 'number' ? quote.btc_price as number : null}
                   btcOpen={typeof quote?.window_open_btc === 'number' ? quote.window_open_btc as number : null}
-                  freshSec={isCurrent5m ? freshSec : (selWin ? Math.max(0, Math.round(selWin.ahead_sec - (Date.now() - futureAt) / 1000)) : null)} />
+                  freshSec={isCurrent ? freshSec : aheadLocal} />
                 <div className="flex items-center justify-between mt-1 text-[11px] font-mono font-bold tabular-nums">
-                  <span>{selected === 'current' ? `剩余 ${remainSec != null ? `${Math.floor(remainSec / 60)}:${String(remainSec % 60).padStart(2, '0')}` : '--:--'}` : `距开盘 ${selWin ? Math.round(selWin.ahead_sec) : '--'}s`}</span>
+                  <span>{isCurrent
+                    ? `剩余 ${remainLocal != null ? `${Math.floor(remainLocal / 60)}:${String(remainLocal % 60).padStart(2, '0')}` : '--:--'}`
+                    : `距开盘 ${aheadLocal ?? '--'}s`}</span>
                   {alreadyOrdered && <span className="text-warning">本窗已有手动单</span>}
                 </div>
               </div>
@@ -4142,7 +4158,7 @@ function LiveTradeTab() {
 
     {/* 悬浮与抽屉：下单 FAB + 右侧抽屉（K 线对照 / 资金变化双 tab，2026-08-29） */}
     <TestTradeFab quote={quote} remainSec={remainSec} urgent={urgent} wallet={wallet} refresh={refresh}
-      orders={orders} activeChannels={activeLiveChannels} redeemable={redeemable} />
+      orders={orders} activeChannels={activeLiveChannels} redeemable={redeemable} clockOffset={clockOffset} />
     <ChartDrawer orders={orders} />
     </>
   )

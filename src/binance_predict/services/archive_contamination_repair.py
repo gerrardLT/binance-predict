@@ -516,6 +516,11 @@ async def resettle_window_orders(
         .where(TradeOrderModel.market_period == "5m")
         .where(TradeOrderModel.scene_signal_id.is_(None))
         .where(TradeOrderModel.direction.isnot(None))
+        # 手动平仓产物（2026-09-18）不参与断链重结算：SELL 已实现盈亏，
+        # 重结算会凭空改写真金 pnl / 把股数当 USDT 算亏（High#1）
+        .where(TradeOrderModel.settle_outcome.is_distinct_from("SOLD"))
+        .where(TradeOrderModel.signal_version.notlike("manual_close%"))
+        .where(TradeOrderModel.side == "BUY")
     )).scalars().all()
     changed = 0
     for row in rows:

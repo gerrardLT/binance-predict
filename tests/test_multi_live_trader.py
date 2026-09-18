@@ -2591,7 +2591,7 @@ def _make_real_trader(monkeypatch, with_15m: bool = True) -> BinancePredictionTr
     monkeypatch.setattr(trader, "list_markets", _list)
 
     # detail 预取默认不命中（避免单测触网；命中路径有独立用例覆盖）
-    async def _no_detail(_period, _start_ms):
+    async def _no_detail(_period, _start_ms, **_kw):
         return None
 
     monkeypatch.setattr(trader, "_fetch_market_via_detail", _no_detail)
@@ -2631,7 +2631,7 @@ async def test_signal_trade_market_success_external_call_baseline(monkeypatch) -
         calls["list"] += 1
         return await original_list()
 
-    async def _detail(period, start_ms):
+    async def _detail(period, start_ms, **_kw):
         calls["detail"] += 1
         return await original_detail(period, start_ms)
 
@@ -3053,7 +3053,7 @@ async def test_signal_trade_15m_detail_prefetch_fallback(monkeypatch) -> None:
     quote_tokens: list[str] = []
     fetched: list[tuple] = []
 
-    async def _detail(period, start_ms):
+    async def _detail(period, start_ms, **_kw):
         fetched.append((period, start_ms))
         return {"end_date": start_ms + 900_000, "up_token": "T-FUT-UP",
                 "down_token": "T-FUT-DOWN", "up_price": 0.5, "down_price": 0.5}
@@ -3097,7 +3097,7 @@ async def test_signal_trade_5m_anchor_mismatch_prefetch(monkeypatch) -> None:
     trader._5m_start_date = WINDOW_START - 300_000  # 缓存属上一周期
     quote_tokens: list[str] = []
 
-    async def _detail(period, start_ms):
+    async def _detail(period, start_ms, **_kw):
         return {"end_date": start_ms + 300_000, "up_token": "T5-UP",
                 "down_token": "T5-DOWN", "up_price": 0.5, "down_price": 0.5}
 
@@ -5327,10 +5327,10 @@ async def test_fetch_market_via_detail_scan_budget_parameterized(monkeypatch) ->
     monkeypatch.setattr(trader, "_sign_request", lambda p: dict(p))
 
     await trader._fetch_market_via_detail("5m", 1_789_670_400_000)
-    assert min(probed) == 5001 and max(probed) == 5000 + 48 - 1
+    assert min(probed) == 5001 and max(probed) == 5000 + 48
     probed.clear()
     await trader._fetch_market_via_detail("5m", 1_789_670_400_000, scan_budget=160)
-    assert max(probed) == 5000 + 160 - 1
+    assert max(probed) == 5000 + 160
 
 
 class _FakeScalar:
@@ -5400,11 +5400,14 @@ async def test_close_position_filled_realizes_pnl_and_sell_row(monkeypatch) -> N
     assert row.settle_outcome == "SOLD"
     assert row.win is False  # 0.95 < 1.0 亏
     assert row.settle_price == 0.5
-    # SELL 记录行避开 (signal_version,window_start) 唯一键
+    assert row.redeemed_at is not None  # 已卖 token 不再进可赎回集合
+    # SELL 记录行：signal_version 带 BUY id 避唯一键；amount_in 为 USDT 口径
     assert len(db.added) == 1
     sell = db.added[0]
     assert sell.side == "SELL"
-    assert sell.signal_version == "manual_close"
+    assert sell.signal_version == "manual_close:77"
+    assert sell.amount_in == str(int(0.95 * 1e18))
+    assert sell.quote_json["soldShareQty"] == 1.92
     assert sell.window_start == row.window_start
     assert db.committed is True
 

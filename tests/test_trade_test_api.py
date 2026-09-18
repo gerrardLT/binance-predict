@@ -195,6 +195,7 @@ async def test_recent_trades_fields_and_limit() -> None:
         id=1, signal_version="manual_test", window_start=1_787_412_600_000,
         market_period="5m",
         status="FAILED", order_id=None, token_id=None, amount_in=None,
+        side="BUY",
         quote_json={"averagePrice": 0.5},
         direction=None, settle_outcome=None, settle_price=64250.5, win=None, pnl=None, settled_at=None,
         redeemed_at=None,

@@ -2284,6 +2284,7 @@ async def get_recent_trades(
                 # 「按这个价买到了」（2026-09-04 id=285 归因时踩到）。
                 "price_kind": _order_price_kind(o),
                 "direction": o.direction,
+                "side": o.side,
                 "settle_outcome": o.settle_outcome,
                 "settle_price": getattr(o, "settle_price", None),
                 "win": o.win,
@@ -2315,7 +2316,13 @@ async def get_trades_fund_flow(
     from .db.models import TradeOrderModel
 
     limit = max(1, min(int(limit), 5000))
-    stmt = select(TradeOrderModel).order_by(TradeOrderModel.created_at.asc()).limit(limit)
+    stmt = (
+        select(TradeOrderModel)
+        # 平仓 SELL 记录行不参与资金流水：BUY 的 SOLD 行已带实现盈亏，
+        # 前端按 settled+pnl 算回流即正确；SELL 行会造成 phantom 流出（Medium#4）
+        .where(TradeOrderModel.side.is_distinct_from("SELL"))
+        .order_by(TradeOrderModel.created_at.asc()).limit(limit)
+    )
     if since_ms > 0:
         since_dt = datetime.fromtimestamp(int(since_ms) / 1000, tz=timezone.utc)
         stmt = stmt.where(TradeOrderModel.created_at >= since_dt)
@@ -2499,10 +2506,24 @@ async def get_future_markets(
         return {"error": "count 仅允许 1~8"}
     windows, cached_age = await prediction_trader.get_future_markets_cached(
         period, count=count)
+    # 当前窗报价/起止（Medium#8）：quote-preview 仅 5m，15m 当前窗价/倒计时
+    # 改由本端点从 list_markets 缓存提供
+    if period == "5m":
+        cs, ce = prediction_trader._5m_start_date, prediction_trader._5m_end_date
+        cu, cd = prediction_trader._5m_up_price, prediction_trader._5m_down_price
+    else:
+        cs, ce = prediction_trader._15m_start_date, prediction_trader._15m_end_date
+        cu, cd = prediction_trader._15m_up_price, prediction_trader._15m_down_price
+    current = (
+        {"window_start": int(cs), "window_end": int(ce) if ce else None,
+         "up_price": cu, "down_price": cd}
+        if cs is not None else None
+    )
     return {
         "period": period,
         "server_now_ms": int(time.time() * 1000),
         "cached_age_sec": round(cached_age, 1),
+        "current": current,
         "windows": windows,
     }
 
@@ -2550,9 +2571,13 @@ async def manual_trade_test(
         if window_start > now_ms + 80 * 60_000:
             return {"error": "window_start 超出扫描 horizon（now+80min）"}
 
-    # 踩线兜底（C12）：目标为当前窗且距收盘 <5s 拒单（前端另有阈值）
-    if window_start == current_start and (window_start + step_ms - now_ms) < 5_000:
-        return {"error": "距收盘不足 5 秒，请改选下一窗口"}
+    # 踩线兜底（C12，Medium#5 统一）：当前窗距收盘 <5s 拒单；
+    # 未来窗距开盘 <5s 同样拒单（旧版只判当前窗，领先 1ms 的未来窗无守卫）
+    if window_start == current_start:
+        if window_start + step_ms - now_ms < 5_000:
+            return {"error": "距收盘不足 5 秒，请改选下一窗口"}
+    elif window_start - now_ms < 5_000:
+        return {"error": "距开盘不足 5 秒，请改选下一窗口"}
 
     order = await prediction_trader.execute_signal_trade(
         prediction=req.prediction,
@@ -2562,6 +2587,7 @@ async def manual_trade_test(
         max_exec_price=effective_guard,
         market_period=req.market_period,
         order_type=req.order_type,
+        scan_budget=160,  # 手动远窗需更大扫描预算（Medium#6）
     )
     if order is None:
         return {
@@ -3222,6 +3248,8 @@ async def prediction_redeemable(_: None = Depends(_require_auth)):
             .where(TradeOrderModel.redeemed_at.is_(None))
             .where(TradeOrderModel.token_id.isnot(None))
             .where(TradeOrderModel.token_id != "")
+            # 手动平仓（SOLD）的 token 已不在钱包，不得计入可赎回（Medium#3）
+            .where(TradeOrderModel.settle_outcome.is_distinct_from("SOLD"))
             .order_by(TradeOrderModel.id.desc())
         )).all()
     db_tokens = [r.token_id for r in rows]
@@ -3308,6 +3336,8 @@ async def prediction_redeem(
                 .where(TradeOrderModel.redeemed_at.is_(None))
                 .where(TradeOrderModel.token_id.isnot(None))
                 .where(TradeOrderModel.token_id != "")
+                # 手动平仓（SOLD）token 已卖出，送 batch-redeem 会 400（Medium#3）
+                .where(TradeOrderModel.settle_outcome.is_distinct_from("SOLD"))
             )).all()
         token_ids = [r.token_id for r in rows]
     if not token_ids:
