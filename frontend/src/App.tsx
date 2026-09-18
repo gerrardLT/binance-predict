@@ -2074,19 +2074,10 @@ const fmtMMSS = (sec: number) =>
 
 interface KlineBar { t: number; o: number; h: number; l: number; c: number }
 
-const KLINE_PERIODS = [
-  { key: '1m', step: 60_000, label: '1m' },
-  { key: '5m', step: 300_000, label: '5m' },
-  { key: '15m', step: 900_000, label: '15m' },
-  { key: '1h', step: 3_600_000, label: '1H' },
-] as const
-
-type KlinePeriodKey = (typeof KLINE_PERIODS)[number]['key']
-
 const BINANCE_REST = 'https://api.binance.com'
 const BINANCE_WS = 'wss://stream.binance.com:9443/ws'
 
-function KlineMini({ period, nowMs }: { period: KlinePeriodKey; nowMs: number }) {
+function KlineMini({ period, nowMs }: { period: '5m' | '15m'; nowMs: number }) {
   const [bars, setBars] = useState<KlineBar[]>([])
   const [live, setLive] = useState<'ws' | 'poll' | 'init'>('init')
 
@@ -2158,7 +2149,7 @@ function KlineMini({ period, nowMs }: { period: KlinePeriodKey; nowMs: number })
   }, [period])
 
   // 所选周期当前窗收盘倒计时
-  const step = KLINE_PERIODS.find(p => p.key === period)?.step ?? 300_000
+  const step = period === '5m' ? 300_000 : 900_000
   const remain = Math.max(0, Math.floor(((Math.floor(nowMs / step) + 1) * step - nowMs) / 1000))
 
   // SVG 蜡烛图坐标
@@ -2228,10 +2219,8 @@ function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }
   clockOffset: number
 }) {
   const [open, setOpen] = useState(false)
-  // 唯一周期切换：K 线周期（1m/5m/15m/1H）；下单周期由其推导
-  // （1m/5m → 5m 市场；15m/1H → 15m 市场）
-  const [klinePeriod, setKlinePeriod] = useState<KlinePeriodKey>('5m')
-  const period: '5m' | '15m' = klinePeriod === '15m' || klinePeriod === '1h' ? '15m' : '5m'
+  // 唯一切换器：下单周期（5m/15m）；K 线跟随同一周期
+  const [period, setPeriod] = useState<'5m' | '15m'>('5m')
   // 窗口多选：'current' 或未来窗起点 ms；默认当前窗
   const [picked, setPicked] = useState<(number | 'current')[]>(['current'])
   const [future, setFuture] = useState<FutureWindow[]>([])
@@ -2370,12 +2359,11 @@ function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }
               <div className="flex items-center gap-2">
                 <span className="font-bold text-ink-95">⚡ 一键下单</span>
                 <div className="flex items-center gap-1">
-                  {KLINE_PERIODS.map(p => (
-                    <button key={p.key} onClick={() => { setKlinePeriod(p.key); setPicked(['current']) }}
-                      className={`px-2.5 py-0.5 text-xs font-bold rounded-pill border ${klinePeriod === p.key ? 'bg-brand text-white border-brand' : 'bg-card text-ink-55 border-line hover:border-brand'}`}
-                    >{p.label}</button>
+                  {(['5m', '15m'] as const).map(p => (
+                    <button key={p} onClick={() => { setPeriod(p); setPicked(['current']) }}
+                      className={`px-2.5 py-0.5 text-xs font-bold rounded-pill border ${period === p ? 'bg-brand text-white border-brand' : 'bg-card text-ink-55 border-line hover:border-brand'}`}
+                    >{p}</button>
                   ))}
-                  <span className="text-[10px] text-ink-55 ml-1">下单周期 {period}</span>
                 </div>
               </div>
               <button onClick={() => setOpen(false)} className="text-ink-55 hover:text-ink-80 text-lg leading-none px-1">✕</button>
@@ -2392,8 +2380,8 @@ function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }
               </span>
             </div>
 
-            {/* 实时 K 线：币安 BTC 现货，周期跟随唯一切换器 + 收盘倒计时 */}
-            <KlineMini period={klinePeriod} nowMs={nowMs} />
+            {/* 实时 K 线：币安 BTC 现货，周期跟随下单周期 + 收盘倒计时 */}
+            <KlineMini period={period} nowMs={nowMs} />
 
             {/* 窗口多选（核心）：当前 + 未来窗，点选高亮；
                 另提供「下期起连选 N 窗」快捷钮——自动选中从下一周期起往后 N 个可用窗 */}
