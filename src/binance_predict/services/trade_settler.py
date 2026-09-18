@@ -129,6 +129,9 @@ class TradeSettler:
                 TradeOrderModel.settled_at.is_(None),
                 TradeOrderModel.window_start.isnot(None),
                 TradeOrderModel.created_at < cutoff,
+                # 手动平仓 SELL 记录行不参与窗口结算（盈亏在 close_position
+                # 已实现落库；重算会按 BUY 口径错记，CodeReview R2）
+                TradeOrderModel.side == "BUY",
             )
             .order_by(TradeOrderModel.window_start.asc())
             .limit(SCAN_BATCH)
@@ -162,6 +165,12 @@ class TradeSettler:
         # 按「有无 scene_signal_id」分流而非硬编码通道名：新增 15m 影子族通道无需改此处。
         if getattr(row, "signal_version", None) in CANDLESTICK_SIGNAL_IDS:
             return await self._settle_kline_shadow_row(row)
+        # 手动 15m 单（manual_test_*）：无影子信号行，回读 KlineShadowSignal 必落空
+        # → 24h 后被错记 EXPIRED/pnl=0（CodeReview R2 Critical#1，与 id=466 同型）。
+        # 分流到独立路径：用 15m 窗内首尾两个 5m SentimentWindow 拼出周期开盘/收盘价。
+        if (row.market_period == "15m" and row.scene_signal_id is None
+                and (row.signal_version or "").startswith("manual_test")):
+            return await self._settle_manual_15m_row(row)
         if row.market_period == "15m" and row.scene_signal_id is None:
             return await self._settle_kline_shadow_row(row)
         if row.market_period == "15m" or row.scene_signal_id is not None:
@@ -565,6 +574,85 @@ class TradeSettler:
             SentimentWindow.start_time == window_start)
         async with async_session_factory() as session:
             return (await session.execute(stmt)).scalar_one_or_none()
+
+    async def _settle_manual_15m_row(self, row: TradeOrderModel) -> bool:
+        """手动 15m 单结算：用 5m 窗口归档拼出 15m 周期开盘/收盘价判向。
+
+        结算源：15m 窗 [t0, t0+900s) 内首尾两个 5m SentimentWindow——
+        w1(t0) 的 entry_price 即 15m 开盘价；w3(t0+600s) 的 exit_price 即
+        15m 收盘价（5m 窗边界价快照，与 15m K 线 open/close 同口径）。
+        pnl 公式与 5m 路径同口径（赢优先 股数−成本，回退 amount/均价−amount，
+        输=−amount）；首尾窗归档迟到（未超 24h）则重试，超时 EXPIRED 兕底。
+        """
+        from datetime import datetime, timezone
+
+        now_dt = datetime.now(timezone.utc)
+        t0 = int(row.window_start)
+        w_first = await self._find_window(t0)
+        w_last = await self._find_window(t0 + 600_000)
+        entry = self._to_float(w_first.entry_price) if w_first else None
+        exit_ = self._to_float(w_last.exit_price) if w_last else None
+
+        if entry is not None and exit_ is not None and entry > 0:
+            if exit_ > entry:
+                outcome = "UP"
+            elif exit_ < entry:
+                outcome = "DOWN"
+            else:
+                outcome = "NOISE"
+        else:
+            # 首尾窗未齐（归档迟到）：未超 24h 重试，超时 EXPIRED 兕底（同 5m 路径）
+            created = self._aware(row.created_at)
+            if created is not None and created > now_dt - EXPIRE_AFTER:
+                return False
+            outcome = "EXPIRED"
+
+        if outcome == "NOISE":
+            win, settle_price, pnl = None, exit_, 0.0
+        elif outcome == "EXPIRED":
+            win, settle_price, pnl = None, None, 0.0
+        else:
+            win = row.direction == outcome
+            settle_price = exit_
+            amount = self._amount_usdt(row)
+            avg_price = self._avg_price(row)
+            shares = self._shares(row)
+            if win and amount is not None and shares is not None:
+                pnl = shares - amount
+            elif win and amount is not None and avg_price is not None:
+                pnl = amount / avg_price - amount
+            elif not win and amount is not None:
+                pnl = -amount
+            else:
+                pnl = None
+
+        # 幂等守卫：WHERE settled_at IS NULL（并发竞争只生效一次）
+        async with async_session_factory() as session:
+            stmt = (
+                sa_update(TradeOrderModel)
+                .where(
+                    TradeOrderModel.id == row.id,
+                    TradeOrderModel.settled_at.is_(None),
+                )
+                .values(
+                    settle_outcome=outcome,
+                    win=win,
+                    settle_price=settle_price,
+                    pnl=pnl,
+                    settled_at=now_dt,
+                )
+            )
+            result = await session.execute(stmt)
+            await session.commit()
+        if result.rowcount == 0:
+            return False
+        await self._patch_settlement_assessment(row, str(outcome))
+        self._settled_count += 1
+        logger.info(
+            "订单结算 | id=%s | 手动 15m（窗口拼接口径）| window=%s | direction=%s → %s | win=%s | pnl=%s",
+            row.id, row.window_start, row.direction, outcome, win,
+            f"{pnl:+.4f}" if pnl is not None else "N/A")
+        return True
 
     @staticmethod
     def _amount_usdt(row: TradeOrderModel) -> float | None:

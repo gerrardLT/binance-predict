@@ -30,6 +30,7 @@ from datetime import datetime, timezone
 from loguru import logger
 
 from sqlalchemy import delete as sa_delete
+from sqlalchemy import or_
 from sqlalchemy import select as sa_select
 from sqlalchemy import update as sa_update
 
@@ -517,9 +518,14 @@ async def resettle_window_orders(
         .where(TradeOrderModel.scene_signal_id.is_(None))
         .where(TradeOrderModel.direction.isnot(None))
         # 手动平仓产物（2026-09-18）不参与断链重结算：SELL 已实现盈亏，
-        # 重结算会凭空改写真金 pnl / 把股数当 USDT 算亏（High#1）
+        # 重结算会凭空改写真金 pnl / 把股数当 USDT 算亏（High#1）；
+        # notlike 需 or NULL（SQL 三值逻辑：NULL NOT LIKE → NULL → 行被误滤，
+        # 旧路径订单 signal_version 可为 NULL，W#9）
         .where(TradeOrderModel.settle_outcome.is_distinct_from("SOLD"))
-        .where(TradeOrderModel.signal_version.notlike("manual_close%"))
+        .where(or_(
+            TradeOrderModel.signal_version.is_(None),
+            TradeOrderModel.signal_version.notlike("manual_close%"),
+        ))
         .where(TradeOrderModel.side == "BUY")
     )).scalars().all()
     changed = 0
