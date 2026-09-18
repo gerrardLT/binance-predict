@@ -52,6 +52,26 @@ jobs:
 
                 trader.place_order = forbidden_place_order
 
+                # 原始 detail 抽样：锚点后 30 个 tid 的 slug/trading/startDate 原样输出
+                anchor_tuple = await trader._list_btc_anchor("5m")
+                print("ANCHOR_5m=", anchor_tuple)
+                if anchor_tuple:
+                    anchor = anchor_tuple[0]
+                    sample = []
+                    for tid in range(anchor + 1, anchor + 31):
+                        d = await trader._detail_one(tid)
+                        if d is None:
+                            sample.append({"tid": tid, "resp": None})
+                        else:
+                            subs = d.get("markets", [])
+                            sample.append({
+                                "tid": tid,
+                                "slug": d.get("slug"),
+                                "trading": subs[0].get("tradingStatus") if subs else None,
+                                "startDate": d.get("startDate"),
+                            })
+                    print("SAMPLE_30=" + json.dumps(sample, ensure_ascii=False))
+
                 for period in ("5m", "15m"):
                     windows = await trader.scan_future_markets(period, count=8)
                     print(f"RAW_SCAN_{period}=" + json.dumps(
