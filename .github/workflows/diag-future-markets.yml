@@ -52,25 +52,43 @@ jobs:
 
                 trader.place_order = forbidden_place_order
 
-                # 原始 detail 抽样：锚点后 30 个 tid 的 slug/trading/startDate 原样输出
+                # 全量 list 的 BTC 市场 + 锚点后 40 个 tid 抽样 + 未来 5m 窗 slug 反查
+                now_ms = int(time.time() * 1000)
+                client = trader._get_client()
+                signed = trader._sign_request({"limit": 100, "offset": 0})
+                resp = await client.get(
+                    f"{trader.BASE_URL}/sapi/v1/w3w/wallet/prediction/market/list",
+                    params=signed, headers={"X-MBX-APIKEY": trader._api_key})
+                btc_topics = []
+                for m in resp.json().get("marketTopics", []):
+                    if m.get("chartType") == "CRYPTO_UP_DOWN" and m.get("symbol") == "BTCUSDT":
+                        btc_topics.append({"tid": m.get("marketTopicId"),
+                                           "slug": m.get("slug"),
+                                           "start": m.get("startDate")})
+                print("BTC_LIST=" + json.dumps(btc_topics, ensure_ascii=False))
                 anchor_tuple = await trader._list_btc_anchor("5m")
                 print("ANCHOR_5m=", anchor_tuple)
                 if anchor_tuple:
                     anchor = anchor_tuple[0]
                     sample = []
-                    for tid in range(anchor + 1, anchor + 31):
+                    for tid in range(anchor + 1, anchor + 41):
                         d = await trader._detail_one(tid)
                         if d is None:
-                            sample.append({"tid": tid, "resp": None})
+                            sample.append({"tid": tid, "r": None})
                         else:
-                            subs = d.get("markets", [])
-                            sample.append({
-                                "tid": tid,
-                                "slug": d.get("slug"),
-                                "trading": subs[0].get("tradingStatus") if subs else None,
-                                "startDate": d.get("startDate"),
-                            })
-                    print("SAMPLE_30=" + json.dumps(sample, ensure_ascii=False))
+                            sample.append({"tid": tid, "slug": d.get("slug"),
+                                           "st": d.get("startDate")})
+                    print("SAMPLE_40=" + json.dumps(sample, ensure_ascii=False))
+                    # 反查：下一 5m 窗（now+300s 对齐）slug 直接构造，双向扫 500 找它
+                    want_epoch = (now_ms + 300_000) // 300_000 * 300_000 // 1000
+                    slug_want = f"btc-updown-5m-{want_epoch}"
+                    found = []
+                    for tid in range(anchor - 100, anchor + 500):
+                        d = await trader._detail_one(tid)
+                        if d and d.get("slug") == slug_want:
+                            found.append({"tid": tid, "slug": slug_want})
+                            break
+                    print("FUTURE_5M_FOUND=" + json.dumps(found, ensure_ascii=False))
 
                 for period in ("5m", "15m"):
                     windows = await trader.scan_future_markets(period, count=8)
