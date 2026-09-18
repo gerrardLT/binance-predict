@@ -1,0 +1,71 @@
+name: Diag Future Markets
+
+# 只读诊断：生产容器内验证未来窗获取（list 分页直取 + ID 扫描兜底）。
+# 禁止下单（place_order 替换为抛异常）。
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: diag-future-markets
+  cancel-in-progress: false
+
+jobs:
+  diag:
+    name: Read-only diagnosis on VPS
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Run diag on VPS
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
+          command_timeout: 10m
+          script: |
+            set -euo pipefail
+            cd /www/wwwroot/binance-predict
+            docker compose -f docker-compose.prod.yml exec -T backend python - <<'PY'
+            import asyncio
+            import json
+            import time
+
+            from binance_predict.services import clock_sync
+            from binance_predict.services.prediction_trading import BinancePredictionTrader
+
+
+            async def main():
+                trader = BinancePredictionTrader()
+                await clock_sync.sync_server_time()
+
+                async def forbidden_place_order(*a, **kw):
+                    raise RuntimeError("SAFETY: place_order forbidden in diag")
+
+                trader.place_order = forbidden_place_order
+
+                # list 分页直取后 _future_markets 内容
+                await trader.list_markets()
+                now_ms = int(time.time() * 1000)
+                for period in ("5m", "15m"):
+                    fm = trader._future_markets.get(period, {})
+                    print(f"LIST_FUTURE_{period}=" + json.dumps(
+                        [{"start": s, "ahead": round((s - now_ms) / 1000, 1),
+                          "up": e.get("up_price"), "dn": e.get("down_price"),
+                          "has_tokens": bool(e.get("up_token"))}
+                         for s, e in sorted(fm.items())], ensure_ascii=False))
+
+                # 端点实际走的缓存路径
+                for period in ("5m", "15m"):
+                    rows, age = await trader.get_future_markets_cached(period, 8)
+                    print(f"CACHED_{period}=" + json.dumps(
+                        [{"start": w["window_start"]} for w in rows],
+                        ensure_ascii=False) + f" age={age}")
+
+                await trader.aclose()
+
+
+            asyncio.run(main())
+            PY

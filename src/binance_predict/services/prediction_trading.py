@@ -195,6 +195,9 @@ class BinancePredictionTrader:
         self._future_locks: dict[str, asyncio.Lock] = {}
         # TTL 45s > 前端 30s 轮询间隔，避免每次轮询都 miss 重扫（Low#11）
         self._future_cache_ttl_ms = 45_000
+        # 未来窗市场表（list 分页直取，与 App 同源）：period → {start_ms: entry+tokens}；
+        # 每次 list_markets 重建；scan_future_markets 与下单路径共用
+        self._future_markets: dict[str, dict[int, dict]] = {}
 
         if not self._api_key or not self._api_secret:
             logger.warning("Binance API Key/Secret 未配置，预测交易功能不可用")
@@ -1008,18 +1011,48 @@ class BinancePredictionTrader:
     async def scan_future_markets(
         self, period: str, count: int = 10, budget: int = 160
     ) -> list[dict]:
-        """扫描未来周期市场（并发分块 + 提前终止）。
+        """未来周期市场列表（与币安 App 同源：market/list 分页直取）。
+
+        2026-09-18 修正：旧实现靠 marketTopicId 猜测扫描（+1..+160），但币安
+        市场 ID 不连续（批次间夹杂其他市场，间隔可达上千），已创建的未来窗
+        经常扫不到 → 误报「未创建」。改为与 App 同源：list_markets() 分页
+        拉全量列表（list_markets 内填充 _future_markets），直接过滤未来窗。
+        ID 猜测扫描仅降级为列表无未来窗时的兜底。
 
         Args:
             period: '5m' 或 '15m'
             count: 期望返回的未来窗数量
-            budget: 向前扫描的 ID 预算（默认 160）
+            budget: 兜底 ID 扫描预算（默认 160）
 
         Returns:
             未来窗列表（按 start_ms 升序，最多 count 个），含 window_start/window_end/
-            ahead_sec/trading_status/up_price/down_price/topic_id/available
+            ahead_sec/trading_status/up_price/down_price/up_token/down_token/topic_id/available
         """
         now_ms = int(time.time() * 1000)
+        await self.list_markets()
+        rows = [
+            {
+                "window_start": start,
+                "window_end": e.get("end_date"),
+                "ahead_sec": round((start - now_ms) / 1000, 1),
+                "trading_status": "OPEN",
+                "up_price": e.get("up_price"),
+                "down_price": e.get("down_price"),
+                "up_token": e.get("up_token"),
+                "down_token": e.get("down_token"),
+                "topic_id": e.get("topic_id"),
+                "available": True,
+            }
+            for start, e in sorted(self._future_markets.get(period, {}).items())
+        ]
+        if rows:
+            return rows[:count]
+        return await self._scan_future_via_detail(period, count, budget, now_ms)
+
+    async def _scan_future_via_detail(
+        self, period: str, count: int, budget: int, now_ms: int
+    ) -> list[dict]:
+        """兜底：list 无未来窗时按 marketTopicId 猜测扫描（并发分块 + 提前终止）。"""
         anchor_tuple = await self._list_btc_anchor(period)
         if not anchor_tuple:
             return []
@@ -1027,7 +1060,7 @@ class BinancePredictionTrader:
 
         prefix = f"btc-updown-{period}-"
         tids = list(range(anchor + 1, anchor + budget + 1))
-        WAVE = 10  # 每波并发 10 个 detail（W#10 降并发）；波间退避，凑够即停
+        WAVE = 10  # 每波并发 10 个 detail；波间退避，凑够即停
         collected: list[dict] = []
 
         def _to_row(tid: int, d: dict | None) -> dict | None:
@@ -1053,6 +1086,8 @@ class BinancePredictionTrader:
                 "trading_status": trading,
                 "up_price": entry.get("up_price"),
                 "down_price": entry.get("down_price"),
+                "up_token": entry.get("up_token"),
+                "down_token": entry.get("down_token"),
                 "topic_id": tid,
                 "available": True,
             }
@@ -1078,22 +1113,21 @@ class BinancePredictionTrader:
                     else:
                         miss_streak += 1
                 if rate_limited:
-                    # 限流即中止本轮（W#10）：继续打波会升级 418 封禁，
+                    # 限流即中止本轮：继续打波会升级 418 封禁，
                     # 拖垮与下单热路径共享的 Key/配额；返回已收集结果
                     logger.warning(
-                        "scan_future_markets | {} | 命中限流，中止本轮（已收集 {}）",
+                        "scan_future_via_detail | {} | 命中限流，中止本轮（已收集 {}）",
                         period, len(collected))
                     break
                 if len(collected) >= count:
                     break  # 提前终止：已凑够，不再打后续波
                 if miss_streak >= 60:
-                    # 连续 60 个 ID 无 BTC 命中：已扫过未来市场创建前沿，
-                    # 止损退出，避免 15m 等稀疏周期每轮烧满 160 次签名请求（Low#11）
+                    # 连续 60 个 ID 无 BTC 命中：止损退出，避免烧满签名请求
                     break
-                # 波间退避：平滑突发，避免 ~50 req/s 冲击 sapi 配额（W#10）
+                # 波间退避：平滑突发，冲击 sapi 配额
                 await asyncio.sleep(0.3)
         except Exception as e:
-            logger.warning("scan_future_markets | {} | {}", period, e)
+            logger.warning("_scan_future_via_detail | {} | {}", period, e)
 
         collected.sort(key=lambda r: r["window_start"])
         return collected[:count]
@@ -1547,6 +1581,9 @@ class BinancePredictionTrader:
             offset += limit
 
         btc_markets = []
+        # 未来窗市场表每次 list_markets 重建（list 含未来窗，与 App 同源）
+        self._future_markets = {}
+        _now_ms = int(time.time() * 1000)
 
         for market in markets:
             if (
@@ -1557,6 +1594,17 @@ class BinancePredictionTrader:
 
                 # 按周期分类（先判 15m 再判 5m）
                 period = self._classify_period(market)
+
+                # 未来窗入表：startDate 在未来且 tradingStatus=OPEN（2026-09-18）
+                if period in ("5m", "15m"):
+                    _pf = self._parse_15m_entry(market)
+                    if _pf is not None:
+                        _f_start, _f_entry = _pf
+                        _subs = market.get("markets", [])
+                        _trading = _subs[0].get("tradingStatus") if _subs else None
+                        if _f_start > _now_ms and _trading == "OPEN":
+                            _f_entry["topic_id"] = market.get("marketTopicId")
+                            self._future_markets.setdefault(period, {})[_f_start] = _f_entry
 
                 if period == "5m":
                     # 更新 5 分钟市场元数据
@@ -2099,8 +2147,16 @@ class BinancePredictionTrader:
                     token_id = (self._up_token_id if prediction == "UP"
                                 else self._down_token_id)
                 else:
-                    entry = await self._fetch_market_via_detail(
-                        "5m", window_start, scan_budget=scan_budget)
+                    # 未来窗：优先用 list 直取的 token（与 App 同源，本单开头
+                    # list_markets 已填充 _future_markets）；未命中再走 ID 猜测扫描兜底
+                    entry = None
+                    for _fs, _fe in self._future_markets.get("5m", {}).items():
+                        if abs(_fs - window_start) <= 2000:
+                            entry = _fe
+                            break
+                    if entry is None:
+                        entry = await self._fetch_market_via_detail(
+                            "5m", window_start, scan_budget=scan_budget)
                     token_id = (entry["up_token"] if prediction == "UP"
                                 else entry["down_token"]) if entry else None
                     if entry is None:
