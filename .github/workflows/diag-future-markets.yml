@@ -1,0 +1,70 @@
+name: Diag Future Markets
+
+# 一次性只读诊断：生产容器内直调 scan_future_markets / get_future_markets_cached，
+# 排查「未来窗口消失」。禁止下单（place_order 被替换为抛异常）。用完即删。
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: diag-future-markets
+  cancel-in-progress: false
+
+jobs:
+  diag:
+    name: Read-only diagnosis on VPS
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Run diag on VPS
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
+          command_timeout: 10m
+          script: |
+            set -euo pipefail
+            cd /www/wwwroot/binance-predict
+            docker compose -f docker-compose.prod.yml exec -T backend python - <<'PY'
+            import asyncio
+            import json
+
+            from binance_predict.services import clock_sync
+            from binance_predict.services.prediction_trading import BinancePredictionTrader
+
+
+            async def main():
+                trader = BinancePredictionTrader()
+                await clock_sync.sync_server_time()
+                wallet = await trader.fetch_wallet_info()
+                print("wallet_ok=", bool(wallet))
+
+                await trader.list_markets()
+                print("5m_start_date=", trader._5m_start_date)
+                print("15m_start_date=", trader._15m_start_date)
+                print("15m_markets_keys=", sorted(trader._15m_markets.keys()))
+
+                async def forbidden_place_order(*a, **kw):
+                    raise RuntimeError("SAFETY: place_order forbidden in diag")
+
+                trader.place_order = forbidden_place_order
+
+                for period in ("5m", "15m"):
+                    windows = await trader.scan_future_markets(period, count=8)
+                    print(f"RAW_SCAN_{period}=" + json.dumps(
+                        [{"start": w["window_start"], "ahead": w["ahead_sec"],
+                          "up": w["up_price"], "dn": w["down_price"]} for w in windows],
+                        ensure_ascii=False))
+                    cached, age = await trader.get_future_markets_cached(period, 8)
+                    print(f"CACHED_{period}=" + json.dumps(
+                        [{"start": w["window_start"]} for w in cached], ensure_ascii=False)
+                        + f" age={age}")
+
+                await trader.aclose()
+
+
+            asyncio.run(main())
+            PY
