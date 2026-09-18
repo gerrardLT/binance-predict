@@ -2239,6 +2239,12 @@ function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }
                 <span>点选要下单的窗口（可多选，至多 {MAX_WINDOWS} 个）</span>
                 <span className="ml-auto">{loading ? '扫描未来周期…' : `已选 ${targets.length} 窗`}</span>
               </div>
+              {/* 币安未来市场分批创建：扫描空窗期（非加载中、无未来窗）提示等待而非故障 */}
+              {!loading && future.length === 0 && (
+                <div className="text-[11px] text-ink-55 rounded-sm bg-sunken px-2 py-1">
+                  币安尚未创建下一批未来市场（周期边界常见），约 30 秒后自动重试；当前窗仍可下单
+                </div>
+              )}
               {/* 快捷连选：从下一周期（不含当前窗）往后数 N 个可用窗自动选中 */}
               <div className="flex items-center gap-1.5 flex-wrap">
                 <span className="text-[11px] text-ink-55">下期起连选</span>
