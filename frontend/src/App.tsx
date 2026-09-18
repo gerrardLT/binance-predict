@@ -2232,11 +2232,37 @@ function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }
               </span>
             </div>
 
-            {/* 窗口多选（核心）：当前 + 未来窗，点选高亮 */}
+            {/* 窗口多选（核心）：当前 + 未来窗，点选高亮；
+                另提供「下期起连选 N 窗」快捷钮——自动选中从下一周期起往后 N 个可用窗 */}
             <div className="space-y-1">
               <div className="flex items-center text-[11px] text-ink-55">
                 <span>点选要下单的窗口（可多选，至多 {MAX_WINDOWS} 个）</span>
                 <span className="ml-auto">{loading ? '扫描未来周期…' : `已选 ${targets.length} 窗`}</span>
+              </div>
+              {/* 快捷连选：从下一周期（不含当前窗）往后数 N 个可用窗自动选中 */}
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <span className="text-[11px] text-ink-55">下期起连选</span>
+                {Array.from({ length: MAX_WINDOWS }, (_, i) => i + 1).map(n => {
+                  const nextAvail = future.filter(w =>
+                    w.available && w.window_start - nowMs >= 5_000)
+                  const autoActive = !picked.includes('current')
+                    && picked.length === Math.min(n, nextAvail.length)
+                    && nextAvail.slice(0, n).every(w => picked.includes(w.window_start))
+                  return (
+                    <button key={n}
+                      disabled={loading || nextAvail.length === 0}
+                      title={`自动选中未来第 1~${n} 个窗口（不含当前窗）`}
+                      onClick={() => {
+                        const wins = nextAvail.slice(0, n)
+                        setPicked(wins.map(w => w.window_start))
+                      }}
+                      className={`px-2 py-0.5 rounded-pill border text-xs transition ${autoActive
+                        ? 'bg-brand text-white border-brand font-semibold'
+                        : 'border-line bg-card text-ink-80 hover:border-brand'} disabled:opacity-40`}
+                    >{n}窗</button>
+                  )
+                })}
+                <span className="text-[11px] text-ink-55">（或直接点选下方窗口）</span>
               </div>
               <div className="flex items-center gap-1.5 flex-wrap">
                 <button onClick={() => togglePick('current')}
