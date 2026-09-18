@@ -2065,6 +2065,165 @@ const fmtHHMM = (ms: number) =>
 const fmtMMSS = (sec: number) =>
   `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`
 
+// ============================================================
+// 实时 K 线小组件（2026-09-18）：下单弹框内嵌，币安 BTC 现货 K 线。
+// 数据源：REST 拉历史（公开无 key）+ WebSocket kline 流推实时；
+// WS 断线自动降级 5s 轮询。自绘 SVG 蜡烛图（不依赖 recharts 蜡烛支持）。
+// 周期可切 1m/5m/15m/1h，并显示所选周期当前窗收盘倒计时。
+// ============================================================
+
+interface KlineBar { t: number; o: number; h: number; l: number; c: number }
+
+const KLINE_PERIODS = [
+  { key: '1m', step: 60_000, label: '1m' },
+  { key: '5m', step: 300_000, label: '5m' },
+  { key: '15m', step: 900_000, label: '15m' },
+  { key: '1h', step: 3_600_000, label: '1H' },
+] as const
+
+type KlinePeriodKey = (typeof KLINE_PERIODS)[number]['key']
+
+const BINANCE_REST = 'https://api.binance.com'
+const BINANCE_WS = 'wss://stream.binance.com:9443/ws'
+
+function KlineMini({ nowMs }: { nowMs: number }) {
+  const [period, setPeriod] = useState<KlinePeriodKey>('5m')
+  const [bars, setBars] = useState<KlineBar[]>([])
+  const [live, setLive] = useState<'ws' | 'poll' | 'init'>('init')
+
+  // REST 拉历史 + WS 订阅；周期切换重建连接
+  useEffect(() => {
+    let alive = true
+    let ws: WebSocket | null = null
+    let pollTimer: number | null = null
+    setLive('init')
+
+    const applyKlines = (raw: unknown[]) => {
+      const next: KlineBar[] = raw.map(r => {
+        const a = r as (string | number)[]
+        return { t: Number(a[0]), o: +a[1], h: +a[2], l: +a[3], c: +a[4] }
+      })
+      if (alive) setBars(next.slice(-100))
+    }
+    const mergeKline = (k: { t: number; o: number; h: number; l: number; c: number }) => {
+      if (!alive) return
+      setBars(prev => {
+        if (!prev.length) return [k]
+        const last = prev[prev.length - 1]
+        if (k.t === last.t) return [...prev.slice(0, -1), k]
+        if (k.t > last.t) return [...prev, k].slice(-100)
+        return prev
+      })
+    }
+
+    const startPoll = () => {
+      if (pollTimer != null) return
+      setLive('poll')
+      pollTimer = window.setInterval(async () => {
+        try {
+          const r = await fetch(
+            `${BINANCE_REST}/api/v3/klines?symbol=BTCUSDT&interval=${period}&limit=100`)
+          if (!r.ok) return
+          applyKlines(await r.json())
+        } catch { /* 轮询失败静默等下一轮 */ }
+      }, 5_000)
+    }
+
+    fetch(`${BINANCE_REST}/api/v3/klines?symbol=BTCUSDT&interval=${period}&limit=100`)
+      .then(r => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then(applyKlines)
+      .catch(() => { if (alive) startPoll() })
+
+    try {
+      ws = new WebSocket(`${BINANCE_WS}/btcusdt@kline_${period}`)
+      ws.onopen = () => { if (alive) setLive('ws') }
+      ws.onmessage = ev => {
+        try {
+          const msg = JSON.parse(ev.data)
+          const k = msg?.k
+          if (!k) return
+          mergeKline({ t: k.t, o: +k.o, h: +k.h, l: +k.l, c: +k.c })
+        } catch { /* 非 kline 消息忽略 */ }
+      }
+      ws.onerror = () => { if (alive) startPoll() }
+      ws.onclose = () => { if (alive) startPoll() }
+    } catch {
+      startPoll()
+    }
+
+    return () => {
+      alive = false
+      if (ws) { ws.onclose = null; ws.close() }
+      if (pollTimer != null) clearInterval(pollTimer)
+    }
+  }, [period])
+
+  // 所选周期当前窗收盘倒计时
+  const step = KLINE_PERIODS.find(p => p.key === period)?.step ?? 300_000
+  const remain = Math.max(0, Math.floor(((Math.floor(nowMs / step) + 1) * step - nowMs) / 1000))
+
+  // SVG 蜡烛图坐标
+  const W = 560
+  const H = 150
+  const n = bars.length
+  let lo = Infinity
+  let hi = -Infinity
+  for (const b of bars) { if (b.l < lo) lo = b.l; if (b.h > hi) hi = b.h }
+  const pad = (hi - lo) * 0.08 || 1
+  lo -= pad; hi += pad
+  const y = (v: number) => H - ((v - lo) / (hi - lo)) * H
+  const bw = n > 0 ? W / n : W
+  const last = n > 0 ? bars[n - 1] : null
+
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center gap-1.5">
+        <span className="text-[11px] text-ink-55">BTC 实时 K 线</span>
+        {KLINE_PERIODS.map(p => (
+          <button key={p.key} onClick={() => setPeriod(p.key)}
+            className={`px-2 py-0.5 text-[11px] font-semibold rounded-pill border ${period === p.key ? 'bg-brand text-white border-brand' : 'bg-card text-ink-55 border-line hover:border-brand'}`}
+          >{p.label}</button>
+        ))}
+        <span className="ml-auto font-mono text-[11px] font-bold tabular-nums" title="所选周期当前窗收盘倒计时">
+          收盘 {fmtMMSS(remain)}
+        </span>
+        <span className={`text-[10px] ${live === 'ws' ? 'text-positive' : 'text-ink-55'}`} title={live === 'ws' ? 'WebSocket 实时推送' : live === 'poll' ? 'WS 断线，5s 轮询降级' : '加载中'}>
+          {live === 'ws' ? '● 实时' : live === 'poll' ? '○ 轮询' : '…'}
+        </span>
+      </div>
+      {n > 1 ? (
+        <svg viewBox={`0 0 ${W} ${H}`} className="w-full rounded-sm bg-sunken" style={{ height: 150 }}>
+          {bars.map((b, i) => {
+            const cx = i * bw + bw / 2
+            const up = b.c >= b.o
+            const color = up ? 'var(--positive)' : 'var(--negative)'
+            const bodyTop = y(Math.max(b.o, b.c))
+            const bodyH = Math.max(1, Math.abs(y(b.o) - y(b.c)))
+            return (
+              <g key={b.t}>
+                <line x1={cx} x2={cx} y1={y(b.h)} y2={y(b.l)} stroke={color} strokeWidth={1} />
+                <rect x={cx - bw * 0.32} y={bodyTop} width={bw * 0.64} height={bodyH} fill={color} />
+              </g>
+            )
+          })}
+          {last != null && (
+            <g>
+              <line x1={0} x2={W} y1={y(last.c)} y2={y(last.c)} stroke="var(--ink-55)" strokeDasharray="3 3" strokeWidth={0.8} />
+              <text x={W - 4} y={y(last.c) - 3} textAnchor="end" fontSize={10} fill="var(--ink-80)" fontFamily="monospace">
+                {last.c.toFixed(1)}
+              </text>
+            </g>
+          )}
+        </svg>
+      ) : (
+        <div className="h-[150px] flex items-center justify-center rounded-sm bg-sunken text-[11px] text-ink-55">
+          K 线加载中…（网络不通时自动降级轮询）
+        </div>
+      )}
+    </div>
+  )
+}
+
 // 悬浮快速下单（右下角 FAB）：一键下单 5m/15m 多个周期窗口（真实订单）。
 function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }: {
   quote: Record<string, unknown> | null
@@ -2231,6 +2390,9 @@ function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }
                 {curEnd != null && `到期 ${fmtHHMM(curEnd)} · 剩 ${fmtMMSS(remainLocal ?? 0)}`}
               </span>
             </div>
+
+            {/* 实时 K 线：币安 BTC 现货，周期可切 1m/5m/15m/1H + 收盘倒计时 */}
+            <KlineMini nowMs={nowMs} />
 
             {/* 窗口多选（核心）：当前 + 未来窗，点选高亮；
                 另提供「下期起连选 N 窗」快捷钮——自动选中从下一周期起往后 N 个可用窗 */}
