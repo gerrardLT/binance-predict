@@ -2043,8 +2043,9 @@ function LiveOrderChartCard({ orders = [] }: { orders?: Record<string, unknown>[
 }
 
 // ============================================================
-// 手动下单模态框（2026-09-18 重构）：未来周期选择 / 方向大卡 / 一键下单 /
-// 限价+护栏 / 模态内确认 / 平仓 / 持仓小页（A1–A12、B1–B2、C1–C13，除 C14）
+// 手动下单模态框（2026-09-18 R3 极简重构）：一键下单 5m/15m 多个周期窗口。
+// 砍掉限价/护栏/持仓小页/K线/规则等杂项，只留：周期切换 → 窗口多选 →
+// 方向 → 金额 → 一键下单。平仓/赎回入口回到实盘页面主区。
 // ============================================================
 
 interface FutureWindow {
@@ -2061,455 +2062,91 @@ interface FutureWindow {
 const fmtHHMM = (ms: number) =>
   new Date(ms).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
 
-// 周期选择条（A1/A2/A4）：当前窗 + 未来窗 chips；不可用窗禁用
-function PeriodStrip({ period, onPeriod, selected, onSelect, future, loading }: {
-  period: '5m' | '15m'
-  onPeriod: (p: '5m' | '15m') => void
-  selected: number | 'current'
-  onSelect: (w: number | 'current') => void
-  future: FutureWindow[]
-  loading: boolean
-}) {
-  return (
-    <div className="space-y-1.5">
-      <div className="flex items-center gap-1.5">
-        {(['5m', '15m'] as const).map(p => (
-          <button key={p} onClick={() => onPeriod(p)}
-            className={`px-2 py-0.5 text-xs font-semibold rounded-pill border ${period === p ? 'bg-brand text-white border-brand' : 'bg-card text-ink-55 border-line hover:border-brand'}`}
-          >{p}</button>
-        ))}
-        <span className="text-[10px] text-ink-55 ml-auto">{loading ? '扫描未来周期…' : `未来 ${future.length} 窗`}</span>
-      </div>
-      <div className="flex items-center gap-1.5 flex-wrap">
-        <button onClick={() => onSelect('current')}
-          className={`px-2 py-0.5 text-xs rounded-pill border ${selected === 'current' ? 'bg-positive-soft text-positive border-positive' : 'bg-card text-ink-80 border-line hover:border-brand'}`}
-        >当前</button>
-        {future.map(w => (
-          <button key={w.window_start} disabled={!w.available}
-            title={w.available ? `距开盘 ${Math.round(w.ahead_sec)}s` : '该周期暂不可交易'}
-            onClick={() => onSelect(w.window_start)}
-            className={`px-2 py-0.5 text-xs rounded-pill border ${selected === w.window_start ? 'bg-brand text-white border-brand' : 'bg-card text-ink-80 border-line hover:border-brand'} disabled:opacity-40`}
-          >{fmtHHMM(w.window_start)}<span className="opacity-60 ml-1">{Math.round(w.ahead_sec)}s</span></button>
-        ))}
-      </div>
-    </div>
-  )
-}
+const fmtMMSS = (sec: number) =>
+  `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`
 
-// 方向大卡（A5）：涨/跌 带实时价
-function DirectionCards({ side, onSide, up, down }: {
-  side: 'UP' | 'DOWN'
-  onSide: (s: 'UP' | 'DOWN') => void
-  up: number | null
-  down: number | null
-}) {
-  const card = (s: 'UP' | 'DOWN', price: number | null, active: string) => (
-    <button onClick={() => onSide(s)}
-      className={`flex-1 py-2 rounded-card border text-center ${side === s ? active : 'bg-card text-ink-55 border-line'}`}
-    >
-      <div className="text-sm font-bold">{s === 'UP' ? '↗ 涨' : '↘ 跌'}</div>
-      <div className="text-[11px] font-mono">{price != null ? price.toFixed(3) : '--'}</div>
-    </button>
-  )
-  return (
-    <div className="flex gap-2">
-      {card('UP', up, 'bg-positive-soft text-positive border-positive')}
-      {card('DOWN', down, 'bg-negative-soft text-negative border-negative')}
-    </div>
-  )
-}
-
-// 金额面板（A6/A7/A9/C7）：余额、预设卡带潜在赢得、自定义预设、一键下单开关
-function AmountPanel({ amount, onAmount, balance, price, oneClick, onOneClick }: {
-  amount: string
-  onAmount: (v: string) => void
-  balance: number | null
-  price: number | null
-  oneClick: boolean
-  onOneClick: (v: boolean) => void
-}) {
-  const num = parseFloat(amount)
-  const payout = Number.isFinite(num) && price && price > 0 ? num / price : null
-  const [custom, setCustom] = useState<number[]>(() => {
-    try { return JSON.parse(localStorage.getItem('manual_order_presets') || '[]') } catch { return [] }
-  })
-  const saveCustom = () => {
-    if (!Number.isFinite(num) || num < 0.1 || num > 50) return
-    const next = Array.from(new Set([...custom, num])).slice(-6)
-    setCustom(next)
-    localStorage.setItem('manual_order_presets', JSON.stringify(next))
-  }
-  return (
-    <div className="space-y-1.5">
-      <div className="flex items-center gap-2">
-        <label className="text-ink-55 text-xs shrink-0">金额</label>
-        <input type="number" min={0.1} max={50} step={0.5} value={amount}
-          onChange={e => onAmount(e.target.value)}
-          className="ds-input ds-input-numeric w-24" />
-        <span className="text-[10px] text-ink-55">0.1~50</span>
-        <span className="ml-auto text-[10px] text-ink-55">余额 {balance != null ? balance.toFixed(2) : '--'} U</span>
-      </div>
-      {payout != null && (
-        <div className="text-[11px] text-positive">潜在赢得 ≈ {payout.toFixed(2)} U（金额÷价）</div>
-      )}
-      <div className="flex items-center gap-1.5 flex-wrap text-xs">
-        {[1, 2, 5, 10, 20, 50].map(u => (
-          <button key={u} onClick={() => onAmount(String(u))}
-            className="px-2 py-0.5 rounded-pill border border-line bg-card text-ink-80 hover:border-brand"
-          >{u}U</button>
-        ))}
-        {custom.map(u => (
-          <button key={`c${u}`} onClick={() => onAmount(String(u))}
-            className="px-2 py-0.5 rounded-pill border border-brand/40 bg-card text-brand hover:border-brand"
-          >{u}U</button>
-        ))}
-        <button onClick={saveCustom} title="把当前金额存为自定义预设"
-          className="px-2 py-0.5 rounded-pill border border-line bg-card text-ink-55 hover:border-brand">＋存</button>
-      </div>
-      <label className="flex items-center gap-1.5 text-xs text-ink-70">
-        <input type="checkbox" checked={oneClick} onChange={e => onOneClick(e.target.checked)} />
-        一键下单（跳过勾选确认）
-        <HelpHint text="开启后提交不再要求勾选确认条；仍受金额/护栏/踩线守卫约束" />
-      </label>
-    </div>
-  )
-}
-
-// 订单类型面板（B1/B2）：市价/限价 + 限价 + 护栏
-function OrderTypePanel({ orderType, onOrderType, priceLimit, onPriceLimit, guard, onGuard }: {
-  orderType: 'MARKET' | 'LIMIT'
-  onOrderType: (t: 'MARKET' | 'LIMIT') => void
-  priceLimit: string
-  onPriceLimit: (v: string) => void
-  guard: string
-  onGuard: (v: string) => void
-}) {
-  return (
-    <div className="flex items-center gap-2 flex-wrap text-xs">
-      {(['MARKET', 'LIMIT'] as const).map(t => (
-        <button key={t} onClick={() => onOrderType(t)}
-          className={`px-2 py-0.5 rounded-pill border ${orderType === t ? 'bg-brand text-white border-brand' : 'bg-card text-ink-55 border-line'}`}
-        >{t === 'MARKET' ? '市价' : '限价'}</button>
-      ))}
-      {orderType === 'LIMIT' && (
-        <label className="flex items-center gap-1">限价
-          <input type="number" min={0.01} max={0.99} step={0.01} value={priceLimit}
-            onChange={e => onPriceLimit(e.target.value)} className="ds-input ds-input-numeric w-20" />
-        </label>
-      )}
-      <label className="flex items-center gap-1">护栏
-        <input type="number" min={0.01} max={0.99} step={0.01} value={guard} placeholder="空=不设"
-          onChange={e => onGuard(e.target.value)} className="ds-input ds-input-numeric w-20" />
-        <HelpHint text="执行价护栏：报价超价/贴线即弃单；限价单时限价值即护栏" />
-      </label>
-    </div>
-  )
-}
-
-// 信息行（A3/C2/C3/C4）：目标/当前/差额、报价新鲜度、错价徽标、本窗 BTC 涨跌
-function InfoRow({ up, down, btc, btcOpen, freshSec }: {
-  up: number | null
-  down: number | null
-  btc: number | null
-  btcOpen: number | null
-  freshSec: number | null
-}) {
-  const mis = up != null && down != null ? Math.abs(up + down - 1) : null
-  const btcDelta = btc != null && btcOpen != null && btcOpen > 0 ? (btc - btcOpen) : null
-  return (
-    <div className="flex items-center gap-2 flex-wrap text-[11px] text-ink-70">
-      <span className="font-mono">UP {up != null ? up.toFixed(3) : '--'} / DN {down != null ? down.toFixed(3) : '--'}</span>
-      {mis != null && mis > 0.01 && (
-        <span className="px-1 rounded-pill bg-warning/15 text-warning" title="UP+DOWN 偏离 1，潜在错价">错价 {(mis * 100).toFixed(1)}pt</span>
-      )}
-      {btcDelta != null && (
-        <span className={`font-mono ${btcDelta >= 0 ? 'text-positive' : 'text-negative'}`}>
-          BTC {btcDelta >= 0 ? '+' : ''}{btcDelta.toFixed(1)}
-        </span>
-      )}
-      <span className="ml-auto text-ink-55">{freshSec != null ? `${freshSec}s 前` : '--'}</span>
-    </div>
-  )
-}
-
-// 迷你 BTC 走势（A10）：recharts 折线 + 窗口开盘价虚线
-function MiniSpark({ klines, target }: { klines: BtcKline[]; target: number | null }) {
-  if (!klines.length) return null
-  const data = klines.map(k => ({ t: k.open_time, c: k.close }))
-  return (
-    <div className="h-16">
-      <ResponsiveContainer width="100%" height="100%">
-        <LineChart data={data} margin={{ top: 4, right: 4, bottom: 0, left: 4 }}>
-          <Line type="monotone" dataKey="c" stroke="var(--chart-1)" strokeWidth={1.5} dot={false} isAnimationActive={false} />
-          {target != null && <ReferenceLine y={target} stroke="var(--ink-55)" strokeDasharray="3 3" />}
-        </LineChart>
-      </ResponsiveContainer>
-    </div>
-  )
-}
-
-// 规则折叠（A11）
-function RulesCollapse() {
-  return (
-    <details className="text-[11px] text-ink-55">
-      <summary className="cursor-pointer hover:text-ink-80">规则说明</summary>
-      <p className="mt-1">
-        窗口收盘 BTC 价 &gt; 开盘价 → UP 赢，否则 DOWN 赢；赢单按持有股数兑付（1 股=1 USDT）。
-        手动单与信号实盘同链路，同一窗口至多一单；未来窗需该周期 tradingStatus=OPEN 才可下单。
-      </p>
-    </details>
-  )
-}
-
-// 确认条（C5/C6）：汇总 + 勾选启用；大额额外警示
-function ConfirmBar({ confirmed, onConfirmed, summary, big }: {
-  confirmed: boolean
-  onConfirmed: (v: boolean) => void
-  summary: string
-  big: boolean
-}) {
-  return (
-    <div className={`p-2 rounded-sm border text-xs ${big ? 'border-warning bg-warning/10' : 'border-line bg-sunken'}`}>
-      <div className="text-ink-80 whitespace-pre-line">{summary}</div>
-      {big && <div className="text-warning font-semibold mt-1">⚠ 大额单（&gt;10 USDT），请再次核对</div>}
-      <label className="flex items-center gap-1.5 mt-1.5 text-ink-70">
-        <input type="checkbox" checked={confirmed} onChange={e => onConfirmed(e.target.checked)} />
-        确认真实下单（真金）
-      </label>
-    </div>
-  )
-}
-
-// 结果面板（C8/C9）：逐窗结果列表
-function ResultPanel({ results }: { results: Record<string, unknown>[] }) {
-  if (!results.length) return null
-  return (
-    <div className="space-y-1">
-      {results.map((r, i) => {
-        const ok = r.status === 'FILLED'
-        return (
-          <div key={i} className={`p-1.5 rounded-sm text-[11px] ${ok ? 'bg-positive-soft text-positive' : 'bg-negative-soft text-negative'}`}>
-            <span className="font-bold">{ok ? '✓ FILLED' : `✗ ${String(r.status ?? r.error ?? r.detail ?? '未执行')}`}</span>
-            {r.window_start != null && (
-              <span className="ml-1 font-mono">{fmtHHMM(Number(r.window_start))}{r.window_end != null ? `–${fmtHHMM(Number(r.window_end))}` : ''}</span>
-            )}
-            {r.average_price != null && <span className="ml-1">@{String(r.average_price)}</span>}
-            {r.filled_shares != null && <span className="ml-1">{String(r.filled_shares)}股</span>}
-            {r.provider_fee != null && <span className="ml-1">费{String(r.provider_fee)}</span>}
-            {r.error_message != null && <span className="ml-1">{String(r.error_message)}</span>}
-            {r.error != null && <span className="ml-1">{String(r.error)}</span>}
-          </div>
-        )
-      })}
-    </div>
-  )
-}
-
-// 持仓小页（A12/C10/C1）：持仓/委托/结算/余额 + 平仓按钮 + 可赎回提醒
-function PositionsMini({ orders, redeemable, onClose, onRedeem, balance, closingId, redeeming }: {
-  orders: Record<string, unknown>[]
-  redeemable: Record<string, unknown> | null
-  onClose: (id: number) => void
-  onRedeem: () => void
-  balance: number | null
-  closingId: number | null
-  redeeming: boolean
-}) {
-  const [tab, setTab] = useState<'open' | 'pending' | 'settled' | 'bal'>('open')
-  // S#SELL 行过滤：平仓 SELL 记录行不是独立持仓/委托，不重复渲染
-  const buyOrders = orders.filter(o => o.side !== 'SELL')
-  const open = buyOrders.filter(o => o.status === 'FILLED' && !o.settled_at)
-  const pending = buyOrders.filter(o => o.status === 'PENDING')
-  const settled = buyOrders.filter(o => o.settled_at)
-  const redeemCount = Number(redeemable?.claimable_count ?? 0)
-  const rows = tab === 'open' ? open : tab === 'pending' ? pending : tab === 'settled' ? settled : []
-  const fmtAmt = (v: unknown) => {
-    const n = Number(v)
-    return Number.isFinite(n) && n > 0 ? `${(n / 1e18).toFixed(2)}U` : '--'
-  }
-  const fmtPnl = (v: unknown) => {
-    const n = Number(v)
-    return Number.isFinite(n) ? `${n >= 0 ? '+' : ''}${n.toFixed(2)}` : null
-  }
-  return (
-    <div className="space-y-1">
-      <div className="flex items-center gap-1 text-[11px]">
-        {([['open', `持仓(${open.length})`], ['pending', `委托(${pending.length})`], ['settled', `结算(${settled.length})`], ['bal', '余额']] as const).map(([k, label]) => (
-          <button key={k} onClick={() => setTab(k)}
-            className={`px-1.5 py-0.5 rounded-pill border ${tab === k ? 'bg-brand text-white border-brand' : 'bg-card text-ink-55 border-line'}`}
-          >{label}</button>
-        ))}
-        {redeemCount > 0 && (
-          <button onClick={onRedeem} disabled={redeeming}
-            className="ml-auto px-1.5 py-0.5 rounded-pill bg-warning text-white font-semibold disabled:opacity-40"
-            title="batch-redeem 全部可领赢单"
-          >{redeeming ? '赎回中…' : `可赎回 ${redeemCount} · 一键赎回`}</button>
-        )}
-      </div>
-      {tab === 'bal' ? (
-        <div className="text-[11px] text-ink-70 font-mono">
-          预测钱包可用：{balance != null ? `${balance.toFixed(2)} U` : '--（余额不可查）'}
-          <div className="text-ink-55 font-sans mt-0.5">划转/现货余额在实盘面板操作</div>
-        </div>
-      ) : (
-        <div className="max-h-28 overflow-auto space-y-0.5">
-          {rows.slice(0, 20).map(o => {
-            const pnl = fmtPnl(o.pnl)
-            return (
-              <div key={String(o.id)} className="flex items-center gap-1.5 text-[11px] text-ink-70">
-                <span className="font-mono">{o.window_start != null ? fmtHHMM(Number(o.window_start)) : '--'}</span>
-                <span className={o.direction === 'UP' ? 'text-positive' : 'text-negative'}>{String(o.direction ?? '--')}</span>
-                <span>{fmtAmt(o.amount_in)}</span>
-                {tab === 'settled' && o.settle_outcome != null && (
-                  <span className={o.settle_outcome === 'SOLD' ? 'text-warning' : (o.win === true ? 'text-positive' : o.win === false ? 'text-negative' : 'text-ink-55')}>
-                    {String(o.settle_outcome)}
-                    {pnl != null && <span className="ml-0.5">{pnl}</span>}
-                  </span>
-                )}
-                {tab !== 'settled' && <span>{String(o.status)}</span>}
-                {tab === 'open' && (
-                  <button onClick={() => onClose(Number(o.id))} disabled={closingId != null}
-                    className="ml-auto px-1.5 py-0.5 rounded-pill border border-negative text-negative hover:bg-negative-soft disabled:opacity-40">
-                    {closingId === Number(o.id) ? '平仓中…' : '平仓'}</button>
-                )}
-              </div>
-            )
-          })}
-          {!rows.length && <div className="text-[11px] text-ink-55">无记录</div>}
-        </div>
-      )}
-    </div>
-  )
-}
-
-// 通道冲突提示（C11）
-function ConflictHint({ channels, period }: { channels: { channel: string; market_period: string }[]; period: string }) {
-  const same = channels.filter(c => c.market_period === period)
-  if (!same.length) return null
-  return (
-    <div className="text-[10px] text-ink-55">
-      在跑同周期通道：{same.map(c => c.channel).join(', ')}（同窗可能已被自动单占用）
-    </div>
-  )
-}
-
-// 悬浮快速下单（右下角 FAB）：表单状态自持有；报价/倒计时/钱包由 LiveTradeTab 传入。
-function TestTradeFab({ quote, remainSec, urgent, wallet, refresh, orders, activeChannels, redeemable, clockOffset }: {
+// 悬浮快速下单（右下角 FAB）：一键下单 5m/15m 多个周期窗口（真实订单）。
+function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }: {
   quote: Record<string, unknown> | null
   remainSec: number | null
-  urgent: boolean
   wallet: Record<string, unknown> | null
   refresh: () => void
   orders: Record<string, unknown>[]
-  activeChannels: { channel: string; market_period: string }[]
-  redeemable: Record<string, unknown> | null
   clockOffset: number
 }) {
   const [open, setOpen] = useState(false)
   const [period, setPeriod] = useState<'5m' | '15m'>('5m')
-  const [selected, setSelected] = useState<number | 'current'>('current')
+  // 窗口多选：'current' 或未来窗起点 ms；默认当前窗
+  const [picked, setPicked] = useState<(number | 'current')[]>(['current'])
   const [future, setFuture] = useState<FutureWindow[]>([])
-  const [futureLoading, setFutureLoading] = useState(false)
+  const [loading, setLoading] = useState(false)
   const [amount, setAmount] = useState('1')
   const [side, setSide] = useState<'UP' | 'DOWN'>('UP')
-  const [orderType, setOrderType] = useState<'MARKET' | 'LIMIT'>('MARKET')
-  const [priceLimit, setPriceLimit] = useState('0.5')
-  const [guard, setGuard] = useState('')
-  const [oneClick, setOneClick] = useState(false)
-  const [confirmed, setConfirmed] = useState(false)
-  const [multi, setMulti] = useState(1)
   const [busy, setBusy] = useState(false)
   const [results, setResults] = useState<Record<string, unknown>[]>([])
-  const [klines, setKlines] = useState<BtcKline[]>([])
   const [currentWin, setCurrentWin] = useState<Record<string, unknown> | null>(null)
-  // A8：买入/平仓双 tab（平仓聚焦持仓小页，与需求形式对齐）
-  const [mode, setMode] = useState<'buy' | 'close'>('buy')
+  // 大额（>10U/窗）勾选确认；小单一键直接下
+  const [confirmed, setConfirmed] = useState(false)
 
+  const MAX_WINDOWS = 6
   const q = (v: unknown) => (typeof v === 'number' ? v : null)
-  const nowMs = Date.now() + clockOffset  // 服务端时钟校正（Medium#5）
+  const nowMs = Date.now() + clockOffset
   const step = period === '5m' ? 300_000 : 900_000
-  const baseWindow = selected === 'current'
-    ? Math.floor(nowMs / step) * step
-    : selected
-  const selWin = selected === 'current' ? null : future.find(w => w.window_start === selected) ?? null
-  const isCurrent = selected === 'current'
-  // 指示价分流（决策 2 + Medium#8）：当前 5m 用 quote-preview；当前 15m 用
-  // future-markets 的 current；未来窗用 detail 价
-  const curSrc = isCurrent
-    ? (period === '5m'
-      ? { up: q(quote?.up_price), down: q(quote?.down_price), end: q(quote?.window_end) }
-      : { up: q(currentWin?.up_price), down: q(currentWin?.down_price), end: q(currentWin?.window_end) })
-    : { up: selWin?.up_price ?? null, down: selWin?.down_price ?? null, end: q(selWin?.window_end) }
-  const up = curSrc.up
-  const down = curSrc.down
-  const price = side === 'UP' ? up : down
-  const balance = typeof wallet?.prediction_usdt_free === 'number' ? wallet.prediction_usdt_free as number : null
-  const freshSec = quote && !quote.stale && typeof quote.server_now_ms === 'number'
-    ? Math.max(0, Math.round((Date.now() - (quote.server_now_ms as number)) / 1000)) : null
-  const alreadyOrdered = orders.some(o =>
-    String(o.signal_version ?? '').startsWith('manual_test')
-    && o.market_period === period
-    && o.window_start === baseWindow && o.status !== 'FAILED')
-  // 倒计时本地实时递减、跨周期正确（Medium#5/#8）；15m 数据未加载时不回落
-  // 5m 口径（S#4-②：会把 5m 剩余时间错用于 15m 的 tooLate 判定，误拦尚有
-  // ~10min 的下单）——置 null 显示 --:-- 且不参与踩线判定
-  const remainLocal = isCurrent
-    ? (curSrc.end != null
-        ? Math.max(0, Math.floor((curSrc.end - nowMs) / 1000))
-        : (period === '5m' ? remainSec : null))
-    : null
-  const aheadLocal = selWin != null ? Math.max(0, Math.floor((selWin.window_start - nowMs) / 1000)) : null
-  // 踩线守卫（C12 + Medium#5 实时化）
-  const tooLate = isCurrent && remainLocal != null && remainLocal < 10
-  const futureTooSoon = selWin != null && aheadLocal != null && aheadLocal < 5
+  const baseWindow = Math.floor(nowMs / step) * step
+
+  // 当前窗参考价（5m 用 quote-preview；15m 用 future-markets 的 current）
+  const up = period === '5m' ? q(quote?.up_price) : q(currentWin?.up_price)
+  const down = period === '5m' ? q(quote?.down_price) : q(currentWin?.down_price)
+  const curEnd = period === '5m' ? q(quote?.window_end) : q(currentWin?.window_end)
+  const balance = typeof wallet?.prediction_usdt_free === 'number'
+    ? wallet.prediction_usdt_free as number : null
+
+  // 当前窗剩余秒（15m 数据未加载时置 null，不误用 5m 口径）
+  const remainLocal = curEnd != null
+    ? Math.max(0, Math.floor((curEnd - nowMs) / 1000))
+    : (period === '5m' ? remainSec : null)
+  // 当前窗踩线（<10s）时自动移出选择
+  const currentTooLate = remainLocal != null && remainLocal < 10
+
   const amtNum = parseFloat(amount)
   const amtOk = Number.isFinite(amtNum) && amtNum >= 0.1 && amtNum <= 50
-  // 护栏/限价解析即校验（W#11）：'0' 或非法值阻断而非静默回退 null
-  // （旧版 parseFloat('0')||null → null → 用户以为设了护栏实际无护栏真金下单）
-  const guardNum = parseFloat(guard)
-  const guardOk = guard === '' || (Number.isFinite(guardNum) && guardNum > 0 && guardNum < 1)
-  const limitNum = parseFloat(priceLimit)
-  const limitOk = orderType !== 'LIMIT' || (Number.isFinite(limitNum) && limitNum > 0 && limitNum < 1)
-  // 无指示价且非限价/无护栏时禁止盲下真金市价单（Medium#8）
-  const priceKnown = price != null || orderType === 'LIMIT' || guard !== ''
-  // 大额与一键互斥（W#12/C6）：>10 USDT 必须勾选确认，一键模式不豁免
-  const bigAmount = Number.isFinite(amtNum) && amtNum > 10
-  const canSubmit = amtOk && guardOk && limitOk && !busy && !tooLate && !futureTooSoon
-    && priceKnown && ((oneClick && !bigAmount) || confirmed)
-  // C12：踩线自动切下一可用窗（未来窗已按 window_start 升序）
-  useEffect(() => {
-    if (isCurrent && tooLate && future.length > 0
-        && future[0].window_start - nowMs >= 5_000) {
-      setSelected(future[0].window_start)
-    }
-  }, [isCurrent, tooLate, future, nowMs])
+  const bigAmount = amtNum > 10
+  // 提交目标：'current' → 当前窗；过滤踩线当前窗与距开盘 <5s 的未来窗
+  const targets = picked.map(w => (w === 'current' ? baseWindow : w))
+    .filter(ws => {
+      if (ws === baseWindow && currentTooLate) return false
+      return ws - nowMs >= 5_000 || ws === baseWindow
+    })
+  const alreadyOrderedWins = new Set(orders
+    .filter(o => String(o.signal_version ?? '').startsWith('manual_test')
+      && o.market_period === period && o.status !== 'FAILED')
+    .map(o => Number(o.window_start)))
+  const canSubmit = amtOk && !busy && targets.length > 0
+    && (!bigAmount || confirmed)
 
-  // 打开/切周期/30s 刷新未来窗
+  // 踩线自动移出 + 大额时要求确认
+  useEffect(() => {
+    if (currentTooLate && picked.includes('current')) {
+      setPicked(p => p.filter(w => w !== 'current'))
+    }
+  }, [currentTooLate, picked])
+  useEffect(() => { if (!bigAmount) setConfirmed(false) }, [bigAmount])
+
+  // 打开/切周期拉取未来窗（含当前窗参考价）
   useEffect(() => {
     if (!open) return
     let alive = true
     const load = () => {
-      setFutureLoading(true)
+      setLoading(true)
       api.getFutureMarkets(period, 8).then((d: Record<string, unknown>) => {
         if (!alive) return
         setFuture(Array.isArray(d.windows) ? d.windows as FutureWindow[] : [])
         setCurrentWin((d.current ?? null) as Record<string, unknown> | null)
-      }).catch(() => {}).finally(() => alive && setFutureLoading(false))
+      }).catch(() => {}).finally(() => alive && setLoading(false))
     }
     load()
     const t = setInterval(load, 30_000)
     return () => { alive = false; clearInterval(t) }
-  }, [open, period])
-
-  // 迷你 K 线（S#4：alive 守卫防快速切周期时旧响应覆盖新数据）
-  useEffect(() => {
-    if (!open) return
-    let alive = true
-    api.getBtcKlines(period, 30).then((d: Record<string, unknown>) => {
-      if (!alive) return
-      setKlines(Array.isArray(d.klines) ? d.klines as BtcKline[] : [])
-    }).catch(() => {})
-    return () => { alive = false }
   }, [open, period])
 
   // Esc 关闭
@@ -2520,24 +2157,25 @@ function TestTradeFab({ quote, remainSec, urgent, wallet, refresh, orders, activ
     return () => window.removeEventListener('keydown', onKey)
   }, [open])
 
+  const togglePick = (w: number | 'current') => {
+    setPicked(p => p.includes(w) ? p.filter(x => x !== w)
+      : (p.length >= MAX_WINDOWS ? p : [...p, w]))
+  }
+
   const handleSubmit = async () => {
     if (!canSubmit) return
     setBusy(true)
     setResults([])
     const out: Record<string, unknown>[] = []
     try {
-      for (let i = 0; i < multi; i++) {
-        const ws = baseWindow + i * step
+      for (const ws of targets) {
         const res = await api.postTradeTest(amtNum, side, {
           market_period: period,
           window_start: ws,
-          order_type: orderType,
-          price_limit: orderType === 'LIMIT' ? limitNum : null,
-          max_exec_price: orderType === 'MARKET' && guard !== '' ? guardNum : null,
         })
-        out.push({ ...res, window_start: ws })
-        // S#2：FastAPI 错误体是 {detail}，无 error/status 字段——不识别会继续烧后续窗
-        if (res.error || res.detail || res.status === 'FAILED') break
+        out.push({ ...res, window_start: ws,
+          window_end: ws + step })
+        // 逐窗独立尝试（每窗一单占位互不影响）；余额不足等硬错误会逐窗复现于结果
       }
       setResults(out)
       refresh()
@@ -2549,53 +2187,17 @@ function TestTradeFab({ quote, remainSec, urgent, wallet, refresh, orders, activ
     }
   }
 
-  // 平仓 busy 防双击（Critical#2 前端层；服务端已有原子占位）
-  const [closingId, setClosingId] = useState<number | null>(null)
-  const handleClose = async (id: number) => {
-    if (closingId != null) return
-    if (!window.confirm(`确认平仓订单 #${id}？将卖出全部持仓股数并实现盈亏。`)) return
-    setClosingId(id)
-    try {
-      const res = await api.postClosePosition(id)
-      if (res.error) alert(String(res.error))
-      refresh()
-    } catch (e) {
-      alert(`请求失败: ${(e as Error).message}`)
-    } finally {
-      setClosingId(null)
-    }
-  }
-
-  // C10：模态内一键赎回（复用实盘页 handleRedeem 同链路）
-  const [redeeming, setRedeeming] = useState(false)
-  const handleRedeemAll = async () => {
-    if (redeeming) return
-    if (!window.confirm('确认赎回全部可领赢单？')) return
-    setRedeeming(true)
-    try {
-      const res = await api.postRedeem()
-      if (res.error) alert(String(res.error))
-      refresh()
-    } catch (e) {
-      alert(`请求失败: ${(e as Error).message}`)
-    } finally {
-      setRedeeming(false)
-    }
-  }
-
-  const summary = [
-    `周期 ${period} | 窗口 ${fmtHHMM(baseWindow)}${multi > 1 ? ` 起连 ${multi} 窗` : ''}`,
-    `方向 ${side === 'UP' ? '涨' : '跌'} | 金额 ${amount} U | ${orderType === 'MARKET' ? '市价' : `限价 ${priceLimit}`}`,
-    guard ? `护栏 ${guard}` : '不设护栏',
-    price != null ? `指示价 ${price.toFixed(3)} | 潜在赢得 ≈ ${(amtNum / price).toFixed(2)} U` : '指示价 --',
-  ].join('\n')
+  const chipCls = (on: boolean) =>
+    `px-2.5 py-1 text-xs font-semibold rounded-pill border transition ${on
+      ? 'bg-brand text-white border-brand'
+      : 'bg-card text-ink-80 border-line hover:border-brand'} disabled:opacity-40`
 
   return (
     <>
       <button
         onClick={() => setOpen(o => !o)}
         className="fixed bottom-6 right-6 z-40 px-4 py-3 rounded-pill font-bold text-white text-sm transition bg-brand hover:bg-brand-hover"
-        title="手动下单（真实订单）"
+        title="一键下单（5m/15m 多周期窗口，真实订单）"
       >
         {busy ? '下单中…' : '⚡ 下单'}
       </button>
@@ -2603,108 +2205,153 @@ function TestTradeFab({ quote, remainSec, urgent, wallet, refresh, orders, activ
       {open && (
         <>
           <div className="fixed inset-0 z-40 bg-ink-black/10" onClick={() => setOpen(false)} />
-          <div className="fixed bottom-24 right-6 z-50 w-[380px] max-w-[94vw] max-h-[86vh] overflow-auto bg-card rounded-card border border-line p-4 space-y-2.5 text-sm">
+          <div className="fixed bottom-24 right-6 z-50 w-[600px] max-w-[94vw] max-h-[86vh] overflow-auto bg-card rounded-card border border-line p-5 space-y-3 text-sm">
+            {/* 标题 + 周期切换 */}
             <div className="flex items-center justify-between">
-              <span className="text-sm font-bold text-ink-95">⚡ 手动下单（真实订单）</span>
+              <div className="flex items-center gap-2">
+                <span className="font-bold text-ink-95">⚡ 一键下单</span>
+                <div className="flex items-center gap-1">
+                  {(['5m', '15m'] as const).map(p => (
+                    <button key={p} onClick={() => { setPeriod(p); setPicked(['current']) }}
+                      className={`px-2.5 py-0.5 text-xs font-bold rounded-pill border ${period === p ? 'bg-brand text-white border-brand' : 'bg-card text-ink-55 border-line hover:border-brand'}`}
+                    >{p}</button>
+                  ))}
+                </div>
+              </div>
               <button onClick={() => setOpen(false)} className="text-ink-55 hover:text-ink-80 text-lg leading-none px-1">✕</button>
             </div>
 
-            {/* A8：买入 / 平仓双 tab */}
-            <div className="flex items-center gap-1.5">
-              {([['buy', '买入'], ['close', '平仓']] as const).map(([k, label]) => (
-                <button key={k} onClick={() => setMode(k)}
-                  className={`px-2.5 py-0.5 text-xs font-semibold rounded-pill border ${mode === k ? 'bg-brand text-white border-brand' : 'bg-card text-ink-55 border-line hover:border-brand'}`}
-                >{label}</button>
-              ))}
+            {/* 参考价 + 当前窗倒计时 */}
+            <div className={`flex items-center justify-between rounded-sm px-3 py-1.5 text-xs ${remainLocal != null && remainLocal < 60 ? 'bg-negative-soft text-negative' : 'bg-sunken text-ink-80'}`}>
+              <span className="font-mono">
+                涨 {up != null ? up.toFixed(3) : '--'} / 跌 {down != null ? down.toFixed(3) : '--'}
+                <span className="opacity-60 ml-1">（当前窗参考价）</span>
+              </span>
+              <span className="font-mono font-bold tabular-nums">
+                {curEnd != null && `到期 ${fmtHHMM(curEnd)} · 剩 ${fmtMMSS(remainLocal ?? 0)}`}
+              </span>
             </div>
 
-            {mode === 'close' ? (
-              <>
-                <PositionsMini orders={orders} redeemable={redeemable} onClose={handleClose}
-                  onRedeem={handleRedeemAll} balance={balance} closingId={closingId} redeeming={redeeming} />
-                <RulesCollapse />
-              </>
-            ) : (
-              <>
+            {/* 窗口多选（核心）：当前 + 未来窗，点选高亮 */}
+            <div className="space-y-1">
+              <div className="flex items-center text-[11px] text-ink-55">
+                <span>点选要下单的窗口（可多选，至多 {MAX_WINDOWS} 个）</span>
+                <span className="ml-auto">{loading ? '扫描未来周期…' : `已选 ${targets.length} 窗`}</span>
+              </div>
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <button onClick={() => togglePick('current')}
+                  disabled={currentTooLate}
+                  title={currentTooLate ? '当前窗距收盘不足 10 秒' : `剩余 ${fmtMMSS(remainLocal ?? 0)}`}
+                  className={chipCls(picked.includes('current') && !currentTooLate)}
+                >当前 {fmtHHMM(baseWindow)}</button>
+                {future.map(w => {
+                  const ahead = Math.max(0, Math.floor((w.window_start - nowMs) / 1000))
+                  const tooSoon = ahead < 5
+                  const hasOrder = alreadyOrderedWins.has(w.window_start)
+                  return (
+                    <button key={w.window_start}
+                      onClick={() => togglePick(w.window_start)}
+                      disabled={!w.available || tooSoon}
+                      title={tooSoon ? '距开盘不足 5 秒'
+                        : hasOrder ? '该窗口已有手动单（下单会被拒）'
+                        : `距开盘 ${ahead}s`}
+                      className={`${chipCls(picked.includes(w.window_start))} ${hasOrder ? 'border-warning/60' : ''}`}
+                    >{fmtHHMM(w.window_start)}<span className="opacity-60 ml-1">{Math.round(ahead / 60)}分</span>
+                      {hasOrder && <span className="ml-1 text-warning">●</span>}
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
 
-            <PeriodStrip period={period} onPeriod={p => { setPeriod(p); setSelected('current') }}
-              selected={selected} onSelect={setSelected} future={future} loading={futureLoading} />
+            {/* 方向大卡 */}
+            <div className="flex gap-3">
+              <button onClick={() => setSide('UP')}
+                className={`flex-1 py-3 rounded-card border text-center transition ${side === 'UP' ? 'bg-positive-soft text-positive border-positive' : 'bg-card text-ink-55 border-line hover:border-positive/50'}`}
+              >
+                <div className="text-base font-bold">↗ 涨</div>
+                <div className="text-xs font-mono">{up != null ? up.toFixed(3) : '--'}</div>
+              </button>
+              <button onClick={() => setSide('DOWN')}
+                className={`flex-1 py-3 rounded-card border text-center transition ${side === 'DOWN' ? 'bg-negative-soft text-negative border-negative' : 'bg-card text-ink-55 border-line hover:border-negative/50'}`}
+              >
+                <div className="text-base font-bold">↘ 跌</div>
+                <div className="text-xs font-mono">{down != null ? down.toFixed(3) : '--'}</div>
+              </button>
+            </div>
 
-            {isCurrent && up == null && down == null ? (
-              <div className="text-xs text-ink-55 rounded-pill bg-sunken px-2 py-1.5">报价不可用（等待采样器/市场列表…）</div>
-            ) : (
-              <div className={`rounded-sm px-2 py-1.5 ${urgent && isCurrent ? 'bg-negative-soft' : 'bg-sunken'}`}>
-                <InfoRow up={up} down={down}
-                  btc={typeof quote?.btc_price === 'number' ? quote.btc_price as number : null}
-                  btcOpen={isCurrent && period === '5m' && typeof quote?.window_open_btc === 'number' ? quote.window_open_btc as number : null}
-                  freshSec={isCurrent ? freshSec : null} />
-                <div className="flex items-center justify-between mt-1 text-[11px] font-mono font-bold tabular-nums">
-                  <span>{isCurrent
-                    ? `剩余 ${remainLocal != null ? `${Math.floor(remainLocal / 60)}:${String(remainLocal % 60).padStart(2, '0')}` : '--:--'}`
-                    : `距开盘 ${aheadLocal ?? '--'}s`}
-                    {curSrc.end != null && <span className="ml-2 opacity-60">到期 {fmtHHMM(curSrc.end)}</span>}
-                  </span>
-                  {alreadyOrdered && <span className="text-warning">本窗已有手动单</span>}
+            {/* 金额 + 预设 */}
+            <div className="space-y-1.5">
+              <div className="flex items-center gap-2">
+                <label className="text-ink-55 text-xs shrink-0">金额</label>
+                <input type="number" min={0.1} max={50} step={0.5} value={amount}
+                  onChange={e => setAmount(e.target.value)}
+                  className="ds-input ds-input-numeric w-28" />
+                <span className="text-[11px] text-ink-55">0.1~50 U / 每窗</span>
+                <span className="ml-auto text-[11px] text-ink-55">余额 {balance != null ? balance.toFixed(2) : '--'} U</span>
+              </div>
+              <div className="flex items-center gap-1.5 flex-wrap text-xs">
+                {[1, 2, 5, 10, 20, 50].map(u => (
+                  <button key={u} onClick={() => setAmount(String(u))}
+                    className={`px-2.5 py-0.5 rounded-pill border ${amtNum === u ? 'bg-brand text-white border-brand' : 'border-line bg-card text-ink-80 hover:border-brand'}`}
+                  >{u}U</button>
+                ))}
+              </div>
+              {up != null && Number.isFinite(amtNum) && (
+                <div className="text-[11px] text-positive">
+                  每窗潜在赢得 ≈ {(amtNum / (side === 'UP' ? up : down ?? 0.5)).toFixed(2)} U
+                  {targets.length > 1 && ` × ${targets.length} 窗 ≈ ${((amtNum / (side === 'UP' ? up : down ?? 0.5)) * targets.length).toFixed(2)} U`}
                 </div>
+              )}
+            </div>
+
+            {/* 大额确认（仅 >10U 出现） */}
+            {bigAmount && (
+              <label className="flex items-center gap-2 p-2 rounded-sm border border-warning bg-warning/10 text-xs text-ink-80">
+                <input type="checkbox" checked={confirmed} onChange={e => setConfirmed(e.target.checked)} />
+                大额单（&gt;10 U/窗）确认真实下单
+              </label>
+            )}
+
+            {/* 一键下单 */}
+            <button onClick={handleSubmit} disabled={!canSubmit}
+              className={`ds-btn-primary w-full py-3 text-base font-bold disabled:opacity-40 ${busy ? 'cursor-wait' : ''}`}
+            >
+              {busy ? '下单中…'
+                : `一键下单（${side === 'UP' ? '涨' : '跌'} ${amount}U${targets.length > 1 ? ` × ${targets.length} 窗` : ''}）`}
+            </button>
+
+            {/* 结果 */}
+            {results.length > 0 && (
+              <div className="space-y-1">
+                {results.map((r, i) => {
+                  const ok = r.status === 'FILLED'
+                  return (
+                    <div key={i} className={`p-2 rounded-sm text-xs ${ok ? 'bg-positive-soft text-positive' : 'bg-negative-soft text-negative'}`}>
+                      <span className="font-bold">{ok ? '✓ 成交' : '✗ 失败'}</span>
+                      {r.window_start != null && (
+                        <span className="ml-1.5 font-mono">{fmtHHMM(Number(r.window_start))}–{r.window_end != null ? fmtHHMM(Number(r.window_end)) : '--'}</span>
+                      )}
+                      {r.average_price != null && <span className="ml-1.5">@{String(r.average_price)}</span>}
+                      {r.filled_shares != null && <span className="ml-1.5">{String(r.filled_shares)}股</span>}
+                      {(r.error || r.error_message) != null && <span className="ml-1.5">{String(r.error ?? r.error_message)}</span>}
+                    </div>
+                  )
+                })}
               </div>
             )}
 
-            <MiniSpark klines={klines}
-              target={isCurrent && period === '5m' && typeof quote?.window_open_btc === 'number' ? quote.window_open_btc as number : null} />
-
-            <DirectionCards side={side} onSide={setSide} up={up} down={down} />
-
-            <AmountPanel amount={amount} onAmount={setAmount} balance={balance} price={price}
-              oneClick={oneClick} onOneClick={setOneClick} />
-
-            <OrderTypePanel orderType={orderType} onOrderType={setOrderType}
-              priceLimit={priceLimit} onPriceLimit={setPriceLimit} guard={guard} onGuard={setGuard} />
-
-            <div className="flex items-center gap-1.5 text-xs">
-              <span className="text-ink-55">连买窗数</span>
-              {[1, 2, 3, 4].map(n => (
-                <button key={n} onClick={() => setMulti(n)}
-                  className={`px-2 py-0.5 rounded-pill border ${multi === n ? 'bg-brand text-white border-brand' : 'bg-card text-ink-55 border-line'}`}
-                >{n}</button>
-              ))}
-              <HelpHint text="从所选窗口起连续下 N 个周期（上限 4）；逐窗独立占位/护栏，失败即停" />
-            </div>
-
-            <ConflictHint channels={activeChannels} period={period} />
-
-            {!oneClick && (
-              <ConfirmBar confirmed={confirmed} onConfirmed={setConfirmed} summary={summary} big={bigAmount} />
-            )}
-            {oneClick && bigAmount && (
-              <div className="text-[11px] text-warning">⚠ 大额单（&gt;10U）需勾选确认，一键模式不豁免</div>
-            )}
-            {oneClick && !bigAmount && <div className="text-[11px] text-ink-55 whitespace-pre-line">{summary}</div>}
-
-            {!guardOk && <div className="text-[11px] text-negative">护栏值非法（须 0~1 开区间）</div>}
-            {!limitOk && <div className="text-[11px] text-negative">限价值非法（须 0~1 开区间）</div>}
-
-            {(tooLate || futureTooSoon) && (
-              <div className="text-[11px] text-negative">距开盘/收盘过近，已自动改选下一窗或请手动改选</div>
-            )}
-
-            <button onClick={handleSubmit} disabled={!canSubmit}
-              className={`ds-btn-primary w-full py-2 font-bold disabled:opacity-40 ${busy ? 'cursor-wait' : ''}`}
-            >
-              {busy ? '下单中…' : `下单（真实订单${multi > 1 ? `×${multi}` : ''}）`}
-            </button>
-
-            <ResultPanel results={results} />
-            <PositionsMini orders={orders} redeemable={redeemable} onClose={handleClose}
-              onRedeem={handleRedeemAll} balance={balance} closingId={closingId} redeeming={redeeming} />
-            <RulesCollapse />
-              </>
-            )}
+            <p className="text-[11px] text-ink-55">
+              真实订单：每窗至多一单，窗口收盘 BTC 涨跌定输赢；平仓/赎回去实盘面板。
+            </p>
           </div>
         </>
       )}
     </>
   )
 }
+
+
 
 // 订单记录卡片（页面主区展示，2026-08-28 用户要求回归页面；
 // 2026-08-29：加状态/通道/方向筛选 + 通道中文化与解释 + 分页；
@@ -3606,7 +3253,6 @@ function LiveTradeTab() {
   const remainSec = (typeof windowEnd === 'number' && quote && !quote.stale)
     ? Math.max(0, Math.floor((windowEnd - (nowMs + clockOffset)) / 1000))
     : null
-  const urgent = remainSec != null && remainSec < 60
 
   // 在途持仓（FILLED 未结算；订单明细/累计盈亏见账户状态下方「最近订单」）
   const openPositions = orders.filter(o => o.status === 'FILLED' && !o.settled_at)
@@ -4279,8 +3925,8 @@ function LiveTradeTab() {
     </div>
 
     {/* 悬浮与抽屉：下单 FAB + 右侧抽屉（K 线对照 / 资金变化双 tab，2026-08-29） */}
-    <TestTradeFab quote={quote} remainSec={remainSec} urgent={urgent} wallet={wallet} refresh={refresh}
-      orders={orders} activeChannels={activeLiveChannels} redeemable={redeemable} clockOffset={clockOffset} />
+    <TestTradeFab quote={quote} remainSec={remainSec} wallet={wallet} refresh={refresh}
+      orders={orders} clockOffset={clockOffset} />
     <ChartDrawer orders={orders} />
     </>
   )
