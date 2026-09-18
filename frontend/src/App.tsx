@@ -2264,26 +2264,44 @@ function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }
                 })}
                 <span className="text-[11px] text-ink-55">（或直接点选下方窗口）</span>
               </div>
-              <div className="flex items-center gap-1.5 flex-wrap">
+              <div className="flex items-stretch gap-1.5 flex-wrap">
+                {/* 窗卡：上行时间、下行该窗真实报价（涨绿/跌红）；选中态白字 */}
+                {/* 当前窗卡 */}
                 <button onClick={() => togglePick('current')}
                   disabled={currentTooLate}
                   title={currentTooLate ? '当前窗距收盘不足 10 秒' : `剩余 ${fmtMMSS(remainLocal ?? 0)}`}
-                  className={chipCls(picked.includes('current') && !currentTooLate)}
-                >当前 {fmtHHMM(baseWindow)}</button>
+                  className={`${chipCls(picked.includes('current') && !currentTooLate)} flex-col items-center gap-0.5 px-2.5 py-1 leading-tight`}
+                >
+                  <span>当前 {fmtHHMM(baseWindow)}</span>
+                  <span className="font-mono text-[10px]">
+                    <span className={picked.includes('current') ? 'opacity-90' : 'text-positive'}>{up != null ? up.toFixed(2) : '--'}</span>
+                    <span className="opacity-40">/</span>
+                    <span className={picked.includes('current') ? 'opacity-90' : 'text-negative'}>{down != null ? down.toFixed(2) : '--'}</span>
+                  </span>
+                </button>
                 {future.map(w => {
                   const ahead = Math.max(0, Math.floor((w.window_start - nowMs) / 1000))
                   const tooSoon = ahead < 5
                   const hasOrder = alreadyOrderedWins.has(w.window_start)
+                  const on = picked.includes(w.window_start)
                   return (
                     <button key={w.window_start}
                       onClick={() => togglePick(w.window_start)}
                       disabled={!w.available || tooSoon}
                       title={tooSoon ? '距开盘不足 5 秒'
                         : hasOrder ? '该窗口已有手动单（下单会被拒）'
-                        : `距开盘 ${ahead}s`}
-                      className={`${chipCls(picked.includes(w.window_start))} ${hasOrder ? 'border-warning/60' : ''}`}
-                    >{fmtHHMM(w.window_start)}<span className="opacity-60 ml-1">{Math.round(ahead / 60)}分</span>
-                      {hasOrder && <span className="ml-1 text-warning">●</span>}
+                        : `距开盘 ${ahead}s | 涨 ${w.up_price ?? '--'} / 跌 ${w.down_price ?? '--'}（真实报价）`}
+                      className={`${chipCls(on)} ${hasOrder ? 'border-warning/60' : ''} flex-col items-center gap-0.5 px-2.5 py-1 leading-tight`}
+                    >
+                      <span>{fmtHHMM(w.window_start)}
+                        <span className="opacity-60">·{Math.round(ahead / 60)}分</span>
+                        {hasOrder && <span className="ml-1 text-warning">●</span>}
+                      </span>
+                      <span className="font-mono text-[10px]">
+                        <span className={on ? 'opacity-90' : 'text-positive'}>{w.up_price != null ? w.up_price.toFixed(2) : '--'}</span>
+                        <span className="opacity-40">/</span>
+                        <span className={on ? 'opacity-90' : 'text-negative'}>{w.down_price != null ? w.down_price.toFixed(2) : '--'}</span>
+                      </span>
                     </button>
                   )
                 })}
