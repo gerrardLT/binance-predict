@@ -1009,20 +1009,19 @@ class BinancePredictionTrader:
         return (anchor or fallback, fallback or anchor) if anchor or fallback else None
 
     async def scan_future_markets(
-        self, period: str, count: int = 10, budget: int = 160
+        self, period: str, count: int = 10, budget: int = 400
     ) -> list[dict]:
         """未来周期市场列表（与币安 App 同源：market/list 分页直取）。
 
         2026-09-18 修正：旧实现靠 marketTopicId 猜测扫描（+1..+160），但币安
         市场 ID 不连续（批次间夹杂其他市场，间隔可达上千），已创建的未来窗
-        经常扫不到 → 误报「未创建」。改为与 App 同源：list_markets() 分页
-        拉全量列表（list_markets 内填充 _future_markets），直接过滤未来窗。
-        ID 猜测扫描仅降级为列表无未来窗时的兜底。
+        经常扫不到 → 误报「未创建」。实测（2026-09-18 诊断）：market/list
+        分页也不含未来窗，故仍以 ID 扫描为主路径，预算扩至 400 覆盖批次间隔。
 
         Args:
             period: '5m' 或 '15m'
             count: 期望返回的未来窗数量
-            budget: 兜底 ID 扫描预算（默认 160）
+            budget: ID 扫描预算（默认 400，覆盖批次间最大实测间隔）
 
         Returns:
             未来窗列表（按 start_ms 升序，最多 count 个），含 window_start/window_end/
@@ -1060,7 +1059,7 @@ class BinancePredictionTrader:
 
         prefix = f"btc-updown-{period}-"
         tids = list(range(anchor + 1, anchor + budget + 1))
-        WAVE = 10  # 每波并发 10 个 detail；波间退避，凑够即停
+        WAVE = 20  # 每波并发 20 个 detail；波间退避，凑够即停
         collected: list[dict] = []
 
         def _to_row(tid: int, d: dict | None) -> dict | None:
@@ -1121,11 +1120,13 @@ class BinancePredictionTrader:
                     break
                 if len(collected) >= count:
                     break  # 提前终止：已凑够，不再打后续波
-                if miss_streak >= 60:
-                    # 连续 60 个 ID 无 BTC 命中：止损退出，避免烧满签名请求
+                if miss_streak >= 300:
+                    # 连续 300 个 ID 无 BTC 命中：到达创建前沿（后续 ID 均未创建）。
+                    # 阈值须大于两创建批次间的最大夹杂间隔（实测批次间夹数百个
+                    # 其他市场 ID，旧阈值 60 会在批次间提前停 → 误报「未创建」）
                     break
                 # 波间退避：平滑突发，冲击 sapi 配额
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.2)
         except Exception as e:
             logger.warning("_scan_future_via_detail | {} | {}", period, e)
 
