@@ -803,3 +803,72 @@ async def test_analytics_live_channel_field(monkeypatch) -> None:
     # 未出现在执行器状态中的版本仍为 None；状态只拉一次，非逐版本查询。
     assert out2["shadow"]["combo_p1_v1"]["summary"]["live_channel"] is None
     assert fake.status_async.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_analytics_shadow_guarded_metrics_and_curves() -> None:
+    """带护栏实际数据计算测试：
+    1. firsthit_down_v1 护栏 0.08：
+       - q=0.07 win=True -> 护栏通过，计入 guarded
+       - q=0.08 win=False -> 贴线护栏弃单，排除在 guarded 外
+       - q=0.09 win=False -> 超出护栏弃单，排除在 guarded 外
+       理论: n=3, win_rate=1/3; 带护栏: guarded_n=1, guarded_win_rate=1.0, guarded_rejected_n=2
+    2. x4_v2 护栏 0.50 + 白名单 [0, 0.1) ∪ [0.3, 0.4)：
+       - q=0.06 win=False -> 通过
+       - q=0.20 win=True -> 白名单外弃单，排除
+       - q=0.35 win=True -> 通过
+       - q=0.45 win=True -> 白名单外弃单，排除
+       - q=0.50 win=True -> 贴线护栏弃单，排除
+    """
+    import binance_predict.main as m
+
+    fh_rows = [
+        _shadow_row(version="firsthit_down_v1", window_start=1_000, win=True,
+                    entry_down_price=0.07, direction="DOWN", ev_at_entry=0.98/0.07 - 1),
+        _shadow_row(version="firsthit_down_v1", window_start=2_000, win=False,
+                    entry_down_price=0.08, direction="DOWN", ev_at_entry=-1.0),
+        _shadow_row(version="firsthit_down_v1", window_start=3_000, win=False,
+                    entry_down_price=0.09, direction="DOWN", ev_at_entry=-1.0),
+    ]
+    x4_rows = [
+        _shadow_row(version="x4_v2", window_start=1_100, win=False,
+                    entry_down_price=0.06, direction="DOWN", ev_at_entry=-1.0),
+        _shadow_row(version="x4_v2", window_start=2_100, win=True,
+                    entry_down_price=0.20, direction="DOWN", ev_at_entry=0.98/0.21 - 1),
+        _shadow_row(version="x4_v2", window_start=3_100, win=True,
+                    entry_down_price=0.35, direction="DOWN", ev_at_entry=0.98/0.36 - 1),
+        _shadow_row(version="x4_v2", window_start=4_100, win=True,
+                    entry_down_price=0.45, direction="DOWN", ev_at_entry=0.98/0.46 - 1),
+        _shadow_row(version="x4_v2", window_start=5_100, win=True,
+                    entry_down_price=0.50, direction="DOWN", ev_at_entry=0.98/0.51 - 1),
+    ]
+    db = _make_db(x4_rows, [], firsthit_rows=fh_rows)
+    out = await m.get_signals_analytics(db)
+
+    fh = out["shadow"]["firsthit_down_v1"]
+    assert fh["summary"]["n"] == 3
+    assert fh["summary"]["win_rate"] == pytest.approx(1 / 3)
+    assert fh["summary"]["guard_price"] == 0.08
+    assert fh["summary"]["guarded_n"] == 1
+    assert fh["summary"]["guarded_rejected_n"] == 2
+    assert fh["summary"]["guarded_fill_rate"] == pytest.approx(1 / 3)
+    assert fh["summary"]["guarded_win_rate"] == 1.0
+    assert fh["summary"]["guarded_quote_n"] == 1
+    assert fh["summary"]["guarded_avg_ev"] == pytest.approx(0.98 / 0.07 - 1)
+    assert len(fh["curve"]) == 3
+    assert len(fh["guarded_curve"]) == 1
+    assert fh["guarded_curve"][0]["cum_wr"] == 1.0
+
+    x4 = out["shadow"]["x4_v2"]
+    assert x4["summary"]["n"] == 5
+    assert x4["summary"]["win_rate"] == pytest.approx(4 / 5)
+    assert x4["summary"]["guard_price"] == 0.50
+    assert x4["summary"]["guarded_n"] == 2  # 0.06 (win=False) 和 0.35 (win=True)
+    assert x4["summary"]["guarded_rejected_n"] == 3  # 0.20, 0.45, 0.50 弃单
+    assert x4["summary"]["guarded_fill_rate"] == pytest.approx(2 / 5)
+    assert x4["summary"]["guarded_win_rate"] == 0.5
+    assert len(x4["curve"]) == 5
+    assert len(x4["guarded_curve"]) == 2
+    assert x4["guarded_curve"][0]["cum_wr"] == 0.0
+    assert x4["guarded_curve"][1]["cum_wr"] == 0.5
+

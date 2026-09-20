@@ -280,6 +280,16 @@ interface ShadowVersionBlock {
     avg_breakeven: number | null; bench_winrate: number | null; bench_ev: number | null
     bench_max_entry_price: number | null
     desc: string
+    // 带护栏实际数据（过滤掉贴线/超价弃单及白名单外单）：
+    guard_price?: number | null
+    guarded_n?: number
+    guarded_rejected_n?: number
+    guarded_fill_rate?: number | null
+    guarded_win_rate?: number | null
+    guarded_quote_n?: number
+    guarded_avg_ev?: number | null
+    guarded_cum_ev?: number | null
+    guarded_avg_breakeven?: number | null
     // 影子开关（2026-09-04 前端手动下线能力）：下线=停采集+置灰，历史保留
     enabled?: boolean
     // 永久退役（2026-09-04）：后端 shadow_version_gate.RETIRED_VERSIONS 硬闸，
@@ -296,6 +306,7 @@ interface ShadowVersionBlock {
     role?: 'PRIMARY' | 'CONTROL' | 'COMPONENT' | 'HYPOTHESIS' | 'STRATEGY'
   }
   curve: AnalyticsCurvePoint[]
+  guarded_curve?: AnalyticsCurvePoint[]
 }
 interface SceneTypeBlock {
   summary: {
@@ -6786,13 +6797,15 @@ const utcMD = (ts: number) =>
 
 // 把各版本曲线按时间戳合并成宽表（recharts 单 data 多 Line 需要）
 function mergeCurves(
-  blocks: Record<string, { curve: AnalyticsCurvePoint[] }>,
+  blocks: Record<string, { curve: AnalyticsCurvePoint[]; guarded_curve?: AnalyticsCurvePoint[] }>,
   meta: Record<string, { label: string; color: string }>,
+  useGuarded = false,
 ): Record<string, number>[] {
   const rowMap = new Map<number, Record<string, number>>()
   for (const [key, blk] of Object.entries(blocks)) {
     const label = meta[key]?.label ?? key
-    for (const p of blk.curve) {
+    const pts = (useGuarded && blk.guarded_curve) ? blk.guarded_curve : blk.curve
+    for (const p of pts) {
       const row = rowMap.get(p.ts) ?? { ts: p.ts }
       row[label] = +(p.cum_wr * 100).toFixed(1)
       rowMap.set(p.ts, row)
@@ -7209,6 +7222,7 @@ function ShadowSignalCard({
   const [statusFilter, setStatusFilter] = useState<'ALL' | 'ONLINE' | 'OFFLINE' | 'LIVE'>('ALL')
   const [familyFilter, setFamilyFilter] = useState('ALL')
   const [roleFilter, setRoleFilter] = useState('ALL')
+  const [guardMode, setGuardMode] = useState<'GUARDED' | 'THEORETICAL' | 'BOTH'>('GUARDED')
   const [sortCol, setSortCol] = useState<string>('default')
   const [sortAsc, setSortAsc] = useState<boolean>(false)
 
@@ -7289,21 +7303,35 @@ function ShadowSignalCard({
       const valB = sb.retired ? 0 : sb.live_channel?.enabled ? 2 : sb.live_channel ? 1 : 0
       diff = valA - valB
     } else if (sortCol === 'n') {
-      diff = (sa.n ?? 0) - (sb.n ?? 0)
+      const na = guardMode === 'GUARDED' ? (sa.guarded_n ?? 0) : (sa.n ?? 0)
+      const nb = guardMode === 'GUARDED' ? (sb.guarded_n ?? 0) : (sb.n ?? 0)
+      diff = na - nb
     } else if (sortCol === 'win_rate') {
-      diff = (sa.win_rate ?? -1) - (sb.win_rate ?? -1)
+      const wra = guardMode === 'GUARDED' ? (sa.guarded_win_rate ?? -1) : (sa.win_rate ?? -1)
+      const wrb = guardMode === 'GUARDED' ? (sb.guarded_win_rate ?? -1) : (sb.win_rate ?? -1)
+      diff = wra - wrb
     } else if (sortCol === 'breakeven') {
-      diff = (sa.avg_breakeven ?? -1) - (sb.avg_breakeven ?? -1)
+      const bea = guardMode === 'GUARDED' ? (sa.guarded_avg_breakeven ?? -1) : (sa.avg_breakeven ?? -1)
+      const beb = guardMode === 'GUARDED' ? (sb.guarded_avg_breakeven ?? -1) : (sb.avg_breakeven ?? -1)
+      diff = bea - beb
     } else if (sortCol === 'bench') {
       diff = (sa.bench_winrate ?? -1) - (sb.bench_winrate ?? -1)
     } else if (sortCol === 'dev') {
-      const devA = sa.win_rate != null && sa.bench_winrate != null ? sa.win_rate - sa.bench_winrate : -999
-      const devB = sb.win_rate != null && sb.bench_winrate != null ? sb.win_rate - sb.bench_winrate : -999
+      const activeWra = guardMode === 'GUARDED' ? sa.guarded_win_rate : sa.win_rate
+      const activeWrb = guardMode === 'GUARDED' ? sb.guarded_win_rate : sb.win_rate
+      const devA = activeWra != null && sa.bench_winrate != null ? activeWra - sa.bench_winrate : -999
+      const devB = activeWrb != null && sb.bench_winrate != null ? activeWrb - sb.bench_winrate : -999
       diff = devA - devB
     } else if (sortCol === 'avg_ev') {
-      diff = (sa.avg_ev ?? -999) - (sb.avg_ev ?? -999)
+      const eva = guardMode === 'GUARDED' ? (sa.guarded_avg_ev ?? -999) : (sa.avg_ev ?? -999)
+      const evb = guardMode === 'GUARDED' ? (sb.guarded_avg_ev ?? -999) : (sb.avg_ev ?? -999)
+      diff = eva - evb
     } else if (sortCol === 'cum_ev') {
-      diff = (sa.cum_ev ?? -999) - (sb.cum_ev ?? -999)
+      const ceva = guardMode === 'GUARDED' ? (sa.guarded_cum_ev ?? -999) : (sa.cum_ev ?? -999)
+      const cevb = guardMode === 'GUARDED' ? (sb.guarded_cum_ev ?? -999) : (sb.cum_ev ?? -999)
+      diff = ceva - cevb
+    } else if (sortCol === 'fill_rate') {
+      diff = (sa.guarded_fill_rate ?? -1) - (sb.guarded_fill_rate ?? -1)
     }
     return sortAsc ? diff : -diff
   })
@@ -7345,6 +7373,35 @@ function ShadowSignalCard({
               <option value="LIVE">仅实盘中</option>
             </select>
           )}
+          <div className="inline-flex items-center rounded-sm border border-line bg-sunken p-0.5 text-xs">
+            <button
+              onClick={() => setGuardMode('GUARDED')}
+              className={`px-2 py-0.5 rounded-xs transition-colors font-medium ${
+                guardMode === 'GUARDED' ? 'bg-card text-brand shadow-xs' : 'text-ink-55 hover:text-ink-80'
+              }`}
+              title="仅统计通过实盘执行价护栏及白名单的实际可成交信号"
+            >
+              带护栏实际
+            </button>
+            <button
+              onClick={() => setGuardMode('THEORETICAL')}
+              className={`px-2 py-0.5 rounded-xs transition-colors font-medium ${
+                guardMode === 'THEORETICAL' ? 'bg-card text-brand shadow-xs' : 'text-ink-55 hover:text-ink-80'
+              }`}
+              title="原始全量影子信号（未做任何护栏拦截）"
+            >
+              全量理论
+            </button>
+            <button
+              onClick={() => setGuardMode('BOTH')}
+              className={`px-2 py-0.5 rounded-xs transition-colors font-medium ${
+                guardMode === 'BOTH' ? 'bg-card text-brand shadow-xs' : 'text-ink-55 hover:text-ink-80'
+              }`}
+              title="同时对比理论与带护栏实际数据"
+            >
+              双口径对比
+            </button>
+          </div>
           {filterActive && (
             <button
               onClick={() => { setKw(''); setStatusFilter('ALL'); setFamilyFilter('ALL'); setRoleFilter('ALL') }}
@@ -7382,14 +7439,46 @@ function ShadowSignalCard({
                   {thSort('ver', '版本 / 分类', 'left')}
                   {thSort('status', '影子采集', 'center')}
                   {thSort('live', '实盘', 'center')}
-                  {thSort('n', 'n', 'right')}
-                  {thSort('win_rate', '胜率', 'right')}
-                  {thSort('breakeven', '前向保本率', 'right', '按上线后真实入场报价计算；暂无报价样本时显示—')}
-                  <th className="py-1 px-2 text-right" title="冻结回测胜率×0.98：费后理论允许的最高入场价">回测保本价</th>
-                  {thSort('bench', '回测胜率', 'right')}
-                  {thSort('dev', '偏离', 'right')}
-                  {thSort('avg_ev', '平均EV', 'right')}
-                  {thSort('cum_ev', '累计EV', 'right')}
+                  <th className="py-1 px-2 text-right" title="实盘执行价护栏（超价或贴线弃单）">护栏/弃单</th>
+                  {guardMode === 'BOTH' ? (
+                    <>
+                      {thSort('n', '实际n / 理论n', 'right')}
+                      {thSort('fill_rate', '成交率', 'right', '带护栏实际成交信号占理论信号的比例')}
+                      {thSort('win_rate', '带护栏实际胜率', 'right')}
+                      <th className="py-1 px-2 text-right text-ink-40" title="未做护栏过滤的全量影子理论胜率">理论胜率</th>
+                      {thSort('breakeven', '实际保本率', 'right', '带护栏成交信号前向真实入场报价对应的平均保本胜率')}
+                      <th className="py-1 px-2 text-right" title="冻结回测胜率×0.98：费后理论允许的最高入场价">回测保本价</th>
+                      {thSort('bench', '回测胜率', 'right')}
+                      {thSort('dev', '偏离(实-基)', 'right')}
+                      {thSort('avg_ev', '实际单均EV', 'right')}
+                      <th className="py-1 px-2 text-right text-ink-40" title="理论单均EV">理论EV</th>
+                      {thSort('cum_ev', '实际累计EV', 'right')}
+                      <th className="py-1 px-2 text-right text-ink-40" title="理论累计EV">理论累计</th>
+                    </>
+                  ) : guardMode === 'GUARDED' ? (
+                    <>
+                      {thSort('n', '实际n', 'right')}
+                      {thSort('fill_rate', '成交率', 'right', '带护栏实际成交信号占理论信号的比例')}
+                      {thSort('win_rate', '实际胜率', 'right')}
+                      {thSort('breakeven', '实际保本率', 'right', '带护栏成交信号前向真实入场报价对应的平均保本胜率')}
+                      <th className="py-1 px-2 text-right" title="冻结回测胜率×0.98：费后理论允许的最高入场价">回测保本价</th>
+                      {thSort('bench', '回测胜率', 'right')}
+                      {thSort('dev', '偏离', 'right')}
+                      {thSort('avg_ev', '实际单均EV', 'right')}
+                      {thSort('cum_ev', '实际累计EV', 'right')}
+                    </>
+                  ) : (
+                    <>
+                      {thSort('n', '理论n', 'right')}
+                      {thSort('win_rate', '理论胜率', 'right')}
+                      {thSort('breakeven', '理论保本率', 'right', '按上线后真实入场报价计算；暂无报价样本时显示—')}
+                      <th className="py-1 px-2 text-right" title="冻结回测胜率×0.98：费后理论允许的最高入场价">回测保本价</th>
+                      {thSort('bench', '回测胜率', 'right')}
+                      {thSort('dev', '偏离', 'right')}
+                      {thSort('avg_ev', '理论单均EV', 'right')}
+                      {thSort('cum_ev', '理论累计EV', 'right')}
+                    </>
+                  )}
                 </tr>
               </thead>
               <tbody>
@@ -7398,7 +7487,8 @@ function ShadowSignalCard({
                   const s = analytics.shadow[k].summary
                   // 与图表同序：本区第 11 条起降透明度，保证表格色块与曲线一一对应
                   const faded = i >= 10
-                  const dev = s.win_rate != null && s.bench_winrate != null ? s.win_rate - s.bench_winrate : null
+                  const displayWr = guardMode === 'GUARDED' ? s.guarded_win_rate : s.win_rate
+                  const dev = displayWr != null && s.bench_winrate != null ? displayWr - s.bench_winrate : null
                   const online = s.enabled !== false
                   const retired = s.retired === true
                   const live = retired ? null : (s.live_channel ?? null)
@@ -7473,16 +7563,62 @@ function ShadowSignalCard({
                           </span>
                         )}
                       </td>
-                      <td className="py-1 px-2 text-right font-mono">{s.n}</td>
-                      <td className="py-1 px-2 text-right font-mono font-bold">{pct1(s.win_rate)}</td>
-                      <td className="py-1 px-2 text-right font-mono text-ink-55" title={s.avg_breakeven == null ? '暂无前向真实报价样本' : '前向真实入场报价对应的平均保本胜率'}>{pct1(s.avg_breakeven)}</td>
-                      <td className="py-1 px-2 text-right font-mono text-ink-55">{pct1(s.bench_max_entry_price)}</td>
-                      <td className="py-1 px-2 text-right font-mono text-ink-55">{pct1(s.bench_winrate)}</td>
-                      <td className={`py-1 px-2 text-right font-mono ${dev == null ? 'text-ink-55' : dev >= 0 ? 'text-positive' : 'text-negative'}`}>
-                        {dev == null ? '—' : `${dev >= 0 ? '+' : ''}${(dev * 100).toFixed(1)}pp`}
+                      <td className="py-1 px-2 text-right font-mono text-ink-55" title={s.guard_price != null ? `护栏 ≤ ${s.guard_price}；已拦截弃单 ${s.guarded_rejected_n ?? 0} 笔` : '未配置护栏'}>
+                        {s.guard_price != null ? (
+                          <span>
+                            {s.guard_price}
+                            <span className="text-[10px] text-negative ml-1">(-{s.guarded_rejected_n ?? 0})</span>
+                          </span>
+                        ) : '—'}
                       </td>
-                      <td className={`py-1 px-2 text-right font-mono ${s.avg_ev == null ? 'text-ink-55' : s.avg_ev >= 0 ? 'text-positive' : 'text-negative'}`}>{evFmt(s.avg_ev)}</td>
-                      <td className={`py-1 px-2 text-right font-mono ${s.cum_ev == null ? 'text-ink-55' : s.cum_ev >= 0 ? 'text-positive' : 'text-negative'}`}>{evFmt(s.cum_ev)}</td>
+                      {guardMode === 'BOTH' ? (
+                        <>
+                          <td className="py-1 px-2 text-right font-mono">
+                            <span className="font-bold text-ink-95">{s.guarded_n ?? 0}</span>
+                            <span className="text-ink-40 text-[10px]"> / {s.n}</span>
+                          </td>
+                          <td className="py-1 px-2 text-right font-mono font-medium">{pct1(s.guarded_fill_rate)}</td>
+                          <td className="py-1 px-2 text-right font-mono font-bold text-brand">{pct1(s.guarded_win_rate)}</td>
+                          <td className="py-1 px-2 text-right font-mono text-ink-40">{pct1(s.win_rate)}</td>
+                          <td className="py-1 px-2 text-right font-mono text-ink-55" title={s.guarded_avg_breakeven == null ? '暂无前向真实报价样本' : '带护栏成交信号前向真实入场报价对应的平均保本胜率'}>{pct1(s.guarded_avg_breakeven)}</td>
+                          <td className="py-1 px-2 text-right font-mono text-ink-55">{pct1(s.bench_max_entry_price)}</td>
+                          <td className="py-1 px-2 text-right font-mono text-ink-55">{pct1(s.bench_winrate)}</td>
+                          <td className={`py-1 px-2 text-right font-mono ${dev == null ? 'text-ink-55' : dev >= 0 ? 'text-positive' : 'text-negative'}`}>
+                            {dev == null ? '—' : `${dev >= 0 ? '+' : ''}${(dev * 100).toFixed(1)}pp`}
+                          </td>
+                          <td className={`py-1 px-2 text-right font-mono font-bold ${s.guarded_avg_ev == null ? 'text-ink-55' : s.guarded_avg_ev >= 0 ? 'text-positive' : 'text-negative'}`}>{evFmt(s.guarded_avg_ev)}</td>
+                          <td className={`py-1 px-2 text-right font-mono text-[11px] ${s.avg_ev == null ? 'text-ink-40' : s.avg_ev >= 0 ? 'text-positive/70' : 'text-negative/70'}`}>{evFmt(s.avg_ev)}</td>
+                          <td className={`py-1 px-2 text-right font-mono font-bold ${s.guarded_cum_ev == null ? 'text-ink-55' : s.guarded_cum_ev >= 0 ? 'text-positive' : 'text-negative'}`}>{evFmt(s.guarded_cum_ev)}</td>
+                          <td className={`py-1 px-2 text-right font-mono text-[11px] ${s.cum_ev == null ? 'text-ink-40' : s.cum_ev >= 0 ? 'text-positive/70' : 'text-negative/70'}`}>{evFmt(s.cum_ev)}</td>
+                        </>
+                      ) : guardMode === 'GUARDED' ? (
+                        <>
+                          <td className="py-1 px-2 text-right font-mono font-bold">{s.guarded_n ?? 0}</td>
+                          <td className="py-1 px-2 text-right font-mono font-medium">{pct1(s.guarded_fill_rate)}</td>
+                          <td className="py-1 px-2 text-right font-mono font-bold text-brand">{pct1(s.guarded_win_rate)}</td>
+                          <td className="py-1 px-2 text-right font-mono text-ink-55" title={s.guarded_avg_breakeven == null ? '暂无前向真实报价样本' : '带护栏成交信号前向真实入场报价对应的平均保本胜率'}>{pct1(s.guarded_avg_breakeven)}</td>
+                          <td className="py-1 px-2 text-right font-mono text-ink-55">{pct1(s.bench_max_entry_price)}</td>
+                          <td className="py-1 px-2 text-right font-mono text-ink-55">{pct1(s.bench_winrate)}</td>
+                          <td className={`py-1 px-2 text-right font-mono ${dev == null ? 'text-ink-55' : dev >= 0 ? 'text-positive' : 'text-negative'}`}>
+                            {dev == null ? '—' : `${dev >= 0 ? '+' : ''}${(dev * 100).toFixed(1)}pp`}
+                          </td>
+                          <td className={`py-1 px-2 text-right font-mono ${s.guarded_avg_ev == null ? 'text-ink-55' : s.guarded_avg_ev >= 0 ? 'text-positive' : 'text-negative'}`}>{evFmt(s.guarded_avg_ev)}</td>
+                          <td className={`py-1 px-2 text-right font-mono ${s.guarded_cum_ev == null ? 'text-ink-55' : s.guarded_cum_ev >= 0 ? 'text-positive' : 'text-negative'}`}>{evFmt(s.guarded_cum_ev)}</td>
+                        </>
+                      ) : (
+                        <>
+                          <td className="py-1 px-2 text-right font-mono">{s.n}</td>
+                          <td className="py-1 px-2 text-right font-mono font-bold">{pct1(s.win_rate)}</td>
+                          <td className="py-1 px-2 text-right font-mono text-ink-55" title={s.avg_breakeven == null ? '暂无前向真实报价样本' : '前向真实入场报价对应的平均保本胜率'}>{pct1(s.avg_breakeven)}</td>
+                          <td className="py-1 px-2 text-right font-mono text-ink-55">{pct1(s.bench_max_entry_price)}</td>
+                          <td className="py-1 px-2 text-right font-mono text-ink-55">{pct1(s.bench_winrate)}</td>
+                          <td className={`py-1 px-2 text-right font-mono ${dev == null ? 'text-ink-55' : dev >= 0 ? 'text-positive' : 'text-negative'}`}>
+                            {dev == null ? '—' : `${dev >= 0 ? '+' : ''}${(dev * 100).toFixed(1)}pp`}
+                          </td>
+                          <td className={`py-1 px-2 text-right font-mono ${s.avg_ev == null ? 'text-ink-55' : s.avg_ev >= 0 ? 'text-positive' : 'text-negative'}`}>{evFmt(s.avg_ev)}</td>
+                          <td className={`py-1 px-2 text-right font-mono ${s.cum_ev == null ? 'text-ink-55' : s.cum_ev >= 0 ? 'text-positive' : 'text-negative'}`}>{evFmt(s.cum_ev)}</td>
+                        </>
+                      )}
                     </tr>
                   )
                 })}
@@ -7492,7 +7628,24 @@ function ShadowSignalCard({
             })}
           </div>
           <ResponsiveContainer width="100%" height={240}>
-            <LineChart data={rows} margin={{ top: 6, right: 12, left: 0, bottom: 0 }}>
+            <LineChart
+              data={
+                guardMode === 'GUARDED'
+                  ? mergeCurves(
+                      Object.fromEntries(sorted.map(([k]) => [k, analytics.shadow[k]])),
+                      SHADOW_META,
+                      true,
+                    )
+                  : guardMode === 'THEORETICAL'
+                  ? mergeCurves(
+                      Object.fromEntries(sorted.map(([k]) => [k, analytics.shadow[k]])),
+                      SHADOW_META,
+                      false,
+                    )
+                  : rows
+              }
+              margin={{ top: 6, right: 12, left: 0, bottom: 0 }}
+            >
               <CartesianGrid stroke="var(--line-soft)" />
               <XAxis dataKey="ts" type="number" domain={['dataMin', 'dataMax']} scale="time"
                 tickFormatter={utcMD} tick={{ fontSize: 11, fill: 'var(--ink-55)', fontFamily: 'var(--font-stack-mono)' }} stroke="var(--ink-55)" />
@@ -7507,6 +7660,7 @@ function ShadowSignalCard({
               {sorted.map(([k, m], i) => {
                 const s = analytics.shadow[k].summary
                 const faded = i >= 10
+                const activeBreakeven = guardMode === 'GUARDED' ? s.guarded_avg_breakeven : s.avg_breakeven
                 return (
                   <Fragment key={k}>
                     <Line dataKey={m.label} stroke={m.color} strokeWidth={faded ? 1.5 : 2}
@@ -7514,8 +7668,8 @@ function ShadowSignalCard({
                     {s.bench_winrate != null && (
                       <ReferenceLine y={s.bench_winrate * 100} stroke={m.color} strokeDasharray="5 4" strokeOpacity={faded ? 0.3 : 0.5} />
                     )}
-                    {s.avg_breakeven != null && (
-                      <ReferenceLine y={s.avg_breakeven! * 100} stroke={m.color} strokeDasharray="1 3" strokeOpacity={faded ? 0.35 : 0.6} />
+                    {activeBreakeven != null && (
+                      <ReferenceLine y={activeBreakeven * 100} stroke={m.color} strokeDasharray="1 3" strokeOpacity={faded ? 0.35 : 0.6} />
                     )}
                   </Fragment>
                 )

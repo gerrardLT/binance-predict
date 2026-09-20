@@ -4256,6 +4256,21 @@ def _shadow_breakeven(version: str, q: float) -> float:
     return (q + 0.01) / 0.98 if version.startswith("x4") else q / 0.98
 
 
+def _is_guarded_pass(
+    q: float | None,
+    max_exec_price: float | None,
+    entry_bands: tuple[tuple[float, float], ...] | None = None,
+) -> bool:
+    """判定入场报价是否满足执行价护栏及白名单（贴线弃单，与实盘执行一致）。"""
+    if q is None or q <= 0:
+        return False
+    if max_exec_price is not None and q >= max_exec_price:
+        return False
+    if entry_bands is not None and not any(lo <= q < hi for lo, hi in entry_bands):
+        return False
+    return True
+
+
 def _shadow_realized_ev(version: str, win: bool, q: float | None) -> float | None:
     """逐笔实现 EV（与各检测器落库 ev_at_entry 同口径）：赢 0.98/entry−1 / 输 −1。
 
@@ -4435,6 +4450,8 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
     versions += sorted({s.version for s in sh_rows} - set(versions))
     # 影子版本 → 实盘通道状态（version==通道名，2026-09-06 promote + x4_v3 注册后 13 通道；
     # 一次 status_async 拉全量按 channel 建索引，执行器未装配/查询失败 → 空表兜底）
+    from .services.live_channels import LIVE_CHANNELS, RETIRED_CHANNEL_SPECS
+
     live_by_ch: dict[str, dict] = {}
     if multi_live_trader is not None:
         try:
@@ -4445,8 +4462,25 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
     shadow = {}
     for v in versions:
         g = [s for s in sh_rows if s.version == v and s.win is not None]
+        # 对应通道的执行参数（优先从实盘通道状态读当前生效护栏，缺省从 LIVE_CHANNELS / RETIRED_CHANNEL_SPECS 读预设）
+        ch_spec = LIVE_CHANNELS.get(v) or RETIRED_CHANNEL_SPECS.get(v)
+        active_lc = live_by_ch.get(v)
+        effective_guard: float | None = None
+        if active_lc is not None and active_lc.get("max_exec_price") is not None:
+            effective_guard = float(active_lc["max_exec_price"])
+        elif ch_spec is not None:
+            effective_guard = ch_spec.auto_max_exec
+        entry_bands = ch_spec.entry_band_whitelist if ch_spec is not None else None
+
         curve, wins, evs, bes = [], 0, [], []
         cum_ev = 0.0
+
+        # 带护栏实际统计（过滤掉超价/贴线弃单及白名单外单子）
+        g_curve, g_wins, g_evs, g_bes = [], 0, [], []
+        g_cum_ev = 0.0
+        g_i = 0
+        g_rejected_n = 0
+
         for i, s in enumerate(g, 1):
             wins += int(bool(s.win))
             q = s.entry_down_price if s.direction == "DOWN" else s.entry_up_price
@@ -4464,6 +4498,24 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
                 "i": i, "ts": s.window_start,
                 "cum_wr": round(wins / i, 4), "cum_ev": round(cum_ev, 4),
             })
+
+            # 带护栏判定：未配置护栏的通道默认全部通过；有护栏或白名单的严格按实盘护栏弃单
+            q_float = float(q) if valid_q else None
+            is_pass = _is_guarded_pass(q_float, effective_guard, entry_bands) if effective_guard is not None or entry_bands is not None else True
+            if is_pass:
+                g_i += 1
+                g_wins += int(bool(s.win))
+                if ev is not None:
+                    g_evs.append(ev)
+                    g_cum_ev += ev
+                    g_bes.append(_shadow_breakeven(v, float(q)))
+                g_curve.append({
+                    "i": g_i, "ts": s.window_start,
+                    "cum_wr": round(g_wins / g_i, 4), "cum_ev": round(g_cum_ev, 4),
+                })
+            else:
+                g_rejected_n += 1
+
         n = len(g)
         bwr, bev, desc = SHADOW_BENCH.get(v, (None, None, ""))
         shadow[v] = {
@@ -4480,6 +4532,16 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
                 # 回测胜率可支持的费后理论最高入场价；不同于前向真实报价推导的 avg_breakeven。
                 "bench_max_entry_price": bwr * 0.98 if bwr is not None else None,
                 "desc": desc,
+                # 带护栏实际指标（过滤超限/贴线弃单后）：
+                "guard_price": effective_guard,
+                "guarded_n": g_i,
+                "guarded_rejected_n": g_rejected_n,
+                "guarded_fill_rate": g_i / n if n else None,
+                "guarded_win_rate": g_wins / g_i if g_i else None,
+                "guarded_quote_n": len(g_evs),
+                "guarded_avg_ev": sum(g_evs) / len(g_evs) if g_evs else None,
+                "guarded_cum_ev": round(g_cum_ev, 4) if g_evs else None,
+                "guarded_avg_breakeven": sum(g_bes) / len(g_bes) if g_bes else None,
                 # 影子开关状态（前端手动下线能力）：下线版本置灰+可重新上线；
                 # retired=永久退役（代码级硬闸，toggle 拒改，前端不可点开关）
                 "enabled": shadow_gate.is_enabled(v),
@@ -4510,6 +4572,7 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
                 ),
             },
             "curve": curve[-_CURVE_MAX_POINTS:],
+            "guarded_curve": g_curve[-_CURVE_MAX_POINTS:],
         }
 
     # ---- 场景信号：正式信号（排除 SHADOW 版本名；ACTIVE 版本演进兼容）按 pattern_type 分组 ----
