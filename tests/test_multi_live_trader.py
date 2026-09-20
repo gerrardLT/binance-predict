@@ -363,13 +363,16 @@ def test_channels_registry_shape() -> None:
     assert by["hm_inside_5m_v2"].market_period == "5m"
     assert by["hm_inside_5m_v2"].direction == "DOWN"
     assert by["hm_inside_5m_v2"].auto_max_exec == 0.30
-    assert by["hm_inside_5m_v2"].order_type == "LIMIT"
+    # 2026-09-20 LIMIT→MARKET：GTC 挂 0.30 等回落被动成交构成逆向选择，改市价单
+    assert by["hm_inside_5m_v2"].order_type == "MARKET"
     assert by["hm_inside_15m_v2"].market_period == "15m"
     assert by["hm_inside_15m_v2"].direction == "DOWN"
     assert by["hm_inside_15m_v2"].auto_max_exec == 0.30
+    assert by["hm_inside_15m_v2"].order_type == "MARKET"
     assert by["ih_inside_15m_v2"].market_period == "15m"
     assert by["ih_inside_15m_v2"].direction == "UP"
     assert by["ih_inside_15m_v2"].auto_max_exec == 0.30
+    assert by["ih_inside_15m_v2"].order_type == "MARKET"
     # late_night_contrarian_v2 新注册（时段门 22-24+距日高门≥0.30%，无 v2_guard）。
     # ⚠️ 本通道实盘 never registered v2_guard → shadow口径一致；早期误加v2_guard="max_rise"
     #   但 V2_PRICE_GUARDS 未登记该版本→check() KeyError，影子 36 单/实盘 0 单（2026-09-10修复）。
@@ -4783,11 +4786,13 @@ async def test_signal_trade_quote_error_classifies_insufficient_balance(
 # ============================================================
 
 def test_limit_order_channels_marked_in_registry() -> None:
-    """限价折价通道必须在 ChannelSpec 中声明 order_type='LIMIT'。"""
+    """限价折价通道必须在 ChannelSpec 中声明 order_type='LIMIT'。
+
+    2026-09-20：rev2 孕线三通道（hm_inside_5m/15m、ih_inside_15m）由 LIMIT 改 MARKET
+    （GTC 挂 0.30 等回落被动成交构成逆向选择，热调护栏后还出现 8 天零成交），
+    从 LIMIT 清单移入 MARKET 清单。
+    """
     expected_limit_channels = [
-        "hm_inside_5m_v2",
-        "hm_inside_15m_v2",
-        "ih_inside_15m_v2",
         "firsthit_down_v1",
         "firsthit_down_body_v1",
         "firsthit_down_chg_v1",
@@ -4820,6 +4825,9 @@ def test_limit_order_channels_marked_in_registry() -> None:
         "nb_smaslope_5m_v1",
         "absorption_follow_td120_v1",
         "absorption_follow_td150_v1",
+        "hm_inside_5m_v2",
+        "hm_inside_15m_v2",
+        "ih_inside_15m_v2",
     ]
     for ch in expected_market_channels:
         spec = LIVE_CHANNELS.get(ch)
@@ -4930,11 +4938,15 @@ async def test_signal_trade_limit_gtc_order_flow(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_multi_live_trader_passes_limit_order_type_from_spec(monkeypatch) -> None:
-    """MultiLiveTrader 触发 nextbar/firsthit/s2_cond 限价通道时，
-    必须透传 spec.order_type='LIMIT' 给 execute_signal_trade。"""
+async def test_multi_live_trader_passes_order_type_from_spec(monkeypatch) -> None:
+    """MultiLiveTrader 触发通道时必须透传 spec.order_type 给 execute_signal_trade。
+
+    nextbar 通道（2026-09-20 起 MARKET）透传 MARKET；仍为 LIMIT 的 s2_cond_t4_v1
+    透传 LIMIT——两条路径都要覆盖，防止后续通道改型时透传链路被碰坏。
+    """
     fake = _FakeTrader()
-    t = _make_trader(monkeypatch, fake, channels=["hm_inside_15m_v2"])
+    t = _make_trader(monkeypatch, fake,
+                     channels=["hm_inside_15m_v2", "s2_cond_t4_v1"])
     sig = {
         "version": "hm_inside_15m_v2",
         "market_start": WINDOW_START,
@@ -4944,15 +4956,19 @@ async def test_multi_live_trader_passes_limit_order_type_from_spec(monkeypatch) 
     t.on_nextbar_signal(sig)
     await _drain(t)
 
-    assert len(fake.calls) == 1
-    assert fake.calls[0]["signal_version"] == "hm_inside_15m_v2"
-    assert fake.calls[0]["order_type"] == "LIMIT"
-    assert fake.calls[0]["max_exec_price"] == 0.30
+    t.on_s2_cond_signal(_s2_cond_sig("s2_cond_t4_v1"))
+    await _drain(t)
+
+    assert len(fake.calls) == 2
+    by_channel = {c["signal_version"]: c for c in fake.calls}
+    assert by_channel["hm_inside_15m_v2"]["order_type"] == "MARKET"
+    assert by_channel["hm_inside_15m_v2"]["max_exec_price"] == 0.30
+    assert by_channel["s2_cond_t4_v1"]["order_type"] == "LIMIT"
 
 
 @pytest.mark.asyncio
-async def test_multi_live_trader_passes_5m_rev2_limit_and_hot_guard(monkeypatch) -> None:
-    """5m Rev2 nextbar 信号透传 5m 周期、DOWN、LIMIT 与热调后的护栏。"""
+async def test_multi_live_trader_passes_5m_rev2_market_and_hot_guard(monkeypatch) -> None:
+    """5m Rev2 nextbar 信号透传 5m 周期、DOWN、MARKET（2026-09-20 改型）与热调后的护栏。"""
     fake = _FakeTrader()
     t = _make_trader(
         monkeypatch,
@@ -4973,7 +4989,7 @@ async def test_multi_live_trader_passes_5m_rev2_limit_and_hot_guard(monkeypatch)
     assert fake.calls[0]["signal_version"] == "hm_inside_5m_v2"
     assert fake.calls[0]["prediction"] == "DOWN"
     assert fake.calls[0]["market_period"] == "5m"
-    assert fake.calls[0]["order_type"] == "LIMIT"
+    assert fake.calls[0]["order_type"] == "MARKET"
     assert fake.calls[0]["max_exec_price"] == 0.27
 
 

@@ -29,25 +29,27 @@ from binance_predict.services.rev2_inside_shadow_detector import (
 
 
 def test_live_channels_registered() -> None:
-    """验证 Rev2 三个通道的周期、方向与默认热调护栏。"""
+    """验证 Rev2 三个通道的周期、方向与默认热调护栏（2026-09-20 LIMIT→MARKET）。"""
     spec_5m = LIVE_CHANNELS["hm_inside_5m_v2"]
     assert spec_5m.family == "nextbar"
     assert spec_5m.market_period == "5m"
     assert spec_5m.direction == "DOWN"
     assert spec_5m.auto_max_exec == 0.30
-    assert spec_5m.order_type == "LIMIT"
+    assert spec_5m.order_type == "MARKET"
 
     spec_hm = LIVE_CHANNELS["hm_inside_15m_v2"]
     assert spec_hm.family == "nextbar"
     assert spec_hm.market_period == "15m"
     assert spec_hm.direction == "DOWN"
     assert spec_hm.auto_max_exec == 0.30
+    assert spec_hm.order_type == "MARKET"
 
     spec_ih = LIVE_CHANNELS["ih_inside_15m_v2"]
     assert spec_ih.family == "nextbar"
     assert spec_ih.market_period == "15m"
     assert spec_ih.direction == "UP"
     assert spec_ih.auto_max_exec == 0.30
+    assert spec_ih.order_type == "MARKET"
 
 
 def test_evaluate_rev2_patterns_hanging_man() -> None:

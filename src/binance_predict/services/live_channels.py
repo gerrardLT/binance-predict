@@ -265,18 +265,21 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
         "g7_t270_v1", "firsthit", "5m", "DOWN", 0.10,
         "首触G7+非极晚 t≤270s（押DOWN）", order_type="LIMIT",
     ),
-    # --- rev2 族：孕线反转 + 短影精选，默认 0.30 GTC LIMIT（可热调覆盖） ---
+    # --- rev2 族：孕线反转 + 短影精选（2026-09-20 LIMIT→MARKET）：原 GTC 挂 0.30
+    # 等回落被动成交——成交价恒等于挂单价（10/10 笔），只吃到市场跌穿 0.30 的逆向
+    # 选择单；护栏被热调至 0.20 后 hm_inside_15m_v2 直接 8 天零成交。改为 MARKET：
+    # K 线收盘钩子即下单，均价 >= 0.30（含贴线）弃单，0.30 从挂单价变为弃单线。 ---
     "hm_inside_5m_v2": ChannelSpec(
         "hm_inside_5m_v2", "nextbar", "5m", "DOWN", 0.30,
-        "5m孕线上吊线精选反转（押DOWN）", order_type="LIMIT",
+        "5m孕线上吊线精选反转（押DOWN）",
     ),
     "hm_inside_15m_v2": ChannelSpec(
         "hm_inside_15m_v2", "nextbar", "15m", "DOWN", 0.30,
-        "15m孕线上吊线反转（押DOWN）", order_type="LIMIT",
+        "15m孕线上吊线反转（押DOWN）",
     ),
     "ih_inside_15m_v2": ChannelSpec(
         "ih_inside_15m_v2", "nextbar", "15m", "UP", 0.30,
-        "15m孕线倒垂线反转（押UP）", order_type="LIMIT",
+        "15m孕线倒垂线反转（押UP）",
     ),
 }
 
