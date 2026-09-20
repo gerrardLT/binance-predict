@@ -164,8 +164,14 @@ async def patch_assessment(session: AsyncSession, patch: AssessmentPatch) -> Non
     values = patch.values()
     candidate_rank = stage_rank(values["terminal_stage"])
     advances = literal(candidate_rank) >= _rank_case(table.c.terminal_stage)
+    # Stage/reason advance monotonically. A lower-stage late patch may fill facts
+    # that are still NULL, but must not overwrite facts captured at a later stage.
     guarded = {
-        key: case((advances, value), else_=table.c[key])
+        key: (
+            case((advances, value), else_=table.c[key])
+            if key in {"terminal_stage", "reason_code"}
+            else case((advances, value), else_=func.coalesce(table.c[key], value))
+        )
         for key, value in values.items()
     }
     guarded["updated_at"] = func.now()

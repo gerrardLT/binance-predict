@@ -216,6 +216,38 @@ def test_parse_defaults_all_off(monkeypatch) -> None:
     assert all(c.max_exec_price is None for c in cfgs.values())  # 缺省回落 auto
 
 
+@pytest.mark.asyncio
+async def test_heal_only_scans_misalignment_families_and_counts_success(monkeypatch) -> None:
+    """自愈不能反复扫描 candlestick/firsthit 等永远不在 MisalignmentSignal 的订单。"""
+    trader = _make_trader(monkeypatch, _FakeTrader())
+    captured = {}
+
+    class _HealSession:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def execute(self, stmt):
+            captured["sql"] = str(stmt.compile(compile_kwargs={"literal_binds": True}))
+            result = MagicMock()
+            result.all.return_value = [(WINDOW_START, "quote_contrarian_v2"),
+                                       (WINDOW_START + 300_000, "x4_v2")]
+            return result
+
+    outcomes = iter([True, False])
+
+    async def _backfill(_ws, _version=None):
+        return next(outcomes)
+
+    monkeypatch.setattr(milt, "async_session_factory", lambda: _HealSession())
+    monkeypatch.setattr(trader, "_backfill_signal_link", _backfill)
+
+    await trader._heal_once()
+
+    assert "quote_contrarian_v2" in captured["sql"]
+    assert "x4_v2" in captured["sql"]
+    assert "candle_hm_bull_5m_consensus2_shadow_v1" not in captured["sql"]
+    assert trader.status()["healed_total"] == 1
+
+
 def test_long_candlestick_channel_ids_fit_persisted_models() -> None:
     """最长 65 字符逻辑 ID 必须可写订单、覆盖表和执行账本。"""
     from binance_predict.db.models import (
@@ -2585,6 +2617,7 @@ def _make_real_trader(monkeypatch, with_15m: bool = True) -> BinancePredictionTr
         if with_15m:
             # 新锚定机制：按 startDate 建表，下单精确匹配 window_start
             trader._15m_markets[WINDOW_START] = {
+                "market_id": 15001,
                 "end_date": WINDOW_START + 900_000,
                 "up_token": "TOKEN-15M-UP", "down_token": "TOKEN-15M-DOWN",
                 "up_price": 0.45, "down_price": 0.55,
@@ -2990,6 +3023,7 @@ async def test_signal_trade_15m_token_and_scene_id(monkeypatch) -> None:
     trader = _make_real_trader(monkeypatch)
     reserve_calls: list[tuple] = []
     quote_tokens: list[str] = []
+    update_calls: list[dict] = []
 
     async def _reserve(_v, _ws, direction=None, market_period="5m",
                        scene_signal_id=None):
@@ -2997,6 +3031,7 @@ async def test_signal_trade_15m_token_and_scene_id(monkeypatch) -> None:
         return _pending_order()
 
     async def _update(order, status, **kwargs):
+        update_calls.append(kwargs)
         return {**order, "status": status, **kwargs}
 
     async def _quote(token_id, side, amount_usdt=None):
@@ -3018,6 +3053,7 @@ async def test_signal_trade_15m_token_and_scene_id(monkeypatch) -> None:
     assert order["status"] == "FILLED"
     assert quote_tokens == ["TOKEN-15M-DOWN"]       # 15m token 分流
     assert reserve_calls == [("15m", 42)]            # 占位透传（落库依据）
+    assert update_calls[-1]["market_id"] == 15001    # 实际目标市场，不能沿用活动 5m 市场
 
 
 @pytest.mark.asyncio

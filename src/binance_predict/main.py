@@ -3509,6 +3509,7 @@ async def _sync_binance_orders_impl() -> dict:
     synced: list[dict] = []
     amount_corrected: list[dict] = []
     ambiguous: list[dict] = []
+    unmatched_exchange: list[dict] = []
     now_ms = int(time.time() * 1000)
     async with async_session_factory() as db:
         async def _patch_reconciled_assessment(
@@ -3698,11 +3699,10 @@ async def _sync_binance_orders_impl() -> dict:
 
         # 幽灵成交订正：本地 FILLED 而币安侧同 orderId 为 FAILED（FOK 受理后
         # 翻转未成交）→ 改判 FAILED 并清结算字段（2026-08 对账发现 2 笔）
-        filled_rows = (await db.execute(
-            select(TradeOrderModel)
-            .where(TradeOrderModel.status == "FILLED")
-            .where(TradeOrderModel.order_id.isnot(None))
+        ledger_rows = (await db.execute(
+            select(TradeOrderModel).where(TradeOrderModel.order_id.isnot(None))
         )).scalars().all()
+        filled_rows = [row for row in ledger_rows if row.status == "FILLED"]
         for row in filled_rows:
             bo = by_orderid.get(str(row.order_id))
             if not bo or bo.get("status") != "FAILED":
@@ -3784,10 +3784,49 @@ async def _sync_binance_orders_impl() -> dict:
                 "部分成交订正 | 订单 {} | id={} | 金额 {} → {} USDT | 股数 {} | pnl={}",
                 row.order_id, row.id, local_wei / 1e18, amt, shares,
                 f"{row.pnl:+.4f}" if row.pnl is not None else "N/A")
+        # 币安有、本地无的订单只能报告，不能猜 signal_version 自动补造持仓。
+        # 按 orderId 查全量本地行（不限 PENDING/FILLED），防把人工单或其它进程
+        # 的订单静默混入本地实盘绩效。
+        local_order_ids = {
+            str(row.order_id) for row in ledger_rows if row.order_id
+        }
+        for bo in history:
+            oid = str(bo.get("orderId") or "").strip()
+            if not oid or oid in local_order_ids:
+                continue
+            if str(bo.get("side") or "BUY").upper() != "BUY":
+                continue  # SELL 平仓有独立账本语义，不混入缺失买单告警
+            try:
+                filled_usdt = float(bo.get("filledUsdtAmount") or 0)
+            except (TypeError, ValueError):
+                filled_usdt = 0.0
+            unmatched_exchange.append({
+                "order_id": oid,
+                "status": bo.get("status"),
+                "slug": bo.get("slug"),
+                "side": bo.get("side"),
+                "outcome": bo.get("outcome"),
+                "order_type": bo.get("orderType"),
+                "filled_usdt": filled_usdt,
+                "created_at_ms": bo.get("createTime"),
+            })
+        if unmatched_exchange:
+            logger.critical(
+                "对账：币安订单未在本地账本找到 | count={} | filled={} | stake={} USDT",
+                len(unmatched_exchange),
+                sum(row["status"] == "FILLED" for row in unmatched_exchange),
+                round(sum(row["filled_usdt"] for row in unmatched_exchange), 8),
+            )
         await db.commit()
     result = {"synced": len(synced), "details": synced,
               "amount_corrected": amount_corrected,
-              "binance_orders": len(history)}
+              "binance_orders": len(history),
+              "unmatched_exchange": unmatched_exchange,
+              "unmatched_exchange_summary": {
+                  "count": len(unmatched_exchange),
+                  "filled_count": sum(row["status"] == "FILLED" for row in unmatched_exchange),
+                  "filled_usdt": round(sum(row["filled_usdt"] for row in unmatched_exchange), 8),
+              }}
     if ambiguous:
         result["ambiguous"] = ambiguous
     return result

@@ -19,6 +19,8 @@ def test_legacy_order_query_filters_registry_versions_before_bounded_batch() -> 
 
     assert "trade_orders.signal_version IN" in sql
     assert "quote_contrarian_v2" in sql
+    assert "LEFT OUTER JOIN shadow_execution_assessments" in sql
+    assert "strategy_eligible IS NULL" in sql
     assert "LIMIT 17" in sql
 
 
@@ -129,6 +131,9 @@ async def test_reconcile_links_exact_key_and_advances_proven_terminal(monkeypatc
     assert written.assessment_id == 41
     assert written.stage is TerminalStage.FILL
     assert written.reason is ReasonCode.ORDER_FILLED
+    assert written.strategy_eligible is True
+    assert written.operational_eligible is True
+    assert written.execution_eligible is True
 
 
 @pytest.mark.asyncio

@@ -54,13 +54,11 @@ def _quote_amount_usdt(value: Any) -> float | None:
 
 
 def actual_cost(order: LiveOrder) -> float | None:
-    quote = order.quote_json or {}
-    if "amountIn" in quote:
-        amount = _quote_amount_usdt(quote.get("amountIn"))
-        if amount is not None:
-            return amount
-    fallback = _positive_float(order.amount_in)
-    return fallback / WEI if fallback is not None else None
+    """Return persisted actual spend; quote amount is only a legacy fallback."""
+    amount = _positive_float(order.amount_in)
+    if amount is not None:
+        return amount / WEI
+    return _quote_amount_usdt((order.quote_json or {}).get("amountIn"))
 
 
 def execution_details(order: LiveOrder) -> dict[str, Any]:
@@ -105,10 +103,11 @@ def break_even(order: LiveOrder) -> dict[str, Any]:
 
 
 def market_window_key(order: LiveOrder) -> tuple[Any, ...] | None:
-    if order.market_id is not None and str(order.market_id).strip():
-        return ("market_id", order.market_id)
+    """Prefer the immutable period/window identity; legacy market_id is fallback only."""
     if order.market_period and order.window_start is not None:
         return ("period_window", order.market_period, order.window_start)
+    if order.market_id is not None and str(order.market_id).strip():
+        return ("market_id", order.market_id)
     return None
 
 

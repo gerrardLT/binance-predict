@@ -9,10 +9,12 @@ from sqlalchemy.dialects import postgresql
 from binance_predict.services.shadow_execution_registry import SHADOW_VERSION_SPECS
 from binance_predict.services.shadow_execution_store import (
     build_assessment_values,
+    patch_assessment,
     upsert_assessment,
 )
 from binance_predict.services.shadow_execution_types import (
     EXECUTION_POLICY_VERSION,
+    AssessmentPatch,
     NormalizedShadowEvent,
     ReasonCode,
     SourceType,
@@ -128,6 +130,28 @@ def test_unknown_can_advance_and_equal_rank_can_refresh_reason() -> None:
     assert stage_advances(TerminalStage.UNKNOWN, TerminalStage.STRATEGY)
     assert stage_advances(TerminalStage.ORDER, TerminalStage.ORDER)
     assert not stage_advances(TerminalStage.ORDER, TerminalStage.EXECUTION)
+
+@pytest.mark.asyncio
+async def test_late_fact_patch_fills_eligibility_without_regressing_terminal_stage() -> None:
+    session = SimpleNamespace(execute=AsyncMock())
+
+    await patch_assessment(session, AssessmentPatch(
+        assessment_id=9,
+        stage=TerminalStage.FILL,
+        reason=ReasonCode.ORDER_FILLED,
+        strategy_eligible=True,
+        operational_eligible=True,
+        execution_eligible=True,
+    ))
+
+    stmt = session.execute.await_args.args[0]
+    sql = str(stmt.compile(dialect=postgresql.dialect()))
+    compact = sql.replace(" ", "").lower()
+    assert "strategy_eligible=casewhen" in compact
+    assert "operational_eligible=casewhen" in compact
+    assert "execution_eligible=casewhen" in compact
+    assert "coalesce(shadow_execution_assessments.strategy_eligible" in compact
+    assert "terminal_stage=casewhen" in compact
 
 
 @dataclass

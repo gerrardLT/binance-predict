@@ -2199,7 +2199,7 @@ class BinancePredictionTrader:
                 logger.error("信号实盘：余额预检未过，弃单 | signal={} | window={} | {}",
                              signal_version, window_start, bal_why)
                 return await self._update_signal_order(
-                    pending, "FAILED", direction=prediction,
+                    pending, "FAILED", direction=prediction, market_id=market_id,
                     error_message=f"余额预检弃单 | {bal_why}")
 
             # 区分 LIMIT GTC 挂单 vs MARKET FOK 市价单
@@ -2232,7 +2232,7 @@ class BinancePredictionTrader:
                     decision_snapshot={"quote_error": detail, "balance_reason": bal_why},
                 )
                 return await self._update_signal_order(
-                    pending, "FAILED", direction=prediction,
+                    pending, "FAILED", direction=prediction, market_id=market_id,
                     error_message=f"获取报价失败 | {detail}",
                 )
 
@@ -2279,7 +2279,7 @@ class BinancePredictionTrader:
                         reason=f"报价 {avg_price} 超出或贴线护栏上限 {max_exec_price}",
                     )
                     return await self._update_signal_order(
-                        pending, "FAILED", direction=prediction,
+                        pending, "FAILED", direction=prediction, market_id=market_id,
                         error_message=f"执行价护栏弃单 | averagePrice={avg_price} >= {max_exec_price}（贴线无滑点空间）",
                         quote_json=quote)
                 wechat_notifier.notify_order_abandoned(
@@ -2291,7 +2291,7 @@ class BinancePredictionTrader:
                     reason=f"成交均价 {avg_price} 不在入场白名单区间 {entry_band_whitelist}",
                 )
                 return await self._update_signal_order(
-                    pending, "FAILED", direction=prediction,
+                    pending, "FAILED", direction=prediction, market_id=market_id,
                     error_message=f"入场价白名单弃单 | averagePrice={avg_price} 不在 {entry_band_whitelist}",
                     quote_json=quote)
 
@@ -2310,7 +2310,7 @@ class BinancePredictionTrader:
                 order_result = await self.place_order(quote, slippage_bps=slippage_bps)
             if not order_result:
                 snapshot = await self._update_signal_order(
-                    pending, "FAILED", direction=prediction,
+                    pending, "FAILED", direction=prediction, market_id=market_id,
                     error_message="下单失败", quote_json=quote)
                 await self._patch_signal_assessment(
                     assessment_id,
@@ -2330,6 +2330,7 @@ class BinancePredictionTrader:
                 snapshot = await self._update_signal_order(
                     pending, "PENDING",
                     direction=prediction,
+                    market_id=market_id,
                     token_id=token_id,
                     order_id=order_id,
                     quote_json=quote,
@@ -2396,8 +2397,8 @@ class BinancePredictionTrader:
                         "result": ReasonCode.EXEC_PRICE_GUARD.value,
                     })
                     snapshot = await self._update_signal_order(
-                        pending, "FAILED", direction=prediction, token_id=token_id,
-                        order_id=order_id, quote_json=retry_quote,
+                        pending, "FAILED", direction=prediction, market_id=market_id,
+                        token_id=token_id, order_id=order_id, quote_json=retry_quote,
                         error_message=(
                             f"重试执行价护栏弃单 | averagePrice={retry_avg} "
                             f">= {max_exec_price}（贴线无滑点空间）"))
@@ -2417,8 +2418,8 @@ class BinancePredictionTrader:
                         "result": ReasonCode.ENTRY_BAND_REJECTED.value,
                     })
                     snapshot = await self._update_signal_order(
-                        pending, "FAILED", direction=prediction, token_id=token_id,
-                        order_id=order_id, quote_json=retry_quote,
+                        pending, "FAILED", direction=prediction, market_id=market_id,
+                        token_id=token_id, order_id=order_id, quote_json=retry_quote,
                         error_message=(
                             f"重试入场价白名单弃单 | averagePrice={retry_avg} "
                             f"不在 {entry_band_whitelist}"))
@@ -2458,8 +2459,8 @@ class BinancePredictionTrader:
 
             if confirmed is not None and confirmed.get("status") in RETRYABLE_ORDER_STATUSES:
                 snapshot = await self._update_signal_order(
-                    pending, "FAILED", direction=prediction, token_id=token_id,
-                    order_id=order_id, quote_json=quote,
+                    pending, "FAILED", direction=prediction, market_id=market_id,
+                    token_id=token_id, order_id=order_id, quote_json=quote,
                     error_message=(
                         f"币安侧订单终态 {confirmed.get('status')}"
                         f"（FOK 未成交，已重试 {retries} 次）"))
@@ -2480,6 +2481,7 @@ class BinancePredictionTrader:
             snapshot = await self._update_signal_order(
                 pending, status,
                 direction=prediction,
+                market_id=market_id,
                 token_id=token_id,
                 amount_in=str(quote.get("amountIn", "")),
                 amount_out=str(quote.get("amountOut", "")),
@@ -2553,7 +2555,9 @@ class BinancePredictionTrader:
                 order = TradeOrderModel(
                     prediction_id=None,
                     assessment_id=assessment_id,
-                    market_id=self._active_market.get("marketTopicId") if self._active_market else None,
+                    # 目标市场要到 list/detail 锚定后才可确定；不得把当前活动
+                    # 5m market_id 预写到 15m/未来窗占位，终态更新时再回填。
+                    market_id=None,
                     token_id="",
                     side="BUY",
                     amount_in="0",
@@ -2580,6 +2584,7 @@ class BinancePredictionTrader:
         status: str,
         *,
         direction: str | None = None,
+        market_id: int | None = None,
         token_id: str | None = None,
         amount_in: str | None = None,
         amount_out: str | None = None,
@@ -2602,6 +2607,8 @@ class BinancePredictionTrader:
                 order.status = status
                 if direction is not None:
                     order.direction = direction
+                if market_id is not None:
+                    order.market_id = market_id
                 if token_id is not None:
                     order.token_id = token_id
                 if amount_in is not None:
@@ -2622,6 +2629,7 @@ class BinancePredictionTrader:
                     "signal_version": merged.signal_version,
                     "window_start": merged.window_start,
                     "direction": merged.direction,
+                    "market_id": merged.market_id,
                     "token_id": merged.token_id,
                     "order_id": merged.order_id,
                     "amount_in": merged.amount_in,
@@ -2639,6 +2647,7 @@ class BinancePredictionTrader:
                 "signal_version": getattr(order, "signal_version", None),
                 "window_start": getattr(order, "window_start", None),
                 "direction": direction if direction is not None else getattr(order, "direction", None),
+                "market_id": market_id,
                 "token_id": token_id,
                 "order_id": order_id,
                 "amount_in": amount_in,

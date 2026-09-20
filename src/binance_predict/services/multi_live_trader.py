@@ -1712,12 +1712,8 @@ class MultiLiveTrader:
         task.add_done_callback(self._tasks.discard)
 
     async def _backfill_signal_link(self, window_start: int,
-                                    version: str | None = None) -> None:
-        """窗口结算后把订单关联回影子信号（实盘 vs 影子一一对账）。
-
-        统一按 target_window_start 匹配：quote_edge 信号 target==本窗、
-        x4 信号 target==次窗，均等于订单 window_start（版本名已隔离族）。
-        """
+                                    version: str | None = None) -> bool:
+        """把 MisalignmentSignal 族订单关联回影子信号；成功更新返回 True。"""
         try:
             async with async_session_factory() as session:
                 sig = (await session.execute(
@@ -1729,8 +1725,8 @@ class MultiLiveTrader:
                 if sig is None:
                     logger.debug("多通道实盘：影子信号未就绪，跳过回填 | 窗口 {}",
                                  window_start)
-                    return
-                await session.execute(
+                    return False
+                result = await session.execute(
                     sa_update(TradeOrderModel).where(
                         TradeOrderModel.signal_version == version,
                         TradeOrderModel.window_start == window_start,
@@ -1738,11 +1734,15 @@ class MultiLiveTrader:
                     ).values(signal_id=sig[0])
                 )
                 await session.commit()
-                logger.info("多通道实盘：订单已关联影子信号 | {} | 窗口 {} | signal_id={}",
-                            version, window_start, sig[0])
+                updated = bool(result.rowcount)
+                if updated:
+                    logger.info("多通道实盘：订单已关联影子信号 | {} | 窗口 {} | signal_id={}",
+                                version, window_start, sig[0])
+                return updated
         except Exception as exc:
             logger.warning("多通道实盘：signal_id 回填失败 | {} | 窗口 {} | {}",
                            version, window_start, exc)
+            return False
 
     async def _link_signal_id(self, version: str, window_start: int,
                               sig_id: int) -> None:
@@ -1805,27 +1805,26 @@ class MultiLiveTrader:
                 logger.warning("多通道实盘：自愈扫描异常 | {}", exc)
 
     async def _heal_once(self) -> None:
-        """为超过 10 分钟仍缺 signal_id 的 5m 订单重试回填（幂等）。
-
-        只扫 5m 订单：scene 订单走 scene_signal_id（下单即落库），
-        signal_id 语义上恒为 NULL，纳入扫描会永久空转。
-        """
+        """为超过 10 分钟仍缺 signal_id 的 MisalignmentSignal 族订单重试回填。"""
         try:
             cutoff = datetime.now(timezone.utc) - timedelta(minutes=10)
             async with async_session_factory() as session:
                 orders = (await session.execute(
                     sa_select(TradeOrderModel.window_start,
                               TradeOrderModel.signal_version).where(
-                        TradeOrderModel.signal_version.in_(list(self._specs)),
+                        TradeOrderModel.signal_version.in_(tuple(
+                            channel for channel, spec in self._specs.items()
+                            if spec.family in ("quote_edge", "x4")
+                        )),
                         TradeOrderModel.signal_id.is_(None),
                         TradeOrderModel.market_period == "5m",
                         TradeOrderModel.created_at < cutoff,
                     ).order_by(TradeOrderModel.window_start.asc()).limit(20)
                 )).all()
+            healed = 0
             for ws, ver in orders:
-                await self._backfill_signal_link(int(ws), ver)
-            if orders:
-                self._healed_total += len(orders)
+                healed += int(await self._backfill_signal_link(int(ws), ver))
+            self._healed_total += healed
         except Exception as exc:
             logger.warning("多通道实盘：自愈扫描查询失败 | {}", exc)
 

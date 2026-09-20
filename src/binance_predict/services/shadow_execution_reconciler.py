@@ -46,12 +46,21 @@ def _order_terminal(order: TradeOrderModel) -> tuple[TerminalStage, ReasonCode]:
 def _legacy_order_statement(batch_size: int):
     return (
         select(TradeOrderModel)
+        .outerjoin(
+            ShadowExecutionAssessment,
+            TradeOrderModel.assessment_id == ShadowExecutionAssessment.id,
+        )
         .where(
-            TradeOrderModel.assessment_id.is_(None),
             TradeOrderModel.signal_version.in_(tuple(SHADOW_VERSION_SPECS)),
             TradeOrderModel.window_start.isnot(None),
             TradeOrderModel.market_period.isnot(None),
             TradeOrderModel.direction.isnot(None),
+            (
+                TradeOrderModel.assessment_id.is_(None)
+                | ShadowExecutionAssessment.strategy_eligible.is_(None)
+                | ShadowExecutionAssessment.operational_eligible.is_(None)
+                | ShadowExecutionAssessment.execution_eligible.is_(None)
+            ),
         )
         .order_by(TradeOrderModel.id.asc())
         .limit(batch_size)
@@ -63,11 +72,7 @@ async def reconcile_shadow_execution_orders(
     *,
     batch_size: int = 200,
 ) -> ReconcileReport:
-    """Bind legacy orders by exact version/window/period and copy proven lifecycle facts.
-
-    Eligibility remains unknown: historical strategy, configuration, balance, quote and
-    exclusivity state cannot be reconstructed from an order row.
-    """
+    """Bind legacy orders and backfill lifecycle/eligibility facts proven by an order."""
     rows = list((await session.execute(
         _legacy_order_statement(batch_size)
     )).scalars().all())
@@ -95,12 +100,17 @@ async def reconcile_shadow_execution_orders(
                 )
                 stage, reason = _order_terminal(order)
                 if stage is not TerminalStage.UNKNOWN:
+                    # 订单已经存在即证明策略与操作门均通过；是否进入执行由
+                    # 报价/下单事实决定。旧账本缺这三列时在对账阶段补齐。
                     await patch_assessment(
                         session,
                         AssessmentPatch(
                             assessment_id=int(assessment.id),
                             stage=stage,
                             reason=reason,
+                            strategy_eligible=True,
+                            operational_eligible=True,
+                            execution_eligible=bool(order.order_id),
                         ),
                     )
                 result = await session.execute(

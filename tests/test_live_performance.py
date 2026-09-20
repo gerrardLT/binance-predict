@@ -50,11 +50,11 @@ def test_ewma_uses_first_valid_value_and_span_20_alpha():
     assert values[2] == pytest.approx(19 / 21)
 
 
-def test_actual_amount_and_shares_take_precedence():
+def test_reconciled_order_amount_and_shares_take_precedence():
     row = order(
-        amount_in=str(9 * 10**18),
+        amount_in=str(2 * 10**18),
         quote_json={
-            "amountIn": str(2 * 10**18),
+            "amountIn": str(9 * 10**18),
             "filledShareQty": 2.5,
             "averagePrice": 0.7,
             "quotedAvgPrice": 0.6,
@@ -86,11 +86,14 @@ def test_confirmed_average_price_is_fee_adjusted_without_shares():
     assert result["method"] == "FEE_ADJUSTED_ACTUAL_AVERAGE_PRICE"
 
 
-def test_market_window_key_prefers_market_id_and_period_fallback_separates_5m_15m():
-    assert market_window_key(order(market_id=123)) == ("market_id", 123)
+def test_market_window_key_prefers_period_window_and_uses_market_id_only_as_fallback():
+    assert market_window_key(order(market_id=123)) == ("period_window", "5m", 1)
     assert market_window_key(order(market_id=None)) == ("period_window", "5m", 1)
     assert market_window_key(order(market_id=None, market_period="15m")) != market_window_key(order())
-    assert market_window_key(order(market_period=None, window_start=None)) is None
+    assert market_window_key(order(market_id=123, market_period=None, window_start=None)) == (
+        "market_id", 123,
+    )
+    assert market_window_key(order(market_id=None, market_period=None, window_start=None)) is None
 
 
 def test_same_window_aggregates_real_pnl_and_deduplicates_win_rate():
@@ -235,5 +238,5 @@ def test_portfolio_series_uses_window_time_not_market_id():
     series = portfolio_window_series(rows)
     assert [point["t"] for point in series] == [1000, 2000]
     assert [point["market_window_key"] for point in series] == [
-        ["market_id", 99], ["market_id", 10],
+        ["period_window", "5m", 1000], ["period_window", "5m", 2000],
     ]

@@ -1184,6 +1184,41 @@ async def test_sync_binance_non_filled_with_partial_error_message(monkeypatch) -
     assert "1.5" in row.error_message
 
 
+@pytest.mark.asyncio
+async def test_sync_binance_reports_exchange_only_orders_without_guessing(monkeypatch) -> None:
+    """币安有、本地无的订单只报告，不猜通道、不自动补造持仓行。"""
+    ws = 1_787_418_600_000
+    history = [{
+        "orderId": "EXCHANGE-ONLY",
+        "slug": f"btc-updown-5m-{ws // 1000}",
+        "status": "FILLED",
+        "side": "BUY",
+        "outcome": "Up",
+        "orderType": "MARKET",
+        "filledUsdtAmount": "2.5",
+        "createTime": ws + 1_000,
+        "price": "0.51",
+    }]
+    m, db = _sync_harness(monkeypatch, history, [])
+
+    out = await m._sync_binance_orders_impl()
+
+    assert out["unmatched_exchange_summary"] == {
+        "count": 1, "filled_count": 1, "filled_usdt": 2.5,
+    }
+    assert out["unmatched_exchange"] == [{
+        "order_id": "EXCHANGE-ONLY",
+        "status": "FILLED",
+        "slug": f"btc-updown-5m-{ws // 1000}",
+        "side": "BUY",
+        "outcome": "Up",
+        "order_type": "MARKET",
+        "filled_usdt": 2.5,
+        "created_at_ms": ws + 1_000,
+    }]
+    db.add.assert_not_called()
+
+
 # ============================================================
 # GET /api/prediction/quote-preview（报价预览：倒计时/指示价）
 # ============================================================
