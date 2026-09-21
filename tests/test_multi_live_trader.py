@@ -208,7 +208,7 @@ def test_parse_defaults_all_off(monkeypatch) -> None:
     monkeypatch.setattr(settings, "live_default_max_daily_orders", 100)
     monkeypatch.setattr(settings, "live_channels_json", "")
     cfgs = parse_channel_config()
-    assert len(cfgs) == 31 + len(CANDLESTICK_SIGNAL_IDS)
+    assert len(cfgs) == 32 + len(CANDLESTICK_SIGNAL_IDS)
     assert set(CANDLESTICK_SIGNAL_IDS) <= set(cfgs)
     assert all(not c.enabled for c in cfgs.values())
     assert all(c.amount_usdt == 2.0 for c in cfgs.values())
@@ -360,7 +360,7 @@ def test_channels_registry_shape() -> None:
         "x4_v2",
         "x4_v3",
         "scene_bull_exhaust", "scene_bull_exhaust_confirm",
-        "scene_bear_exhaust", "scene_momentum_fade",
+        "scene_bear_exhaust", "scene_bear_exhaust_opt_v1", "scene_momentum_fade",
         "s5_deep_z20_v1",
         # 2026-09-06 影子 promote 三族（默认全 OFF，面板/配置开启）
         "s2_cond_t4_v1", "s2_cond_t5d_v1",
@@ -416,10 +416,13 @@ def test_channels_registry_shape() -> None:
     assert by["x4_v2"].auto_max_exec == 0.50
     assert all(by[ch].market_period == "15m" for ch in
                ("scene_bull_exhaust", "scene_bull_exhaust_confirm",
-                "scene_bear_exhaust", "scene_momentum_fade"))
+                "scene_bear_exhaust", "scene_bear_exhaust_opt_v1",
+                "scene_momentum_fade"))
     assert by["scene_bull_exhaust"].auto_max_exec == 0.70
     assert by["scene_bull_exhaust_confirm"].auto_max_exec == 0.75
     assert by["scene_bear_exhaust"].auto_max_exec == 0.65
+    assert by["scene_bear_exhaust_opt_v1"].auto_max_exec == 0.57
+    assert by["scene_bear_exhaust_opt_v1"].direction == "UP"
     assert by["scene_momentum_fade"].auto_max_exec == 0.55
     # S5 深档：scene 族 15m 押 DOWN，护栏 0.88（盈亏平衡 0.895 略下方）
     s5d = by["s5_deep_z20_v1"]
@@ -467,6 +470,8 @@ def test_channels_registry_shape() -> None:
     assert exclusive_group("g7_t270_v1") is None
     assert exclusive_group("firsthit_down_g7_v1") is None
     assert exclusive_group("scene_bull_exhaust") is None
+    assert exclusive_group("scene_bear_exhaust") == frozenset(
+        {"scene_bear_exhaust", "scene_bear_exhaust_opt_v1"})
     assert exclusive_group("quote_contrarian_v2") is None
     assert exclusive_group("quote_momentum_v3") is None   # 退役组不参与生产判定
     assert RETIRED_SAME_WINDOW_EXCLUSIVE == (
@@ -1240,6 +1245,35 @@ async def test_scene_s2_up_15m(monkeypatch) -> None:
     assert call["signal_version"] == "scene_bear_exhaust"
     assert call["market_period"] == "15m"
     assert call["max_exec_price"] == 0.65
+
+
+@pytest.mark.asyncio
+async def test_scene_s2_optimized_up_15m(monkeypatch) -> None:
+    """S2 优化版独立通道默认关；显式开启后押 UP，使用保守冻结护栏。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["scene_bear_exhaust_opt_v1"])
+    t.on_scene_signal(_scene_sig("bear_exhaust_opt_v1", "low"))
+    await _drain(t)
+    call = fake.calls[0]
+    assert call["prediction"] == "UP"
+    assert call["signal_version"] == "scene_bear_exhaust_opt_v1"
+    assert call["market_period"] == "15m"
+    assert call["max_exec_price"] == 0.57
+
+
+@pytest.mark.asyncio
+async def test_scene_s2_variants_same_window_exclusive(monkeypatch) -> None:
+    """原 S2 已成交后，优化版同窗不得重复下注同一方向。"""
+    fake = _FakeTrader()
+    t = _make_trader(
+        monkeypatch, fake,
+        channels=["scene_bear_exhaust", "scene_bear_exhaust_opt_v1"],
+    )
+    t.on_scene_signal(_scene_sig("bear_exhaust", "low", sig_id=1))
+    await _drain(t)
+    t.on_scene_signal(_scene_sig("bear_exhaust_opt_v1", "low", sig_id=1))
+    await _drain(t)
+    assert [c["signal_version"] for c in fake.calls] == ["scene_bear_exhaust"]
 
 
 @pytest.mark.asyncio
@@ -2179,7 +2213,7 @@ def test_status_shape(monkeypatch) -> None:
     assert s["defaults"]["amount_usdt"] == 2.0
     assert s["defaults"]["max_daily_orders"] == 100
     from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
-    assert len(s["channels"]) == 39 + len(CANDLESTICK_SIGNAL_IDS)
+    assert len(s["channels"]) == 40 + len(CANDLESTICK_SIGNAL_IDS)
     by = {c["channel"]: c for c in s["channels"]}
     c = by["quote_contrarian_v1"]
     assert c["enabled"] is True and c["enabled_at_startup"] is True

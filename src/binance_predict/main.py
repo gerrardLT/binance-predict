@@ -80,6 +80,7 @@ from .services.quote_edge_detector import QuoteEdgeDetector
 from .services.reversal_shadow_detector import ReversalShadowDetector
 from .services.rev2_inside_shadow_detector import Rev2InsideShadowDetector
 from .services.s2_cond_shadow_detector import S2CondShadowDetector
+from .services.s2_optimized_shadow_detector import S2OptimizedShadowDetector
 from .services.shadow_execution_projector import shadow_execution_projector
 from .services.shadow_execution_types import EXECUTION_POLICY_VERSION
 from .services.shadow_version_gate import shadow_gate
@@ -206,6 +207,7 @@ absorption_shadow_detector: AbsorptionShadowDetector | None = None
 # 派生窗内 t=4/t=5 判价条件确认 → 押次周期 UP，落 kline_shadow_signals version 隔离，
 # 只记录不下注）
 s2_cond_shadow_detector: S2CondShadowDetector | None = None
+s2_optimized_shadow_detector: S2OptimizedShadowDetector | None = None
 
 # 5m DOWN 首触反转影子检测器全局实例（firsthit_down_v1/_body_v1/_chg_v1 三 version：
 # G0 基底 / G1 body_r≤0.35 / G3 chg≤+2.82bp，归档后处理落 SETTLED，只记录不下注，
@@ -1361,7 +1363,7 @@ async def lifespan(app: FastAPI):
     # （窗口对齐+龄守卫），真实 EV 前向现算（研究 EV 属报价表乐观上界）。影子仍只记录
     # 不下注；实盘通道 s2_cond_t4_v1/t5d_v1 已注册 LIVE_CHANNELS，判定命中即经
     # _on_live_fire 钩子驱动真单（与影子 gate 互不影响）。默认开关开启，与其他影子一致。
-    global s2_cond_shadow_detector
+    global s2_cond_shadow_detector, s2_optimized_shadow_detector
     if settings.s2_cond_shadow_enabled:
         s2_cond_shadow_detector = S2CondShadowDetector(
             collector=collector,
@@ -1373,6 +1375,15 @@ async def lifespan(app: FastAPI):
         # S2 影子仍从每个实盘 bear_exhaust 派生采集前向样本）
         if fake_breakout_detector is not None:
             fake_breakout_detector._on_s2_cond = s2_cond_shadow_detector.on_s2_signal
+
+    # S2 优化版：复用父 S2，额外评估量比<4与14日位置≥0.33；影子持续采集，实盘默认 OFF。
+    s2_optimized_shadow_detector = S2OptimizedShadowDetector(
+        collector=collector,
+        pm_15m_latest=_pm_15m_latest,
+    )
+    await s2_optimized_shadow_detector.start()
+    if fake_breakout_detector is not None:
+        fake_breakout_detector._on_s2_optimized = s2_optimized_shadow_detector.evaluate
 
     # 5m DOWN 首触反转影子信号（firsthit_down 族，2026-09-07）：窗内 DOWN 报价首次
     # 进入 (0.005,0.1] → 以该报价买 DOWN 的前向重放。三 version 同表隔离：
@@ -1444,6 +1455,8 @@ async def lifespan(app: FastAPI):
         # candlestick 钩子已在其 start() 前注入，避免冷启动时序漏单，故这里不重复赋值。
         if s2_cond_shadow_detector is not None:
             s2_cond_shadow_detector._on_live_fire = multi_live_trader.on_s2_cond_signal
+        if s2_optimized_shadow_detector is not None:
+            s2_optimized_shadow_detector._on_live_fire = multi_live_trader.on_scene_signal
         if nextbar_shadow_detector is not None:
             nextbar_shadow_detector._on_live_fire = multi_live_trader.on_nextbar_signal
         if rev2_inside_shadow_detector is not None:
@@ -1523,9 +1536,11 @@ async def lifespan(app: FastAPI):
     # 停止吸收/欠反应跟随影子检测器
     if absorption_shadow_detector is not None:
         await absorption_shadow_detector.stop()
-    # 停止 S2 条件单影子检测器
+    # 停止 S2 条件单 / S2 优化版影子检测器
     if s2_cond_shadow_detector is not None:
         await s2_cond_shadow_detector.stop()
+    if s2_optimized_shadow_detector is not None:
+        await s2_optimized_shadow_detector.stop()
     # 停止 5m DOWN 首触反转影子检测器
     if firsthit_shadow_detector is not None:
         await firsthit_shadow_detector.stop()
@@ -4189,6 +4204,7 @@ SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     # 真实 EV 由生产报价前向现算（低买 UP 的正 EV 来自入场价而非胜率）
     "s2_cond_t4_v1": (0.389, None, "S2条件t=4: 实盘S2(bear_exhaust,破4h支撑+收阴+放量)派生→次周期t=4(+240s)1m收盘<周期开盘(全深度回落)→押次周期15m UP(收阳赢)（720d触发1069/2176=49.1%/1.48天,价-only胜率38.9%；开盘即买EV≈−0.042不赚钱,等t=4低买UP正EV来自入场价；真实EV前向现算,报价表研究EV+0.237属乐观上界）"),
     "s2_cond_t5d_v1": (0.448, None, "S2条件t=5剔深: 同S2派生→次周期t=5(+300s)0<ln(开盘/px5)<15bp(中度回落剔深)→押次周期15m UP(收阳赢)（720d触发643/2176=29.5%/0.89天,价-only胜率44.8%；剔深单均优于t=4全深度；真实EV前向现算,报价表研究EV+0.283属乐观上界）"),
+    "scene_bear_exhaust_opt_v1": (0.5897, None, "S2空头耗尽优化版: 原S2(破4h支撑+收阴+量比≥2)叠加量比<4且最近14日区间位置≥0.33→押次周期15m UP（720d n=975 胜率58.97%；纯K线回测无真实报价，EV按前向真实UP报价现算；实盘通道默认OFF）"),
     # rev2 孕线反转族（2026-09-09 / 2026-09-13）：前置高/低点最长实体柱+信号柱完全包裹(Inside Bar)，
     # 押次根收盘反转（kline_shadow_signals 表），15m 为经典 Ver2（短影≤10%），5m 为精选 HM（下影[75%,90%)）。
     # 2026-09-20 LIMIT→MARKET：原 GTC 挂 0.30 等回落被动成交（成交价恒=挂单价 10/10 笔，

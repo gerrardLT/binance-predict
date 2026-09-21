@@ -55,6 +55,7 @@ _VERSION_ROWS: tuple[tuple[str, SourceType, str, str, str], ...] = (
     ("absorption_follow_td150_v1", SourceType.ABSORPTION, "5m", "same_window", "dynamic"),
     ("s2_cond_t4_v1", SourceType.KLINE, "15m", "target_bar", "row"),
     ("s2_cond_t5d_v1", SourceType.KLINE, "15m", "target_bar", "row"),
+    ("scene_bear_exhaust_opt_v1", SourceType.KLINE, "15m", "target_bar", "row"),
     ("firsthit_down_v1", SourceType.FIRSTHIT, "5m", "same_window_first_touch", "down"),
     ("firsthit_down_body_v1", SourceType.FIRSTHIT, "5m", "same_window_first_touch", "down"),
     ("firsthit_down_chg_v1", SourceType.FIRSTHIT, "5m", "same_window_first_touch", "down"),
@@ -96,6 +97,8 @@ def _family_of(version: str, source: SourceType) -> str:
         return "absorption"
     if version.startswith("s2_cond_"):
         return "s2_cond"
+    if version == "scene_bear_exhaust_opt_v1":
+        return "scene"
     if version.startswith("combo_"):
         return "combo"
     if version.startswith(("nb_", "hm_inside_", "ih_inside_")):

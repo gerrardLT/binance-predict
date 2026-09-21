@@ -24,7 +24,7 @@ EXPECTED_ANALYTICS_VERSIONS = (
     "combo_p2_v1", "combo_p3_v1", "combo_p4_v1", "combo_p5_v1",
     "s5_deep_z20_v1", "quote_momentum_v3", "absorption_follow_td120_v1",
     "absorption_follow_td150_v1", "s2_cond_t4_v1", "s2_cond_t5d_v1",
-    "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1",
+    "scene_bear_exhaust_opt_v1", "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1",
     "firsthit_down_g4_v1", "firsthit_down_g7_v1", "g7_streak_v1",
     "g7_wick20_v1", "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",
     "hm_inside_15m_v2", "ih_inside_15m_v2", "hm_inside_5m_v2",
@@ -34,7 +34,7 @@ EXPECTED_ANALYTICS_VERSIONS = (
 
 def test_registry_matches_all_physical_shadow_versions_in_order() -> None:
     assert SHADOW_VERSIONS == EXPECTED_ANALYTICS_VERSIONS
-    assert len(SHADOW_VERSION_SPECS) == 46
+    assert len(SHADOW_VERSION_SPECS) == 47
     for version in ("candle_hm_bull_5m_event_v1", "candle_hm_bull_15m_event_v1"):
         spec = SHADOW_VERSION_SPECS[version]
         assert spec.family == "candlestick_reversal"

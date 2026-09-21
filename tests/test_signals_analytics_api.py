@@ -341,6 +341,29 @@ async def test_analytics_regime_split_and_daily() -> None:
 
 
 @pytest.mark.asyncio
+async def test_s2_optimized_shadow_appears_in_analytics() -> None:
+    import binance_predict.main as m
+
+    row = _krev_row(
+        version="scene_bear_exhaust_opt_v1",
+        window_start=1_700_000_000_000,
+        win=True,
+        entry_up_price=0.50,
+    )
+    out = await m.get_signals_analytics(_make_db([], [], krev_rows=[row]))
+
+    summary = out["shadow"]["scene_bear_exhaust_opt_v1"]["summary"]
+    assert summary["n"] == 1
+    assert summary["win_rate"] == 1.0
+    assert summary["avg_ev"] == pytest.approx(0.96)
+    assert summary["execution_mode"] == "SHADOW_ONLY"  # 测试未装配 MultiLiveTrader
+    from binance_predict.services.shadow_execution_registry import SHADOW_VERSION_SPECS
+    assert SHADOW_VERSION_SPECS["scene_bear_exhaust_opt_v1"].live_channel == (
+        "scene_bear_exhaust_opt_v1"
+    )
+
+
+@pytest.mark.asyncio
 async def test_analytics_empty_db() -> None:
     """空数据：结构完整不崩溃（v2/v3 门禁版部署即入面板，bench=真实回测基准）。"""
     import binance_predict.main as m
@@ -358,7 +381,7 @@ async def test_analytics_empty_db() -> None:
         "combo_p1_v1", "combo_p2_v1", "combo_p3_v1", "combo_p4_v1", "combo_p5_v1",
         "s5_deep_z20_v1", "quote_momentum_v3",
         "absorption_follow_td120_v1", "absorption_follow_td150_v1",
-        "s2_cond_t4_v1", "s2_cond_t5d_v1",
+        "s2_cond_t4_v1", "s2_cond_t5d_v1", "scene_bear_exhaust_opt_v1",
         "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1",
         # 2026-09-08 首触 G4 交互门（G1∩G3）
         "firsthit_down_g4_v1",
@@ -464,6 +487,7 @@ async def test_analytics_empty_db() -> None:
     for ver, bwr, dpre in (
         ("s2_cond_t4_v1", 0.389, "S2条件t=4"),
         ("s2_cond_t5d_v1", 0.448, "S2条件t=5剔深"),
+        ("scene_bear_exhaust_opt_v1", 0.5897, "S2空头耗尽优化版"),
     ):
         sc = out["shadow"][ver]["summary"]
         assert sc["bench_winrate"] == bwr and sc["bench_ev"] is None
