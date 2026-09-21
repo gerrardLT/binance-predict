@@ -61,7 +61,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 
 from loguru import logger
@@ -365,6 +365,8 @@ class FakeBreakoutDetector:
         # S2 条件单影子钩子（main 装配注入 S2CondShadowDetector.on_s2_signal）：
         # 实盘 bear_exhaust 派生窗内 t=4/t=5 条件确认影子（只记录不下注，物理隔离）
         self._on_s2_cond: Callable[[dict], None] | None = None
+        # S2 优化版异步派生钩子：父 bear_exhaust 命中后评估量比上界与 14 日位置。
+        self._on_s2_optimized: Callable[[dict], Awaitable[None]] | None = None
 
         self._running = False
         self._task: asyncio.Task | None = None
@@ -861,6 +863,9 @@ class FakeBreakoutDetector:
         # 路径；从每个实盘 bear_exhaust 派生以最大化前向样本，不受 scene 通道门禁）
         if not shadow and pattern_type == "bear_exhaust":
             self._notify_s2_cond(signal.id, next_start, next_end)
+            self._notify_s2_optimized(
+                signal.id, sig_k, vol_ratio, next_start, next_end,
+            )
 
         direction = "DOWN" if side == "high" else "UP"
         scene_channel = scene_pattern_to_channel(pattern_type)
@@ -952,6 +957,33 @@ class FakeBreakoutDetector:
         except Exception as exc:
             logger.warning("S2 条件单影子钩子异常（不影响检测循环）| #{} | {}",
                            signal_id, exc)
+
+    def _notify_s2_optimized(
+        self,
+        signal_id: int,
+        sig_k: dict,
+        vol_ratio: float | None,
+        next_start: int,
+        next_end: int,
+    ) -> None:
+        """父 S2 命中后异步评估优化门；失败不影响正式场景链路。"""
+        hook = self._on_s2_optimized
+        if hook is None:
+            return
+        try:
+            task = hook({
+                "id": signal_id,
+                "pattern_type": "bear_exhaust",
+                "signal_bar_start": int(sig_k["open_time"]),
+                "signal_close": float(sig_k["close"]),
+                "vol_ratio": vol_ratio,
+                "market_start_15m": next_start,
+                "market_end_15m": next_end,
+            })
+            if task is not None:
+                asyncio.create_task(task, name=f"s2opt_{signal_id}")
+        except Exception as exc:
+            logger.warning("S2优化版钩子异常（不影响检测循环）| #{} | {}", signal_id, exc)
 
     async def _send_signal_email_bg(self, signal_id: int) -> None:
         """后台邮件发送：重新查库拿完整信号，发送成功后回填 email_sent。

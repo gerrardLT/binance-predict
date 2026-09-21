@@ -130,6 +130,13 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     "scene_bear_exhaust": ChannelSpec(
         "scene_bear_exhaust", "scene", "15m", "UP", 0.65, "场景S2 空头耗尽（押UP）",
     ),
+    # S2 优化版：复用原 S2，只保留 2≤量比<4 且最近14日区间位置≥0.33。
+    # 720d K线回测 n=975/wr=58.97%；无真实预测市场报价，默认护栏按
+    # wr×0.98≈0.578 保守取 0.57。parse_channel_config 默认 OFF，先影子前向验证。
+    "scene_bear_exhaust_opt_v1": ChannelSpec(
+        "scene_bear_exhaust_opt_v1", "scene", "15m", "UP", 0.57,
+        "场景S2 空头耗尽·温和放量非低位（押UP）",
+    ),
     "scene_momentum_fade": ChannelSpec(
         "scene_momentum_fade", "scene", "15m", "DOWN", 0.55, "场景S4 动量衰竭（押DOWN）",
     ),
@@ -355,6 +362,8 @@ _CANDLE_15M_CHANNELS = frozenset(v for v in CANDLESTICK_SIGNAL_IDS if "_15m_" in
 
 SAME_WINDOW_EXCLUSIVE: tuple[frozenset[str], ...] = (
     frozenset({"scene_bull_exhaust_confirm", "s5_deep_z20_v1"}),
+    # 原 S2 与优化版是同一父事件、同方向、同目标窗；若同时启用只允许一单成交。
+    frozenset({"scene_bear_exhaust", "scene_bear_exhaust_opt_v1"}),
     # S2 条件单双变体同源（同一实盘 S2 事件、同一目标周期；t=4/t=5 判价高度重叠），
     # 防同事件双成交叠加敞口（2026-09-06 promote）。
     frozenset({"s2_cond_t4_v1", "s2_cond_t5d_v1"}),

@@ -888,7 +888,11 @@ const SIGNAL_INFO: Record<string, { name: string; desc: string; retired?: boolea
   },
   scene_bear_exhaust: {
     name: '场景S2 空头耗尽（押UP）',
-    desc: '15m 周期跌破 4h 支撑 + 收阴 + 放量 → 次周期开盘押 UP（胜率 53.6%，盈亏平衡 0.525）。护栏 0.55：跌态 UP 报价常在 0.79+，超护栏保护性弃单（负 EV 保护，属正确行为）。',
+    desc: '15m 周期跌破 4h 支撑 + 收阴 + 放量 → 次周期开盘押 UP（胜率 53.6%，盈亏平衡 0.525）。护栏 0.65。',
+  },
+  scene_bear_exhaust_opt_v1: {
+    name: '场景S2 空头耗尽·温和放量非低位（押UP）',
+    desc: '复用原 S2，再要求 2≤量比<4 且信号收盘不在最近14日区间下方33%（位置≥0.33）→ 次周期开盘押 UP。720d n=975、胜率58.97%；影子持续采集，实盘默认关闭，护栏0.57；与原S2同窗互斥。',
   },
   scene_momentum_fade: {
     name: '场景S4 动量衰竭（押DOWN）',
@@ -6694,6 +6698,7 @@ const SHADOW_META: Record<string, { label: string; color: string }> = {
   absorption_follow_td150_v1: { label: '吸收跟随 TD150 欠反应→顺势', color: 'var(--chart-10)' },
   s2_cond_t4_v1: { label: 'S2条件 t=4价<开→UP', color: 'var(--chart-1)' },
   s2_cond_t5d_v1: { label: 'S2条件 t=5剔深→UP', color: 'var(--chart-2)' },
+  scene_bear_exhaust_opt_v1: { label: 'S2优化 温和放量非低位→UP', color: 'var(--chart-3)' },
   // 2026-09-07/08 首触反转族（专用表 firsthit_shadow_signals，影子+实盘通道）
   firsthit_down_v1: { label: '首触G0 基底 q∈(0.005,0.1]→DOWN', color: 'var(--chart-3)' },
   firsthit_down_body_v1: { label: '首触G1 body_r≤0.35→DOWN', color: 'var(--chart-4)' },
@@ -6747,6 +6752,7 @@ const ANALYTICS_EXTRA_DESC: Record<string, string> = {
   absorption_follow_td150_v1: '吸收跟随 TD150：同 TD120 口径（欠反应跟随、双向顺势、trailing ~14 天滚动标定 k/门禁），但决策点延至窗开 150s（给报价更多时间暴露粘滞）。落专用表 absorption_shadow_signals，与 TD120 变体前向 A/B 并行采集。真实价复核 RECENT real n=399 命中 88.5% / EV +0.105（CI[+0.050,+0.165]✓，双 variant 中最稳健）、FULL real n=1083 EV +0.099 CI✓；EV 按 TD 真实 token 报价前向现算：赢 0.98/q−1 / 输 −1。',
   s2_cond_t4_v1: 'S2 条件单 t=4：由实盘 S2（空头耗尽 bear_exhaust：破 4h 支撑 + 收阴 + 放量）信号派生 → 次周期窗内等到 t=4（开盘后 240s），若该时刻 1m 收盘价 < 次周期开盘价（全深度回落，不设上界），按当时真实 15m UP 报价记录押次周期 15m 收阳 UP 的影子信号，仅记录不下单。研究结论：S2 开盘即买 UP 的 EV≈−0.042 不赚钱，等 t=4 价跌时 UP token 变便宜、低买 UP 的正 EV 来自入场价而非胜率。落 kline_shadow_signals（与 KREV/反转/nextbar/combo 共表、version 严格隔离结算，免迁移）。720d 触发 1069/2176（49.1%，1.48 次/天），价-only 胜率 38.9%；EV 按目标窗真实 15m UP 报价前向现算：赢 0.98/q−1 / 输 −1（报价表研究 EV +0.237 属乐观上界，不作基准）。',
   s2_cond_t5d_v1: 'S2 条件单 t=5 剔深：同由实盘 S2（bear_exhaust）派生 → 次周期窗内等到 t=5（开盘后 300s），若回落深度 0 < ln(开盘/px5) < 15bp（中度回落、剔除过深样本），按当时真实 15m UP 报价记录押次周期 15m 收阳 UP 的影子信号，仅记录不下单。剔深版单均优于 t=4 全深度（过深回落常伴随趋势性下破，剔掉后质量更高）。落 kline_shadow_signals（共表、version 严格隔离结算，免迁移）。720d 触发 643/2176（29.5%，0.89 次/天），价-only 胜率 44.8%；EV 按目标窗真实 15m UP 报价前向现算：赢 0.98/q−1 / 输 −1（报价表研究 EV +0.283 属乐观上界，不作基准）。',
+  scene_bear_exhaust_opt_v1: 'S2 空头耗尽优化版：完全复用原 S2（跌破4小时支撑、15分钟收阴、量比≥2），再排除极端放量（量比≥4）和最近14日区间下方33%（pos14d<0.33）；保留后押下一15分钟 UP。14日高低点严格截止信号K收盘，无未来函数；历史不足或区间无波动保守不触发。720d n=975、胜率58.97%，前后半段均改善；影子持续采集，同名实盘通道默认关闭，护栏0.57，与原S2同窗互斥。',
   firsthit_down_v1: '首触反转 G0 基底（对照组）：5m 窗内 DOWN token 报价**首次**进入 (0.005, 0.1]（深折价，市场判定几乎不会跌）的采样点 → 按该时刻真实报价买 DOWN，押注最终结算 DOWN =「反转」的影子信号，仅记录不下单。触发时刻特征严格 ex-ante（只读 ≤触发时刻采样）：chg_bps（BTC 相对开盘涨跌）、body_r（|btc@触−开盘|/路径 max−min 归一实体）、npts（路径采样点数，<8 整窗不落表=路径太稀疏特征不可信）。落专用表 firsthit_shadow_signals，G1/G3 为 G0 的纯子集（同表 version 隔离、全特征落库，交叉门 G4=body∧chg 可事后重构）。44d 回测基底 EV +0.22（日聚类 CI[+0.10,+0.35]），EV 按逐事件真实触发价现算：赢 0.98/q−1 / 输 −1（禁用任何均值/分位代理）。预注册裁决（4 周前向）：若 G0 前向 EV 日聚类 CI **上界** < 0 → DOWN 侧 edge 消失，整族否决重来。',
   firsthit_down_body_v1: '首触反转 G1 小实体：G0 基底 + body_r ≤ 0.35 门禁（触发时刻 BTC 相对开盘的净位移只占窗内路径振幅的 ≤35%，即价格来回震荡而非单边跑出去）→ 按首触时刻真实 DOWN 报价买 DOWN 的影子信号，仅记录不下单。研究口径：45 维条件扫描中 body_r≤0.35 是唯一扛住 FDR 多重校正的形态门（q=0.007，logit 控 t+t² 后 β=+1.28 p=0.000），排除时间分段混淆。严格 ex-ante 时间切分两段考试：calib EV +1.44 → confirm EV +1.59（两段日聚类 CI 下界均 > 0）。落专用表 firsthit_shadow_signals（G0 纯子集，version 隔离），EV 逐事件真实触发价现算：赢 0.98/q−1 / 输 −1。预注册裁决（4 周前向）：通过 = 前向触发率 P ≥ 12% 且 EV 日聚类 CI 下界 > 0。',
   firsthit_down_chg_v1: '首触反转 G3 价格偏离：G0 基底 + chg_bps ≤ +2.82bp 门禁（触发时刻 BTC 相对窗开盘涨幅不超过 +2.82 个基点，即深折价并非由 BTC 真涨造成，属报价错杀而非信息驱动）→ 按首触时刻真实 DOWN 报价买 DOWN 的影子信号，仅记录不下单。研究口径：logit 控 t+t² 后 β=+0.07 p=0.000（chg 越低反转概率越高，单调）。严格 ex-ante 时间切分两段考试：calib EV +0.39 → confirm EV +0.97（confirm 段更强但样本少）。落专用表 firsthit_shadow_signals（G0 纯子集，version 隔离），EV 逐事件真实触发价现算：赢 0.98/q−1 / 输 −1。预注册裁决（4 周前向）：通过 = 前向触发率 P ≥ 10% 且 EV 日聚类 CI 下界 > 0。',

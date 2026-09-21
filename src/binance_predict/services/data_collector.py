@@ -247,6 +247,64 @@ class BinanceDataCollector:
             logger.warning("fetch_kline_close 失败 | interval={} start={} | {}", interval, start_ms, exc)
             return 0.0
 
+    async def fetch_klines_ending_at(
+        self, interval: str, limit: int, end_ms: int,
+    ) -> list[dict]:
+        """拉取严格结束于 ``end_ms`` 前的完整 K 线（升序）。
+
+        ``endTime=end_ms-1`` 把历史窗口固定在信号时刻，避免部署延迟时把后续 K 线
+        混入滚动特征。失败或返回不足由调用方保守处理。
+        """
+        interval_ms = {
+            "1m": 60_000, "5m": 300_000, "15m": 900_000,
+            "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000,
+        }.get(interval)
+        if interval_ms is None:
+            logger.warning("fetch_klines_ending_at 不支持的周期 | interval={}", interval)
+            return []
+        url = f"{settings.binance_api_base}/api/v3/klines"
+        try:
+            data: list[list] = []
+            cursor = end_ms - 1
+            async with httpx.AsyncClient(timeout=10) as client:
+                while len(data) < limit:
+                    batch_limit = min(1000, limit - len(data))  # Binance 单次上限
+                    resp = await client.get(url, params={
+                        "symbol": settings.symbol,
+                        "interval": interval,
+                        "endTime": cursor,
+                        "limit": batch_limit,
+                    })
+                    resp.raise_for_status()
+                    batch = resp.json()
+                    if not batch:
+                        break
+                    closed = [k for k in batch if int(k[0]) + interval_ms <= end_ms]
+                    data = closed + data
+                    if len(batch) < batch_limit or len(closed) < batch_limit:
+                        break
+                    next_cursor = int(batch[0][0]) - 1
+                    if next_cursor >= cursor:
+                        break
+                    cursor = next_cursor
+            return [
+                {
+                    "open_time": int(k[0]),
+                    "open": float(k[1]),
+                    "high": float(k[2]),
+                    "low": float(k[3]),
+                    "close": float(k[4]),
+                    "volume": float(k[5]),
+                }
+                for k in data[-limit:]
+            ]
+        except Exception as exc:
+            logger.warning(
+                "fetch_klines_ending_at 失败 | interval={} end={} | {}",
+                interval, end_ms, exc,
+            )
+            return []
+
     async def fetch_recent_klines(self, interval: str, limit: int) -> list[dict]:
         """拉最近 limit 根已收盘 K 线（升序），供周期收盘质量判定与图表 API 使用。
 
