@@ -911,6 +911,10 @@ const SIGNAL_INFO: Record<string, { name: string; desc: string; retired?: boolea
     name: 'S2条件单·t5剔深（押UP）',
     desc: '实盘 S2（bear_exhaust）派生：次周期 t=5(+300s) 0<回落<15bp（中度回落剔深，排除已深跌的接刀窗）→ 当刻买 UP 押次周期 15m 收阳。720d 触发 643/2176（29.5%，0.89/天），价-only 胜率 44.8%；通道护栏 0.44（44.8%×0.98）。与 t4 价<开同窗互斥（至多一单成交）。',
   },
+  nb_zschamp_15m_v1: {
+    name: 'nextbar 15m冠军·深超卖反转（押UP）',
+    desc: 'zscore_10≤−1.651 ∧ zscore_5≤−1.538 ∧ 3根跌幅≤−0.395% 的深超卖组合 → 押次根15m收阳UP。720d n≈2006、胜率58.92%，holdout n=368、胜率61.96%；生产影子 n=28、胜率67.9%，报价样本平均EV +0.130但CI仍跨0。默认实盘关闭，护栏0.57，仅目标根开盘后90秒内的新鲜命中派单。',
+  },
   nb_smaslope_5m_v1: {
     name: 'nextbar 5m动量误定价（押UP）',
     desc: '5m sma_slope_atr_5 ≥ 1.66（动量急升）→ 押次根 5m 收阳 UP。研究自评：720d 次根收阳仅 47.43%（长样本反指），edge 依赖 7-8 月 regime——record-only 科学仪器非背书，影子期前向验证「动量误定价」是否持续。护栏 0.46（47.43%×0.98 下方）刻意只放行 UP 便宜窗，成交少是保命设计。仅目标根开盘 ≤90s 内的新鲜命中下单（冷启动回补天然排除）。',
@@ -6741,7 +6745,7 @@ const ANALYTICS_EXTRA_DESC: Record<string, string> = {
   rev_p2_v1: '反转 P2：15m 连涨 5 根 + 弱阳收盘（贴最高，close_pos≥0.85）→ 押次根 15m 收阴 DOWN。影子持续记录；同名实盘通道默认关闭，护栏 0.612，仅开盘后 90 秒内的新鲜命中派单。720d 回测胜率 62.4% / oos 61.3%。',
   s5_deep_z20_v1: 'S5 深档：S1 多头耗尽信号 +5min 回落确认，且回落幅度 z5=c5_close/anchor−1≤−20bp（深档）→ 按 +5min 时刻真实 15m DOWN 报价记录押 DOWN 的影子信号，仅记录不下单，次周期 15m 收阴判赢。落 pattern_shadow_signals（entry_state=TOUCHED，借用 HM 结算器）。720d 回测~91.3%（深档样本 EV 偏乐观、含机械成分），影子期即前向验证。',
   quote_momentum_v3: '【2026-09-04 已退役：修正未来函数后门禁效应≈0（+3.8pp，CI 重叠），不值得占实盘额度；随 momentum 族整体下线】报价动量 v3：在 v1（触发后 90~120s DOWN 报价 q∈[0.69,0.75)）基础上叠加“非连涨”门禁——用最后已收 15m（触发时刻所属 15m 的前一根，严格防未来函数）判定 close[j]≤close[j−1] 才落表 → 押 DOWN 的影子信号，落 misalignment_signals，按报价 edge 结算。回测修正未来函数后 80.2% vs 连涨 76.4%（+3.8pp，CI 重叠、门禁效应≈0），影子用于前向验证门禁是否真实有效。',
-  nb_zschamp_15m_v1: 'nextbar 15m冠军：zscore_10≤-1.651 ∧ zscore_5≤-1.538 ∧ ret_3≤-0.00395（深超卖+急跌+卖盘衰竭）→ 押次根 15m 收阳 UP 的影子信号，仅记录不下单。源自 H=1 方向研究 converge_registry L3 ROBUST（holdout P(up_1)=61.96% n=368，月一致性 0.958 / walk-forward 1.00）；build_feature_matrix+condition_mask 实时重放冻结条件原文，与 KREV/反转共表 kline_shadow_signals（version+timeframe 隔离）。720d 次根收阳 58.92%（2006 触发，EV 按目标窗开盘后首次轮询的真实报价前向现算：赢 0.98/q−1 / 输 −1）。',
+  nb_zschamp_15m_v1: 'nextbar 15m冠军：zscore_10≤-1.651 ∧ zscore_5≤-1.538 ∧ ret_3≤-0.00395（深超卖+急跌+卖盘衰竭）→ 押次根 15m 收阳 UP。源自 H=1 方向研究 converge_registry L3 ROBUST（holdout P(up_1)=61.96% n=368，月一致性 0.958 / walk-forward 1.00）；build_feature_matrix+condition_mask 实时重放冻结条件原文，与 KREV/反转共表 kline_shadow_signals（version+timeframe 隔离）。720d 次根收阳 58.92%（约2006触发）；生产影子 n=28 胜率67.9%、报价样本平均EV+0.130，但置信区间仍跨0。已注册默认关闭的小额实盘通道，MARKET护栏0.57（成交均价≥0.57弃单），仅目标根开盘后90秒内新鲜命中派单。',
   nb_smaslope_5m_v1: 'nextbar 5m误定价：sma_slope_atr_5≥1.661（5 根 SMA 陡峭上行/短期动量）→ 押次根 5m 收阳 UP 的影子信号，仅记录不下单。源自阶段E误定价扫描——市场报价钝在 q̄0.500 而 Jul-Aug 真实 P(UP)=0.534（B⁺ 逐笔 EV t=1.73 未达 t>3 门槛）。注意 720d 全样本次根收阳仅 47.43%（19597 触发，长样本反指），edge 依赖 Jul-Aug regime；影子期前向验证动量误定价是否持续，非背书。EV 按目标窗开盘后首次轮询的真实报价前向现算：赢 0.98/q−1 / 输 −1。',
   combo_p1_v1: 'combo 组合 P1：连阳 3 根以上 ∧ 周末（UTC）∧ EMA20 乖离≥+0.3%（短线过热）→ 押次根 15m 收阴 DOWN 的影子信号，仅记录不下单。源自 45 维条件大搜索（720d 三三组合全扫）+ 1443 天样本外考试 + 50 次置换检验三重过滤后存活的“真层”——胜率来自时间×动量维度而非 K 线形态。720d n=490 胜率 63.9% / 样本外 n=1588 胜率 60.6%；EV 按目标窗开盘后首次轮询的真实报价前向现算：赢 0.98/q−1 / 输 −1。',
   combo_p2_v1: 'combo 组合 P2：大实体（body_bp≥23.46，研究美元 P80 的冻结口径）∧ 连阳 3 根以上 ∧ 周末 → 押次根 15m 收阴 DOWN 的影子信号，仅记录不下单。P1 的加强版（实体更大）。720d n=206 胜率 66.5% / 样本外 n=957 胜率 60.5%；EV 按目标窗开盘后首次轮询的真实报价前向现算：赢 0.98/q−1 / 输 −1。',

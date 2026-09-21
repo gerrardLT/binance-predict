@@ -397,18 +397,13 @@ def test_timeframe_version_partition() -> None:
         assert len(s["version"]) <= 24 and len(s["discovery_id"]) <= 16, "超出 DB 列宽"
 
 
-def test_versions_isolated_from_trading_path() -> None:
-    """影子纪律红线：不进 X4 下单白名单；实盘化只走显式 promote——
-    2026-09-06 仅 nb_smaslope_5m_v1 进 LIVE_CHANNELS（护栏 0.46），
-    nb_zschamp_15m_v1 未 promote，保持 record-only。"""
+def test_versions_isolated_from_x4_and_registered_live() -> None:
+    """nextbar 双版本只走显式 nextbar 钩子，不得混入 X4 轮询下单路径。"""
     from binance_predict.services.live_channels import LIVE_CHANNELS
     from binance_predict.services.multi_live_trader import X4_VERSIONS
     for v in NEXTBAR_VERSIONS:
         assert v not in X4_VERSIONS, f"{v} 不得进入 X4 下单白名单"
-        if v == "nb_smaslope_5m_v1":
-            assert v in LIVE_CHANNELS, "5m 版本应已 promote 注册实盘通道"
-        else:
-            assert v not in LIVE_CHANNELS, f"{v} 未 promote，不得注册实盘通道"
+        assert v in LIVE_CHANNELS, f"{v} 应注册为默认关闭的实盘通道"
 
 
 def test_settings_default_on() -> None:

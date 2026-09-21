@@ -806,6 +806,9 @@ async def test_analytics_live_channel_field(monkeypatch) -> None:
     # 装配替身：nextbar + KREV 通道在册（状态直通下发，不查 DB）
     fake = SimpleNamespace(status_async=AsyncMock(return_value={
         "channels": [{
+            "channel": "nb_zschamp_15m_v1", "enabled": False,
+            "amount_usdt": 2.0, "max_daily_orders": 100, "max_exec_price": 0.57,
+        }, {
             "channel": "nb_smaslope_5m_v1", "enabled": False,
             "amount_usdt": 2.0, "max_daily_orders": 100, "max_exec_price": 0.46,
         }, {
@@ -815,6 +818,11 @@ async def test_analytics_live_channel_field(monkeypatch) -> None:
     }))
     monkeypatch.setattr(m, "multi_live_trader", fake)
     out2 = await m.get_signals_analytics(_make_db([], []))
+    assert out2["shadow"]["nb_zschamp_15m_v1"]["summary"]["live_channel"] == {
+        "enabled": False, "amount_usdt": 2.0,
+        "max_daily_orders": 100, "max_exec_price": 0.57,
+    }
+    assert out2["shadow"]["nb_zschamp_15m_v1"]["summary"]["guard_price"] == 0.57
     assert out2["shadow"]["nb_smaslope_5m_v1"]["summary"]["live_channel"] == {
         "enabled": False, "amount_usdt": 2.0,
         "max_daily_orders": 100, "max_exec_price": 0.46,

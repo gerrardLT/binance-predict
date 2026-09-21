@@ -23,10 +23,10 @@
 自己 timeframe 的 version，且用本 timeframe 的 K 线结算——15m bar 起点同时也是某
 5m bar 起点，若跨 timeframe 混用会用 5m 次根 close 错结 15m 信号，故按 tf 严格隔离。
 
-影子纪律（2026-09-06 promote 后更新）：影子落表与实盘下单解耦——影子仍只记录不下注；
-实盘通道 nb_smaslope_5m_v1 已注册 LIVE_CHANNELS，由 _on_live_fire 钩子驱动
-MultiLiveTrader 真单（仅目标根开盘 ≤90s 的新鲜命中开火，冷启动回补天然排除；
-通道 enabled 由 toggle 管，与影子 gate 互不影响）。
+影子纪律（2026-09-21 promote 后更新）：影子落表与实盘下单解耦——影子仍只记录不下注；
+实盘通道 nb_zschamp_15m_v1 / nb_smaslope_5m_v1 已注册 LIVE_CHANNELS，由
+_on_live_fire 钩子驱动 MultiLiveTrader 真单（仅目标根开盘 ≤90s 的新鲜命中开火，
+冷启动回补天然排除；通道 enabled 由 toggle 管，与影子 gate 互不影响）。
 
 数据流：
     1. 每 60s 轮询；fetch_recent_klines 按币安服务器时间只返回已收盘 K，天然规避
