@@ -203,7 +203,7 @@ async def test_settles_own_pending_signal(monkeypatch) -> None:
     monkeypatch.setattr(s2o, "async_session_factory", lambda: _FakeSessionCtx(session))
     detector = S2OptimizedShadowDetector(_Collector([]), {})
 
-    await detector.settle([{              
+    await detector.settle([{
         "open_time": TARGET_START, "open": 100.0, "close": 101.0,
     }])
 
