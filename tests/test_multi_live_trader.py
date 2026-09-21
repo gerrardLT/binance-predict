@@ -208,7 +208,7 @@ def test_parse_defaults_all_off(monkeypatch) -> None:
     monkeypatch.setattr(settings, "live_default_max_daily_orders", 100)
     monkeypatch.setattr(settings, "live_channels_json", "")
     cfgs = parse_channel_config()
-    assert len(cfgs) == 32 + len(CANDLESTICK_SIGNAL_IDS)
+    assert len(cfgs) == 33 + len(CANDLESTICK_SIGNAL_IDS)
     assert set(CANDLESTICK_SIGNAL_IDS) <= set(cfgs)
     assert all(not c.enabled for c in cfgs.values())
     assert all(c.amount_usdt == 2.0 for c in cfgs.values())
@@ -362,9 +362,9 @@ def test_channels_registry_shape() -> None:
         "scene_bull_exhaust", "scene_bull_exhaust_confirm",
         "scene_bear_exhaust", "scene_bear_exhaust_opt_v1", "scene_momentum_fade",
         "s5_deep_z20_v1",
-        # 2026-09-06 影子 promote 三族（默认全 OFF，面板/配置开启）
+        # nextbar / s2_cond 影子 promote（默认全 OFF，面板/配置开启）
         "s2_cond_t4_v1", "s2_cond_t5d_v1",
-        "nb_smaslope_5m_v1",
+        "nb_zschamp_15m_v1", "nb_smaslope_5m_v1",
         "absorption_follow_td120_v1", "absorption_follow_td150_v1",
         # 2026-09-18 K线反转四通道（默认全 OFF，仅新鲜次根开盘派单）
         "krev_a_v1", "krev_b_v1", "rev_p1_v1", "rev_p2_v1",
@@ -434,6 +434,7 @@ def test_channels_registry_shape() -> None:
     for ch, period, fam, guard in (
         ("s2_cond_t4_v1", "15m", "s2_cond", 0.38),
         ("s2_cond_t5d_v1", "15m", "s2_cond", 0.44),
+        ("nb_zschamp_15m_v1", "15m", "nextbar", 0.57),
         ("nb_smaslope_5m_v1", "5m", "nextbar", 0.46),
         ("krev_a_v1", "15m", "kline_reversal", 0.629),
         ("krev_b_v1", "15m", "kline_reversal", 0.621),
@@ -1356,12 +1357,13 @@ def _s2_cond_sig(version: str = "s2_cond_t4_v1", parent_id: int | None = 9) -> d
 
 def _nextbar_sig(version: str = "nb_smaslope_5m_v1") -> dict:
     """NextbarShadowDetector._dispatch_live payload 替身（目标根 = WINDOW_START）。"""
+    period_ms = 900_000 if version == "nb_zschamp_15m_v1" else 300_000
     return {
         "version": version,
         "market_start": WINDOW_START,
-        "market_end": WINDOW_START + 300_000,
+        "market_end": WINDOW_START + period_ms,
         "direction": "UP",
-        "signal_bar_start": WINDOW_START - 300_000,
+        "signal_bar_start": WINDOW_START - period_ms,
     }
 
 
@@ -1463,6 +1465,21 @@ async def test_nextbar_hook_fires_5m(monkeypatch) -> None:
     assert call["market_period"] == "5m"
     assert call["window_start"] == WINDOW_START
     assert call["max_exec_price"] == 0.46
+
+
+@pytest.mark.asyncio
+async def test_nextbar_15m_champion_hook_fires_up(monkeypatch) -> None:
+    """15m 冠军：新鲜命中后押次根 UP，使用 0.57 含贴线弃单护栏。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["nb_zschamp_15m_v1"])
+    t.on_nextbar_signal(_nextbar_sig("nb_zschamp_15m_v1"))
+    await _drain(t)
+    assert len(fake.calls) == 1
+    call = fake.calls[0]
+    assert call["signal_version"] == "nb_zschamp_15m_v1"
+    assert call["prediction"] == "UP"
+    assert call["market_period"] == "15m"
+    assert call["max_exec_price"] == 0.57
 
 
 @pytest.mark.asyncio
@@ -2213,7 +2230,7 @@ def test_status_shape(monkeypatch) -> None:
     assert s["defaults"]["amount_usdt"] == 2.0
     assert s["defaults"]["max_daily_orders"] == 100
     from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
-    assert len(s["channels"]) == 40 + len(CANDLESTICK_SIGNAL_IDS)
+    assert len(s["channels"]) == 41 + len(CANDLESTICK_SIGNAL_IDS)
     by = {c["channel"]: c for c in s["channels"]}
     c = by["quote_contrarian_v1"]
     assert c["enabled"] is True and c["enabled_at_startup"] is True

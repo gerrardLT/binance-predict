@@ -162,11 +162,16 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     "s2_cond_t5d_v1": ChannelSpec(
         "s2_cond_t5d_v1", "s2_cond", "15m", "UP", 0.44, "S2条件t=5剔深（押UP）",
     ),
-    # --- nextbar 族（2026-09-06 影子 promote）：NextbarShadowDetector 新根收盘钩子，
-    # 冻结条件 sma_slope_atr_5≥1.6606 → 次根 5m 市场押 UP（目标窗开盘后 90s 内）。
-    # ⚠ 研究原文自评：720d 次根收阳仅 47.43%（长样本反指），edge 依赖 Jul-Aug regime，
-    # record-only 科学仪器非背书——用户拍板小额前向验证。护栏 0.46 = 平衡价略下方，
-    # 只在 UP 便宜（市场看衰而条件看涨）时成交，成交率低是保命设计非 bug。
+    # --- nextbar 族：NextbarShadowDetector 新根收盘钩子，目标窗开盘后 90s 内开火。---
+    # 15m 冠军（2026-09-21 promote）：深超卖+急跌+卖盘衰竭 → 次根 UP；720d n≈2006
+    # 胜率 58.92%，holdout n=368 胜率 61.96%，生产影子 n=28 胜率 67.9%、报价样本
+    # n=25 平均 EV +0.130（CI 尚跨 0）。护栏 0.57 < 长期费后保本价 0.5774；默认 OFF。
+    "nb_zschamp_15m_v1": ChannelSpec(
+        "nb_zschamp_15m_v1", "nextbar", "15m", "UP", 0.57,
+        "nextbar 15m冠军·深超卖反转（押UP）",
+    ),
+    # 5m 误定价候选：冻结条件 sma_slope_atr_5≥1.6606 → 次根 UP。720d 次根收阳
+    # 仅 47.43%（长样本反指），edge 依赖 Jul-Aug regime；护栏 0.46 只放行便宜 UP。
     "nb_smaslope_5m_v1": ChannelSpec(
         "nb_smaslope_5m_v1", "nextbar", "5m", "UP", 0.46, "nextbar 5m动量误定价（押UP）",
     ),

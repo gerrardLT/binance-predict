@@ -29,6 +29,7 @@ _FROZEN_BENCHMARKS: dict[str, tuple[float, int | None]] = {
     "s2_cond_t4_v1": (0.389, 1069),
     "s2_cond_t5d_v1": (0.448, 643),
     "scene_bear_exhaust_opt_v1": (0.5897, 975),
+    "nb_zschamp_15m_v1": (0.5892, 2006),
     "nb_smaslope_5m_v1": (0.4743, 19597),
     "krev_a_v1": (0.642, 137),
     "krev_b_v1": (0.634, 134),
