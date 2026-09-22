@@ -447,11 +447,14 @@ async def test_analytics_empty_db() -> None:
     s5 = out["shadow"]["s5_deep_z20_v1"]["summary"]
     assert s5["bench_winrate"] == 0.913 and s5["bench_ev"] is None
     assert s5["desc"].startswith("S5深档")
-    # S1 动态轧空路由：仅影子，无实盘映射；30d q90 动态门的720d基准64.93%。
+    # S1 动态轧空路由：已注册默认关闭实盘通道；未装配 trader 时仍显示 SHADOW_ONLY。
+    # 30d q90 动态门的720d基准64.93%。
     s1d = out["shadow"]["s1_dyn_sq_v1"]["summary"]
     assert s1d["bench_winrate"] == 0.6493 and s1d["bench_ev"] is None
     assert s1d["execution_mode"] == "SHADOW_ONLY"
-    assert s1d["desc"].startswith("S1动态轧空路由影子")
+    assert s1d["desc"].startswith("S1动态轧空路由")
+    from binance_predict.services.shadow_execution_registry import SHADOW_VERSION_SPECS
+    assert SHADOW_VERSION_SPECS["s1_dyn_sq_v1"].live_channel == "s1_dyn_sq_v1"
     # 报价动量 v3（misalignment_signals）：修正未来函数后回测只钉胜率，EV 基准留 None（门禁待前向验证）
     qm3 = out["shadow"]["quote_momentum_v3"]["summary"]
     assert qm3["bench_winrate"] == 0.802 and qm3["bench_ev"] is None
@@ -817,6 +820,9 @@ async def test_analytics_live_channel_field(monkeypatch) -> None:
             "channel": "nb_smaslope_5m_v1", "enabled": False,
             "amount_usdt": 2.0, "max_daily_orders": 100, "max_exec_price": 0.46,
         }, {
+            "channel": "s1_dyn_sq_v1", "enabled": False,
+            "amount_usdt": 2.0, "max_daily_orders": 100, "max_exec_price": 0.63,
+        }, {
             "channel": "krev_a_v1", "enabled": False,
             "amount_usdt": 2.0, "max_daily_orders": 100, "max_exec_price": 0.629,
         }],
@@ -832,6 +838,12 @@ async def test_analytics_live_channel_field(monkeypatch) -> None:
         "enabled": False, "amount_usdt": 2.0,
         "max_daily_orders": 100, "max_exec_price": 0.46,
     }
+    assert out2["shadow"]["s1_dyn_sq_v1"]["summary"]["live_channel"] == {
+        "enabled": False, "amount_usdt": 2.0,
+        "max_daily_orders": 100, "max_exec_price": 0.63,
+    }
+    assert out2["shadow"]["s1_dyn_sq_v1"]["summary"]["execution_mode"] == "LIVE_AVAILABLE"
+    assert out2["shadow"]["s1_dyn_sq_v1"]["summary"]["guard_price"] == 0.63
     assert out2["shadow"]["krev_a_v1"]["summary"]["live_channel"] == {
         "enabled": False, "amount_usdt": 2.0,
         "max_daily_orders": 100, "max_exec_price": 0.629,

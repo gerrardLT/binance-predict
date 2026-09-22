@@ -1450,6 +1450,8 @@ async def lifespan(app: FastAPI):
             fake_breakout_detector._on_signal_fired = multi_live_trader.on_scene_signal
             fake_breakout_detector._on_s5_deep_fired = (
                 multi_live_trader.on_s5_deep_signal)
+            fake_breakout_detector._on_s1_dynamic_fired = (
+                multi_live_trader.on_s1_dynamic_signal)
         # 影子 promote 实盘钩子（2026-09-06）：s2_cond 判价命中 / nextbar 新根命中 →
         # 真单（各检测器内钩子独立于影子 gate；检测器关闭则通道无触发源，fail-safe 同 scene 族）。
         # candlestick 钩子已在其 start() 前注入，避免冷启动时序漏单，故这里不重复赋值。
@@ -4149,7 +4151,7 @@ SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     # S5 深档（2026-09-03）：S1+5min确认且 z5≤−20bp 深回落子集，落 pattern_shadow_signals，
     # 记 +5min 真实 DOWN 报价；基准为深档回测点估计（EV 偏乐观含机械成分），影子前向验证
     "s5_deep_z20_v1": (0.913, None, "S5深档: S1+5min回落确认且z5≤−20bp → 押次周期15m DOWN（回测~91.3%，深档EV偏乐观含机械成分，影子前向验证）"),
-    "s1_dyn_sq_v1": (0.6493, None, "S1动态轧空路由影子: 当前ret1h低于此前30天滚动q90时按开盘模拟DOWN；达到q90仅首根5m收阴才按+5min报价模拟DOWN，否则跳过。720d严格时序重放 n=1782/wr64.9%，只记录不改变S1/S5实盘"),
+    "s1_dyn_sq_v1": (0.6493, None, "S1动态轧空路由: 当前ret1h低于此前30天滚动q90时按开盘押DOWN；达到q90仅首根5m收阴才按+5min报价押DOWN，否则跳过。720d严格时序重放 n=1782/wr64.9%；影子持续采集，同名实盘通道默认OFF、护栏0.63，与原S1同窗互斥"),
     # 报价动量 v3（2026-09-03）：v1 区间 ∩ 非连涨门禁，落 misalignment_signals，真实报价 EV；
     # 回测修正未来函数后门禁效应≈0（80.2% vs 连涨76.4%，CI重叠），影子前向验证门禁是否真实有效
     "quote_momentum_v3": (0.802, None, "报价动量v3: v1(t90~120s q∈[0.69,0.75))∩末收15m非连涨 → 押DOWN（修正未来函数后回测80.2% vs 连涨76.4%，+3.8pp CI重叠，影子前向验证门禁是否真实有效）"),

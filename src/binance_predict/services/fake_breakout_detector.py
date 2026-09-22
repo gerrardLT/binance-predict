@@ -145,7 +145,7 @@ S5_DEEP_RULE_TEXT = (
     " 含机械成分，影子前向验证）。"
 )
 
-# S1 动态轧空路由影子（2026-09-21）：只记录，不改变 S1/S5 实盘。
+# S1 动态轧空路由（2026-09-21）：影子持续记录；同名实盘通道默认关闭。
 # 严格 ex-ante：目标窗开盘时读取前 30 天已完成 5m K，计算每个时点过去 1h
 # 收益；当前 ret1h 位于滚动分布前 10%（nearest-rank q90）即视为 SQUEEZE。
 # SQUEEZE 必须等待首根 5m 收阴才模拟 DOWN 入场，否则跳过；NORMAL 沿用 S1
@@ -160,8 +160,8 @@ S1_DYNAMIC_RULE_TEXT = (
     "S1动态轧空路由：父S1命中后，以目标窗开盘为锚点，用此前30天已完成5m K"
     "构造滚动ret1h分布；当前ret1h≥nearest-rank q90为SQUEEZE，否则NORMAL。"
     "NORMAL按开盘近端真实DOWN报价模拟入场；SQUEEZE等待目标窗首根5m收盘，"
-    "仅close<open时按+5min真实DOWN报价模拟入场，否则跳过。全程只做影子记录，"
-    "不驱动实盘。"
+    "仅close<open时按+5min真实DOWN报价模拟入场，否则跳过。影子记录与同名实盘"
+    "通道独立；实盘默认关闭。"
 )
 
 
@@ -414,6 +414,9 @@ class FakeBreakoutDetector:
         self._on_s2_cond: Callable[[dict], None] | None = None
         # S2 优化版异步派生钩子：父 bear_exhaust 命中后评估量比上界与 14 日位置。
         self._on_s2_optimized: Callable[[dict], Awaitable[None]] | None = None
+        # S1 动态路由实盘钩子：仅动态门判定为实际模拟入场时派发；影子 gate
+        # 与实盘开关独立（影子下线不阻止已显式启用的真单，实盘关闭仍持续采集）。
+        self._on_s1_dynamic_fired: Callable[[dict], None] | None = None
 
         self._running = False
         self._task: asyncio.Task | None = None
@@ -1200,8 +1203,10 @@ class FakeBreakoutDetector:
     async def _route_s1_dynamic_shadow(
         self, parent: FakeBreakoutSignal, next_start: int, next_end: int,
     ) -> None:
-        """父 S1 的只读动态路由影子：NORMAL 开盘入场；SQUEEZE 等首根 5m 回落。"""
-        if not shadow_gate.is_enabled(S1_DYNAMIC_VERSION):
+        """父 S1 动态路由：影子持续记录；同名实盘通道仅在显式启用时开火。"""
+        shadow_enabled = shadow_gate.is_enabled(S1_DYNAMIC_VERSION)
+        live_enabled = is_live_enabled(S1_DYNAMIC_VERSION)
+        if not shadow_enabled and not live_enabled:
             return
         try:
             need = S1_REGIME_LOOKBACK_BARS + S1_RET1H_BARS + 1
@@ -1231,15 +1236,19 @@ class FakeBreakoutDetector:
                     float(q["down_price"])
                     if matched and q.get("down_price") is not None else None
                 )
-                await self._record_s1_dynamic_shadow(
-                    parent, next_start, ret1h, threshold, "NORMAL",
-                    "TOUCHED" if quote is not None else "NO_DATA",
-                    touch_ts=(
-                        int(q.get("updated_ts") or clock_sync.now_ms())
-                        if quote is not None else None
-                    ),
-                    entry_quote=quote,
+                touch_ts = (
+                    int(q.get("updated_ts") or clock_sync.now_ms())
+                    if quote is not None else None
                 )
+                if live_enabled and quote is not None:
+                    self._notify_s1_dynamic_fired(parent.id, next_start, next_end, "NORMAL")
+                if shadow_enabled:
+                    await self._record_s1_dynamic_shadow(
+                        parent, next_start, ret1h, threshold, "NORMAL",
+                        "TOUCHED" if quote is not None else "NO_DATA",
+                        touch_ts=touch_ts,
+                        entry_quote=quote,
+                    )
                 return
 
             await self._sleep_until(next_start + S5_CONFIRM_DELAY_MS + S5_CONFIRM_GRACE_MS)
@@ -1255,9 +1264,10 @@ class FakeBreakoutDetector:
                     continue
                 confirmed, _ = confirm_bull_exhaust_5m(float(k5["close"]), float(k5["open"]))
                 if not confirmed:
-                    await self._record_s1_dynamic_shadow(
-                        parent, next_start, ret1h, threshold, "SQUEEZE", "NOT_TOUCHED",
-                    )
+                    if shadow_enabled:
+                        await self._record_s1_dynamic_shadow(
+                            parent, next_start, ret1h, threshold, "SQUEEZE", "NOT_TOUCHED",
+                        )
                     return
                 q = dict(self._pm_15m)
                 matched = q.get("start_date") == next_start
@@ -1265,15 +1275,19 @@ class FakeBreakoutDetector:
                     float(q["down_price"])
                     if matched and q.get("down_price") is not None else None
                 )
-                await self._record_s1_dynamic_shadow(
-                    parent, next_start, ret1h, threshold, "SQUEEZE",
-                    "TOUCHED" if quote is not None else "NO_DATA",
-                    touch_ts=(
-                        int(q.get("updated_ts") or clock_sync.now_ms())
-                        if quote is not None else None
-                    ),
-                    entry_quote=quote,
+                touch_ts = (
+                    int(q.get("updated_ts") or clock_sync.now_ms())
+                    if quote is not None else None
                 )
+                if live_enabled and quote is not None:
+                    self._notify_s1_dynamic_fired(parent.id, next_start, next_end, "SQUEEZE")
+                if shadow_enabled:
+                    await self._record_s1_dynamic_shadow(
+                        parent, next_start, ret1h, threshold, "SQUEEZE",
+                        "TOUCHED" if quote is not None else "NO_DATA",
+                        touch_ts=touch_ts,
+                        entry_quote=quote,
+                    )
                 return
             if self._running:
                 logger.warning("S1动态影子跳过：+5min K线不可用 | 父 #{}", parent.id)
@@ -1281,6 +1295,25 @@ class FakeBreakoutDetector:
             pass
         except Exception as exc:
             logger.warning("S1动态影子任务异常（不影响S1/S5）| 父 #{} | {}", parent.id, exc)
+
+    def _notify_s1_dynamic_fired(
+        self, parent_id: int, next_start: int, next_end: int, regime: str,
+    ) -> None:
+        """动态路由实际入场时通知实盘执行器；异常不影响影子落表。"""
+        hook = self._on_s1_dynamic_fired
+        if hook is None:
+            return
+        try:
+            hook({
+                "id": parent_id,
+                "pattern_type": S1_DYNAMIC_VERSION,
+                "side": "high",
+                "market_start_15m": next_start,
+                "market_end_15m": next_end,
+                "regime": regime,
+            })
+        except Exception as exc:
+            logger.warning("S1动态路由实盘钩子异常（不影响影子采集）| 父 #{} | {}", parent_id, exc)
 
     async def _record_s1_dynamic_shadow(
         self,

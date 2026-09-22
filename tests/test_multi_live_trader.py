@@ -208,7 +208,7 @@ def test_parse_defaults_all_off(monkeypatch) -> None:
     monkeypatch.setattr(settings, "live_default_max_daily_orders", 100)
     monkeypatch.setattr(settings, "live_channels_json", "")
     cfgs = parse_channel_config()
-    assert len(cfgs) == 33 + len(CANDLESTICK_SIGNAL_IDS)
+    assert len(cfgs) == 34 + len(CANDLESTICK_SIGNAL_IDS)
     assert set(CANDLESTICK_SIGNAL_IDS) <= set(cfgs)
     assert all(not c.enabled for c in cfgs.values())
     assert all(c.amount_usdt == 2.0 for c in cfgs.values())
@@ -359,7 +359,7 @@ def test_channels_registry_shape() -> None:
         "late_night_contrarian_v2",
         "x4_v2",
         "x4_v3",
-        "scene_bull_exhaust", "scene_bull_exhaust_confirm",
+        "scene_bull_exhaust", "s1_dyn_sq_v1", "scene_bull_exhaust_confirm",
         "scene_bear_exhaust", "scene_bear_exhaust_opt_v1", "scene_momentum_fade",
         "s5_deep_z20_v1",
         # nextbar / s2_cond 影子 promote（默认全 OFF，面板/配置开启）
@@ -415,10 +415,12 @@ def test_channels_registry_shape() -> None:
     assert by["late_night_contrarian_v2"].ln_dd_guard is True
     assert by["x4_v2"].auto_max_exec == 0.50
     assert all(by[ch].market_period == "15m" for ch in
-               ("scene_bull_exhaust", "scene_bull_exhaust_confirm",
+               ("scene_bull_exhaust", "s1_dyn_sq_v1", "scene_bull_exhaust_confirm",
                 "scene_bear_exhaust", "scene_bear_exhaust_opt_v1",
                 "scene_momentum_fade"))
     assert by["scene_bull_exhaust"].auto_max_exec == 0.70
+    assert by["s1_dyn_sq_v1"].auto_max_exec == 0.63
+    assert by["s1_dyn_sq_v1"].direction == "DOWN"
     assert by["scene_bull_exhaust_confirm"].auto_max_exec == 0.75
     assert by["scene_bear_exhaust"].auto_max_exec == 0.65
     assert by["scene_bear_exhaust_opt_v1"].auto_max_exec == 0.57
@@ -460,6 +462,8 @@ def test_channels_registry_shape() -> None:
         assert spec.auto_max_exec == pytest.approx(CANDLESTICK_BACKTEST[version][0] * 0.98, abs=5e-5)
     # 同窗互斥组：S5、S2 condition 与 absorption（firsthit 全族已于 2026-09-12 解除互斥以支持独立实盘测试）
     from binance_predict.services.live_channels import exclusive_group
+    assert exclusive_group("s1_dyn_sq_v1") == frozenset(
+        {"scene_bull_exhaust", "s1_dyn_sq_v1"})
     g_s5 = exclusive_group("s5_deep_z20_v1")
     assert g_s5 == frozenset({"scene_bull_exhaust_confirm", "s5_deep_z20_v1"})
     assert exclusive_group("s2_cond_t4_v1") == frozenset(
@@ -470,7 +474,8 @@ def test_channels_registry_shape() -> None:
     assert exclusive_group("firsthit_down_v1") is None
     assert exclusive_group("g7_t270_v1") is None
     assert exclusive_group("firsthit_down_g7_v1") is None
-    assert exclusive_group("scene_bull_exhaust") is None
+    assert exclusive_group("scene_bull_exhaust") == frozenset(
+        {"scene_bull_exhaust", "s1_dyn_sq_v1"})
     assert exclusive_group("scene_bear_exhaust") == frozenset(
         {"scene_bear_exhaust", "scene_bear_exhaust_opt_v1"})
     assert exclusive_group("quote_contrarian_v2") is None
@@ -1233,6 +1238,45 @@ async def test_scene_s1_down_15m(monkeypatch) -> None:
     assert call["max_exec_price"] == 0.70
     assert call["amount_usdt"] == 2.0
 
+
+@pytest.mark.asyncio
+async def test_s1_dynamic_live_down_15m(monkeypatch) -> None:
+    """动态 S1 显式开启后按判定时点押 DOWN，护栏 0.63。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["s1_dyn_sq_v1"])
+    t.on_s1_dynamic_signal(_scene_sig("s1_dyn_sq_v1", "high", sig_id=88))
+    await _drain(t)
+    call = fake.calls[0]
+    assert call["prediction"] == "DOWN"
+    assert call["signal_version"] == "s1_dyn_sq_v1"
+    assert call["window_start"] == MARKET_START_15M
+    assert call["market_period"] == "15m"
+    assert call["scene_signal_id"] == 88
+    assert call["max_exec_price"] == 0.63
+    assert call["amount_usdt"] == 2.0
+
+@pytest.mark.asyncio
+async def test_s1_dynamic_live_disabled_no_fire(monkeypatch) -> None:
+    """动态 S1 默认关闭时不下单，影子路由仍由检测器独立运行。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=[])
+    t.on_s1_dynamic_signal(_scene_sig("s1_dyn_sq_v1", "high"))
+    await _drain(t)
+    assert fake.calls == []
+
+@pytest.mark.asyncio
+async def test_s1_dynamic_and_original_s1_same_window_exclusive(monkeypatch) -> None:
+    """原 S1 已成交后，动态 S1 同窗不得再次押 DOWN。"""
+    fake = _FakeTrader()
+    t = _make_trader(
+        monkeypatch, fake,
+        channels=["scene_bull_exhaust", "s1_dyn_sq_v1"],
+    )
+    t.on_scene_signal(_scene_sig("bull_exhaust", "high", sig_id=1))
+    await _drain(t)
+    t.on_s1_dynamic_signal(_scene_sig("s1_dyn_sq_v1", "high", sig_id=1))
+    await _drain(t)
+    assert [c["signal_version"] for c in fake.calls] == ["scene_bull_exhaust"]
 
 @pytest.mark.asyncio
 async def test_scene_s2_up_15m(monkeypatch) -> None:
@@ -2230,7 +2274,7 @@ def test_status_shape(monkeypatch) -> None:
     assert s["defaults"]["amount_usdt"] == 2.0
     assert s["defaults"]["max_daily_orders"] == 100
     from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
-    assert len(s["channels"]) == 41 + len(CANDLESTICK_SIGNAL_IDS)
+    assert len(s["channels"]) == 42 + len(CANDLESTICK_SIGNAL_IDS)
     by = {c["channel"]: c for c in s["channels"]}
     c = by["quote_contrarian_v1"]
     assert c["enabled"] is True and c["enabled_at_startup"] is True

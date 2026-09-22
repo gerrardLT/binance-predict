@@ -116,6 +116,7 @@ V3_PREV_RETRY_DELAY_S = 30.0        # 前窗未归档延迟重查（归档在边
 REGIME_RETRY_DELAY_S = 30.0         # v4 ret24 K 线拉取失败延迟重查（重试后窗内仍可下单）
 STREAK_RETRY_DELAY_S = 5.0          # v3 非连涨 15m K 线拉取失败延迟重查（末收根已归档，短等即可）
 S5_DEEP_CHANNEL = "s5_deep_z20_v1"  # 与 fake_breakout_detector.S5_DEEP_VERSION 同名（对账对齐）
+S1_DYNAMIC_CHANNEL = "s1_dyn_sq_v1"  # 与 fake_breakout_detector.S1_DYNAMIC_VERSION 同名
 MARKET_WARMUP_INTERVAL_S = 60.0     # 市场列表后台预热间隔（未来 15m 周期预缓存，2026-08-30）
 ABS_LIVE_JUDGE_GRACE_S = 90.0       # absorption 判定新鲜度：t_rel 超 TD+此值 → 本窗放弃
                                     # （重启/中途启用后的在途窗，当前价已非 TD 时刻价，
@@ -1271,6 +1272,27 @@ class MultiLiveTrader:
             task.add_done_callback(self._tasks.discard)
         except Exception as exc:
             logger.warning("多通道实盘：S5 深档钩子异常（不影响检测循环）| {}", exc)
+
+    def on_s1_dynamic_signal(self, sig: dict) -> None:
+        """S1 动态路由实际入场钩子；通道默认关闭，影子采集不受影响。"""
+        try:
+            if self._stopped:
+                return
+            cfg = self._configs[S1_DYNAMIC_CHANNEL]
+            if not cfg.enabled:
+                return
+            market_start = int(sig["market_start_15m"])
+            if market_start in cfg.fired:
+                return
+            cfg.fired.add(market_start)
+            task = asyncio.create_task(
+                self._fire_scene(S1_DYNAMIC_CHANNEL, sig),
+                name=f"live_scene_{S1_DYNAMIC_CHANNEL}_{market_start}",
+            )
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+        except Exception as exc:
+            logger.warning("多通道实盘：S1动态路由钩子异常（不影响检测循环）| {}", exc)
 
     async def _fire_scene(self, channel: str, sig: dict) -> None:
         spec = self._specs[channel]
