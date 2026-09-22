@@ -28,6 +28,10 @@ from binance_predict.services.fake_breakout_detector import (
     PATTERN_GROUP,
     POS4H_MIN,
     RESEARCH_WIN_RATES,
+    S1_DYNAMIC_RULE_TEXT,
+    S1_DYNAMIC_VERSION,
+    S1_REGIME_LOOKBACK_BARS,
+    S1_RET1H_BARS,
     S5_DEEP_RULE_TEXT,
     S5_DEEP_VERSION,
     S5_DEEP_Z5,
@@ -36,6 +40,7 @@ from binance_predict.services.fake_breakout_detector import (
     classify_close_pattern,
     compute_pattern_stats,
     confirm_bull_exhaust_5m,
+    s1_squeeze_threshold,
     is_momentum_fade,
 )
 
@@ -622,6 +627,128 @@ async def test_s5_deep_shadow_none_quote_records_null(monkeypatch) -> None:
     assert len(shadows) == 1
     assert shadows[0].entry_down_quote is None
     assert shadows[0].status == "PENDING"
+
+
+def _regime_bars(current: float, threshold: float = 0.006) -> list[dict]:
+    """构造连续 30d+13 根 5m close，使历史 q90=threshold、当前 ret1h 可控。"""
+    need = S1_REGIME_LOOKBACK_BARS + S1_RET1H_BARS + 1
+    closes = [100.0] * need
+    # 让约一半滚动 1h 收益为 threshold、另一半为 0，q90 稳定等于 threshold。
+    for j in range(0, len(closes) - 1, 2 * S1_RET1H_BARS):
+        for k in range(j + S1_RET1H_BARS, min(j + 2 * S1_RET1H_BARS, len(closes) - 1)):
+            closes[k] = 100.0 * (1.0 + threshold)
+    closes[-1] = closes[-1 - S1_RET1H_BARS] * (1.0 + current)
+    start = NEXT_START - need * 300_000
+    return [
+        {"open_time": start + i * 300_000, "close": c}
+        for i, c in enumerate(closes)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_s1_dynamic_normal_records_open_entry(monkeypatch) -> None:
+    """NORMAL：当前 ret1h 低于过去 30 天 q90，按目标窗近开盘报价模拟 DOWN。"""
+    pm = {"start_date": NEXT_START, "end_date": NEXT_END,
+          "down_price": 0.52, "up_price": 0.47, "updated_ts": NEXT_START + 4_000}
+    session = _S5Session(parent=_s5_parent(), exists=None)
+    det = _mk_s5_detector(monkeypatch, pm, session)
+    bars = _regime_bars(current=0.0059)
+
+    async def ending_at(tf, limit, end):
+        assert (tf, limit, end) == ("5m", len(bars), NEXT_START)
+        return bars
+
+    det._collector.fetch_klines_ending_at = ending_at
+    await det._route_s1_dynamic_shadow(SimpleNamespace(id=8), NEXT_START, NEXT_END)
+
+    sh = _shadows(session)[0]
+    assert sh.version == S1_DYNAMIC_VERSION == "s1_dyn_sq_v1"
+    assert sh.entry_state == "TOUCHED" and sh.status == "PENDING"
+    assert sh.entry_down_quote == 0.52 and sh.touch_ts == NEXT_START + 4_000
+    assert sh.clv == pytest.approx(0.0059)
+    assert "regime=NORMAL" in sh.rule_text and "q90=0.00600000" in sh.rule_text
+    assert S1_DYNAMIC_RULE_TEXT in sh.rule_text
+
+
+@pytest.mark.asyncio
+async def test_s1_dynamic_squeeze_without_pullback_skips(monkeypatch) -> None:
+    """SQUEEZE：当前 ret1h 贴 q90 且首根 5m 续涨，整窗跳过。"""
+    pm = {"start_date": NEXT_START, "end_date": NEXT_END,
+          "down_price": 0.52, "up_price": 0.47, "updated_ts": NEXT_START + 304_000}
+    session = _S5Session(parent=_s5_parent(), exists=None)
+    det = _mk_s5_detector(monkeypatch, pm, session,
+                          now_ms=NEXT_START + fbd.S5_CONFIRM_DELAY_MS + fbd.S5_CONFIRM_GRACE_MS)
+    bars = _regime_bars(current=0.006)
+
+    async def ending_at(_tf, _limit, _end):
+        return bars
+
+    async def fetch(_tf, _limit):
+        return [{"open_time": NEXT_START, "open": 100.0, "close": 100.2}]
+
+    async def no_sleep(_target):
+        return None
+
+    det._collector.fetch_klines_ending_at = ending_at
+    det._collector.fetch_recent_klines = fetch
+    det._sleep_until = no_sleep
+    await det._route_s1_dynamic_shadow(SimpleNamespace(id=9), NEXT_START, NEXT_END)
+
+    sh = _shadows(session)[0]
+    assert sh.entry_state == "NOT_TOUCHED" and sh.status == "PENDING"
+    assert sh.entry_down_quote is None and sh.touch_ts is None
+    assert "regime=SQUEEZE" in sh.rule_text
+
+
+@pytest.mark.asyncio
+async def test_s1_dynamic_squeeze_pullback_records_5m_quote(monkeypatch) -> None:
+    """SQUEEZE：首根 5m 收阴才按确认时刻报价记录模拟 DOWN 入场。"""
+    pm = {"start_date": NEXT_START, "end_date": NEXT_END,
+          "down_price": 0.64, "up_price": 0.35, "updated_ts": NEXT_START + 304_000}
+    session = _S5Session(parent=_s5_parent(), exists=None)
+    det = _mk_s5_detector(monkeypatch, pm, session,
+                          now_ms=NEXT_START + fbd.S5_CONFIRM_DELAY_MS + fbd.S5_CONFIRM_GRACE_MS)
+    bars = _regime_bars(current=0.008)
+
+    async def ending_at(_tf, _limit, _end):
+        return bars
+
+    async def fetch(_tf, _limit):
+        return [{"open_time": NEXT_START, "open": 100.0, "close": 99.8}]
+
+    async def no_sleep(_target):
+        return None
+
+    det._collector.fetch_klines_ending_at = ending_at
+    det._collector.fetch_recent_klines = fetch
+    det._sleep_until = no_sleep
+    await det._route_s1_dynamic_shadow(SimpleNamespace(id=10), NEXT_START, NEXT_END)
+
+    sh = _shadows(session)[0]
+    assert sh.entry_state == "TOUCHED" and sh.status == "PENDING"
+    assert sh.entry_down_quote == 0.64 and sh.touch_ts == NEXT_START + 304_000
+    assert sh.clv == pytest.approx(0.008)
+
+
+@pytest.mark.asyncio
+async def test_s1_dynamic_missing_regime_records_nothing(monkeypatch) -> None:
+    """30 天数据缺失保守跳过；不猜 NORMAL，避免错位样本污染。"""
+    session = _S5Session(parent=_s5_parent(), exists=None)
+    det = _mk_s5_detector(monkeypatch, {}, session)
+
+    async def ending_at(_tf, _limit, _end):
+        return []
+
+    det._collector.fetch_klines_ending_at = ending_at
+    await det._route_s1_dynamic_shadow(SimpleNamespace(id=11), NEXT_START, NEXT_END)
+    assert _shadows(session) == []
+
+
+def test_s1_squeeze_threshold_rejects_bad_shape_and_freezes_boundary() -> None:
+    assert s1_squeeze_threshold([]) is None
+    bars = _regime_bars(current=0.006)
+    result = s1_squeeze_threshold([float(k["close"]) for k in bars])
+    assert result == pytest.approx((0.006, 0.006))
 
 
 @pytest.mark.asyncio
