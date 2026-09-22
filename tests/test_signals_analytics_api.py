@@ -379,7 +379,7 @@ async def test_analytics_empty_db() -> None:
         "krev_a_v1", "krev_b_v1", "hm_touch_down_v1", "hm_touch_down_v2",
         "rev_p1_v1", "rev_p2_v1", "nb_zschamp_15m_v1", "nb_smaslope_5m_v1",
         "combo_p1_v1", "combo_p2_v1", "combo_p3_v1", "combo_p4_v1", "combo_p5_v1",
-        "s5_deep_z20_v1", "quote_momentum_v3",
+        "s5_deep_z20_v1", "s1_dyn_sq_v1", "quote_momentum_v3",
         "absorption_follow_td120_v1", "absorption_follow_td150_v1",
         "s2_cond_t4_v1", "s2_cond_t5d_v1", "scene_bear_exhaust_opt_v1",
         "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1",
@@ -447,6 +447,11 @@ async def test_analytics_empty_db() -> None:
     s5 = out["shadow"]["s5_deep_z20_v1"]["summary"]
     assert s5["bench_winrate"] == 0.913 and s5["bench_ev"] is None
     assert s5["desc"].startswith("S5深档")
+    # S1 动态轧空路由：仅影子，无实盘映射；30d q90 动态门的720d基准64.93%。
+    s1d = out["shadow"]["s1_dyn_sq_v1"]["summary"]
+    assert s1d["bench_winrate"] == 0.6493 and s1d["bench_ev"] is None
+    assert s1d["execution_mode"] == "SHADOW_ONLY"
+    assert s1d["desc"].startswith("S1动态轧空路由影子")
     # 报价动量 v3（misalignment_signals）：修正未来函数后回测只钉胜率，EV 基准留 None（门禁待前向验证）
     qm3 = out["shadow"]["quote_momentum_v3"]["summary"]
     assert qm3["bench_winrate"] == 0.802 and qm3["bench_ev"] is None

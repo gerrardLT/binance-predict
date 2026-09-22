@@ -22,7 +22,7 @@ EXPECTED_ANALYTICS_VERSIONS = (
     "krev_b_v1", "hm_touch_down_v1", "hm_touch_down_v2", "rev_p1_v1",
     "rev_p2_v1", "nb_zschamp_15m_v1", "nb_smaslope_5m_v1", "combo_p1_v1",
     "combo_p2_v1", "combo_p3_v1", "combo_p4_v1", "combo_p5_v1",
-    "s5_deep_z20_v1", "quote_momentum_v3", "absorption_follow_td120_v1",
+    "s5_deep_z20_v1", "s1_dyn_sq_v1", "quote_momentum_v3", "absorption_follow_td120_v1",
     "absorption_follow_td150_v1", "s2_cond_t4_v1", "s2_cond_t5d_v1",
     "scene_bear_exhaust_opt_v1", "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1",
     "firsthit_down_g4_v1", "firsthit_down_g7_v1", "g7_streak_v1",
@@ -34,7 +34,7 @@ EXPECTED_ANALYTICS_VERSIONS = (
 
 def test_registry_matches_all_physical_shadow_versions_in_order() -> None:
     assert SHADOW_VERSIONS == EXPECTED_ANALYTICS_VERSIONS
-    assert len(SHADOW_VERSION_SPECS) == 47
+    assert len(SHADOW_VERSION_SPECS) == 48
     for version in ("candle_hm_bull_5m_event_v1", "candle_hm_bull_15m_event_v1"):
         spec = SHADOW_VERSION_SPECS[version]
         assert spec.family == "candlestick_reversal"
@@ -53,6 +53,15 @@ def test_registry_separates_signal_and_execution_policy_versions() -> None:
         EXECUTION_POLICY_VERSION
     }
     assert EXECUTION_POLICY_VERSION not in SHADOW_VERSION_SPECS
+
+
+def test_s1_dynamic_shadow_is_record_only_pattern_strategy() -> None:
+    spec = SHADOW_VERSION_SPECS["s1_dyn_sq_v1"]
+    assert spec.source_type is SourceType.PATTERN
+    assert spec.market_period == "15m"
+    assert spec.direction_mode == "down"
+    assert spec.family == "pattern"
+    assert spec.live_channel is None
 
 
 def test_rev2_versions_are_not_excluded() -> None:

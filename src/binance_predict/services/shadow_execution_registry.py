@@ -50,6 +50,7 @@ _VERSION_ROWS: tuple[tuple[str, SourceType, str, str, str], ...] = (
     ("combo_p4_v1", SourceType.KLINE, "15m", "target_bar", "row"),
     ("combo_p5_v1", SourceType.KLINE, "15m", "target_bar", "row"),
     ("s5_deep_z20_v1", SourceType.PATTERN, "15m", "target_bar", "down"),
+    ("s1_dyn_sq_v1", SourceType.PATTERN, "15m", "target_bar", "down"),
     ("quote_momentum_v3", SourceType.MISALIGNMENT, "5m", "same_window", "row"),
     ("absorption_follow_td120_v1", SourceType.ABSORPTION, "5m", "same_window", "dynamic"),
     ("absorption_follow_td150_v1", SourceType.ABSORPTION, "5m", "same_window", "dynamic"),
@@ -105,7 +106,7 @@ def _family_of(version: str, source: SourceType) -> str:
         return "nextbar"
     if version.startswith(("krev_", "rev_")):
         return "kline_reversal"
-    if version.startswith(("hm_touch_", "s5_deep_")):
+    if version.startswith(("hm_touch_", "s5_deep_", "s1_dyn_")):
         return "pattern"
     return source.value
 

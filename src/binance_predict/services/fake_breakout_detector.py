@@ -60,6 +60,7 @@ trade_orders.scene_signal_id == 信号 id 且 FILLED；影子无实盘订单天�
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
@@ -133,6 +134,42 @@ S5_DEEP_RULE_TEXT = (
     " 15m DOWN 报价；目标 15m 根收阴（close<open）即赢。回测 ~91.3%（深档 EV 偏乐观"
     " 含机械成分，影子前向验证）。"
 )
+
+# S1 动态轧空路由影子（2026-09-21）：只记录，不改变 S1/S5 实盘。
+# 严格 ex-ante：目标窗开盘时读取前 30 天已完成 5m K，计算每个时点过去 1h
+# 收益；当前 ret1h 位于滚动分布前 10%（nearest-rank q90）即视为 SQUEEZE。
+# SQUEEZE 必须等待首根 5m 收阴才模拟 DOWN 入场，否则跳过；NORMAL 沿用 S1
+# 开盘入场。阈值只由过去行情分布决定，不看 S1 胜负，随波动 regime 自适应。
+# 720d 严格时序重放：原 S1 n=2288/wr58.3%；动态路由 n=1782/wr64.9%；
+# SQUEEZE 确认组 n=684/wr78.1%，未确认组 n=506/wr35.0%。
+S1_DYNAMIC_VERSION = "s1_dyn_sq_v1"
+S1_RET1H_BARS = 12
+S1_REGIME_LOOKBACK_BARS = 30 * 24 * 12
+S1_REGIME_QUANTILE = 0.90
+S1_DYNAMIC_RULE_TEXT = (
+    "S1动态轧空路由：父S1命中后，以目标窗开盘为锚点，用此前30天已完成5m K"
+    "构造滚动ret1h分布；当前ret1h≥nearest-rank q90为SQUEEZE，否则NORMAL。"
+    "NORMAL按开盘近端真实DOWN报价模拟入场；SQUEEZE等待目标窗首根5m收盘，"
+    "仅close<open时按+5min真实DOWN报价模拟入场，否则跳过。全程只做影子记录，"
+    "不驱动实盘。"
+)
+
+
+def s1_squeeze_threshold(closes: list[float]) -> tuple[float, float] | None:
+    """返回 (当前 ret1h, 过去30天 ret1h q90)；数据非法/不连续由调用方先拒绝。"""
+    need = S1_REGIME_LOOKBACK_BARS + S1_RET1H_BARS + 1
+    if len(closes) != need or any(not math.isfinite(c) or c <= 0 for c in closes):
+        return None
+    returns = [
+        closes[end] / closes[end - S1_RET1H_BARS] - 1.0
+        for end in range(S1_RET1H_BARS, len(closes))
+    ]
+    history, current = sorted(returns[:-1]), returns[-1]
+    if len(history) != S1_REGIME_LOOKBACK_BARS:
+        return None
+    # nearest-rank：与 absorption 滚动标定的确定性分位算子同型，不引入 numpy。
+    q_idx = round(S1_REGIME_QUANTILE * (len(history) - 1))
+    return current, history[q_idx]
 
 # 交易定价常数 (与 EV 计算一致：费 2%+0.01 溢价，赔率 b≈0.922，打平胜率≈52.0%)
 FEE = 0.02
@@ -857,6 +894,10 @@ class FakeBreakoutDetector:
                 self._confirm_s5_entry(signal.id, next_start, next_end),
                 name=f"fbs_s5_{signal.id}",
             )
+            asyncio.create_task(
+                self._route_s1_dynamic_shadow(signal, next_start, next_end),
+                name=f"fbs_s1_dynamic_{signal.id}",
+            )
 
         # S2 条件单影子（2026-09-06）：仅正式 bear_exhaust 信号派生——窗内 t=4/t=5
         # 判价条件确认 → 押次周期 UP，落 kline_shadow_signals（纯影子，物理隔离于下单
@@ -1143,8 +1184,139 @@ class FakeBreakoutDetector:
             logger.warning("入场报价快照任务异常 #{} | {}", signal_id, exc)
 
     # ==================================================================
-    # S5 确认入场（2026-08-18）：S1 信号 +5min 回落确认才买 DOWN
+    # S1 动态轧空影子 + S5 确认入场
     # ==================================================================
+
+    async def _route_s1_dynamic_shadow(
+        self, parent: FakeBreakoutSignal, next_start: int, next_end: int,
+    ) -> None:
+        """父 S1 的只读动态路由影子：NORMAL 开盘入场；SQUEEZE 等首根 5m 回落。"""
+        if not shadow_gate.is_enabled(S1_DYNAMIC_VERSION):
+            return
+        try:
+            need = S1_REGIME_LOOKBACK_BARS + S1_RET1H_BARS + 1
+            bars = await self._collector.fetch_klines_ending_at("5m", need, next_start)
+            expected_first = next_start - need * 300_000
+            continuous = (
+                len(bars) == need
+                and int(bars[0]["open_time"]) == expected_first
+                and int(bars[-1]["open_time"]) == next_start - 300_000
+                and all(
+                    int(bars[i]["open_time"]) - int(bars[i - 1]["open_time"]) == 300_000
+                    for i in range(1, len(bars))
+                )
+            )
+            regime_stats = (
+                s1_squeeze_threshold([float(k["close"]) for k in bars])
+                if continuous else None
+            )
+            if regime_stats is None:
+                logger.warning("S1动态影子跳过：30天ret1h分布不可用/不连续 | 父 #{}", parent.id)
+                return
+            ret1h, threshold = regime_stats
+            if ret1h < threshold:
+                q = dict(self._pm_15m)
+                matched = q.get("start_date") == next_start
+                quote = (
+                    float(q["down_price"])
+                    if matched and q.get("down_price") is not None else None
+                )
+                await self._record_s1_dynamic_shadow(
+                    parent, next_start, ret1h, threshold, "NORMAL",
+                    "TOUCHED" if quote is not None else "NO_DATA",
+                    touch_ts=(
+                        int(q.get("updated_ts") or clock_sync.now_ms())
+                        if quote is not None else None
+                    ),
+                    entry_quote=quote,
+                )
+                return
+
+            await self._sleep_until(next_start + S5_CONFIRM_DELAY_MS + S5_CONFIRM_GRACE_MS)
+            deadline = next_start + S5_CONFIRM_DELAY_MS + S5_CONFIRM_MAX_WAIT_MS
+            while self._running and clock_sync.now_ms() < min(deadline, next_end):
+                try:
+                    klines = await self._collector.fetch_recent_klines("5m", 3)
+                except Exception:
+                    klines = []
+                k5 = next((k for k in klines if k["open_time"] == next_start), None)
+                if k5 is None or clock_sync.now_ms() < next_start + S5_CONFIRM_DELAY_MS:
+                    await asyncio.sleep(ENTRY_SNAPSHOT_RETRY_INTERVAL_S)
+                    continue
+                confirmed, _ = confirm_bull_exhaust_5m(float(k5["close"]), float(k5["open"]))
+                if not confirmed:
+                    await self._record_s1_dynamic_shadow(
+                        parent, next_start, ret1h, threshold, "SQUEEZE", "NOT_TOUCHED",
+                    )
+                    return
+                q = dict(self._pm_15m)
+                matched = q.get("start_date") == next_start
+                quote = (
+                    float(q["down_price"])
+                    if matched and q.get("down_price") is not None else None
+                )
+                await self._record_s1_dynamic_shadow(
+                    parent, next_start, ret1h, threshold, "SQUEEZE",
+                    "TOUCHED" if quote is not None else "NO_DATA",
+                    touch_ts=(
+                        int(q.get("updated_ts") or clock_sync.now_ms())
+                        if quote is not None else None
+                    ),
+                    entry_quote=quote,
+                )
+                return
+            if self._running:
+                logger.warning("S1动态影子跳过：+5min K线不可用 | 父 #{}", parent.id)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.warning("S1动态影子任务异常（不影响S1/S5）| 父 #{} | {}", parent.id, exc)
+
+    async def _record_s1_dynamic_shadow(
+        self,
+        parent: FakeBreakoutSignal,
+        next_start: int,
+        ret1h: float,
+        threshold: float,
+        regime: str,
+        entry_state: str,
+        *,
+        touch_ts: int | None = None,
+        entry_quote: float | None = None,
+    ) -> None:
+        """复用 PatternShadowSignal 落动态路由决策；唯一键按父 S1 信号根幂等。"""
+        signal_bar_start = next_start - 900_000
+        async with async_session_factory() as session:
+            exists = (await session.execute(
+                select(PatternShadowSignal.id).where(
+                    PatternShadowSignal.version == S1_DYNAMIC_VERSION,
+                    PatternShadowSignal.signal_bar_start == signal_bar_start,
+                )
+            )).scalar_one_or_none()
+            if exists is not None:
+                return
+            session.add(PatternShadowSignal(
+                version=S1_DYNAMIC_VERSION,
+                rule_text=(
+                    f"{S1_DYNAMIC_RULE_TEXT} | parent_id={parent.id} | regime={regime} | "
+                    f"ret1h={ret1h:.8f} | q90={threshold:.8f}"
+                ),
+                signal_bar_start=signal_bar_start,
+                signal_bar_end=next_start,
+                target_bar_start=next_start,
+                signal_bar_open=None,
+                signal_bar_close=None,
+                clv=ret1h,
+                entry_state=entry_state,
+                touch_ts=touch_ts,
+                entry_down_quote=entry_quote,
+                status="PENDING",
+            ))
+            await session.commit()
+        logger.info(
+            "S1动态影子路由 | 父 #{} | {} ret1h={:+.2f}% q90={:+.2f}% | 入场={} quote={}",
+            parent.id, regime, ret1h * 100.0, threshold * 100.0, entry_state, entry_quote,
+        )
 
     async def _confirm_s5_entry(self, parent_id: int, next_start: int, next_end: int) -> None:
         """S5 确认判定：+5min 拉次周期第 1 根 5m K，回落确认则落 S5 信号。
