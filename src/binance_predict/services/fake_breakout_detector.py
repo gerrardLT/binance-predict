@@ -70,15 +70,25 @@ from sqlalchemy import desc, or_, select
 
 from ..config.settings import settings
 from ..db.engine import async_session_factory
-from ..db.models import FakeBreakoutSignal, PatternShadowSignal, SceneParamVersion, SentimentWindow
+from ..db.models import (
+    FakeBreakoutSignal,
+    PatternShadowSignal,
+    SceneParamVersion,
+    SentimentWindow,
+)
 from . import clock_sync
 from .alerting import send_plain_email
 from .data_collector import BinanceDataCollector
 from .live_channels import scene_pattern_to_channel
-from .scene_params import DEFAULT_SCENE_PARAMS, SceneParams
 from .notification_config import notify_config
-from .signal_notify import TZ_BJT, has_scene_filled_order, is_live_enabled, is_settled_email_enabled
+from .scene_params import DEFAULT_SCENE_PARAMS, SceneParams
 from .shadow_version_gate import shadow_gate
+from .signal_notify import (
+    TZ_BJT,
+    has_scene_filled_order,
+    is_live_enabled,
+    is_settled_email_enabled,
+)
 from .wechat_notifier import wechat_notifier
 
 # 超宽限阈值：到期后超过此宽限未结算的信号转 klines 精确补结算路径
