@@ -122,6 +122,13 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     "scene_bull_exhaust": ChannelSpec(
         "scene_bull_exhaust", "scene", "15m", "DOWN", 0.70, "场景S1 多头耗尽（押DOWN）",
     ),
+    # S1 动态轧空路由：复用正式 S1 父信号。NORMAL 在目标窗开盘入场；
+    # SQUEEZE 仅首根 5m 收阴后入场；720d 严格时序回放 n=1782/wr=64.93%。
+    # 无独立预测市场报价回测，护栏按 wr×0.98≈0.6363 保守取 0.63；默认 OFF。
+    "s1_dyn_sq_v1": ChannelSpec(
+        "s1_dyn_sq_v1", "scene", "15m", "DOWN", 0.63,
+        "S1动态轧空路由（押DOWN）",
+    ),
     "scene_bull_exhaust_confirm": ChannelSpec(
         "scene_bull_exhaust_confirm", "scene", "15m", "DOWN", 0.75, "场景S5 确认入场（押DOWN）",
     ),
@@ -366,6 +373,9 @@ _CANDLE_5M_CHANNELS = frozenset(v for v in CANDLESTICK_SIGNAL_IDS if "_5m_" in v
 _CANDLE_15M_CHANNELS = frozenset(v for v in CANDLESTICK_SIGNAL_IDS if "_15m_" in v)
 
 SAME_WINDOW_EXCLUSIVE: tuple[frozenset[str], ...] = (
+    # 动态 S1 是原 S1 的路由替代版；两者同源、同方向、同目标窗，不能双成交。
+    # 不扩大到既有 S5/深档组，避免仅注册新通道就改变当前 S1/S5 生产语义。
+    frozenset({"scene_bull_exhaust", "s1_dyn_sq_v1"}),
     frozenset({"scene_bull_exhaust_confirm", "s5_deep_z20_v1"}),
     # 原 S2 与优化版是同一父事件、同方向、同目标窗；若同时启用只允许一单成交。
     frozenset({"scene_bear_exhaust", "scene_bear_exhaust_opt_v1"}),

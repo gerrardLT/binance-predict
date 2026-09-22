@@ -161,6 +161,8 @@ def test_explicit_exclusive_group_conflict_and_benchmark_registry():
     ]
     assert duplicate_risk(rows)["explicit_exclusive_conflict_count"] == 1
     assert get_channel_benchmark("scene_bull_exhaust").win_rate == 0.644
+    assert get_channel_benchmark("s1_dyn_sq_v1").win_rate == 0.6493
+    assert get_channel_benchmark("s1_dyn_sq_v1").sample_size == 1782
     assert get_channel_benchmark("x4_v2").win_rate == 0.553
     assert get_channel_benchmark("firsthit_down_g7_v1").win_rate == 0.192
     assert get_channel_benchmark("krev_a_v1").win_rate == 0.642

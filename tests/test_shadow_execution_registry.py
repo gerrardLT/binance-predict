@@ -55,13 +55,13 @@ def test_registry_separates_signal_and_execution_policy_versions() -> None:
     assert EXECUTION_POLICY_VERSION not in SHADOW_VERSION_SPECS
 
 
-def test_s1_dynamic_shadow_is_record_only_pattern_strategy() -> None:
+def test_s1_dynamic_shadow_has_registered_live_channel() -> None:
     spec = SHADOW_VERSION_SPECS["s1_dyn_sq_v1"]
     assert spec.source_type is SourceType.PATTERN
     assert spec.market_period == "15m"
     assert spec.direction_mode == "down"
     assert spec.family == "pattern"
-    assert spec.live_channel is None
+    assert spec.live_channel == "s1_dyn_sq_v1"
 
 
 def test_rev2_versions_are_not_excluded() -> None:

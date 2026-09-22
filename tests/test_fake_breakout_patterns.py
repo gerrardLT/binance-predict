@@ -659,6 +659,8 @@ async def test_s1_dynamic_normal_records_open_entry(monkeypatch) -> None:
         return bars
 
     det._collector.fetch_klines_ending_at = ending_at
+    hooks: list[dict] = []
+    det._on_s1_dynamic_fired = hooks.append
     await det._route_s1_dynamic_shadow(SimpleNamespace(id=8), NEXT_START, NEXT_END)
 
     sh = _shadows(session)[0]
@@ -668,6 +670,35 @@ async def test_s1_dynamic_normal_records_open_entry(monkeypatch) -> None:
     assert sh.clv == pytest.approx(0.0059)
     assert "regime=NORMAL" in sh.rule_text and "q90=0.00600000" in sh.rule_text
     assert S1_DYNAMIC_RULE_TEXT in sh.rule_text
+    assert hooks == []
+
+
+@pytest.mark.asyncio
+async def test_s1_dynamic_normal_live_hook_fires_without_shadow(monkeypatch) -> None:
+    """影子 gate 关闭但实盘显式开启时，NORMAL 仍派单且不落影子样本。"""
+    pm = {"start_date": NEXT_START, "end_date": NEXT_END,
+          "down_price": 0.52, "up_price": 0.47, "updated_ts": NEXT_START + 4_000}
+    session = _S5Session(parent=_s5_parent(), exists=None)
+    det = _mk_s5_detector(monkeypatch, pm, session)
+    bars = _regime_bars(current=0.0059)
+
+    async def ending_at(_tf, _limit, _end):
+        return bars
+
+    det._collector.fetch_klines_ending_at = ending_at
+    hooks: list[dict] = []
+    det._on_s1_dynamic_fired = hooks.append
+    monkeypatch.setattr(fbd.shadow_gate, "is_enabled", lambda _v: False)
+    monkeypatch.setattr(fbd, "is_live_enabled", lambda v: v == S1_DYNAMIC_VERSION)
+
+    await det._route_s1_dynamic_shadow(SimpleNamespace(id=18), NEXT_START, NEXT_END)
+
+    assert _shadows(session) == []
+    assert hooks == [{
+        "id": 18, "pattern_type": S1_DYNAMIC_VERSION, "side": "high",
+        "market_start_15m": NEXT_START, "market_end_15m": NEXT_END,
+        "regime": "NORMAL",
+    }]
 
 
 @pytest.mark.asyncio
@@ -701,6 +732,37 @@ async def test_s1_dynamic_squeeze_without_pullback_skips(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_s1_dynamic_squeeze_unconfirmed_never_fires_live(monkeypatch) -> None:
+    """SQUEEZE 首根 5m 未收阴时，即使实盘开启也不得派单。"""
+    pm = {"start_date": NEXT_START, "end_date": NEXT_END,
+          "down_price": 0.52, "up_price": 0.47, "updated_ts": NEXT_START + 304_000}
+    session = _S5Session(parent=_s5_parent(), exists=None)
+    det = _mk_s5_detector(monkeypatch, pm, session,
+                          now_ms=NEXT_START + fbd.S5_CONFIRM_DELAY_MS + fbd.S5_CONFIRM_GRACE_MS)
+    bars = _regime_bars(current=0.006)
+
+    async def ending_at(_tf, _limit, _end):
+        return bars
+
+    async def fetch(_tf, _limit):
+        return [{"open_time": NEXT_START, "open": 100.0, "close": 100.2}]
+
+    async def no_sleep(_target):
+        return None
+
+    det._collector.fetch_klines_ending_at = ending_at
+    det._collector.fetch_recent_klines = fetch
+    det._sleep_until = no_sleep
+    hooks: list[dict] = []
+    det._on_s1_dynamic_fired = hooks.append
+    monkeypatch.setattr(fbd, "is_live_enabled", lambda v: v == S1_DYNAMIC_VERSION)
+
+    await det._route_s1_dynamic_shadow(SimpleNamespace(id=19), NEXT_START, NEXT_END)
+
+    assert hooks == []
+
+
+@pytest.mark.asyncio
 async def test_s1_dynamic_squeeze_pullback_records_5m_quote(monkeypatch) -> None:
     """SQUEEZE：首根 5m 收阴才按确认时刻报价记录模拟 DOWN 入场。"""
     pm = {"start_date": NEXT_START, "end_date": NEXT_END,
@@ -722,12 +784,20 @@ async def test_s1_dynamic_squeeze_pullback_records_5m_quote(monkeypatch) -> None
     det._collector.fetch_klines_ending_at = ending_at
     det._collector.fetch_recent_klines = fetch
     det._sleep_until = no_sleep
+    hooks: list[dict] = []
+    det._on_s1_dynamic_fired = hooks.append
+    monkeypatch.setattr(fbd, "is_live_enabled", lambda v: v == S1_DYNAMIC_VERSION)
     await det._route_s1_dynamic_shadow(SimpleNamespace(id=10), NEXT_START, NEXT_END)
 
     sh = _shadows(session)[0]
     assert sh.entry_state == "TOUCHED" and sh.status == "PENDING"
     assert sh.entry_down_quote == 0.64 and sh.touch_ts == NEXT_START + 304_000
     assert sh.clv == pytest.approx(0.008)
+    assert hooks == [{
+        "id": 10, "pattern_type": S1_DYNAMIC_VERSION, "side": "high",
+        "market_start_15m": NEXT_START, "market_end_15m": NEXT_END,
+        "regime": "SQUEEZE",
+    }]
 
 
 @pytest.mark.asyncio
