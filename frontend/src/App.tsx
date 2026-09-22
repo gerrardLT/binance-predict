@@ -7209,6 +7209,7 @@ function SignalAnalyticsTab() {
         )
       : []
   const activeShadowEntries = shadowEntries.filter(([k]) => !isRetiredVer(k))
+  const featuredShadowKeys = ['s1_dyn_sq_v1'].filter(k => activeShadowEntries.some(([key]) => key === k))
   const retiredShadowEntries = shadowEntries.filter(([k]) => isRetiredVer(k))
   const activeShadowRows = mergeSub(new Set(activeShadowEntries.map(([k]) => k)))
   const retiredShadowRows = mergeSub(new Set(retiredShadowEntries.map(([k]) => k)))
@@ -8126,8 +8127,31 @@ function RegimeByVersionTable({
         />
       )}
 
+      {/* 新上线影子先给出可见入口；完整指标仍在下方在线采集表。 */}
+      {analytics && featuredShadowKeys.map(k => {
+        const s = analytics.shadow[k].summary
+        const meta = SHADOW_META[k]
+        return <div key={k} className="ds-card p-3 flex items-center justify-between gap-4 flex-wrap">
+          <div className="min-w-0">
+            <div className="flex items-center gap-1.5 flex-wrap text-sm font-semibold text-ink-95">
+              <span>{meta?.label ?? k}</span>
+              <span className="ds-badge ds-badge-violet">新上线影子</span>
+              <span className="ds-badge ds-badge-neutral">只记录·不下单</span>
+              <HelpHint text={`${k}：${signalDescFor('shadow', k)}`} />
+            </div>
+            <div className="mt-1 text-xs text-ink-55">30 天滚动 ret1h q90 路由；普通行情开盘模拟 DOWN，轧空行情等首根 5m 收阴确认。</div>
+          </div>
+          <div className="flex items-center gap-5 text-right">
+            <div><div className="text-[10px] text-ink-55">前向样本</div><div className="font-mono font-semibold text-ink-95">{s.n}</div></div>
+            <div><div className="text-[10px] text-ink-55">回测胜率</div><div className="font-mono font-semibold text-violet">{pct1(s.bench_winrate)}</div></div>
+            <a href="#s1-dyn-shadow" className="text-xs font-medium text-brand hover:underline">查看完整指标 ↓</a>
+          </div>
+        </div>
+      })}
+
       {/* 影子在线区（2026-09-07 与退役区分开）：只看仍在采集的版本前向进展 */}
       {analytics && (
+        <div id="s1-dyn-shadow" className="scroll-mt-4">
         <ShadowSignalCard
           title={`影子信号·在线采集（${activeShadowEntries.length} 版）：前向胜率 vs 回测基准 vs 保本线`}
           entries={activeShadowEntries}
@@ -8143,6 +8167,7 @@ function RegimeByVersionTable({
             </>
           }
         />
+        </div>
       )}
 
       {/* 执行漏斗已与“实盘表现诊断”高度重叠，默认收进 details，保留审计能力但不再占主页面。 */}
