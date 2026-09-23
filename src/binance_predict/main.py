@@ -2954,9 +2954,9 @@ async def live_pnl_curve(
 
 
 _LIVE_PERFORMANCE_SCHEMA = "live_performance_v1"
-_LIVE_METRICS_VERSION = "2026-09-15.v1"
+_LIVE_METRICS_VERSION = "2026-09-24.v2"
 _DIAGNOSTIC_SEGMENTS = {
-    "quote", "trigger_offset", "policy_version", "trend_4h", "trend_24h",
+    "quote", "exec_price", "trigger_offset", "policy_version", "trend_4h", "trend_24h",
     "volatility", "deployment",
 }
 

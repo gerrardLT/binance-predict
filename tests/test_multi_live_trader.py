@@ -2670,7 +2670,9 @@ async def test_live_channel_diagnostics_validation_and_segments(monkeypatch) -> 
     rows = [
         LiveOrder(id=1, channel="x4_v2", market_period="5m", window_start=1000,
                   win=True, pnl=1, amount_in=str(10**18), assessment_id=1,
-                  quote_json={"amountIn": str(10**18), "filledShareQty": 5},
+                  quote_json={"amountIn": str(10**18), "filledShareQty": 5,
+                              "averagePrice": 0.22,
+                              "fillSource": "binance_history_confirm"},
                   policy_version="p1", trigger_ts=121000),
         LiveOrder(id=2, channel="x4_v2", market_period="5m", window_start=2000,
                   win=False, pnl=-1, amount_in=str(10**18)),
@@ -2682,9 +2684,14 @@ async def test_live_channel_diagnostics_validation_and_segments(monkeypatch) -> 
     monkeypatch.setattr(m, "_load_live_performance_orders", load)
     monkeypatch.setattr(m, "multi_live_trader", None)
     quote = await m.live_channel_diagnostics(channel="x4_v2", segment_by="quote", db=None)
-    assert {row["segment"] for row in quote["segments"]} == {"[0.2,0.3)", "LEGACY_UNKNOWN"}
+    assert {row["segment"] for row in quote["segments"]} == {"<0.30", "LEGACY_UNKNOWN"}
     assert quote["series"][0]["t"] == 1000
     assert quote["series"][0]["pnl"] == 1 and quote["series"][0]["cost"] == 1
+    exec_price = await m.live_channel_diagnostics(
+        channel="x4_v2", segment_by="exec_price", db=None)
+    assert {row["segment"] for row in exec_price["segments"]} == {
+        "<0.30", "LEGACY_UNKNOWN",
+    }
     trigger = await m.live_channel_diagnostics(channel="x4_v2", segment_by="trigger_offset", db=None)
     assert {row["segment"] for row in trigger["segments"]} == {"120-179", "LEGACY_UNKNOWN"}
     policy = await m.live_channel_diagnostics(channel="x4_v2", segment_by="policy_version", db=None)

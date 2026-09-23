@@ -15,6 +15,7 @@ from binance_predict.services.live_performance import (
     market_window_key,
     rolling_binary_stats,
     rolling_realized_ev,
+    segment_orders,
 )
 
 
@@ -242,3 +243,104 @@ def test_portfolio_series_uses_window_time_not_market_id():
     assert [point["market_window_key"] for point in series] == [
         ["period_window", "5m", 1000], ["period_window", "5m", 2000],
     ]
+
+
+def test_quote_and_exec_price_fine_bucketing():
+    # 模拟两笔订单：一笔 break_even 0.52，一笔 break_even 0.63
+    rows = [
+        order(
+            id=1,
+            amount_in=str(2 * 10**18),
+            win=True,
+            pnl=1.5,
+            quote_json={
+                "amountIn": str(2 * 10**18),
+                "filledShareQty": 3.846,  # 2.0 / 3.846 ≈ 0.52 -> [0.50,0.55)
+                "averagePrice": 0.48,
+                "fillSource": "binance_history_confirm",
+            },
+        ),
+        order(
+            id=2,
+            amount_in=str(2 * 10**18),
+            win=False,
+            pnl=-2.0,
+            quote_json={
+                "amountIn": str(2 * 10**18),
+                "filledShareQty": 3.174,  # 2.0 / 3.174 ≈ 0.63 -> [0.60,0.65)
+                "averagePrice": 0.61,
+                "fillSource": "binance_history_confirm",
+            },
+        ),
+        order(
+            id=3,
+            amount_in=str(2 * 10**18),
+            win=True,
+            pnl=1.0,
+            quote_json={
+                "amountIn": str(2 * 10**18),
+                "filledShareQty": 7.0,  # 2.0 / 7.0 ≈ 0.285 -> <0.30
+                "averagePrice": 0.27,
+                "source": "binance_history_sync",
+                "binanceOrderStatus": "FILLED",
+            },
+        ),
+        order(
+            id=4,
+            amount_in=str(2 * 10**18),
+            win=True,
+            pnl=0.5,
+            quote_json={
+                "amountIn": str(2 * 10**18),
+                "filledShareQty": 2.5,  # 2.0 / 2.5 = 0.80 -> >=0.70
+                "averagePrice": 0.76,
+                "fillSource": "binance_history_confirm",
+            },
+        ),
+        order(
+            id=5,
+            amount_in=str(2 * 10**18),
+            win=False,
+            pnl=-2.0,
+            quote_json={
+                "amountIn": str(2 * 10**18),
+                "averagePrice": 0.55,  # 报价估算，不得混入确认成交价分桶
+            },
+        ),
+    ]
+
+    # 测试保本率分桶 (quote)
+    quote_segments = {s["segment"]: s for s in segment_orders(rows, "quote")}
+    assert "<0.30" in quote_segments
+    assert "[0.50,0.55)" in quote_segments
+    assert "[0.60,0.65)" in quote_segments
+    assert ">=0.70" in quote_segments
+    assert quote_segments["[0.50,0.55)"]["n"] == 1
+    assert quote_segments["[0.50,0.55)"]["wins"] == 1
+    assert quote_segments["[0.60,0.65)"]["wins"] == 0
+
+    # 测试成交均价分桶 (exec_price)
+    exec_segments = {s["segment"]: s for s in segment_orders(rows, "exec_price")}
+    assert "<0.30" in exec_segments
+    assert "[0.45,0.50)" in exec_segments  # 0.48 落在 [0.45,0.50)
+    assert "[0.60,0.65)" in exec_segments  # 0.61 落在 [0.60,0.65)
+    assert ">=0.70" in exec_segments      # 0.76 落在 >=0.70
+    assert exec_segments["[0.45,0.50)"]["wins"] == 1
+    assert exec_segments["LEGACY_UNKNOWN"]["n"] == 1
+
+
+@pytest.mark.parametrize(
+    ("price", "expected"),
+    [
+        (0.299999, "<0.30"),
+        (0.30, "[0.30,0.35)"),
+        (0.349999, "[0.30,0.35)"),
+        (0.35, "[0.35,0.40)"),
+        (0.699999, "[0.65,0.70)"),
+        (0.70, ">=0.70"),
+    ],
+)
+def test_price_bucket_boundaries(price, expected):
+    from binance_predict.services.live_performance import _price_bucket
+
+    assert _price_bucket(price) == expected

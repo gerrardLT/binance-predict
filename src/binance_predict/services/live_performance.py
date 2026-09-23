@@ -71,6 +71,19 @@ def execution_details(order: LiveOrder) -> dict[str, Any]:
     }
 
 
+def confirmed_execution_price(order: LiveOrder) -> float | None:
+    """Return Binance-confirmed fill price; never relabel a quote estimate as a fill."""
+    quote = order.quote_json or {}
+    confirmed = (
+        quote.get("fillSource") == "binance_history_confirm"
+        or (
+            quote.get("source") == "binance_history_sync"
+            and quote.get("binanceOrderStatus") == "FILLED"
+        )
+    )
+    return execution_details(order)["average_price"] if confirmed else None
+
+
 def break_even(order: LiveOrder) -> dict[str, Any]:
     details = execution_details(order)
     quote = order.quote_json or {}
@@ -336,13 +349,25 @@ def portfolio_window_series(orders: Iterable[LiveOrder]) -> list[dict[str, Any]]
     return output
 
 
+def _price_bucket(value: float | None) -> str:
+    if value is None:
+        return "LEGACY_UNKNOWN"
+    if value < 0.30:
+        return "<0.30"
+    if value >= 0.70:
+        return ">=0.70"
+    # Epsilon keeps exact decimal boundaries such as 0.35 out of the lower bucket.
+    index = min(13, max(6, int(value * 20 + 1e-12)))
+    low = index / 20.0
+    high = (index + 1) / 20.0
+    return f"[{low:.2f},{high:.2f})"
+
+
 def _segment_label(order: LiveOrder, segment_by: str) -> str:
     if segment_by == "quote":
-        probability = break_even(order)["break_even_probability"]
-        if probability is None:
-            return "LEGACY_UNKNOWN"
-        index = min(9, max(0, int(probability * 10)))
-        return f"[{index / 10:.1f},{(index + 1) / 10:.1f}{']' if index == 9 else ')'}"
+        return _price_bucket(break_even(order)["break_even_probability"])
+    if segment_by == "exec_price":
+        return _price_bucket(confirmed_execution_price(order))
     if segment_by == "trigger_offset":
         if order.trigger_ts is None or order.window_start is None:
             return "LEGACY_UNKNOWN"
