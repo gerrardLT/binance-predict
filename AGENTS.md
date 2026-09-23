@@ -26,6 +26,15 @@ BTC 预测市场（Binance Prediction）自动化交易系统。**真金实盘�
 - `alembic/versions/` — DB 迁移；`scripts/` — 一次性/评估脚本（非运行时依赖）
 - `output/`、`logs/`、`.pytest_tmp/` — 运行产物与工作草稿区，不清理、不提交
 
+## 新研究隔离（强制）
+
+- 新研究开始前必须完整读取 `docs/RESEARCH_ISOLATION.md`，默认从 `PREREGISTRATION` 阶段开始
+- 完成预注册、候选冻结和最终盲测前，禁止读取/搜索/索引旧研究报告、旧参数、旧研究脚本、旧信号表、生产策略实现、Git 历史和外部冷归档
+- 发现阶段禁止全仓库搜索；只能访问隔离规范规定的白名单原始数据、字段定义、本轮目录与中性统计工具
+- 每轮研究写入独立的 `output/research_runs/<run_id>/`；成功与失败试验都必须登记，不得只保留赢家
+- 最终盲测报告和哈希冻结后，只有用户明确同意进入 `COMPARISON`，才可解封旧研究做对照
+- 旧研究冷归档位于项目外 `D:/project-archives/binance-predict/legacy-research-2026-09/`；生产代码、数据库历史与交易安全规则不因研究隔离而删除
+
 ## 交易语义（改下单/结算代码前必读）
 
 - `amount_in` 单位是 **wei**：展示层一律 `/1e18`
