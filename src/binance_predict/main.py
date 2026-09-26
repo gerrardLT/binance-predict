@@ -103,6 +103,7 @@ from .services.live_performance import (
     channel_series,
     portfolio_window_series,
     segment_orders,
+    signal_truth,
 )
 
 # ============================================================
@@ -2954,10 +2955,10 @@ async def live_pnl_curve(
 
 
 _LIVE_PERFORMANCE_SCHEMA = "live_performance_v1"
-_LIVE_METRICS_VERSION = "2026-09-24.v2"
+_LIVE_METRICS_VERSION = "2026-09-26.v3"
 _DIAGNOSTIC_SEGMENTS = {
-    "quote", "exec_price", "trigger_offset", "policy_version", "trend_4h", "trend_24h",
-    "volatility", "deployment",
+    "quote", "exec_price", "trigger_offset", "policy_version", "stake", "trend_4h",
+    "trend_24h", "volatility", "deployment",
 }
 
 
@@ -2975,7 +2976,7 @@ async def _live_channel_meta() -> dict[str, dict]:
         meta.setdefault(channel, {
             "channel": channel, "display_name": spec.display_name,
             "family": spec.family, "market_period": spec.market_period,
-            "enabled": False,
+            "enabled": False, "max_exec_price": spec.auto_max_exec,
         })
     return meta
 
@@ -3066,6 +3067,8 @@ async def live_performance_summary(
                 "ewma": latest["ewma_win_rate"],
                 "rolling_realized_ev_20": latest["rolling_realized_ev"]["20"],
                 "rolling_realized_ev_50": latest["rolling_realized_ev"]["50"],
+                "rolling_signal_ev_20": latest["rolling_signal_ev"]["20"],
+                "rolling_signal_ev_50": latest["rolling_signal_ev"]["50"],
                 "mean_break_even_20": latest["rolling_mean_break_even_probability"]["20"],
                 "mean_break_even_50": latest["rolling_mean_break_even_probability"]["50"],
                 "benchmark_gap_20": latest["benchmark_gap"]["20"],
@@ -3073,6 +3076,8 @@ async def live_performance_summary(
             },
             "break_even_coverage": {"available_count": len(channel_be), "order_count": len(rows),
                                     "ratio": len(channel_be) / len(rows)},
+            "signal_truth": signal_truth(rows),
+            "max_exec_price": m.get("max_exec_price"),
         })
     channels_out.sort(key=lambda row: row["total_pnl"], reverse=True)
     window_wins = [row["window_win"] for row in windows]
@@ -3100,6 +3105,7 @@ async def live_performance_summary(
                 "rolling": report["window_stats"],
             },
             "rolling_realized_ev": report["rolling_realized_ev"],
+            "signal_truth": signal_truth(orders),
             "quote_edge": {
                 "display_name": "样本命中减保本率",
                 "metric_semantics": "realized_outcome_minus_break_even_probability",
@@ -3141,8 +3147,10 @@ async def live_channel_diagnostics(
                     "from_ms": from_ms, "to_ms": to_ms},
         "channel": {"channel": channel, "display_name": m.get("display_name", channel),
                     "family": m.get("family"), "market_period": m.get("market_period"),
-                    "enabled": bool(m.get("enabled"))},
+                    "enabled": bool(m.get("enabled")),
+                    "max_exec_price": m.get("max_exec_price")},
         "benchmark": benchmark_dict(channel),
+        "signal_truth": signal_truth(orders),
         "coverage": {"order_count": len(orders), "break_even_available_count": available_be,
                      "assessment_linked_count": sum(row.assessment_id is not None for row in orders),
                      "is_truncated": False},

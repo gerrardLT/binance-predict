@@ -344,3 +344,100 @@ def test_price_bucket_boundaries(price, expected):
     from binance_predict.services.live_performance import _price_bucket
 
     assert _price_bucket(price) == expected
+
+
+# ---- 信号真相（剔除动态下单金额）----
+
+def _settled(id_, stake, win, price, **kw):
+    """构造已结算订单：赢 pnl=stake*(0.98/price-1)，输 pnl=-stake；成交确认价=price。"""
+    pnl = stake * (0.98 / price - 1) if win else -stake
+    return order(
+        id=id_, window_start=id_, amount_in=str(int(stake * 10**18)), win=win, pnl=pnl,
+        quote_json={"averagePrice": price, "fillSource": "binance_history_confirm"}, **kw,
+    )
+
+
+def test_signal_truth_separates_equal_weight_ev_from_capital_roi():
+    from binance_predict.services.live_performance import signal_truth, unit_return
+
+    # 3 笔 1U 小注全赢 + 1 笔 50U 大注输：信号本身赚钱，钱包亏钱
+    rows = [_settled(i, 1.0, True, 0.5) for i in range(1, 4)] + [_settled(4, 50.0, False, 0.5)]
+    assert unit_return(rows[0]) == pytest.approx(0.96)
+    truth = signal_truth(rows)
+    assert truth["signal_n"] == 4
+    assert truth["signal_ev"] == pytest.approx((0.96 * 3 - 1) / 4)
+    assert truth["capital_roi"] == pytest.approx((0.96 * 3 - 50) / 53)
+    assert truth["sizing_distortion"] == pytest.approx(truth["capital_roi"] - truth["signal_ev"])
+    assert truth["sizing_distortion"] < 0
+    assert truth["stake_max"] == 50.0
+    assert truth["stake_median"] == 1.0
+    assert truth["top3_stake_share"] == pytest.approx(52 / 53)
+    assert truth["equal_stake_pnl"] == pytest.approx(truth["signal_ev"] * 4 * 1.0)
+    # 保本率 = 0.5/0.98；edge = 平均(win - 保本率)
+    be = 0.5 / 0.98
+    assert truth["mean_break_even"] == pytest.approx(be)
+    assert truth["edge"] == pytest.approx(0.75 - be)
+    assert truth["edge_n"] == 4
+    lo, hi = truth["signal_ev_ci95"]
+    assert lo < truth["signal_ev"] < hi
+
+
+def test_signal_truth_equal_stakes_have_zero_distortion():
+    from binance_predict.services.live_performance import signal_truth
+
+    rows = [_settled(1, 5.0, True, 0.4), _settled(2, 5.0, False, 0.4)]
+    truth = signal_truth(rows)
+    assert truth["sizing_distortion"] == pytest.approx(0.0)
+    assert truth["equal_stake_pnl"] == pytest.approx(sum(r.pnl for r in rows))
+
+
+def test_signal_truth_empty_and_missing_cost_are_none_safe():
+    from binance_predict.services.live_performance import signal_truth
+
+    empty = signal_truth([])
+    assert empty["signal_ev"] is None and empty["capital_roi"] is None
+    assert empty["sizing_distortion"] is None and empty["edge"] is None
+    assert empty["signal_ev_ci95"] is None and empty["equal_stake_pnl"] is None
+    # 无成本行不进信号 EV，也不进资金 ROI 分子（口径一致）
+    no_cost = order(id=9, win=True, pnl=3.0)
+    truth = signal_truth([no_cost, _settled(1, 2.0, False, 0.5)])
+    assert truth["signal_n"] == 1
+    assert truth["capital_roi"] == pytest.approx(-1.0)
+    assert truth["signal_ev_ci95"] is None  # 单样本不给区间
+
+
+@pytest.mark.parametrize(
+    ("stake", "expected"),
+    [(2.999, "<3U"), (3.0, "3-8U"), (7.99, "3-8U"), (8.0, "8-15U"), (15.0, "15-30U"),
+     (29.99, "15-30U"), (30.0, ">=30U"), (50.0, ">=30U")],
+)
+def test_stake_bucket_boundaries(stake, expected):
+    from binance_predict.services.live_performance import _stake_bucket
+
+    assert _stake_bucket(stake) == expected
+    assert _stake_bucket(None) == "LEGACY_UNKNOWN"
+
+
+def test_stake_segments_are_ordered_and_carry_signal_fields():
+    rows = [_settled(1, 50.0, False, 0.6), _settled(2, 1.0, True, 0.5), _settled(3, 10.0, True, 0.5)]
+    segments = segment_orders(rows, "stake")
+    assert [s["segment"] for s in segments] == ["<3U", "8-15U", ">=30U"]
+    big = segments[-1]
+    assert big["signal_ev"] == pytest.approx(-1.0)
+    assert big["realized_ev"] == pytest.approx(-1.0)
+    assert big["sizing_distortion"] == pytest.approx(0.0)
+    assert big["stake_max"] == 50.0
+    assert big["low_sample"] is True
+    assert big["mean_break_even"] == pytest.approx(0.6 / 0.98)
+    assert big["win_rate_wilson_95"] is not None
+
+
+def test_channel_series_exposes_rolling_signal_ev():
+    rows = [_settled(i, 1.0 if i % 2 else 40.0, i % 2 == 1, 0.5) for i in range(1, 23)]
+    last = channel_series(rows)[-1]
+    sig20 = last["rolling_signal_ev"]["20"]
+    assert sig20["n"] == 20 and sig20["full_window"] is True
+    # 最近 20 笔：10 赢(1U) + 10 输(40U) → 等权 EV = (0.96*10 - 10)/20
+    assert sig20["signal_ev"] == pytest.approx((0.96 * 10 - 10) / 20)
+    assert last["rolling_realized_ev"]["20"]["realized_ev"] < sig20["signal_ev"]
+    assert last["unit_return"] == pytest.approx(-1.0)

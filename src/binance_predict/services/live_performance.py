@@ -186,6 +186,108 @@ def rolling_realized_ev(orders: Iterable[LiveOrder], window: int) -> dict[str, A
     }
 
 
+def unit_return(order: LiveOrder) -> float | None:
+    """Per-order return per 1 USDT staked (pnl / actual cost), independent of stake size."""
+    cost = actual_cost(order)
+    if order.pnl is None or cost is None:
+        return None
+    return float(order.pnl) / cost
+
+
+def rolling_signal_ev(orders: Iterable[LiveOrder], window: int) -> dict[str, Any]:
+    """Equal-weight mean of unit returns over the last ``window`` orders."""
+    sample = list(orders)[-window:]
+    values = [value for row in sample if (value := unit_return(row)) is not None]
+    return {
+        "window_size": window,
+        "n": len(values),
+        "full_window": len(values) == window,
+        "signal_ev": sum(values) / len(values) if values else None,
+    }
+
+
+def _mean_ci(values: list[float]) -> list[float] | None:
+    """Normal-approximation 95% interval of a sample mean; None below two samples."""
+    n = len(values)
+    if n < 2:
+        return None
+    mean = sum(values) / n
+    variance = sum((value - mean) ** 2 for value in values) / (n - 1)
+    half = 1.96 * (variance / n) ** 0.5
+    return [mean - half, mean + half]
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def signal_truth(orders: Iterable[LiveOrder]) -> dict[str, Any]:
+    """Stake-neutral signal quality versus stake-weighted capital outcome.
+
+    - signal_ev: equal-weight mean of pnl/cost (what 1 USDT per order would earn)
+    - capital_roi: sum(pnl)/sum(cost) (what the wallet actually earned)
+    - sizing_distortion: capital_roi - signal_ev (<0 means big stakes lost more)
+    - edge: mean(win - break_even) over orders with a captured break-even
+    """
+    rows = list(orders)
+    returns = [value for row in rows if (value := unit_return(row)) is not None]
+    costs = [cost for row in rows if (cost := actual_cost(row)) is not None]
+    pnls = [float(row.pnl) for row in rows if row.pnl is not None and actual_cost(row) is not None]
+    edges: list[float] = []
+    break_evens: list[float] = []
+    for row in rows:
+        win = _order_win(row)
+        probability = break_even(row)["break_even_probability"]
+        if win is None or probability is None:
+            continue
+        break_evens.append(probability)
+        edges.append(float(win) - probability)
+    total_cost = sum(costs)
+    signal_ev = sum(returns) / len(returns) if returns else None
+    capital_roi = sum(pnls) / total_cost if total_cost > 0 else None
+    median_stake = _median(costs)
+    top3 = sum(sorted(costs, reverse=True)[:3])
+    return {
+        "signal_n": len(returns),
+        "signal_ev": signal_ev,
+        "signal_ev_ci95": _mean_ci(returns),
+        "capital_roi": capital_roi,
+        "sizing_distortion": (
+            capital_roi - signal_ev if capital_roi is not None and signal_ev is not None else None
+        ),
+        "mean_break_even": sum(break_evens) / len(break_evens) if break_evens else None,
+        "edge": sum(edges) / len(edges) if edges else None,
+        "edge_ci95": _mean_ci(edges),
+        "edge_n": len(edges),
+        "stake_mean": total_cost / len(costs) if costs else None,
+        "stake_median": median_stake,
+        "stake_max": max(costs) if costs else None,
+        "top3_stake_share": top3 / total_cost if total_cost > 0 else None,
+        "equal_stake_pnl": (
+            signal_ev * len(returns) * median_stake
+            if signal_ev is not None and median_stake is not None else None
+        ),
+    }
+
+
+STAKE_BUCKETS: tuple[tuple[float, str], ...] = (
+    (3.0, "<3U"), (8.0, "3-8U"), (15.0, "8-15U"), (30.0, "15-30U"),
+)
+
+
+def _stake_bucket(cost: float | None) -> str:
+    if cost is None:
+        return "LEGACY_UNKNOWN"
+    for upper, label in STAKE_BUCKETS:
+        if cost < upper:
+            return label
+    return ">=30U"
+
+
 def _sort_component(value: Any) -> tuple[int, float | str]:
     if value is None:
         return (2, "")
@@ -245,6 +347,10 @@ def channel_series(orders: Iterable[LiveOrder]) -> list[dict[str, Any]]:
             str(size): rolling_realized_ev(order_windows[size], size)
             for size in (20, 50)
         }
+        signal_ev = {
+            str(size): rolling_signal_ev(order_windows[size], size)
+            for size in (20, 50)
+        }
         mean_break_even = {
             str(size): (
                 sum(value for value in break_even_windows[size] if value is not None)
@@ -280,6 +386,8 @@ def channel_series(orders: Iterable[LiveOrder]) -> list[dict[str, Any]]:
             "rolling": rolling,
             "ewma_win_rate": ewma_value,
             "rolling_realized_ev": realized_ev,
+            "rolling_signal_ev": signal_ev,
+            "unit_return": unit_return(row),
             "break_even_probability": probability,
             "rolling_mean_break_even_probability": mean_break_even,
             "benchmark_win_rate": benchmark.win_rate if benchmark else None,
@@ -380,7 +488,16 @@ def _segment_label(order: LiveOrder, segment_by: str) -> str:
         return ">=300"
     if segment_by == "policy_version":
         return order.policy_version or "LEGACY_UNKNOWN"
+    if segment_by == "stake":
+        return _stake_bucket(actual_cost(order))
     return "LEGACY_UNKNOWN"
+
+
+_STAKE_ORDER = {label: index for index, (_, label) in enumerate(STAKE_BUCKETS)}
+_STAKE_ORDER[">=30U"] = len(STAKE_BUCKETS)
+
+# Segments below this size are displayed but flagged as statistically unreliable.
+MIN_SEGMENT_SAMPLE = 10
 
 
 def segment_orders(orders: Iterable[LiveOrder], segment_by: str) -> list[dict[str, Any]]:
@@ -394,18 +511,35 @@ def segment_orders(orders: Iterable[LiveOrder], segment_by: str) -> list[dict[st
         costs = [cost for row in rows if (cost := actual_cost(row)) is not None]
         pnls = [float(row.pnl) for row in rows if row.pnl is not None]
         total_cost = sum(costs)
+        truth = signal_truth(rows)
+        win_rate = sum(valid_wins) / len(valid_wins) if valid_wins else None
         output.append({
             "segment": label,
             "n": len(rows),
             "wins": sum(valid_wins),
-            "win_rate": sum(valid_wins) / len(valid_wins) if valid_wins else None,
+            "win_rate": win_rate,
+            "win_rate_wilson_95": (
+                list(wilson(win_rate, len(valid_wins))) if win_rate is not None else None
+            ),
             "total_cost": total_cost,
             "total_pnl": sum(pnls),
             "realized_ev": sum(pnls) / total_cost if total_cost > 0 else None,
+            "signal_ev": truth["signal_ev"],
+            "signal_ev_ci95": truth["signal_ev_ci95"],
+            "sizing_distortion": truth["sizing_distortion"],
+            "mean_break_even": truth["mean_break_even"],
+            "edge": truth["edge"],
+            "edge_ci95": truth["edge_ci95"],
+            "stake_mean": truth["stake_mean"],
+            "stake_max": truth["stake_max"],
+            "low_sample": len(rows) < MIN_SEGMENT_SAMPLE,
             "unique_window_count": len({key for row in rows if (key := market_window_key(row)) is not None}),
             "data_quality": "LEGACY_UNKNOWN" if label == "LEGACY_UNKNOWN" else "CAPTURED",
         })
-    output.sort(key=lambda row: (row["segment"] == "LEGACY_UNKNOWN", row["segment"]))
+    if segment_by == "stake":
+        output.sort(key=lambda row: _STAKE_ORDER.get(row["segment"], len(_STAKE_ORDER)))
+    else:
+        output.sort(key=lambda row: (row["segment"] == "LEGACY_UNKNOWN", row["segment"]))
     return output
 
 
