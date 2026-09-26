@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback, useRef, useMemo, Fragment } from 'react'
+import { useState, useEffect, useCallback, useRef, useMemo, useLayoutEffect, useId, Fragment } from 'react'
+import { createPortal } from 'react-dom'
 import {
   XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, Area, AreaChart, ReferenceLine,
@@ -814,14 +815,73 @@ function DiscoveryMethodBadge({ method }: { method?: string }) {
   return <span className={`ds-badge ${m.cls}`}>{m.label}</span>
 }
 
-// 问号 hover 提示（信号说明等）：纯 CSS group-hover，无依赖
+// 问号 hover 提示（信号说明等）
+// 气泡经 portal 挂到 body、position:fixed 定位：不再被 overflow 容器（表格滚动区/卡片）裁切或压层。
+// 定位规则：默认在问号上方右对齐；上方放不下翻到下方；水平方向夹在视口内（留 8px 边距）。
+// tabIndex + focus 保留：键盘必须能触发（AGENTS.md 既有行为，不得回退）。
+const HINT_GAP = 6
+const HINT_MARGIN = 8
 function HelpHint({ text }: { text: string }) {
-  /* 反白气泡（ink-black + on-ink）脱离页面层级，不用阴影。
-     tabIndex + :focus-within 保留：键盘必须能触发（AGENTS.md 既有行为，不得回退）。 */
+  const triggerRef = useRef<HTMLSpanElement>(null)
+  const bubbleRef = useRef<HTMLSpanElement>(null)
+  const [open, setOpen] = useState(false)
+  const [pos, setPos] = useState<{ top: number; left: number } | null>(null)
+  const id = useId()
+
+  const place = useCallback(() => {
+    const trigger = triggerRef.current, bubble = bubbleRef.current
+    if (!trigger || !bubble) return
+    const r = trigger.getBoundingClientRect()
+    const w = bubble.offsetWidth, h = bubble.offsetHeight
+    const vw = window.innerWidth, vh = window.innerHeight
+    // 右对齐问号，再夹进视口
+    const left = Math.min(Math.max(r.right - w, HINT_MARGIN), vw - w - HINT_MARGIN)
+    const above = r.top - HINT_GAP - h
+    const below = r.bottom + HINT_GAP
+    const top = above >= HINT_MARGIN || below + h > vh - HINT_MARGIN
+      ? Math.max(above, HINT_MARGIN)
+      : below
+    setPos({ top, left: Math.max(left, HINT_MARGIN) })
+  }, [])
+
+  // 打开后先隐形渲染测尺寸，再定位（避免首帧闪到错误位置）
+  useLayoutEffect(() => {
+    if (!open) { setPos(null); return }
+    place()
+    // 滚动（含任意祖先滚动容器，capture）/缩放时跟随重算
+    window.addEventListener('scroll', place, true)
+    window.addEventListener('resize', place)
+    return () => {
+      window.removeEventListener('scroll', place, true)
+      window.removeEventListener('resize', place)
+    }
+  }, [open, place, text])
+
   return (
-    <span className="ds-hint align-middle" tabIndex={0}>
-      <span className="ds-hint-trigger">?</span>
-      <span className="ds-hint-bubble">{text}</span>
+    <span
+      ref={triggerRef}
+      className="ds-hint align-middle"
+      tabIndex={0}
+      aria-describedby={open ? id : undefined}
+      onMouseEnter={() => setOpen(true)}
+      onMouseLeave={() => setOpen(false)}
+      onFocus={() => setOpen(true)}
+      onBlur={() => setOpen(false)}
+      onKeyDown={e => { if (e.key === 'Escape') setOpen(false) }}
+    >
+      <span className="ds-hint-trigger" aria-hidden="true">?</span>
+      {open && createPortal(
+        <span
+          ref={bubbleRef}
+          id={id}
+          role="tooltip"
+          className="ds-hint-bubble ds-hint-bubble-floating"
+          style={pos ? { top: pos.top, left: pos.left } : { top: 0, left: 0, visibility: 'hidden' }}
+        >
+          {text}
+        </span>,
+        document.body,
+      )}
     </span>
   )
 }

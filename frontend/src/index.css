@@ -588,6 +588,21 @@ code {
     opacity: 1;
     visibility: visible;
   }
+  /* portal 浮层版：挂在 body 下 fixed 定位，坐标由 HelpHint 按视口计算；
+     脱离所有 overflow 容器，z-index 高于抽屉/弹窗；超长说明内部滚动。 */
+  .ds-hint-bubble-floating {
+    position: fixed;
+    right: auto;
+    bottom: auto;
+    margin: 0;
+    max-width: calc(100vw - 16px);
+    max-height: min(60vh, 420px);
+    overflow-y: auto;
+    opacity: 1;
+    visibility: visible;
+    pointer-events: none;
+    z-index: 1000;
+  }
 
   /* ---- Input：focus 用品牌蓝描边 + brand-soft 外环，不发光不阴影 ---- */
   .ds-field {
