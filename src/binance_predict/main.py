@@ -4339,8 +4339,23 @@ async def _official_scene_version_filter(db: AsyncSession):
 _CURVE_MAX_POINTS = 500  # 单版本曲线点数上限（防响应体随信号量无界膨胀）
 
 
+def _current_live_channels() -> dict[str, dict]:
+    """当前实盘通道内存快照；分析页无需为 filled_today 额外查一次 DB。"""
+    if multi_live_trader is None:
+        return {}
+    try:
+        status_fn = getattr(multi_live_trader, "status", None)
+        if status_fn is None:
+            return {}
+        return {c["channel"]: c for c in status_fn()["channels"]}
+    except Exception as exc:
+        logger.warning("信号分析：实盘通道状态查询失败 | {}", exc)
+        return {}
+
 @app.get("/api/signals/analytics")
-async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
+async def get_signals_analytics(
+    db: AsyncSession = Depends(get_db), active_only: bool = False,
+):
     """信号分析面板聚合端点：口径常量固化在后端（单一事实源）。
 
     - shadow: 影子各版本累计胜率/EV 曲线 + 汇总（含逐笔平均盈亏平衡、回测基准）
@@ -4363,35 +4378,49 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
     from .services.fake_breakout_detector import (
         RESEARCH_WIN_RATES, scene_realized_ev,
     )
+    from .services.shadow_execution_registry import SHADOW_VERSION_SPECS, SHADOW_VERSIONS
+    from .services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
 
-    # ---- 影子信号：全量 SETTLED 升序（仅取所需列，避免整行 ORM 实体化）----
+    event_versions = {"candle_hm_bull_5m_event_v1", "candle_hm_bull_15m_event_v1"}
+    live_by_ch = _current_live_channels()
+    registered_versions = (set(SHADOW_VERSIONS) - event_versions) | set(CANDLESTICK_SIGNAL_IDS)
+    visible_versions = {
+        version for version in registered_versions
+        if not shadow_gate.is_retired(version)
+        and (shadow_gate.is_enabled(version) or live_by_ch.get(version, {}).get("enabled"))
+    } if active_only else None
+
+    # ---- 影子信号：SETTLED 升序（分析页 active_only 时在 DB 层排除已下线历史）----
+    sh_stmt = sa_select(
+        MisalignmentSignal.version, MisalignmentSignal.window_start,
+        MisalignmentSignal.win, MisalignmentSignal.ev_at_entry,
+        MisalignmentSignal.entry_down_price, MisalignmentSignal.entry_up_price,
+        MisalignmentSignal.direction,
+    ).where(MisalignmentSignal.status == "SETTLED")
+    if visible_versions is not None:
+        sh_stmt = sh_stmt.where(MisalignmentSignal.version.in_(visible_versions))
     sh_rows = (await db.execute(
-        sa_select(
-            MisalignmentSignal.version, MisalignmentSignal.window_start,
-            MisalignmentSignal.win, MisalignmentSignal.ev_at_entry,
-            MisalignmentSignal.entry_down_price, MisalignmentSignal.entry_up_price,
-            MisalignmentSignal.direction,
-        )
-        .where(MisalignmentSignal.status == "SETTLED")
-        .order_by(MisalignmentSignal.window_start)
+        sh_stmt.order_by(MisalignmentSignal.window_start)
     )).all()
     # KREV/反转/nextbar/combo（kline_shadow_signals 表）：K 线族影子，结算口径为次根 K 线涨跌；
     # 2026-09-03 起落库目标窗真实入场报价（entry_up/down_price），聚合层按 direction 取
     # 对应侧 q 现算真实 EV（赢 0.98/q−1 / 输 −1）；报价缺失/冷启动回补行 entry 为 NULL →
     # 该笔 EV 不计（与旧「纯 K 线无报价」口径兼容）。ev_at_entry 仍未落库（恒 None，兜底现算）。
+    kline_versions = set(visible_versions or ()) | event_versions if active_only else None
+    krev_stmt = sa_select(
+        KlineShadowSignal.version,
+        KlineShadowSignal.target_bar_start.label("window_start"),
+        KlineShadowSignal.win,
+        sa_literal(None).label("ev_at_entry"),
+        KlineShadowSignal.entry_down_price.label("entry_down_price"),
+        KlineShadowSignal.entry_up_price.label("entry_up_price"),
+        KlineShadowSignal.direction.label("direction"),
+        KlineShadowSignal.feature_snapshot.label("feature_snapshot"),
+    ).where(KlineShadowSignal.status == "SETTLED")
+    if kline_versions is not None:
+        krev_stmt = krev_stmt.where(KlineShadowSignal.version.in_(kline_versions))
     krev_rows = (await db.execute(
-        sa_select(
-            KlineShadowSignal.version,
-            KlineShadowSignal.target_bar_start.label("window_start"),
-            KlineShadowSignal.win,
-            sa_literal(None).label("ev_at_entry"),
-            KlineShadowSignal.entry_down_price.label("entry_down_price"),
-            KlineShadowSignal.entry_up_price.label("entry_up_price"),
-            KlineShadowSignal.direction.label("direction"),
-            KlineShadowSignal.feature_snapshot.label("feature_snapshot"),
-        )
-        .where(KlineShadowSignal.status == "SETTLED")
-        .order_by(KlineShadowSignal.target_bar_start)
+        krev_stmt.order_by(KlineShadowSignal.target_bar_start)
     )).all()
     # 蜡烛组合主/对照/组件/潜力版本共享同一物理事件。统计层按标签展开只读视图，
     # 保留各冻结 ID 的独立前向曲线，但原始表仍每周期每根至多一行。
@@ -4417,78 +4446,73 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
     # 结算口径=目标根收阴（押 DOWN），入场报价=触及时刻 DOWN 真实报价；仅 TOUCHED 行
     # 进 SETTLED（其余入场态无结算不进面板）。逐笔 EV 未落库（ev 恒 None），
     # 聚合时按 entry_down_quote 兜底现算实现 EV（_shadow_realized_ev）。
+    pattern_stmt = sa_select(
+        PatternShadowSignal.version,
+        PatternShadowSignal.target_bar_start.label("window_start"),
+        PatternShadowSignal.win,
+        sa_literal(None).label("ev_at_entry"),
+        PatternShadowSignal.entry_down_quote.label("entry_down_price"),
+        sa_literal(None).label("entry_up_price"),
+        sa_literal("DOWN").label("direction"),
+    ).where(PatternShadowSignal.status == "SETTLED")
+    if visible_versions is not None:
+        pattern_stmt = pattern_stmt.where(PatternShadowSignal.version.in_(visible_versions))
     pattern_rows = (await db.execute(
-        sa_select(
-            PatternShadowSignal.version,
-            PatternShadowSignal.target_bar_start.label("window_start"),
-            PatternShadowSignal.win,
-            sa_literal(None).label("ev_at_entry"),
-            PatternShadowSignal.entry_down_quote.label("entry_down_price"),
-            sa_literal(None).label("entry_up_price"),
-            sa_literal("DOWN").label("direction"),
-        )
-        .where(PatternShadowSignal.status == "SETTLED")
-        .order_by(PatternShadowSignal.target_bar_start)
+        pattern_stmt.order_by(PatternShadowSignal.target_bar_start)
     )).all()
     # absorption_follow_v1 族（absorption_shadow_signals 表，2026-09-04 并入）：5m 窗内报价
     # 对 BTC 位移欠反应 → 跟随 btc 补涨的影子重放，TD 时刻真实 token 价入场、按本窗 outcome
     # 结算（归档后处理直接落 SETTLED）。逐笔 ev_at_entry 已落库（真实价口径），聚合直读；
     # entry_up/down_price 按 direction 取对应侧 q 供盈亏平衡/兜底现算。
+    absorption_stmt = sa_select(
+        AbsorptionShadowSignal.version,
+        AbsorptionShadowSignal.window_start,
+        AbsorptionShadowSignal.win,
+        AbsorptionShadowSignal.ev_at_entry,
+        AbsorptionShadowSignal.entry_down_price,
+        AbsorptionShadowSignal.entry_up_price,
+        AbsorptionShadowSignal.direction,
+    ).where(AbsorptionShadowSignal.status == "SETTLED")
+    if visible_versions is not None:
+        absorption_stmt = absorption_stmt.where(AbsorptionShadowSignal.version.in_(visible_versions))
     absorption_rows = (await db.execute(
-        sa_select(
-            AbsorptionShadowSignal.version,
-            AbsorptionShadowSignal.window_start,
-            AbsorptionShadowSignal.win,
-            AbsorptionShadowSignal.ev_at_entry,
-            AbsorptionShadowSignal.entry_down_price,
-            AbsorptionShadowSignal.entry_up_price,
-            AbsorptionShadowSignal.direction,
-        )
-        .where(AbsorptionShadowSignal.status == "SETTLED")
-        .order_by(AbsorptionShadowSignal.window_start)
+        absorption_stmt.order_by(AbsorptionShadowSignal.window_start)
     )).all()
     sh_rows = list(sh_rows) + list(krev_rows) + list(pattern_rows) + list(absorption_rows)
     # firsthit_down 族（firsthit_shadow_signals 表，2026-09-07 并入）：5m 窗内 DOWN 报价首次
     # 进入 (0.005,0.1] → 以该报价买 DOWN 的前向重放。三 version（G0 基底 / G1 body_r≤0.35 /
     # G3 chg≤+2.82bp）同表隔离；归档后处理直接落 SETTLED（无 PENDING）；npts≥8 路径质量门；
     # 逐笔 ev_at_entry 已落库（真实触发价口径），聚合直读；direction 恒 DOWN。
+    firsthit_stmt = sa_select(
+        FirstHitShadowSignal.version,
+        FirstHitShadowSignal.window_start,
+        FirstHitShadowSignal.win,
+        FirstHitShadowSignal.ev_at_entry,
+        FirstHitShadowSignal.entry_down_price,
+        sa_literal(None).label("entry_up_price"),
+        sa_literal("DOWN").label("direction"),
+    ).where(FirstHitShadowSignal.status == "SETTLED")
+    if visible_versions is not None:
+        firsthit_stmt = firsthit_stmt.where(FirstHitShadowSignal.version.in_(visible_versions))
     firsthit_rows = (await db.execute(
-        sa_select(
-            FirstHitShadowSignal.version,
-            FirstHitShadowSignal.window_start,
-            FirstHitShadowSignal.win,
-            FirstHitShadowSignal.ev_at_entry,
-            FirstHitShadowSignal.entry_down_price,
-            sa_literal(None).label("entry_up_price"),
-            sa_literal("DOWN").label("direction"),
-        )
-        .where(FirstHitShadowSignal.status == "SETTLED")
-        .order_by(FirstHitShadowSignal.window_start)
+        firsthit_stmt.order_by(FirstHitShadowSignal.window_start)
     )).all()
     sh_rows = sh_rows + list(firsthit_rows)
-    # 版本顺序以统一注册表为权威口径；历史未知版本仍追加，避免旧数据从 API 消失。
-    from .services.shadow_execution_registry import SHADOW_VERSION_SPECS, SHADOW_VERSIONS
-    from .services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
-
-    # 物理 candle event 不直接展示；前端只看由标签还原的 18 个逻辑版本。
-    event_versions = {"candle_hm_bull_5m_event_v1", "candle_hm_bull_15m_event_v1"}
+    # 完整审计口径保留所有注册/历史未知版本；分析页只返回当前在线或实盘中的版本。
     versions = [version for version in SHADOW_VERSIONS if version not in event_versions]
     versions += list(CANDLESTICK_SIGNAL_IDS)
     versions += sorted({s.version for s in sh_rows} - set(versions))
-    # 影子版本 → 实盘通道状态（version==通道名，2026-09-06 promote + x4_v3 注册后 13 通道；
-    # 一次 status_async 拉全量按 channel 建索引，执行器未装配/查询失败 → 空表兜底）
+    if visible_versions is not None:
+        versions = [version for version in versions if version in visible_versions]
     from .services.live_channels import LIVE_CHANNELS, RETIRED_CHANNEL_SPECS
 
-    live_by_ch: dict[str, dict] = {}
-    if multi_live_trader is not None:
-        try:
-            _live_st = await multi_live_trader.status_async()
-            live_by_ch = {c["channel"]: c for c in _live_st["channels"]}
-        except Exception as exc:
-            logger.warning("信号分析：实盘通道状态查询失败 | {}", exc)
+    rows_by_version: dict[str, list] = {}
+    for row in sh_rows:
+        if row.win is not None:
+            rows_by_version.setdefault(row.version, []).append(row)
     shadow = {}
     for v in versions:
-        g = [s for s in sh_rows if s.version == v and s.win is not None]
+        g = rows_by_version.get(v, [])
         # 对应通道的执行参数（优先从实盘通道状态读当前生效护栏，缺省从 LIVE_CHANNELS / RETIRED_CHANNEL_SPECS 读预设）
         ch_spec = LIVE_CHANNELS.get(v) or RETIRED_CHANNEL_SPECS.get(v)
         active_lc = live_by_ch.get(v)
@@ -4645,6 +4669,8 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
             "momentum_fade": "scene_momentum_fade",
         }.get(pt)
         scene_live = live_by_ch.get(scene_channel or "")
+        if active_only and not (scene_live and scene_live["enabled"]):
+            continue
         scene[pt] = {
             "summary": {
                 "n": n,
@@ -4666,21 +4692,22 @@ async def get_signals_analytics(db: AsyncSession = Depends(get_db)):
         }
 
     # ---- 周期归因：场景 + 影子合并的 pre/pump 切分、逐影子版本拆分与按天胜率 ----
+    visible_shadow_rows = [
+        row for row in sh_rows if row.win is not None and row.version in shadow
+    ]
+    visible_scene_types = set(scene)
     pairs: list[tuple[int, bool]] = [
-        (s.window_start, bool(s.win))
-        for s in sh_rows if s.win is not None
+        (s.window_start, bool(s.win)) for s in visible_shadow_rows
     ]
     pairs += [
         (r.signal_time, r.settle_outcome == ("DOWN" if r.side == "high" else "UP"))
-        for rows_pt in by_pt.values() for r in rows_pt
+        for pt, rows_pt in by_pt.items() if pt in visible_scene_types for r in rows_pt
     ]
     phases: dict[str, list[int]] = {}
     daily: dict[str, list[int]] = {}
     # 逐影子版本 × 阶段（对齐审计报告「表二」的归因维度）
     by_version: dict[str, dict[str, dict]] = {}
-    for s in sh_rows:
-        if s.win is None:
-            continue
+    for s in visible_shadow_rows:
         ph = "pump" if s.window_start >= PUMP_TS_MS else "pre"
         g = by_version.setdefault(s.version, {}).setdefault(ph, {"n": 0, "wins": 0})
         g["n"] += 1
@@ -4721,6 +4748,7 @@ async def get_signals_execution_comparison(
     to_ts: int | None = Query(default=None, alias="to"),
     market_period: str | None = None,
     include_retired: bool = False,
+    active_only: bool = False,
     db: AsyncSession = Depends(get_db),
 ):
     """Compare theoretical shadow returns with executable and actual facts."""
@@ -4729,6 +4757,23 @@ async def get_signals_execution_comparison(
 
     from .services.shadow_execution_analytics import build_execution_comparison
 
+    active_versions = None
+    if active_only:
+        live_by_ch = _current_live_channels()
+        active_versions = {
+            version for version in SHADOW_BENCH
+            if not shadow_gate.is_retired(version)
+            and (shadow_gate.is_enabled(version) or live_by_ch.get(version, {}).get("enabled"))
+        }
+        from .services.candlestick_shadow_detector import (
+            CANDLESTICK_LOGICAL_SPECS, EVENT_VERSION_BY_TF,
+        )
+        for timeframe, event_version in EVENT_VERSION_BY_TF.items():
+            if any(
+                spec["timeframe"] == timeframe and spec["signal_id"] in active_versions
+                for spec in CANDLESTICK_LOGICAL_SPECS
+            ):
+                active_versions.add(event_version)
     return await build_execution_comparison(
         db,
         policy_version=policy_version,
@@ -4736,6 +4781,7 @@ async def get_signals_execution_comparison(
         to_ts=to_ts,
         market_period=market_period,
         include_retired=include_retired,
+        signal_versions=active_versions,
     )
 
 

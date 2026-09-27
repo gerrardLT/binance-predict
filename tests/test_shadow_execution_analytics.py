@@ -58,6 +58,18 @@ class Result:
 
 
 @pytest.mark.asyncio
+async def test_execution_comparison_filters_signal_versions_in_query():
+    session = SimpleNamespace(execute=AsyncMock(return_value=Result([])))
+
+    await build_execution_comparison(session, signal_versions={"x4_v2", "krev_a_v1"})
+
+    stmt = session.execute.await_args.args[0]
+    sql = str(stmt.compile(compile_kwargs={"literal_binds": True}))
+    assert "signal_version IN ('x4_v2', 'krev_a_v1')" in sql or (
+        "signal_version IN ('krev_a_v1', 'x4_v2')" in sql
+    )
+
+@pytest.mark.asyncio
 async def test_empty_response_has_null_rates_and_is_json_serializable():
     session = SimpleNamespace(execute=AsyncMock(return_value=Result([])))
 

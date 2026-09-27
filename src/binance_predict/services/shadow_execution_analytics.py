@@ -276,6 +276,7 @@ async def build_execution_comparison(
     session: AsyncSession, *, policy_version: str | None = None,
     from_ts: int | None = None, to_ts: int | None = None,
     market_period: str | None = None, include_retired: bool = False,
+    signal_versions: set[str] | None = None,
 ) -> dict[str, Any]:
     """Load bounded ledger facts in two queries and return the comparison contract."""
     stmt = select(ShadowExecutionAssessment)
@@ -287,6 +288,8 @@ async def build_execution_comparison(
         stmt = stmt.where(ShadowExecutionAssessment.target_window_start < to_ts)
     if market_period is not None:
         stmt = stmt.where(ShadowExecutionAssessment.market_period == market_period)
+    if signal_versions is not None:
+        stmt = stmt.where(ShadowExecutionAssessment.signal_version.in_(signal_versions))
     if not include_retired:
         stmt = stmt.where(ShadowExecutionAssessment.retired.is_not(True))
     stmt = stmt.order_by(ShadowExecutionAssessment.target_window_start, ShadowExecutionAssessment.id)

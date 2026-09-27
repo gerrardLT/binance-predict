@@ -607,9 +607,9 @@ const api = {
   getFakeBreakoutStats: () => authFetch('/api/fake-breakout/stats').then(r => r.json()),
   getBtcKlines: (interval: string, limit: number) =>
     authFetch(`/api/chart/btc-klines?interval=${interval}&limit=${limit}`).then(r => r.json()),
-  getSignalsAnalytics: () => authFetch('/api/signals/analytics').then(r => r.json()),
+  getSignalsAnalytics: () => authFetch('/api/signals/analytics?active_only=true').then(r => r.json()),
   getSignalsExecutionComparison: (): Promise<ExecutionComparison> =>
-    authFetch('/api/signals/execution-comparison').then(r => {
+    authFetch('/api/signals/execution-comparison?active_only=true').then(r => {
       if (!r.ok) throw new Error(`HTTP ${r.status}`)
       return r.json() as Promise<ExecutionComparison>
     }),
@@ -6501,6 +6501,7 @@ function SignalAnalyticsTab() {
   const [analytics, setAnalytics] = useState<SignalsAnalytics | null>(null)
   const [executionComparison, setExecutionComparison] = useState<ExecutionComparison | null>(null)
   const [executionUnavailable, setExecutionUnavailable] = useState('')
+  const [executionRequested, setExecutionRequested] = useState(false)
   const [klines, setKlines] = useState<BtcKline[]>([])
   const [kinterval, setKinterval] = useState<'1d' | '1h'>('1d')
   const [autoRefresh, setAutoRefresh] = useState(true)
@@ -6511,20 +6512,6 @@ function SignalAnalyticsTab() {
 
   const load = useCallback(() => {
     const id = ++reqIdRef.current
-    api.getSignalsExecutionComparison().then(value => {
-      if (id !== reqIdRef.current) return
-      if (isExecutionComparison(value)) {
-        setExecutionComparison(value)
-        setExecutionUnavailable('')
-      } else {
-        setExecutionComparison(null)
-        setExecutionUnavailable('执行对比暂不可用：后端返回格式不兼容。')
-      }
-    }).catch(() => {
-      if (id !== reqIdRef.current) return
-      setExecutionComparison(null)
-      setExecutionUnavailable('执行对比暂不可用：当前后端未提供该数据。')
-    })
     Promise.all([
       api.getSignalsAnalytics(),
       api.getBtcKlines(kinterval, kinterval === '1d' ? 30 : 168),
@@ -6537,6 +6524,21 @@ function SignalAnalyticsTab() {
       if (id === reqIdRef.current) setErr(`请求失败: ${(e as Error).message}`)
     })
   }, [kinterval])
+
+  const loadExecutionComparison = useCallback(() => {
+    api.getSignalsExecutionComparison().then(value => {
+      if (isExecutionComparison(value)) {
+        setExecutionComparison(value)
+        setExecutionUnavailable('')
+      } else {
+        setExecutionComparison(null)
+        setExecutionUnavailable('执行对比暂不可用：后端返回格式不兼容。')
+      }
+    }).catch(() => {
+      setExecutionComparison(null)
+      setExecutionUnavailable('执行对比暂不可用：当前后端未提供该数据。')
+    })
+  }, [])
 
   useEffect(() => { load() }, [load])
   useEffect(() => {
@@ -6580,25 +6582,10 @@ function SignalAnalyticsTab() {
   const shadowEntries: [string, { label: string; color: string }][] = analytics
     ? Object.keys(analytics.shadow).map((k, i) => [k, metaFor(SHADOW_META)(k, i)])
     : []
-  /* 2026-09-07 退役 / 在线分区（纯前端，不碰后端）：口径源是后端已下发的
-     summary.retired（= shadow_gate.is_retired，RETIRED_VERSIONS 硬闸）。
-     退役版本代码级停发、不再产生新样本，与在线版本混在同一张表/同一张图里会让
-     「曲线末端」语义混淆（在线=前向进展，退役=最后采集点），故拆成两张卡片：
-     在线区看前向验证，退役区只作历史审计。颜色仍按全量序号分配（跨区不重排），
-     faded 淡化按各区自身序号，保证每区前十条都是实色。 */
-  const isRetiredVer = (k: string) => analytics?.shadow[k]?.summary.retired === true
-  const mergeSub = (keys: Set<string>) =>
-    analytics
-      ? mergeCurves(
-          Object.fromEntries(Object.entries(analytics.shadow).filter(([k]) => keys.has(k))),
-          SHADOW_META,
-        )
-      : []
-  const activeShadowEntries = shadowEntries.filter(([k]) => !isRetiredVer(k))
+  // 后端 active_only 已排除下线与退役版本；页面只渲染当前在线信号。
+  const activeShadowEntries = shadowEntries
   const featuredShadowKeys = ['s1_dyn_sq_v1'].filter(k => activeShadowEntries.some(([key]) => key === k))
-  const retiredShadowEntries = shadowEntries.filter(([k]) => isRetiredVer(k))
-  const activeShadowRows = mergeSub(new Set(activeShadowEntries.map(([k]) => k)))
-  const retiredShadowRows = mergeSub(new Set(retiredShadowEntries.map(([k]) => k)))
+  const activeShadowRows = analytics ? mergeCurves(analytics.shadow, SHADOW_META) : []
 
 function ShadowSignalCard({
   title,
@@ -6770,9 +6757,8 @@ function ShadowSignalCard({
               onChange={e => setStatusFilter(e.target.value as 'ALL' | 'ONLINE' | 'OFFLINE' | 'LIVE')}
               className={selectCls}
             >
-              <option value="ALL">全部状态</option>
+              <option value="ALL">全部在线信号</option>
               <option value="ONLINE">仅在线采集</option>
-              <option value="OFFLINE">仅已下线</option>
               <option value="LIVE">仅实盘中</option>
             </select>
           )}
@@ -7557,31 +7543,18 @@ function RegimeByVersionTable({
       )}
 
       {/* 执行漏斗已与“实盘表现诊断”高度重叠，默认收进 details，保留审计能力但不再占主页面。 */}
-      <details className="ds-card">
-        <summary className="cursor-pointer px-4 py-3 text-sm font-semibold text-ink-95">高级审计：理论影子 → 实盘执行漏斗</summary>
+      <details
+        className="ds-card"
+        onToggle={e => {
+          if (e.currentTarget.open && !executionRequested) {
+            setExecutionRequested(true)
+            loadExecutionComparison()
+          }
+        }}
+      >
+        <summary className="cursor-pointer px-4 py-3 text-sm font-semibold text-ink-95">高级审计：理论影子 → 实盘执行漏斗（展开后加载）</summary>
         <div className="px-2 pb-2"><ShadowExecutionComparisonCard data={executionComparison} unavailable={executionUnavailable} /></div>
       </details>
-
-      {/* 影子退役区：momentum 族 / contrarian v1系 / x4_v1 / HM 族 已于 2026-09-04 永久下线，
-          只作历史审计（代码级硬闸停发，toggle API 拒绝上线），不与在线版本混排 */}
-      {analytics && (
-        <ShadowSignalCard
-          title={`影子信号·已退役历史（${retiredShadowEntries.length} 版）：冻结基准 vs 历史累计胜率`}
-          entries={retiredShadowEntries}
-          rows={retiredShadowRows}
-          analytics={analytics}
-          load={load}
-          pumpTs={pumpTs}
-          isRetired={true}
-          emptyHint="当前无已退役影子版本"
-          footnote={
-            <>
-              本区版本均为 2026-09-04 永久下线（代码级硬闸停发，不可重新上线），不再产生新样本，
-              曲线末端即最后采集点；冻结 bench 基准与历史曲线保留供审计，退役理由见版本名旁「?」悬浮说明。
-            </>
-          }
-        />
-      )}
 
       {/* 固定 2026-08-19 的历史大涨切片已过时且与现有 regime 分析重叠，仅保留折叠审计。 */}
       <details className="ds-card">

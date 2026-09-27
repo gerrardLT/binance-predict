@@ -59,6 +59,7 @@ async def test_execution_comparison_route_forwards_scope(monkeypatch) -> None:
         "to_ts": 200,
         "market_period": "15m",
         "include_retired": True,
+        "signal_versions": None,
     }
     assert out["scope"]["policy_version"] == "policy-a"
 
@@ -362,6 +363,32 @@ async def test_s2_optimized_shadow_appears_in_analytics() -> None:
         "scene_bear_exhaust_opt_v1"
     )
 
+
+@pytest.mark.asyncio
+async def test_analytics_active_only_hides_offline_and_retired_versions(monkeypatch) -> None:
+    """分析页只返回仍在线采集或仍在实盘执行的信号，历史下线版本不传给前端。"""
+    import binance_predict.main as m
+
+    monkeypatch.setattr(m.shadow_gate, "is_retired", lambda version: version == "x4_v1")
+    monkeypatch.setattr(
+        m.shadow_gate, "is_enabled",
+        lambda version: version not in {"x4_v1", "x4_v2", "krev_a_v1"},
+    )
+    monkeypatch.setattr(m, "multi_live_trader", SimpleNamespace(status=MagicMock(return_value={
+        "channels": [{
+            "channel": "krev_a_v1", "enabled": True,
+            "amount_usdt": 2.0, "max_daily_orders": 100, "max_exec_price": 0.629,
+        }],
+    })))
+    out = await m.get_signals_analytics(_make_db([], []), active_only=True)
+
+    assert "x4_v1" not in out["shadow"]
+    assert "x4_v2" not in out["shadow"]
+    assert "krev_a_v1" in out["shadow"]  # 影子虽关闭，但实盘仍开，不能从分析页消失
+    assert out["shadow"]["krev_a_v1"]["summary"]["execution_mode"] == "LIVE_ACTIVE"
+    assert all(block["summary"]["enabled"] for version, block in out["shadow"].items()
+               if version != "krev_a_v1")
+    assert out["scene"] == {}  # 测试替身未提供已开启的正式场景通道
 
 @pytest.mark.asyncio
 async def test_analytics_empty_db() -> None:
@@ -812,7 +839,7 @@ async def test_analytics_live_channel_field(monkeypatch) -> None:
                for b in out["shadow"].values())
 
     # 装配替身：nextbar + KREV 通道在册（状态直通下发，不查 DB）
-    fake = SimpleNamespace(status_async=AsyncMock(return_value={
+    fake = SimpleNamespace(status=MagicMock(return_value={
         "channels": [{
             "channel": "nb_zschamp_15m_v1", "enabled": False,
             "amount_usdt": 2.0, "max_daily_orders": 100, "max_exec_price": 0.57,
@@ -851,7 +878,7 @@ async def test_analytics_live_channel_field(monkeypatch) -> None:
     assert out2["shadow"]["krev_a_v1"]["summary"]["execution_mode"] == "LIVE_AVAILABLE"
     # 未出现在执行器状态中的版本仍为 None；状态只拉一次，非逐版本查询。
     assert out2["shadow"]["combo_p1_v1"]["summary"]["live_channel"] is None
-    assert fake.status_async.await_count == 1
+    assert fake.status.call_count == 1
 
 
 @pytest.mark.asyncio
