@@ -410,6 +410,7 @@ async def test_analytics_empty_db() -> None:
         "absorption_follow_td120_v1", "absorption_follow_td150_v1",
         "s2_cond_t4_v1", "s2_cond_t5d_v1", "scene_bear_exhaust_opt_v1",
         "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1",
+        "firsthit_down_k10_v1", "firsthit_down_k10_profit_v1",
         # 2026-09-08 首触 G4 交互门（G1∩G3）
         "firsthit_down_g4_v1",
         # 2026-09-08 首触 G7 系列六变体

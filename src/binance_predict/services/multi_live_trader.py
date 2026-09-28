@@ -78,7 +78,9 @@ from .shadow_execution_store import (
 from .shadow_execution_types import AssessmentPatch, ReasonCode, TerminalStage
 from .firsthit_shadow_detector import (
     FIRSTHIT_SPECS,
+    K10_VERSIONS,
     extract_firsthit_features,
+    extract_k10_kline_features,
     _gate_of as firsthit_gate_of,
 )
 from .live_channels import (
@@ -168,7 +170,11 @@ def _resolve_firsthit_dynamic_guard(spec, cfg, ext: dict,
     # 基础护拦 = 触发价 × 3% 容忍度（关键修复：替代绝对阈值防逆选择）
     base = q * FIRSTHIT_SLIPPAGE_TOL_RATIO
     
-    # 微调项：只收紧不放松（同旧逻辑，但基准已从绝对改为相对）
+    # K10策略门已完全冻结；成交层只保留统一3%滑点保护，不再叠加旧先验过滤。
+    if spec.channel in K10_VERSIONS:
+        return round(max(FIRSTHIT_DYNAMIC_GUARD_CLAMP_LO, base), 4)
+
+    # 旧 firsthit 版本保持原微调，避免本次接入改变既有生产行为。
     adj = 0.0
     
     # 调整项 1：前驱连阳状态（streak_up ≥ 2 已被盘前 veto 拦截，
@@ -207,9 +213,10 @@ class MultiLiveTrader:
         self._tasks: set[asyncio.Task] = set()   # 在途任务（下单/核验/回填/自愈/轮询）
         # 余额缓存作废钩子（main 装配区注入：services 层不反向 import main，用回调解耦）
         self._on_balance_change = None
-        # 15m K 线拉取回调（main 装配注入 collector.fetch_recent_klines）；
-        # 未注入 → v3 非连涨门禁保守不开火（与影子「collector 缺失不落 v3」同口径）
+        # K 线拉取回调（main 装配注入）。recent 供既有门禁；ending_at 给 K10
+        # 严格截断到窗口开始前，缺失则 K10 保守不开火。
         self.kline_fetcher = None
+        self.kline_ending_at_fetcher = None
         # 吸收/欠反应跟随标定源（main 装配注入 AbsorptionShadowDetector 实例；
         # 未注入 → absorption 族通道保守不开火，与 kline_fetcher 同 fail-safe 模式）
         self.absorption_calibrator = None
@@ -635,20 +642,29 @@ class MultiLiveTrader:
                     cfg = self._configs[ch]
                     if not cfg.enabled or window_start_ms in cfg.fired:
                         continue
-                    if quick_veto is not None:
+                    if quick_veto is not None and ch not in K10_VERSIONS:
                         logger.info(
                             "多通道实盘：{} 盘前快速否决 | 窗口 {} | {}",
                             ch, _fmt_win(window_start_ms), quick_veto)
-                        continue                     # 不占 fired：否决非尝试，后续采样仍可触发
-                    # 版本门同步判定（保持旧语义：纯特征门未过不进 fired 不派任务）；
-                    # g7_streak/g7_strict 的门依赖 streak_up，延后到异步任务复核。
-                    if ch not in ("g7_streak_v1", "g7_strict_v1"):
-                        if not firsthit_gate_of(ch, ext):
+                        continue                     # K10 只走冻结研究门；旧通道行为不变
+                    # K10 必须按真实首触时点锁定 BTC 前缀，并异步取窗口开始前 K 线；
+                    # 旧通道继续使用成熟路径语义，避免改变既有生产行为。
+                    version_ext = ext
+                    if ch in K10_VERSIONS:
+                        version_ext = extract_firsthit_features(
+                            window_start_ms, float(window_entry_price),
+                            window_down_curve, window_btc_curve,
+                            max_trigger_ts=int(ts_ms), pin_path_to_first_touch=True,
+                        )
+                        if version_ext is None:
+                            continue
+                    elif ch not in ("g7_streak_v1", "g7_strict_v1"):
+                        if not firsthit_gate_of(ch, version_ext):
                             continue                     # 门未过 → 不占 fired、不派任务
-                    # ✅ 关键修复#1：fired 占位延迟到异步任务内完成（见_verify_firsthit_all_gates）
-                    # 这样避免 Gate fail 仍占用同窗互斥槽的问题
+                    if ch in K10_VERSIONS:
+                        cfg.fired.add(window_start_ms)  # K线I/O期间防重复派生；失败后本窗不追单
                     task = asyncio.create_task(
-                        self._verify_firsthit_all_gates(ch, window_start_ms, ext),
+                        self._verify_firsthit_all_gates(ch, window_start_ms, version_ext),
                         name=f"live_firsthit_{ch}_{window_start_ms}",
                     )
                     self._tasks.add(task)
@@ -1573,6 +1589,14 @@ class MultiLiveTrader:
             logger.warning("多通道实盘：首触下单任务异常 | {} | {} | {}",
                            channel, win_label, exc)
 
+    async def _load_k10_features(
+        self, window_start: int, trigger_ts: int,
+    ) -> dict | None:
+        if self.kline_ending_at_fetcher is None:
+            return None
+        klines = await self.kline_ending_at_fetcher("5m", 13, window_start)
+        return extract_k10_kline_features(window_start, trigger_ts, klines)
+
     async def _verify_firsthit_all_gates(self, channel: str, window_start: int, ext: dict) -> None:
         """firsthit 统一异步核验任务（2026-09-10 优化版，取代 _verify_firsthit_streak_and_fire）：
         查前驱 5m 连阳 streak_up → 盘前过滤器 veto（streak 维度）→ 版本门 → 开火。
@@ -1584,32 +1608,43 @@ class MultiLiveTrader:
         """
         win_label = _fmt_win(window_start)
         try:
-            streak_up = 0
-            L_ms = 300_000
-            async with async_session_factory() as session:
-                prev_wins = (await session.execute(
-                    sa_select(SentimentWindow.actual_return)
-                    .where(
-                        SentimentWindow.start_time >= window_start - 4 * L_ms,
-                        SentimentWindow.start_time < window_start,
-                    )
-                    .order_by(SentimentWindow.start_time.desc())
-                )).scalars().all()
-                for ret_val in prev_wins:
-                    if ret_val is not None and float(ret_val) > 0:
-                        streak_up += 1
-                    else:
-                        break
-            veto = _firsthit_pre_market_veto(ext, streak_up)
+            streak_up = None
+            if channel not in K10_VERSIONS:
+                streak_up = 0
+                L_ms = 300_000
+                async with async_session_factory() as session:
+                    prev_wins = (await session.execute(
+                        sa_select(SentimentWindow.actual_return)
+                        .where(
+                            SentimentWindow.start_time >= window_start - 4 * L_ms,
+                            SentimentWindow.start_time < window_start,
+                        )
+                        .order_by(SentimentWindow.start_time.desc())
+                    )).scalars().all()
+                    for ret_val in prev_wins:
+                        if ret_val is not None and float(ret_val) > 0:
+                            streak_up += 1
+                        else:
+                            break
+            veto = None if channel in K10_VERSIONS else _firsthit_pre_market_veto(ext, streak_up)
             if veto is not None:
                 logger.info("多通道实盘：{} 盘前过滤拦截 | 窗口 {} | {}",
                             channel, win_label, veto)
                 return
-            if not firsthit_gate_of(channel, ext, streak_up=streak_up):
+            k10 = None
+            if channel in K10_VERSIONS:
+                k10 = await self._load_k10_features(window_start, int(ext["trigger_ts"]))
+                if k10 is None:
+                    logger.info("多通道实盘：{} K10前序K线缺失，弃单 | 窗口 {}",
+                                channel, win_label)
+                    return
+            if not firsthit_gate_of(channel, ext, streak_up=streak_up, k10=k10):
                 logger.info("多通道实盘：{} 版本门未过(streak={})，弃单 | 窗口 {}",
                             channel, streak_up, win_label)
                 return
-            # ✅ 修复#1 完成：veto + gate全部通过后再占位
+            if k10 is not None:
+                ext = {**ext, "k10": k10}
+            # 旧通道门全部通过后占位；K10在派生异步K线任务前已占位防重复。
             cfg = self._configs[channel]
             cfg.fired.add(window_start)
             await self._fire_firsthit(channel, window_start, ext, streak_up=streak_up)

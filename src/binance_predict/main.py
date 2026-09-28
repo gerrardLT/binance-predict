@@ -1195,6 +1195,7 @@ async def lifespan(app: FastAPI):
         # v3 非连涨门禁 K 线源注入（与影子检测器同 collector；未注入时
         # v3 通道保守不开火，与影子「collector 缺失不落 v3」同口径）
         multi_live_trader.kline_fetcher = collector.fetch_recent_klines
+        multi_live_trader.kline_ending_at_fetcher = collector.fetch_klines_ending_at
 
     # 影子版本开关 gate（前端手动下线能力）：先于所有影子检测器启动，保证首轮
     # 落库判定可用；DB 故障保守全在线（fail-safe，不停采集）。
@@ -1398,7 +1399,7 @@ async def lifespan(app: FastAPI):
     # G0 EV CI 上界<0 为整体否决）。影子只记录不下注，物理隔离下单路径。
     global firsthit_shadow_detector
     if settings.firsthit_shadow_enabled:
-        firsthit_shadow_detector = FirstHitShadowDetector()
+        firsthit_shadow_detector = FirstHitShadowDetector(collector=collector)
         await firsthit_shadow_detector.start()
         logger.info("首触反转影子检测器已启动（G0 基底 / G1 body_r≤0.35 / G3 chg≤+2.82bp 三 version；前向验证 4 周，通过标准已预注册；影子只记录不下注）")
 
@@ -4196,6 +4197,8 @@ SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     "firsthit_down_v1": (0.088, 0.234, "首触基底G0: 5m窗内DOWN首次进入(0.005,0.1]→买DOWN（40d全样本4632次，回测胜率8.8%/EV+0.234；前向现算裁决）"),
     "firsthit_down_body_v1": (0.153, 1.493, "首触体貌G1: G0+body_r≤0.35（FDR q=0.007，全样本418次胜率15.3%/EV+1.493，两段CI下界>0；前向现算裁决）"),
     "firsthit_down_chg_v1": (0.108, 0.517, "首触偏离G3: G0+chg≤+2.82bp（全样本1309次胜率10.8%/EV+0.517；前向现算裁决）"),
+    "firsthit_down_k10_v1": (None, None, "首触K10: G3+标准化剩余结算距离z≤1.85567；发现段已污染，不钉历史基准，前向真实首触与完整前序K线现算裁决"),
+    "firsthit_down_k10_profit_v1": (None, None, "首触K10盈利版: K10再剔除前序平方收益扩张∧长上影∧距结算>60s；探索仅筛除17个历史亏损，前向现算裁决"),
     # 首触反转 G4 交互门（2026-09-08 影子+实盘接入）：G4 = G1 ∩ G3
     # shape_scan_v2 冻结扫描：calib n=214 P=12.6% EV+1.03 CI[+0.08,+2.22]；
     # confirm n=86 P=23.3% EV+1.85 CI[+0.35,+3.44]；binom p=0.025 → BH-FDR q=0.063 STRICT_PASS。

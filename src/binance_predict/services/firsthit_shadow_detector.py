@@ -43,6 +43,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from datetime import datetime, timezone
 
 from loguru import logger
@@ -58,6 +59,8 @@ FIRSTHIT_SPECS: list[tuple[str, str]] = [
     ("firsthit_down_v1", "G0 基底（全部首触）"),
     ("firsthit_down_body_v1", "G1 小实体 body_r≤0.35"),
     ("firsthit_down_chg_v1", "G3 价格偏离 chg≤+2.82bp"),
+    ("firsthit_down_k10_v1", "K10 G3+标准化结算距离 z≤1.85567"),
+    ("firsthit_down_k10_profit_v1", "K10盈利版+前序扩张长上影早触 veto"),
     # G4 interaction（shape_scan_v2 已 FDR q=0.063 + confirm STRICT_PASS）：
     # chg_bps ≤ 2.82 ∧ body_r ≤ 0.35，样本量偏小但 EV 极高；注册影子版本用于前向验证
     ("firsthit_down_g4_v1", "G4 交互门 chg≤2.82∧body≤0.35"),
@@ -72,6 +75,10 @@ Q_LO, Q_HI = 0.005, 0.1      # 首触报价区间 (0.005, 0.1]
 BODY_R_GATE = 0.35           # G1 门：路径归一实体 ≤ 0.35
 CHG_BPS_GATE = 2.82          # G3 门：BTC 相对开盘涨幅 ≤ +2.82 bp
 MIN_PTS = 8                  # 路径质量门：触发前 btc 采样点数 ≥ 8（v2 主分析口径）
+K10_VERSIONS = frozenset({"firsthit_down_k10_v1", "firsthit_down_k10_profit_v1"})
+K10_Z_MAX = 1.8556725686410152
+K10_MAX_BTC_AGE_MS = 15_000
+K10_KLINE_MS = 300_000
 
 FEE_RET = 0.98               # EV = 赢 0.98/q−1 / 输 −1（费 2%，无溢价，回测口径）
 POLL_INTERVAL = 60.0         # 轮询间隔（秒）
@@ -109,6 +116,7 @@ def extract_firsthit_features(
     btc_curve: list | None,
     *,
     max_trigger_ts: int | None = None,
+    pin_path_to_first_touch: bool = False,
 ) -> dict | None:
     """首触特征纯函数：归档影子与实时实盘共用，防止两套公式漂移。
 
@@ -124,11 +132,14 @@ def extract_firsthit_features(
     start = int(window_start)
     dn_p = _ser(down_curve)
     btc = _ser(btc_curve)
-
     # 首触：升序采样中第一个 down_price ∈ (Q_LO, Q_HI] 的点
     trig = None
     for p in dn_p:
         ts = int(p["t"])
+        if pin_path_to_first_touch and ts < start:
+            continue
+        if pin_path_to_first_touch and ts >= start + K10_KLINE_MS:
+            break
         if max_trigger_ts is not None and ts > int(max_trigger_ts):
             break
         v = float(p["v"])
@@ -139,6 +150,17 @@ def extract_firsthit_features(
         return None
     q = float(trig["v"])
     trigger_ts = int(trig["t"])
+    if pin_path_to_first_touch:
+        # 只检查决策前缀；首触后的冲突脏点不能取消已发生的信号。
+        for points in (dn_p, btc):
+            seen: dict[int, float] = {}
+            for point in points:
+                ts, value = int(point["t"]), float(point["v"])
+                if not (start <= ts <= trigger_ts):
+                    continue
+                if ts in seen and seen[ts] != value:
+                    return None
+                seen[ts] = value
 
     # 开盘 BTC 基准：调用方优先提供 entry_price，缺失时回退 btc 曲线首点
     bo = float(btc_open) if (btc_open is not None and float(btc_open) > 0) else (
@@ -146,14 +168,22 @@ def extract_firsthit_features(
     if not bo or bo <= 0:
         return None
 
-    # KEY FIX: 触发前路径使用 max_trigger_ts（当前采样时刻的最新历史），而非仅≤trigger_ts
-    # 这允许早期首触窗口在 t≥105s 后 npts 达标时正常开火，而不是永久被扼杀。
-    pre = [float(p["v"]) for p in btc if int(p["t"]) <= int(max_trigger_ts)] if max_trigger_ts else [float(p["v"]) for p in btc if int(p["t"]) <= trigger_ts]
+    # 旧 firsthit 版本允许早触后等待路径成熟；K10 研究口径严格锁定真实首触前缀。
+    path_limit = trigger_ts if pin_path_to_first_touch else (
+        int(max_trigger_ts) if max_trigger_ts is not None else trigger_ts)
+    pre_points = [
+        p for p in btc
+        if int(p["t"]) <= path_limit
+        and (not pin_path_to_first_touch or start <= int(p["t"]) < start + K10_KLINE_MS)
+    ]
+    pre = [float(p["v"]) for p in pre_points]
     npts = len(pre)
     if npts < MIN_PTS:
         return None                                    # 路径质量门（v2 主分析口径）
     if pre[-1] <= 0:
         return None
+    if pin_path_to_first_touch and trigger_ts - int(pre_points[-1]["t"]) > K10_MAX_BTC_AGE_MS:
+        return None                                    # K10 冻结口径：首触 BTC 年龄≤15s
     pts = [bo] + pre
     btc_trig = pre[-1]                                 # 触发时刻 btc = ≤max_trigger_ts 的最后一点
 
@@ -174,6 +204,63 @@ def extract_firsthit_features(
         chg_bps=chg_bps, body_r=body_r, wick01=wick01, upper_wick_bps=upper_wick_bps,
         rng_bps=rng_bps, npts=npts, dvol=None, dpar=None,
     )
+
+
+def extract_k10_kline_features(
+    window_start: int,
+    trigger_ts: int,
+    klines: list[dict] | None,
+) -> dict | None:
+    """K10/K10盈利版的完整前序 K 线特征；严格按窗口开始时刻截断。"""
+    start = int(window_start)
+    by_open: dict[int, tuple[float, float, float, float]] = {}
+    for bar in klines or []:
+        try:
+            t = int(bar["open_time"])
+            o, h, low, c = (float(bar[k]) for k in ("open", "high", "low", "close"))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if all(math.isfinite(v) and v > 0 for v in (o, h, low, c)) and low <= min(o, c) <= max(o, c) <= h:
+            by_open[t] = (o, h, low, c)
+
+    # K10：紧邻窗口前 12 根完整 5m bar（s-300s ... s-3600s）。
+    k10_bars = [by_open.get(start - i * K10_KLINE_MS) for i in range(1, 13)]
+    # 盈利版：隔离最近一根，使用 s-600s ... s-3900s。
+    profit_bars = [by_open.get(start - i * K10_KLINE_MS) for i in range(2, 14)]
+    if any(bar is None for bar in k10_bars):
+        return None
+
+    returns = [math.log(bar[3] / bar[0]) for bar in k10_bars]
+    mean = sum(returns) / len(returns)
+    std = math.sqrt(sum((value - mean) ** 2 for value in returns) / len(returns))
+    remaining_seconds = (start + K10_KLINE_MS - int(trigger_ts)) / 1000.0
+    if std <= 0 or not (0 <= remaining_seconds <= 300):
+        return None
+    remaining_sigma_bps = std * math.sqrt(remaining_seconds / 300.0) * 10_000.0
+    if remaining_sigma_bps <= 0:
+        return None
+
+    energy_expands = None
+    upper_wick_ratio = None
+    profit_veto = None
+    if not any(bar is None for bar in profit_bars):
+        profit_returns = [math.log(bar[3] / bar[0]) for bar in profit_bars]
+        energy_expands = sum(v * v for v in profit_returns[:6]) > sum(
+            v * v for v in profit_returns[6:])
+        o, h, low, c = profit_bars[0]
+        upper_wick_ratio = (h - max(o, c)) / (h - low) if h > low else None
+        if upper_wick_ratio is not None:
+            profit_veto = (
+                energy_expands and upper_wick_ratio >= 0.5
+                and remaining_seconds > 60.0
+            )
+    return {
+        "remaining_seconds": remaining_seconds,
+        "remaining_sigma_bps": remaining_sigma_bps,
+        "energy_expands": energy_expands,
+        "upper_wick_ratio": upper_wick_ratio,
+        "profit_veto": profit_veto,
+    }
 
 
 def _extract(w: SentimentWindow) -> dict | None:
@@ -215,7 +302,12 @@ def _extract(w: SentimentWindow) -> dict | None:
     return ext
 
 
-def _gate_of(version: str, ext: dict, streak_up: int | None = None) -> bool:
+def _gate_of(
+    version: str,
+    ext: dict,
+    streak_up: int | None = None,
+    k10: dict | None = None,
+) -> bool:
     """version → 落表门（G0 恒真；G1 body；G3 chg；G4=G1∩G3；G7 及各变体）。
 
     特征缺失（None）一律不落表——宁可少样本，不用不可信特征污染前向裁决。
@@ -226,6 +318,16 @@ def _gate_of(version: str, ext: dict, streak_up: int | None = None) -> bool:
         return ext["body_r"] is not None and ext["body_r"] <= BODY_R_GATE
     if version == "firsthit_down_chg_v1":
         return ext["chg_bps"] is not None and ext["chg_bps"] <= CHG_BPS_GATE
+    if version in K10_VERSIONS:
+        if ext.get("chg_bps") is None or ext["chg_bps"] > CHG_BPS_GATE or k10 is None:
+            return False
+        z = ext["chg_bps"] / k10["remaining_sigma_bps"]
+        k10["z"] = z
+        if not math.isfinite(z) or z > K10_Z_MAX:
+            return False
+        if version == "firsthit_down_k10_v1":
+            return True
+        return k10.get("profit_veto") is False
     if version == "firsthit_down_g4_v1":
         # G4 = G1 ∩ G3（chg_bps ≤ 2.82 ∧ body_r ≤ 0.35）。
         # 注意：G4 ⊂ G1 且 G4 ⊂ G3，与两者非独立——同窗三门全中即同一注的 3 倍暴露。
@@ -391,9 +493,34 @@ class FirstHitShadowDetector:
         if ext is None:
             return                                     # 无首触/路径质量不足：整窗不落表
 
+        # K10 使用真实首触时点的 BTC 前缀；旧 firsthit 版本保持原归档语义。
+        k10_ext = None
+        k10_features = None
+        if self._collector is not None and any(
+            shadow_gate.is_enabled(version) for version in K10_VERSIONS
+        ):
+            btc = _ser(getattr(w, "curve_btc_price", None))
+            ep = getattr(w, "entry_price", None)
+            btc_open = float(ep) if (ep is not None and float(ep) > 0) else None
+            if btc_open is not None:
+                k10_ext = extract_firsthit_features(
+                    start_ms,
+                    btc_open,
+                    getattr(w, "curve_down_price", None),
+                    btc,
+                    pin_path_to_first_touch=True,
+                )
+            if (
+                k10_ext is not None
+                and k10_ext.get("chg_bps") is not None
+                and k10_ext["chg_bps"] <= CHG_BPS_GATE
+            ):
+                klines = await self._collector.fetch_klines_ending_at(
+                    "5m", 13, start_ms)
+                k10_features = extract_k10_kline_features(
+                    start_ms, int(k10_ext["trigger_ts"]), klines)
+
         win = outcome == "DOWN"                        # 买 DOWN：窗结算 DOWN 即赢
-        q = ext["q"]
-        ev = _ev_at_entry(win, q)                      # 逐事件真实触发价，禁均值/pct 代理
 
         # 计算前驱 5m 连续阳线数（用于 g7_streak_v1 / g7_strict_v1）
         streak_up = 0
@@ -421,10 +548,15 @@ class FirstHitShadowDetector:
             # per-version 独立 commit：单 version 落表失败不回滚、不影响其他 version。
             for version, _name in FIRSTHIT_SPECS:
                 try:
-                    if not _gate_of(version, ext, streak_up=streak_up):
-                        continue                        # 门未命中：不落表
                     if not shadow_gate.is_enabled(version):
                         continue                        # 手动下线：停止采集该版本（历史保留）
+                    version_ext = k10_ext if version in K10_VERSIONS else ext
+                    if version_ext is None or not _gate_of(
+                        version, version_ext, streak_up=streak_up, k10=k10_features
+                    ):
+                        continue                        # 门未命中/前序K线缺失：不落表
+                    q = version_ext["q"]
+                    ev = _ev_at_entry(win, q)          # 逐事件真实触发价，禁均值/pct 代理
                     dup = await session.execute(
                         sa_select(FirstHitShadowSignal.id).where(
                             FirstHitShadowSignal.version == version,
@@ -437,16 +569,21 @@ class FirstHitShadowDetector:
                         version=version,
                         window_start=start_ms,
                         window_end=end_ms,
-                        trigger_ts=ext["trigger_ts"],
-                        td_sec=ext["td_sec"],
+                        trigger_ts=version_ext["trigger_ts"],
+                        td_sec=version_ext["td_sec"],
                         entry_down_price=q,
-                        chg_bps=ext["chg_bps"],
-                        body_r=ext["body_r"],
-                        wick01=ext["wick01"],
-                        rng_bps=ext["rng_bps"],
-                        npts=ext["npts"],
-                        dvol=ext["dvol"],
-                        dpar=ext["dpar"],
+                        chg_bps=version_ext["chg_bps"],
+                        body_r=version_ext["body_r"],
+                        wick01=version_ext["wick01"],
+                        rng_bps=version_ext["rng_bps"],
+                        npts=version_ext["npts"],
+                        dvol=version_ext["dvol"],
+                        dpar=version_ext["dpar"],
+                        k10_z=(k10_features or {}).get("z") if version in K10_VERSIONS else None,
+                        k10_remaining_seconds=(k10_features or {}).get("remaining_seconds") if version in K10_VERSIONS else None,
+                        k10_remaining_sigma_bps=(k10_features or {}).get("remaining_sigma_bps") if version in K10_VERSIONS else None,
+                        k10_energy_expands=(k10_features or {}).get("energy_expands") if version in K10_VERSIONS else None,
+                        k10_upper_wick_ratio=(k10_features or {}).get("upper_wick_ratio") if version in K10_VERSIONS else None,
                         settle_outcome=outcome,
                         win=win,
                         ev_at_entry=ev,
@@ -460,7 +597,8 @@ class FirstHitShadowDetector:
                         version,
                         datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)
                         .strftime("%m-%d %H:%M"),
-                        ext["td_sec"], q, ext["chg_bps"], ext["body_r"], win, ev, ext["npts"],
+                        version_ext["td_sec"], q, version_ext["chg_bps"],
+                        version_ext["body_r"], win, ev, version_ext["npts"],
                     )
                 except Exception as exc:
                     await session.rollback()
@@ -478,5 +616,6 @@ class FirstHitShadowDetector:
             "triggers": dict(self._trigger_counts),
             "last_window_end": self._last_window_end,
             "gates": {"q_range": [Q_LO, Q_HI], "body_r": BODY_R_GATE,
-                      "chg_bps": CHG_BPS_GATE, "min_pts": MIN_PTS},
+                      "chg_bps": CHG_BPS_GATE, "min_pts": MIN_PTS,
+                      "k10_z_max": K10_Z_MAX},
         }

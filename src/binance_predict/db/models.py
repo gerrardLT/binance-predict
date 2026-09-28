@@ -1286,6 +1286,12 @@ class FirstHitShadowSignal(Base):
     dpar: Mapped[float | None] = mapped_column(
         Float, nullable=True, comment="Δparticipants（@触−open，soft 记录维度，不作门）"
     )
+    # ---- K10 可审计快照（仅 K10 族写入，旧版本为 NULL）----
+    k10_z: Mapped[float | None] = mapped_column(Float, nullable=True)
+    k10_remaining_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    k10_remaining_sigma_bps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    k10_energy_expands: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    k10_upper_wick_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
     # ---- 结算（归档后处理，窗已结算）----
     settle_outcome: Mapped[str | None] = mapped_column(
         String(10), nullable=True, comment="触发窗结算方向 UP | DOWN"

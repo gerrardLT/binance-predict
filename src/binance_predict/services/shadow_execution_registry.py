@@ -60,6 +60,8 @@ _VERSION_ROWS: tuple[tuple[str, SourceType, str, str, str], ...] = (
     ("firsthit_down_v1", SourceType.FIRSTHIT, "5m", "same_window_first_touch", "down"),
     ("firsthit_down_body_v1", SourceType.FIRSTHIT, "5m", "same_window_first_touch", "down"),
     ("firsthit_down_chg_v1", SourceType.FIRSTHIT, "5m", "same_window_first_touch", "down"),
+    ("firsthit_down_k10_v1", SourceType.FIRSTHIT, "5m", "same_window_first_touch", "down"),
+    ("firsthit_down_k10_profit_v1", SourceType.FIRSTHIT, "5m", "same_window_first_touch", "down"),
     ("firsthit_down_g4_v1", SourceType.FIRSTHIT, "5m", "same_window_first_touch", "down"),
     ("firsthit_down_g7_v1", SourceType.FIRSTHIT, "5m", "same_window_first_touch", "down"),
     ("g7_streak_v1", SourceType.FIRSTHIT, "5m", "same_window_first_touch", "down"),

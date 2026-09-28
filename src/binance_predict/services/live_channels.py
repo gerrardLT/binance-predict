@@ -241,6 +241,17 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
         "firsthit_down_chg_v1", "firsthit", "5m", "DOWN", 0.09,
         "首触G3偏离 chg≤+2.82bp（押DOWN）", order_type="LIMIT",
     ),
+    # K10 族：G3 + 前12根完整5m波动归一的剩余结算距离；盈利版再剔除
+    # 「前序平方收益扩张 + 长上影 + 距结算>60s」三项同时成立。影子默认采集，
+    # 实盘配置默认 OFF；用户明确两个版本同窗独立下注，不加入互斥组。
+    "firsthit_down_k10_v1": ChannelSpec(
+        "firsthit_down_k10_v1", "firsthit", "5m", "DOWN", 0.10,
+        "首触K10标准化结算距离（押DOWN）", order_type="LIMIT",
+    ),
+    "firsthit_down_k10_profit_v1": ChannelSpec(
+        "firsthit_down_k10_profit_v1", "firsthit", "5m", "DOWN", 0.10,
+        "首触K10盈利过滤版（押DOWN）", order_type="LIMIT",
+    ),
     # G4 交互门（2026-09-08 影子+实盘接入）：G4 = G1 ∩ G3（chg≤2.82 ∧ body≤0.35）
     # 依据 shape_scan_v2 冻结扫描：calib n=214 P=12.6% EV+1.03 CI[+0.08,+2.22]；
     # confirm n=86 P=23.3% EV+1.85 CI[+0.35,+3.44]；binom p=0.025 → BH-FDR q=0.063 ✅ STRICT_PASS。

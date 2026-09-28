@@ -41,6 +41,7 @@ _FROZEN_BENCHMARKS: dict[str, tuple[float, int | None]] = {
     "firsthit_down_v1": (0.088, 4632),
     "firsthit_down_body_v1": (0.153, 418),
     "firsthit_down_chg_v1": (0.108, 1309),
+    # K10/K10盈利版仅有污染发现段估计，不钉生产 benchmark，前向现算。
     "firsthit_down_g4_v1": (0.157, 300),
     "firsthit_down_g7_v1": (0.192, 260),
     "g7_streak_v1": (0.193, 202),

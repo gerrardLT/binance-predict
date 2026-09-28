@@ -208,7 +208,7 @@ def test_parse_defaults_all_off(monkeypatch) -> None:
     monkeypatch.setattr(settings, "live_default_max_daily_orders", 100)
     monkeypatch.setattr(settings, "live_channels_json", "")
     cfgs = parse_channel_config()
-    assert len(cfgs) == 34 + len(CANDLESTICK_SIGNAL_IDS)
+    assert len(cfgs) == 36 + len(CANDLESTICK_SIGNAL_IDS)
     assert set(CANDLESTICK_SIGNAL_IDS) <= set(cfgs)
     assert all(not c.enabled for c in cfgs.values())
     assert all(c.amount_usdt == 2.0 for c in cfgs.values())
@@ -368,8 +368,9 @@ def test_channels_registry_shape() -> None:
         "absorption_follow_td120_v1", "absorption_follow_td150_v1",
         # 2026-09-18 K线反转四通道（默认全 OFF，仅新鲜次根开盘派单）
         "krev_a_v1", "krev_b_v1", "rev_p1_v1", "rev_p2_v1",
-        # 2026-09-07 firsthit 三通道（默认全 OFF，用户确认独立下单）
+        # firsthit 族（默认全 OFF，用户确认独立下单）
         "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1",
+        "firsthit_down_k10_v1", "firsthit_down_k10_profit_v1",
         # 2026-09-08 firsthit G4 交互门（G1∩G3，默认 OFF；⚠非独立暴露，见 live_channels 注释）
         "firsthit_down_g4_v1",
         # 2026-09-08 firsthit G7 系列六通道（默认全 OFF，用户确认独立下单）
@@ -470,8 +471,10 @@ def test_channels_registry_shape() -> None:
         {"s2_cond_t4_v1", "s2_cond_t5d_v1"})
     assert exclusive_group("absorption_follow_td150_v1") == frozenset(
         {"absorption_follow_td120_v1", "absorption_follow_td150_v1"})
-    # firsthit 全族解除互斥
+    # firsthit 全族解除互斥（K10双版用户同样明确选择独立下注）
     assert exclusive_group("firsthit_down_v1") is None
+    assert exclusive_group("firsthit_down_k10_v1") is None
+    assert exclusive_group("firsthit_down_k10_profit_v1") is None
     assert exclusive_group("g7_t270_v1") is None
     assert exclusive_group("firsthit_down_g7_v1") is None
     assert exclusive_group("scene_bull_exhaust") == frozenset(
@@ -1950,6 +1953,87 @@ async def test_firsthit_three_channels_independent_fill(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+def _k10_klines(*, profit_veto: bool = False) -> list[dict]:
+    bars = []
+    for i in range(1, 14):
+        if profit_veto:
+            close = 99.8 if 2 <= i <= 7 else 99.95
+            high = 100.3 if i == 2 else 100.05
+            low = min(close, 99.75)
+        else:
+            close = 100.2 if i % 2 else 99.8
+            high, low = max(100.25, close), min(99.75, close)
+        bars.append({"open_time": WINDOW_START - i * 300_000,
+                     "open": 100.0, "high": high, "low": low, "close": close})
+    return sorted(bars, key=lambda bar: bar["open_time"])
+
+
+@pytest.mark.asyncio
+async def test_k10_channels_default_off_and_independent_fire(monkeypatch) -> None:
+    fake = _FakeTrader()
+    channels = ["firsthit_down_k10_v1", "firsthit_down_k10_profit_v1"]
+    t = _make_trader(monkeypatch, fake, channels=channels)
+
+    async def ending_at(interval: str, limit: int, end_ms: int):
+        assert (interval, limit, end_ms) == ("5m", 13, WINDOW_START)
+        return _k10_klines()
+
+    t.kline_ending_at_fetcher = ending_at
+    dn_p = _firsthit_down_curve(trigger_q=0.07, npts=20, trigger_idx=8)
+    btc_p = _firsthit_btc_curve(btc_open=100.0, btc_trig=100.02, npts=20)
+    fired = t.check(
+        WINDOW_START, WINDOW_END, WINDOW_START + 120_000,
+        down_price=0.07, btc_price=100.02, window_entry_price=100.0,
+        window_btc_curve=btc_p, window_down_curve=dn_p,
+    )
+    assert set(fired) == set(channels)
+    # K线异步核验未完成前重复采样不得重复派生任务。
+    assert t.check(
+        WINDOW_START, WINDOW_END, WINDOW_START + 135_000,
+        down_price=0.07, btc_price=100.02, window_entry_price=100.0,
+        window_btc_curve=btc_p, window_down_curve=dn_p,
+    ) == []
+    await _drain(t)
+    assert {call["signal_version"] for call in fake.calls} == set(channels)
+    assert len(fake.calls) == 2  # 用户明确选择同窗独立下注
+    assert all(call["prediction"] == "DOWN" for call in fake.calls)
+    assert all(call["max_exec_price"] == pytest.approx(0.0721) for call in fake.calls)
+
+
+@pytest.mark.asyncio
+async def test_k10_profit_veto_and_missing_klines_fail_safe(monkeypatch) -> None:
+    fake = _FakeTrader()
+    channels = ["firsthit_down_k10_v1", "firsthit_down_k10_profit_v1"]
+    t = _make_trader(monkeypatch, fake, channels=channels)
+
+    async def ending_at(interval: str, limit: int, end_ms: int):
+        return _k10_klines(profit_veto=True)
+
+    t.kline_ending_at_fetcher = ending_at
+    dn_p = _firsthit_down_curve(trigger_q=0.07, npts=20, trigger_idx=8)
+    btc_p = _firsthit_btc_curve(btc_open=100.0, btc_trig=100.02, npts=20)
+    fired = t.check(
+        WINDOW_START, WINDOW_END, WINDOW_START + 120_000,
+        down_price=0.07, btc_price=100.02, window_entry_price=100.0,
+        window_btc_curve=btc_p, window_down_curve=dn_p,
+    )
+    assert set(fired) == set(channels)  # 异步K线门尚未完成
+    await _drain(t)
+    assert [call["signal_version"] for call in fake.calls] == ["firsthit_down_k10_v1"]
+
+    # 新执行器不注入 K 线源：两个真钱通道均 fail-safe 不下单。
+    fake2 = _FakeTrader()
+    t2 = _make_trader(monkeypatch, fake2, channels=channels)
+    t2.check(
+        WINDOW_START, WINDOW_END, WINDOW_START + 120_000,
+        down_price=0.07, btc_price=100.02, window_entry_price=100.0,
+        window_btc_curve=btc_p, window_down_curve=dn_p,
+    )
+    await _drain(t2)
+    assert fake2.calls == []
+
+
+@pytest.mark.asyncio
 async def test_firsthit_no_down_curve_data_not_fire(monkeypatch) -> None:
     """缺 window_down_curve → 保守不开火（向后兼容旧调用方）。"""
     fake = _FakeTrader()
@@ -2274,7 +2358,7 @@ def test_status_shape(monkeypatch) -> None:
     assert s["defaults"]["amount_usdt"] == 2.0
     assert s["defaults"]["max_daily_orders"] == 100
     from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
-    assert len(s["channels"]) == 42 + len(CANDLESTICK_SIGNAL_IDS)
+    assert len(s["channels"]) == 44 + len(CANDLESTICK_SIGNAL_IDS)
     by = {c["channel"]: c for c in s["channels"]}
     c = by["quote_contrarian_v1"]
     assert c["enabled"] is True and c["enabled_at_startup"] is True

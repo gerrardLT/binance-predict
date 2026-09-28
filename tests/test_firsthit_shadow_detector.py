@@ -37,6 +37,7 @@ from binance_predict.services.firsthit_shadow_detector import (
     Q_HI,
     BODY_R_GATE,
     CHG_BPS_GATE,
+    K10_Z_MAX,
     FirstHitShadowDetector,
     _ev_at_entry,
     _extract,
@@ -44,6 +45,7 @@ from binance_predict.services.firsthit_shadow_detector import (
     _outcome_of,
     _ser,
     extract_firsthit_features,
+    extract_k10_kline_features,
 )
 
 START = 1_700_000_000_000 // 300_000 * 300_000   # 对齐 5m 整点
@@ -252,6 +254,25 @@ def test_gate_of_g4_boundary_inclusive_and_none_guard():
     assert _gate_of("firsthit_down_g4_v1", {**base, "chg_bps": None, "body_r": None}) is False
 
 
+def test_k10_gate_boundary_and_profit_veto():
+    ext = {
+        "q": 0.07, "trigger_ts": START + 120_000, "td_sec": 120,
+        "chg_bps": 2.0, "body_r": 0.2, "wick01": 1.0,
+        "rng_bps": 5.0, "npts": 8, "dvol": None, "dpar": None,
+    }
+    k10 = {"remaining_sigma_bps": 2.0 / K10_Z_MAX, "profit_veto": False}
+    assert _gate_of("firsthit_down_k10_v1", ext, k10=k10) is True
+    assert k10["z"] == pytest.approx(K10_Z_MAX)
+    assert _gate_of("firsthit_down_k10_profit_v1", ext, k10={**k10}) is True
+    assert _gate_of(
+        "firsthit_down_k10_profit_v1", ext,
+        k10={**k10, "profit_veto": True}) is False
+    assert _gate_of(
+        "firsthit_down_k10_v1", {**ext, "chg_bps": ext["chg_bps"] + 1e-9},
+        k10={**k10}) is False
+    assert _gate_of("firsthit_down_k10_v1", ext, k10=None) is False
+
+
 def test_firsthit_specs_contains_g4_and_is_unique():
     """FIRSTHIT_SPECS 注册了 G4，且 version 名全表唯一（幂等键依赖唯一性）。"""
     versions = [v for v, _ in fhd.FIRSTHIT_SPECS]
@@ -334,6 +355,50 @@ def test_extract_firsthit_features_max_trigger_ts_is_ex_ante():
     assert ext["trigger_ts"] == START + 30_000
 
 
+def test_k10_pin_path_to_real_first_touch_and_stale_btc():
+    down = [{"t": START + 30_000, "v": 0.07}]
+    btc = [{"t": START + i * 5_000, "v": 100 + i * .001} for i in range(7)]
+    btc += [{"t": START + 45_000 + i * 5_000, "v": 100.1} for i in range(3)]
+    assert extract_firsthit_features(
+        START, 100.0, down, btc, max_trigger_ts=START + 60_000,
+        pin_path_to_first_touch=True) is None
+    stale = [{"t": START + i * 2_000, "v": 100.0} for i in range(8)]
+    assert extract_firsthit_features(
+        START, 100.0, down, stale, max_trigger_ts=START + 60_000,
+        pin_path_to_first_touch=True) is None
+    conflicted = [{"t": START + i * 3_000, "v": 100.0} for i in range(8)]
+    conflicted.append({"t": START + 21_000, "v": 101.0})
+    assert extract_firsthit_features(
+        START, 100.0, down, conflicted, max_trigger_ts=START + 60_000,
+        pin_path_to_first_touch=True) is None
+    clean = [{"t": START + i * 3_000, "v": 100.0} for i in range(11)]
+    clean += [{"t": START + 45_000, "v": 99.0}, {"t": START + 45_000, "v": 101.0}]
+    assert extract_firsthit_features(
+        START, 100.0, down, clean, max_trigger_ts=START + 60_000,
+        pin_path_to_first_touch=True) is not None
+
+
+def test_extract_k10_kline_features_and_profit_veto():
+    bars = []
+    for i in range(1, 14):
+        close = 99.8 if 2 <= i <= 7 else 99.95
+        bars.append({
+            "open_time": START - i * 300_000, "open": 100.0,
+            "high": 100.3 if i == 2 else 100.05,
+            "low": min(close, 99.75), "close": close,
+        })
+    got = extract_k10_kline_features(START, START + 120_000, bars)
+    assert got is not None
+    assert got["remaining_seconds"] == 180
+    assert got["remaining_sigma_bps"] > 0
+    assert got["energy_expands"] is True
+    assert got["upper_wick_ratio"] >= 0.5
+    assert got["profit_veto"] is True
+    # K10只需要12根；盈利版额外需要隔离后的第13根。
+    base_only = extract_k10_kline_features(START, START + 120_000, bars[:-1])
+    assert base_only is not None and base_only["profit_veto"] is None
+
+
 # ============================================================
 # 3. 触发落 SETTLED / 幂等 / gate 拦截 / npts 门槛
 # ============================================================
@@ -381,6 +446,37 @@ async def test_process_window_triggers_g1(monkeypatch):
     await d._process_window(w)
     versions = [r.version for r in session.added]
     assert "firsthit_down_v1" in versions and "firsthit_down_body_v1" in versions
+
+
+@pytest.mark.asyncio
+async def test_process_window_triggers_k10_versions_with_audit_fields(monkeypatch):
+    class _Collector:
+        async def fetch_klines_ending_at(self, interval, limit, end_ms):
+            assert (interval, limit, end_ms) == ("5m", 13, START)
+            bars = []
+            for i in range(1, 14):
+                close = 100.2 if i % 2 else 99.8
+                bars.append({
+                    "open_time": START - i * 300_000, "open": 100.0,
+                    "high": max(100.25, close), "low": min(99.75, close),
+                    "close": close,
+                })
+            return sorted(bars, key=lambda bar: bar["open_time"])
+
+    session = _FakeSession(first=None)
+    monkeypatch.setattr(fhd, "async_session_factory", lambda: _FakeSessionCtx(session))
+    d = FirstHitShadowDetector(collector=_Collector())
+    w = _seed_window(npts=20, trigger_q=0.07, btc_change_pct=0.00005)
+    await d._process_window(w)
+    by_version = {row.version: row for row in session.added}
+    assert "firsthit_down_k10_v1" in by_version
+    assert "firsthit_down_k10_profit_v1" in by_version
+    row = by_version["firsthit_down_k10_v1"]
+    assert row.k10_z is not None and row.k10_z <= K10_Z_MAX
+    assert row.k10_remaining_seconds == pytest.approx(180.0, abs=0.02)
+    assert row.k10_remaining_sigma_bps > 0
+    assert row.k10_energy_expands is False
+    assert row.k10_upper_wick_ratio is not None
 
 
 @pytest.mark.asyncio
@@ -473,7 +569,9 @@ def test_specs_self_consistent():
     """spec 自洽：十 version 合法（G0/G1/G3/G4+6G7）、不超 DB 列宽 String(32)，冻结常数正确。"""
     assert set(v for v, _ in FIRSTHIT_SPECS) == {
         "firsthit_down_v1",
-        "firsthit_down_body_v1", "firsthit_down_chg_v1", "firsthit_down_g4_v1",
+        "firsthit_down_body_v1", "firsthit_down_chg_v1",
+        "firsthit_down_k10_v1", "firsthit_down_k10_profit_v1",
+        "firsthit_down_g4_v1",
         "firsthit_down_g7_v1", "g7_streak_v1", "g7_wick20_v1",
         "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",
     }
