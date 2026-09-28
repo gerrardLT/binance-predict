@@ -2942,19 +2942,32 @@ function LiveTradeTab() {
   const regTs = wallet?.registered_time as number | undefined
   // 多通道实盘：live = live_channels status（channels[] 见 LiveChannelStatus）
   const liveChannels = Array.isArray(live?.channels) ? live.channels as LiveChannelStatus[] : []
-  const activeLiveChannels = liveChannels.filter(c => c.enabled)
-  const stoppedLiveChannels = liveChannels.filter(c => !c.enabled)
-  const enabledCount = activeLiveChannels.length
   const liveDefaults = (live?.defaults ?? {}) as Record<string, unknown>
 
-  // 通道 pnl 快速索引
-  const pnlByChan = useMemo(() => {
-    const map: Record<string, PnlChannel> = {}
-    for (const c of pnlData?.channels ?? []) {
-      map[c.channel] = c
+  // 通道 pnl 快速索引；列表默认按真实胜率、信号 EV 依次降序，无已结算单者排末尾。
+  const { pnlByChan, liveSortMetrics } = useMemo(() => {
+    const byChannel: Record<string, PnlChannel> = {}
+    const metrics: Record<string, { winRate: number; signalEv: number }> = {}
+    for (const channel of pnlData?.channels ?? []) {
+      byChannel[channel.channel] = channel
+      const returns = channel.points.filter(point => point.cost != null && point.cost > 0).map(point => point.pnl / point.cost!)
+      metrics[channel.channel] = {
+        winRate: channel.win_rate ?? Number.NEGATIVE_INFINITY,
+        signalEv: returns.length ? returns.reduce((sum, value) => sum + value, 0) / returns.length : Number.NEGATIVE_INFINITY,
+      }
     }
-    return map
+    return { pnlByChan: byChannel, liveSortMetrics: metrics }
   }, [pnlData])
+  const byLivePerformance = (a: LiveChannelStatus, b: LiveChannelStatus) => {
+    const am = liveSortMetrics[a.channel] ?? { winRate: Number.NEGATIVE_INFINITY, signalEv: Number.NEGATIVE_INFINITY }
+    const bm = liveSortMetrics[b.channel] ?? { winRate: Number.NEGATIVE_INFINITY, signalEv: Number.NEGATIVE_INFINITY }
+    if (am.winRate !== bm.winRate) return bm.winRate - am.winRate
+    if (am.signalEv !== bm.signalEv) return bm.signalEv - am.signalEv
+    return a.channel.localeCompare(b.channel)
+  }
+  const activeLiveChannels = liveChannels.filter(c => c.enabled).sort(byLivePerformance)
+  const stoppedLiveChannels = liveChannels.filter(c => !c.enabled).sort(byLivePerformance)
+  const enabledCount = activeLiveChannels.length
 
   // 倒计时：服务端时钟修正后的剩余毫秒；<60s 红色警示
   const windowEnd = quote?.window_end as number | null | undefined
@@ -3434,7 +3447,7 @@ function LiveTradeTab() {
           <div className="flex justify-between gap-2 items-center">
             <span className="text-ink-55 shrink-0 flex items-center">
               信号实盘通道
-              <HelpHint text="后端注册表中的实盘通道：每通道独立开关、金额、日限和执行价护栏。是否实盘只以后端通道状态为准；影子采集开关不等于真钱开关。" />
+              <HelpHint text="后端注册表中的实盘通道：每通道独立开关、金额、日限和执行价护栏。默认按真实胜率降序，同胜率按信号EV降序；无已结算单排末尾。是否实盘只以后端通道状态为准；影子采集开关不等于真钱开关。" />
             </span>
             {liveChannels.length > 0
               ? <span className="flex items-baseline gap-1.5 text-right">
