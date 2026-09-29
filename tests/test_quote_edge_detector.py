@@ -172,6 +172,58 @@ def test_pass_v2_price_guard_ex_ante() -> None:
 
 
 # ============================================================
+# 标准化早涨门禁：严格 1m K 线时点 / 阈值边界 / 缺失 fail closed
+# ============================================================
+
+def _one_minute_bars(start_ms: int, returns: list[float]) -> list[dict]:
+    return [
+        {"open_time": start_ms + i * 60_000, "open": 100.0,
+         "close": 100.0 * (1.0 + ret)}
+        for i, ret in enumerate(returns)
+    ]
+
+
+def test_contrarian_z_features_use_only_frozen_ex_ante_bars() -> None:
+    start = 10_000_000
+    returns = [(-1 if i % 2 else 1) * 0.001 for i in range(60)]
+    history = _one_minute_bars(start - 60 * 60_000, returns)
+    features = qed._contrarian_z_features(
+        history, [{"open_time": start, "open": 100.0, "close": 100.05}], start)
+    assert features is not None
+    ret1, rv60, zret = features
+    assert ret1 == pytest.approx(0.0005)
+    assert rv60 == pytest.approx(qed._sample_std(returns))
+    assert zret == pytest.approx(ret1 / rv60)
+    # 历史最后一根错位到开窗后，即使价格齐全也必须拒绝。
+    history[-1]["open_time"] = start + 60_000
+    assert qed._contrarian_z_features(history, [
+        {"open_time": start, "open": 100.0, "close": 100.05}], start) is None
+
+
+def test_contrarian_z_guard_boundaries_and_missing() -> None:
+    high_z, high_rv = qed.CONTRARIAN_Z_GUARDS["quote_contrarian_z_high_v1"]
+    mid_z, _ = qed.CONTRARIAN_Z_GUARDS["quote_contrarian_z_mid_v1"]
+    assert qed._pass_contrarian_z_guard(
+        "quote_contrarian_z_high_v1", (0.0, high_rv, high_z)) is True
+    assert qed._pass_contrarian_z_guard(
+        "quote_contrarian_z_high_v1", (0.0, high_rv - 1e-12, high_z)) is False
+    assert qed._pass_contrarian_z_guard(
+        "quote_contrarian_z_high_v1", (0.0, high_rv, high_z + 1e-12)) is False
+    assert qed._pass_contrarian_z_guard(
+        "quote_contrarian_z_mid_v1", (0.0, 1e-9, mid_z)) is True
+    assert qed._pass_contrarian_z_guard("quote_contrarian_z_mid_v1", None) is False
+
+
+def test_contrarian_z_features_fail_closed_on_short_or_zero_vol_history() -> None:
+    start = 10_000_000
+    first = [{"open_time": start, "open": 100.0, "close": 100.05}]
+    short = _one_minute_bars(start - 59 * 60_000, [0.001] * 59)
+    flat = _one_minute_bars(start - 60 * 60_000, [0.0] * 60)
+    assert qed._contrarian_z_features(short, first, start) is None
+    assert qed._contrarian_z_features(flat, first, start) is None
+
+
+# ============================================================
 # _process_window 落表（fake session）
 # ============================================================
 
@@ -225,15 +277,69 @@ class _FakeSession:
         pass
 
 
-def _make_detector(monkeypatch, dup_first=None,
-                   day_high_curves=()) -> tuple[QuoteEdgeDetector, _FakeSession]:
+def _make_detector(monkeypatch, dup_first=None, day_high_curves=(),
+                   collector=None) -> tuple[QuoteEdgeDetector, _FakeSession]:
     session = _FakeSession(dup_first=dup_first, day_high_curves=day_high_curves)
 
     def _factory():
         return session
 
     monkeypatch.setattr(qed, "async_session_factory", _factory)
-    return QuoteEdgeDetector(), session
+    return QuoteEdgeDetector(collector=collector), session
+
+
+class _KlineCollector:
+    def __init__(self, history: list[dict], first_minute: list[dict]):
+        self.bars = history + first_minute
+        self.calls: list[tuple[str, int, int]] = []
+
+    async def fetch_klines_ending_at(self, interval, limit, end_ms):
+        self.calls.append((interval, limit, end_ms))
+        return self.bars
+
+
+@pytest.mark.asyncio
+async def test_process_window_contrarian_z_variants_insert_and_share_ex_ante_queries(
+    monkeypatch,
+) -> None:
+    start = 10_000_000
+    returns = [(-1 if i % 2 else 1) * 0.001 for i in range(60)]
+    collector = _KlineCollector(
+        _one_minute_bars(start - 60 * 60_000, returns),
+        [{"open_time": start, "open": 100.0, "close": 100.05}],
+    )
+    d, session = _make_detector(monkeypatch, collector=collector)
+    w = SentimentWindow(
+        start_time=start, end_time=start + 300_000, actual_return=-0.001,
+        outcome="DOWN", entry_price=100.0,
+        curve_down_price=[{"t": start + 50_000, "v": 0.20}],
+        curve_btc_price=[{"t": start, "v": 100.0},
+                         {"t": start + 50_000, "v": 100.05}],
+    )
+    await d._process_window(w)
+    versions = {signal.version for signal in session.added}
+    assert {"quote_contrarian_z_high_v1", "quote_contrarian_z_mid_v1"} <= versions
+    assert collector.calls == [("1m", 61, start + 60_000)]
+    z_signals = [s for s in session.added if s.version.startswith("quote_contrarian_z_")]
+    assert all(s.entry_quote_ts == start + 50_000 for s in z_signals)
+
+
+@pytest.mark.asyncio
+async def test_process_window_contrarian_z_missing_klines_fail_closed(monkeypatch) -> None:
+    start = 10_000_000
+    collector = _KlineCollector([], [])
+    d, session = _make_detector(monkeypatch, collector=collector)
+    w = SentimentWindow(
+        start_time=start, end_time=start + 300_000, actual_return=-0.001,
+        outcome="DOWN", entry_price=100.0,
+        curve_down_price=[{"t": start + 50_000, "v": 0.20}],
+        curve_btc_price=[{"t": start, "v": 100.0},
+                         {"t": start + 50_000, "v": 100.05}],
+    )
+    await d._process_window(w)
+    versions = {signal.version for signal in session.added}
+    assert "quote_contrarian_v2" in versions
+    assert not any(version.startswith("quote_contrarian_z_") for version in versions)
 
 
 @pytest.mark.asyncio

@@ -33,6 +33,13 @@ v2 价格门禁版（2026-08-22 5m 粒度归因落地，只加不改；v1 冻结
     quote_contrarian_v2 = v1 区间 + 触发时点 BTC 未高于窗口开盘 ≥0.10%（只接假冲高）。
     门禁数据源 curve_btc_price（与报价曲线同步采样），只用 ≤触发时点采样点（严格 ex-ante）。
 
+标准化早期涨幅影子版（2026-09-29，record-only）：
+    quote_contrarian_z_mid_v1 / quote_contrarian_z_high_v1 均为 quote_contrarian_v2
+    的前向子集；以 T+60s 第一根完整 1m K 计算 ret1，并以开窗前 60 根完整
+    1m K 的 return 样本标准差归一化。中频版要求 zret1_60≤1.4696111971489016；
+    高纯度版要求 zret1_60≤0.8618732766463684 且 rv60≥0.0008177729241675949。
+    K 线缺失、断棒或零波动均不落。两版不进 LIVE_CHANNELS，不触发交易。
+
 v3 环境门禁版（2026-08-24 交替/延续归因落地，只加不改；v1/v2 冻结口径原样）：
     quote_contrarian_v3a = v2 ∩ 前窗 outcome==DOWN（交替环境：前窗跌+本窗涨=V 反弹假冲高）；
     quote_contrarian_v3b = v3a ∩ 触发时点距当日高点回落≥0.30%（含边界，与归因分桶同口径；震荡日：冲高更易衰竭）。
@@ -146,6 +153,23 @@ V2_PRICE_GUARDS: dict[str, tuple[str, str, float]] = {
     "quote_momentum_v2": ("quote_momentum_v1", "min_drop", -0.10),
     "quote_contrarian_v2": ("quote_contrarian_v1", "max_rise", 0.10),
 }
+
+# ---- quote_contrarian v2 的两条研究门禁影子版（2026-09-29，record-only）----
+# 两版都先满足 quote_contrarian_v2：t45~60s、q∈[0.15,0.25)、BTC chg<+0.10%。
+# 再以开窗后第一根完整 1m K 收盘（T+60s）计算：
+#   ret1 = close/open - 1
+#   rv60 = 开窗前 60 根完整 1m K 收益率的样本标准差（严格结束于 window_start）
+#   zret1_60 = ret1 / rv60
+# 中频版只要求 z≤1.4696；高纯度版还要求 rv60≥0.08178%。数据不足/断棒/零波动
+# 均保守不落。注意：判定发生在窗口归档后，但 fetch_klines_ending_at 的 end_ms
+# 锚定历史时点，绝不读取第一根 1m 以后数据。两版只进影子注册表，不进 LIVE_CHANNELS。
+CONTRARIAN_Z_GUARDS: dict[str, tuple[float, float | None]] = {
+    "quote_contrarian_z_mid_v1": (1.4696111971489016, None),
+    "quote_contrarian_z_high_v1": (0.8618732766463684, 0.0008177729241675949),
+}
+_CONTRARIAN_Z_BASE = "quote_contrarian_v2"
+_RV60_BARS = 60
+_ONE_MINUTE_MS = 60_000
 
 # ---- v3 环境门禁（2026-08-24 交替/延续归因落地，只加不改；v1/v2 冻结口径原样） ----
 # v3 -> 是否额外要求距日高回落≥0.30%（含边界，与归因分桶同口径；v3a 否 / v3b 是）
@@ -279,6 +303,59 @@ async def _prev_window_outcome(session, window_start_ms: int) -> str | None:
     return prev if prev in ("UP", "DOWN") else None
 
 
+def _sample_std(values: list[float]) -> float | None:
+    """样本标准差；不足两点或零方差返回 None，门禁保守不落。"""
+    if len(values) < 2:
+        return None
+    avg = sum(values) / len(values)
+    variance = sum((value - avg) ** 2 for value in values) / (len(values) - 1)
+    return variance ** 0.5 if variance > 0 else None
+
+
+def _contrarian_z_features(
+    history: list[dict], first_minute: list[dict], window_start_ms: int,
+) -> tuple[float, float, float] | None:
+    """严格 ex-ante 计算 (ret1, rv60, zret1_60)。
+
+    history 必须是恰好结束于开窗前的 60 根连续完整 1m K；first_minute 必须是
+    [window_start, window_start+60s) 的唯一完整 K。任何断棒/错位/非法价均返回 None。
+    """
+    if len(history) != _RV60_BARS or len(first_minute) != 1:
+        return None
+    expected_start = window_start_ms - _RV60_BARS * _ONE_MINUTE_MS
+    for index, bar in enumerate(history):
+        if int(bar.get("open_time", -1)) != expected_start + index * _ONE_MINUTE_MS:
+            return None
+    first = first_minute[0]
+    if int(first.get("open_time", -1)) != window_start_ms:
+        return None
+    opens = [float(bar.get("open") or 0) for bar in history]
+    closes = [float(bar.get("close") or 0) for bar in history]
+    if any(value <= 0 for value in (*opens, *closes)):
+        return None
+    open_price = float(first.get("open") or 0)
+    close_price = float(first.get("close") or 0)
+    if open_price <= 0 or close_price <= 0:
+        return None
+    returns = [close / open_ - 1.0 for open_, close in zip(opens, closes)]
+    rv60 = _sample_std(returns)
+    if rv60 is None:
+        return None
+    ret1 = close_price / open_price - 1.0
+    return ret1, rv60, ret1 / rv60
+
+
+def _pass_contrarian_z_guard(
+    version: str, features: tuple[float, float, float] | None,
+) -> bool:
+    """研究冻结门禁；数据缺失恒 False。阈值均含边界。"""
+    if features is None:
+        return False
+    _ret1, rv60, zret1_60 = features
+    max_z, min_rv60 = CONTRARIAN_Z_GUARDS[version]
+    return zret1_60 <= max_z and (min_rv60 is None or rv60 >= min_rv60)
+
+
 def _pass_v3_env_guard(version: str, w: SentimentWindow, quote_ts: int,
                        prev_outcome: str | None, day_high: float | None) -> bool:
     """v3 环境门禁（纯函数）：前窗 DOWN（交替环境）+ 可选距日高回落≥0.30%。
@@ -354,7 +431,8 @@ class QuoteEdgeDetector:
     """
 
     def __init__(self, collector=None) -> None:
-        self._collector = collector  # v3 非连涨门禁拉 15m K 线用（None → v3 保守不落）
+        # z 门禁与非连涨门禁共用现有 collector；缺失则保守不落对应版本。
+        self._collector = collector
         self._running = False
         self._task: asyncio.Task | None = None
         self._last_window_end: int | None = None  # 已处理过的最大窗口 end_time
@@ -381,7 +459,7 @@ class QuoteEdgeDetector:
         logger.info(
             "报价 edge 影子检测器启动 | v1 规则 {} + v2 价格门禁版 {} + v3 环境门禁版 {}"
             " + 时段门禁 {} + 深夜距日高门禁 {} + regime 门禁 {} + 非连涨门禁 {}"
-            " | EV=0.98/q−1（费 2%，影子模式只记录不下注）",
+            " + z门禁 {} | EV=0.98/q−1（费 2%，影子模式只记录不下注）",
             {k: f"t∈[{v[0]:.0f},{v[1]:.0f})s q∈[{v[2]:.2f},{v[3]:.2f})"
              for k, v in QUOTE_EDGE_RULES.items()},
             {k: f"{m}{p:+.2f}%" for k, (_b, m, p) in V2_PRICE_GUARDS.items()},
@@ -391,6 +469,8 @@ class QuoteEdgeDetector:
             {k: f"{b}+距日高≥{abs(p):.2f}%(含边界)" for k, (b, p) in LN_DD_GUARDS.items()},
             {k: f"{b}+ret24≤{p:+.1f}%(含边界)" for k, (b, p) in REGIME_GUARDS.items()},
             {k: f"{b}∩非连涨(末收15m)" for k, b in STREAK_GUARDS.items()},
+            {k: f"z≤{z:.3f}" + (f"+rv60≥{rv:.6f}" if rv is not None else "")
+             for k, (z, rv) in CONTRARIAN_Z_GUARDS.items()},
         )
 
     async def stop(self) -> None:
@@ -493,6 +573,8 @@ class QuoteEdgeDetector:
         rules: dict[str, tuple[float, float, float, float]] = dict(QUOTE_EDGE_RULES)
         for v2, (base, _mode, _pct) in V2_PRICE_GUARDS.items():
             rules[v2] = QUOTE_EDGE_RULES[base]
+        for z_version in CONTRARIAN_Z_GUARDS:
+            rules[z_version] = QUOTE_EDGE_RULES[V2_PRICE_GUARDS[_CONTRARIAN_Z_BASE][0]]
         for v3 in V3_ENV_GUARDS:
             rules[v3] = QUOTE_EDGE_RULES["quote_contrarian_v1"]  # v3 基于 contrarian 区间
         for ln in LN_DD_GUARDS:
@@ -512,8 +594,12 @@ class QuoteEdgeDetector:
         v3_high_fetched = False
         ln_high: float | None = None
         ln_high_fetched = False
-        # v3 非连涨门禁 klines15 懒拉（每窗至多一次；None=未拉，[]=拉失败/collector 缺失）
+        # v3 非连涨门禁 klines15 懒拉（每窗至多一次；None=未拉，[]=拉失败）
         streak_klines: list[dict] | None = None
+        # 两条 z 门禁同窗共用两次历史锚定查询与 v2 价格门禁结果。
+        z_v2_ok: bool | None = None
+        z_features: tuple[float, float, float] | None = None
+        z_features_fetched = False
         async with async_session_factory() as session:
             for version, (t_lo, t_hi, q_lo, q_hi) in rules.items():
                 try:
@@ -525,6 +611,20 @@ class QuoteEdgeDetector:
                         continue  # 时段门禁未过 → 该规则跳过（其他规则不受影响）
                     if version in V2_PRICE_GUARDS and _pass_v2_price_guard(version, w, quote_ts) is not True:
                         continue  # 门禁未过/门禁数据缺失 → v2 不落（v1 不受影响）
+                    if version in CONTRARIAN_Z_GUARDS:
+                        if z_v2_ok is None:
+                            z_v2_ok = _pass_v2_price_guard(
+                                _CONTRARIAN_Z_BASE, w, quote_ts) is True
+                        if not z_v2_ok or self._collector is None:
+                            continue
+                        if not z_features_fetched:
+                            bars = await self._collector.fetch_klines_ending_at(
+                                "1m", _RV60_BARS + 1, start_ms + _ONE_MINUTE_MS)
+                            z_features = _contrarian_z_features(
+                                bars[:-1], bars[-1:], start_ms)
+                            z_features_fetched = True
+                        if not _pass_contrarian_z_guard(version, z_features):
+                            continue
                     if version in V3_ENV_GUARDS:
                         # v3 = v2 价格门禁 ∩ 环境门禁（chg 门禁先过，环境门禁再判）
                         if v3_v2_ok is None:

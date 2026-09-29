@@ -401,6 +401,7 @@ async def test_analytics_empty_db() -> None:
     expected = {
         "x4_v1", "quote_momentum_v1", "quote_contrarian_v1",
         "x4_v2", "x4_v3", "quote_momentum_v2", "quote_contrarian_v2",
+        "quote_contrarian_z_high_v1", "quote_contrarian_z_mid_v1",
         "quote_contrarian_v3a", "quote_contrarian_v3b", "quote_contrarian_v4",
         "late_night_contrarian_v1", "late_night_contrarian_v2",
         "krev_a_v1", "krev_b_v1", "hm_touch_down_v1", "hm_touch_down_v2",
@@ -438,6 +439,11 @@ async def test_analytics_empty_db() -> None:
     assert out["shadow"]["x4_v2"]["summary"]["bench_winrate"] == 0.553
     assert out["shadow"]["quote_contrarian_v3b"]["summary"]["bench_ev"] == 0.646
     assert out["shadow"]["quote_momentum_v2"]["summary"]["desc"].startswith("顺势v2")
+    for version in ("quote_contrarian_z_high_v1", "quote_contrarian_z_mid_v1"):
+        summary = out["shadow"][version]["summary"]
+        assert summary["collection_mode"] == "RECORD_ONLY"
+        assert summary["execution_mode"] == "SHADOW_ONLY"
+        assert "T+60s" in summary["desc"]
     # v4 regime 门禁版：62 天真实订单簿回测 down 段基准（胜率+EV 双钉）
     v4 = out["shadow"]["quote_contrarian_v4"]["summary"]
     assert v4["bench_winrate"] == 0.303 and v4["bench_ev"] == 0.372

@@ -16,7 +16,8 @@ from binance_predict.services.shadow_execution_types import (
 
 EXPECTED_ANALYTICS_VERSIONS = (
     "x4_v1", "quote_momentum_v1", "quote_contrarian_v1", "x4_v2",
-    "quote_momentum_v2", "quote_contrarian_v2", "x4_v3",
+    "quote_momentum_v2", "quote_contrarian_v2", "quote_contrarian_z_high_v1",
+    "quote_contrarian_z_mid_v1", "x4_v3",
     "quote_contrarian_v3a", "quote_contrarian_v3b", "quote_contrarian_v4",
     "late_night_contrarian_v1", "late_night_contrarian_v2", "krev_a_v1",
     "krev_b_v1", "hm_touch_down_v1", "hm_touch_down_v2", "rev_p1_v1",
@@ -34,7 +35,7 @@ EXPECTED_ANALYTICS_VERSIONS = (
 
 def test_registry_matches_all_physical_shadow_versions_in_order() -> None:
     assert SHADOW_VERSIONS == EXPECTED_ANALYTICS_VERSIONS
-    assert len(SHADOW_VERSION_SPECS) == 50
+    assert len(SHADOW_VERSION_SPECS) == 52
     for version in ("candle_hm_bull_5m_event_v1", "candle_hm_bull_15m_event_v1"):
         spec = SHADOW_VERSION_SPECS[version]
         assert spec.family == "candlestick_reversal"
@@ -53,6 +54,14 @@ def test_registry_separates_signal_and_execution_policy_versions() -> None:
         EXECUTION_POLICY_VERSION
     }
     assert EXECUTION_POLICY_VERSION not in SHADOW_VERSION_SPECS
+
+
+def test_contrarian_z_variants_are_record_only() -> None:
+    for version in ("quote_contrarian_z_high_v1", "quote_contrarian_z_mid_v1"):
+        spec = SHADOW_VERSION_SPECS[version]
+        assert spec.source_type is SourceType.MISALIGNMENT
+        assert spec.market_period == "5m"
+        assert spec.live_channel is None
 
 
 def test_s1_dynamic_shadow_has_registered_live_channel() -> None:

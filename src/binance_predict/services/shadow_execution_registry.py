@@ -30,6 +30,8 @@ _VERSION_ROWS: tuple[tuple[str, SourceType, str, str, str], ...] = (
     ("x4_v2", SourceType.MISALIGNMENT, "5m", "next_window", "row"),
     ("quote_momentum_v2", SourceType.MISALIGNMENT, "5m", "same_window", "row"),
     ("quote_contrarian_v2", SourceType.MISALIGNMENT, "5m", "same_window", "row"),
+    ("quote_contrarian_z_high_v1", SourceType.MISALIGNMENT, "5m", "same_window", "row"),
+    ("quote_contrarian_z_mid_v1", SourceType.MISALIGNMENT, "5m", "same_window", "row"),
     ("x4_v3", SourceType.MISALIGNMENT, "5m", "next_window", "row"),
     ("quote_contrarian_v3a", SourceType.MISALIGNMENT, "5m", "same_window", "row"),
     ("quote_contrarian_v3b", SourceType.MISALIGNMENT, "5m", "same_window", "row"),
