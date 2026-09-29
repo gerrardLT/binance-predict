@@ -2945,7 +2945,7 @@ function LiveTradeTab() {
   const liveChannels = Array.isArray(live?.channels) ? live.channels as LiveChannelStatus[] : []
   const liveDefaults = (live?.defaults ?? {}) as Record<string, unknown>
 
-  // 通道 pnl 快速索引；列表默认按真实胜率、信号 EV 依次降序，无已结算单者排末尾。
+  // 通道 pnl 快速索引；列表默认按信号 EV、真实胜率依次降序，无已结算单者排末尾。
   const { pnlByChan, liveSortMetrics } = useMemo(() => {
     const byChannel: Record<string, PnlChannel> = {}
     const metrics: Record<string, { winRate: number | null; signalEv: number | null }> = {}
@@ -2962,10 +2962,10 @@ function LiveTradeTab() {
   const byLivePerformance = (a: LiveChannelStatus, b: LiveChannelStatus) => {
     const am = liveSortMetrics[a.channel]
     const bm = liveSortMetrics[b.channel]
-    const winDiff = (bm?.winRate ?? Number.NEGATIVE_INFINITY) - (am?.winRate ?? Number.NEGATIVE_INFINITY)
-    if (winDiff) return winDiff
     const evDiff = (bm?.signalEv ?? Number.NEGATIVE_INFINITY) - (am?.signalEv ?? Number.NEGATIVE_INFINITY)
-    return evDiff || a.channel.localeCompare(b.channel)
+    if (evDiff) return evDiff
+    const winDiff = (bm?.winRate ?? Number.NEGATIVE_INFINITY) - (am?.winRate ?? Number.NEGATIVE_INFINITY)
+    return winDiff || a.channel.localeCompare(b.channel)
   }
   const activeLiveChannels = liveChannels.filter(c => c.enabled).sort(byLivePerformance)
   const stoppedLiveChannels = liveChannels.filter(c => !c.enabled).sort(byLivePerformance)
@@ -3469,7 +3469,7 @@ function LiveTradeTab() {
           <div className="flex justify-between gap-2 items-center">
             <span className="text-ink-55 shrink-0 flex items-center">
               信号实盘通道
-              <HelpHint text="后端注册表中的实盘通道：每通道独立开关、金额、日限和执行价护栏。默认按真实胜率降序，同胜率按信号EV降序；无已结算单排末尾。是否实盘只以后端通道状态为准；影子采集开关不等于真钱开关。" />
+              <HelpHint text="后端注册表中的实盘通道：每通道独立开关、金额、日限和执行价护栏。默认按信号EV降序，同EV按真实胜率降序；无已结算单排末尾。是否实盘只以后端通道状态为准；影子采集开关不等于真钱开关。" />
             </span>
             {liveChannels.length > 0
               ? <span className="flex items-baseline gap-1.5 text-right">
