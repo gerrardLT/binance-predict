@@ -2909,6 +2909,7 @@ function LiveTradeTab() {
   const [redeemResult, setRedeemResult] = useState<Record<string, unknown> | null>(null)
   const [showRedeemDetails, setShowRedeemDetails] = useState(false)
   const [showStoppedChannels, setShowStoppedChannels] = useState(false)
+  const [expandedLiveChannel, setExpandedLiveChannel] = useState<string | null>(null)
   // 通道盈亏与 ROI 数据（2026-09-09：在实盘通道卡片中直观映射实盘战绩与盈利率）
   const [pnlData, setPnlData] = useState<PnlCurveData | null>(null)
 
@@ -2969,6 +2970,26 @@ function LiveTradeTab() {
   const activeLiveChannels = liveChannels.filter(c => c.enabled).sort(byLivePerformance)
   const stoppedLiveChannels = liveChannels.filter(c => !c.enabled).sort(byLivePerformance)
   const enabledCount = activeLiveChannels.length
+  const toggleLiveDetails = (channel: string) => setExpandedLiveChannel(current => current === channel ? null : channel)
+  const liveDetails = (ch: LiveChannelStatus) => {
+    const p = pnlByChan[ch.channel]
+    const metrics = liveSortMetrics[ch.channel]
+    const detail = (label: string, value: string, tone = '') => <div><span className="text-ink-55">{label}</span><b className={`ml-1 font-mono ${tone}`}>{value}</b></div>
+    return <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-4 gap-y-1 px-3 py-2 text-[11px] border-t border-line-soft bg-card" onClick={event => event.stopPropagation()}>
+      {detail('真实胜率', metrics?.winRate == null ? '--' : `${(metrics.winRate * 100).toFixed(1)}%`)}
+      {detail('信号EV', metrics?.signalEv == null ? '--' : `${metrics.signalEv >= 0 ? '+' : ''}${(metrics.signalEv * 100).toFixed(1)}%`, metrics?.signalEv == null ? '' : metrics.signalEv >= 0 ? 'text-positive' : 'text-negative')}
+      {detail('已结算', `${p?.settled_count ?? 0} 单`)}
+      {detail('胜 / 负', `${p?.win_count ?? 0} / ${Math.max(0, (p?.settled_count ?? 0) - (p?.win_count ?? 0))}`)}
+      {detail('累计投入', p ? `${p.total_cost.toFixed(2)} U` : '--')}
+      {detail('真实PnL', p ? `${p.total_pnl >= 0 ? '+' : ''}${p.total_pnl.toFixed(2)} U` : '--', p ? p.total_pnl >= 0 ? 'text-positive' : 'text-negative' : '')}
+      {detail('资金ROI', p?.roi == null ? '--' : `${p.roi >= 0 ? '+' : ''}${(p.roi * 100).toFixed(1)}%`, p?.roi == null ? '' : p.roi >= 0 ? 'text-positive' : 'text-negative')}
+      {detail('今日 / 日限', `${ch.filled_today ?? 0} / ${ch.max_daily_orders}`)}
+      {detail('累计开火', `${ch.fire_total} 次`)}
+      {detail('周期', ch.market_period || '--')}
+      {detail('方向', ch.direction || '--')}
+      {detail('执行价护栏', ch.max_exec_price.toFixed(2))}
+    </div>
+  }
 
   // 倒计时：服务端时钟修正后的剩余毫秒；<60s 红色警示
   const windowEnd = quote?.window_end as number | null | undefined
@@ -3473,9 +3494,12 @@ function LiveTradeTab() {
                 const dirty = draft != null && draft !== String(ch.amount_usdt)
                 const metrics = liveSortMetrics[ch.channel]
                 return (
+                  <div key={ch.channel} className={`rounded-sm border overflow-hidden ${ch.enabled ? 'border-positive bg-positive-soft' : 'border-line bg-card'}`}>
                   <div
-                    key={ch.channel}
-                    className={`flex items-center gap-2 px-2 py-1.5 rounded-sm border text-xs ${ch.enabled ? 'border-positive bg-positive-soft' : 'border-line bg-card'}`}
+                    role="button" tabIndex={0} aria-expanded={expandedLiveChannel === ch.channel}
+                    onClick={() => toggleLiveDetails(ch.channel)}
+                    onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggleLiveDetails(ch.channel) } }}
+                    className="flex items-center gap-2 px-2 py-1.5 text-xs cursor-pointer"
                   >
                     <span className="flex items-center gap-1.5 min-w-0 flex-1">
                       <span className="ds-badge ds-badge-up shrink-0">实盘通道</span>
@@ -3486,7 +3510,7 @@ function LiveTradeTab() {
                       <span>胜率 <b>{metrics?.winRate == null ? '--' : `${(metrics.winRate * 100).toFixed(1)}%`}</b></span>
                       <span className={metrics?.signalEv == null ? 'text-ink-55' : metrics.signalEv >= 0 ? 'text-positive' : 'text-negative'}>信号EV <b>{metrics?.signalEv == null ? '--' : `${metrics.signalEv >= 0 ? '+' : ''}${(metrics.signalEv * 100).toFixed(1)}%`}</b></span>
                     </span>
-                    <span className="shrink-0 flex items-center gap-1">
+                    <span className="shrink-0 flex items-center gap-1" onClick={event => event.stopPropagation()}>
                       <span className="text-[10px] text-ink-55">护栏</span>
                       <input
                         type="number" min={0.01} max={0.99} step={0.01}
@@ -3543,7 +3567,7 @@ function LiveTradeTab() {
                         </span>
                       )
                     })()}
-                    <span className="shrink-0 flex items-center gap-1">
+                    <span className="shrink-0 flex items-center gap-1" onClick={event => event.stopPropagation()}>
                       <input
                         type="number" min={0.1} max={50} step={0.5}
                         value={draft ?? String(ch.amount_usdt)}
@@ -3560,10 +3584,13 @@ function LiveTradeTab() {
                       >存</button>
                     </span>
                     <button
-                      onClick={() => handleChannelToggle(ch)}
+                      onClick={event => { event.stopPropagation(); handleChannelToggle(ch) }}
                       disabled={togglingLive}
                       className={`shrink-0 px-2 py-0.5 rounded-pill font-bold text-white disabled:opacity-50 ${ch.enabled ? 'bg-negative' : 'bg-positive'}`}
                     >{ch.enabled ? '停火' : '开火'}</button>
+                    <span className="shrink-0 text-ink-55" aria-hidden="true">{expandedLiveChannel === ch.channel ? '▲' : '▼'}</span>
+                  </div>
+                  {expandedLiveChannel === ch.channel && liveDetails(ch)}
                   </div>
                 )
               })}
@@ -3584,7 +3611,13 @@ function LiveTradeTab() {
                         const amountDirty = amountDraft != null && amountDraft !== String(ch.amount_usdt)
                         const metrics = liveSortMetrics[ch.channel]
                         return (
-                          <div key={ch.channel} className="flex items-center gap-2 px-2 py-1.5 rounded-sm border border-line bg-card text-xs">
+                          <div key={ch.channel} className="rounded-sm border border-line bg-card overflow-hidden">
+                          <div
+                            role="button" tabIndex={0} aria-expanded={expandedLiveChannel === ch.channel}
+                            onClick={() => toggleLiveDetails(ch.channel)}
+                            onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggleLiveDetails(ch.channel) } }}
+                            className="flex items-center gap-2 px-2 py-1.5 text-xs cursor-pointer"
+                          >
                             <span className="flex items-center gap-1.5 min-w-0 flex-1">
                               <span className="ds-badge ds-badge-neutral shrink-0">已停火</span>
                               <span className="text-ink-95 font-medium truncate">{info?.name ?? ch.display_name}</span>
@@ -3594,7 +3627,7 @@ function LiveTradeTab() {
                               <span>胜率 <b>{metrics?.winRate == null ? '--' : `${(metrics.winRate * 100).toFixed(1)}%`}</b></span>
                               <span className={metrics?.signalEv == null ? 'text-ink-55' : metrics.signalEv >= 0 ? 'text-positive' : 'text-negative'}>信号EV <b>{metrics?.signalEv == null ? '--' : `${metrics.signalEv >= 0 ? '+' : ''}${(metrics.signalEv * 100).toFixed(1)}%`}</b></span>
                             </span>
-                            <span className="shrink-0 flex items-center gap-1">
+                            <span className="shrink-0 flex items-center gap-1" onClick={event => event.stopPropagation()}>
                               <span className="text-[10px] text-ink-55">护栏</span>
                               <input
                                 type="number" min={0.01} max={0.99} step={0.01}
@@ -3609,7 +3642,7 @@ function LiveTradeTab() {
                                 className="px-1.5 py-0.5 rounded-pill border border-brand bg-card text-brand font-semibold text-[10px] disabled:opacity-40"
                               >存</button>
                             </span>
-                            <span className="shrink-0 flex items-center gap-1">
+                            <span className="shrink-0 flex items-center gap-1" onClick={event => event.stopPropagation()}>
                               <input
                                 type="number" min={0.1} max={50} step={0.5}
                                 value={amountDraft ?? String(ch.amount_usdt)}
@@ -3624,10 +3657,13 @@ function LiveTradeTab() {
                               >存</button>
                             </span>
                             <button
-                              onClick={() => handleChannelToggle(ch)}
+                              onClick={event => { event.stopPropagation(); handleChannelToggle(ch) }}
                               disabled={togglingLive}
                               className="shrink-0 px-2 py-0.5 rounded-pill font-bold text-white bg-positive disabled:opacity-50"
                             >开火</button>
+                            <span className="shrink-0 text-ink-55" aria-hidden="true">{expandedLiveChannel === ch.channel ? '▲' : '▼'}</span>
+                          </div>
+                          {expandedLiveChannel === ch.channel && liveDetails(ch)}
                           </div>
                         )
                       })}
