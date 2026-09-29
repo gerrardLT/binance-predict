@@ -2947,23 +2947,24 @@ function LiveTradeTab() {
   // 通道 pnl 快速索引；列表默认按真实胜率、信号 EV 依次降序，无已结算单者排末尾。
   const { pnlByChan, liveSortMetrics } = useMemo(() => {
     const byChannel: Record<string, PnlChannel> = {}
-    const metrics: Record<string, { winRate: number; signalEv: number }> = {}
+    const metrics: Record<string, { winRate: number | null; signalEv: number | null }> = {}
     for (const channel of pnlData?.channels ?? []) {
       byChannel[channel.channel] = channel
       const returns = channel.points.filter(point => point.cost != null && point.cost > 0).map(point => point.pnl / point.cost!)
       metrics[channel.channel] = {
-        winRate: channel.win_rate ?? Number.NEGATIVE_INFINITY,
-        signalEv: returns.length ? returns.reduce((sum, value) => sum + value, 0) / returns.length : Number.NEGATIVE_INFINITY,
+        winRate: channel.win_rate,
+        signalEv: returns.length ? returns.reduce((sum, value) => sum + value, 0) / returns.length : null,
       }
     }
     return { pnlByChan: byChannel, liveSortMetrics: metrics }
   }, [pnlData])
   const byLivePerformance = (a: LiveChannelStatus, b: LiveChannelStatus) => {
-    const am = liveSortMetrics[a.channel] ?? { winRate: Number.NEGATIVE_INFINITY, signalEv: Number.NEGATIVE_INFINITY }
-    const bm = liveSortMetrics[b.channel] ?? { winRate: Number.NEGATIVE_INFINITY, signalEv: Number.NEGATIVE_INFINITY }
-    if (am.winRate !== bm.winRate) return bm.winRate - am.winRate
-    if (am.signalEv !== bm.signalEv) return bm.signalEv - am.signalEv
-    return a.channel.localeCompare(b.channel)
+    const am = liveSortMetrics[a.channel]
+    const bm = liveSortMetrics[b.channel]
+    const winDiff = (bm?.winRate ?? Number.NEGATIVE_INFINITY) - (am?.winRate ?? Number.NEGATIVE_INFINITY)
+    if (winDiff) return winDiff
+    const evDiff = (bm?.signalEv ?? Number.NEGATIVE_INFINITY) - (am?.signalEv ?? Number.NEGATIVE_INFINITY)
+    return evDiff || a.channel.localeCompare(b.channel)
   }
   const activeLiveChannels = liveChannels.filter(c => c.enabled).sort(byLivePerformance)
   const stoppedLiveChannels = liveChannels.filter(c => !c.enabled).sort(byLivePerformance)
@@ -3470,6 +3471,7 @@ function LiveTradeTab() {
                 const info = SIGNAL_INFO[ch.channel]
                 const draft = amountDrafts[ch.channel]
                 const dirty = draft != null && draft !== String(ch.amount_usdt)
+                const metrics = liveSortMetrics[ch.channel]
                 return (
                   <div
                     key={ch.channel}
@@ -3477,12 +3479,12 @@ function LiveTradeTab() {
                   >
                     <span className="flex items-center gap-1.5 min-w-0 flex-1">
                       <span className="ds-badge ds-badge-up shrink-0">实盘通道</span>
-                      <span className={`px-1.5 py-0.5 text-[10px] font-semibold rounded-pill border shrink-0 ${ch.order_type === 'LIMIT' ? 'bg-brand-soft text-brand border-brand/30' : 'bg-sunken text-ink-70 border-line'}`} title={ch.order_type === 'LIMIT' ? '限价挂单模式（GTC 长效挂单被动撮合）' : '市价模式（FOK 询价即时成交）'}>
-                        {ch.order_type === 'LIMIT' ? '限价GTC' : '市价FOK'}
-                      </span>
                       <span className="text-ink-95 font-medium truncate">{info?.name ?? ch.display_name}</span>
-                      <span className="text-[10px] text-ink-55 font-mono hidden md:inline truncate max-w-[10em]" title={ch.channel}>{ch.channel}</span>
                       <HelpHint text={info?.desc ?? ch.display_name} />
+                    </span>
+                    <span className="shrink-0 flex items-center gap-2 font-mono text-[11px]" title="按已结算实盘订单统计；信号EV为每笔 PnL/投入的等权平均">
+                      <span>胜率 <b>{metrics?.winRate == null ? '--' : `${(metrics.winRate * 100).toFixed(1)}%`}</b></span>
+                      <span className={metrics?.signalEv == null ? 'text-ink-55' : metrics.signalEv >= 0 ? 'text-positive' : 'text-negative'}>信号EV <b>{metrics?.signalEv == null ? '--' : `${metrics.signalEv >= 0 ? '+' : ''}${(metrics.signalEv * 100).toFixed(1)}%`}</b></span>
                     </span>
                     <span className="shrink-0 flex items-center gap-1">
                       <span className="text-[10px] text-ink-55">护栏</span>
@@ -3580,13 +3582,17 @@ function LiveTradeTab() {
                         const info = SIGNAL_INFO[ch.channel]
                         const amountDraft = amountDrafts[ch.channel]
                         const amountDirty = amountDraft != null && amountDraft !== String(ch.amount_usdt)
+                        const metrics = liveSortMetrics[ch.channel]
                         return (
                           <div key={ch.channel} className="flex items-center gap-2 px-2 py-1.5 rounded-sm border border-line bg-card text-xs">
                             <span className="flex items-center gap-1.5 min-w-0 flex-1">
                               <span className="ds-badge ds-badge-neutral shrink-0">已停火</span>
                               <span className="text-ink-95 font-medium truncate">{info?.name ?? ch.display_name}</span>
-                              <span className="text-[10px] text-ink-55 font-mono hidden md:inline truncate max-w-[10em]" title={ch.channel}>{ch.channel}</span>
                               <HelpHint text={info?.desc ?? ch.display_name} />
+                            </span>
+                            <span className="shrink-0 flex items-center gap-2 font-mono text-[11px]" title="按已结算实盘订单统计；信号EV为每笔 PnL/投入的等权平均">
+                              <span>胜率 <b>{metrics?.winRate == null ? '--' : `${(metrics.winRate * 100).toFixed(1)}%`}</b></span>
+                              <span className={metrics?.signalEv == null ? 'text-ink-55' : metrics.signalEv >= 0 ? 'text-positive' : 'text-negative'}>信号EV <b>{metrics?.signalEv == null ? '--' : `${metrics.signalEv >= 0 ? '+' : ''}${(metrics.signalEv * 100).toFixed(1)}%`}</b></span>
                             </span>
                             <span className="shrink-0 flex items-center gap-1">
                               <span className="text-[10px] text-ink-55">护栏</span>
