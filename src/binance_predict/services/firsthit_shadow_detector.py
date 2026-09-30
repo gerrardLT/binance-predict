@@ -54,13 +54,16 @@ from binance_predict.db.engine import async_session_factory
 from binance_predict.db.models import FirstHitShadowSignal, SentimentWindow
 from binance_predict.services.shadow_version_gate import shadow_gate
 
+from .process_recovery import VERSION as PROCESS_RECOVERY_VERSION, extract_process_recovery
+
 # ---- 冻结口径（local_shape_scan_v2.py / G7 系列扫描）----
 FIRSTHIT_SPECS: list[tuple[str, str]] = [
+    (PROCESS_RECOVERY_VERSION, "过程恢复双确认（DOWN）"),
     ("firsthit_down_v1", "G0 基底（全部首触）"),
     ("firsthit_down_body_v1", "G1 小实体 body_r≤0.35"),
     ("firsthit_down_chg_v1", "G3 价格偏离 chg≤+2.82bp"),
     ("firsthit_down_k10_v1", "K10 G3+标准化结算距离 z≤1.85567"),
-    ("firsthit_down_k10_profit_v1", "K10盈利版+前序扩张长上影早触 veto"),
+    ("firsthit_down_k10_profit_v1", "K10盈利版+末60s veto+前序扩张长上影早触 veto"),
     # G4 interaction（shape_scan_v2 已 FDR q=0.063 + confirm STRICT_PASS）：
     # chg_bps ≤ 2.82 ∧ body_r ≤ 0.35，样本量偏小但 EV 极高；注册影子版本用于前向验证
     ("firsthit_down_g4_v1", "G4 交互门 chg≤2.82∧body≤0.35"),
@@ -251,8 +254,8 @@ def extract_k10_kline_features(
         upper_wick_ratio = (h - max(o, c)) / (h - low) if h > low else None
         if upper_wick_ratio is not None:
             profit_veto = (
-                energy_expands and upper_wick_ratio >= 0.5
-                and remaining_seconds > 60.0
+                remaining_seconds <= 60.0
+                or (energy_expands and upper_wick_ratio >= 0.5)
             )
     return {
         "remaining_seconds": remaining_seconds,
@@ -312,6 +315,8 @@ def _gate_of(
 
     特征缺失（None）一律不落表——宁可少样本，不用不可信特征污染前向裁决。
     """
+    if version == PROCESS_RECOVERY_VERSION:
+        return True  # 独立提取器已完成全部过程门。
     if version == "firsthit_down_v1":
         return True
     if version == "firsthit_down_body_v1":
@@ -490,8 +495,11 @@ class FirstHitShadowDetector:
             return                                     # NOISE/缺结算：胜负不可判，不产生信号
         start_ms, end_ms = int(w.start_time), int(w.end_time)
         ext = _extract(w)
-        if ext is None:
-            return                                     # 无首触/路径质量不足：整窗不落表
+        process_ext = extract_process_recovery(
+            start_ms, getattr(w, "entry_price", None),
+            getattr(w, "curve_down_price", None), getattr(w, "curve_btc_price", None))
+        if ext is None and process_ext is None:
+            return
 
         # K10 使用真实首触时点的 BTC 前缀；旧 firsthit 版本保持原归档语义。
         k10_ext = None
@@ -550,7 +558,8 @@ class FirstHitShadowDetector:
                 try:
                     if not shadow_gate.is_enabled(version):
                         continue                        # 手动下线：停止采集该版本（历史保留）
-                    version_ext = k10_ext if version in K10_VERSIONS else ext
+                    version_ext = (process_ext if version == PROCESS_RECOVERY_VERSION else
+                                   k10_ext if version in K10_VERSIONS else ext)
                     if version_ext is None or not _gate_of(
                         version, version_ext, streak_up=streak_up, k10=k10_features
                     ):

@@ -229,6 +229,10 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     #   （只收紧不放松，clamp [0.05, base]），实现见 multi_live_trader.py 顶部
     #   FIRSTHIT_PRE_MARKET_* 常量区。过滤参数为保守先验未经离线回测，前向观测
     #   裁决后可调；影子端口径不变（仍记录全部触发），护栏选择效应由离线分析覆盖。
+    "process_recovery_down_v1": ChannelSpec(
+        "process_recovery_down_v1", "process_recovery", "5m", "DOWN", 0.35,
+        "过程恢复双确认（押DOWN）",
+    ),
     "firsthit_down_v1": ChannelSpec(
         "firsthit_down_v1", "firsthit", "5m", "DOWN", 0.08,
         "首触G0基底 q∈(0.005,0.1]（押DOWN）", order_type="LIMIT",
@@ -241,8 +245,8 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
         "firsthit_down_chg_v1", "firsthit", "5m", "DOWN", 0.09,
         "首触G3偏离 chg≤+2.82bp（押DOWN）", order_type="LIMIT",
     ),
-    # K10 族：G3 + 前12根完整5m波动归一的剩余结算距离；盈利版再剔除
-    # 「前序平方收益扩张 + 长上影 + 距结算>60s」三项同时成立。影子默认采集，
+    # K10 族：G3 + 前12根完整5m波动归一的剩余结算距离；盈利版无条件剔除
+    # 最后60秒首触，并在更早首触中剔除「前序平方收益扩张 + 长上影」。影子默认采集，
     # 实盘配置默认 OFF；用户明确两个版本同窗独立下注，不加入互斥组。
     "firsthit_down_k10_v1": ChannelSpec(
         "firsthit_down_k10_v1", "firsthit", "5m", "DOWN", 0.10,

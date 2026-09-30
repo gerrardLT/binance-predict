@@ -67,6 +67,7 @@ from binance_predict.db.models import (
     TradeOrderModel,
 )
 
+from .process_recovery import VERSION as PROCESS_RECOVERY_VERSION, extract_process_recovery
 from .absorption_shadow_detector import ABSORPTION_SPECS
 from .btc_regime import regime_feed
 from .live_execution_policy import config_fingerprint, evaluate_absorption_policy
@@ -618,6 +619,20 @@ class MultiLiveTrader:
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
             fired.append(ch)
+
+        # 过程恢复独立于旧首触门；实盘默认关闭，影子与实盘共用判定。
+        cfg = self._configs.get(PROCESS_RECOVERY_VERSION)
+        if cfg and cfg.enabled and window_start_ms not in cfg.fired and t_rel < 180:
+            process_ext = extract_process_recovery(
+                window_start_ms, window_entry_price, window_down_curve,
+                window_btc_curve, max_ts=ts_ms)
+            if process_ext is not None and process_ext["trigger_ts"] == ts_ms:
+                cfg.fired.add(window_start_ms)
+                task = asyncio.create_task(self._fire_firsthit(
+                    PROCESS_RECOVERY_VERSION, window_start_ms, process_ext))
+                self._tasks.add(task)
+                task.add_done_callback(self._tasks.discard)
+                fired.append(PROCESS_RECOVERY_VERSION)
 
         # ---- firsthit 族（2026-09-07 promote / 2026-09-08 G7扩容 / 2026-09-10 过滤器+动态护栏）----
         # 必须用完整 window_down_curve/window_btc_curve 找第一个入区点，而不是把
@@ -1566,7 +1581,13 @@ class MultiLiveTrader:
             )
             if not proceed:
                 return
-            dyn_guard = _resolve_firsthit_dynamic_guard(spec, cfg, ext, streak_up)
+            if channel == PROCESS_RECOVERY_VERSION:
+                # I/O等待后复核实际剩余时间，禁止早确认被排队成末段下单。
+                if time.time() * 1000 >= window_start + 180_000:
+                    return
+                dyn_guard = resolve_max_exec(spec, cfg)
+            else:
+                dyn_guard = _resolve_firsthit_dynamic_guard(spec, cfg, ext, streak_up)
             logger.info(
                 "多通道实盘开火 | {} | 首触反转押 DOWN | 窗口 {} | t=+{}s q={:.4f}"
                 " chg={:+.2f}bp body_r={:.3f} npts={} | 金额 {} | 护栏 {}（动态）",

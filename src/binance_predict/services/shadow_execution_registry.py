@@ -59,6 +59,7 @@ _VERSION_ROWS: tuple[tuple[str, SourceType, str, str, str], ...] = (
     ("s2_cond_t4_v1", SourceType.KLINE, "15m", "target_bar", "row"),
     ("s2_cond_t5d_v1", SourceType.KLINE, "15m", "target_bar", "row"),
     ("scene_bear_exhaust_opt_v1", SourceType.KLINE, "15m", "target_bar", "row"),
+    ("process_recovery_down_v1", SourceType.FIRSTHIT, "5m", "same_window", "down"),
     ("firsthit_down_v1", SourceType.FIRSTHIT, "5m", "same_window_first_touch", "down"),
     ("firsthit_down_body_v1", SourceType.FIRSTHIT, "5m", "same_window_first_touch", "down"),
     ("firsthit_down_chg_v1", SourceType.FIRSTHIT, "5m", "same_window_first_touch", "down"),
@@ -90,6 +91,8 @@ def _live_mapping(version: str) -> tuple[str | None, bool]:
 
 
 def _family_of(version: str, source: SourceType) -> str:
+    if version.startswith("process_recovery_"):
+        return "process_recovery"
     if version.startswith("candle_hm_bull_"):
         return "candlestick_reversal"
     if version.startswith(("quote_", "late_night_")):

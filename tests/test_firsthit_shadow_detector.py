@@ -398,6 +398,25 @@ def test_extract_k10_kline_features_and_profit_veto():
     base_only = extract_k10_kline_features(START, START + 120_000, bars[:-1])
     assert base_only is not None and base_only["profit_veto"] is None
 
+    # 盈利版无条件排除最后60秒；60秒边界含在末段内。
+    neutral_bars = []
+    for i in range(1, 14):
+        close = 100.2 if i % 2 else 99.8
+        neutral_bars.append({
+            "open_time": START - i * 300_000, "open": 100.0,
+            "high": max(100.25, close), "low": min(99.75, close),
+            "close": close,
+        })
+    before = extract_k10_kline_features(START, START + 239_999, neutral_bars)
+    boundary = extract_k10_kline_features(START, START + 240_000, neutral_bars)
+    after = extract_k10_kline_features(START, START + 240_001, neutral_bars)
+    assert before is not None and before["remaining_seconds"] == pytest.approx(60.001)
+    assert before["profit_veto"] is False
+    assert boundary is not None and boundary["remaining_seconds"] == pytest.approx(60.0)
+    assert boundary["profit_veto"] is True
+    assert after is not None and after["remaining_seconds"] == pytest.approx(59.999)
+    assert after["profit_veto"] is True
+
 
 # ============================================================
 # 3. 触发落 SETTLED / 幂等 / gate 拦截 / npts 门槛
@@ -477,6 +496,21 @@ async def test_process_window_triggers_k10_versions_with_audit_fields(monkeypatc
     assert row.k10_remaining_sigma_bps > 0
     assert row.k10_energy_expands is False
     assert row.k10_upper_wick_ratio is not None
+
+
+@pytest.mark.asyncio
+async def test_process_recovery_shadow_independent_of_legacy_firsthit(monkeypatch):
+    session = _FakeSession(first=None)
+    monkeypatch.setattr(fhd, "async_session_factory", lambda: _FakeSessionCtx(session))
+    w = _seed_window(npts=20, trigger_q=0.07)
+    w.curve_down_price = [{"t": START + t, "v": q} for t, q in [(0, .1), (30_000, .2), (120_000, .25)]]
+    w.curve_btc_price = [{"t": START + t, "v": v} for t, v in [(0, 100.), (30_000, 101.), (120_000, 100.5)]]
+    w.entry_price = 100.
+    await FirstHitShadowDetector()._process_window(w)
+    rows = [r for r in session.added if r.version == "process_recovery_down_v1"]
+    assert len(rows) == 1
+    assert rows[0].entry_down_price == .25
+    assert rows[0].trigger_ts == START + 120_000
 
 
 @pytest.mark.asyncio
@@ -571,6 +605,7 @@ def test_specs_self_consistent():
         "firsthit_down_v1",
         "firsthit_down_body_v1", "firsthit_down_chg_v1",
         "firsthit_down_k10_v1", "firsthit_down_k10_profit_v1",
+        "process_recovery_down_v1",
         "firsthit_down_g4_v1",
         "firsthit_down_g7_v1", "g7_streak_v1", "g7_wick20_v1",
         "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",

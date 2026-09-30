@@ -4201,8 +4201,9 @@ SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     "firsthit_down_v1": (0.088, 0.234, "首触基底G0: 5m窗内DOWN首次进入(0.005,0.1]→买DOWN（40d全样本4632次，回测胜率8.8%/EV+0.234；前向现算裁决）"),
     "firsthit_down_body_v1": (0.153, 1.493, "首触体貌G1: G0+body_r≤0.35（FDR q=0.007，全样本418次胜率15.3%/EV+1.493，两段CI下界>0；前向现算裁决）"),
     "firsthit_down_chg_v1": (0.108, 0.517, "首触偏离G3: G0+chg≤+2.82bp（全样本1309次胜率10.8%/EV+0.517；前向现算裁决）"),
+    "process_recovery_down_v1": (None, None, "过程恢复DOWN: 30≤t<180过程段首个q≤0.20；BTC不利极值回收≥35%且token回升≥0.02，首个双确认t<180、0.15<q≤0.35。后验候选，历史采样标签非币安结算；前向影子裁决，实盘默认关闭"),
     "firsthit_down_k10_v1": (None, None, "首触K10: G3+标准化剩余结算距离z≤1.85567；发现段已污染，不钉历史基准，前向真实首触与完整前序K线现算裁决"),
-    "firsthit_down_k10_profit_v1": (None, None, "首触K10盈利版: K10再剔除前序平方收益扩张∧长上影∧距结算>60s；探索仅筛除17个历史亏损，前向现算裁决"),
+    "firsthit_down_k10_profit_v1": (None, None, "首触K10盈利版: K10无条件剔除距结算≤60s的末段首触；更早首触再剔除前序平方收益扩张∧长上影；前向现算裁决"),
     # 首触反转 G4 交互门（2026-09-08 影子+实盘接入）：G4 = G1 ∩ G3
     # shape_scan_v2 冻结扫描：calib n=214 P=12.6% EV+1.03 CI[+0.08,+2.22]；
     # confirm n=86 P=23.3% EV+1.85 CI[+0.35,+3.44]；binom p=0.025 → BH-FDR q=0.063 STRICT_PASS。
