@@ -436,7 +436,7 @@ async def test_process_window_triggers_g0(monkeypatch):
     versions = [r.version for r in session.added]
     assert "firsthit_down_v1" in versions
     assert "firsthit_down_chg_v1" in versions      # chg=0.5bp ≤ 2.82bp → G3 同窗命中
-    assert len(session.added) == 2 and session.committed == 2   # per-version 独立 commit
+    assert len(session.added) == 3 and session.committed == 3   # G0+G3+G3 early 独立 commit
     row = [r for r in session.added if r.version == "firsthit_down_v1"][0]
     assert row.status == "SETTLED"
     assert row.win is True and row.settle_outcome == "DOWN"
@@ -606,6 +606,7 @@ def test_specs_self_consistent():
         "firsthit_down_body_v1", "firsthit_down_chg_v1",
         "firsthit_down_k10_v1", "firsthit_down_k10_profit_v1",
         "process_recovery_down_v1",
+        "firsthit_down_chg_early180_v1", "firsthit_down_k10_early180_v1",
         "firsthit_down_g4_v1",
         "firsthit_down_g7_v1", "g7_streak_v1", "g7_wick20_v1",
         "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",

@@ -54,11 +54,14 @@ from binance_predict.db.engine import async_session_factory
 from binance_predict.db.models import FirstHitShadowSignal, SentimentWindow
 from binance_predict.services.shadow_version_gate import shadow_gate
 
+from .firsthit_early import G3_EARLY, K10_EARLY, before_cutoff as early_before_cutoff
 from .process_recovery import VERSION as PROCESS_RECOVERY_VERSION, extract_process_recovery
 
 # ---- 冻结口径（local_shape_scan_v2.py / G7 系列扫描）----
 FIRSTHIT_SPECS: list[tuple[str, str]] = [
     (PROCESS_RECOVERY_VERSION, "过程恢复双确认（DOWN）"),
+    (G3_EARLY, "G3前3分钟研究版"),
+    (K10_EARLY, "K10前3分钟研究版"),
     ("firsthit_down_v1", "G0 基底（全部首触）"),
     ("firsthit_down_body_v1", "G1 小实体 body_r≤0.35"),
     ("firsthit_down_chg_v1", "G3 价格偏离 chg≤+2.82bp"),
@@ -78,7 +81,7 @@ Q_LO, Q_HI = 0.005, 0.1      # 首触报价区间 (0.005, 0.1]
 BODY_R_GATE = 0.35           # G1 门：路径归一实体 ≤ 0.35
 CHG_BPS_GATE = 2.82          # G3 门：BTC 相对开盘涨幅 ≤ +2.82 bp
 MIN_PTS = 8                  # 路径质量门：触发前 btc 采样点数 ≥ 8（v2 主分析口径）
-K10_VERSIONS = frozenset({"firsthit_down_k10_v1", "firsthit_down_k10_profit_v1"})
+K10_VERSIONS = frozenset({"firsthit_down_k10_v1", "firsthit_down_k10_profit_v1", K10_EARLY})
 K10_Z_MAX = 1.8556725686410152
 K10_MAX_BTC_AGE_MS = 15_000
 K10_KLINE_MS = 300_000
@@ -209,6 +212,20 @@ def extract_firsthit_features(
     )
 
 
+def extract_g3_early_features(window_start, btc_open, down_curve, btc_curve):
+    """重放实时成熟语义：首触后首次达到路径质量门的采样即决策。"""
+    for point in _ser(down_curve):
+        ts = int(point["t"])
+        if ts >= int(window_start) + 180_000:
+            break
+        ext = extract_firsthit_features(
+            window_start, btc_open, down_curve, btc_curve, max_trigger_ts=ts)
+        if ext is not None and ext.get("chg_bps") is not None and ext["chg_bps"] <= CHG_BPS_GATE:
+            return {**ext, "q": float(point["v"]), "trigger_ts": ts,
+                    "td_sec": (ts - int(window_start)) / 1000}
+    return None
+
+
 def extract_k10_kline_features(
     window_start: int,
     trigger_ts: int,
@@ -317,6 +334,14 @@ def _gate_of(
     """
     if version == PROCESS_RECOVERY_VERSION:
         return True  # 独立提取器已完成全部过程门。
+    if version == G3_EARLY:
+        return ext["chg_bps"] is not None and ext["chg_bps"] <= CHG_BPS_GATE
+    if version == K10_EARLY:
+        if ext.get("chg_bps") is None or ext["chg_bps"] > CHG_BPS_GATE or k10 is None:
+            return False
+        z = ext["chg_bps"] / k10["remaining_sigma_bps"]
+        k10["z"] = z
+        return math.isfinite(z) and z <= K10_Z_MAX
     if version == "firsthit_down_v1":
         return True
     if version == "firsthit_down_body_v1":
@@ -498,6 +523,9 @@ class FirstHitShadowDetector:
         process_ext = extract_process_recovery(
             start_ms, getattr(w, "entry_price", None),
             getattr(w, "curve_down_price", None), getattr(w, "curve_btc_price", None))
+        g3_early_ext = extract_g3_early_features(
+            start_ms, getattr(w, "entry_price", None),
+            getattr(w, "curve_down_price", None), getattr(w, "curve_btc_price", None))
         if ext is None and process_ext is None:
             return
 
@@ -559,9 +587,12 @@ class FirstHitShadowDetector:
                     if not shadow_gate.is_enabled(version):
                         continue                        # 手动下线：停止采集该版本（历史保留）
                     version_ext = (process_ext if version == PROCESS_RECOVERY_VERSION else
+                                   g3_early_ext if version == G3_EARLY else
                                    k10_ext if version in K10_VERSIONS else ext)
-                    if version_ext is None or not _gate_of(
-                        version, version_ext, streak_up=streak_up, k10=k10_features
+                    if (version_ext is None
+                        or version in (G3_EARLY, K10_EARLY) and not early_before_cutoff(
+                            start_ms, version_ext["trigger_ts"])
+                        or not _gate_of(version, version_ext, streak_up=streak_up, k10=k10_features)
                     ):
                         continue                        # 门未命中/前序K线缺失：不落表
                     q = version_ext["q"]

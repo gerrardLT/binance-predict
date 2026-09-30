@@ -59,6 +59,8 @@ _VERSION_ROWS: tuple[tuple[str, SourceType, str, str, str], ...] = (
     ("s2_cond_t4_v1", SourceType.KLINE, "15m", "target_bar", "row"),
     ("s2_cond_t5d_v1", SourceType.KLINE, "15m", "target_bar", "row"),
     ("scene_bear_exhaust_opt_v1", SourceType.KLINE, "15m", "target_bar", "row"),
+    ("firsthit_down_chg_early180_v1", SourceType.FIRSTHIT, "5m", "same_window_first_touch", "down"),
+    ("firsthit_down_k10_early180_v1", SourceType.FIRSTHIT, "5m", "same_window_first_touch", "down"),
     ("process_recovery_down_v1", SourceType.FIRSTHIT, "5m", "same_window", "down"),
     ("firsthit_down_v1", SourceType.FIRSTHIT, "5m", "same_window_first_touch", "down"),
     ("firsthit_down_body_v1", SourceType.FIRSTHIT, "5m", "same_window_first_touch", "down"),

@@ -67,6 +67,10 @@ from binance_predict.db.models import (
     TradeOrderModel,
 )
 
+from .firsthit_early import (
+    G3_EARLY, K10_EARLY, VERSIONS as FIRSTHIT_EARLY_VERSIONS,
+    before_cutoff as early_before_cutoff,
+)
 from .process_recovery import VERSION as PROCESS_RECOVERY_VERSION, extract_process_recovery
 from .absorption_shadow_detector import ABSORPTION_SPECS
 from .btc_regime import regime_feed
@@ -652,12 +656,12 @@ class MultiLiveTrader:
                 # 同步快速否决（不含 streak 维度——前驱窗需 DB，异步任务内复核）
                 quick_veto = _firsthit_pre_market_veto(ext, None)
                 for ch, spec in self._specs.items():
-                    if spec.family != "firsthit":
+                    if spec.family not in ("firsthit", "firsthit_early"):
                         continue
                     cfg = self._configs[ch]
                     if not cfg.enabled or window_start_ms in cfg.fired:
                         continue
-                    if quick_veto is not None and ch not in K10_VERSIONS:
+                    if quick_veto is not None and ch not in K10_VERSIONS | FIRSTHIT_EARLY_VERSIONS:
                         logger.info(
                             "多通道实盘：{} 盘前快速否决 | 窗口 {} | {}",
                             ch, _fmt_win(window_start_ms), quick_veto)
@@ -671,12 +675,23 @@ class MultiLiveTrader:
                             window_down_curve, window_btc_curve,
                             max_trigger_ts=int(ts_ms), pin_path_to_first_touch=True,
                         )
-                        if version_ext is None:
+                        if (version_ext is None
+                            or ch == K10_EARLY and (
+                                not early_before_cutoff(window_start_ms, version_ext["trigger_ts"])
+                                or int(version_ext["trigger_ts"]) != int(ts_ms)
+                            )):
+                            continue
+                    elif ch == G3_EARLY:
+                        if not early_before_cutoff(window_start_ms, ts_ms):
+                            continue
+                        version_ext = {**ext, "q": float(down_price),
+                                       "trigger_ts": int(ts_ms), "td_sec": t_rel}
+                        if not firsthit_gate_of(ch, version_ext):
                             continue
                     elif ch not in ("g7_streak_v1", "g7_strict_v1"):
                         if not firsthit_gate_of(ch, version_ext):
                             continue                     # 门未过 → 不占 fired、不派任务
-                    if ch in K10_VERSIONS:
+                    if ch in K10_VERSIONS | FIRSTHIT_EARLY_VERSIONS:
                         cfg.fired.add(window_start_ms)  # K线I/O期间防重复派生；失败后本窗不追单
                     task = asyncio.create_task(
                         self._verify_firsthit_all_gates(ch, window_start_ms, version_ext),
@@ -1630,7 +1645,7 @@ class MultiLiveTrader:
         win_label = _fmt_win(window_start)
         try:
             streak_up = None
-            if channel not in K10_VERSIONS:
+            if channel not in K10_VERSIONS | FIRSTHIT_EARLY_VERSIONS:
                 streak_up = 0
                 L_ms = 300_000
                 async with async_session_factory() as session:
@@ -1647,7 +1662,7 @@ class MultiLiveTrader:
                             streak_up += 1
                         else:
                             break
-            veto = None if channel in K10_VERSIONS else _firsthit_pre_market_veto(ext, streak_up)
+            veto = None if channel in K10_VERSIONS | FIRSTHIT_EARLY_VERSIONS else _firsthit_pre_market_veto(ext, streak_up)
             if veto is not None:
                 logger.info("多通道实盘：{} 盘前过滤拦截 | 窗口 {} | {}",
                             channel, win_label, veto)

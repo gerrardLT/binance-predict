@@ -208,7 +208,7 @@ def test_parse_defaults_all_off(monkeypatch) -> None:
     monkeypatch.setattr(settings, "live_default_max_daily_orders", 100)
     monkeypatch.setattr(settings, "live_channels_json", "")
     cfgs = parse_channel_config()
-    assert len(cfgs) == 37 + len(CANDLESTICK_SIGNAL_IDS)
+    assert len(cfgs) == 39 + len(CANDLESTICK_SIGNAL_IDS)
     assert set(CANDLESTICK_SIGNAL_IDS) <= set(cfgs)
     assert all(not c.enabled for c in cfgs.values())
     assert all(c.amount_usdt == 2.0 for c in cfgs.values())
@@ -368,6 +368,7 @@ def test_channels_registry_shape() -> None:
         "absorption_follow_td120_v1", "absorption_follow_td150_v1",
         # 2026-09-18 K线反转四通道（默认全 OFF，仅新鲜次根开盘派单）
         "krev_a_v1", "krev_b_v1", "rev_p1_v1", "rev_p2_v1",
+        "firsthit_down_chg_early180_v1", "firsthit_down_k10_early180_v1",
         "process_recovery_down_v1",
         # firsthit 族（默认全 OFF，用户确认独立下单）
         "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1",
@@ -1851,6 +1852,29 @@ async def test_process_recovery_default_off_and_live_confirmation(monkeypatch):
     assert fake2.calls == []
 
 
+@pytest.mark.asyncio
+async def test_firsthit_early_channels_default_off_and_time_boundaries(monkeypatch):
+    channels = ["firsthit_down_chg_early180_v1", "firsthit_down_k10_early180_v1"]
+    assert all(parse_channel_config()[ch].enabled is False for ch in channels)
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=channels)
+    t.kline_ending_at_fetcher = AsyncMock(return_value=_k10_klines())
+    dn = _firsthit_down_curve(trigger_q=.07, npts=20, trigger_idx=8)
+    btc = _firsthit_btc_curve(btc_open=100., btc_trig=100.02, npts=20)
+    fired = t.check(WINDOW_START, WINDOW_END, WINDOW_START + 120_000,
+                    down_price=.07, btc_price=100.02, window_entry_price=100.,
+                    window_btc_curve=btc, window_down_curve=dn)
+    assert set(fired) == set(channels)
+    await _drain(t)
+    assert {call["signal_version"] for call in fake.calls} == set(channels)
+
+    late = _make_trader(monkeypatch, _FakeTrader(), channels=channels)
+    late.kline_ending_at_fetcher = AsyncMock(return_value=_k10_klines())
+    assert late.check(WINDOW_START, WINDOW_END, WINDOW_START + 180_000,
+                      down_price=.07, btc_price=100.02, window_entry_price=100.,
+                      window_btc_curve=btc, window_down_curve=dn) == []
+
+
 def _firsthit_down_curve(trigger_q: float = 0.07, npts: int = 20, trigger_idx: int = 8) -> list[dict]:
     """构造 down_curve，使 trigger_idx 位置的点是第一个入区点（默认 t=120s）。"""
     pts = []
@@ -2413,7 +2437,7 @@ def test_status_shape(monkeypatch) -> None:
     assert s["defaults"]["amount_usdt"] == 2.0
     assert s["defaults"]["max_daily_orders"] == 100
     from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
-    assert len(s["channels"]) == 45 + len(CANDLESTICK_SIGNAL_IDS)
+    assert len(s["channels"]) == 47 + len(CANDLESTICK_SIGNAL_IDS)
     by = {c["channel"]: c for c in s["channels"]}
     c = by["quote_contrarian_v1"]
     assert c["enabled"] is True and c["enabled_at_startup"] is True

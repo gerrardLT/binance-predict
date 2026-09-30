@@ -229,6 +229,14 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     #   （只收紧不放松，clamp [0.05, base]），实现见 multi_live_trader.py 顶部
     #   FIRSTHIT_PRE_MARKET_* 常量区。过滤参数为保守先验未经离线回测，前向观测
     #   裁决后可调；影子端口径不变（仍记录全部触发），护栏选择效应由离线分析覆盖。
+    "firsthit_down_chg_early180_v1": ChannelSpec(
+        "firsthit_down_chg_early180_v1", "firsthit_early", "5m", "DOWN", 0.10,
+        "首触G3前3分钟研究版（押DOWN）", order_type="LIMIT",
+    ),
+    "firsthit_down_k10_early180_v1": ChannelSpec(
+        "firsthit_down_k10_early180_v1", "firsthit_early", "5m", "DOWN", 0.10,
+        "首触K10前3分钟研究版（押DOWN）", order_type="LIMIT",
+    ),
     "process_recovery_down_v1": ChannelSpec(
         "process_recovery_down_v1", "process_recovery", "5m", "DOWN", 0.35,
         "过程恢复双确认（押DOWN）",
