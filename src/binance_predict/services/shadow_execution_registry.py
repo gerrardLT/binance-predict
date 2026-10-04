@@ -82,13 +82,15 @@ _VERSION_ROWS: tuple[tuple[str, SourceType, str, str, str], ...] = (
     ("ih_inside_15m_v2", SourceType.KLINE, "15m", "target_bar", "row"),
     ("hm_inside_5m_v2", SourceType.KLINE, "5m", "target_bar", "row"),
     # CRV 情绪反转族（2026-10-04 研究 run 20261004T083106Z）：15m/5m 突破族押次根
-    # 收阴 DOWN + 两个三因子探索级押次根收阳 UP；direction 按行（row）落库。
+    # 收阴 DOWN + 三个三因子探索/观察级（dnex/os_st4/hi_z3，仅影子）；direction 按行（row）。
     ("crv_hi_brk20_15m_v1", SourceType.KLINE, "15m", "target_bar", "row"),
     ("crv_brk20_15m_v1", SourceType.KLINE, "15m", "target_bar", "row"),
     ("crv_brk50_hi_15m_v1", SourceType.KLINE, "15m", "target_bar", "row"),
     ("crv_dnex_15m_v1", SourceType.KLINE, "15m", "target_bar", "row"),
     ("crv_brk20_5m_v1", SourceType.KLINE, "5m", "target_bar", "row"),
     ("crv_os_st4_5m_v1", SourceType.KLINE, "5m", "target_bar", "row"),
+    # 2026-10-04 AMENDMENT-2 全枚举新发现（观察级，仅影子）
+    ("crv_hi_z3_15m_v1", SourceType.KLINE, "15m", "target_bar", "row"),
     # 长影短实体检测器按 timeframe 只落一个物理事件；18 个冻结逻辑版本作为标签，
     # 不在此投影表重复展开，避免同窗主版本/严格子集/组件被统计成多次事件。
     ("candle_hm_bull_5m_event_v1", SourceType.KLINE, "5m", "target_bar", "row"),

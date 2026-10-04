@@ -19,6 +19,10 @@
         disc n=132 61.4% / val n=108 60.2%；未过盲测（探索性，晋级需前向影子 ≥8 周）。
     crv_os_st4_5m_v1（5m 三因子探索级，仅影子）：RSI14<30∧连4阴∧跌破20低
         disc n=330 60.6% / val n=200 52.5%；未过盲测。
+    crv_hi_z3_15m_v1（15m 三因子观察级，2026-10-04 AMENDMENT-2 全枚举新发现，仅影子）：
+        阳线∧pos100>0.90∧z20>+2∧恰连3阳 → 押次根收阴 DOWN
+        disc n=190 62.1%（Wilson95%下界 55.0%，全场深度3最高）/ val n=74 67.6%（n<100
+        未达冻结晋级门槛）；180/90/30D 58.7%/56.8%/56.3% 不衰减。晋级由前向影子裁决。
 
 口径保真（影子阶段的生命线）：
     特征公式逐位移植研究 features.py（trailing 滚动窗、prior 高低点显式 shift、
@@ -98,6 +102,14 @@ CRV_SHADOW_SPECS: list[dict] = [
         "direction": "UP",             # 三因子探索级：RSI<30∧连4阴∧跌破20低 → 次根收阳
         "condition_text": "down & rsi14<30 & streak==4 & break20_dn(5m) → 次根收阳UP（探索级，仅影子）",
     },
+    {
+        "version": "crv_hi_z3_15m_v1",
+        "tf": "15m",
+        "discovery_id": "crv20261004_hiz3",
+        "kind": "hi_z3",
+        "direction": "DOWN",           # 三因子观察级：高位∧z20>+2∧恰连3阳 → 次根收阴
+        "condition_text": "up & pos100>0.90 & z20>+2 & streak==3 → 次根收阴DOWN（观察级，仅影子）",
+    },
 ]
 CRV_VERSIONS = [s["version"] for s in CRV_SHADOW_SPECS]
 CRV_VERSIONS_BY_TF: dict[str, list[str]] = {
@@ -142,6 +154,19 @@ def roll_mean(x: np.ndarray, w: int) -> np.ndarray:
     return out
 
 
+def roll_std_ddof1(x: np.ndarray, w: int) -> np.ndarray:
+    """trailing 样本标准差（ddof=1；与 pandas rolling(w).std(ddof=1) 同口径）。"""
+    n = len(x)
+    out = np.full(n, np.nan)
+    for i in range(w - 1, n):
+        win = x[i - w + 1:i + 1]
+        if np.isnan(win).any():
+            continue
+        d = win - win.mean()
+        out[i] = float(np.sqrt((d * d).sum() / (w - 1)))
+    return out
+
+
 def _shift1(x: np.ndarray) -> np.ndarray:
     """shift(1)：x[i-1]，首根 NaN（对齐 pandas shift 语义）。"""
     out = np.full(len(x), np.nan)
@@ -164,6 +189,11 @@ def compute_crv_features(kl: Klines) -> dict:
     lo100, hi100 = roll_min(l, 100), roll_max(h, 100)
     with np.errstate(invalid="ignore", divide="ignore"):
         pos100 = (c - lo100) / (hi100 - lo100 + 1e-12)
+    # z20：(close − roll_mean(c,20)) / roll_std(c,20,ddof=1).clip(1e-12)
+    sma20 = roll_mean(c, 20)
+    std20 = roll_std_ddof1(c, 20)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        z20 = (c - sma20) / np.maximum(std20, 1e-12)
     # ATR14：TR 的 14 根 SMA（TR[0] 因前收缺失为 NaN，与 pandas 口径一致）
     pc = _shift1(c)
     tr = np.full(len(c), np.nan)
@@ -210,7 +240,7 @@ def compute_crv_features(kl: Klines) -> dict:
     return {
         "close": c, "up": up, "dn": dn, "body": body,
         "prior_hi20": prior_hi20, "prior_lo20": prior_lo20, "prior_hi50": prior_hi50,
-        "pos100": pos100, "atr": atr, "rsi": rsi, "streak": streak,
+        "pos100": pos100, "z20": z20, "atr": atr, "rsi": rsi, "streak": streak,
         "near_lo20": near_lo20,
     }
 
@@ -248,6 +278,9 @@ def spec_mask(spec: dict, feat: dict) -> np.ndarray:
     if kind == "os_st4":
         return (feat["dn"] & _lt(feat["rsi"], 30.0) & (feat["streak"] == 4)
                 & _lt(c, feat["prior_lo20"]))
+    if kind == "hi_z3":
+        return (feat["up"] & _gt(feat["pos100"], 0.90) & _gt(feat["z20"], 2.0)
+                & (feat["streak"] == 3))
     raise ValueError(f"未知 CRV spec.kind: {kind}")
 
 
@@ -437,7 +470,7 @@ class CrvShadowDetector:
         snapshot: dict = {}
         streak_v = int(feat["streak"][idx])
         snapshot["streak"] = streak_v
-        for name in ("pos100", "rsi"):
+        for name in ("pos100", "rsi", "z20"):
             v = float(feat[name][idx])
             if not np.isnan(v):
                 snapshot[name] = round(v, 6)

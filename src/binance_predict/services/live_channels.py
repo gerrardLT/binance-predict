@@ -344,8 +344,9 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     # 「高位/突破阳线 → 次根收阴」的反转族。护栏 = 盲测胜率 × 0.98（费后保本入场价，
     # 与 KREV/P1/P2 同口径）；EV 基准为研究代理模型（0.51 买入+2% 费），前向真实 EV
     # 由影子目标窗报价现算。检测器 crv_shadow_detector 落 kline_shadow_signals，
-    # 新鲜命中经 on_kline_reversal_signal 钩子派单（目标根开盘 ≤90s）。两个三因子
-    # 探索级版本（crv_dnex_15m_v1 / crv_os_st4_5m_v1）未过盲测，仅影子不注册实盘。---
+    # 新鲜命中经 on_kline_reversal_signal 钩子派单（目标根开盘 ≤90s）。三个三因子
+    # 探索/观察级版本（crv_dnex_15m_v1 / crv_os_st4_5m_v1 / crv_hi_z3_15m_v1）
+    # 未过盲测，仅影子不注册实盘。---
     "crv_hi_brk20_15m_v1": ChannelSpec(
         "crv_hi_brk20_15m_v1", "kline_reversal", "15m", "DOWN", 0.62,
         "CRV高位突破20高反转（押DOWN）",

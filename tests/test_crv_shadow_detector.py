@@ -102,6 +102,16 @@ def _research_reference(rows: list[dict], tf_ms: int) -> dict:
     feat["prior_hi50"] = shift1(roll(np.max, h, 50))
     lo100, hi100 = roll(np.min, l, 100), roll(np.max, h, 100)
     feat["pos100"] = (c - lo100) / (hi100 - lo100 + 1e-12)
+    # z20：(close − roll_mean(c,20)) / roll_std(c,20,ddof=1).clip(1e-12)
+    def roll_std(x, w):
+        out = np.full(len(x), np.nan)
+        for i in range(w - 1, len(x)):
+            win = x[i - w + 1:i + 1]
+            if not np.isnan(win).any():
+                d = win - win.mean()
+                out[i] = float(np.sqrt((d * d).sum() / (w - 1)))
+        return out
+    feat["z20"] = (c - roll(np.mean, c, 20)) / np.maximum(roll_std(c, 20), 1e-12)
     pc = shift1(c)
     tr = np.full(len(c), np.nan)
     for i in range(1, len(c)):
@@ -142,7 +152,8 @@ def test_feature_bitwise_parity_vs_research_reference(seed: int) -> None:
     feat = compute_crv_features(kl)
     ref = _research_reference(rows, 900_000)
     tail = slice(105, 130)  # 全部 warmup（pos100=100/atr=14/滚动20/50）之后
-    for key in ("up", "dn", "prior_hi20", "prior_lo20", "prior_hi50", "pos100", "atr", "streak"):
+    for key in ("up", "dn", "prior_hi20", "prior_lo20", "prior_hi50", "pos100",
+                "z20", "atr", "streak"):
         mine, ref_v = feat[key][tail], ref[key][tail]
         assert np.array_equal(mine, ref_v), f"{key} 与研究参照不一致"
     assert np.allclose(feat["rsi"][tail], np.nan_to_num(ref["rsi"][tail], nan=-1), atol=1e-8)
@@ -206,6 +217,47 @@ def test_dnex3_positive_and_negatives() -> None:
     # 反例 2：跌破但小实体（body<ATR）→ 不命中
     feat_small = compute_crv_features(_to_klines(_band(129, 99.9, 99.65), 900_000))
     assert _tail_hits(feat_small, "crv_dnex_15m_v1", n_tail=1) == []
+
+
+def test_hi_z3_positive_and_negatives() -> None:
+    """高位∧z20>+2∧恰连3阳：正例 + streak=4 反例 + z20 不足反例。"""
+    def _hiz3_rows(n_up: int = 3, down_dips: bool = False) -> list[dict]:
+        rows = []
+        price = 100.0
+        for i in range(126):
+            o = price
+            c = price + (0.05 if i % 2 == 0 else -0.05)
+            if down_dips and i in (110, 112):
+                # 深回撤：收盘 −4.0 但不移动基准价位（下一根收回中枢）
+                rows.append(_mk(900_000, i, o, o + 0.05, o - 4.1, o - 4.0))
+                continue
+            if down_dips and i in (111, 113):
+                # 修复性反弹：开盘接前根深收、收盘回中枢基准
+                rows.append(_mk(900_000, i, o - 4.0, price + 0.05, o - 4.1, price))
+                continue
+            rows.append(_mk(900_000, i, o, max(o, c) + 0.02, min(o, c) - 0.02, c))
+            price = c
+        for k in range(n_up):
+            o = price
+            c = o + 0.8
+            rows.append(_mk(900_000, 126 + k, o, c + 0.05, o - 0.05, c))
+            price = c
+        return rows
+
+    rows = _hiz3_rows()
+    feat = compute_crv_features(_to_klines(rows, 900_000))
+    idx = len(rows) - 1
+    assert feat["streak"][idx] == 3 and feat["pos100"][idx] > 0.90 and feat["z20"][idx] > 2.0
+    assert idx in _tail_hits(feat, "crv_hi_z3_15m_v1", n_tail=1)
+    # 反例 1：连 4 阳（streak==4）→ 不命中（恰 3 的精确性）
+    feat4 = compute_crv_features(_to_klines(_hiz3_rows(n_up=4), 900_000))
+    assert _tail_hits(feat4, "crv_hi_z3_15m_v1", n_tail=1) == []
+    # 反例 2：近 20 根内两根深回撤拉大 std20 → z20<2 → 不命中（pos100/streak 仍满足）
+    featz = compute_crv_features(_to_klines(_hiz3_rows(down_dips=True), 900_000))
+    idxz = len(rows) - 1
+    assert featz["streak"][idxz] == 3 and featz["pos100"][idxz] > 0.90
+    assert featz["z20"][idxz] < 2.0
+    assert _tail_hits(featz, "crv_hi_z3_15m_v1", n_tail=1) == []
 
 
 def test_os_st4_positive_and_streak_negatives() -> None:
@@ -405,9 +457,9 @@ def test_crv_live_channels_registered_default_off() -> None:
         assert spec.family == "kline_reversal"
         assert spec.market_period == period and spec.direction == direction
         assert spec.auto_max_exec == guard
-    # 探索级两个版本不注册实盘
-    assert "crv_dnex_15m_v1" not in LIVE_CHANNELS
-    assert "crv_os_st4_5m_v1" not in LIVE_CHANNELS
+    # 探索级/观察级版本不注册实盘
+    for shadow_only in ("crv_dnex_15m_v1", "crv_os_st4_5m_v1", "crv_hi_z3_15m_v1"):
+        assert shadow_only not in LIVE_CHANNELS
     # 默认全部 OFF（parse_channel_config 无覆盖时）
     configs = parse_channel_config()
     for version in expected:
@@ -431,7 +483,7 @@ def test_crv_versions_in_shadow_projection() -> None:
     for version in ("crv_hi_brk20_15m_v1", "crv_brk20_15m_v1",
                     "crv_brk50_hi_15m_v1", "crv_brk20_5m_v1"):
         assert SHADOW_VERSION_SPECS[version].live_channel == version
-    for version in ("crv_dnex_15m_v1", "crv_os_st4_5m_v1"):
+    for version in ("crv_dnex_15m_v1", "crv_os_st4_5m_v1", "crv_hi_z3_15m_v1"):
         assert SHADOW_VERSION_SPECS[version].live_channel is None
 
 
