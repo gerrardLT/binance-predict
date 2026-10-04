@@ -963,7 +963,15 @@ const SIGNAL_INFO: Record<string, { name: string; desc: string; retired?: boolea
   },
   scene_momentum_fade: {
     name: '场景S4 动量衰竭（押DOWN）',
-    desc: '连阳 ≥3 根 + 光头阳的动量衰竭 → 次周期开盘押 DOWN（胜率 55.4%，盈亏平衡 0.54）。实盘已解锁：15m 市场次周期开盘下单，护栏 0.55。',
+    desc: '连阳 ≥3 根 + 光头阳的动量衰竭 → 次周期开盘押 DOWN（胜率 55.4%，盈亏平衡 0.54）。实盘已解锁：15m 市场次周期开盘下单，护栏 0.55。2026-10-04 起跳过续发：上一根 15m 本身已触发 S4（上一窗押 DOWN 已输、连阳延长）则本根不下单也不记录——720 天续发 n=180 胜率 50.6%，真实盘口近 3 个月续发胜率 32%。',
+  },
+  s4_delay60_v1: {
+    name: 'S4延迟入场·首分钟回落（押DOWN）',
+    desc: '【仅记录，不实盘】正式 S4（已跳过续发）命中后，等目标窗第 1 根 1m 收盘：BTC 低于窗口开盘才按 +60s 真实 DOWN 报价入场，否则放弃。720 天重放 n=837、胜率 66.2%；predict.fun 真实盘口两段均EV +0.119 / +0.107。入场价约 0.62（比开盘贵），研究 EV 未扣 20U 深度滑点，待前向验证。',
+  },
+  s4_hiconf_v1: {
+    name: 'S4高信心档·连阳≥5（押DOWN）',
+    desc: '【仅记录，不实盘】连阳 ≥5 根（含信号K）且收盘位置 ≥0.9，允许 4h 破位周期 → 次周期押 DOWN。720 天重放 n=399、胜率 63.2%；真实盘口两段均EV +0.119 / +0.147。约一半与 S1 同窗重叠，上实盘前须并入同窗互斥组。',
   },
   s1_dyn_sq_v1: {
     name: 'S1 动态轧空路由影子（押DOWN）',
@@ -6177,6 +6185,8 @@ const SHADOW_META: Record<string, { label: string; color: string }> = {
   s2_cond_t4_v1: { label: 'S2条件 t=4价<开→UP', color: 'var(--chart-1)' },
   s2_cond_t5d_v1: { label: 'S2条件 t=5剔深→UP', color: 'var(--chart-2)' },
   scene_bear_exhaust_opt_v1: { label: 'S2优化 温和放量非低位→UP', color: 'var(--chart-3)' },
+  s4_delay60_v1: { label: 'S4延迟入场 首分钟回落→DOWN', color: 'var(--chart-4)' },
+  s4_hiconf_v1: { label: 'S4高信心 连阳≥5→DOWN', color: 'var(--chart-5)' },
   // 2026-09-07/08 首触反转族（专用表 firsthit_shadow_signals，影子+实盘通道）
   firsthit_down_v1: { label: '首触G0 基底 q∈(0.005,0.1]→DOWN', color: 'var(--chart-3)' },
   firsthit_down_body_v1: { label: '首触G1 body_r≤0.35→DOWN', color: 'var(--chart-4)' },

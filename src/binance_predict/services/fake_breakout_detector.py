@@ -290,6 +290,45 @@ def is_momentum_fade(
     return hit, close_pos if hit else None
 
 
+def s4_is_refire(
+    prev_cycle: int,
+    last_eval_cycle: int | None,
+    last_hit_cycle: int | None,
+    prev_bar_shape: bool,
+) -> bool:
+    """S4 续发判定（2026-10-04 跳过续发）：上一根 15m 本身也是 S4 触发 → 本根为续发。
+
+    续发 = 上一窗押 DOWN 已输（目标根收阳）后连阳延长再次触发；720d 续发 n=180
+    胜率 50.6%（首发 58.2%），predict.fun 真实盘口 07-05→10-03 续发 n=28 胜率 32%
+    均EV −0.43。研究口径（定义 A）：上一根 = S4 形态 且 其周期无 high 侧破位。
+
+    - 本进程评估过上一周期（last_eval_cycle == prev_cycle-1）：用内存记录精确判定；
+    - 否则（冷启动后首个周期，内存不知上一周期）：退回无状态口径——上一根 K 线
+      本身满足 S4 形态即视为续发（定义 B，仅多含「上一周期有破位」的少数情况，偏保守）。
+    """
+    if last_eval_cycle == prev_cycle - 1:
+        return last_hit_cycle == prev_cycle - 1
+    return prev_bar_shape
+
+S4_HICONF_STREAK_MIN = 5     # 高信心档：连阳≥5（含信号K）
+S4_HICONF_CLOSE_POS_MIN = 0.9  # 高信心档：收盘位置≥0.9
+
+def is_s4_hiconf(
+    o: float, h: float, l: float, c: float, prev_dir: list[int] | None,
+) -> bool:
+    """S4 高信心档影子判定（record-only）：连阳≥5 ∧ close_pos≥0.9，允许破位周期。
+
+    720d 重放 n=399 胜率 63.2%；predict.fun 真实盘口 P1/P2 均EV +0.119/+0.147。
+    与 S1 重叠约 52%（破位周期），故只记录不下单。
+    """
+    rng = h - l
+    if rng <= 0 or o <= 0 or c <= o:
+        return False
+    need = S4_HICONF_STREAK_MIN - 1
+    if prev_dir is None or len(prev_dir) < need or not all(d == 1 for d in prev_dir[-need:]):
+        return False
+    return (c - l) / rng >= S4_HICONF_CLOSE_POS_MIN
+
 def confirm_bull_exhaust_5m(c5_close: float, anchor: float) -> tuple[bool, str]:
     """S5 确认判定（纯函数）：次周期第 1 根 5m 收盘价 vs 次周期开盘价。
 
@@ -417,6 +456,15 @@ class FakeBreakoutDetector:
         # S1 动态路由实盘钩子：仅动态门判定为实际模拟入场时派发；影子 gate
         # 与实盘开关独立（影子下线不阻止已显式启用的真单，实盘关闭仍持续采集）。
         self._on_s1_dynamic_fired: Callable[[dict], None] | None = None
+        # S4 派生影子钩子（record-only，main 装配注入 S4VariantShadowDetector）：
+        # _on_s4_delay：非续发的正式 S4 命中 → +60s 回落确认影子；
+        # _on_s4_hiconf：连阳≥5∧cp≥0.9（含破位周期）→ 高信心档影子。
+        self._on_s4_delay: Callable[[dict], None] | None = None
+        self._on_s4_hiconf: Callable[[dict], None] | None = None
+        # S4 续发判定状态：本进程最近一次完成 S4 评估的周期 / 最近一次 S4 形态命中的周期
+        self._s4_last_eval_cycle: int | None = None
+        self._s4_last_hit_cycle: int | None = None
+        self._s4_refire_skip_count: int = 0
 
         self._running = False
         self._task: asyncio.Task | None = None
@@ -787,11 +835,35 @@ class FakeBreakoutDetector:
 
         # S4 momentum_fade 独立检查：仅无 high 侧破位 pending 的周期执行
         # （破位周期若 K 同时满足 S4 定义必为 S1 子集，已被上面优先处理）
+        next_start, next_end = cur_cycle * 900_000, cur_cycle * 900_000 + 900_000
         if "high" not in due:
             m_hit, m_close_pos = is_momentum_fade(
                 sig_k["open"], sig_k["high"], sig_k["low"], sig_k["close"], prev_dir,
             )
+            refire = False
             if m_hit:
+                prev_k = hist[-1] if hist else None
+                prev_shape = bool(
+                    prev_k is not None
+                    and int(prev_k["open_time"]) == sig_open_time - 900_000
+                    and is_momentum_fade(
+                        prev_k["open"], prev_k["high"], prev_k["low"], prev_k["close"],
+                        prev_dir[:-1],
+                    )[0]
+                )
+                refire = s4_is_refire(
+                    prev_cycle, self._s4_last_eval_cycle, self._s4_last_hit_cycle, prev_shape,
+                )
+                # 续发链（如连阳 4→5→6 连续触发）：被跳过的 S4 仍记为形态命中，
+                # 下一根继续判为续发，与研究口径（上一根是 S4 触发）一致
+                self._s4_last_hit_cycle = prev_cycle
+            if m_hit and refire:
+                self._s4_refire_skip_count += 1
+                logger.info(
+                    "S4 续发跳过 | 周期 {} 上一根也是 S4 触发（上一窗押 DOWN 已输、连阳延长）| "
+                    "收盘位置 {:.3f}", prev_cycle, m_close_pos or 0.0,
+                )
+            elif m_hit:
                 # 合成 rec：S4 无位势破位，level 固定 momentum（8 字符）区分索引统计；
                 # broken_level 记信号 K 高点仅作审计参考
                 synthetic_rec = {
@@ -806,6 +878,34 @@ class FakeBreakoutDetector:
                     version=self._active_version, shadow=False,
                     pattern_type="momentum_fade",
                 )
+                self._notify_s4_variant(self._on_s4_delay, {
+                    "signal_bar_start": sig_open_time,
+                    "market_start_15m": next_start,
+                    "market_end_15m": next_end,
+                    "close_pos": m_close_pos,
+                })
+        self._s4_last_eval_cycle = prev_cycle
+
+        # S4 高信心档影子（record-only）：每周期独立判定，允许破位周期
+        if is_s4_hiconf(sig_k["open"], sig_k["high"], sig_k["low"], sig_k["close"], prev_dir):
+            rng = sig_k["high"] - sig_k["low"]
+            self._notify_s4_variant(self._on_s4_hiconf, {
+                "signal_bar_start": sig_open_time,
+                "market_start_15m": next_start,
+                "market_end_15m": next_end,
+                "close_pos": (sig_k["close"] - sig_k["low"]) / rng,
+                "hi_break": "high" in due,
+            })
+
+    @staticmethod
+    def _notify_s4_variant(hook: Callable[[dict], None] | None, payload: dict) -> None:
+        """S4 派生影子钩子（同步 fire-and-forget）；异常只告警，不影响正式信号链路。"""
+        if hook is None:
+            return
+        try:
+            hook(payload)
+        except Exception as exc:
+            logger.warning("S4 派生影子钩子异常（不影响检测循环）| {}", exc)
 
     async def _fire_confirmed_signal(
         self,
@@ -2004,6 +2104,7 @@ class FakeBreakoutDetector:
             "shadow_versions": [s["version"] for s in self._shadow_versions],
             "daily_count": self._daily_count,
             "daily_date": self._daily_date,
+            "s4_refire_skip_count": self._s4_refire_skip_count,
             "eps": settings.fake_breakout_eps,
             "cooldown_seconds": settings.fake_breakout_cooldown_seconds,
             "max_daily_signals": settings.fake_breakout_max_daily_signals,

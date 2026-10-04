@@ -410,6 +410,7 @@ async def test_analytics_empty_db() -> None:
         "s5_deep_z20_v1", "s1_dyn_sq_v1", "quote_momentum_v3",
         "absorption_follow_td120_v1", "absorption_follow_td150_v1",
         "s2_cond_t4_v1", "s2_cond_t5d_v1", "scene_bear_exhaust_opt_v1",
+        "s4_delay60_v1", "s4_hiconf_v1",
         "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1",
         "firsthit_down_k10_v1", "firsthit_down_k10_profit_v1",
         "firsthit_down_chg_early180_v1", "firsthit_down_k10_early180_v1", "process_recovery_down_v1",
@@ -531,6 +532,8 @@ async def test_analytics_empty_db() -> None:
         ("s2_cond_t4_v1", 0.389, "S2条件t=4"),
         ("s2_cond_t5d_v1", 0.448, "S2条件t=5剔深"),
         ("scene_bear_exhaust_opt_v1", 0.5897, "S2空头耗尽优化版"),
+        ("s4_delay60_v1", 0.662, "S4延迟入场"),
+        ("s4_hiconf_v1", 0.632, "S4高信心档"),
     ):
         sc = out["shadow"][ver]["summary"]
         assert sc["bench_winrate"] == bwr and sc["bench_ev"] is None

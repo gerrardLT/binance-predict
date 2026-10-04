@@ -81,6 +81,7 @@ from .services.reversal_shadow_detector import ReversalShadowDetector
 from .services.rev2_inside_shadow_detector import Rev2InsideShadowDetector
 from .services.s2_cond_shadow_detector import S2CondShadowDetector
 from .services.s2_optimized_shadow_detector import S2OptimizedShadowDetector
+from .services.s4_variant_shadow_detector import S4VariantShadowDetector
 from .services.shadow_execution_projector import shadow_execution_projector
 from .services.shadow_execution_types import EXECUTION_POLICY_VERSION
 from .services.shadow_version_gate import shadow_gate
@@ -209,6 +210,8 @@ absorption_shadow_detector: AbsorptionShadowDetector | None = None
 # 只记录不下注）
 s2_cond_shadow_detector: S2CondShadowDetector | None = None
 s2_optimized_shadow_detector: S2OptimizedShadowDetector | None = None
+# S4 派生影子（s4_delay60_v1 / s4_hiconf_v1，record-only，不接实盘钩子）
+s4_variant_shadow_detector: S4VariantShadowDetector | None = None
 
 # 5m DOWN 首触反转影子检测器全局实例（firsthit_down_v1/_body_v1/_chg_v1 三 version：
 # G0 基底 / G1 body_r≤0.35 / G3 chg≤+2.82bp，归档后处理落 SETTLED，只记录不下注，
@@ -1387,6 +1390,18 @@ async def lifespan(app: FastAPI):
     if fake_breakout_detector is not None:
         fake_breakout_detector._on_s2_optimized = s2_optimized_shadow_detector.evaluate
 
+    # S4 派生影子（2026-10-04）：延迟入场（+60s BTC 已回落）/ 高信心档（连阳≥5∧cp≥0.9），
+    # 只落 kline_shadow_signals，不注册实盘通道、不挂下单钩子。
+    global s4_variant_shadow_detector
+    s4_variant_shadow_detector = S4VariantShadowDetector(
+        collector=collector,
+        pm_15m_latest=_pm_15m_latest,
+    )
+    await s4_variant_shadow_detector.start()
+    if fake_breakout_detector is not None:
+        fake_breakout_detector._on_s4_delay = s4_variant_shadow_detector.on_delay
+        fake_breakout_detector._on_s4_hiconf = s4_variant_shadow_detector.on_hiconf
+
     # 5m DOWN 首触反转影子信号（firsthit_down 族，2026-09-07）：窗内 DOWN 报价首次
     # 进入 (0.005,0.1] → 以该报价买 DOWN 的前向重放。三 version 同表隔离：
     # firsthit_down_v1 基底（G0，calib EV+0.21 CI[+0.06,+0.34]）/ _body_v1（G1
@@ -1545,6 +1560,8 @@ async def lifespan(app: FastAPI):
         await s2_cond_shadow_detector.stop()
     if s2_optimized_shadow_detector is not None:
         await s2_optimized_shadow_detector.stop()
+    if s4_variant_shadow_detector is not None:
+        await s4_variant_shadow_detector.stop()
     # 停止 5m DOWN 首触反转影子检测器
     if firsthit_shadow_detector is not None:
         await firsthit_shadow_detector.stop()
@@ -4225,6 +4242,10 @@ SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     # 真实 EV 由生产报价前向现算（低买 UP 的正 EV 来自入场价而非胜率）
     "s2_cond_t4_v1": (0.389, None, "S2条件t=4: 实盘S2(bear_exhaust,破4h支撑+收阴+放量)派生→次周期t=4(+240s)1m收盘<周期开盘(全深度回落)→押次周期15m UP(收阳赢)（720d触发1069/2176=49.1%/1.48天,价-only胜率38.9%；开盘即买EV≈−0.042不赚钱,等t=4低买UP正EV来自入场价；真实EV前向现算,报价表研究EV+0.237属乐观上界）"),
     "s2_cond_t5d_v1": (0.448, None, "S2条件t=5剔深: 同S2派生→次周期t=5(+300s)0<ln(开盘/px5)<15bp(中度回落剔深)→押次周期15m UP(收阳赢)（720d触发643/2176=29.5%/0.89天,价-only胜率44.8%；剔深单均优于t=4全深度；真实EV前向现算,报价表研究EV+0.283属乐观上界）"),
+    # S4 派生影子（2026-10-04，record-only）：胜率基准 = 720d K 线重放（生产纯函数）；
+    # EV 由真实报价前向现算（延迟入场入场价更高，研究 EV 未扣 20U 深度滑点）
+    "s4_delay60_v1": (0.662, None, "S4延迟入场: 正式S4(已跳过续发)+目标窗第1根1m收盘<开盘(BTC已回落)才按+60s真实DOWN报价入场→押15m DOWN（720d重放 n=837 胜率66.2%；predict.fun真实盘口 P1/P2 均EV +0.119/+0.107；仅记录不下单）"),
+    "s4_hiconf_v1": (0.632, None, "S4高信心档: 连阳≥5(含信号K)∧收盘位置≥0.9，允许破位周期→押次周期15m DOWN（720d重放 n=399 胜率63.2%；真实盘口 P1/P2 均EV +0.119/+0.147；与S1重叠约52%，仅记录不下单）"),
     "scene_bear_exhaust_opt_v1": (0.5897, None, "S2空头耗尽优化版: 原S2(破4h支撑+收阴+量比≥2)叠加量比<4且最近14日区间位置≥0.33→押次周期15m UP（720d n=975 胜率58.97%；纯K线回测无真实报价，EV按前向真实UP报价现算；实盘通道默认OFF）"),
     # rev2 孕线反转族（2026-09-09 / 2026-09-13）：前置高/低点最长实体柱+信号柱完全包裹(Inside Bar)，
     # 押次根收盘反转（kline_shadow_signals 表），15m 为经典 Ver2（短影≤10%），5m 为精选 HM（下影[75%,90%)）。

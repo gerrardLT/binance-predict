@@ -59,6 +59,8 @@ _VERSION_ROWS: tuple[tuple[str, SourceType, str, str, str], ...] = (
     ("s2_cond_t4_v1", SourceType.KLINE, "15m", "target_bar", "row"),
     ("s2_cond_t5d_v1", SourceType.KLINE, "15m", "target_bar", "row"),
     ("scene_bear_exhaust_opt_v1", SourceType.KLINE, "15m", "target_bar", "row"),
+    ("s4_delay60_v1", SourceType.KLINE, "15m", "target_bar", "row"),
+    ("s4_hiconf_v1", SourceType.KLINE, "15m", "target_bar", "row"),
     ("firsthit_down_chg_early180_v1", SourceType.FIRSTHIT, "5m", "same_window_first_touch", "down"),
     ("firsthit_down_k10_early180_v1", SourceType.FIRSTHIT, "5m", "same_window_first_touch", "down"),
     ("process_recovery_down_v1", SourceType.FIRSTHIT, "5m", "same_window", "down"),
@@ -107,7 +109,7 @@ def _family_of(version: str, source: SourceType) -> str:
         return "absorption"
     if version.startswith("s2_cond_"):
         return "s2_cond"
-    if version == "scene_bear_exhaust_opt_v1":
+    if version in ("scene_bear_exhaust_opt_v1", "s4_delay60_v1", "s4_hiconf_v1"):
         return "scene"
     if version.startswith("combo_"):
         return "combo"
