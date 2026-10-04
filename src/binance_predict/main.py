@@ -4859,6 +4859,84 @@ async def get_signals_execution_comparison(
     )
 
 
+@app.get("/api/signals/firsthit-forward")
+async def get_firsthit_forward_events(
+    limit: int = 200,
+    after_id: int | None = None,
+    side: str | None = None,
+    status: str | None = None,
+    _: None = Depends(_require_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """首触前向事件只读导出（G3 实盘归因后的可执行 EV 校准数据源，2026-10-04）。
+
+    FirstHitForwardRecorder 落库的 q≤0.10 首触母事件：LIVE 触达行含触发时刻
+    1/5/10 USDT 只读 get_quote 报价阶梯（execution_quotes，含相对触发价的
+    slippage_bps 与延迟），归档回补行无阶梯（capture_mode 区分，不作执行口径）。
+    影子信号接口口径 limit≤200，全量导出靠 id 升序 + after_id 游标翻页。
+    """
+    limit = max(1, min(int(limit), 200))
+    if side is not None and side not in ("UP", "DOWN"):
+        raise HTTPException(status_code=422, detail="side 必须是 UP 或 DOWN")
+    if status is not None and status not in ("PENDING", "SETTLED"):
+        raise HTTPException(status_code=422, detail="status 必须是 PENDING 或 SETTLED")
+
+    from sqlalchemy import select as sa_select
+
+    from .db.models import FirstHitForwardEvent
+
+    stmt = sa_select(FirstHitForwardEvent).order_by(FirstHitForwardEvent.id.asc())
+    if after_id is not None:
+        stmt = stmt.where(FirstHitForwardEvent.id > int(after_id))
+    if side is not None:
+        stmt = stmt.where(FirstHitForwardEvent.side == side)
+    if status is not None:
+        stmt = stmt.where(FirstHitForwardEvent.status == status)
+    rows = (await db.execute(stmt.limit(limit))).scalars().all()
+
+    return {
+        "last_id": rows[-1].id if rows else after_id,
+        "events": [
+            {
+                "id": r.id,
+                "schema_version": r.schema_version,
+                "capture_mode": r.capture_mode,
+                "window_start": r.window_start,
+                "window_end": r.window_end,
+                "side": r.side,
+                "trigger_ts": r.trigger_ts,
+                "td_sec": r.td_sec,
+                "trigger_q": r.trigger_q,
+                "opposite_q": r.opposite_q,
+                "quote_sum": r.quote_sum,
+                "btc_open": r.btc_open,
+                "btc_adverse_extreme": r.btc_adverse_extreme,
+                "btc_trigger": r.btc_trigger,
+                "btc_signed_return_bps": r.btc_signed_return_bps,
+                "btc_signed_min_bps": r.btc_signed_min_bps,
+                "btc_recovery_bps": r.btc_recovery_bps,
+                "btc_recovery_frac": r.btc_recovery_frac,
+                "recovery_pass": r.recovery_pass,
+                "atr_bps": r.atr_bps,
+                "current_move_atr": r.current_move_atr,
+                "labels": r.labels,
+                "trigger_features": r.trigger_features,
+                "future_quotes": r.future_quotes,
+                "execution_quotes": r.execution_quotes,
+                "post_features": r.post_features,
+                "retrospective": r.retrospective,
+                "data_missing": r.data_missing,
+                "settle_outcome": r.settle_outcome,
+                "win": r.win,
+                "ev_at_entry": r.ev_at_entry,
+                "status": r.status,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ],
+    }
+
+
 # ============================================================
 # 情绪曲线分析 API
 # ============================================================
