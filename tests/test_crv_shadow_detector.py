@@ -1,16 +1,16 @@
-"""CRV 情绪反转影子检测器测试：研究口径逐位保真（pandas 参照）+ 判定正反例 +
+"""CRV 情绪反转影子检测器测试：研究口径逐位保真（numpy 参照）+ 判定正反例 +
 双周期 direction 结算 + 幂等 + 新鲜度派单 + 实盘注册默认 OFF。
 
-不触网络/真实 DB：collector/session 全用替身。pandas 参照复刻研究
+不触网络/真实 DB：collector/session 全用替身。numpy 参照独立转写研究
 features.py 的公式（trailing 滚动、prior shift、Wilder RSI、实体 streak），
-对尾部掩码逐位断言——研究口径的守门测试。
+对尾部掩码逐位断言——研究口径的守门测试（运行时依赖无 pandas，参照用
+sliding_window_view 实现，与检测器的循环滚动结构独立）。
 """
 from __future__ import annotations
 
 from types import SimpleNamespace
 
 import numpy as np
-import pandas as pd
 import pytest
 
 import binance_predict.services.crv_shadow_detector as csd
@@ -72,54 +72,79 @@ def _tail_hits(feat: dict, version: str, n_tail: int = 3) -> list[int]:
 
 
 # ============================================================
-# 研究口径逐位保真：pandas 参照（与研究 features.py 同公式）
+# 研究口径逐位保真：numpy 参照（独立转写研究 features.py 同公式）
 # ============================================================
 
-def _pandas_reference(rows: list[dict], tf_ms: int) -> dict:
-    df = pd.DataFrame(rows)
-    o, h, l, c = (df[k].astype(float) for k in ("open", "high", "low", "close"))
+def _research_reference(rows: list[dict], tf_ms: int) -> dict:
+    """研究 features.py 公式的独立 numpy 转写（滑窗视图实现，与检测器结构不同）。"""
+    arr = {k: np.array([r[k] for r in rows], dtype=np.float64)
+           for k in ("open", "high", "low", "close")}
+    o, h, l, c = arr["open"], arr["high"], arr["low"], arr["close"]
+
+    def roll(fn, x, w):
+        out = np.full(len(x), np.nan)
+        for i in range(w - 1, len(x)):
+            win = x[i - w + 1:i + 1]
+            out[i] = np.nan if np.isnan(win).any() else float(fn(win))
+        return out
+
+    def shift1(x):
+        out = np.full(len(x), np.nan)
+        out[1:] = x[:-1]
+        return out
+
     feat: dict[str, np.ndarray] = {}
-    feat["up"] = (c > o).to_numpy()
-    feat["dn"] = (c < o).to_numpy()
-    feat["body"] = (c - o).abs().to_numpy()
-    feat["prior_hi20"] = h.rolling(20).max().shift(1).to_numpy()
-    feat["prior_lo20"] = l.rolling(20).min().shift(1).to_numpy()
-    feat["prior_hi50"] = h.rolling(50).max().shift(1).to_numpy()
-    lo100, hi100 = l.rolling(100).min(), h.rolling(100).max()
-    feat["pos100"] = ((c - lo100) / (hi100 - lo100 + 1e-12)).to_numpy()
-    pc = c.shift(1)
-    tr = pd.concat([h - l, (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
-    feat["atr"] = tr.rolling(14).mean().to_numpy()
-    delta = c.diff()
-    gain = delta.clip(lower=0.0)
-    loss = (-delta).clip(lower=0.0)
-    ag = gain.ewm(alpha=1 / 14, adjust=False).mean()
-    al = loss.ewm(alpha=1 / 14, adjust=False).mean()
-    feat["rsi"] = (100 - 100 / (1 + ag / al.clip(lower=1e-12))).to_numpy()
-    s = np.sign(c - o).to_numpy()
-    streak = np.zeros(len(s), dtype=int)
+    feat["up"] = c > o
+    feat["dn"] = c < o
+    feat["body"] = np.abs(c - o)
+    feat["prior_hi20"] = shift1(roll(np.max, h, 20))
+    feat["prior_lo20"] = shift1(roll(np.min, l, 20))
+    feat["prior_hi50"] = shift1(roll(np.max, h, 50))
+    lo100, hi100 = roll(np.min, l, 100), roll(np.max, h, 100)
+    feat["pos100"] = (c - lo100) / (hi100 - lo100 + 1e-12)
+    pc = shift1(c)
+    tr = np.full(len(c), np.nan)
+    for i in range(1, len(c)):
+        tr[i] = max(h[i] - l[i], abs(h[i] - pc[i]), abs(l[i] - pc[i]))
+    feat["atr"] = roll(np.mean, tr, 14)
+    # RSI14 Wilder（ewm alpha=1/14 adjust=False 的等价递推；首根 delta 缺失跳过）
+    ag = al = np.nan
+    rsi = np.full(len(c), np.nan)
+    for i in range(1, len(c)):
+        d = c[i] - c[i - 1]
+        gain, loss = max(d, 0.0), max(-d, 0.0)
+        if np.isnan(ag):
+            ag, al = gain, loss
+        else:
+            ag = ag + (gain - ag) / 14.0
+            al = al + (loss - al) / 14.0
+        rsi[i] = 100.0 - 100.0 / (1.0 + ag / max(al, 1e-12))
+    feat["rsi"] = rsi
+    # 实体 streak（研究循环：首根恒 0，同向 +1 / 换向重起 1 / 零实体 0）
+    s = np.sign(c - o)
+    streak = np.zeros(len(s), dtype=np.int64)
     for i in range(1, len(s)):
         if s[i] != 0 and s[i] == s[i - 1]:
             streak[i] = streak[i - 1] + 1
         elif s[i] != 0:
             streak[i] = 1
     feat["streak"] = streak
-    feat["close"] = df["close"].astype(float).to_numpy()
+    feat["close"] = c
     with np.errstate(invalid="ignore"):
-        feat["near_lo20"] = np.abs(feat["close"] - feat["prior_lo20"]) < 0.25 * feat["atr"]
+        feat["near_lo20"] = np.abs(c - feat["prior_lo20"]) < 0.25 * feat["atr"]
     return feat
 
 
 @pytest.mark.parametrize("seed", [3, 11, 42])
-def test_feature_bitwise_parity_vs_pandas(seed: int) -> None:
+def test_feature_bitwise_parity_vs_research_reference(seed: int) -> None:
     rows = _quiet_rows(130, seed=seed)
     kl = _to_klines(rows, 900_000)
     feat = compute_crv_features(kl)
-    ref = _pandas_reference(rows, 900_000)
+    ref = _research_reference(rows, 900_000)
     tail = slice(105, 130)  # 全部 warmup（pos100=100/atr=14/滚动20/50）之后
     for key in ("up", "dn", "prior_hi20", "prior_lo20", "prior_hi50", "pos100", "atr", "streak"):
         mine, ref_v = feat[key][tail], ref[key][tail]
-        assert np.array_equal(mine, ref_v), f"{key} 与 pandas 参照不一致"
+        assert np.array_equal(mine, ref_v), f"{key} 与研究参照不一致"
     assert np.allclose(feat["rsi"][tail], np.nan_to_num(ref["rsi"][tail], nan=-1), atol=1e-8)
     # 六个 spec 的掩码逐位一致
     for spec in CRV_SHADOW_SPECS:
