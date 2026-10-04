@@ -25,7 +25,7 @@ EXPECTED_ANALYTICS_VERSIONS = (
     "combo_p2_v1", "combo_p3_v1", "combo_p4_v1", "combo_p5_v1",
     "s5_deep_z20_v1", "s1_dyn_sq_v1", "quote_momentum_v3", "absorption_follow_td120_v1",
     "absorption_follow_td150_v1", "s2_cond_t4_v1", "s2_cond_t5d_v1",
-    "scene_bear_exhaust_opt_v1", "s4_delay60_v1", "s4_hiconf_v1", "firsthit_down_chg_early180_v1", "firsthit_down_k10_early180_v1", "process_recovery_down_v1", "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1",
+    "scene_bear_exhaust_opt_v1", "s4_delay60_v1", "s4_hiconf_v1", "s1_early2_v1", "s1_dip45_v1", "firsthit_down_chg_early180_v1", "firsthit_down_k10_early180_v1", "process_recovery_down_v1", "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1",
     "firsthit_down_k10_v1", "firsthit_down_k10_profit_v1", "firsthit_down_g4_v1", "firsthit_down_g7_v1", "g7_streak_v1",
     "g7_wick20_v1", "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",
     "hm_inside_15m_v2", "ih_inside_15m_v2", "hm_inside_5m_v2",
@@ -35,7 +35,7 @@ EXPECTED_ANALYTICS_VERSIONS = (
 
 def test_registry_matches_all_physical_shadow_versions_in_order() -> None:
     assert SHADOW_VERSIONS == EXPECTED_ANALYTICS_VERSIONS
-    assert len(SHADOW_VERSION_SPECS) == 57
+    assert len(SHADOW_VERSION_SPECS) == 59
     for version in ("candle_hm_bull_5m_event_v1", "candle_hm_bull_15m_event_v1"):
         spec = SHADOW_VERSION_SPECS[version]
         assert spec.family == "candlestick_reversal"
@@ -71,6 +71,16 @@ def test_s4_variants_are_record_only() -> None:
         assert spec.market_period == "15m"
         assert spec.family == "scene"
         assert spec.live_channel is None
+
+
+def test_s1_entry_variants_have_same_name_live_channels() -> None:
+    """S1m2 / S1 低吸：影子版本与实盘通道同名（订单 signal_version 对账对齐）。"""
+    for version in ("s1_early2_v1", "s1_dip45_v1"):
+        spec = SHADOW_VERSION_SPECS[version]
+        assert spec.source_type is SourceType.KLINE
+        assert spec.market_period == "15m"
+        assert spec.family == "scene"
+        assert spec.live_channel == version and spec.live_retired is False
 
 
 def test_s1_dynamic_shadow_has_registered_live_channel() -> None:

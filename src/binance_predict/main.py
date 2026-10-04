@@ -210,7 +210,8 @@ absorption_shadow_detector: AbsorptionShadowDetector | None = None
 # 只记录不下注）
 s2_cond_shadow_detector: S2CondShadowDetector | None = None
 s2_optimized_shadow_detector: S2OptimizedShadowDetector | None = None
-# S4 派生影子（s4_delay60_v1 / s4_hiconf_v1，record-only，不接实盘钩子）
+# S4 派生影子（s4_delay60_v1 / s4_hiconf_v1，record-only，不接实盘钩子）；
+# 同实例另承载 S1 入场变体 s1_early2_v1 / s1_dip45_v1（影子 + 实盘通道，实盘默认关闭）
 s4_variant_shadow_detector: S4VariantShadowDetector | None = None
 
 # 5m DOWN 首触反转影子检测器全局实例（firsthit_down_v1/_body_v1/_chg_v1 三 version：
@@ -1401,6 +1402,7 @@ async def lifespan(app: FastAPI):
     if fake_breakout_detector is not None:
         fake_breakout_detector._on_s4_delay = s4_variant_shadow_detector.on_delay
         fake_breakout_detector._on_s4_hiconf = s4_variant_shadow_detector.on_hiconf
+        fake_breakout_detector._on_s1_entry = s4_variant_shadow_detector.on_s1_entry
 
     # 5m DOWN 首触反转影子信号（firsthit_down 族，2026-09-07）：窗内 DOWN 报价首次
     # 进入 (0.005,0.1] → 以该报价买 DOWN 的前向重放。三 version 同表隔离：
@@ -1469,6 +1471,10 @@ async def lifespan(app: FastAPI):
                 multi_live_trader.on_s5_deep_signal)
             fake_breakout_detector._on_s1_dynamic_fired = (
                 multi_live_trader.on_s1_dynamic_signal)
+        # S1 入场变体（早确认 / 低吸）实盘钩子：通道默认关闭，影子落表独立于开关
+        if s4_variant_shadow_detector is not None:
+            s4_variant_shadow_detector._on_live_fire = (
+                multi_live_trader.on_s1_variant_signal)
         # 影子 promote 实盘钩子（2026-09-06）：s2_cond 判价命中 / nextbar 新根命中 →
         # 真单（各检测器内钩子独立于影子 gate；检测器关闭则通道无触发源，fail-safe 同 scene 族）。
         # candlestick 钩子已在其 start() 前注入，避免冷启动时序漏单，故这里不重复赋值。
@@ -4246,6 +4252,8 @@ SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     # EV 由真实报价前向现算（延迟入场入场价更高，研究 EV 未扣 20U 深度滑点）
     "s4_delay60_v1": (0.662, None, "S4延迟入场: 正式S4(已跳过续发)+目标窗第1根1m收盘<开盘(BTC已回落)才按+60s真实DOWN报价入场→押15m DOWN（720d重放 n=837 胜率66.2%；predict.fun真实盘口 P1/P2 均EV +0.119/+0.107；仅记录不下单）"),
     "s4_hiconf_v1": (0.632, None, "S4高信心档: 连阳≥5(含信号K)∧收盘位置≥0.9，允许破位周期→押次周期15m DOWN（720d重放 n=399 胜率63.2%；真实盘口 P1/P2 均EV +0.119/+0.147；与S1重叠约52%，仅记录不下单）"),
+    "s1_early2_v1": (0.717, None, "S1早确认(S1m2): 正式S1命中+目标窗第2根1m收盘<开盘(BTC已回落)→+2min按真实DOWN报价入场→押15m DOWN（720d重放 n=1283 胜率71.7%；predict.fun真实盘口 P1/P2 均EV +0.118/+0.099，S5为+0.015/+0.080；与S5重叠76%；影子+实盘通道(默认关闭)）"),
+    "s1_dip45_v1": (0.439, None, "S1低吸: 正式S1命中后+62/122/182/302/482s首次DOWN报价≤0.42(≈真实成交0.45)即入场→押15m DOWN（真实盘口 P1/P2 均EV +0.097/+0.199，n57/n123，随机窗口对照−0.074/+0.011；与S1开盘单同向叠加敞口；影子+实盘通道(默认关闭)）"),
     "scene_bear_exhaust_opt_v1": (0.5897, None, "S2空头耗尽优化版: 原S2(破4h支撑+收阴+量比≥2)叠加量比<4且最近14日区间位置≥0.33→押次周期15m UP（720d n=975 胜率58.97%；纯K线回测无真实报价，EV按前向真实UP报价现算；实盘通道默认OFF）"),
     # rev2 孕线反转族（2026-09-09 / 2026-09-13）：前置高/低点最长实体柱+信号柱完全包裹(Inside Bar)，
     # 押次根收盘反转（kline_shadow_signals 表），15m 为经典 Ver2（短影≤10%），5m 为精选 HM（下影[75%,90%)）。

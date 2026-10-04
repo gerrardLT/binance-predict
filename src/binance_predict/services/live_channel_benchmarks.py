@@ -42,6 +42,10 @@ _FROZEN_BENCHMARKS: dict[str, tuple[float, int | None]] = {
     "firsthit_down_body_v1": (0.153, 418),
     "firsthit_down_chg_v1": (0.108, 1309),
     # K10/K10盈利版仅有污染发现段估计，不钉生产 benchmark，前向现算。
+    # S1 入场变体（2026-10-04）：S1m2 = 720d K 线重放（生产纯函数）；低吸无 K 线口径，
+    # 取真实盘口 05→10 的样本胜率（n=57+123），EV 均由真实报价前向现算。
+    "s1_early2_v1": (0.717, 1283),
+    "s1_dip45_v1": (0.439, 180),
     "firsthit_down_g4_v1": (0.157, 300),
     "firsthit_down_g7_v1": (0.192, 260),
     "g7_streak_v1": (0.193, 202),

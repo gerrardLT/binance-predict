@@ -33,7 +33,7 @@ ENTRY_CLOCK_SKEW_TOLERANCE_MS = 2_000
 
 
 def snapshot_entry_quote(
-    cache: dict | None, target_bar_start: int
+    cache: dict | None, target_bar_start: int, max_offset_ms: int = ENTRY_MAX_OFFSET_MS,
 ) -> tuple[float | None, float | None, int | None]:
     """从实时报价缓存快照目标窗入场价。
 
@@ -62,6 +62,6 @@ def snapshot_entry_quote(
         return None, None, None
     # 守卫 2：近开盘（报价取自目标窗开盘后近端；下沿含时钟偏差容忍，见常量注释）
     offset = ts_i - int(target_bar_start)
-    if offset < -ENTRY_CLOCK_SKEW_TOLERANCE_MS or offset > ENTRY_MAX_OFFSET_MS:
+    if offset < -ENTRY_CLOCK_SKEW_TOLERANCE_MS or offset > max_offset_ms:
         return None, None, None
     return up_f, down_f, ts_i

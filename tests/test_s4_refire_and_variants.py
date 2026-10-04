@@ -16,9 +16,13 @@ from binance_predict.services.fake_breakout_detector import (
     s4_is_refire,
 )
 from binance_predict.services.s4_variant_shadow_detector import (
+    DIP_TRIGGER,
+    S1_DIP_VERSION,
+    S1_EARLY_VERSION,
     S4_DELAY_VERSION,
     S4_HICONF_VERSION,
     S4VariantShadowDetector,
+    early_confirmed,
     first_minute_dropped,
 )
 
@@ -311,3 +315,147 @@ def test_spawn_dedup_and_gate(monkeypatch) -> None:
     monkeypatch.setattr(s4v.shadow_gate, "is_enabled", lambda _v: True)
     det.on_hiconf(SIG)
     assert det._watched == set()  # 未启动 → 不派生
+
+
+# ---------------- S1 入场变体：早确认(S1m2) / 低吸 ----------------
+
+class _CMulti:
+    """返回预设 1m K 线列表。"""
+
+    def __init__(self, bars: list[dict]) -> None:
+        self.bars = bars
+
+    async def fetch_recent_klines(self, interval: str, limit: int) -> list[dict]:
+        return self.bars
+
+S1SIG = {"id": 7, "signal_bar_start": 100 * M15, "market_start_15m": WS, "market_end_15m": WS + M15}
+
+async def _no_wait(_target: int) -> None:
+    return None
+
+def _m1(off_min: int, o: float, c: float) -> dict:
+    return {"open_time": WS + off_min * 60_000, "open": o, "close": c}
+
+def test_early_confirmed_boundaries() -> None:
+    b1, b2 = _m1(0, 100.0, 100.5), _m1(1, 100.5, 99.99)
+    assert early_confirmed(b1, b2, WS) is True            # 第2根收盘 < 窗口开盘
+    assert early_confirmed(b1, _m1(1, 100.5, 100.0), WS) is False   # 贴线（平盘）不算
+    assert early_confirmed(b1, _m1(1, 100.5, 100.01), WS) is False  # 高于开盘
+    assert early_confirmed(b1, _m1(2, 100.5, 99.0), WS) is False    # 第2根错位
+    assert early_confirmed(_m1(1, 100.0, 99.0), b2, WS) is False    # 第1根错位
+    assert early_confirmed(None, b2, WS) is False
+    assert early_confirmed(b1, None, WS) is False
+    assert early_confirmed(b1, {"open_time": WS + 60_000, "close": "x"}, WS) is False
+
+@pytest.mark.asyncio
+async def test_s1_early_records_and_fires_live_when_dropped(monkeypatch) -> None:
+    sess = _Sess()
+    _patch(monkeypatch, sess, WS + 130_000)
+    pm = {"start_date": WS, "up_price": 0.33, "down_price": 0.67, "updated_ts": WS + 121_000}
+    det = S4VariantShadowDetector(_CMulti([_m1(0, 100.0, 100.4), _m1(1, 100.4, 99.9)]), pm)
+    det._running = True
+    live: list[dict] = []
+    det._on_live_fire = live.append
+    await det._confirm(S1_EARLY_VERSION, S1SIG)
+    assert len(sess.added) == 1
+    row = sess.added[0]
+    assert row.version == S1_EARLY_VERSION and row.direction == "DOWN"
+    assert row.target_bar_start == WS and row.signal_bar_start == 100 * M15
+    assert row.entry_down_price == 0.67 and row.feature_snapshot["m2_close"] == 99.9
+    assert live == [{"version": S1_EARLY_VERSION, "id": 7, "pattern_type": S1_EARLY_VERSION,
+                     "side": "high", "market_start_15m": WS, "market_end_15m": WS + M15}]
+
+@pytest.mark.asyncio
+async def test_s1_early_skips_when_not_dropped(monkeypatch) -> None:
+    sess = _Sess()
+    _patch(monkeypatch, sess, WS + 130_000)
+    det = S4VariantShadowDetector(_CMulti([_m1(0, 100.0, 100.4), _m1(1, 100.4, 100.0)]), {})
+    det._running = True
+    live: list[dict] = []
+    det._on_live_fire = live.append
+    await det._confirm(S1_EARLY_VERSION, S1SIG)
+    assert sess.added == [] and live == []               # 贴线（第2根收于开盘）→ 不入场
+
+@pytest.mark.asyncio
+async def test_s1_early_stale_open_quote_not_used_as_entry_price(monkeypatch) -> None:
+    """开盘陈旧报价（+5s）不得冒充 +2min 入场价：落行但入场价为空（EV 不计）。"""
+    sess = _Sess()
+    _patch(monkeypatch, sess, WS + 130_000)
+    pm = {"start_date": WS, "up_price": 0.5, "down_price": 0.5, "updated_ts": WS + 5_000}
+    det = S4VariantShadowDetector(_CMulti([_m1(0, 100.0, 100.4), _m1(1, 100.4, 99.9)]), pm)
+    det._running = True
+    await det._confirm(S1_EARLY_VERSION, S1SIG)
+    assert len(sess.added) == 1 and sess.added[0].entry_down_price is None
+
+@pytest.mark.asyncio
+async def test_s1_dip_trigger_boundary_inclusive(monkeypatch) -> None:
+    """低吸触发：缓存 DOWN 价 ≤ DIP_TRIGGER 含贴线；略高则整窗不入场。"""
+    assert DIP_TRIGGER == 0.42
+    for down, fires in ((0.42, True), (0.41, True), (0.4201, False)):
+        sess = _Sess()
+        _patch(monkeypatch, sess, WS + 70_000)
+        pm = {"start_date": WS, "up_price": 1 - down, "down_price": down, "updated_ts": WS + 65_000}
+        det = S4VariantShadowDetector(_CMulti([]), pm)
+        det._running = True
+        det._sleep_until = _no_wait  # type: ignore[method-assign]
+        live: list[dict] = []
+        det._on_live_fire = live.append
+        await det._confirm(S1_DIP_VERSION, S1SIG)
+        assert (len(sess.added) == 1) is fires and (len(live) == 1) is fires, down
+        if fires:
+            assert sess.added[0].entry_down_price == down
+            assert sess.added[0].feature_snapshot["dip_offset_s"] == 62
+
+@pytest.mark.asyncio
+async def test_s1_dip_ignores_stale_or_misaligned_quote(monkeypatch) -> None:
+    sess = _Sess()
+    _patch(monkeypatch, sess, WS + 70_000)
+    # 报价停在上一个市场（start_date 错位）与超过 20s 的陈旧报价均不触发
+    for pm in ({"start_date": WS - M15, "up_price": 0.7, "down_price": 0.3, "updated_ts": WS + 65_000},
+               {"start_date": WS, "up_price": 0.7, "down_price": 0.3, "updated_ts": WS + 40_000}):
+        det = S4VariantShadowDetector(_CMulti([]), pm)
+        det._running = True
+        det._sleep_until = _no_wait  # type: ignore[method-assign]
+        await det._confirm(S1_DIP_VERSION, S1SIG)
+    assert sess.added == []
+
+@pytest.mark.asyncio
+async def test_s1_variant_live_fires_even_when_shadow_offline(monkeypatch) -> None:
+    """影子下线不阻止实盘钩子（两开关独立，同 s1_dyn_sq_v1）；影子不落行。"""
+    sess = _Sess()
+    _patch(monkeypatch, sess, WS + 70_000)
+    monkeypatch.setattr(s4v.shadow_gate, "is_enabled", lambda _v: False)
+    pm = {"start_date": WS, "up_price": 0.7, "down_price": 0.3, "updated_ts": WS + 65_000}
+    det = S4VariantShadowDetector(_CMulti([]), pm)
+    det._running = True
+    live: list[dict] = []
+    det._on_live_fire = live.append
+    await det._confirm_s1_variant(S1_DIP_VERSION, S1SIG, WS)
+    assert len(live) == 1 and sess.added == []
+
+@pytest.mark.asyncio
+async def test_s1_variant_live_hook_exception_does_not_block_shadow(monkeypatch) -> None:
+    sess = _Sess()
+    _patch(monkeypatch, sess, WS + 70_000)
+    pm = {"start_date": WS, "up_price": 0.7, "down_price": 0.3, "updated_ts": WS + 65_000}
+    det = S4VariantShadowDetector(_CMulti([]), pm)
+    det._running = True
+
+    def _boom(_p):
+        raise RuntimeError("live down")
+
+    det._on_live_fire = _boom
+    await det._confirm(S1_DIP_VERSION, S1SIG)
+    assert len(sess.added) == 1
+
+def test_s1_spawn_gate_shadow_or_live(monkeypatch) -> None:
+    """派生门：影子开 或 实盘开 任一即派生；都关不派生；S4 两版不受实盘开关影响。"""
+    monkeypatch.setattr(s4v.shadow_gate, "is_enabled", lambda _v: False)
+    monkeypatch.setattr(s4v, "is_live_enabled", lambda _v: False)
+    det = S4VariantShadowDetector(_CMulti([]), {})
+    det._running = True
+    det.on_s1_entry(S1SIG)
+    assert det._watched == set()
+    monkeypatch.setattr(s4v, "is_live_enabled", lambda v: v == S1_DIP_VERSION)
+    det.on_hiconf(SIG)
+    assert det._watched == set()                       # S4 版不看实盘开关

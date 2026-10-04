@@ -270,3 +270,37 @@ async def test_handle_15m_defensive(monkeypatch) -> None:
     bad2.down_price = None
     await m._handle_15m_quote(bad2, ts_ms=1, persist=True)
     session.add.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_s1_fire_notifies_entry_variants_only_for_official_bull_exhaust(monkeypatch) -> None:
+    """正式 S1(bull_exhaust) 命中 → 通知 S1 入场变体钩子；S2 与影子版本不通知。"""
+    pm = {"start_date": NEXT_START, "down_price": 0.5, "up_price": 0.5}
+    det, _ = _make_detector(monkeypatch, pm, mid=64_000.0, row=_Row())
+    monkeypatch.setattr(det, "_send_signal_email_bg", AsyncMock())
+
+    def fake_create_task(coro, name=None):
+        coro.close()
+        return MagicMock()
+
+    monkeypatch.setattr(asyncio, "create_task", fake_create_task)
+    hits: list[dict] = []
+    det._on_s1_entry = hits.append
+    rec = {"level": "4h", "cycle_id": 111, "broken_level": 63_000.0,
+           "break_price": 63_100.0, "break_time": 0}
+    sig_k = {"open": 63_000.0, "high": 63_500.0, "low": 62_900.0,
+             "close": 63_400.0, "volume": 120.0}
+    cycle = NEXT_START // 900_000
+
+    await det._fire_confirmed_signal("high", rec, sig_k, 0.92, None, cycle, NEXT_START + 2_000,
+                                     pattern_type="bull_exhaust")
+    assert len(hits) == 1
+    grid = cycle * 900_000      # 目标周期按 15m 网格推算（NEXT_START 本身不在网格上）
+    assert hits[0]["market_start_15m"] == grid and hits[0]["market_end_15m"] == grid + 900_000
+    assert hits[0]["signal_bar_start"] == grid - 900_000
+
+    await det._fire_confirmed_signal("low", rec, sig_k, 0.1, 2.5, cycle, NEXT_START + 2_000 + 10**7,
+                                     pattern_type="bear_exhaust")
+    await det._fire_confirmed_signal("high", rec, sig_k, 0.92, None, cycle, NEXT_START + 2_000 + 2 * 10**7,
+                                     version="shadow_v", shadow=True, pattern_type="bull_exhaust")
+    assert len(hits) == 1                                  # S2 / 影子均不派生

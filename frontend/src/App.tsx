@@ -973,6 +973,14 @@ const SIGNAL_INFO: Record<string, { name: string; desc: string; retired?: boolea
     name: 'S4高信心档·连阳≥5（押DOWN）',
     desc: '【仅记录，不实盘】连阳 ≥5 根（含信号K）且收盘位置 ≥0.9，允许 4h 破位周期 → 次周期押 DOWN。720 天重放 n=399、胜率 63.2%；真实盘口两段均EV +0.119 / +0.147。约一半与 S1 同窗重叠，上实盘前须并入同窗互斥组。',
   },
+  s1_early2_v1: {
+    name: 'S1早确认·+2min回落（押DOWN）',
+    desc: '正式 S1 命中后，等目标窗第 2 根 1m 收盘：BTC 低于窗口开盘才按 +2min 真实 DOWN 报价入场，否则放弃。是 S5（+5min 确认）的早确认版，买得更便宜（约 0.67 对 0.71）、胜率低约 3 个百分点。真实盘口两段均EV +0.118 / +0.099（S5 为 +0.015 / +0.080），720 天 K 线胜率 71.7%。与 S5 约 76% 重叠。影子持续采集；同名实盘通道已注册，默认关闭，护栏 0.75；替换 S5 时请先关 S5，避免同窗叠加。',
+  },
+  s1_dip45_v1: {
+    name: 'S1低吸·DOWN≤0.45（押DOWN）',
+    desc: '正式 S1 命中后，在 +1/+2/+3/+5/+8 分钟首次看到 DOWN 报价 ≤0.45（影子按缓存价 ≤0.42 触发，缓存价比真实成交低约 0.03）即入场。真实盘口两段均EV +0.097 / +0.199（n57 / n123），同规则用在随机窗口上为 −0.074 / +0.011，说明收益来自 S1 信号本身。与 S1 开盘单同向叠加敞口，金额宜小于 S1。影子持续采集；同名实盘通道已注册，默认关闭，护栏 0.47。',
+  },
   s1_dyn_sq_v1: {
     name: 'S1 动态轧空路由影子（押DOWN）',
     desc: '父S1命中时，用目标窗之前30天已完成5m K构造滚动1小时收益分布。当前ret1h低于q90按开盘近端报价押DOWN；达到或超过q90视为轧空，只在首根5m收阴确认后按+5min报价押DOWN，否则整窗跳过。阈值随行情波动自适应；720d严格时序重放 n=1782、胜率64.9%，原S1为58.3%。影子持续采集；同名小额实盘通道已注册，默认关闭，护栏0.63，与原S1同窗互斥。',
@@ -6187,6 +6195,8 @@ const SHADOW_META: Record<string, { label: string; color: string }> = {
   scene_bear_exhaust_opt_v1: { label: 'S2优化 温和放量非低位→UP', color: 'var(--chart-3)' },
   s4_delay60_v1: { label: 'S4延迟入场 首分钟回落→DOWN', color: 'var(--chart-4)' },
   s4_hiconf_v1: { label: 'S4高信心 连阳≥5→DOWN', color: 'var(--chart-5)' },
+  s1_early2_v1: { label: 'S1早确认 +2min回落→DOWN', color: 'var(--chart-6)' },
+  s1_dip45_v1: { label: 'S1低吸 DOWN≤0.45→DOWN', color: 'var(--chart-7)' },
   // 2026-09-07/08 首触反转族（专用表 firsthit_shadow_signals，影子+实盘通道）
   firsthit_down_v1: { label: '首触G0 基底 q∈(0.005,0.1]→DOWN', color: 'var(--chart-3)' },
   firsthit_down_body_v1: { label: '首触G1 body_r≤0.35→DOWN', color: 'var(--chart-4)' },
@@ -6233,6 +6243,8 @@ const ANALYTICS_EXTRA_DESC: Record<string, string> = {
   rev_p1_v1: '反转 P1：15m 连跌 4 根 + 弱阴收盘（贴最低，close_pos≤0.15）+ 成交量正常（[1.0,1.5)×20 根均量）→ 押次根 15m 收阳 UP。影子持续记录；同名实盘通道默认关闭，护栏 0.608，仅开盘后 90 秒内的新鲜命中派单。720d 回测胜率 62.0% / oos 63.9%。',
   rev_p2_v1: '反转 P2：15m 连涨 5 根 + 弱阳收盘（贴最高，close_pos≥0.85）→ 押次根 15m 收阴 DOWN。影子持续记录；同名实盘通道默认关闭，护栏 0.612，仅开盘后 90 秒内的新鲜命中派单。720d 回测胜率 62.4% / oos 61.3%。',
   s5_deep_z20_v1: 'S5 深档：S1 多头耗尽信号 +5min 回落确认，且回落幅度 z5=c5_close/anchor−1≤−20bp（深档）→ 按 +5min 时刻真实 15m DOWN 报价记录押 DOWN 的影子信号，仅记录不下单，次周期 15m 收阴判赢。落 pattern_shadow_signals（entry_state=TOUCHED，借用 HM 结算器）。720d 回测~91.3%（深档样本 EV 偏乐观、含机械成分），影子期即前向验证。',
+  s1_early2_v1: 'S1 早确认：正式 S1 命中后，目标窗第 2 根 1m 收盘低于窗口开盘（BTC 已回落）才在 +2min 按真实 DOWN 报价入场，押次周期 15m DOWN。S5 的早确认替代版：买得更便宜、胜率略低、均EV更高。落 kline_shadow_signals；同名实盘通道默认关闭。',
+  s1_dip45_v1: 'S1 低吸：正式 S1 命中后，+1/+2/+3/+5/+8 分钟首次 DOWN 报价 ≤0.45（影子按缓存价 ≤0.42）即入场，押次周期 15m DOWN。与 S1 开盘单同向叠加敞口。落 kline_shadow_signals；同名实盘通道默认关闭。',
   s1_dyn_sq_v1: 'S1 动态轧空路由：复用正式 S1 父信号，不改变原 S1/S5 通道配置。目标窗开盘时，以严格 ex-ante 的此前30天已完成5m K构造滚动ret1h分布；当前ret1h低于nearest-rank q90为NORMAL，按开盘近端真实DOWN报价入场；达到或超过q90为SQUEEZE，只在首根5m收阴后按+5min真实DOWN报价入场，否则跳过。q90只由过去行情分布计算，不看S1胜负，随波动regime自适应。720d重放原S1 n=2288/胜率58.3%，动态路由 n=1782/胜率64.9%；轧空确认组 n=684/78.1%，未确认组 n=506/DOWN胜率35.0%。影子持续采集；同名小额实盘通道默认关闭，护栏0.63，与原S1同窗互斥。',
   quote_momentum_v3: '【2026-09-04 已退役：修正未来函数后门禁效应≈0（+3.8pp，CI 重叠），不值得占实盘额度；随 momentum 族整体下线】报价动量 v3：在 v1（触发后 90~120s DOWN 报价 q∈[0.69,0.75)）基础上叠加“非连涨”门禁——用最后已收 15m（触发时刻所属 15m 的前一根，严格防未来函数）判定 close[j]≤close[j−1] 才落表 → 押 DOWN 的影子信号，落 misalignment_signals，按报价 edge 结算。回测修正未来函数后 80.2% vs 连涨 76.4%（+3.8pp，CI 重叠、门禁效应≈0），影子用于前向验证门禁是否真实有效。',
   nb_zschamp_15m_v1: 'nextbar 15m冠军：zscore_10≤-1.651 ∧ zscore_5≤-1.538 ∧ ret_3≤-0.00395（深超卖+急跌+卖盘衰竭）→ 押次根 15m 收阳 UP。源自 H=1 方向研究 converge_registry L3 ROBUST（holdout P(up_1)=61.96% n=368，月一致性 0.958 / walk-forward 1.00）；build_feature_matrix+condition_mask 实时重放冻结条件原文，与 KREV/反转共表 kline_shadow_signals（version+timeframe 隔离）。720d 次根收阳 58.92%（约2006触发）；生产影子 n=28 胜率67.9%、报价样本平均EV+0.130，但置信区间仍跨0。已注册默认关闭的小额实盘通道，MARKET护栏0.57（成交均价≥0.57弃单），仅目标根开盘后90秒内新鲜命中派单。',

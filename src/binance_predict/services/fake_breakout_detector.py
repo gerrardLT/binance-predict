@@ -461,6 +461,9 @@ class FakeBreakoutDetector:
         # _on_s4_hiconf：连阳≥5∧cp≥0.9（含破位周期）→ 高信心档影子。
         self._on_s4_delay: Callable[[dict], None] | None = None
         self._on_s4_hiconf: Callable[[dict], None] | None = None
+        # S1 入场变体钩子（main 装配注入 S4VariantShadowDetector.on_s1_entry）：
+        # 正式 S1 命中 → 早确认(+2min BTC 已跌) / 低吸(DOWN 价≤0.45) 两条影子+实盘通道。
+        self._on_s1_entry: Callable[[dict], None] | None = None
         # S4 续发判定状态：本进程最近一次完成 S4 评估的周期 / 最近一次 S4 形态命中的周期
         self._s4_last_eval_cycle: int | None = None
         self._s4_last_hit_cycle: int | None = None
@@ -1011,6 +1014,12 @@ class FakeBreakoutDetector:
                 self._route_s1_dynamic_shadow(signal, next_start, next_end),
                 name=f"fbs_s1_dynamic_{signal.id}",
             )
+            self._notify_s4_variant(self._on_s1_entry, {
+                "id": signal.id,
+                "signal_bar_start": next_start - 900_000,
+                "market_start_15m": next_start,
+                "market_end_15m": next_end,
+            })
 
         # S2 条件单影子（2026-09-06）：仅正式 bear_exhaust 信号派生——窗内 t=4/t=5
         # 判价条件确认 → 押次周期 UP，落 kline_shadow_signals（纯影子，物理隔离于下单

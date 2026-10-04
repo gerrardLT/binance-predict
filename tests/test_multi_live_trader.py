@@ -208,7 +208,7 @@ def test_parse_defaults_all_off(monkeypatch) -> None:
     monkeypatch.setattr(settings, "live_default_max_daily_orders", 100)
     monkeypatch.setattr(settings, "live_channels_json", "")
     cfgs = parse_channel_config()
-    assert len(cfgs) == 39 + len(CANDLESTICK_SIGNAL_IDS)
+    assert len(cfgs) == 41 + len(CANDLESTICK_SIGNAL_IDS)
     assert set(CANDLESTICK_SIGNAL_IDS) <= set(cfgs)
     assert all(not c.enabled for c in cfgs.values())
     assert all(c.amount_usdt == 2.0 for c in cfgs.values())
@@ -362,6 +362,8 @@ def test_channels_registry_shape() -> None:
         "scene_bull_exhaust", "s1_dyn_sq_v1", "scene_bull_exhaust_confirm",
         "scene_bear_exhaust", "scene_bear_exhaust_opt_v1", "scene_momentum_fade",
         "s5_deep_z20_v1",
+        # 2026-10-04 S1 入场变体（早确认 / 低吸，默认 OFF）
+        "s1_early2_v1", "s1_dip45_v1",
         # nextbar / s2_cond 影子 promote（默认全 OFF，面板/配置开启）
         "s2_cond_t4_v1", "s2_cond_t5d_v1",
         "nb_zschamp_15m_v1", "nb_smaslope_5m_v1",
@@ -1242,6 +1244,51 @@ async def test_scene_s1_down_15m(monkeypatch) -> None:
     assert call["scene_signal_id"] == 42
     assert call["max_exec_price"] == 0.70
     assert call["amount_usdt"] == 2.0
+
+
+def _s1_variant_sig(channel: str, sig_id: int = 61) -> dict:
+    return {"version": channel, "id": sig_id, "pattern_type": channel, "side": "high",
+            "market_start_15m": MARKET_START_15M,
+            "market_end_15m": MARKET_START_15M + 900_000}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("channel,guard", [("s1_early2_v1", 0.75), ("s1_dip45_v1", 0.47)])
+async def test_s1_variant_live_down_15m(monkeypatch, channel, guard) -> None:
+    """S1 入场变体显式开启后 15m 押 DOWN，护栏取通道默认值，订单关联父 S1 信号 id。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=[channel])
+    t.on_s1_variant_signal(_s1_variant_sig(channel))
+    await _drain(t)
+    call = fake.calls[0]
+    assert call["prediction"] == "DOWN"
+    assert call["signal_version"] == channel
+    assert call["window_start"] == MARKET_START_15M
+    assert call["market_period"] == "15m"
+    assert call["scene_signal_id"] == 61
+    assert call["max_exec_price"] == guard
+    assert call["amount_usdt"] == 2.0
+
+
+@pytest.mark.asyncio
+async def test_s1_variant_default_off_and_dedup(monkeypatch) -> None:
+    """默认 OFF 不下单；开启后同窗重复钩子只派一单；非变体通道名忽略；不进任何互斥组。"""
+    from binance_predict.services.live_channels import exclusive_group
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=[])
+    t.on_s1_variant_signal(_s1_variant_sig("s1_early2_v1"))
+    await _drain(t)
+    assert fake.calls == []
+
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["s1_early2_v1", "scene_bull_exhaust"])
+    t.on_s1_variant_signal(_s1_variant_sig("s1_early2_v1"))
+    t.on_s1_variant_signal(_s1_variant_sig("s1_early2_v1"))
+    t.on_s1_variant_signal(_s1_variant_sig("s1_dip45_v1"))         # 另一通道未启用
+    t.on_s1_variant_signal(_s1_variant_sig("scene_bull_exhaust"))  # 不在变体白名单（即使已启用）
+    await _drain(t)
+    assert [c["signal_version"] for c in fake.calls] == ["s1_early2_v1"]
+    assert exclusive_group("s1_early2_v1") is None and exclusive_group("s1_dip45_v1") is None
 
 
 @pytest.mark.asyncio
@@ -2437,7 +2484,7 @@ def test_status_shape(monkeypatch) -> None:
     assert s["defaults"]["amount_usdt"] == 2.0
     assert s["defaults"]["max_daily_orders"] == 100
     from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
-    assert len(s["channels"]) == 47 + len(CANDLESTICK_SIGNAL_IDS)
+    assert len(s["channels"]) == 49 + len(CANDLESTICK_SIGNAL_IDS)
     by = {c["channel"]: c for c in s["channels"]}
     c = by["quote_contrarian_v1"]
     assert c["enabled"] is True and c["enabled_at_startup"] is True
