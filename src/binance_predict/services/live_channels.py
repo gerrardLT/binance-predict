@@ -339,6 +339,29 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
         "ih_inside_15m_v2", "nextbar", "15m", "UP", 0.30,
         "15m孕线倒垂线反转（押UP）",
     ),
+    # --- CRV 情绪反转族（2026-10-04 研究 run 20261004T083106Z-candle-reversal-certainty
+    # 影子 promote + 用户拍板注册实盘，默认全部 OFF）：
+    # 「高位/突破阳线 → 次根收阴」的反转族。护栏 = 盲测胜率 × 0.98（费后保本入场价，
+    # 与 KREV/P1/P2 同口径）；EV 基准为研究代理模型（0.51 买入+2% 费），前向真实 EV
+    # 由影子目标窗报价现算。检测器 crv_shadow_detector 落 kline_shadow_signals，
+    # 新鲜命中经 on_kline_reversal_signal 钩子派单（目标根开盘 ≤90s）。两个三因子
+    # 探索级版本（crv_dnex_15m_v1 / crv_os_st4_5m_v1）未过盲测，仅影子不注册实盘。---
+    "crv_hi_brk20_15m_v1": ChannelSpec(
+        "crv_hi_brk20_15m_v1", "kline_reversal", "15m", "DOWN", 0.62,
+        "CRV高位突破20高反转（押DOWN）",
+    ),
+    "crv_brk20_15m_v1": ChannelSpec(
+        "crv_brk20_15m_v1", "kline_reversal", "15m", "DOWN", 0.57,
+        "CRV突破20高反转（押DOWN）",
+    ),
+    "crv_brk50_hi_15m_v1": ChannelSpec(
+        "crv_brk50_hi_15m_v1", "kline_reversal", "15m", "DOWN", 0.59,
+        "CRV突破50高∧高位反转（押DOWN）",
+    ),
+    "crv_brk20_5m_v1": ChannelSpec(
+        "crv_brk20_5m_v1", "kline_reversal", "5m", "DOWN", 0.53,
+        "CRV 5m突破20高反转（押DOWN）",
+    ),
 }
 
 # 蜡烛逻辑版本共享 5m/15m 物理事件，但各自可独立注册/热调。默认配置仍全 OFF；
@@ -424,6 +447,10 @@ SAME_WINDOW_EXCLUSIVE: tuple[frozenset[str], ...] = (
     # 吸收跟随双变体同窗同假设（TD120/TD150 只是判定时点不同，欠反应状态连续），
     # 防同窗双成交（2026-09-06 promote）。
     frozenset({"absorption_follow_td120_v1", "absorption_follow_td150_v1"}),
+    # CRV 15m 高位/突破族三通道同源（同一根突破阳线物理事件、同押 DOWN、同目标窗：
+    # hi_brk20 ⊇ brk20 的事件子集、brk50_hi 高度重叠）→ 同窗至多一单成交。
+    # 5m 侧仅 crv_brk20_5m_v1 一个实盘版本，无自互斥需求。
+    frozenset({"crv_hi_brk20_15m_v1", "crv_brk20_15m_v1", "crv_brk50_hi_15m_v1"}),
     # 同周期蜡烛逻辑版本共享物理事件，避免主版/对照/组件/潜力标签重复暴露。
     _CANDLE_5M_CHANNELS,
     _CANDLE_15M_CHANNELS,

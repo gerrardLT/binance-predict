@@ -421,6 +421,9 @@ async def test_analytics_empty_db() -> None:
         "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",
         # rev2 孕线反转族
         "hm_inside_15m_v2", "ih_inside_15m_v2", "hm_inside_5m_v2",
+        # 2026-10-04 CRV 情绪反转族（四个确认级 + 两个三因子探索级）
+        "crv_hi_brk20_15m_v1", "crv_brk20_15m_v1", "crv_brk50_hi_15m_v1",
+        "crv_dnex_15m_v1", "crv_brk20_5m_v1", "crv_os_st4_5m_v1",
     }
     from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
     assert set(out["shadow"].keys()) == expected | set(CANDLESTICK_SIGNAL_IDS)

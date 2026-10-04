@@ -81,6 +81,14 @@ _VERSION_ROWS: tuple[tuple[str, SourceType, str, str, str], ...] = (
     ("hm_inside_15m_v2", SourceType.KLINE, "15m", "target_bar", "row"),
     ("ih_inside_15m_v2", SourceType.KLINE, "15m", "target_bar", "row"),
     ("hm_inside_5m_v2", SourceType.KLINE, "5m", "target_bar", "row"),
+    # CRV 情绪反转族（2026-10-04 研究 run 20261004T083106Z）：15m/5m 突破族押次根
+    # 收阴 DOWN + 两个三因子探索级押次根收阳 UP；direction 按行（row）落库。
+    ("crv_hi_brk20_15m_v1", SourceType.KLINE, "15m", "target_bar", "row"),
+    ("crv_brk20_15m_v1", SourceType.KLINE, "15m", "target_bar", "row"),
+    ("crv_brk50_hi_15m_v1", SourceType.KLINE, "15m", "target_bar", "row"),
+    ("crv_dnex_15m_v1", SourceType.KLINE, "15m", "target_bar", "row"),
+    ("crv_brk20_5m_v1", SourceType.KLINE, "5m", "target_bar", "row"),
+    ("crv_os_st4_5m_v1", SourceType.KLINE, "5m", "target_bar", "row"),
     # 长影短实体检测器按 timeframe 只落一个物理事件；18 个冻结逻辑版本作为标签，
     # 不在此投影表重复展开，避免同窗主版本/严格子集/组件被统计成多次事件。
     ("candle_hm_bull_5m_event_v1", SourceType.KLINE, "5m", "target_bar", "row"),
@@ -118,7 +126,7 @@ def _family_of(version: str, source: SourceType) -> str:
         return "combo"
     if version.startswith(("nb_", "hm_inside_", "ih_inside_")):
         return "nextbar"
-    if version.startswith(("krev_", "rev_")):
+    if version.startswith(("krev_", "rev_", "crv_")):
         return "kline_reversal"
     if version.startswith(("hm_touch_", "s5_deep_", "s1_dyn_")):
         return "pattern"

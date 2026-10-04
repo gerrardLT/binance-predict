@@ -71,6 +71,7 @@ from .services.data_collector import BinanceDataCollector
 from .services.fake_breakout_detector import FakeBreakoutDetector
 from .services.firsthit_shadow_detector import FirstHitShadowDetector
 from .services.firsthit_forward_recorder import FirstHitForwardRecorder
+from .services.crv_shadow_detector import CrvShadowDetector
 from .services.hm_shadow_detector import HmShadowDetector
 from .services.kline_shadow_detector import KlineShadowDetector
 from .services.misalignment_detector import MisalignmentDetector
@@ -190,6 +191,10 @@ hm_shadow_detector: HmShadowDetector | None = None
 
 # 反转形态影子检测器全局实例（P1/P2：15m 连跌/连涨后弱收盘几何反转，只记录不下注）
 reversal_shadow_detector: ReversalShadowDetector | None = None
+
+# CRV 情绪反转影子检测器全局实例（2026-10-04 研究 run 冻结候选：15m/5m 突破族押次根
+# 收阴 DOWN + 两个三因子探索级押 UP；影子落表，四个确认级同名实盘通道默认 OFF）
+crv_shadow_detector: CrvShadowDetector | None = None
 
 # 下一根 K 线方向影子检测器全局实例（nextbar 族：15m 冠军 + 5m sma_slope 误定价候选，只记录不下注）
 nextbar_shadow_detector: NextbarShadowDetector | None = None
@@ -1299,6 +1304,23 @@ async def lifespan(app: FastAPI):
         await reversal_shadow_detector.start()
         logger.info("反转 K线检测器已启动（P1→UP 62.0% / P2→DOWN 62.4%；影子落表 + 实盘通道默认 OFF）")
 
+    # CRV 情绪反转（2026-10-04 研究 run 20261004T083106Z 冻结候选实时重放）：
+    # 15m/5m 突破族（高位∧突破20高 63.7% / 突破20高 58.5% / 突破50高∧高位 60.6% /
+    # 5m 突破20高 54.5%，盲测口径）→ 押次根收阴 DOWN；两个三因子探索级仅影子
+    # （crv_dnex_15m_v1 / crv_os_st4_5m_v1 押 UP）。影子照常落表；四个确认级
+    # 同名实盘通道默认 OFF，仅正常轮询中目标根开盘 ≤90s 新鲜命中派单。
+    global crv_shadow_detector
+    if settings.crv_shadow_enabled:
+        crv_shadow_detector = CrvShadowDetector(
+            collector=collector,
+            pm_15m_latest=_pm_15m_latest,
+            pm_5m_info=_pm_market_info,
+        )
+        if multi_live_trader is not None:
+            crv_shadow_detector._on_live_fire = multi_live_trader.on_kline_reversal_signal
+        await crv_shadow_detector.start()
+        logger.info("CRV 情绪反转检测器已启动（15m 63.7%/58.5%/60.6% + 5m 54.5% → 押DOWN；影子落表 + 实盘通道默认 OFF）")
+
     # 下一根 K 线方向影子信号（nextbar 族，2026-09-03；2026-09-06 promote）：H=1 方向
     # 研究冻结条件实时重放——15m 冠军（zscore_10+zscore_5+ret_3 深超卖反转，holdout
     # P(up_1)=61.96%）押次根 15m 收阳 UP；5m sma_slope≥1.66 动量误定价候选押次根 5m
@@ -1549,6 +1571,10 @@ async def lifespan(app: FastAPI):
     # 停止反转形态影子检测器
     if reversal_shadow_detector is not None:
         await reversal_shadow_detector.stop()
+
+    # 停止 CRV 情绪反转影子检测器
+    if crv_shadow_detector is not None:
+        await crv_shadow_detector.stop()
     # 停止下一根 K 线方向影子检测器
     if nextbar_shadow_detector is not None:
         await nextbar_shadow_detector.stop()
@@ -4184,6 +4210,15 @@ SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     # 回测点估计，只钉胜率；bench EV 留 None（无冻结 EV 基准；面板 EV 由真实报价前向现算）
     "rev_p1_v1": (0.620, None, "反转P1: 15m连跌4+弱阴收(贴最低)+量正常[1.0,1.5) → 押次根收阳UP（720d 62.0%/oos 63.9%；EV按目标窗真实报价前向现算）"),
     "rev_p2_v1": (0.624, None, "反转P2: 15m连涨5+弱阳收(贴最高) → 押次根收阴DOWN（720d 62.4%/oos 61.3%；EV按目标窗真实报价前向现算）"),
+    # CRV 情绪反转族（2026-10-04 研究 run 20261004T083106Z-candle-reversal-certainty，
+    # 720D 预注册穷举 + 90D 盲测；胜率为盲测口径，EV 留 None——研究 EV 为代理模型
+    # （0.51 买入+2% 费），面板 EV 由目标窗真实报价前向现算）
+    "crv_hi_brk20_15m_v1": (0.637, None, "CRV高位突破: 15m阳线∧突破20根高∧pos100>0.90 → 押次根收阴DOWN（盲测 n=212 胜率63.7% LB57.0%，研究EV+0.117；13/13月为正；同名实盘通道默认OFF护栏0.62）"),
+    "crv_brk20_15m_v1": (0.588, None, "CRV突破20高: 15m阳线∧突破20根高 → 押次根收阴DOWN（盲测 n=458 胜率58.5% LB54.0%，研究EV+0.065；360D累计EV+120单位注金；实盘默认OFF护栏0.57）"),
+    "crv_brk50_hi_15m_v1": (0.606, None, "CRV突破50高∧高位: 15m阳线∧突破50根高∧pos100>0.75 → 押次根收阴DOWN（盲测 n=226 胜率60.6% LB54.1%，研究EV+0.086；实盘默认OFF护栏0.59；与CRV另两通道同窗互斥）"),
+    "crv_brk20_5m_v1": (0.545, None, "CRV 5m突破20高: 5m阳线∧突破20根高 → 押次根收阴DOWN（盲测 n=1552 胜率54.5% LB52.0%，5m唯一强档，研究EV+0.025薄边际；实盘默认OFF护栏0.53）"),
+    "crv_dnex_15m_v1": (0.602, None, "CRV三因子·跌破出清（探索级）: 15m跌破20低∧贴20低∧实体>ATR → 押次根收阳UP（disc 61.4%/val 60.2%，未过盲测，仅影子前向验证≥8周后才可评估晋级）"),
+    "crv_os_st4_5m_v1": (0.525, None, "CRV三因子·超卖连阴（探索级）: 5m RSI14<30∧连4阴∧跌破20低 → 押次根收阳UP（disc 60.6%/val 52.5%，未过盲测，仅影子）"),
     # S5 深档（2026-09-03）：S1+5min确认且 z5≤−20bp 深回落子集，落 pattern_shadow_signals，
     # 记 +5min 真实 DOWN 报价；基准为深档回测点估计（EV 偏乐观含机械成分），影子前向验证
     "s5_deep_z20_v1": (0.913, None, "S5深档: S1+5min回落确认且z5≤−20bp → 押次周期15m DOWN（回测~91.3%，深档EV偏乐观含机械成分，影子前向验证）"),

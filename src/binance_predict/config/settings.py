@@ -81,6 +81,12 @@ class Settings(BaseSettings):
     # 显式声明收录，避免 pydantic-settings extra=forbid 拒绝整个配置加载。
     predexon_api_key: str = ""
 
+    # --- 生产环境 HTTP API（本地只读运维/研究导出用，运行时不用）---
+    # .env 存在这两键时若不声明，pydantic-settings extra=forbid 会拒绝整个配置
+    # 加载（本地全量测试因此挂载失败，2026-10-04 补声明）。空值=未配置。
+    prod_api_base: str = ""
+    prod_api_token: str = ""
+
     # --- 安全配置 ---
     # CORS 允许的前端源（逗号分隔，如 "http://localhost:5173,https://example.com"）。
     # 空字符串默认仅允许 localhost 开发源。生产环境必须显式指定。
@@ -391,6 +397,16 @@ class Settings(BaseSettings):
     # 长样本反指），影子期即前向验证动量误定价是否持续。默认开启：与其他影子信号一致，
     # 部署即生效；仅作紧急停用制动力，正常情况下无需触碰。
     nextbar_shadow_enabled: bool = True
+
+    # --- CRV 情绪反转影子信号（crv 族，2026-10-04）---
+    # 研究 run 20261004T083106Z-candle-reversal-certainty 冻结候选实时重放：
+    # 15m 高位∧突破20高（盲测 63.7%）、15m 突破20高（58.5%）、15m 突破50高∧pos100>0.75
+    # （60.6%）→ 押次根 15m 收阴 DOWN；5m 突破20高（54.5%，5m 唯一强档）→ 押次根 5m
+    # 收阴 DOWN；另有两个三因子探索级（15m 跌破20低∧贴20低∧实体>ATR → UP、
+    # 5m RSI<30∧连4阴∧跌破20低 → UP）仅影子不注册实盘。四个确认级同名实盘通道
+    # 默认 OFF（LIVE_CHANNELS_JSON 显式 enabled 才开火）。默认开启影子采集：与其他
+    # 影子信号一致，部署即生效；仅作紧急停用制动力。
+    crv_shadow_enabled: bool = True
 
     # --- 组合条件影子信号（combo 族，2026-09-04）---
     # 45 维条件大搜索（grand_search_v2：720d 三三组合扫描）+ 1443 天样本外考试

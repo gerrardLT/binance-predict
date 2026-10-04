@@ -208,7 +208,7 @@ def test_parse_defaults_all_off(monkeypatch) -> None:
     monkeypatch.setattr(settings, "live_default_max_daily_orders", 100)
     monkeypatch.setattr(settings, "live_channels_json", "")
     cfgs = parse_channel_config()
-    assert len(cfgs) == 41 + len(CANDLESTICK_SIGNAL_IDS)
+    assert len(cfgs) == 45 + len(CANDLESTICK_SIGNAL_IDS)
     assert set(CANDLESTICK_SIGNAL_IDS) <= set(cfgs)
     assert all(not c.enabled for c in cfgs.values())
     assert all(c.amount_usdt == 2.0 for c in cfgs.values())
@@ -382,6 +382,9 @@ def test_channels_registry_shape() -> None:
         "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",
         # 2026-09-09 15m 经典孕线反转双通道 + 2026-09-13 5m HM 精选通道（默认全 OFF）
         "hm_inside_5m_v2", "hm_inside_15m_v2", "ih_inside_15m_v2",
+        # 2026-10-04 CRV 情绪反转四通道（默认全 OFF；两个三因子探索级仅影子不注册实盘）
+        "crv_hi_brk20_15m_v1", "crv_brk20_15m_v1",
+        "crv_brk50_hi_15m_v1", "crv_brk20_5m_v1",
     }
     assert set(LIVE_CHANNELS) == expected_existing | set(CANDLESTICK_SIGNAL_IDS)
     assert set(RETIRED_CHANNELS) == {
@@ -447,6 +450,11 @@ def test_channels_registry_shape() -> None:
         ("krev_b_v1", "15m", "kline_reversal", 0.621),
         ("rev_p1_v1", "15m", "kline_reversal", 0.608),
         ("rev_p2_v1", "15m", "kline_reversal", 0.612),
+        # 2026-10-04 CRV：护栏 = 盲测胜率 × 0.98（费后保本价略下方，同 KREV 口径）
+        ("crv_hi_brk20_15m_v1", "15m", "kline_reversal", 0.62),
+        ("crv_brk20_15m_v1", "15m", "kline_reversal", 0.57),
+        ("crv_brk50_hi_15m_v1", "15m", "kline_reversal", 0.59),
+        ("crv_brk20_5m_v1", "5m", "kline_reversal", 0.53),
         ("absorption_follow_td120_v1", "5m", "absorption", 0.78),
         ("absorption_follow_td150_v1", "5m", "absorption", 0.86),
     ):
@@ -2484,7 +2492,7 @@ def test_status_shape(monkeypatch) -> None:
     assert s["defaults"]["amount_usdt"] == 2.0
     assert s["defaults"]["max_daily_orders"] == 100
     from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
-    assert len(s["channels"]) == 49 + len(CANDLESTICK_SIGNAL_IDS)
+    assert len(s["channels"]) == 53 + len(CANDLESTICK_SIGNAL_IDS)
     by = {c["channel"]: c for c in s["channels"]}
     c = by["quote_contrarian_v1"]
     assert c["enabled"] is True and c["enabled_at_startup"] is True
