@@ -464,6 +464,16 @@ class FirstHitForwardRecorder:
         trader = self._trader
         if trader is None:
             return {}
+        # 独立 trader 实例不经实盘链路初始化：_wallet_address 为空时 get_quote
+        # 恒被币安 -1102（walletAddress 缺失）拒收。触发时自动补取（只读 API，
+        # 每次触发重试自愈；上线 2026-09-17 至 2026-10-04 该缺失致阶梯 100% 失败）。
+        if not getattr(trader, "_wallet_address", ""):
+            wallet = await trader.fetch_wallet_info()
+            if wallet is None or not getattr(trader, "_wallet_address", ""):
+                return {"error": {
+                    "available": False,
+                    "reason": "wallet_address_unavailable",
+                }}
         results: dict[str, dict] = {}
         try:
             async with trader._trade_lock:

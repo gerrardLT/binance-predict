@@ -147,6 +147,7 @@ class _QuoteOnlyTrader:
         self._5m_start_date = START
         self._down_token_id = "down-token"
         self._up_token_id = "up-token"
+        self._wallet_address = "0xwallet-ready"
         self.calls = []
 
     async def list_markets(self):
@@ -164,6 +165,23 @@ class _QuoteOnlyTrader:
         raise AssertionError("record-only 采集器不得调用 place_order")
 
 
+class _EmptyWalletTrader(_QuoteOnlyTrader):
+    """wallet 为空的独立 trader：fetch_wallet_info 成功后地址被填充。"""
+
+    def __init__(self, wallet_ok=True):
+        super().__init__()
+        self._wallet_address = ""
+        self.wallet_ok = wallet_ok
+        self.fetch_calls = 0
+
+    async def fetch_wallet_info(self):
+        self.fetch_calls += 1
+        if not self.wallet_ok:
+            return None
+        self._wallet_address = "0xwallet-fetched"
+        return {"walletAddress": self._wallet_address}
+
+
 @pytest.mark.asyncio
 async def test_execution_ladder_is_quote_only_never_places_order():
     trader = _QuoteOnlyTrader()
@@ -172,6 +190,35 @@ async def test_execution_ladder_is_quote_only_never_places_order():
     assert [call[2] for call in trader.calls] == [1.0, 5.0, 10.0]
     assert all(result[key]["available"] for key in ("1", "5", "10"))
     assert all(result[key]["latency_ms"] >= 0 for key in ("1", "5", "10"))
+
+
+@pytest.mark.asyncio
+async def test_execution_ladder_auto_fetches_missing_wallet_address():
+    """独立 trader 的 _wallet_address 为空（生产 -1102 根因）：触发时自动
+    fetch_wallet_info 补齐后才走报价阶梯，且不再重复获取。"""
+    trader = _EmptyWalletTrader()
+    recorder = FirstHitForwardRecorder(trader=trader)
+    result = await recorder._probe_execution_quotes("DOWN", START, 0.08)
+
+    assert trader.fetch_calls == 1
+    assert [call[2] for call in trader.calls] == [1.0, 5.0, 10.0]
+    assert all(result[key]["available"] for key in ("1", "5", "10"))
+    # 补齐后再次触发：地址已在，不重取
+    await recorder._probe_execution_quotes("DOWN", START, 0.08)
+    assert trader.fetch_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_execution_ladder_wallet_unavailable_short_circuits():
+    """fetch_wallet_info 失败 → 短路返回不可用原因，不打 3 次注定失败的 get_quote。"""
+    trader = _EmptyWalletTrader(wallet_ok=False)
+    recorder = FirstHitForwardRecorder(trader=trader)
+    result = await recorder._probe_execution_quotes("DOWN", START, 0.08)
+
+    assert trader.fetch_calls == 1
+    assert trader.calls == []  # 不触报价阶梯
+    assert result == {"error": {"available": False,
+                                "reason": "wallet_address_unavailable"}}
 
 
 def test_record_only_versions_are_not_live_channels_and_default_on():
