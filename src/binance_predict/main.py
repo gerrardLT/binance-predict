@@ -65,6 +65,7 @@ from .models.schemas import (
 )
 from .services.absorption_shadow_detector import AbsorptionShadowDetector
 from .services.agent_scheduler import AgentScheduler
+from .services.brk_reversion_detector import BrkReversionDetector
 from .services.combo_shadow_detector import ComboShadowDetector
 from .services.candlestick_shadow_detector import CandlestickShadowDetector
 from .services.data_collector import BinanceDataCollector
@@ -195,6 +196,10 @@ reversal_shadow_detector: ReversalShadowDetector | None = None
 # CRV 情绪反转影子检测器全局实例（2026-10-04 研究 run 冻结候选：15m/5m 突破族押次根
 # 收阴 DOWN + 两个三因子探索级押 UP；影子落表，四个确认级同名实盘通道默认 OFF）
 crv_shadow_detector: CrvShadowDetector | None = None
+
+# BRK 假突破回归影子检测器全局实例（2026-10-05 研究 run 冻结候选：收盘突破前 8h
+# 高点 → 押次根收阴 DOWN；影子落表，两个同名实盘通道默认 OFF）
+brk_reversion_detector: BrkReversionDetector | None = None
 
 # 下一根 K 线方向影子检测器全局实例（nextbar 族：15m 冠军 + 5m sma_slope 误定价候选，只记录不下注）
 nextbar_shadow_detector: NextbarShadowDetector | None = None
@@ -1321,6 +1326,23 @@ async def lifespan(app: FastAPI):
         await crv_shadow_detector.start()
         logger.info("CRV 情绪反转检测器已启动（15m 63.7%/58.5%/60.6% + 5m 54.5% → 押DOWN；影子落表 + 实盘通道默认 OFF）")
 
+    # BRK 假突破回归（2026-10-05 研究 run 20261005T051500Z 冻结候选实时重放）：
+    # 收盘突破前 32/96 根（8 小时）高点 → 押次根收阴 DOWN。三段一致最强结构：
+    # 15m 训练 55.2% → 验证 58.8% → 盲测 55.7%；5m 盲测市场结算口径 56.9%。
+    # 影子照常落表；两个同名实盘通道默认 OFF，仅正常轮询中目标根开盘 ≤90s
+    # 新鲜命中派单（与 CRV 突破族同窗互斥）。
+    global brk_reversion_detector
+    if settings.brk_shadow_enabled:
+        brk_reversion_detector = BrkReversionDetector(
+            collector=collector,
+            pm_15m_latest=_pm_15m_latest,
+            pm_5m_info=_pm_market_info,
+        )
+        if multi_live_trader is not None:
+            brk_reversion_detector._on_live_fire = multi_live_trader.on_kline_reversal_signal
+        await brk_reversion_detector.start()
+        logger.info("BRK 假突破回归检测器已启动（15m 盲测 55.7% / 5m 市场口径 56.9% → 押DOWN；影子落表 + 实盘通道默认 OFF）")
+
     # 下一根 K 线方向影子信号（nextbar 族，2026-09-03；2026-09-06 promote）：H=1 方向
     # 研究冻结条件实时重放——15m 冠军（zscore_10+zscore_5+ret_3 深超卖反转，holdout
     # P(up_1)=61.96%）押次根 15m 收阳 UP；5m sma_slope≥1.66 动量误定价候选押次根 5m
@@ -1575,6 +1597,9 @@ async def lifespan(app: FastAPI):
     # 停止 CRV 情绪反转影子检测器
     if crv_shadow_detector is not None:
         await crv_shadow_detector.stop()
+    # 停止 BRK 假突破回归影子检测器
+    if brk_reversion_detector is not None:
+        await brk_reversion_detector.stop()
     # 停止下一根 K 线方向影子检测器
     if nextbar_shadow_detector is not None:
         await nextbar_shadow_detector.stop()
@@ -4220,6 +4245,11 @@ SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     "crv_dnex_15m_v1": (0.602, None, "CRV三因子·跌破出清（探索级）: 15m跌破20低∧贴20低∧实体>ATR → 押次根收阳UP（disc 61.4%/val 60.2%，未过盲测，仅影子前向验证≥8周后才可评估晋级）"),
     "crv_os_st4_5m_v1": (0.525, None, "CRV三因子·超卖连阴（探索级）: 5m RSI14<30∧连4阴∧跌破20低 → 押次根收阳UP（disc 60.6%/val 52.5%，未过盲测，仅影子）"),
     "crv_hi_z3_15m_v1": (0.621, None, "CRV三因子·高位z离群连3阳（观察级）: 15m阳线∧pos100>0.90∧z20>+2∧恰连3阳 → 押次根收阴DOWN（disc n=190 62.1% LB55.0%/val n=74 67.6%，AMENDMENT-2全枚举新发现，未过盲测，仅影子前向验证）"),
+    # BRK 假突破回归族（2026-10-05 研究 run 20261005T051500Z-sentiment-kline-reversal，
+    # 720D 预注册穷举 + 20D 盲测；EV 留 None——研究 EV 为代理模型（0.50 买入+2% 费），
+    # 面板 EV 由目标窗真实报价前向现算）
+    "brkrv_brk8h_15m_v1": (0.557, None, "BRK假突破回归15m: 收盘突破前32根(8h)高 → 押次根收阴DOWN（盲测 55.7% n=79，训练55.2%→验证58.8%(LB56.0%)→盲测三段全正；实盘默认OFF护栏0.54；与CRV 15m突破族同窗互斥）"),
+    "brkrv_brk8h_5m_v1": (0.5694, None, "BRK假突破回归5m: 收盘突破前96根(8h)高 → 押次根收阴DOWN（盲测市场结算口径 56.9% n=144 LB48.8%未达盈亏平衡线；rev1 未过验证门槛，仅影子前向验证，开启实盘前需≥4周影子样本+NOISE率确认；实盘默认OFF护栏0.55；与CRV 5m突破通道同窗互斥）"),
     # S5 深档（2026-09-03）：S1+5min确认且 z5≤−20bp 深回落子集，落 pattern_shadow_signals，
     # 记 +5min 真实 DOWN 报价；基准为深档回测点估计（EV 偏乐观含机械成分），影子前向验证
     "s5_deep_z20_v1": (0.913, None, "S5深档: S1+5min回落确认且z5≤−20bp → 押次周期15m DOWN（回测~91.3%，深档EV偏乐观含机械成分，影子前向验证）"),

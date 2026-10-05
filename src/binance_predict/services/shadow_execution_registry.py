@@ -91,6 +91,10 @@ _VERSION_ROWS: tuple[tuple[str, SourceType, str, str, str], ...] = (
     ("crv_os_st4_5m_v1", SourceType.KLINE, "5m", "target_bar", "row"),
     # 2026-10-04 AMENDMENT-2 全枚举新发现（观察级，仅影子）
     ("crv_hi_z3_15m_v1", SourceType.KLINE, "15m", "target_bar", "row"),
+    # BRK 假突破回归族（2026-10-05 研究 run 20261005T051500Z）：收盘突破前 8h
+    # 高点 → 押次根收阴 DOWN；direction 按行（row）。
+    ("brkrv_brk8h_15m_v1", SourceType.KLINE, "15m", "target_bar", "row"),
+    ("brkrv_brk8h_5m_v1", SourceType.KLINE, "5m", "target_bar", "row"),
     # 长影短实体检测器按 timeframe 只落一个物理事件；18 个冻结逻辑版本作为标签，
     # 不在此投影表重复展开，避免同窗主版本/严格子集/组件被统计成多次事件。
     ("candle_hm_bull_5m_event_v1", SourceType.KLINE, "5m", "target_bar", "row"),
@@ -128,7 +132,7 @@ def _family_of(version: str, source: SourceType) -> str:
         return "combo"
     if version.startswith(("nb_", "hm_inside_", "ih_inside_")):
         return "nextbar"
-    if version.startswith(("krev_", "rev_", "crv_")):
+    if version.startswith(("krev_", "rev_", "crv_", "brkrv_")):
         return "kline_reversal"
     if version.startswith(("hm_touch_", "s5_deep_", "s1_dyn_")):
         return "pattern"

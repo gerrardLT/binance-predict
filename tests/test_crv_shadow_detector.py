@@ -464,10 +464,12 @@ def test_crv_live_channels_registered_default_off() -> None:
     configs = parse_channel_config()
     for version in expected:
         assert configs[version].enabled is False
-    # 15m 三通道同窗互斥
+    # 15m 三通道同窗互斥（2026-10-05 起并入 BRK 同源突破回归通道：同一根突破
+    # 阳线事件子集、同押 DOWN 同目标窗 → 同窗至多一单成交）
     grp = exclusive_group("crv_hi_brk20_15m_v1")
-    assert grp == {"crv_hi_brk20_15m_v1", "crv_brk20_15m_v1", "crv_brk50_hi_15m_v1"}
-    assert exclusive_group("crv_brk20_5m_v1") is None
+    assert grp == {"crv_hi_brk20_15m_v1", "crv_brk20_15m_v1", "crv_brk50_hi_15m_v1",
+                   "brkrv_brk8h_15m_v1"}
+    assert exclusive_group("crv_brk20_5m_v1") == {"crv_brk20_5m_v1", "brkrv_brk8h_5m_v1"}
 
 
 def test_crv_versions_in_shadow_projection() -> None:

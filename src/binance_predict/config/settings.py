@@ -408,6 +408,15 @@ class Settings(BaseSettings):
     # 影子信号一致，部署即生效；仅作紧急停用制动力。
     crv_shadow_enabled: bool = True
 
+    # --- BRK 假突破回归影子信号（brkrv 族，2026-10-05）---
+    # 研究 run 20261005T051500Z-sentiment-kline-reversal 冻结候选实时重放：
+    # 收盘突破前 32/96 根（8 小时）高点 → 押次根收阴 DOWN（假突破回归，本轮研究
+    # 三段训练→验证→盲测全部一致的最强结构）。两个版本同名实盘通道默认 OFF
+    # （LIVE_CHANNELS_JSON 显式 enabled 才开火）；⚠ 5m 版横盘 regime 会被市场
+    # NOISE 结算摧毁经济 EV，开启前须确认近期 NOISE 率。默认开启影子采集：与其他
+    # 影子信号一致，部署即生效；仅作紧急停用制动力。
+    brk_shadow_enabled: bool = True
+
     # --- 组合条件影子信号（combo 族，2026-09-04）---
     # 45 维条件大搜索（grand_search_v2：720d 三三组合扫描）+ 1443 天样本外考试
     # （2020-10~2024-09）+ 50 次置换检验三重过滤后存活的 5 个组合实时重放：

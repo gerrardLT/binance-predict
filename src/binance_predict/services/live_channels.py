@@ -363,6 +363,27 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
         "crv_brk20_5m_v1", "kline_reversal", "5m", "DOWN", 0.53,
         "CRV 5m突破20高反转（押DOWN）",
     ),
+    # --- BRK 假突破回归族（2026-10-05 研究 run 20261005T051500Z-sentiment-kline-reversal
+    # 影子 promote + 用户拍板注册实盘，默认全部 OFF）：
+    # 「收盘突破前 32/96 根（8 小时）高点 → 次根收阴」的假突破回归——本轮研究三段
+    # （训练→验证→盲测）全部一致的最强结构。护栏 = 盲测胜率 × 0.98（费后保本
+    # 入场价，与 CRV 同口径）：15m 55.7%×0.98≈0.5459→0.54；5m 取市场结算口径
+    # （NOISE 计输）盲测 56.9%×0.98≈0.5580→0.55。⚠ 5m 证据强度弱于 15m：56.9%
+    # 是 20 天 n=144 的盲测点估计（Wilson 下界 48.8% 低于盈亏平衡线），且 rev1
+    # 口径未过研究验证门槛（验证段 53.5%）——开启前需 ≥4 周影子前向样本 + 近期
+    # NOISE 率确认（横盘 regime 如 2026-07 NOISE 率 50% 会摧毁经济 EV）。EV 基准为
+    # 研究代理模型，前向真实 EV 由影子目标窗报价现算。检测器 brk_reversion_detector
+    # 落 kline_shadow_signals，新鲜命中经 on_kline_reversal_signal 钩子派单（目标根
+    # 开盘 ≤90s）。事件集 ⊂ crv_brk20 同周期通道 → 各周期与 CRV 突破族同窗互斥
+    # （防同一根突破阳线双倍押 DOWN）。---
+    "brkrv_brk8h_15m_v1": ChannelSpec(
+        "brkrv_brk8h_15m_v1", "kline_reversal", "15m", "DOWN", 0.54,
+        "BRK假突破8h高回归·15m（押DOWN）",
+    ),
+    "brkrv_brk8h_5m_v1": ChannelSpec(
+        "brkrv_brk8h_5m_v1", "kline_reversal", "5m", "DOWN", 0.55,
+        "BRK假突破8h高回归·5m（押DOWN）",
+    ),
 }
 
 # 蜡烛逻辑版本共享 5m/15m 物理事件，但各自可独立注册/热调。默认配置仍全 OFF；
@@ -450,8 +471,12 @@ SAME_WINDOW_EXCLUSIVE: tuple[frozenset[str], ...] = (
     frozenset({"absorption_follow_td120_v1", "absorption_follow_td150_v1"}),
     # CRV 15m 高位/突破族三通道同源（同一根突破阳线物理事件、同押 DOWN、同目标窗：
     # hi_brk20 ⊇ brk20 的事件子集、brk50_hi 高度重叠）→ 同窗至多一单成交。
-    # 5m 侧仅 crv_brk20_5m_v1 一个实盘版本，无自互斥需求。
-    frozenset({"crv_hi_brk20_15m_v1", "crv_brk20_15m_v1", "crv_brk50_hi_15m_v1"}),
+    # BRK 8h 突破回归事件集是 crv_brk20 的子集（前窗更长 ⇒ 更难突破），同押 DOWN
+    # 同目标窗 → 并入同组防同一根突破阳线双倍押 DOWN（仅两通道都开启才生效）。
+    frozenset({"crv_hi_brk20_15m_v1", "crv_brk20_15m_v1", "crv_brk50_hi_15m_v1",
+               "brkrv_brk8h_15m_v1"}),
+    # 同理 5m 侧：brk8h 事件集 ⊂ brk20 事件集（都开启时同窗至多一单 DOWN）。
+    frozenset({"crv_brk20_5m_v1", "brkrv_brk8h_5m_v1"}),
     # 同周期蜡烛逻辑版本共享物理事件，避免主版/对照/组件/潜力标签重复暴露。
     _CANDLE_5M_CHANNELS,
     _CANDLE_15M_CHANNELS,

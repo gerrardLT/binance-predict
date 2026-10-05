@@ -424,6 +424,8 @@ async def test_analytics_empty_db() -> None:
         # 2026-10-04 CRV 情绪反转族（四个确认级 + 两个三因子探索级 + 观察级）
         "crv_hi_brk20_15m_v1", "crv_brk20_15m_v1", "crv_brk50_hi_15m_v1",
         "crv_dnex_15m_v1", "crv_brk20_5m_v1", "crv_os_st4_5m_v1", "crv_hi_z3_15m_v1",
+        # 2026-10-05 BRK 假突破回归族（两个确认级）
+        "brkrv_brk8h_15m_v1", "brkrv_brk8h_5m_v1",
     }
     from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
     assert set(out["shadow"].keys()) == expected | set(CANDLESTICK_SIGNAL_IDS)

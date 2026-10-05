@@ -34,13 +34,15 @@ EXPECTED_ANALYTICS_VERSIONS = (
     "crv_dnex_15m_v1", "crv_brk20_5m_v1", "crv_os_st4_5m_v1",
     # 2026-10-04 AMENDMENT-2 全枚举新发现（观察级，仅影子）
     "crv_hi_z3_15m_v1",
+    # 2026-10-05 BRK 假突破回归族（两个确认级，同名实盘默认 OFF）
+    "brkrv_brk8h_15m_v1", "brkrv_brk8h_5m_v1",
     "candle_hm_bull_5m_event_v1", "candle_hm_bull_15m_event_v1",
 )
 
 
 def test_registry_matches_all_physical_shadow_versions_in_order() -> None:
     assert SHADOW_VERSIONS == EXPECTED_ANALYTICS_VERSIONS
-    assert len(SHADOW_VERSION_SPECS) == 66
+    assert len(SHADOW_VERSION_SPECS) == 68
     for version in ("candle_hm_bull_5m_event_v1", "candle_hm_bull_15m_event_v1"):
         spec = SHADOW_VERSION_SPECS[version]
         assert spec.family == "candlestick_reversal"
