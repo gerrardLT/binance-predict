@@ -208,7 +208,7 @@ def test_parse_defaults_all_off(monkeypatch) -> None:
     monkeypatch.setattr(settings, "live_default_max_daily_orders", 100)
     monkeypatch.setattr(settings, "live_channels_json", "")
     cfgs = parse_channel_config()
-    assert len(cfgs) == 47 + len(CANDLESTICK_SIGNAL_IDS)
+    assert len(cfgs) == 38 + len(CANDLESTICK_SIGNAL_IDS)
     assert set(CANDLESTICK_SIGNAL_IDS) <= set(cfgs)
     assert all(not c.enabled for c in cfgs.values())
     assert all(c.amount_usdt == 2.0 for c in cfgs.values())
@@ -371,15 +371,12 @@ def test_channels_registry_shape() -> None:
         # 2026-09-18 K线反转四通道（默认全 OFF，仅新鲜次根开盘派单）
         "krev_a_v1", "krev_b_v1", "rev_p1_v1", "rev_p2_v1",
         "firsthit_down_chg_early180_v1", "firsthit_down_k10_early180_v1",
-        "process_recovery_down_v1",
-        # firsthit 族（默认全 OFF，用户确认独立下单）
+        # firsthit 族（默认全 OFF，用户确认独立下单）。
+        # 2026-10-05：G7 全系六通道、K10 两版、process_recovery 已退役移出注册表
+        # （剔 Top5 赢单后影子 EV 全负，见 RETIRED_CHANNEL_SPECS 注释）。
         "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1",
-        "firsthit_down_k10_v1", "firsthit_down_k10_profit_v1",
         # 2026-09-08 firsthit G4 交互门（G1∩G3，默认 OFF；⚠非独立暴露，见 live_channels 注释）
         "firsthit_down_g4_v1",
-        # 2026-09-08 firsthit G7 系列六通道（默认全 OFF，用户确认独立下单）
-        "firsthit_down_g7_v1", "g7_streak_v1", "g7_wick20_v1",
-        "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",
         # 2026-09-09 15m 经典孕线反转双通道 + 2026-09-13 5m HM 精选通道（默认全 OFF）
         "hm_inside_5m_v2", "hm_inside_15m_v2", "ih_inside_15m_v2",
         # 2026-10-04 CRV 情绪反转四通道（默认全 OFF；两个三因子探索级仅影子不注册实盘）
@@ -395,6 +392,13 @@ def test_channels_registry_shape() -> None:
         "quote_contrarian_v3a", "quote_contrarian_v3b",
         "quote_contrarian_v4", "quote_momentum_v3",
         "x4_v1",
+        # 2026-10-05：firsthit 前向深析退役（G7 全系/K10 两版/过程恢复）。
+        # late_night_v1 / hm_touch×2 是纯影子版本，本就无实盘通道（只在
+        # shadow_version_gate.RETIRED_VERSIONS 退役）。
+        "firsthit_down_g7_v1", "g7_streak_v1", "g7_wick20_v1",
+        "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",
+        "firsthit_down_k10_v1", "firsthit_down_k10_profit_v1",
+        "process_recovery_down_v1",
     }
     assert not (set(LIVE_CHANNELS) & set(RETIRED_CHANNELS))
     by = {**RETIRED_CHANNEL_SPECS, **LIVE_CHANNELS}
@@ -1962,38 +1966,22 @@ async def test_absorption_stale_judge_window_skipped(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_process_recovery_default_off_and_live_confirmation(monkeypatch):
+    """process_recovery 2026-10-05 已退役：不在 LIVE_CHANNELS/配置，喂价不触发；
+    提取器逻辑（确认价边界/180s 拒单）由 test_process_recovery.py 单元级覆盖。"""
     ch = "process_recovery_down_v1"
-    assert parse_channel_config()[ch].enabled is False
+    from binance_predict.services.live_channels import LIVE_CHANNELS, RETIRED_CHANNELS
+    assert ch not in LIVE_CHANNELS and ch in RETIRED_CHANNELS
+    assert ch not in parse_channel_config()
     fake = _FakeTrader()
-    t = _make_trader(monkeypatch, fake, channels=[ch])
+    t = _make_trader(monkeypatch, fake)          # 全通道装配（不含退役通道）
     down = [{"t": WINDOW_START + ms, "v": q} for ms, q in [(0, .1), (30_000, .2), (120_000, .25)]]
     btc = [{"t": WINDOW_START + ms, "v": v} for ms, v in [(0, 100.), (30_000, 101.), (120_000, 100.5)]]
     monkeypatch.setattr(milt.time, "time", lambda: (WINDOW_START + 121_000) / 1000)
-    args = dict(down_price=.25, window_entry_price=100., window_down_curve=down, window_btc_curve=btc)
-    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 120_000, **args) == [ch]
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 120_000,
+                   down_price=.25, window_entry_price=100.,
+                   window_down_curve=down, window_btc_curve=btc) == []
     await _drain(t)
-    assert len(fake.calls) == 1
-    assert fake.calls[0]["prediction"] == "DOWN"
-    assert fake.calls[0]["max_exec_price"] == .35
-    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 135_000, **args) == []
-
-    # 确认价低于/贴0.15拒绝；越过下界放行，低价母事件仍允许。
-    for q, expected in [(.149999, []), (.15, []), (.150001, [ch])]:
-        low = _make_trader(monkeypatch, _FakeTrader(), channels=[ch])
-        low_down = [{"t": WINDOW_START + ms, "v": v} for ms, v in [(0, .5), (30_000, .12), (120_000, q)]]
-        assert low.check(WINDOW_START, WINDOW_END, WINDOW_START + 120_000,
-                         down_price=q, window_entry_price=100.,
-                         window_down_curve=low_down, window_btc_curve=btc) == expected
-        await _drain(low)
-
-    # 旧确认点不可在重启/迟到后追单；实际执行进入180秒亦拒绝。
-    fake2 = _FakeTrader()
-    t2 = _make_trader(monkeypatch, fake2, channels=[ch])
-    assert t2.check(WINDOW_START, WINDOW_END, WINDOW_START + 135_000, **args) == []
-    monkeypatch.setattr(milt.time, "time", lambda: (WINDOW_START + 180_000) / 1000)
-    t2.check(WINDOW_START, WINDOW_END, WINDOW_START + 120_000, **args)
-    await _drain(t2)
-    assert fake2.calls == []
+    assert fake.calls == []
 
 
 @pytest.mark.asyncio
@@ -2117,44 +2105,100 @@ async def test_firsthit_g1_g3_gate_rejects_high_chg_or_large_body(monkeypatch) -
 @pytest.mark.asyncio
 async def test_firsthit_three_channels_independent_fill(monkeypatch) -> None:
     """2026-09-12 解除 firsthit 同窗互斥后：三门全中时各通道按各自门禁独立下单。
-    
-    三门全中需要：chg≤+2.82bp（G3）、body_r≤0.35（G1）、npts≥8（路径质量）。
-    body_r<1 要求 btc_curve 有波动（中间有比 bo 更低或比 btc_trig 更高的点）。"""
+
+    2026-10-05 起 G3 加利润带门（触发 180~240s × q≥0.07，仅实盘通道）：
+    - 首触 120s：G0/G1 独立下单，G3 被带门拦截（本测试原场景，保留为带门负例）
+    - 首触 195s（trigger_idx=13）：三门全中且带内 → 三通道各自下单
+    - 首触 245s（trigger_idx≈16）：G3 越带上界（≥240s）被拦
+    三门全中需要：chg≤+2.82bp（G3）、body_r≤0.35（G1）、npts≥8（路径质量）。"""
+    def _btc_curve_with_trigger(trigger_idx: int) -> list[dict]:
+        """冲高→下跌→反弹曲线；i=trigger_idx 处 v=100.02（chg=+2bp、上影 4bp）。"""
+        pts = [{"t": WINDOW_START, "v": 100.0}]
+        for i in range(1, 20):
+            ts = WINDOW_START + i * 15_000
+            if i <= 2:
+                v = 100.0 + i * 0.03
+            elif i <= trigger_idx - 1:
+                lo = 99.90
+                v = 100.06 - (i - 2) * ((100.06 - lo) / max(1, trigger_idx - 3))
+            elif i == trigger_idx:
+                v = 100.02
+            else:
+                v = 100.02 + (i - trigger_idx) * 0.01
+            pts.append({"t": ts, "v": v})
+        return pts
+
+    # ---- 场景 1：首触 120s（带外）→ G3 被利润带门拦，仅 G0/G1 下单 ----
     fake = _FakeTrader()
     t = _make_trader(monkeypatch, fake,
                      channels=["firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1"],
                      overrides={"firsthit_down_body_v1": {"enabled": True, "max_exec_price": 0.12},
                                 "firsthit_down_chg_v1": {"enabled": True, "max_exec_price": 0.09}})
-    # chg=+2bp、body_r≈0.125 → 三门全中（i=8 触发点 v=100.02）
     dn_p = _firsthit_down_curve(trigger_q=0.07, npts=20, trigger_idx=8)
-    # btc_curve：冲高→下跌→反弹，让 body_r<0.35、chg≤2.82bp 且上影≥0.5bp（盘前 veto 要求）
-    btc_p = [{"t": WINDOW_START, "v": 100.0}]
-    for i in range(1, 20):
-        ts = WINDOW_START + i * 15_000
-        if i <= 2:
-            v = 100.0 + i * 0.03          # 冲高 100.0→100.06（留 4bp 上影）
-        elif i <= 7:
-            v = 100.06 - (i - 2) * 0.032  # 回落 100.06→99.90 (i=7 最低)
-        elif i == 8:
-            v = 100.02                    # i=8 触发点：chg=+2bp，上影=(100.06-100.02)=4bp
-        else:
-            v = 100.02 + (i - 8) * 0.01   # 反弹后继续上行
-        btc_p.append({"t": ts, "v": v})
-    REL_T_SEC = 120
-    fired = t.check(WINDOW_START, WINDOW_END, WINDOW_START + REL_T_SEC * 1000,
+    btc_p = _btc_curve_with_trigger(8)
+    fired = t.check(WINDOW_START, WINDOW_END, WINDOW_START + 120_000,
                     down_price=0.5, btc_price=100.02,
                     window_entry_price=100.0,
                     window_btc_curve=btc_p, window_down_curve=dn_p)
-    # per-channel fired 防重复；三通道各自 open
+    # fired=同步层派生任务（G3 版本门过、带门在异步任务内裁决）→ 三通道都在；
+    # 实际下单（fake.calls）由带门拦掉 G3。
     assert set(fired) == {"firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1"}
     await _drain(t)
-    # 解除互斥后，三通道各自独立下单，总共 3 笔成交
-    assert len(fake.calls) == 3
     assert {c["signal_version"] for c in fake.calls} == {
-        "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1"
-    }
-    # 2026-09-11: 新动态护拦=触发价×1.03（q=0.07 → 0.0721），替代旧绝对阈值 0.08
+        "firsthit_down_v1", "firsthit_down_body_v1"
+    }, "首触 120s 不在 G3 利润带（180~240s），不得下单"
+    # 2026-09-11: 动态护拦=触发价×1.03（q=0.07 → 0.0721）
     assert abs(fake.calls[0]["max_exec_price"] - 0.0721) < 1e-4
+
+    # ---- 场景 2：首触 195s（带内）→ 三通道各自下单 ----
+    fake2 = _FakeTrader()
+    t2 = _make_trader(monkeypatch, fake2,
+                      channels=["firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1"],
+                      overrides={"firsthit_down_body_v1": {"enabled": True, "max_exec_price": 0.12},
+                                 "firsthit_down_chg_v1": {"enabled": True, "max_exec_price": 0.09}})
+    dn2 = _firsthit_down_curve(trigger_q=0.07, npts=20, trigger_idx=13)   # t=195s
+    btc2 = _btc_curve_with_trigger(13)
+    monkeypatch.setattr(milt.time, "time", lambda: (WINDOW_START + 196_000) / 1000)
+    fired2 = t2.check(WINDOW_START, WINDOW_END, WINDOW_START + 195_000,
+                      down_price=0.07, btc_price=100.02,
+                      window_entry_price=100.0,
+                      window_btc_curve=btc2, window_down_curve=dn2)
+    await _drain(t2)
+    assert {c["signal_version"] for c in fake2.calls} == {
+        "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1"
+    }, "首触 195s 在 G3 利润带内，三门全中各自下单"
+
+    # ---- 场景 3：首触 240s（越带上界）→ G3 被拦 ----
+    fake3 = _FakeTrader()
+    t3 = _make_trader(monkeypatch, fake3,
+                      channels=["firsthit_down_v1", "firsthit_down_chg_v1"],
+                      overrides={"firsthit_down_chg_v1": {"enabled": True, "max_exec_price": 0.09}})
+    dn3 = _firsthit_down_curve(trigger_q=0.07, npts=20, trigger_idx=16)   # t=240s
+    btc3 = _btc_curve_with_trigger(16)
+    monkeypatch.setattr(milt.time, "time", lambda: (WINDOW_START + 241_000) / 1000)
+    fired3 = t3.check(WINDOW_START, WINDOW_END, WINDOW_START + 240_000,
+                      down_price=0.07, btc_price=100.02,
+                      window_entry_price=100.0,
+                      window_btc_curve=btc3, window_down_curve=dn3)
+    await _drain(t3)
+    assert {c["signal_version"] for c in fake3.calls} == {"firsthit_down_v1"}, \
+        "首触 240s 越上界，G3 不得下单"
+
+    # ---- 场景 4：首触 195s 在带内，但下单时刻剩余 <80s（模拟 I/O 排队到 225s+）
+    #      → 剩余时间硬门拦截（限价逆向选择修复：末段反转概率断崖）----
+    fake4 = _FakeTrader()
+    t4 = _make_trader(monkeypatch, fake4,
+                      channels=["firsthit_down_chg_v1"],
+                      overrides={"firsthit_down_chg_v1": {"enabled": True, "max_exec_price": 0.09}})
+    dn4 = _firsthit_down_curve(trigger_q=0.07, npts=20, trigger_idx=13)   # t=195s 带内
+    btc4 = _btc_curve_with_trigger(13)
+    monkeypatch.setattr(milt.time, "time", lambda: (WINDOW_START + 225_000) / 1000)  # 剩余 75s<80s
+    t4.check(WINDOW_START, WINDOW_END, WINDOW_START + 195_000,
+             down_price=0.07, btc_price=100.02,
+             window_entry_price=100.0,
+             window_btc_curve=btc4, window_down_curve=dn4)
+    await _drain(t4)
+    assert fake4.calls == [], "带内触发但下单时刻剩余<80s，G3 剩余门拦截"
 
 
 @pytest.mark.asyncio
@@ -2332,7 +2376,10 @@ async def test_firsthit_does_not_look_ahead_past_current_sample(monkeypatch) -> 
 
 @pytest.mark.asyncio
 async def test_firsthit_g7_series_all_fire(monkeypatch) -> None:
-    """G7 纯组合基底及 5 个变体在满足条件时均能正确开火，独立下单，参数符合护栏。"""
+    """G7 系机制回归（fixture 模式）：退役 spec 经 _with_retired 注回注册表后，
+    纯组合基底及 5 个变体在满足条件时均能正确派生——机制代码（streak 异步核验/
+    版本门/独立下单）仍被未退役通道共用，必须持续覆盖。生产退役状态由
+    test_channels_registry_shape 断言（G7 ⊂ RETIRED_CHANNELS）。"""
     fake = _FakeTrader()
     g7_channels = [
         "firsthit_down_g7_v1", "g7_streak_v1", "g7_wick20_v1",
@@ -2893,11 +2940,11 @@ async def test_live_performance_summary_duplicate_window_and_period_keys(monkeyp
     from binance_predict.services.live_performance import LiveOrder
 
     rows = [
-        LiveOrder(id=1, channel="firsthit_down_g7_v1", market_period="5m",
+        LiveOrder(id=1, channel="firsthit_down_body_v1", market_period="5m",
                   window_start=1000, direction="DOWN", settle_outcome="DOWN", win=True,
                   pnl=3, amount_in=str(2 * 10**18), assessment_id=11,
                   quote_json={"amountIn": str(2 * 10**18), "filledShareQty": 4}),
-        LiveOrder(id=2, channel="g7_streak_v1", market_period="5m",
+        LiveOrder(id=2, channel="firsthit_down_v1", market_period="5m",
                   window_start=1000, direction="DOWN", settle_outcome="DOWN", win=False,
                   pnl=-3, amount_in=str(3 * 10**18)),
         LiveOrder(id=3, channel="s2_cond_t4_v1", market_period="15m",
@@ -2923,8 +2970,8 @@ async def test_live_performance_summary_duplicate_window_and_period_keys(monkeyp
         "realized_outcome_minus_break_even_probability"
     )
     by_channel = {row["channel"]: row for row in out["channels"]}
-    assert by_channel["firsthit_down_g7_v1"]["latest"]["rolling20"]["n"] == 1
-    assert by_channel["firsthit_down_g7_v1"]["benchmark"]["win_rate"] == 0.192
+    assert by_channel["firsthit_down_body_v1"]["latest"]["rolling20"]["n"] == 1
+    assert by_channel["firsthit_down_body_v1"]["benchmark"]["win_rate"] == 0.153
 
 
 @pytest.mark.asyncio
@@ -5240,14 +5287,7 @@ def test_limit_order_channels_marked_in_registry() -> None:
     expected_limit_channels = [
         "firsthit_down_v1",
         "firsthit_down_body_v1",
-        "firsthit_down_chg_v1",
         "firsthit_down_g4_v1",
-        "firsthit_down_g7_v1",
-        "g7_streak_v1",
-        "g7_wick20_v1",
-        "g7_strict_v1",
-        "g7_q05_v1",
-        "g7_t270_v1",
         "quote_contrarian_v2",
         "late_night_contrarian_v2",
         "s2_cond_t4_v1",
@@ -5273,6 +5313,9 @@ def test_limit_order_channels_marked_in_registry() -> None:
         "hm_inside_5m_v2",
         "hm_inside_15m_v2",
         "ih_inside_15m_v2",
+        # 2026-10-05：G3 利润带改造 LIMIT→MARKET（限价成交条件=价格继续恶化，
+        # 曾把实盘样本逆向选择到晚段深价；G7/K10 系通道已退役移出清单）
+        "firsthit_down_chg_v1",
     ]
     for ch in expected_market_channels:
         spec = LIVE_CHANNELS.get(ch)

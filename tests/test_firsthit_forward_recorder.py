@@ -111,7 +111,28 @@ def test_post_features_use_first_sample_at_or_after_horizon():
     assert future["60"]["q"] == pytest.approx(0.24)
     assert future["120"] is None
     assert post["rebound"] is True
-    assert retrospective["source"] == "sampled_btc_path"
+    assert retrospective["source"] == "btc_prefix_le_trigger"
+
+
+def test_retrospective_is_ex_ante_and_ignores_settlement_price():
+    """2026-10-05 look-ahead 修复：body_ratio 只用 ≤trigger_ts 的 BTC 前缀与触发时刻价，
+    结算价（旧实现误作 close）与触发后路径不得影响 retrospective。"""
+    btc = _curve([100.0, 101.0, 100.5, 90.0, 80.0])   # 后三点=触发后（100.5 在 t=30s）
+    snapshot = extract_forward_trigger(
+        side="DOWN", window_start=START, window_end=START + 300_000,
+        btc_open=100.0, up_curve=_curve([0.4, 0.9]), down_curve=_curve([0.6, 0.08]),
+        btc_curve=btc,
+    )
+    assert snapshot is not None and snapshot["trigger_ts"] == START + 15_000
+    _, _, retro_trigger = _post_features(snapshot, None, None, btc, 100.5)
+    assert retro_trigger["source"] == "btc_prefix_le_trigger"
+    # 前缀 = [100.0, 101.0]（触发后 100.5/90/80 全部排除）+ bo：
+    # hi=101.0, lo=100.0, span=1.0, close=100.5 → body=0.5, major_wick=0.5。
+    # 旧口径 hi/lo 用全窗曲线会把 80/90 拉进区间（body=|100.5-100|/21）。
+    assert retro_trigger["body_ratio"] == pytest.approx(0.5)
+    assert retro_trigger["major_wick_ratio"] == pytest.approx(0.5)
+    _, _, retro_none = _post_features(snapshot, None, None, btc, None)
+    assert retro_none["long_wick"] is None, "close 缺失 → 无特征（fail-safe）"
 
 
 class _ExecuteSession:

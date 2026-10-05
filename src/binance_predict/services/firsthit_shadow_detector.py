@@ -76,10 +76,16 @@ FIRSTHIT_SPECS: list[tuple[str, str]] = [
     ("g7_strict_v1", "G7严格版 streak_up≤1∧upper_wick≥1.5bp"),
     ("g7_q05_v1", "G7+深折价 q≤0.05"),
     ("g7_t270_v1", "G7+非极晚 t≤270s"),
+    # 报价错杀版（2026-10-05 注册）：G3 门 ∩ 浅价 q≥0.07 ∩ 触发前 60 采样点
+    # BTC 未上行（btc_speed_60_bps≥0，DOWN 侧有向口径）——DOWN 报价被砸浅但
+    # BTC 侧无涨势 = 报价错杀而非信息驱动。来源：forward 母事件 ex-ante 扫描
+    # 87 笔 18.4%/EV+1.02（剔 Top5 赢单后 +0.33）；多重比较未校正，仅影子前向裁决。
+    ("firsthit_down_btcsoft_v1", "G3门∧浅价q≥0.07∧触发前60点BTC未上行"),
 ]
 Q_LO, Q_HI = 0.005, 0.1      # 首触报价区间 (0.005, 0.1]
 BODY_R_GATE = 0.35           # G1 门：路径归一实体 ≤ 0.35
 CHG_BPS_GATE = 2.82          # G3 门：BTC 相对开盘涨幅 ≤ +2.82 bp
+BTCSOFT_Q_MIN = 0.07         # 报价错杀门：浅价下界（0.07 ≤ q ≤ 0.1）
 MIN_PTS = 8                  # 路径质量门：触发前 btc 采样点数 ≥ 8（v2 主分析口径）
 K10_VERSIONS = frozenset({"firsthit_down_k10_v1", "firsthit_down_k10_profit_v1", K10_EARLY})
 K10_Z_MAX = 1.8556725686410152
@@ -205,10 +211,29 @@ def extract_firsthit_features(
     else:
         body_r, wick01, upper_wick_bps, rng_bps = 0.0, 0.0, 0.0, 0.0
 
+    # btc_speed_60_bps（firsthit_forward_recorder 同口径）：DOWN 侧有向化
+    # signed = -(v/bo−1)×1e4（BTC 跌为正）；端点取 ≤trigger_ts 与 ≤trigger_ts−60s
+    # 的最后采样，速度 = signed 端点差 / 端点秒差。严格 ex-ante（只用 ≤trigger_ts
+    # 前缀），60s 前无采样或两端同点 → None（门不放行，宁缺毋假）。
+    btc_speed_60_bps = None
+    spd_pts = [p for p in pre_points if int(p["t"]) <= trigger_ts]
+    if len(spd_pts) >= 2:
+        end_p = spd_pts[-1]
+        start_p = next(
+            (p for p in reversed(spd_pts) if int(p["t"]) <= trigger_ts - 60_000), None)
+        if start_p is not None and int(start_p["t"]) < int(end_p["t"]):
+            signed_end = -(float(end_p["v"]) / bo - 1.0) * 1e4
+            signed_start = -(float(start_p["v"]) / bo - 1.0) * 1e4
+            btc_speed_60_bps = (
+                (signed_end - signed_start)
+                / ((int(end_p["t"]) - int(start_p["t"])) / 1000.0)
+            )
+
     return dict(
         q=q, trigger_ts=trigger_ts, td_sec=int((trigger_ts - start) / 1000),
         chg_bps=chg_bps, body_r=body_r, wick01=wick01, upper_wick_bps=upper_wick_bps,
         rng_bps=rng_bps, npts=npts, dvol=None, dpar=None,
+        btc_speed_60_bps=btc_speed_60_bps,
     )
 
 
@@ -348,6 +373,15 @@ def _gate_of(
         return ext["body_r"] is not None and ext["body_r"] <= BODY_R_GATE
     if version == "firsthit_down_chg_v1":
         return ext["chg_bps"] is not None and ext["chg_bps"] <= CHG_BPS_GATE
+    if version == "firsthit_down_btcsoft_v1":
+        # 报价错杀版：G3 门 ∩ 浅价 ∩ 触发前 60 采样点 BTC 未上行。
+        # btc_speed_60_bps 缺失（60s 前无采样）一律不放行——宁缺毋假。
+        return (
+            ext.get("chg_bps") is not None and ext["chg_bps"] <= CHG_BPS_GATE
+            and ext.get("q") is not None and ext["q"] >= BTCSOFT_Q_MIN
+            and ext.get("btc_speed_60_bps") is not None
+            and ext["btc_speed_60_bps"] >= 0.0
+        )
     if version in K10_VERSIONS:
         if ext.get("chg_bps") is None or ext["chg_bps"] > CHG_BPS_GATE or k10 is None:
             return False

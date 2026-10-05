@@ -165,7 +165,7 @@ def test_explicit_exclusive_group_conflict_and_benchmark_registry():
     assert get_channel_benchmark("s1_dyn_sq_v1").win_rate == 0.6493
     assert get_channel_benchmark("s1_dyn_sq_v1").sample_size == 1782
     assert get_channel_benchmark("x4_v2").win_rate == 0.553
-    assert get_channel_benchmark("firsthit_down_g7_v1").win_rate == 0.192
+    assert get_channel_benchmark("firsthit_down_body_v1").win_rate == 0.153
     assert get_channel_benchmark("krev_a_v1").win_rate == 0.642
     assert get_channel_benchmark("krev_b_v1").sample_size == 134
     assert get_channel_benchmark("rev_p1_v1").win_rate == 0.620

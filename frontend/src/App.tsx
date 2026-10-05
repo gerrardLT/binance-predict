@@ -1126,6 +1126,10 @@ const SIGNAL_INFO: Record<string, { name: string; desc: string; retired?: boolea
     name: '首触G7+非极晚（押DOWN）',
     desc: 'G7 组合 + 触发时刻 t≤270s（保留均值回归扩散时间窗口）。回测胜率 27.9%~30.4%，EV +3.08~+4.41。默认关闭，执行价护栏 0.10，每通道每窗至多一单。',
   },
+  firsthit_down_btcsoft_v1: {
+    name: '首触报价错杀（押DOWN）',
+    desc: '【仅记录，不实盘】G3 门（chg≤+2.82bp）∩ 浅价 q≥0.07 ∩ 触发前 60 采样点 BTC 未上行（btc_speed_60_bps≥0，DOWN 侧有向口径）——DOWN 报价被砸浅但 BTC 侧无涨势，判定为报价错杀而非信息驱动。来源：2026-10-05 forward 母事件 ex-ante 扫描（09-17~10-04 G3 门内 2144 笔）87 笔胜率 18.4%/EV+1.02、剔 Top5 赢单后 +0.33，为约 30 个扫描格子中唯一稳健候选；多重比较未校正，基准当先验不当结论，影子前向 ≥4 周裁决。',
+  },
   late_night_contrarian_v2: {
     name: '深夜逆势·日高回落门禁版（押 DOWN）',
     desc: 'quote_edge 族深夜变体 v2：t∈[45,90)s 且报价 q∈[0.25,0.30) ∩ 北京时间窗 (22~24 时) ∩ 触发时点距当日高点回落≥0.30%。OOS n=50 wr 44.0% CI[31.2%,57.7%] vs 盈亏平衡≈27%；门禁数据缺失→不落表（保守跳过，v1 不受影响）。护栏 0.33（区间上界 0.30+0.03 容忍），开启后每通道每窗至多一单。⚠️纪律推翻：原 docstring"纯影子前向攒样本"被用户拍板改为实盘注册（线上已开启下单）。',
@@ -6258,6 +6262,7 @@ const SHADOW_META: Record<string, { label: string; color: string }> = {
   g7_strict_v1: { label: '首触G7 严格版 streak≤1∧wick≥1.5bp→DOWN', color: 'var(--chart-9)' },
   g7_q05_v1: { label: '首触G7 深折价 q≤0.05→DOWN', color: 'var(--chart-10)' },
   g7_t270_v1: { label: '首触G7 非极晚 t≤270s→DOWN', color: 'var(--chart-1)' },
+  firsthit_down_btcsoft_v1: { label: '首触报价错杀 浅价∧BTC未上行→DOWN', color: 'var(--chart-2)' },
   // 2026-09-09 / 2026-09-13 Rev2 经典孕线反转族（共表 kline_shadow_signals，影子+实盘通道）
   hm_inside_15m_v2: { label: '15m 孕线上吊线 Inside Bar→DOWN', color: 'var(--chart-2)' },
   ih_inside_15m_v2: { label: '15m 孕线倒垂线 Inside Bar→UP', color: 'var(--chart-3)' },

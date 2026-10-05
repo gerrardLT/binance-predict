@@ -266,23 +266,31 @@ def _post_features(snapshot: dict, up_curve: list | None, down_curve: list | Non
         "retest": retest_ts is not None,
     }
 
+    # retrospective（2026-10-05 修复 look-ahead）：仅用 ≤trigger_ts 的 BTC 前缀，
+    # close 取触发时刻价（snapshot["btc_trigger"]）。旧实现把 window.exit_price
+    # （结算价）当 close、hi/lo 用全窗曲线——body_ratio 编码了「结算距开盘多远」，
+    # 与 win 机械相关（body<0.2 假胜率 45.5%），绝不可用于门设计。
     bo = snapshot.get("btc_open")
-    btc_values = [point["v"] for point in btc]
-    close = float(btc_close) if btc_close is not None else (btc_values[-1] if btc_values else None)
-    if bo and close is not None and btc_values:
-        hi, lo = max([bo, *btc_values]), min([bo, *btc_values])
+    btc_prefix = [
+        point for point in (btc or [])
+        if int(point["t"]) <= int(trigger_ts)
+    ]
+    close = float(btc_close) if btc_close is not None else None
+    if bo and close is not None and btc_prefix:
+        vals = [float(point["v"]) for point in btc_prefix]
+        hi, lo = max([bo, *vals]), min([bo, *vals])
         span = hi - lo
         body_ratio = abs(close - bo) / span if span > 0 else 0.0
         major_wick = (min(bo, close) - lo) if side == "UP" else (hi - max(bo, close))
         wick_ratio = major_wick / span if span > 0 else 0.0
         retrospective = {
-            "source": "sampled_btc_path",
+            "source": "btc_prefix_le_trigger",
             "body_ratio": body_ratio,
             "major_wick_ratio": wick_ratio,
             "long_wick": wick_ratio >= 0.5 and body_ratio <= 0.5,
         }
     else:
-        retrospective = {"source": "sampled_btc_path", "long_wick": None}
+        retrospective = {"source": "btc_prefix_le_trigger", "long_wick": None}
     return future, post, retrospective
 
 
@@ -557,7 +565,7 @@ class FirstHitForwardRecorder:
                 continue
             future, post, retrospective = _post_features(
                 snapshot, window.curve_up_price, window.curve_down_price,
-                window.curve_btc_price, window.exit_price,
+                window.curve_btc_price, snapshot.get("btc_trigger"),
             )
             async with async_session_factory() as session:
                 # 单语句 upsert 关闭实时触达任务与归档轮询的竞态：实时行存在则

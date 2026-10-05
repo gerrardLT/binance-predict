@@ -141,6 +141,27 @@ FIRSTHIT_PRE_MARKET_UPPER_WICK_BPS_MIN = 0.5  # upper_wick_bps < 此值跳过（
 FIRSTHIT_DYNAMIC_GUARD_CLAMP_LO = 0.05        # 动态护栏下限 clamp（低于触发区无意义）
 FIRSTHIT_SLIPPAGE_TOL_RATIO = 1.03            # 2026-09-11 新增：下单护拦=触发价×1.03（3% 容忍度），替代绝对阈值防逆选择
 
+# G3 利润带执行门（2026-10-05 改造）：forward 母事件 2144 笔分桶定位的唯一稳健
+# 正 EV 区——触发 180~240s × 浅价 q≥0.07（427 笔 10.5%/EV+0.155，剔 Top5 +0.01；
+# 240s+ 触发段 6.1%/EV−0.08，280s+ 彻底死）。三件套之二：带门（本常量区）与
+# 下单时刻剩余门（_fire_firsthit）；三件套之一 LIMIT→MARKET 在 live_channels。
+# 仅约束实盘通道；G3 影子版本继续全样本采集。
+G3_LIVE_CHANNEL = "firsthit_down_chg_v1"
+G3_LIVE_TD_BAND_S = (180.0, 240.0)            # 触发时刻带（距窗开秒，含下界不含上界）
+G3_LIVE_Q_MIN = 0.07                          # 浅价下界（触发报价）
+G3_LIVE_MIN_REMAIN_S = 80.0                   # 下单时刻距窗末剩余硬门（限价逆向选择修复）
+
+
+def _g3_live_band_veto(ext: dict) -> str | None:
+    """G3 实盘利润带门：触发时刻/价格不在带内 → 拦截（仅实盘通道，影子不受限）。"""
+    td = ext.get("td_sec")
+    q = ext.get("q")
+    if td is None or not (G3_LIVE_TD_BAND_S[0] <= float(td) < G3_LIVE_TD_BAND_S[1]):
+        return f"触发时刻{td}s不在利润带{G3_LIVE_TD_BAND_S}"
+    if q is None or float(q) < G3_LIVE_Q_MIN:
+        return f"触发价{q}低于浅价下界{G3_LIVE_Q_MIN}"
+    return None
+
 
 def _firsthit_pre_market_veto(ext: dict, streak_up: int | None) -> str | None:
     """首触盘前过滤器 veto 检查（ex-ante，仅用窗口内已知特征）。
@@ -1624,6 +1645,15 @@ class MultiLiveTrader:
                     return
                 dyn_guard = resolve_max_exec(spec, cfg)
             else:
+                if channel == G3_LIVE_CHANNEL:
+                    # 利润带门三件套之三：下单时刻距窗末剩余 ≥80s 硬门（I/O 等待后
+                    # 复核实际墙钟）。末段反转概率断崖（240s+ 触发胜率 6.1%、
+                    # 280s+ EV −0.256），且 G3 历史实盘 83% 成交单堆积在此区间。
+                    if time.time() * 1000 > window_start + 300_000 - G3_LIVE_MIN_REMAIN_S * 1000:
+                        logger.info(
+                            "多通道实盘：{} 下单时刻剩余<{:.0f}s，弃单 | 窗口 {}",
+                            channel, G3_LIVE_MIN_REMAIN_S, win_label)
+                        return
                 dyn_guard = _resolve_firsthit_dynamic_guard(spec, cfg, ext, streak_up)
             logger.info(
                 "多通道实盘开火 | {} | 首触反转押 DOWN | 窗口 {} | t=+{}s q={:.4f}"
@@ -1700,6 +1730,15 @@ class MultiLiveTrader:
                 logger.info("多通道实盘：{} 版本门未过(streak={})，弃单 | 窗口 {}",
                             channel, streak_up, win_label)
                 return
+            if channel == G3_LIVE_CHANNEL:
+                # 利润带门（2026-10-05）：版本门通过后限定触发 180~240s × 浅价，
+                # 影子版本不受限。未过不占 fired——但本函数派生前同步层已对
+                # 非互斥通道占位，此处 return 即本窗该通道结束。
+                band_veto = _g3_live_band_veto(ext)
+                if band_veto is not None:
+                    logger.info("多通道实盘：{} 利润带门拦截，弃单 | 窗口 {} | {}",
+                                channel, win_label, band_veto)
+                    return
             if k10 is not None:
                 ext = {**ext, "k10": k10}
             # 旧通道门全部通过后占位；K10在派生异步K线任务前已占位防重复。

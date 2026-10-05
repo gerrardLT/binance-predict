@@ -253,10 +253,8 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
         "firsthit_down_k10_early180_v1", "firsthit_early", "5m", "DOWN", 0.10,
         "首触K10前3分钟研究版（押DOWN）", order_type="LIMIT",
     ),
-    "process_recovery_down_v1": ChannelSpec(
-        "process_recovery_down_v1", "process_recovery", "5m", "DOWN", 0.35,
-        "过程恢复双确认（押DOWN）",
-    ),
+    # 2026-10-05：process_recovery_down_v1 移入 RETIRED_CHANNEL_SPECS（前向深析
+    # 剔 Top5 赢单后 EV −0.38，无修复价值）。
     "firsthit_down_v1": ChannelSpec(
         "firsthit_down_v1", "firsthit", "5m", "DOWN", 0.08,
         "首触G0基底 q∈(0.005,0.1]（押DOWN）", order_type="LIMIT",
@@ -265,21 +263,20 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
         "firsthit_down_body_v1", "firsthit", "5m", "DOWN", 0.15,
         "首触G1小实体 body_r≤0.35（押DOWN）", order_type="LIMIT",
     ),
+    # G3（2026-10-05 利润带改造）：实盘执行限定在唯一稳健为正的利润带——触发
+    # 180~240s × 浅价 q≥0.07（forward 母体 427 笔 10.5%/EV+0.155，剔 Top5 +0.01；
+    # 200-220s 桶最肥 +0.531），叠加下单时刻剩余 ≥80s 硬门与 LIMIT→MARKET
+    # （限价单成交条件=价格继续恶化，曾把实盘样本系统性逆向选择到 240s+ 深价
+    # 低胜率段：20 单 83% 晚触全输）。带门在 multi_live_trader 执行层实施，
+    # 影子版本仍全样本采集（研究资产）。护栏 0.09 语义随 MARKET 变为弃单线，
+    # 动态护栏（q×1.03）继续生效。
     "firsthit_down_chg_v1": ChannelSpec(
         "firsthit_down_chg_v1", "firsthit", "5m", "DOWN", 0.09,
-        "首触G3偏离 chg≤+2.82bp（押DOWN）", order_type="LIMIT",
+        "首触G3偏离·利润带版 触发180-240s∧q≥0.07（押DOWN）",
     ),
-    # K10 族：G3 + 前12根完整5m波动归一的剩余结算距离；盈利版无条件剔除
-    # 最后60秒首触，并在更早首触中剔除「前序平方收益扩张 + 长上影」。影子默认采集，
-    # 实盘配置默认 OFF；用户明确两个版本同窗独立下注，不加入互斥组。
-    "firsthit_down_k10_v1": ChannelSpec(
-        "firsthit_down_k10_v1", "firsthit", "5m", "DOWN", 0.10,
-        "首触K10标准化结算距离（押DOWN）", order_type="LIMIT",
-    ),
-    "firsthit_down_k10_profit_v1": ChannelSpec(
-        "firsthit_down_k10_profit_v1", "firsthit", "5m", "DOWN", 0.10,
-        "首触K10盈利过滤版（押DOWN）", order_type="LIMIT",
-    ),
+    # 2026-10-05：K10 两版移入 RETIRED_CHANNEL_SPECS——影子本身负 EV
+    # （−0.44/−0.42，剔 Top5 后 −0.95），信号已死非执行问题；盈利版的末 60s
+    # veto 在实盘路径曾整体失效（17 单全部距窗末<60s 成交），一并退役。
     # G4 交互门（2026-09-08 影子+实盘接入）：G4 = G1 ∩ G3（chg≤2.82 ∧ body≤0.35）
     # 依据 shape_scan_v2 冻结扫描：calib n=214 P=12.6% EV+1.03 CI[+0.08,+2.22]；
     # confirm n=86 P=23.3% EV+1.85 CI[+0.35,+3.44]；binom p=0.025 → BH-FDR q=0.063 ✅ STRICT_PASS。
@@ -297,32 +294,10 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     # G7 族（2026-09-08 影子+实盘接入）：G7 纯组合基底及 5 个科学变体
     # 护栏设置依据：回测中均值触发价约 0.068~0.075，盈亏平衡平衡价 wr*0.98（胜率 18%~24% 对应 0.17~0.23）；
     # 取值保持极度保守（只吃深折价优质单）：基底 0.10；streak 0.10；wick20 0.12；strict 0.12；q05 0.05；t270 0.10。
-    # ⚠️ 研究账本 Phase 0（2026-09-08）政策替换 ΔV：G7 vs G1 ≈0、g7strict vs g7streak −0.055
-    #   （显著负）——用户知情后仍拍板维持实盘（线上已开启下单），前向验证裁决。
-    "firsthit_down_g7_v1": ChannelSpec(
-        "firsthit_down_g7_v1", "firsthit", "5m", "DOWN", 0.10,
-        "首触G7基底 body_r≤0.35∧wick=1（押DOWN）", order_type="LIMIT",
-    ),
-    "g7_streak_v1": ChannelSpec(
-        "g7_streak_v1", "firsthit", "5m", "DOWN", 0.10,
-        "首触G7+非强连阳 streak_up≤1（押DOWN）", order_type="LIMIT",
-    ),
-    "g7_wick20_v1": ChannelSpec(
-        "g7_wick20_v1", "firsthit", "5m", "DOWN", 0.12,
-        "首触G7+长上影 upper_wick≥2bp（押DOWN）", order_type="LIMIT",
-    ),
-    "g7_strict_v1": ChannelSpec(
-        "g7_strict_v1", "firsthit", "5m", "DOWN", 0.12,
-        "首触G7严格版 streak≤1∧wick≥1.5bp（押DOWN）", order_type="LIMIT",
-    ),
-    "g7_q05_v1": ChannelSpec(
-        "g7_q05_v1", "firsthit", "5m", "DOWN", 0.05,
-        "首触G7+深折价 q≤0.05（押DOWN）", order_type="LIMIT",
-    ),
-    "g7_t270_v1": ChannelSpec(
-        "g7_t270_v1", "firsthit", "5m", "DOWN", 0.10,
-        "首触G7+非极晚 t≤270s（押DOWN）", order_type="LIMIT",
-    ),
+    # 2026-10-05：G7 全系六通道移入 RETIRED_CHANNEL_SPECS——前向深析剔 Top5
+    # 赢单后 EV 全负（基底 −0.34 ~ strict −0.91），正 EV 是右尾彩票驱动；收紧门
+    # 在利润带内部反向选择（浅价带胜率 G4 25.6% → strict 15.0% 逐级稀释）。
+    # G4 保留观察（前向 CI 半宽大，延长观察期）。
     # --- rev2 族：孕线反转 + 短影精选（2026-09-20 LIMIT→MARKET）：原 GTC 挂 0.30
     # 等回落被动成交——成交价恒等于挂单价（10/10 笔），只吃到市场跌穿 0.30 的逆向
     # 选择单；护栏被热调至 0.20 后 hm_inside_15m_v2 直接 8 天零成交。改为 MARKET：
@@ -441,6 +416,45 @@ RETIRED_CHANNEL_SPECS: dict[str, ChannelSpec] = {
     "quote_contrarian_v4": ChannelSpec(
         "quote_contrarian_v4", "quote_edge", "5m", "DOWN", _qe_guard("quote_contrarian_v1"),
         "报价反向·下跌周期版", regime_gate=True,
+    ),
+    # ---- 2026-10-05 退役（firsthit 前向深析，与 shadow_version_gate.RETIRED_VERSIONS 同步）：
+    # G7 全系六通道（剔 Top5 赢单后 EV −0.34~−0.91，右尾彩票驱动）、K10 两版
+    # （影子本身负 EV）、过程恢复（剔 Top5 后 −0.38）。历史订单与影子数据保留。----
+    "firsthit_down_g7_v1": ChannelSpec(
+        "firsthit_down_g7_v1", "firsthit", "5m", "DOWN", 0.10,
+        "首触G7基底 body_r≤0.35∧wick=1（押DOWN）", order_type="LIMIT",
+    ),
+    "g7_streak_v1": ChannelSpec(
+        "g7_streak_v1", "firsthit", "5m", "DOWN", 0.10,
+        "首触G7+非强连阳 streak_up≤1（押DOWN）", order_type="LIMIT",
+    ),
+    "g7_wick20_v1": ChannelSpec(
+        "g7_wick20_v1", "firsthit", "5m", "DOWN", 0.12,
+        "首触G7+长上影 upper_wick≥2bp（押DOWN）", order_type="LIMIT",
+    ),
+    "g7_strict_v1": ChannelSpec(
+        "g7_strict_v1", "firsthit", "5m", "DOWN", 0.12,
+        "首触G7严格版 streak≤1∧wick≥1.5bp（押DOWN）", order_type="LIMIT",
+    ),
+    "g7_q05_v1": ChannelSpec(
+        "g7_q05_v1", "firsthit", "5m", "DOWN", 0.05,
+        "首触G7+深折价 q≤0.05（押DOWN）", order_type="LIMIT",
+    ),
+    "g7_t270_v1": ChannelSpec(
+        "g7_t270_v1", "firsthit", "5m", "DOWN", 0.10,
+        "首触G7+非极晚 t≤270s（押DOWN）", order_type="LIMIT",
+    ),
+    "firsthit_down_k10_v1": ChannelSpec(
+        "firsthit_down_k10_v1", "firsthit", "5m", "DOWN", 0.10,
+        "首触K10标准化结算距离（押DOWN）", order_type="LIMIT",
+    ),
+    "firsthit_down_k10_profit_v1": ChannelSpec(
+        "firsthit_down_k10_profit_v1", "firsthit", "5m", "DOWN", 0.10,
+        "首触K10盈利过滤版（押DOWN）", order_type="LIMIT",
+    ),
+    "process_recovery_down_v1": ChannelSpec(
+        "process_recovery_down_v1", "process_recovery", "5m", "DOWN", 0.35,
+        "过程恢复双确认（押DOWN）",
     ),
 }
 

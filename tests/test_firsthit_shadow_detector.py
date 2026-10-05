@@ -469,6 +469,8 @@ async def test_process_window_triggers_g1(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_process_window_triggers_k10_versions_with_audit_fields(monkeypatch):
+    """K10 两版 2026-10-05 已退役：同窗即使特征齐备也不得落表（gate 代码级拦截）；
+    未退役的 G0/G3 照常落表。K10 audit 字段的落库路径由 K10_EARLY（未退役）沿用。"""
     class _Collector:
         async def fetch_klines_ending_at(self, interval, limit, end_ms):
             assert (interval, limit, end_ms) == ("5m", 13, START)
@@ -488,18 +490,16 @@ async def test_process_window_triggers_k10_versions_with_audit_fields(monkeypatc
     w = _seed_window(npts=20, trigger_q=0.07, btc_change_pct=0.00005)
     await d._process_window(w)
     by_version = {row.version: row for row in session.added}
-    assert "firsthit_down_k10_v1" in by_version
-    assert "firsthit_down_k10_profit_v1" in by_version
-    row = by_version["firsthit_down_k10_v1"]
-    assert row.k10_z is not None and row.k10_z <= K10_Z_MAX
-    assert row.k10_remaining_seconds == pytest.approx(180.0, abs=0.02)
-    assert row.k10_remaining_sigma_bps > 0
-    assert row.k10_energy_expands is False
-    assert row.k10_upper_wick_ratio is not None
+    assert "firsthit_down_k10_v1" not in by_version, "退役版本不得落库"
+    assert "firsthit_down_k10_profit_v1" not in by_version, "退役版本不得落库"
+    assert "firsthit_down_v1" in by_version, "G0 照常采集"
+    assert "firsthit_down_chg_v1" in by_version, "G3 照常采集"
 
 
 @pytest.mark.asyncio
 async def test_process_recovery_shadow_independent_of_legacy_firsthit(monkeypatch):
+    """process_recovery 2026-10-05 已退役：即使独立提取器命中也不落表；
+    提取器本身的逻辑仍由 test_process_recovery.py 单元覆盖。"""
     session = _FakeSession(first=None)
     monkeypatch.setattr(fhd, "async_session_factory", lambda: _FakeSessionCtx(session))
     w = _seed_window(npts=20, trigger_q=0.07)
@@ -508,9 +508,7 @@ async def test_process_recovery_shadow_independent_of_legacy_firsthit(monkeypatc
     w.entry_price = 100.
     await FirstHitShadowDetector()._process_window(w)
     rows = [r for r in session.added if r.version == "process_recovery_down_v1"]
-    assert len(rows) == 1
-    assert rows[0].entry_down_price == .25
-    assert rows[0].trigger_ts == START + 120_000
+    assert rows == [], "退役版本不得落库"
 
 
 @pytest.mark.asyncio
@@ -585,13 +583,21 @@ async def test_poll_once_advances_watermark(monkeypatch):
 # ============================================================
 
 def test_versions_isolated_from_trading_path():
-    """影子纪律：不进 X4 下单白名单 / 非退役（影子默认在线采集）。"""
+    """影子纪律：不进 X4 下单白名单；spec 中的退役版本必须在 gate 退役名单里
+    （2026-10-05 起 FIRSTHIT_SPECS 保留退役版本供历史审计，落表由 gate 拦截——
+    此断言防「spec 在、gate 忘加」的单侧退役）。"""
     from binance_predict.services.live_channels import LIVE_CHANNELS
     from binance_predict.services.multi_live_trader import X4_VERSIONS
     from binance_predict.services.shadow_version_gate import RETIRED_VERSIONS
     for v, _name in FIRSTHIT_SPECS:
         assert v not in X4_VERSIONS, f"{v} 不得进入 X4 下单白名单"
-        assert v not in RETIRED_VERSIONS, f"{v} 非退役版本（影子应默认在线采集）"
+    retired_in_specs = {v for v, _ in FIRSTHIT_SPECS} & RETIRED_VERSIONS
+    assert retired_in_specs == {
+        "firsthit_down_k10_v1", "firsthit_down_k10_profit_v1",
+        "process_recovery_down_v1",
+        "firsthit_down_g7_v1", "g7_streak_v1", "g7_wick20_v1",
+        "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",
+    }, "退役名单与 spec 集不一致"
 
 
 def test_settings_default_on():
@@ -600,7 +606,8 @@ def test_settings_default_on():
 
 
 def test_specs_self_consistent():
-    """spec 自洽：十 version 合法（G0/G1/G3/G4+6G7）、不超 DB 列宽 String(32)，冻结常数正确。"""
+    """spec 自洽：版本集合（G0/G1/G3/G4+6G7+K10+过程恢复+early+报价错杀）、
+    不超 DB 列宽 String(32)，冻结常数正确。"""
     assert set(v for v, _ in FIRSTHIT_SPECS) == {
         "firsthit_down_v1",
         "firsthit_down_body_v1", "firsthit_down_chg_v1",
@@ -610,6 +617,7 @@ def test_specs_self_consistent():
         "firsthit_down_g4_v1",
         "firsthit_down_g7_v1", "g7_streak_v1", "g7_wick20_v1",
         "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",
+        "firsthit_down_btcsoft_v1",
     }
     for v, name in FIRSTHIT_SPECS:
         assert len(v) <= 32, f"{v} 超出 DB 列宽 String(32)"
@@ -622,3 +630,81 @@ def test_shadow_bench_registered():
     """9 个 firsthit 版本已全量登记进 main.SHADOW_BENCH（analytics 面板事实源）。"""
     for version, _ in FIRSTHIT_SPECS:
         assert version in SHADOW_BENCH, f"{version} 未在 SHADOW_BENCH 中登记"
+
+
+# ============================================================
+# 6. 报价错杀版 firsthit_down_btcsoft_v1（2026-10-05 注册）
+# ============================================================
+
+def _btcsoft_curves(btc_60s: float, btc_trig: float):
+    """down 首触 t=120s q=0.08；BTC 前缀在 t=60s 取 btc_60s、t=120s 取 btc_trig，
+    其余点线性内插（15s 间隔，开盘 100.0，npts=20 保证 ≥MIN_PTS）。"""
+    dn = []
+    btc = []
+    for i in range(20):
+        ts = START + i * 15_000
+        dn.append({"t": ts, "v": 0.5 if i < 8 else 0.08})
+        if i == 0:
+            v = 100.0
+        elif i >= 8:
+            # 触发段（t=120s 起）：触发点后不影响首触特征（路径 ≤trigger_ts）
+            v = btc_trig if i == 8 else btc_trig
+        else:
+            # t=15..105s 线性过渡到 t=60 的目标值后走平
+            frac = min(1.0, i / 4)          # i=4 → t=60s 达到 btc_60s
+            v = 100.0 + (btc_60s - 100.0) * frac
+        btc.append({"t": ts, "v": v})
+    return dn, btc
+
+
+def test_btcsoft_speed_calculation_matches_forward_semantics():
+    """btc_speed_60_bps 与 forward recorder 同口径：DOWN 侧 signed=-(v/bo−1)×1e4，
+    端点取 ≤trigger_ts 与 ≤trigger_ts−60s 的最后采样，速度=端点差/秒差。"""
+    dn, btc = _btcsoft_curves(btc_60s=100.0, btc_trig=99.90)   # 60s 前平、触发时跌 10bp
+    ext = fhd.extract_firsthit_features(START, 100.0, dn, btc)
+    assert ext is not None and ext["trigger_ts"] == START + 120_000
+    # signed(t=60s)=0、signed(t=120s)=+10bp → speed = 10/60 ≈ +0.1667 bp/s
+    assert ext["btc_speed_60_bps"] == pytest.approx(10.0 / 60.0, abs=1e-6)
+    assert ext["td_sec"] == 120
+
+
+def test_btcsoft_gate_positive_and_negative_cases():
+    """门 = G3 门 ∧ q≥0.07 ∧ btc_speed_60_bps≥0（None 拒）。"""
+    gate = fhd._gate_of
+    # 正例：BTC 末 60s 未上行（横盘后微跌）、q=0.08、chg=-10bp
+    dn, btc = _btcsoft_curves(btc_60s=100.0, btc_trig=99.90)
+    ext = fhd.extract_firsthit_features(START, 100.0, dn, btc)
+    assert gate("firsthit_down_btcsoft_v1", ext) is True
+    # 反例 1：末 60s 上行（t=60s 99.80 → 触发 100.02：signed +20→−2，speed<0）
+    #   chg=+2bp 仍过 G3 门，但报价错杀门必须拒—— btcsoft 比 G3 多出的条件
+    dn2, btc2 = _btcsoft_curves(btc_60s=99.80, btc_trig=100.02)
+    ext2 = fhd.extract_firsthit_features(START, 100.0, dn2, btc2)
+    assert ext2["btc_speed_60_bps"] < 0
+    assert gate("firsthit_down_chg_v1", ext2) is True      # G3 门仍放行
+    assert gate("firsthit_down_btcsoft_v1", ext2) is False  # 错杀门拦截
+    # 反例 2：深价 q<0.07
+    dn3 = [{"t": p["t"], "v": 0.5 if i < 8 else 0.05} for i, p in enumerate(dn)]
+    ext3 = fhd.extract_firsthit_features(START, 100.0, dn3, btc)
+    assert gate("firsthit_down_btcsoft_v1", ext3) is False
+    # 反例 3：speed 特征缺失（None）→ 拒（宁缺毋假）
+    ext4 = {**ext, "btc_speed_60_bps": None}
+    assert gate("firsthit_down_btcsoft_v1", ext4) is False
+    # 反例 4：chg 越 G3 门
+    dn5, btc5 = _btcsoft_curves(btc_60s=100.10, btc_trig=100.10)   # chg=+10bp
+    ext5 = fhd.extract_firsthit_features(START, 100.0, dn5, btc5)
+    assert gate("firsthit_down_btcsoft_v1", ext5) is False
+
+
+@pytest.mark.asyncio
+async def test_process_window_persists_btcsoft(monkeypatch):
+    """满足错杀门 → btcsoft 版本落表（与 G3 同窗同时命中）。"""
+    session = _FakeSession(first=None)
+    monkeypatch.setattr(fhd, "async_session_factory", lambda: _FakeSessionCtx(session))
+    d = FirstHitShadowDetector()
+    w = _seed_window(npts=20, trigger_q=0.08, btc_change_pct=-0.0005)  # BTC 微跌
+    await d._process_window(w)
+    versions = [r.version for r in session.added]
+    assert "firsthit_down_btcsoft_v1" in versions, "错杀门满足应落表"
+    assert "firsthit_down_chg_v1" in versions, "G3 门（母集）同时命中"
+    row = next(r for r in session.added if r.version == "firsthit_down_btcsoft_v1")
+    assert row.entry_down_price == pytest.approx(0.08)

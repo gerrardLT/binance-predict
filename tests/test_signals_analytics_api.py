@@ -419,6 +419,8 @@ async def test_analytics_empty_db() -> None:
         # 2026-09-08 首触 G7 系列六变体
         "firsthit_down_g7_v1", "g7_streak_v1", "g7_wick20_v1",
         "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",
+        # 2026-10-05 首触报价错杀版（仅影子）
+        "firsthit_down_btcsoft_v1",
         # rev2 孕线反转族
         "hm_inside_15m_v2", "ih_inside_15m_v2", "hm_inside_5m_v2",
         # 2026-10-04 CRV 情绪反转族（四个确认级 + 两个三因子探索级 + 观察级）

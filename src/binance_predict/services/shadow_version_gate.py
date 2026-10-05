@@ -48,6 +48,15 @@ RETIRED_VERSIONS: frozenset[str] = frozenset({
     "quote_contrarian_v4",
     "x4_v1", "late_night_contrarian_v1",
     "hm_touch_down_v1", "hm_touch_down_v2",
+    # 2026-10-05 退役（前向深析定案）：G7 全系/K10 两版/过程恢复——影子口径剔除
+    # Top5 赢单后 EV 全负（G7 系 −0.34~−1.0 且 Top5 占赢单 EV 49%~100%，收紧门
+    # 只剩右尾彩票；K10 两版影子本身负 EV，非执行问题），无修复价值。
+    # G1/G4/G0 基础版本保留继续采集（对照资产）。G3_EARLY/K10_EARLY 为独立
+    # 研究版不在此列。
+    "firsthit_down_g7_v1", "g7_streak_v1", "g7_wick20_v1", "g7_strict_v1",
+    "g7_q05_v1", "g7_t270_v1",
+    "firsthit_down_k10_v1", "firsthit_down_k10_profit_v1",
+    "process_recovery_down_v1",
 })
 
 
