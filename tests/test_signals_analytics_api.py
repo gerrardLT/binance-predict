@@ -166,7 +166,7 @@ def _make_db(shadow_rows, scene_rows, krev_rows=(), pattern_rows=(),
 
 @pytest.mark.asyncio
 async def test_btc_klines_invalid_interval() -> None:
-    """interval 不在 5m/15m/1h/4h/1d → 422（5m/15m 已开放给实盘对照图）。"""
+    """interval 不在 1m/5m/15m/1h/4h/1d → 422（1m 供一键下单实时图）。"""
     import binance_predict.main as m
 
     with pytest.raises(HTTPException) as exc:
@@ -192,6 +192,34 @@ async def test_btc_klines_cache_hit(monkeypatch) -> None:
     assert out1["klines"] == fake and out2["klines"] == fake
     assert fetch.await_count == 1  # 第二次走缓存
     m._btc_kline_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_btc_klines_1m_and_include_open(monkeypatch) -> None:
+    """1m 已进白名单；include_open=true 走 fetch_klines_raw（含未收盘 K）且不经缓存。"""
+    import binance_predict.main as m
+
+    m._btc_kline_cache.clear()
+    m._btc_kline_fail.clear()
+    raw = [{"open_time": i, "open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 9}
+           for i in range(12)]
+    fetch_raw = AsyncMock(return_value=raw)
+    fetch_closed = AsyncMock(return_value=raw[:-1])
+    monkeypatch.setattr(m.collector, "fetch_klines_raw", fetch_raw)
+    monkeypatch.setattr(m.collector, "fetch_recent_klines", fetch_closed)
+
+    # include_open：raw 路径，两次调用两次抓取（不缓存），末根未收盘 K 原样透传
+    out1 = await m.get_btc_klines(interval="1m", limit=30, include_open=True)
+    out2 = await m.get_btc_klines(interval="1m", limit=30, include_open=True)
+    assert out1["klines"][-1] == raw[-1]
+    assert fetch_raw.await_count == 2 and fetch_closed.await_count == 0
+
+    # 默认（include_open=False）1m 走已收盘缓存路径
+    out3 = await m.get_btc_klines(interval="1m", limit=30)
+    assert out3["klines"] == raw[:-1]
+    assert fetch_closed.await_count == 1
+    m._btc_kline_cache.clear()
+    m._btc_kline_fail.clear()
 
 
 # ============================================================

@@ -607,6 +607,9 @@ const api = {
   getFakeBreakoutStats: () => authFetch('/api/fake-breakout/stats').then(r => r.json()),
   getBtcKlines: (interval: string, limit: number) =>
     authFetch(`/api/chart/btc-klines?interval=${interval}&limit=${limit}`).then(r => r.json()),
+  // 实时口径 K 线代理（含当前未收盘 K，不走缓存）：一键下单实时图轮询基线
+  getBtcKlinesLive: (interval: string, limit: number) =>
+    authFetch(`/api/chart/btc-klines?interval=${interval}&limit=${limit}&include_open=true`).then(r => r.json()),
   getSignalsAnalytics: () => authFetch('/api/signals/analytics?active_only=true').then(r => r.json()),
   getSignalsExecutionComparison: (): Promise<ExecutionComparison> =>
     authFetch('/api/signals/execution-comparison?active_only=true').then(r => {
@@ -1294,14 +1297,14 @@ const fmtMMSS = (sec: number) =>
 
 // ============================================================
 // 实时 K 线小组件（2026-09-18）：下单弹框内嵌，币安 BTC 现货 K 线。
-// 数据源：REST 拉历史（公开无 key）+ WebSocket kline 流推实时；
-// WS 断线自动降级 5s 轮询。自绘 SVG 蜡烛图（不依赖 recharts 蜡烛支持）。
+// 数据源：后端代理 /api/chart/btc-klines 5s 轮询为基线（浏览器无需可达币安，
+// 任何网络都能出图）；币安 WS 直连可用时自动升级为实时推送、断开回落轮询。
+// 自绘 SVG 蜡烛图（不依赖 recharts 蜡烛支持）。
 // 周期可切 1m/5m/15m，并显示所选下单周期当前窗收盘倒计时。
 // ============================================================
 
 interface KlineBar { t: number; o: number; h: number; l: number; c: number }
 
-const BINANCE_REST = 'https://api.binance.com'
 const BINANCE_WS = 'wss://stream.binance.com:9443/ws'
 
 // 计算单值序列 EMA
@@ -1323,7 +1326,7 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
   // 独立选看 K 线周期，可看 1m/5m/15m，初始跟随下单周期
   const [chartPeriod, setChartPeriod] = useState<'1m' | '5m' | '15m'>(orderPeriod)
   const [bars, setBars] = useState<KlineBar[]>([])
-  const [live, setLive] = useState<'ws' | 'poll' | 'init'>('init')
+  const [live, setLive] = useState<'ws' | 'proxy' | 'init'>('init')
   const [showIndicators, setShowIndicators] = useState(true)
   const [view, setView] = useState({ i0: 0, count: 60 })
   const previousBarCountRef = useRef(0)
@@ -1333,20 +1336,22 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
     setChartPeriod(orderPeriod)
   }, [orderPeriod])
 
-  // REST 拉历史 + WS 订阅；周期切换重建连接
+  // 后端代理轮询（基线）+ 币安 WS 直连（增强）；周期切换重建连接
   useEffect(() => {
     let alive = true
     let ws: WebSocket | null = null
     let pollTimer: number | null = null
+    let wsLive = false
     setLive('init')
     setBars([])
     setView({ i0: 0, count: 60 })
     previousBarCountRef.current = 0
 
-    const applyKlines = (raw: unknown[]) => {
-      const next: KlineBar[] = raw.map(r => {
-        const a = r as (string | number)[]
-        return { t: Number(a[0]), o: +a[1], h: +a[2], l: +a[3], c: +a[4] }
+    // 代理返回的是对象数组（open_time/open/...），整体替换 120 根
+    const applyProxy = (raw: unknown) => {
+      const next: KlineBar[] = (Array.isArray(raw) ? raw : []).map(r => {
+        const k = r as Record<string, unknown>
+        return { t: Number(k.open_time), o: Number(k.open), h: Number(k.high), l: Number(k.low), c: Number(k.close) }
       })
       if (alive) setBars(next.slice(-120))
     }
@@ -1361,27 +1366,28 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
       })
     }
 
+    // 基线轮询走后端代理（服务器出网拉币安），浏览器网络不直连币安也能出图
     const startPoll = () => {
       if (pollTimer != null) return
-      setLive('poll')
-      pollTimer = window.setInterval(async () => {
+      setLive('proxy')
+      const tick = async () => {
         try {
-          const r = await fetch(
-            `${BINANCE_REST}/api/v3/klines?symbol=BTCUSDT&interval=${chartPeriod}&limit=120`)
-          if (!r.ok) return
-          applyKlines(await r.json())
+          const d = await api.getBtcKlinesLive(chartPeriod, 120)
+          // WS 已接管实时后不再用代理响应覆盖（避免旧数据顶掉新推送）
+          if (alive && !wsLive) applyProxy(d?.klines)
         } catch { /* 轮询失败静默等下一轮 */ }
-      }, 5_000)
+      }
+      tick()
+      pollTimer = window.setInterval(tick, 5_000)
+    }
+    const stopPoll = () => {
+      if (pollTimer != null) { clearInterval(pollTimer); pollTimer = null }
     }
 
-    fetch(`${BINANCE_REST}/api/v3/klines?symbol=BTCUSDT&interval=${chartPeriod}&limit=120`)
-      .then(r => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
-      .then(applyKlines)
-      .catch(() => { if (alive) startPoll() })
-
+    startPoll()
     try {
       ws = new WebSocket(`${BINANCE_WS}/btcusdt@kline_${chartPeriod}`)
-      ws.onopen = () => { if (alive) setLive('ws') }
+      ws.onopen = () => { if (alive) { wsLive = true; setLive('ws'); stopPoll() } }
       ws.onmessage = ev => {
         try {
           const msg = JSON.parse(ev.data)
@@ -1391,7 +1397,7 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
         } catch { /* 非 kline 消息忽略 */ }
       }
       ws.onerror = () => { if (alive) startPoll() }
-      ws.onclose = () => { if (alive) startPoll() }
+      ws.onclose = () => { if (alive) { wsLive = false; startPoll() } }
     } catch {
       startPoll()
     }
@@ -1399,7 +1405,7 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
     return () => {
       alive = false
       if (ws) { ws.onclose = null; ws.close() }
-      if (pollTimer != null) clearInterval(pollTimer)
+      stopPoll()
     }
   }, [chartPeriod])
 
@@ -1555,8 +1561,8 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
           <span className="font-mono text-[11px] font-bold tabular-nums" title={`当前下单周期 (${orderPeriod}) 窗口收盘倒计时`}>
             {orderPeriod}窗收盘 {fmtMMSS(remain)}
           </span>
-          <span className={`text-[11px] font-medium ${live === 'ws' ? 'text-positive' : 'text-ink-55'}`} title={live === 'ws' ? 'Binance 现货 WebSocket 实时推送' : live === 'poll' ? 'WS 断线，5s 轮询降级' : '初始化中'}>
-            {live === 'ws' ? '● 实时' : live === 'poll' ? '○ 轮询' : '…'}
+          <span className={`text-[11px] font-medium ${live === 'ws' ? 'text-positive' : 'text-ink-55'}`} title={live === 'ws' ? 'Binance 现货 WebSocket 实时推送' : live === 'proxy' ? '经服务器代理轮询（约 5s 延迟），浏览器直连币安不可达' : '初始化中'}>
+            {live === 'ws' ? '● 实时' : live === 'proxy' ? '○ 代理' : '…'}
           </span>
         </div>
       </div>
@@ -1693,7 +1699,7 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
         </div>
       ) : (
         <div className="h-[280px] flex items-center justify-center rounded-sm bg-sunken text-xs text-ink-55">
-          BTC 实时 K 线加载中…（支持 1m/5m/15m，网络不通时自动降级轮询）
+          BTC 实时 K 线加载中…（支持 1m/5m/15m，经服务器代理获取）
         </div>
       )}
     </div>
@@ -1725,7 +1731,6 @@ function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }
   // 大额（>10U/窗）勾选确认；小单一键直接下
   const [confirmed, setConfirmed] = useState(false)
 
-  const MAX_WINDOWS = 6
   const q = (v: unknown) => (typeof v === 'number' ? v : null)
   const nowMs = Date.now() + clockOffset
   const step = period === '5m' ? 300_000 : 900_000
@@ -1758,6 +1763,9 @@ function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }
     .filter(o => String(o.signal_version ?? '').startsWith('manual_test')
       && o.market_period === period && o.status !== 'FAILED')
     .map(o => Number(o.window_start)))
+  // 可连选的未来窗（可用且距开盘 ≥5s）；连选钮数量随实际窗口数自适应，不再设上限
+  const nextAvailWins = future.filter(w =>
+    w.available && w.window_start - nowMs >= 5_000)
   const canSubmit = amtOk && !busy && targets.length > 0
     && (!bigAmount || confirmed)
 
@@ -1797,8 +1805,7 @@ function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }
   }, [open])
 
   const togglePick = (w: number | 'current') => {
-    setPicked(p => p.includes(w) ? p.filter(x => x !== w)
-      : (p.length >= MAX_WINDOWS ? p : [...p, w]))
+    setPicked(p => p.includes(w) ? p.filter(x => x !== w) : [...p, w])
   }
 
   const handleSubmit = async () => {
@@ -1892,7 +1899,7 @@ function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }
                 另提供「下期起连选 N 窗」快捷钮——自动选中从下一周期起往后 N 个可用窗 */}
             <div className="space-y-1">
               <div className="flex items-center text-[11px] text-ink-55">
-                <span>点选要下单的窗口（可多选，至多 {MAX_WINDOWS} 个）</span>
+                <span>点选要下单的窗口（可多选）</span>
                 <span className="ml-auto">{loading ? '扫描未来周期…' : `已选 ${targets.length} 窗`}</span>
               </div>
               {/* 未来窗加载失败（后端接口异常）与币安空窗期区分提示，均自动重试 */}
@@ -1908,18 +1915,16 @@ function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }
               {/* 快捷连选：从下一周期（不含当前窗）往后数 N 个可用窗自动选中 */}
               <div className="flex items-center gap-1.5 flex-wrap">
                 <span className="text-[11px] text-ink-55">下期起连选</span>
-                {Array.from({ length: MAX_WINDOWS }, (_, i) => i + 1).map(n => {
-                  const nextAvail = future.filter(w =>
-                    w.available && w.window_start - nowMs >= 5_000)
+                {Array.from({ length: nextAvailWins.length }, (_, i) => i + 1).map(n => {
                   const autoActive = !picked.includes('current')
-                    && picked.length === Math.min(n, nextAvail.length)
-                    && nextAvail.slice(0, n).every(w => picked.includes(w.window_start))
+                    && picked.length === Math.min(n, nextAvailWins.length)
+                    && nextAvailWins.slice(0, n).every(w => picked.includes(w.window_start))
                   return (
                     <button key={n}
-                      disabled={loading || nextAvail.length === 0}
+                      disabled={loading || nextAvailWins.length === 0}
                       title={`自动选中未来第 1~${n} 个窗口（不含当前窗）`}
                       onClick={() => {
-                        const wins = nextAvail.slice(0, n)
+                        const wins = nextAvailWins.slice(0, n)
                         setPicked(wins.map(w => w.window_start))
                       }}
                       className={`px-2 py-0.5 rounded-pill border text-xs transition ${autoActive

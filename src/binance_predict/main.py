@@ -4368,15 +4368,27 @@ _BTC_KLINE_FAIL_TTL = 10.0
 
 
 @app.get("/api/chart/btc-klines")
-async def get_btc_klines(interval: str = "1d", limit: int = 30):
-    """BTC K 线代理（信号分析面板背景图）：仅返回已收盘 K，升序。"""
-    if interval not in ("5m", "15m", "1h", "4h", "1d"):
-        raise HTTPException(status_code=422, detail=f"interval 仅支持 5m/15m/1h/4h/1d: {interval}")
+async def get_btc_klines(
+    interval: str = "1d", limit: int = 30, include_open: bool = False,
+):
+    """BTC K 线代理（信号分析面板背景图）：仅返回已收盘 K，升序。
+
+    interval 含 1m（一键下单实时图）；include_open=true 时改走
+    fetch_klines_raw（含当前未收盘 K、不经缓存），供前端浏览器直连
+    币安不可达时的实时轮询基线。
+    """
+    if interval not in ("1m", "5m", "15m", "1h", "4h", "1d"):
+        raise HTTPException(status_code=422, detail=f"interval 仅支持 1m/5m/15m/1h/4h/1d: {interval}")
     limit = max(10, min(limit, 200))
-    tier = next((t for t in _BTC_KLINE_LIMIT_TIERS if t >= limit), _BTC_KLINE_LIMIT_TIERS[-1])
     now = time.time()
     if now - _btc_kline_fail.get(interval, 0.0) < _BTC_KLINE_FAIL_TTL:
         return {"interval": interval, "klines": []}
+    if include_open:
+        klines = await collector.fetch_klines_raw(interval, limit)
+        if not klines:
+            _btc_kline_fail[interval] = now
+        return {"interval": interval, "klines": klines[-limit:] if klines else []}
+    tier = next((t for t in _BTC_KLINE_LIMIT_TIERS if t >= limit), _BTC_KLINE_LIMIT_TIERS[-1])
     key = f"{interval}:{tier}"
     cached = _btc_kline_cache.get(key)
     if cached and now - cached[0] < _BTC_KLINE_CACHE_TTL:
