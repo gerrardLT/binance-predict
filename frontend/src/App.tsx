@@ -1300,10 +1300,10 @@ const fmtMMSS = (sec: number) =>
 // 数据源：后端代理 /api/chart/btc-klines 5s 轮询为基线（浏览器无需可达币安，
 // 任何网络都能出图）；币安 WS 直连可用时自动升级为实时推送、断开回落轮询。
 // 自绘 SVG 蜡烛图（不依赖 recharts 蜡烛支持）。
-// 周期可切 1m/5m/15m，并显示所选下单周期当前窗收盘倒计时。
+// 周期可切 1m/5m/15m/1h/1d，含量能副图（MA20 均量），并显示所选下单周期当前窗收盘倒计时。
 // ============================================================
 
-interface KlineBar { t: number; o: number; h: number; l: number; c: number }
+interface KlineBar { t: number; o: number; h: number; l: number; c: number; v: number }
 
 const BINANCE_WS = 'wss://stream.binance.com:9443/ws'
 
@@ -1322,9 +1322,19 @@ function computeEmaSeries(bars: KlineBar[], span: number): (number | null)[] {
   })
 }
 
+// 计算单值序列简单移动平均（量能 MA 用；窗口不足返回 null）
+function computeSmaSeries(values: number[], span: number): (number | null)[] {
+  return values.map((_, idx) => {
+    if (idx < span - 1) return null
+    let s = 0
+    for (let j = idx - span + 1; j <= idx; j++) s += values[j]
+    return s / span
+  })
+}
+
 function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs: number }) {
-  // 独立选看 K 线周期，可看 1m/5m/15m，初始跟随下单周期
-  const [chartPeriod, setChartPeriod] = useState<'1m' | '5m' | '15m'>(orderPeriod)
+  // 独立选看 K 线周期，可看 1m/5m/15m/1h/1d，初始跟随下单周期
+  const [chartPeriod, setChartPeriod] = useState<'1m' | '5m' | '15m' | '1h' | '1d'>(orderPeriod)
   const [bars, setBars] = useState<KlineBar[]>([])
   const [live, setLive] = useState<'ws' | 'proxy' | 'init'>('init')
   const [showIndicators, setShowIndicators] = useState(true)
@@ -1351,11 +1361,11 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
     const applyProxy = (raw: unknown) => {
       const next: KlineBar[] = (Array.isArray(raw) ? raw : []).map(r => {
         const k = r as Record<string, unknown>
-        return { t: Number(k.open_time), o: Number(k.open), h: Number(k.high), l: Number(k.low), c: Number(k.close) }
+        return { t: Number(k.open_time), o: Number(k.open), h: Number(k.high), l: Number(k.low), c: Number(k.close), v: Number(k.volume) }
       })
       if (alive) setBars(next.slice(-120))
     }
-    const mergeKline = (k: { t: number; o: number; h: number; l: number; c: number }) => {
+    const mergeKline = (k: KlineBar) => {
       if (!alive) return
       setBars(prev => {
         if (!prev.length) return [k]
@@ -1393,7 +1403,7 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
           const msg = JSON.parse(ev.data)
           const k = msg?.k
           if (!k) return
-          mergeKline({ t: k.t, o: +k.o, h: +k.h, l: +k.l, c: +k.c })
+          mergeKline({ t: k.t, o: +k.o, h: +k.h, l: +k.l, c: +k.c, v: +k.v })
         } catch { /* 非 kline 消息忽略 */ }
       }
       ws.onerror = () => { if (alive) startPoll() }
@@ -1411,11 +1421,12 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
 
   // ---- 交互状态：滚轮/按钮缩放 + 拖拽平移 + 悬停十字线数据 ----
   const W = 840
-  const H = 280
+  const H = 320
   const RIGHT_PAD = 60
   const BOTTOM_PAD = 20
+  const VOL_H = 56
   const CHART_W = W - RIGHT_PAD
-  const CHART_H = H - BOTTOM_PAD
+  const CHART_H = H - BOTTOM_PAD - VOL_H
   const n = bars.length
   const [hover, setHover] = useState<{ i: number; vx: number; vy: number } | null>(null)
   const dragRef = useRef<{ x: number; i0: number } | null>(null)
@@ -1430,6 +1441,9 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
   const ema25Full = useMemo(() => computeEmaSeries(bars, 25), [bars])
   const ema7Slice = ema7Full.slice(i0, i0 + count)
   const ema25Slice = ema25Full.slice(i0, i0 + count)
+  // 量能 MA20（全量算再切片，与 EMA 同套路）
+  const volMaFull = useMemo(() => computeSmaSeries(bars.map(b => b.v), 20), [bars])
+  const volMaSlice = volMaFull.slice(i0, i0 + count)
 
   // 首批历史数据定位最新区间；后续仅在原视图贴右时跟随新柱。
   useEffect(() => {
@@ -1514,13 +1528,27 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
   const ema7Path = buildLinePath(ema7Slice)
   const ema25Path = buildLinePath(ema25Slice)
 
+  // 量能副图：比例尺基于可见 slice，紧凑数字格式
+  const volMax = Math.max(1e-9, ...slice.map(b => b.v)) * 1.15
+  const vy = (v: number) => CHART_H + VOL_H - (v / volMax) * VOL_H
+  const fmtVol = (v: number) => (v >= 1000 ? `${(v / 1000).toFixed(2)}k` : v.toFixed(1))
+  const buildVolLinePath = (values: (number | null)[]) => {
+    let d = ''
+    values.forEach((v, idx) => {
+      if (v == null) return
+      d += d === '' ? `M ${idx * bw + bw / 2} ${vy(v)}` : ` L ${idx * bw + bw / 2} ${vy(v)}`
+    })
+    return d
+  }
+  const volMaPath = buildVolLinePath(volMaSlice)
+
   return (
     <div className="space-y-1.5 rounded-card border border-line bg-card p-3">
       <div className="flex items-center gap-2 flex-wrap">
         <span className="font-bold text-xs text-ink-95">BTC 实时 K 线</span>
         {/* 独立看盘周期切换 */}
         <div className="flex items-center gap-0.5 bg-sunken rounded-pill p-0.5 border border-line-soft">
-          {(['1m', '5m', '15m'] as const).map(p => (
+          {(['1m', '5m', '15m', '1h', '1d'] as const).map(p => (
             <button
               key={p}
               onClick={() => setChartPeriod(p)}
@@ -1556,6 +1584,7 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
             <span className="text-[#06b6d4]">■ EMA25</span>
           </div>
         )}
+        <span className="text-[10px] font-mono text-[#a78bfa]">■ 量MA20</span>
 
         <div className="ml-auto flex items-center gap-2 text-xs">
           <span className="font-mono text-[11px] font-bold tabular-nums" title={`当前下单周期 (${orderPeriod}) 窗口收盘倒计时`}>
@@ -1569,7 +1598,7 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
 
       {n > 1 ? (
         <div ref={wrapRef} className="relative select-none">
-          <svg viewBox={`0 0 ${W} ${H}`} className="w-full rounded-sm bg-sunken cursor-crosshair" style={{ height: 280 }}
+          <svg viewBox={`0 0 ${W} ${H}`} className="w-full rounded-sm bg-sunken cursor-crosshair" style={{ height: 320 }}
             onMouseMove={onMove}
             onMouseLeave={() => { setHover(null); dragRef.current = null }}
             onMouseDown={e => { dragRef.current = { x: e.clientX, i0 }; setHover(null) }}
@@ -1643,6 +1672,18 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
               </>
             )}
 
+            {/* 量能副图：成交量柱（涨绿/跌红）+ MA20 均量线，与主图共享时间轴 */}
+            <line x1={0} x2={CHART_W} y1={CHART_H} y2={CHART_H} stroke="var(--line-soft)" strokeWidth={1} />
+            <text x={4} y={CHART_H + 11} fontSize={9} fill="#a78bfa" fontFamily="var(--font-stack-mono)">量 MA20</text>
+            {slice.map((b, i) => {
+              const hgt = b.v > 0 ? Math.max(1, (b.v / volMax) * VOL_H) : 0
+              return (
+                <rect key={b.t} x={i * bw + bw * 0.15} y={CHART_H + VOL_H - hgt} width={bw * 0.7} height={hgt}
+                  fill={b.c >= b.o ? 'var(--positive)' : 'var(--negative)'} opacity={0.4} />
+              )
+            })}
+            <path d={volMaPath} fill="none" stroke="#a78bfa" strokeWidth={1.2} />
+
             {/* 最新价格水平参考线 */}
             {last != null && (
               <g>
@@ -1657,7 +1698,7 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
             {/* 十字线 */}
             {hover != null && (
               <g>
-                <line x1={hover.vx} x2={hover.vx} y1={0} y2={CHART_H} stroke="var(--ink-55)" strokeWidth={0.8} strokeDasharray="3 3" />
+                <line x1={hover.vx} x2={hover.vx} y1={0} y2={CHART_H + VOL_H} stroke="var(--ink-55)" strokeWidth={0.8} strokeDasharray="3 3" />
                 <line x1={0} x2={CHART_W} y1={hover.vy} y2={hover.vy} stroke="var(--ink-55)" strokeWidth={0.8} strokeDasharray="3 3" />
               </g>
             )}
@@ -1690,6 +1731,10 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
                 <span>低: {hoverBar.l.toFixed(1)}</span>
                 <span className="font-bold">收: {hoverBar.c.toFixed(1)}</span>
               </div>
+              <div className="flex justify-between gap-3 text-ink-80">
+                <span>量: {fmtVol(hoverBar.v)}</span>
+                <span>均量: {volMaSlice[hover.i] != null ? fmtVol(volMaSlice[hover.i] as number) : '--'}</span>
+              </div>
               <div className={hoverBar.c >= hoverBar.o ? 'text-positive font-bold' : 'text-negative font-bold'}>
                 涨跌: {hoverBar.c >= hoverBar.o ? '+' : ''}{(((hoverBar.c - hoverBar.o) / hoverBar.o) * 100).toFixed(2)}%
                 <span className="text-ink-55 font-normal ml-2">振幅: {(((hoverBar.h - hoverBar.l) / hoverBar.l) * 100).toFixed(2)}%</span>
@@ -1699,7 +1744,7 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
         </div>
       ) : (
         <div className="h-[280px] flex items-center justify-center rounded-sm bg-sunken text-xs text-ink-55">
-          BTC 实时 K 线加载中…（支持 1m/5m/15m，经服务器代理获取）
+          BTC 实时 K 线加载中…（支持 1m/5m/15m/1h/1d · 含量能，经服务器代理获取）
         </div>
       )}
     </div>
@@ -1723,6 +1768,8 @@ function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }
   const [future, setFuture] = useState<FutureWindow[]>([])
   const [futureErr, setFutureErr] = useState(false)
   const [loading, setLoading] = useState(false)
+  // 手动刷新计数：bump 触发未来窗立即重扫
+  const [reloadTick, setReloadTick] = useState(0)
   const [amount, setAmount] = useState('1')
   const [side, setSide] = useState<'UP' | 'DOWN'>('UP')
   const [busy, setBusy] = useState(false)
@@ -1777,12 +1824,14 @@ function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }
   }, [currentTooLate, picked])
   useEffect(() => { if (!bigAmount) setConfirmed(false) }, [bigAmount])
 
-  // 打开/切周期拉取未来窗（含当前窗参考价）
+  // 打开/切周期/手动刷新拉取未来窗（含当前窗参考价）
   useEffect(() => {
     if (!open) return
     let alive = true
-    const load = () => {
-      setLoading(true)
+    // 周期切换/手动刷新时先清掉旧列表：上一周期的窗口立即消失，视觉即时切换
+    setFuture([])
+    const load = (spinner: boolean) => {
+      if (spinner) setLoading(true)
       api.getFutureMarkets(period, 8).then((d: Record<string, unknown>) => {
         if (!alive) return
         setFuture(Array.isArray(d.windows) ? d.windows as FutureWindow[] : [])
@@ -1791,10 +1840,11 @@ function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }
       }).catch(() => { if (alive) setFutureErr(true) })
         .finally(() => alive && setLoading(false))
     }
-    load()
-    const t = setInterval(load, 30_000)
+    load(true)
+    // 后台静默刷新（30s）：不闪加载态
+    const t = setInterval(() => load(false), 30_000)
     return () => { alive = false; clearInterval(t) }
-  }, [open, period])
+  }, [open, period, reloadTick])
 
   // Esc 关闭
   useEffect(() => {
@@ -1900,6 +1950,10 @@ function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }
             <div className="space-y-1">
               <div className="flex items-center text-[11px] text-ink-55">
                 <span>点选要下单的窗口（可多选）</span>
+                <button onClick={() => setReloadTick(t => t + 1)} disabled={loading}
+                  title="立即重新扫描未来窗口"
+                  className="ml-2 px-1.5 py-0.5 rounded border border-line text-ink-55 hover:border-brand hover:text-ink-80 transition disabled:opacity-40"
+                >↻ 刷新</button>
                 <span className="ml-auto">{loading ? '扫描未来周期…' : `已选 ${targets.length} 窗`}</span>
               </div>
               {/* 未来窗加载失败（后端接口异常）与币安空窗期区分提示，均自动重试 */}
