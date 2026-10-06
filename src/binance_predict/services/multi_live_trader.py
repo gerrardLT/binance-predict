@@ -141,23 +141,23 @@ FIRSTHIT_PRE_MARKET_UPPER_WICK_BPS_MIN = 0.5  # upper_wick_bps < 此值跳过（
 FIRSTHIT_DYNAMIC_GUARD_CLAMP_LO = 0.05        # 动态护栏下限 clamp（低于触发区无意义）
 FIRSTHIT_SLIPPAGE_TOL_RATIO = 1.03            # 2026-09-11 新增：下单护拦=触发价×1.03（3% 容忍度），替代绝对阈值防逆选择
 
-# G3 利润带执行门（2026-10-05 改造）：forward 母事件 2144 笔分桶定位的唯一稳健
-# 正 EV 区——触发 180~240s × 浅价 q≥0.07（427 笔 10.5%/EV+0.155，剔 Top5 +0.01；
-# 240s+ 触发段 6.1%/EV−0.08，280s+ 彻底死）。三件套之二：带门（本常量区）与
-# 下单时刻剩余门（_fire_firsthit）；三件套之一 LIMIT→MARKET 在 live_channels。
-# 仅约束实盘通道；G3 影子版本继续全样本采集。
+# G3 双波峰利润带执行门（2026-10-06 改造）：forward 母事件 4549 笔 15S 细粒度分桶定位
+# 的仅有两个正 EV 波峰区——早波峰 105~120s（胜率 13.8%，EV+0.607）与主波峰 210~240s
+# （胜率 10.1%，EV+0.265）× 浅价 q≥0.07；坚决避开 240s+（剩余<60s）衰竭区与 285s+ 归零深渊。
+# 三件套之二：带门（本常量区）与下单时刻剩余门（_fire_firsthit，下调至 60s 打通 220-240s 主峰）；
+# 三件套之一 LIMIT→MARKET 在 live_channels。仅约束实盘通道；G3 影子版本继续全样本采集。
 G3_LIVE_CHANNEL = "firsthit_down_chg_v1"
-G3_LIVE_TD_BAND_S = (180.0, 240.0)            # 触发时刻带（距窗开秒，含下界不含上界）
-G3_LIVE_Q_MIN = 0.07                          # 浅价下界（触发报价）
-G3_LIVE_MIN_REMAIN_S = 80.0                   # 下单时刻距窗末剩余硬门（限价逆向选择修复）
+G3_LIVE_TD_BANDS_S = ((105.0, 120.0), (210.0, 240.0))  # 触发时刻双波峰带（距窗开秒，含下界不含上界）
+G3_LIVE_Q_MIN = 0.07                                   # 浅价下界（触发报价，过滤深水归零单）
+G3_LIVE_MIN_REMAIN_S = 60.0                            # 下单时刻距窗末剩余硬门（60s，防>240s末段追单）
 
 
 def _g3_live_band_veto(ext: dict) -> str | None:
-    """G3 实盘利润带门：触发时刻/价格不在带内 → 拦截（仅实盘通道，影子不受限）。"""
+    """G3 实盘双波峰利润带门：触发时刻不在 [105,120)s / [210,240)s 或 q<0.07 → 拦截（仅实盘通道）。"""
     td = ext.get("td_sec")
     q = ext.get("q")
-    if td is None or not (G3_LIVE_TD_BAND_S[0] <= float(td) < G3_LIVE_TD_BAND_S[1]):
-        return f"触发时刻{td}s不在利润带{G3_LIVE_TD_BAND_S}"
+    if td is None or not any(lo <= float(td) < hi for lo, hi in G3_LIVE_TD_BANDS_S):
+        return f"触发时刻{td}s不在双波峰利润带{G3_LIVE_TD_BANDS_S}"
     if q is None or float(q) < G3_LIVE_Q_MIN:
         return f"触发价{q}低于浅价下界{G3_LIVE_Q_MIN}"
     return None
@@ -1739,9 +1739,9 @@ class MultiLiveTrader:
                             channel, streak_up, win_label)
                 return
             if channel == G3_LIVE_CHANNEL:
-                # 利润带门（2026-10-05）：版本门通过后限定触发 180~240s × 浅价，
-                # 影子版本不受限。未过不占 fired——但本函数派生前同步层已对
-                # 非互斥通道占位，此处 return 即本窗该通道结束。
+                # 双波峰利润带门（2026-10-06）：版本门通过后限定触发 105~120s /
+                # 210~240s × 浅价，影子版本不受限。未过不占 fired——但本函数派生
+                # 前同步层已对非互斥通道占位，此处 return 即本窗该通道结束。
                 band_veto = _g3_live_band_veto(ext)
                 if band_veto is not None:
                     logger.info("多通道实盘：{} 利润带门拦截，弃单 | 窗口 {} | {}",

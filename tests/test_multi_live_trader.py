@@ -2137,10 +2137,14 @@ async def test_firsthit_g1_g3_gate_rejects_high_chg_or_large_body(monkeypatch) -
 async def test_firsthit_three_channels_independent_fill(monkeypatch) -> None:
     """2026-09-12 解除 firsthit 同窗互斥后：三门全中时各通道按各自门禁独立下单。
 
-    2026-10-05 起 G3 加利润带门（触发 180~240s × q≥0.07，仅实盘通道）：
-    - 首触 120s：G0/G1 独立下单，G3 被带门拦截（本测试原场景，保留为带门负例）
-    - 首触 195s（trigger_idx=13）：三门全中且带内 → 三通道各自下单
-    - 首触 245s（trigger_idx≈16）：G3 越带上界（≥240s）被拦
+    2026-10-06 起 G3 加双波峰利润带门（触发 105~120s / 210~240s × q≥0.07，仅实盘）：
+    - 首触 105s（trigger_idx=7，早峰下界带内）：三门全中 → 三通道各自下单
+    - 首触 120s（trigger_idx=8，早峰上界带外）：G0/G1 独立下单，G3 被带门拦截
+    - 首触 195s（trigger_idx=13，两峰间空谷）：G3 被带门拦截
+    - 首触 225s（trigger_idx=15，主峰带内）：三门全中 → 下单（旧 80s 剩余门会把
+      220~240s 打成死区，60s 硬门打通主峰核心利润区）
+    - 首触 225s 带内但墙钟 245s（剩余 55s<60s）：剩余时间硬门拦截
+    - 首触 240s（trigger_idx=16，主峰上界带外）：G3 越界被拦
     三门全中需要：chg≤+2.82bp（G3）、body_r≤0.35（G1）、npts≥8（路径质量）。"""
     def _btc_curve_with_trigger(trigger_idx: int) -> list[dict]:
         """冲高→下跌→反弹曲线；i=trigger_idx 处 v=100.02（chg=+2bp、上影 4bp）。"""
@@ -2159,13 +2163,28 @@ async def test_firsthit_three_channels_independent_fill(monkeypatch) -> None:
             pts.append({"t": ts, "v": v})
         return pts
 
-    # ---- 场景 1：首触 120s（带外）→ G3 被利润带门拦，仅 G0/G1 下单 ----
+    _three_ch = ["firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1"]
+    _three_ov = {"firsthit_down_body_v1": {"enabled": True, "max_exec_price": 0.12},
+                 "firsthit_down_chg_v1": {"enabled": True, "max_exec_price": 0.09}}
+
+    # ---- 场景 A：首触 105s（早峰下界带内）→ 三通道各自下单 ----
+    fakeA = _FakeTrader()
+    tA = _make_trader(monkeypatch, fakeA, channels=_three_ch, overrides=_three_ov)
+    dnA = _firsthit_down_curve(trigger_q=0.07, npts=20, trigger_idx=7)    # t=105s
+    btcA = _btc_curve_with_trigger(7)
+    monkeypatch.setattr(milt.time, "time", lambda: (WINDOW_START + 106_000) / 1000)
+    firedA = tA.check(WINDOW_START, WINDOW_END, WINDOW_START + 105_000,
+                      down_price=0.07, btc_price=100.02,
+                      window_entry_price=100.0,
+                      window_btc_curve=btcA, window_down_curve=dnA)
+    await _drain(tA)
+    assert {c["signal_version"] for c in fakeA.calls} == set(_three_ch), \
+        "首触 105s 在早峰带 [105,120)s 内，三门全中各自下单"
+
+    # ---- 场景 B：首触 120s（早峰上界带外）→ G3 被双波峰带门拦，仅 G0/G1 下单 ----
     fake = _FakeTrader()
-    t = _make_trader(monkeypatch, fake,
-                     channels=["firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1"],
-                     overrides={"firsthit_down_body_v1": {"enabled": True, "max_exec_price": 0.12},
-                                "firsthit_down_chg_v1": {"enabled": True, "max_exec_price": 0.09}})
-    dn_p = _firsthit_down_curve(trigger_q=0.07, npts=20, trigger_idx=8)
+    t = _make_trader(monkeypatch, fake, channels=_three_ch, overrides=_three_ov)
+    dn_p = _firsthit_down_curve(trigger_q=0.07, npts=20, trigger_idx=8)   # t=120s
     btc_p = _btc_curve_with_trigger(8)
     fired = t.check(WINDOW_START, WINDOW_END, WINDOW_START + 120_000,
                     down_price=0.5, btc_price=100.02,
@@ -2173,63 +2192,75 @@ async def test_firsthit_three_channels_independent_fill(monkeypatch) -> None:
                     window_btc_curve=btc_p, window_down_curve=dn_p)
     # fired=同步层派生任务（G3 版本门过、带门在异步任务内裁决）→ 三通道都在；
     # 实际下单（fake.calls）由带门拦掉 G3。
-    assert set(fired) == {"firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1"}
+    assert set(fired) == set(_three_ch)
     await _drain(t)
     assert {c["signal_version"] for c in fake.calls} == {
         "firsthit_down_v1", "firsthit_down_body_v1"
-    }, "首触 120s 不在 G3 利润带（180~240s），不得下单"
-    # 2026-09-11: 动态护拦=触发价×1.03（q=0.07 → 0.0721）
+    }, "首触 120s 越早峰上界（[105,120)s 开区间），G3 不得下单"
+    # 动态护拦=触发价×1.03（q=0.07 → 0.0721）
     assert abs(fake.calls[0]["max_exec_price"] - 0.0721) < 1e-4
 
-    # ---- 场景 2：首触 195s（带内）→ 三通道各自下单 ----
-    fake2 = _FakeTrader()
-    t2 = _make_trader(monkeypatch, fake2,
-                      channels=["firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1"],
-                      overrides={"firsthit_down_body_v1": {"enabled": True, "max_exec_price": 0.12},
-                                 "firsthit_down_chg_v1": {"enabled": True, "max_exec_price": 0.09}})
-    dn2 = _firsthit_down_curve(trigger_q=0.07, npts=20, trigger_idx=13)   # t=195s
-    btc2 = _btc_curve_with_trigger(13)
+    # ---- 场景 C：首触 195s（两峰间空谷）→ G3 被带门拦截 ----
+    fakeC = _FakeTrader()
+    tC = _make_trader(monkeypatch, fakeC, channels=_three_ch, overrides=_three_ov)
+    dnC = _firsthit_down_curve(trigger_q=0.07, npts=20, trigger_idx=13)   # t=195s
+    btcC = _btc_curve_with_trigger(13)
     monkeypatch.setattr(milt.time, "time", lambda: (WINDOW_START + 196_000) / 1000)
-    fired2 = t2.check(WINDOW_START, WINDOW_END, WINDOW_START + 195_000,
-                      down_price=0.07, btc_price=100.02,
-                      window_entry_price=100.0,
-                      window_btc_curve=btc2, window_down_curve=dn2)
-    await _drain(t2)
-    assert {c["signal_version"] for c in fake2.calls} == {
-        "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1"
-    }, "首触 195s 在 G3 利润带内，三门全中各自下单"
-
-    # ---- 场景 3：首触 240s（越带上界）→ G3 被拦 ----
-    fake3 = _FakeTrader()
-    t3 = _make_trader(monkeypatch, fake3,
-                      channels=["firsthit_down_v1", "firsthit_down_chg_v1"],
-                      overrides={"firsthit_down_chg_v1": {"enabled": True, "max_exec_price": 0.09}})
-    dn3 = _firsthit_down_curve(trigger_q=0.07, npts=20, trigger_idx=16)   # t=240s
-    btc3 = _btc_curve_with_trigger(16)
-    monkeypatch.setattr(milt.time, "time", lambda: (WINDOW_START + 241_000) / 1000)
-    fired3 = t3.check(WINDOW_START, WINDOW_END, WINDOW_START + 240_000,
-                      down_price=0.07, btc_price=100.02,
-                      window_entry_price=100.0,
-                      window_btc_curve=btc3, window_down_curve=dn3)
-    await _drain(t3)
-    assert {c["signal_version"] for c in fake3.calls} == {"firsthit_down_v1"}, \
-        "首触 240s 越上界，G3 不得下单"
-
-    # ---- 场景 4：首触 195s 在带内，但下单时刻剩余 <80s（模拟 I/O 排队到 225s+）
-    #      → 剩余时间硬门拦截（限价逆向选择修复：末段反转概率断崖）----
-    fake4 = _FakeTrader()
-    t4 = _make_trader(monkeypatch, fake4,
-                      channels=["firsthit_down_chg_v1"],
-                      overrides={"firsthit_down_chg_v1": {"enabled": True, "max_exec_price": 0.09}})
-    dn4 = _firsthit_down_curve(trigger_q=0.07, npts=20, trigger_idx=13)   # t=195s 带内
-    btc4 = _btc_curve_with_trigger(13)
-    monkeypatch.setattr(milt.time, "time", lambda: (WINDOW_START + 225_000) / 1000)  # 剩余 75s<80s
-    t4.check(WINDOW_START, WINDOW_END, WINDOW_START + 195_000,
+    tC.check(WINDOW_START, WINDOW_END, WINDOW_START + 195_000,
              down_price=0.07, btc_price=100.02,
              window_entry_price=100.0,
-             window_btc_curve=btc4, window_down_curve=dn4)
-    await _drain(t4)
-    assert fake4.calls == [], "带内触发但下单时刻剩余<80s，G3 剩余门拦截"
+             window_btc_curve=btcC, window_down_curve=dnC)
+    await _drain(tC)
+    assert {c["signal_version"] for c in fakeC.calls} == {
+        "firsthit_down_v1", "firsthit_down_body_v1"
+    }, "首触 195s 在两峰间空谷（120,210)s，G3 不得下单"
+
+    # ---- 场景 D：首触 225s（主峰带内，剩余 74s>60s）→ 三通道各自下单 ----
+    fakeD = _FakeTrader()
+    tD = _make_trader(monkeypatch, fakeD, channels=_three_ch, overrides=_three_ov)
+    dnD = _firsthit_down_curve(trigger_q=0.07, npts=20, trigger_idx=15)   # t=225s
+    btcD = _btc_curve_with_trigger(15)
+    monkeypatch.setattr(milt.time, "time", lambda: (WINDOW_START + 226_000) / 1000)
+    tD.check(WINDOW_START, WINDOW_END, WINDOW_START + 225_000,
+             down_price=0.07, btc_price=100.02,
+             window_entry_price=100.0,
+             window_btc_curve=btcD, window_down_curve=dnD)
+    await _drain(tD)
+    assert {c["signal_version"] for c in fakeD.calls} == set(_three_ch), \
+        "首触 225s 在主峰带 [210,240)s 内且剩余 74s>60s，三门全中各自下单" \
+        "（旧 80s 剩余门在墙钟 226s 会误杀本单，60s 硬门打通 220~240s 主峰）"
+
+    # ---- 场景 E：首触 225s 带内，但下单时刻墙钟 245s（剩余 55s<60s）
+    #      → 剩余时间硬门拦截（末段反转概率断崖）----
+    fakeE = _FakeTrader()
+    tE = _make_trader(monkeypatch, fakeE,
+                      channels=["firsthit_down_chg_v1"],
+                      overrides={"firsthit_down_chg_v1": {"enabled": True, "max_exec_price": 0.09}})
+    dnE = _firsthit_down_curve(trigger_q=0.07, npts=20, trigger_idx=15)   # t=225s 带内
+    btcE = _btc_curve_with_trigger(15)
+    monkeypatch.setattr(milt.time, "time", lambda: (WINDOW_START + 245_000) / 1000)  # 剩余 55s<60s
+    tE.check(WINDOW_START, WINDOW_END, WINDOW_START + 225_000,
+             down_price=0.07, btc_price=100.02,
+             window_entry_price=100.0,
+             window_btc_curve=btcE, window_down_curve=dnE)
+    await _drain(tE)
+    assert fakeE.calls == [], "带内触发但下单时刻剩余<60s，G3 剩余门拦截"
+
+    # ---- 场景 F：首触 240s（主峰上界带外）→ G3 被拦 ----
+    fakeF = _FakeTrader()
+    tF = _make_trader(monkeypatch, fakeF,
+                      channels=["firsthit_down_v1", "firsthit_down_chg_v1"],
+                      overrides={"firsthit_down_chg_v1": {"enabled": True, "max_exec_price": 0.09}})
+    dnF = _firsthit_down_curve(trigger_q=0.07, npts=20, trigger_idx=16)   # t=240s
+    btcF = _btc_curve_with_trigger(16)
+    monkeypatch.setattr(milt.time, "time", lambda: (WINDOW_START + 241_000) / 1000)
+    tF.check(WINDOW_START, WINDOW_END, WINDOW_START + 240_000,
+             down_price=0.07, btc_price=100.02,
+             window_entry_price=100.0,
+             window_btc_curve=btcF, window_down_curve=dnF)
+    await _drain(tF)
+    assert {c["signal_version"] for c in fakeF.calls} == {"firsthit_down_v1"}, \
+        "首触 240s 越主峰上界（[210,240)s 开区间），G3 不得下单"
 
 
 @pytest.mark.asyncio
@@ -6153,6 +6184,9 @@ async def test_manual_test_signal_version_periodized(monkeypatch) -> None:
     """W#8：signal_version 周期化 manual_test_5m/15m（同起点 5m/15m 不互撞）。"""
     import binance_predict.main as m
     from binance_predict.models.schemas import ManualTradeTestRequest
+
+    # 固定墙钟（窗中安全点，避免刚好撞到 <5s 收盘弃单护栏导致 flaky）
+    monkeypatch.setattr(m.time, "time", lambda: 1_700_000_060.0)
 
     seen = {}
 
