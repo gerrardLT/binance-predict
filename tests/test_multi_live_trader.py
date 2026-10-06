@@ -2264,6 +2264,35 @@ async def test_firsthit_three_channels_independent_fill(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_g3_pin_btc_to_first_touch_eliminates_timing_drift(monkeypatch) -> None:
+    """G3 时点漂移根治验证：首触时刻 chg>+2.82bp，即便后续采样 BTC 回落，实盘坚决不开火。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake,
+                     channels=["firsthit_down_chg_v1"],
+                     overrides={"firsthit_down_chg_v1": {"enabled": True, "max_exec_price": 0.09}})
+
+    # 构造曲线：首触发生在 105s (trigger_idx=7)，此时 BTC=+10.0bp（超 +2.82bp）
+    # 随后 BTC 在 225s 回落至 +0.0bp
+    dn_p = _firsthit_down_curve(trigger_q=0.07, npts=20, trigger_idx=7)
+    btc_p = []
+    for i in range(20):
+        ts = WINDOW_START + i * 15_000
+        # 首触 (i=7) 处 v=100.10 (+10bp)；之后回落到 100.00 (+0bp)
+        v = 100.0 + (i * 0.0143 if i <= 7 else max(0.0, 0.10 - (i - 7) * 0.0125))
+        btc_p.append({"t": ts, "v": v})
+
+    # 实盘在 225s 采样：如果存在时点漂移，会按当前 100.00 误判过门；
+    # 锁定首触后，严格按 105s 首触时刻的 100.10 (+10bp) 判定未过门，弃单
+    monkeypatch.setattr(milt.time, "time", lambda: (WINDOW_START + 226_000) / 1000)
+    fired = t.check(WINDOW_START, WINDOW_END, WINDOW_START + 225_000,
+                    down_price=0.07, btc_price=100.00,
+                    window_entry_price=100.0,
+                    window_btc_curve=btc_p, window_down_curve=dn_p)
+    await _drain(t)
+    assert fake.calls == [], "首触时刻 BTC 超门限，后续即便回落也坚决不开火（时点漂移已根除）"
+
+
+@pytest.mark.asyncio
 def _k10_klines(*, profit_veto: bool = False) -> list[dict]:
     bars = []
     for i in range(1, 14):

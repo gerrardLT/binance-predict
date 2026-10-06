@@ -710,6 +710,15 @@ class MultiLiveTrader:
                                 or int(version_ext["trigger_ts"]) != int(ts_ms)
                             )):
                             continue
+                    elif ch == G3_LIVE_CHANNEL:
+                        # 2026-10-06 根除 G3 时点漂移：锁定首触时刻 BTC 计算 chg_bps，与影子严格对齐
+                        version_ext = extract_firsthit_features(
+                            window_start_ms, float(window_entry_price),
+                            window_down_curve, window_btc_curve,
+                            max_trigger_ts=int(ts_ms), pin_btc_to_first_touch=True,
+                        )
+                        if version_ext is None or not firsthit_gate_of(ch, version_ext):
+                            continue
                     elif ch == G3_EARLY:
                         if not early_before_cutoff(window_start_ms, ts_ms):
                             continue

@@ -129,6 +129,7 @@ def extract_firsthit_features(
     *,
     max_trigger_ts: int | None = None,
     pin_path_to_first_touch: bool = False,
+    pin_btc_to_first_touch: bool = False,
 ) -> dict | None:
     """首触特征纯函数：归档影子与实时实盘共用，防止两套公式漂移。
 
@@ -197,7 +198,14 @@ def extract_firsthit_features(
     if pin_path_to_first_touch and trigger_ts - int(pre_points[-1]["t"]) > K10_MAX_BTC_AGE_MS:
         return None                                    # K10 冻结口径：首触 BTC 年龄≤15s
     pts = [bo] + pre
-    btc_trig = pre[-1]                                 # 触发时刻 btc = ≤max_trigger_ts 的最后一点
+    # 锁定首触时刻 BTC（消除实盘门禁时点漂移，与影子 ex-ante 触发瞬间口径严格一致）
+    if pin_btc_to_first_touch:
+        btc_trig_candidates = [p for p in pre_points if int(p["t"]) <= trigger_ts]
+        if not btc_trig_candidates:
+            return None
+        btc_trig = float(btc_trig_candidates[-1]["v"])
+    else:
+        btc_trig = pre[-1]                                 # 触发时刻 btc = ≤max_trigger_ts 的最后一点
 
     # 特征（与 local_shape_scan_v2.py / comprehensive_firsthit_backtest.py 同式）
     chg_bps = (btc_trig / bo - 1.0) * 1e4
