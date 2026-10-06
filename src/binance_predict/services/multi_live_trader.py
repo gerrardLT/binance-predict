@@ -126,9 +126,9 @@ S5_DEEP_CHANNEL = "s5_deep_z20_v1"  # 与 fake_breakout_detector.S5_DEEP_VERSION
 S1_DYNAMIC_CHANNEL = "s1_dyn_sq_v1"  # 与 fake_breakout_detector.S1_DYNAMIC_VERSION 同名
 S1_VARIANT_CHANNELS = ("s1_early2_v1", "s1_dip45_v1")  # 与 s4_variant_shadow_detector.S1_VARIANT_VERSIONS 同名
 MARKET_WARMUP_INTERVAL_S = 60.0     # 市场列表后台预热间隔（未来 15m 周期预缓存，2026-08-30）
-ABS_LIVE_JUDGE_GRACE_S = 90.0       # absorption 判定新鲜度：t_rel 超 TD+此值 → 本窗放弃
-                                    # （重启/中途启用后的在途窗，当前价已非 TD 时刻价，
-                                    # 与影子 ≤TD 末点口径不成立 → 保守不下注）
+ABS_LIVE_JUDGE_GRACE_S = 20.0       # absorption 判定新鲜度：t_rel 超 TD+此值 → 本窗放弃
+                                    # （2026-10-06 优化：从 90s 收窄至 20s，阻断 180~240s
+                                    # 残值期追单；与影子 ≤TD 口径严格对齐）
 
 # -----------------------------------------------------------------------------
 # firsthit 族盘前过滤器和动态护栏（2026-09-10/11 优化版）
@@ -635,6 +635,13 @@ class MultiLiveTrader:
             )
             if not policy.eligible or policy.prediction is None:
                 continue                     # 位移门/欠反应门未过
+            # 2026-10-06 优化：吸收跟随实盘方向门禁（仅放行 DOWN 顺势，阻断 UP 假冲刺）
+            if policy.prediction != "DOWN":
+                logger.debug(
+                    "多通道实盘：{} 吸收跟随实盘方向门禁跳过 UP 预测 | 窗口 {}",
+                    ch, _fmt_win(window_start_ms))
+                cfg.fired.add(window_start_ms)
+                continue
             cfg.fired.add(window_start_ms)
             task = asyncio.create_task(
                 self._fire_absorption(
@@ -1612,6 +1619,7 @@ class MultiLiveTrader:
                 window_start=window_start,
                 max_exec_price=resolve_max_exec(spec, cfg),
                 market_period="5m",
+                entry_band_whitelist=spec.entry_band_whitelist,
                 order_type=spec.order_type,
                 assessment_context=assessment_context,
             )

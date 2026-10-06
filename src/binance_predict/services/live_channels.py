@@ -217,19 +217,20 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
         "rev_p2_v1", "kline_reversal", "15m", "DOWN", 0.612,
         "P2 连涨弱阳反转（押DOWN）",
     ),
-    # --- absorption 族（2026-09-06 影子 promote）：采样循环喂价内联判定（窗开快照 +
-    # TD 秒实时双快照），标定 k/b/位移门/欠反应门复用 AbsorptionShadowDetector 滚动
-    # 缓冲（同一采样 feed 同基）。跟随 BTC 位移方向（动态 UP/DOWN，当前 5m 市场中段
-    # 入场）。真实价复核：TD150 real EV +0.105 CI[+0.050,+0.165]、TD120 +0.065
-    # CI[+0.006,+0.123]；价-only 胜率 79.8%/88.5% → 平衡价 0.782/0.867 略下方。
-    # 两版同窗同假设 → 同窗互斥。
+    # --- absorption 族（2026-09-06 影子 promote；2026-10-06 实盘归因优化）：
+    # 采样循环喂价内联判定（窗开快照 + TD 秒实时双快照），标定 k/b/位移门/欠反应门
+    # 复用 AbsorptionShadowDetector 滚动缓冲。2026-10-06 优化：实盘仅放行 DOWN 顺势
+    # （阻断 UP 假冲刺出血点）；宽限期收窄至 20s（禁绝 180~240s 残值期下注）；
+    # 配置 entry_band_whitelist=((0.55, 0.99),) 阻断 <0.55 假突破毒单。两版同窗互斥。
     "absorption_follow_td120_v1": ChannelSpec(
-        "absorption_follow_td120_v1", "absorption", "5m", "UP", 0.78,
+        "absorption_follow_td120_v1", "absorption", "5m", "DOWN", 0.78,
         "吸收跟随TD120欠反应→顺势",
+        entry_band_whitelist=((0.55, 0.99),),
     ),
     "absorption_follow_td150_v1": ChannelSpec(
-        "absorption_follow_td150_v1", "absorption", "5m", "UP", 0.86,
+        "absorption_follow_td150_v1", "absorption", "5m", "DOWN", 0.86,
         "吸收跟随TD150欠反应→顺势",
+        entry_band_whitelist=((0.55, 0.99),),
     ),
     # --- firsthit 族（2026-09-07 影子 promote）：5m 采样循环按本窗完整历史重放
     # DOWN 首次进入 (0.005,0.1] 的触发点，命中后买 DOWN。所有版本共用

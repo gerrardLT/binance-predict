@@ -1828,31 +1828,24 @@ async def test_absorption_missing_calibration_no_fire(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_absorption_fires_up_when_btc_up(monkeypatch) -> None:
-    """absorption：过位移门+欠反应门 → 开火押 UP（follow 补涨），护栏 0.78。"""
+async def test_absorption_skips_up_prediction(monkeypatch) -> None:
+    """absorption：过位移门+欠反应门但预测为 UP → 实盘方向门禁跳过（不开火，阻断 UP 假冲刺）。"""
     fake = _FakeTrader()
     t = _make_trader(monkeypatch, fake, channels=["absorption_follow_td120_v1"])
     t.absorption_calibrator = _FakeCalibrator((2.0, 0.0, 10.0, 0.5))
     t.check(WINDOW_START, WINDOW_END, WINDOW_START + 5_000, 0.5,
             btc_price=100.0, window_entry_price=100.0, up_price=0.50,
             up_open=0.50)
-    # TD 后：btc +30bp（过位移门 10bp）、UP 报价粘滞 under=+59.5pp（过欠反应门 0.5）
+    # TD 后：btc +30bp、UP 报价粘滞 under=+59.5pp，原本押 UP，但实盘门禁跳过
     assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 130_000, 0.5,
-                   btc_price=100.3, window_entry_price=100.0, up_price=0.505) \
-        == ["absorption_follow_td120_v1"]
+                   btc_price=100.3, window_entry_price=100.0, up_price=0.505) == []
     await _drain(t)
-    call = fake.calls[0]
-    assert call["signal_version"] == "absorption_follow_td120_v1"
-    assert call["prediction"] == "UP"
-    assert call["market_period"] == "5m"
-    assert call["window_start"] == WINDOW_START
-    assert call["max_exec_price"] == 0.78
-    assert call["amount_usdt"] == 2.0
+    assert fake.calls == []
 
 
 @pytest.mark.asyncio
 async def test_absorption_fires_down_when_btc_down(monkeypatch) -> None:
-    """absorption：btc 跌（btc_move<0）过门 → 押 DOWN（方向随 btc_move 符号）。"""
+    """absorption：btc 跌（btc_move<0）过门 → 押 DOWN，护栏 0.78 + 报价下限白名单 ((0.55, 0.99),)。"""
     fake = _FakeTrader()
     t = _make_trader(monkeypatch, fake, channels=["absorption_follow_td120_v1"])
     t.absorption_calibrator = _FakeCalibrator((2.0, 0.0, 10.0, 0.5))
@@ -1863,7 +1856,14 @@ async def test_absorption_fires_down_when_btc_down(monkeypatch) -> None:
                    btc_price=99.7, window_entry_price=100.0, up_price=0.505) \
         == ["absorption_follow_td120_v1"]
     await _drain(t)
-    assert fake.calls[0]["prediction"] == "DOWN"
+    call = fake.calls[0]
+    assert call["signal_version"] == "absorption_follow_td120_v1"
+    assert call["prediction"] == "DOWN"
+    assert call["market_period"] == "5m"
+    assert call["window_start"] == WINDOW_START
+    assert call["max_exec_price"] == 0.78
+    assert call["amount_usdt"] == 2.0
+    assert call["entry_band_whitelist"] == ((0.55, 0.99),)
 
 
 @pytest.mark.asyncio
@@ -1877,14 +1877,14 @@ async def test_absorption_exclusive_td120_fill_blocks_td150(monkeypatch) -> None
             btc_price=100.0, window_entry_price=100.0, up_price=0.50,
             up_open=0.50)
     assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 130_000, 0.5,
-                   btc_price=100.3, window_entry_price=100.0, up_price=0.505) \
+                   btc_price=99.7, window_entry_price=100.0, up_price=0.505) \
         == ["absorption_follow_td120_v1"]
     await _drain(t)
     assert [c["signal_version"] for c in fake.calls] == [
         "absorption_follow_td120_v1"]
     # TD150 时点：门照过、fired 占位生效（同步开火），但互斥槽拒单（td120 已成交）
     assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 160_000, 0.5,
-                   btc_price=100.3, window_entry_price=100.0, up_price=0.505) \
+                   btc_price=99.7, window_entry_price=100.0, up_price=0.505) \
         == ["absorption_follow_td150_v1"]
     await _drain(t)
     assert [c["signal_version"] for c in fake.calls] == [
@@ -1921,43 +1921,74 @@ async def test_absorption_midwindow_enable_uses_window_open_basis(monkeypatch) -
     首个有效 UP 采样，与影子 _first(up_p) 同源）→ 基准正确，在途窗口仍可判定。
 
     t=130s 启用后首采样建快照（up_open=0.50 窗开价、up_price=0.505 当前价），
-    t=145s 判定：up_move=+0.5pp、btc_move=+30bp → under=+59.5pp 过门 → 开火
-    （证明修复不损失在途窗口，且基准是窗开价而非中途价）。
+    t=135s 判定（在 120s+20s 宽限期内）：btc_move=-30bp → under=+59.5pp 过门 → 开火押 DOWN。
     """
     fake = _FakeTrader()
     t = _make_trader(monkeypatch, fake, channels=["absorption_follow_td120_v1"])
     t.absorption_calibrator = _FakeCalibrator((2.0, 0.0, 10.0, 0.5))
     assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 130_000, 0.5,
-                   btc_price=100.3, window_entry_price=100.0, up_price=0.505,
+                   btc_price=99.7, window_entry_price=100.0, up_price=0.505,
                    up_open=0.50) == []          # 快照刚建立，判定等后续采样
     assert t._abs_open[WINDOW_START] == (0.50, 100.0)   # 基准=窗开价非中途价
-    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 145_000, 0.5,
-                   btc_price=100.3, window_entry_price=100.0, up_price=0.505,
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 135_000, 0.5,
+                   btc_price=99.7, window_entry_price=100.0, up_price=0.505,
                    up_open=0.50) == ["absorption_follow_td120_v1"]
     await _drain(t)
-    assert fake.calls[0]["prediction"] == "UP"
+    assert fake.calls[0]["prediction"] == "DOWN"
 
 
 @pytest.mark.asyncio
 async def test_absorption_stale_judge_window_skipped(monkeypatch) -> None:
-    """absorption 判定新鲜度：t_rel 超 TD+90s（重启后在途窗）→ 本窗放弃。
+    """absorption 判定新鲜度：t_rel 超 TD+20s（2026-10-06 收窄至 20s）→ 本窗放弃。
 
-    当前价已非 TD 时刻价，与影子 ≤TD 末点口径不成立；即使数学过门也不下注
-    （口径漂移防御，与中途建快照防线互补）。
+    当前价已非 TD 时刻价，与影子 ≤TD 末点口径不成立；即使数学过门也不下注。
     """
     fake = _FakeTrader()
     t = _make_trader(monkeypatch, fake, channels=["absorption_follow_td120_v1"])
     t.absorption_calibrator = _FakeCalibrator((2.0, 0.0, 10.0, 0.5))
-    # t=5s 建快照（up_open 正确），随后进程「重启」错过判定点，t=250s 才恢复采样
+    # t=5s 建快照（up_open 正确），随后进程错过判定点，t=145s ( > 120s+20s ) 才恢复采样
     t.check(WINDOW_START, WINDOW_END, WINDOW_START + 5_000, 0.5,
             btc_price=100.0, window_entry_price=100.0, up_price=0.50,
             up_open=0.50)
-    # 250s > TD120+90s：up_move=+0.05pp、under=+59.95pp 数学过门，但口径过期
-    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 250_000, 0.5,
-                   btc_price=100.3, window_entry_price=100.0, up_price=0.5005,
+    # 145s > TD120+20s (140s)：即使数学过门，也必须因新鲜度过期弃单
+    assert t.check(WINDOW_START, WINDOW_END, WINDOW_START + 145_000, 0.5,
+                   btc_price=99.7, window_entry_price=100.0, up_price=0.505,
                    up_open=0.50) == []
     await _drain(t)
     assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_absorption_quote_floor_entry_band_whitelist_applied(monkeypatch) -> None:
+    """absorption 2026-10-06 报价下限护栏：entry_band_whitelist=((0.55, 0.99),)。
+    低于 0.55（如 0.50）在下单层被白名单拦截弃单；0.65 正常放行。"""
+    trader = _make_real_trader(monkeypatch)
+    from binance_predict.services.live_channels import LIVE_CHANNELS
+    bands = LIVE_CHANNELS["absorption_follow_td120_v1"].entry_band_whitelist
+    assert bands == ((0.55, 0.99),)
+
+    # 1. 报价 0.50 (< 0.55)：被白名单拦下
+    updates, place_calls = _stub_whitelist_trade(
+        monkeypatch, trader,
+        quotes=[{"averagePrice": 0.50, "amountIn": "5", "amountOut": "10", "quoteId": "Q1"}],
+        confirms=[])
+    order = await trader.execute_signal_trade(
+        "DOWN", 2.0, "absorption_follow_td120_v1", WINDOW_START,
+        max_exec_price=0.78, market_period="5m", entry_band_whitelist=bands)
+    assert order["status"] == "FAILED"
+    assert "入场价白名单弃单" in updates[0][1]["error_message"]
+    assert place_calls == []
+
+    # 2. 报价 0.65 (>= 0.55 且 < 0.78)：正常成交
+    updates, place_calls = _stub_whitelist_trade(
+        monkeypatch, trader,
+        quotes=[{"averagePrice": 0.65, "amountIn": "5", "amountOut": "7.69", "quoteId": "Q2"}],
+        confirms=[{"orderId": "ORD-1", "status": "FILLED", "price": "0.65"}])
+    order_ok = await trader.execute_signal_trade(
+        "DOWN", 2.0, "absorption_follow_td120_v1", WINDOW_START,
+        max_exec_price=0.78, market_period="5m", entry_band_whitelist=bands)
+    assert order_ok["status"] == "FILLED"
+    assert place_calls == ["Q2"]
 
 
 # ============================================================
