@@ -331,6 +331,97 @@ interface SignalsAnalytics {
   }
 }
 
+// 影子信号详情与实盘对比数据结构
+interface ShadowDetailLiveOrder {
+  id: number
+  order_id: string | null
+  status: string
+  amount_usdt: number
+  average_price: number | null
+  price_kind: 'fill' | 'quote' | null
+  win: boolean | null
+  pnl: number | null
+  settle_outcome: string | null
+  error_message: string | null
+  created_at: string | null
+  settled_at: string | null
+}
+
+interface ShadowDetailOrderItem {
+  window_start: number
+  direction: string
+  entry_price: number | null
+  win: boolean | null
+  ev: number | null
+  breakeven: number | null
+  guarded_pass: boolean
+  reject_reason: string | null
+  live_order: ShadowDetailLiveOrder | null
+}
+
+interface ShadowDetailCurvePoint {
+  i: number
+  ts: number
+  cum_ev_theoretical: number
+  cum_ev_guarded: number
+  cum_pnl_live: number | null
+  win_rate_theoretical: number
+  win_rate_guarded: number | null
+}
+
+interface ShadowDetailBucket {
+  range?: string
+  hour_range?: string
+  signals: number
+  wins: number
+  win_rate: number | null
+  avg_ev: number | null
+  live_orders: number
+  live_wins: number
+  live_win_rate: number | null
+  live_pnl: number | null
+}
+
+interface ShadowSignalDetailResponse {
+  version: string
+  desc: string
+  family: string
+  role: string
+  guard_price: number | null
+  bench_winrate: number | null
+  summary: {
+    total_signals: number
+    theoretical_wins: number
+    theoretical_win_rate: number | null
+    theoretical_avg_ev: number | null
+    theoretical_cum_ev: number
+    guarded_signals: number
+    guarded_wins: number
+    guarded_win_rate: number | null
+    guarded_pass_rate: number | null
+    guarded_avg_ev: number | null
+    guarded_cum_ev: number
+    rejected_signals: number
+    rejected_wins: number
+    rejected_losses: number
+    rejected_win_rate: number | null
+    avoided_loss_ev: number
+    live_orders_count: number
+    live_filled_count: number
+    live_wins: number
+    live_win_rate: number | null
+    live_total_pnl: number
+    live_avg_pnl: number | null
+    avg_quote_price: number | null
+    avg_live_fill_price: number | null
+    slippage_bps: number | null
+  }
+  curves: ShadowDetailCurvePoint[]
+  quote_buckets: ShadowDetailBucket[]
+  hour_buckets: ShadowDetailBucket[]
+  orders: ShadowDetailOrderItem[]
+}
+
 interface ExecutionFunnel {
   theoretical: number
   strategy_eligible: number
@@ -622,6 +713,11 @@ const api = {
     authFetch('/api/signals/execution-comparison?active_only=true').then(r => {
       if (!r.ok) throw new Error(`HTTP ${r.status}`)
       return r.json() as Promise<ExecutionComparison>
+    }),
+  getShadowSignalDetail: (version: string, limit = 500): Promise<ShadowSignalDetailResponse> =>
+    authFetch(`/api/signals/shadow/detail?version=${encodeURIComponent(version)}&limit=${limit}`).then(r => {
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      return r.json()
     }),
   // 影子版本手动下线/上线（2026-09-04）：下线=停采集新信号+面板置灰，历史数据保留
   toggleShadow: (version: string, enabled: boolean) =>
@@ -1085,8 +1181,8 @@ const SIGNAL_INFO: Record<string, { name: string; desc: string; retired?: boolea
     desc: 'G0 + body_r≤0.35（首触前 BTC 路径归一实体小，震荡而非单边跑出去）。默认关闭；与 G0/G3 独立下单，不做跨版本互斥，每通道每窗至多一单。执行价护栏 0.12，实际成交均价高于护栏弃单。confirm 段已 burned，护栏非前向胜率背书。',
   },
   firsthit_down_chg_v1: {
-    name: '首触G3偏离·利润带版（押DOWN）',
-    desc: '【2026-10-05 实盘执行改造；影子口径不变仍全样本采集】信号门 G0+chg≤+2.82bp 不变；实盘执行限定利润带：触发 180~240s × 浅价 q≥0.07（forward 母体 427 笔 10.5%/EV+0.155，剔Top5 +0.01），MARKET 市价单（原 LIMIT 限价曾把成交逆向选择到晚段深价：20 单 83% 晚触全输），下单时刻距窗末剩余 ≥80s 弃单（末段反转概率断崖）。默认关闭；护栏=触发价×1.03 动态护栏。⚠️对比实盘与影子时须把影子按同门（带内子集）过滤，全样本直比口径不可比。',
+    name: '首触G3偏离·双波峰版（押DOWN）',
+    desc: '【2026-10-06 双波峰改造；影子口径不变仍全样本采集】信号门 G0+chg≤+2.82bp 不变；实盘执行限定两个正 EV 波峰：触发 105~120s（早峰 13.8%/EV+0.607）与 210~240s（主峰 10.1%/EV+0.265）× 浅价 q≥0.07（4549 笔母事件 15S 分桶定位）；坚决避开 240s+ 衰竭区（占 41% 样本暴亏）与 285s+ 归零深渊（胜率 4.97%）。MARKET 市价单（原 LIMIT 限价曾把成交逆向选择到晚段深价：20 单 83% 晚触全输），下单时刻距窗末剩余 ≥60s 弃单（80s→60s 打通 220-240s 主峰）。默认关闭；护栏=触发价×1.03 动态护栏。⚠️对比实盘与影子时须把影子按同门（双峰带内子集）过滤，全样本直比口径不可比。',
   },
   firsthit_down_chg_early180_v1: {
     name: '首触G3前3分钟研究版（押DOWN）',
@@ -7299,6 +7395,607 @@ function SignalAnalyticsTab() {
   const featuredShadowKeys = ['s1_dyn_sq_v1'].filter(k => activeShadowEntries.some(([key]) => key === k))
   const activeShadowRows = analytics ? mergeCurves(analytics.shadow, SHADOW_META) : []
 
+function ShadowSignalDetailModal({
+  version,
+  onClose,
+}: {
+  version: string
+  onClose: () => void
+}) {
+  const [data, setData] = useState<ShadowSignalDetailResponse | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [activeTab, setActiveTab] = useState<'chart' | 'buckets' | 'orders'>('orders')
+  const [orderFilter, setOrderFilter] = useState<'ALL' | 'GUARDED' | 'REJECTED' | 'LIVE' | 'WIN' | 'LOSS'>('ALL')
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(20)
+
+  const loadDetail = useCallback(() => {
+    setLoading(true)
+    setError('')
+    api.getShadowSignalDetail(version, 1000)
+      .then(res => {
+        setData(res)
+        setLoading(false)
+      })
+      .catch(err => {
+        setError(`加载失败: ${(err as Error).message}`)
+        setLoading(false)
+      })
+  }, [version])
+
+  useEffect(() => {
+    loadDetail()
+  }, [loadDetail])
+
+  const s = data?.summary
+
+  const filteredOrders = useMemo(() => {
+    const list = data?.orders ?? []
+    return list.filter(o => {
+      if (orderFilter === 'GUARDED') return o.guarded_pass
+      if (orderFilter === 'REJECTED') return !o.guarded_pass
+      if (orderFilter === 'LIVE') return o.live_order != null
+      if (orderFilter === 'WIN') return o.win === true
+      if (orderFilter === 'LOSS') return o.win === false
+      return true
+    })
+  }, [data?.orders, orderFilter])
+
+  const totalPages = Math.max(1, Math.ceil(filteredOrders.length / pageSize))
+  const safePage = Math.min(page, totalPages)
+  const pageOrders = filteredOrders.slice((safePage - 1) * pageSize, safePage * pageSize)
+
+  const info = SIGNAL_INFO[version]
+  const displayName = info?.name ?? version
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-overlay p-4" onClick={onClose}>
+      <div
+        className="bg-card rounded-panel border border-line w-full max-w-5xl max-h-[90vh] flex flex-col shadow-xl"
+        onClick={e => e.stopPropagation()}
+      >
+        {/* 头部 */}
+        <div className="px-5 py-3.5 border-b border-line flex items-center justify-between shrink-0 bg-sunken rounded-t-panel">
+          <div>
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="font-bold text-sm text-ink-95">{displayName}</span>
+              <span className="font-mono text-xs text-ink-55">{version}</span>
+              {data && (
+                <>
+                  <span className="ds-badge ds-badge-neutral">{signalFamilyLabel(data.family)}</span>
+                  {data.guard_price != null && (
+                    <span className="ds-badge ds-badge-indigo">护栏 ≤ {data.guard_price}</span>
+                  )}
+                  {data.bench_winrate != null && (
+                    <span className="ds-badge ds-badge-violet">基准 {pct1(data.bench_winrate)}</span>
+                  )}
+                </>
+              )}
+            </div>
+            <p className="text-[11px] text-ink-55 mt-1 line-clamp-1">{data?.desc || info?.desc || '暂无说明'}</p>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={loadDetail}
+              disabled={loading}
+              className="px-2.5 py-1 text-xs rounded-sm border border-line bg-card hover:bg-sunken text-ink-80 transition disabled:opacity-40"
+              title="刷新最新订单与对比数据"
+            >
+              {loading ? '刷新中…' : '🔄 刷新'}
+            </button>
+            <button
+              onClick={onClose}
+              className="text-ink-55 hover:text-ink-95 text-lg leading-none px-1.5 py-0.5 rounded-sm hover:bg-sunken"
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+
+        {/* 核心 KPI 矩阵 */}
+        {s && (
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-2 px-5 py-3 border-b border-line-soft bg-card shrink-0">
+            <div className="p-2 rounded-sm bg-sunken border border-line-soft">
+              <div className="text-[10px] text-ink-55">信号与通过率</div>
+              <div className="font-mono font-bold text-sm text-ink-95">
+                {s.guarded_signals} <span className="text-[11px] font-normal text-ink-40">/ {s.total_signals}</span>
+              </div>
+              <div className="text-[10px] text-ink-55 mt-0.5">
+                护栏通过率 <span className="font-mono font-medium text-brand">{pct1(s.guarded_pass_rate)}</span>
+              </div>
+            </div>
+
+            <div className="p-2 rounded-sm bg-sunken border border-line-soft">
+              <div className="text-[10px] text-ink-55">胜率对比（实 vs 理）</div>
+              <div className="font-mono font-bold text-sm text-brand">
+                {pct1(s.guarded_win_rate)} <span className="text-[11px] font-normal text-ink-40">({s.guarded_wins}胜)</span>
+              </div>
+              <div className="text-[10px] text-ink-55 mt-0.5">
+                全量理论 <span className="font-mono text-ink-80">{pct1(s.theoretical_win_rate)}</span>
+              </div>
+            </div>
+
+            <div className="p-2 rounded-sm bg-sunken border border-line-soft">
+              <div className="text-[10px] text-ink-55">理论收益（累计 / 单均）</div>
+              <div className={`font-mono font-bold text-sm ${s.guarded_cum_ev >= 0 ? 'text-positive' : 'text-negative'}`}>
+                {evFmt(s.guarded_cum_ev)} EV
+              </div>
+              <div className="text-[10px] text-ink-55 mt-0.5">
+                实际单均 <span className="font-mono">{evFmt(s.guarded_avg_ev)}</span> · 理论 <span className="font-mono">{evFmt(s.theoretical_avg_ev)}</span>
+              </div>
+            </div>
+
+            <div className="p-2 rounded-sm bg-sunken border border-line-soft">
+              <div className="text-[10px] text-ink-55">实盘订单与盈亏</div>
+              <div className={`font-mono font-bold text-sm ${s.live_total_pnl >= 0 ? 'text-positive' : 'text-negative'}`}>
+                {s.live_total_pnl >= 0 ? '+' : ''}{s.live_total_pnl.toFixed(2)} USDT
+              </div>
+              <div className="text-[10px] text-ink-55 mt-0.5">
+                成交 <span className="font-mono">{s.live_filled_count}</span> 单 · 实盘胜率 <span className="font-mono">{pct1(s.live_win_rate)}</span>
+              </div>
+            </div>
+
+            <div className="p-2 rounded-sm bg-sunken border border-line-soft">
+              <div className="text-[10px] text-ink-55">护栏避损与执行价</div>
+              <div className="font-mono font-bold text-sm text-ink-95">
+                拦截 {s.rejected_signals} 笔
+                <span className="text-[11px] font-normal text-positive ml-1">
+                  ({s.avoided_loss_ev >= 0 ? '+' : ''}{s.avoided_loss_ev.toFixed(2)} EV)
+                </span>
+              </div>
+              <div className="text-[10px] text-ink-55 mt-0.5">
+                理论均价 <span className="font-mono">{s.avg_quote_price?.toFixed(3) ?? '--'}</span>
+                {s.avg_live_fill_price != null && (
+                  <> · 实盘 <span className="font-mono">{s.avg_live_fill_price.toFixed(3)}</span></>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* 标签栏 */}
+        <div className="flex items-center gap-2 px-5 py-2 border-b border-line-soft bg-sunken text-xs shrink-0">
+          <button
+            onClick={() => setActiveTab('orders')}
+            className={`px-3 py-1 font-semibold rounded-sm transition ${
+              activeTab === 'orders' ? 'bg-brand text-white shadow-xs' : 'text-ink-80 hover:text-ink-95 bg-card border border-line-soft'
+            }`}
+          >
+            📋 逐笔订单与实盘对齐 ({data?.orders.length ?? 0})
+          </button>
+          <button
+            onClick={() => setActiveTab('chart')}
+            className={`px-3 py-1 font-semibold rounded-sm transition ${
+              activeTab === 'chart' ? 'bg-brand text-white shadow-xs' : 'text-ink-80 hover:text-ink-95 bg-card border border-line-soft'
+            }`}
+          >
+            📈 累计曲线走势对比
+          </button>
+          <button
+            onClick={() => setActiveTab('buckets')}
+            className={`px-3 py-1 font-semibold rounded-sm transition ${
+              activeTab === 'buckets' ? 'bg-brand text-white shadow-xs' : 'text-ink-80 hover:text-ink-95 bg-card border border-line-soft'
+            }`}
+          >
+            📊 报价分桶与时段归因
+          </button>
+        </div>
+
+        {/* 内容区 */}
+        <div className="flex-1 min-h-0 overflow-auto p-4">
+          {loading && <div className="text-center text-ink-55 py-12 text-xs">加载订单与分析数据中…</div>}
+          {error && <div className="text-center text-negative py-12 text-xs">{error}</div>}
+
+          {!loading && !error && data && (
+            <>
+              {/* Tab 1: 逐笔订单表格 */}
+              {activeTab === 'orders' && (
+                <div className="space-y-3">
+                  {/* 表格工具栏 */}
+                  <div className="flex items-center justify-between gap-2 flex-wrap text-xs">
+                    <div className="flex items-center gap-2">
+                      <span className="text-ink-55">筛选:</span>
+                      <select
+                        value={orderFilter}
+                        onChange={e => { setOrderFilter(e.target.value as typeof orderFilter); setPage(1) }}
+                        className="px-2 py-0.5 border border-line rounded-sm text-xs text-ink-80 bg-card"
+                      >
+                        <option value="ALL">全部记录 ({data?.orders.length ?? 0})</option>
+                        <option value="GUARDED">仅护栏通过</option>
+                        <option value="REJECTED">仅护栏拦截/弃单</option>
+                        <option value="LIVE">仅有实盘下单</option>
+                        <option value="WIN">仅理论胜单</option>
+                        <option value="LOSS">仅理论负单</option>
+                      </select>
+                      <span className="text-ink-40">|</span>
+                      <span className="text-ink-55">
+                        显示 {filteredOrders.length} 笔（第 {safePage} / {totalPages} 页）
+                      </span>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <span className="text-ink-55">每页</span>
+                      <select
+                        value={pageSize}
+                        onChange={e => { setPageSize(Number(e.target.value)); setPage(1) }}
+                        className="px-2 py-0.5 border border-line rounded-sm text-xs text-ink-80 bg-card"
+                      >
+                        <option value={15}>15 笔</option>
+                        <option value={30}>30 笔</option>
+                        <option value={50}>50 笔</option>
+                        <option value={100}>100 笔</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  {/* 逐笔明细对齐表 */}
+                  <div className="overflow-x-auto border border-line rounded-sm">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="border-b border-line bg-sunken text-ink-55">
+                          <th className="py-1.5 px-2 text-left">时间 (UTC / 本地)</th>
+                          <th className="py-1.5 px-2 text-center">方向</th>
+                          <th className="py-1.5 px-2 text-right">理论入场价</th>
+                          <th className="py-1.5 px-2 text-center">理论胜负</th>
+                          <th className="py-1.5 px-2 text-right">理论单笔EV</th>
+                          <th className="py-1.5 px-2 text-center">护栏判定</th>
+                          <th className="py-1.5 px-2 text-center">实盘订单</th>
+                          <th className="py-1.5 px-2 text-right">实盘成交价</th>
+                          <th className="py-1.5 px-2 text-right">实盘投入</th>
+                          <th className="py-1.5 px-2 text-right">实盘盈亏</th>
+                          <th className="py-1.5 px-2 text-center">实盘胜负</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {pageOrders.length === 0 ? (
+                          <tr>
+                            <td colSpan={11} className="py-8 text-center text-ink-55">
+                              当前筛选下无匹配记录
+                            </td>
+                          </tr>
+                        ) : (
+                          pageOrders.map((o, idx) => {
+                            const won = o.win === true
+                            const lo = o.live_order
+                            const liveWon = lo?.win === true
+                            const liveLost = lo?.win === false
+                            return (
+                              <tr key={idx} className="border-b border-line-soft hover:bg-sunken transition-colors">
+                                <td className="py-1.5 px-2 font-mono text-ink-80 whitespace-nowrap">
+                                  {performanceTime(o.window_start)}
+                                </td>
+                                <td className="py-1.5 px-2 text-center">
+                                  <span className={`px-1.5 py-0.2 rounded-xs font-bold text-[10px] ${
+                                    o.direction === 'UP' ? 'bg-positive-soft text-positive' : 'bg-negative-soft text-negative'
+                                  }`}>
+                                    {o.direction}
+                                  </span>
+                                </td>
+                                <td className="py-1.5 px-2 text-right font-mono text-ink-95">
+                                  {o.entry_price != null ? o.entry_price.toFixed(3) : '--'}
+                                </td>
+                                <td className="py-1.5 px-2 text-center">
+                                  {o.win == null ? (
+                                    <span className="text-ink-40">未结算</span>
+                                  ) : won ? (
+                                    <span className="text-positive font-bold">胜</span>
+                                  ) : (
+                                    <span className="text-negative font-bold">负</span>
+                                  )}
+                                </td>
+                                <td className={`py-1.5 px-2 text-right font-mono font-medium ${
+                                  o.ev == null ? 'text-ink-40' : o.ev >= 0 ? 'text-positive' : 'text-negative'
+                                }`}>
+                                  {evFmt(o.ev)}
+                                </td>
+                                <td className="py-1.5 px-2 text-center">
+                                  {o.guarded_pass ? (
+                                    <span className="px-1.5 py-0.2 text-[10px] font-medium text-brand bg-brand-soft rounded-pill" title="通过护栏与进场白名单">
+                                      通过
+                                    </span>
+                                  ) : (
+                                    <span className="px-1.5 py-0.2 text-[10px] font-medium text-negative bg-negative-soft rounded-pill" title={o.reject_reason ?? '弃单'}>
+                                      {o.reject_reason ?? '弃单'}
+                                    </span>
+                                  )}
+                                </td>
+                                <td className="py-1.5 px-2 text-center whitespace-nowrap">
+                                  {lo ? (
+                                    <span className={`px-1.5 py-0.2 text-[10px] font-medium rounded-pill ${
+                                      lo.status === 'FILLED'
+                                        ? 'bg-positive-soft text-positive border border-positive/30'
+                                        : lo.status === 'FAILED'
+                                        ? 'bg-negative-soft text-negative border border-negative/30'
+                                        : 'bg-warning-soft text-warning'
+                                    }`} title={lo.error_message ? `错误: ${lo.error_message}` : `订单: ${lo.order_id ?? lo.id}`}>
+                                      {lo.status === 'FILLED' ? '已成交' : lo.status === 'FAILED' ? '失败/拒单' : lo.status}
+                                    </span>
+                                  ) : (
+                                    <span className="text-ink-40 text-[10px]">未下单</span>
+                                  )}
+                                </td>
+                                <td className="py-1.5 px-2 text-right font-mono">
+                                  {lo?.average_price != null ? (
+                                    <span className="inline-flex items-center gap-0.5 justify-end">
+                                      {lo.average_price.toFixed(3)}
+                                      {lo.price_kind === 'quote' && (
+                                        <span className="text-[9px] px-0.5 py-0.2 rounded-xs bg-warning-soft text-warning" title="报价/委托价">
+                                          报
+                                        </span>
+                                      )}
+                                    </span>
+                                  ) : '--'}
+                                </td>
+                                <td className="py-1.5 px-2 text-right font-mono text-ink-80">
+                                  {lo ? `${lo.amount_usdt.toFixed(1)}U` : '--'}
+                                </td>
+                                <td className={`py-1.5 px-2 text-right font-mono font-bold ${
+                                  lo?.pnl == null ? 'text-ink-40' : lo.pnl >= 0 ? 'text-positive' : 'text-negative'
+                                }`}>
+                                  {lo?.pnl != null ? `${lo.pnl >= 0 ? '+' : ''}${lo.pnl.toFixed(2)}U` : '--'}
+                                </td>
+                                <td className="py-1.5 px-2 text-center">
+                                  {lo == null ? (
+                                    <span className="text-ink-40">--</span>
+                                  ) : liveWon ? (
+                                    <span className="text-positive font-bold">胜</span>
+                                  ) : liveLost ? (
+                                    <span className="text-negative font-bold">负</span>
+                                  ) : (
+                                    <span className="text-ink-40">{lo.status === 'FAILED' ? '拒' : '--'}</span>
+                                  )}
+                                </td>
+                              </tr>
+                            )
+                          })
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  {/* 分页器 */}
+                  {totalPages > 1 && (
+                    <div className="flex items-center justify-between gap-2 mt-2 text-xs">
+                      <span className="text-ink-55">
+                        共 {filteredOrders.length} 条记录
+                      </span>
+                      <div className="flex items-center gap-1">
+                        <button
+                          disabled={safePage <= 1}
+                          onClick={() => setPage(safePage - 1)}
+                          className="px-2 py-0.5 border border-line rounded-sm disabled:opacity-40 hover:border-brand"
+                        >
+                          上一页
+                        </button>
+                        <span className="px-2 font-mono">
+                          {safePage} / {totalPages}
+                        </span>
+                        <button
+                          disabled={safePage >= totalPages}
+                          onClick={() => setPage(safePage + 1)}
+                          className="px-2 py-0.5 border border-line rounded-sm disabled:opacity-40 hover:border-brand"
+                        >
+                          下一页
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Tab 2: 走势曲线图表 */}
+              {activeTab === 'chart' && (
+                <div className="space-y-4">
+                  <div className="p-3 bg-sunken rounded-sm border border-line-soft text-xs space-y-1">
+                    <div className="font-semibold text-ink-95">曲线走势对比口径：</div>
+                    <div className="text-ink-55 flex items-center gap-4 flex-wrap">
+                      <span><span className="inline-block w-2.5 h-2.5 rounded-full bg-brand mr-1"></span>带护栏实际累计 EV（已过滤超价/贴线弃单）</span>
+                      <span><span className="inline-block w-2.5 h-2.5 rounded-full bg-chart-1 mr-1"></span>全量理论累计 EV（原始全量影子信号）</span>
+                      <span><span className="inline-block w-2.5 h-2.5 rounded-full bg-positive mr-1"></span>实盘累计真实盈亏 PnL (USDT)</span>
+                    </div>
+                  </div>
+
+                  <div className="border border-line rounded-sm p-3 bg-card">
+                    <div className="text-xs font-bold text-ink-95 mb-2">累计收益与盈亏走势 (EV vs USDT)</div>
+                    <ResponsiveContainer width="100%" height={280}>
+                      <ComposedChart data={data.curves}>
+                        <CartesianGrid stroke="var(--line-soft)" />
+                        <XAxis
+                          dataKey="ts"
+                          type="number"
+                          domain={['dataMin', 'dataMax']}
+                          scale="time"
+                          tickFormatter={performanceTime}
+                          tick={{ fontSize: 10, fill: 'var(--ink-55)' }}
+                        />
+                        <YAxis yAxisId="ev" tick={{ fontSize: 10, fill: 'var(--ink-55)' }} />
+                        <YAxis yAxisId="pnl" orientation="right" tick={{ fontSize: 10, fill: 'var(--ink-55)' }} tickFormatter={v => `${v}U`} />
+                        <Tooltip
+                          contentStyle={TOOLTIP_STYLE}
+                          labelStyle={TOOLTIP_LABEL_STYLE}
+                          itemStyle={TOOLTIP_ITEM_STYLE}
+                          labelFormatter={v => performanceTime(Number(v))}
+                        />
+                        <Legend />
+                        <ReferenceLine yAxisId="ev" y={0} stroke="var(--line)" strokeDasharray="3 3" />
+                        <Line
+                          yAxisId="ev"
+                          name="带护栏累计EV"
+                          dataKey="cum_ev_guarded"
+                          stroke="var(--brand)"
+                          strokeWidth={2}
+                          dot={false}
+                          connectNulls
+                        />
+                        <Line
+                          yAxisId="ev"
+                          name="全量理论累计EV"
+                          dataKey="cum_ev_theoretical"
+                          stroke="var(--chart-1)"
+                          strokeWidth={1.5}
+                          strokeDasharray="4 2"
+                          dot={false}
+                          connectNulls
+                        />
+                        {s && s.live_orders_count > 0 && (
+                          <Line
+                            yAxisId="pnl"
+                            name="实盘累计盈亏(USDT)"
+                            dataKey="cum_pnl_live"
+                            stroke="var(--positive)"
+                            strokeWidth={2}
+                            dot={false}
+                            connectNulls
+                          />
+                        )}
+                      </ComposedChart>
+                    </ResponsiveContainer>
+                  </div>
+
+                  <div className="border border-line rounded-sm p-3 bg-card">
+                    <div className="text-xs font-bold text-ink-95 mb-2">前向滚动胜率演进</div>
+                    <ResponsiveContainer width="100%" height={220}>
+                      <LineChart data={data.curves}>
+                        <CartesianGrid stroke="var(--line-soft)" />
+                        <XAxis
+                          dataKey="ts"
+                          type="number"
+                          domain={['dataMin', 'dataMax']}
+                          scale="time"
+                          tickFormatter={performanceTime}
+                          tick={{ fontSize: 10, fill: 'var(--ink-55)' }}
+                        />
+                        <YAxis domain={[0, 1]} tick={{ fontSize: 10, fill: 'var(--ink-55)' }} tickFormatter={v => `${(v * 100).toFixed(0)}%`} />
+                        <Tooltip
+                          contentStyle={TOOLTIP_STYLE}
+                          labelStyle={TOOLTIP_LABEL_STYLE}
+                          itemStyle={TOOLTIP_ITEM_STYLE}
+                          labelFormatter={v => performanceTime(Number(v))}
+                          formatter={v => [typeof v === 'number' ? `${(v * 100).toFixed(1)}%` : '--', '']}
+                        />
+                        <Legend />
+                        {data.bench_winrate != null && (
+                          <ReferenceLine y={data.bench_winrate} stroke="var(--warning)" strokeDasharray="5 3" label="回测基准" />
+                        )}
+                        <Line
+                          name="带护栏胜率"
+                          dataKey="win_rate_guarded"
+                          stroke="var(--brand)"
+                          strokeWidth={2}
+                          dot={false}
+                          connectNulls
+                        />
+                        <Line
+                          name="理论全量胜率"
+                          dataKey="win_rate_theoretical"
+                          stroke="var(--ink-40)"
+                          strokeWidth={1.5}
+                          dot={false}
+                          connectNulls
+                        />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+              )}
+
+              {/* Tab 3: 分桶与归因 */}
+              {activeTab === 'buckets' && (
+                <div className="space-y-4">
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    {/* 报价区间分桶 */}
+                    <div className="border border-line rounded-sm p-3 bg-card">
+                      <div className="text-xs font-bold text-ink-95 mb-2">
+                        按入场报价分档表现 (Quote Buckets)
+                      </div>
+                      <table className="w-full text-xs">
+                        <thead>
+                          <tr className="border-b border-line text-ink-55">
+                            <th className="py-1 px-1.5 text-left">报价档位</th>
+                            <th className="py-1 px-1.5 text-right">信号数</th>
+                            <th className="py-1 px-1.5 text-right">理论胜率</th>
+                            <th className="py-1 px-1.5 text-right">单均EV</th>
+                            <th className="py-1 px-1.5 text-right">实盘单数</th>
+                            <th className="py-1 px-1.5 text-right">实盘PnL</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {data.quote_buckets.map((b, i) => (
+                            <tr key={i} className="border-b border-line-soft hover:bg-sunken">
+                              <td className="py-1 px-1.5 font-mono text-ink-95 font-medium">{b.range}</td>
+                              <td className="py-1 px-1.5 text-right font-mono text-ink-80">{b.signals}</td>
+                              <td className="py-1 px-1.5 text-right font-mono font-medium text-brand">
+                                {pct1(b.win_rate)}
+                              </td>
+                              <td className={`py-1 px-1.5 text-right font-mono ${
+                                b.avg_ev == null ? 'text-ink-40' : b.avg_ev >= 0 ? 'text-positive' : 'text-negative'
+                              }`}>
+                                {evFmt(b.avg_ev)}
+                              </td>
+                              <td className="py-1 px-1.5 text-right font-mono text-ink-80">{b.live_orders || '--'}</td>
+                              <td className={`py-1 px-1.5 text-right font-mono font-bold ${
+                                b.live_pnl == null ? 'text-ink-40' : b.live_pnl >= 0 ? 'text-positive' : 'text-negative'
+                              }`}>
+                                {b.live_pnl != null ? `${b.live_pnl >= 0 ? '+' : ''}${b.live_pnl.toFixed(1)}U` : '--'}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+
+                    {/* UTC 时段分档 */}
+                    <div className="border border-line rounded-sm p-3 bg-card">
+                      <div className="text-xs font-bold text-ink-95 mb-2">
+                        按 UTC 时段分布表现 (Hour Buckets)
+                      </div>
+                      <table className="w-full text-xs">
+                        <thead>
+                          <tr className="border-b border-line text-ink-55">
+                            <th className="py-1 px-1.5 text-left">UTC 时段</th>
+                            <th className="py-1 px-1.5 text-right">信号数</th>
+                            <th className="py-1 px-1.5 text-right">理论胜率</th>
+                            <th className="py-1 px-1.5 text-right">单均EV</th>
+                            <th className="py-1 px-1.5 text-right">实盘单数</th>
+                            <th className="py-1 px-1.5 text-right">实盘PnL</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {data.hour_buckets.map((b, i) => (
+                            <tr key={i} className="border-b border-line-soft hover:bg-sunken">
+                              <td className="py-1 px-1.5 font-mono text-ink-95 font-medium">{b.hour_range}</td>
+                              <td className="py-1 px-1.5 text-right font-mono text-ink-80">{b.signals}</td>
+                              <td className="py-1 px-1.5 text-right font-mono font-medium text-brand">
+                                {pct1(b.win_rate)}
+                              </td>
+                              <td className={`py-1 px-1.5 text-right font-mono ${
+                                b.avg_ev == null ? 'text-ink-40' : b.avg_ev >= 0 ? 'text-positive' : 'text-negative'
+                              }`}>
+                                {evFmt(b.avg_ev)}
+                              </td>
+                              <td className="py-1 px-1.5 text-right font-mono text-ink-80">{b.live_orders || '--'}</td>
+                              <td className={`py-1 px-1.5 text-right font-mono font-bold ${
+                                b.live_pnl == null ? 'text-ink-40' : b.live_pnl >= 0 ? 'text-positive' : 'text-negative'
+                              }`}>
+                                {b.live_pnl != null ? `${b.live_pnl >= 0 ? '+' : ''}${b.live_pnl.toFixed(1)}U` : '--'}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function ShadowSignalCard({
   title,
   entries,
@@ -7327,6 +8024,7 @@ function ShadowSignalCard({
   const [guardMode, setGuardMode] = useState<'GUARDED' | 'THEORETICAL' | 'BOTH'>('GUARDED')
   const [sortCol, setSortCol] = useState<string>('default')
   const [sortAsc, setSortAsc] = useState<boolean>(false)
+  const [detailVersion, setDetailVersion] = useState<string | null>(null)
 
   if (entries.length === 0) {
     return (
@@ -7540,6 +8238,7 @@ function ShadowSignalCard({
                   {thSort('ver', '版本 / 分类', 'left')}
                   {thSort('status', '影子采集', 'center')}
                   {thSort('live', '实盘', 'center')}
+                  <th className="py-1 px-2 text-center" title="查看单信号逐笔订单与实盘对齐对比分析">订单/对比</th>
                   <th className="py-1 px-2 text-right" title="实盘执行价护栏（超价或贴线弃单）">护栏/弃单</th>
                   {guardMode === 'BOTH' ? (
                     <>
@@ -7664,6 +8363,15 @@ function ShadowSignalCard({
                           </span>
                         )}
                       </td>
+                      <td className="py-1 px-2 text-center">
+                        <button
+                          onClick={() => setDetailVersion(k)}
+                          className="px-2 py-0.5 rounded-pill text-[10px] font-semibold border border-brand/40 bg-brand-soft text-brand hover:bg-brand hover:text-white transition shadow-2xs"
+                          title="查看该信号逐笔详情、实盘订单对齐与分析图表"
+                        >
+                          详情 / 对比
+                        </button>
+                      </td>
                       <td className="py-1 px-2 text-right font-mono text-ink-55" title={s.guard_price != null ? `护栏 ≤ ${s.guard_price}；已拦截弃单 ${s.guarded_rejected_n ?? 0} 笔` : '未配置护栏'}>
                         {s.guard_price != null ? (
                           <span>
@@ -7780,6 +8488,12 @@ function ShadowSignalCard({
         </>
       )}
       <div className="text-[10px] text-ink-55 mt-1">{footnote}</div>
+      {detailVersion && (
+        <ShadowSignalDetailModal
+          version={detailVersion}
+          onClose={() => setDetailVersion(null)}
+        />
+      )}
     </Card>
   )
 }

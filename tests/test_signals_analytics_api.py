@@ -994,3 +994,104 @@ async def test_analytics_shadow_guarded_metrics_and_curves() -> None:
     assert x4["guarded_curve"][0]["cum_wr"] == 0.0
     assert x4["guarded_curve"][1]["cum_wr"] == 0.5
 
+
+@pytest.mark.asyncio
+async def test_shadow_signal_detail_api() -> None:
+    """测试单影子信号详情端点：逐笔对齐、执行漏斗、实盘订单关联、分桶与曲线。"""
+    import binance_predict.main as m
+    from datetime import datetime, timezone
+
+    # 构造影子行
+    fh_rows = [
+        _shadow_row(version="firsthit_down_v1", window_start=1_000, win=True,
+                    entry_down_price=0.07, direction="DOWN", ev_at_entry=0.98/0.07 - 1),
+        _shadow_row(version="firsthit_down_v1", window_start=2_000, win=False,
+                    entry_down_price=0.08, direction="DOWN", ev_at_entry=-1.0),
+        _shadow_row(version="firsthit_down_v1", window_start=3_000, win=False,
+                    entry_down_price=0.09, direction="DOWN", ev_at_entry=-1.0),
+    ]
+
+    # 构造模拟的实盘订单
+    live_orders = [
+        SimpleNamespace(
+            id=101,
+            order_id="binance_ord_1",
+            signal_version="firsthit_down_v1",
+            window_start=1_000,
+            status="FILLED",
+            amount_in="2000000000000000000",  # 2 USDT in wei
+            quote_json={"averagePrice": 0.072, "fillSource": "binance_history_confirm"},
+            direction="DOWN",
+            win=True,
+            pnl=25.2,
+            settle_outcome="DOWN",
+            error_message=None,
+            created_at=datetime.fromtimestamp(1, tz=timezone.utc),
+            settled_at=datetime.fromtimestamp(300, tz=timezone.utc),
+        ),
+        SimpleNamespace(
+            id=102,
+            order_id="binance_ord_2",
+            signal_version="firsthit_down_v1",
+            window_start=2_000,
+            status="FAILED",
+            amount_in="2000000000000000000",
+            quote_json={"averagePrice": 0.081},
+            direction="DOWN",
+            win=None,
+            pnl=0.0,
+            settle_outcome=None,
+            error_message="MAX_PRICE_GUARD",
+            created_at=datetime.fromtimestamp(2, tz=timezone.utc),
+            settled_at=None,
+        ),
+    ]
+
+    async def _mock_execute(stmt):
+        stmt_str = str(stmt)
+        res = MagicMock()
+        if "trade_orders" in stmt_str:
+            res.scalars.return_value.all.return_value = live_orders
+        elif "firsthit_shadow_signals" in stmt_str:
+            res.all.return_value = fh_rows
+        else:
+            res.all.return_value = []
+            res.scalars.return_value.all.return_value = []
+        return res
+
+    mock_db = AsyncMock()
+    mock_db.execute = AsyncMock(side_effect=_mock_execute)
+
+    res = await m.get_shadow_signal_detail(version="firsthit_down_v1", limit=100, db=mock_db)
+
+    assert res["version"] == "firsthit_down_v1"
+    summary = res["summary"]
+    assert summary["total_signals"] == 3
+    assert summary["theoretical_wins"] == 1
+    assert summary["guarded_signals"] == 1  # 0.07 通过护栏 0.08
+    assert summary["rejected_signals"] == 2
+    assert summary["live_orders_count"] == 2
+    assert summary["live_filled_count"] == 1
+    assert summary["live_wins"] == 1
+    assert summary["live_total_pnl"] == 25.2
+
+    # 检查 orders 对齐
+    assert len(res["orders"]) == 3
+    # 倒序排列：第 1 条是 window_start=3000，没有实盘订单
+    assert res["orders"][0]["window_start"] == 3_000
+    assert res["orders"][0]["live_order"] is None
+    assert res["orders"][0]["guarded_pass"] is False
+
+    # 第 3 条是 window_start=1000，有成交实盘订单
+    assert res["orders"][2]["window_start"] == 1_000
+    assert res["orders"][2]["guarded_pass"] is True
+    assert res["orders"][2]["live_order"]["status"] == "FILLED"
+    assert res["orders"][2]["live_order"]["pnl"] == 25.2
+    assert res["orders"][2]["live_order"]["amount_usdt"] == 2.0
+    assert res["orders"][2]["live_order"]["price_kind"] == "fill"
+
+    # 检查 curves
+    assert len(res["curves"]) == 3
+    assert res["curves"][0]["cum_ev_theoretical"] == pytest.approx(0.98/0.07 - 1)
+
+

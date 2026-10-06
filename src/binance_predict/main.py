@@ -4899,6 +4899,355 @@ async def get_signals_analytics(
     }
 
 
+@app.get("/api/signals/shadow/detail")
+async def get_shadow_signal_detail(
+    version: str = Query(..., description="影子版本名/通道名"),
+    limit: int = Query(500, ge=1, le=2000, description="最大返回记录数"),
+    db: AsyncSession = Depends(get_db),
+):
+    """单影子信号订单详情与实盘对比分析聚合端点。
+
+    - 逐笔对齐：以 window_start 将影子理论事件与同窗口同通道实盘订单 1:1 对齐
+    - 执行漏斗：理论总数、带护栏实际数、实盘下单数、实盘成交数、实盘盈亏
+    - 对比曲线：理论累计EV、带护栏实际累计EV、实盘累计盈亏(USDT)、滚动胜率
+    - 报价分布与分桶：按入场报价分档统计胜率、EV及实盘表现
+    - 护栏反事实效果：分析被拦截单若成交的胜率与成功避损/错失EV
+    """
+    from decimal import Decimal
+    from sqlalchemy import select as sa_select
+    from .db.models import TradeOrderModel
+    from .services.candlestick_shadow_detector import CANDLESTICK_LOGICAL_SPECS
+    from .services.live_channel_benchmarks import get_channel_benchmark
+    from .services.live_channels import LIVE_CHANNELS, RETIRED_CHANNEL_SPECS
+    from .services.shadow_execution_registry import SHADOW_VERSION_SPECS
+
+    v = version.strip()
+    if not v:
+        raise HTTPException(status_code=422, detail="version 不能为空")
+
+    # 1. 加载该版本影子行
+    all_sh_rows = await _load_shadow_settled_rows(db, {v})
+    sh_rows = [r for r in all_sh_rows if r.version == v and r.win is not None]
+    sh_rows.sort(key=lambda r: int(r.window_start or 0))
+
+    # 2. 查询该版本对应的实盘订单
+    stmt = sa_select(TradeOrderModel).where(
+        TradeOrderModel.signal_version == v
+    ).order_by(TradeOrderModel.window_start.asc(), TradeOrderModel.id.asc())
+    order_rows = (await db.execute(stmt)).scalars().all()
+
+    # 按 window_start 建立实盘订单索引；若同一窗口有多条，FILLED 优先，其次最新
+    orders_by_ws: dict[int, TradeOrderModel] = {}
+    for o in order_rows:
+        if o.window_start is None:
+            continue
+        ws = int(o.window_start)
+        existing = orders_by_ws.get(ws)
+        if existing is None:
+            orders_by_ws[ws] = o
+        elif o.status == "FILLED" and existing.status != "FILLED":
+            orders_by_ws[ws] = o
+        elif o.id > existing.id and (o.status == "FILLED" or existing.status != "FILLED"):
+            orders_by_ws[ws] = o
+
+    # 3. 获取通道配置与护栏
+    live_by_ch = _current_live_channels()
+    ch_spec = LIVE_CHANNELS.get(v) or RETIRED_CHANNEL_SPECS.get(v)
+    active_lc = live_by_ch.get(v)
+    effective_guard: float | None = None
+    if active_lc is not None and active_lc.get("max_exec_price") is not None:
+        effective_guard = float(active_lc["max_exec_price"])
+    elif ch_spec is not None:
+        effective_guard = ch_spec.auto_max_exec
+    entry_bands = ch_spec.entry_band_whitelist if ch_spec is not None else None
+
+    bwr, bev, desc = SHADOW_BENCH.get(v, (None, None, ""))
+    bench_obj = get_channel_benchmark(v)
+    if bench_obj is not None:
+        bwr = bench_obj.win_rate
+
+    # 4. 逐笔比对与指标聚合
+    aligned_items = []
+    curves = []
+
+    theo_wins = 0
+    guarded_wins = 0
+    guarded_n = 0
+    theo_cum_ev = 0.0
+    guarded_cum_ev = 0.0
+    live_cum_pnl = 0.0
+
+    theo_ev_list = []
+    guarded_ev_list = []
+    theo_quotes = []
+    live_fill_prices = []
+
+    rejected_wins = 0
+    rejected_losses = 0
+    rejected_ev_sum = 0.0
+    rejected_n = 0
+
+    live_filled_n = 0
+    live_filled_wins = 0
+    live_total_pnl = 0.0
+
+    # 报价分桶：<0.30, 0.30~0.40, 0.40~0.50, 0.50~0.55, 0.55~0.60, >=0.60
+    buckets_def = [
+        ("< 0.30", 0.0, 0.30),
+        ("0.30~0.40", 0.30, 0.40),
+        ("0.40~0.50", 0.40, 0.50),
+        ("0.50~0.55", 0.50, 0.55),
+        ("0.55~0.60", 0.55, 0.60),
+        (">= 0.60", 0.60, 2.0),
+    ]
+    bucket_stats = {
+        b[0]: {"range": b[0], "signals": 0, "wins": 0, "ev_sum": 0.0, "live_orders": 0, "live_wins": 0, "live_pnl": 0.0}
+        for b in buckets_def
+    }
+
+    # 时段分桶：6 档 UTC 小时 (00-04, 04-08, 08-12, 12-16, 16-20, 20-24)
+    hour_def = [
+        ("00-04", 0, 4), ("04-08", 4, 8), ("08-12", 8, 12),
+        ("12-16", 12, 16), ("16-20", 16, 20), ("20-24", 20, 24),
+    ]
+    hour_stats = {
+        h[0]: {"hour_range": h[0], "signals": 0, "wins": 0, "ev_sum": 0.0, "live_orders": 0, "live_wins": 0, "live_pnl": 0.0}
+        for h in hour_def
+    }
+
+    for idx, s in enumerate(sh_rows, 1):
+        ws = int(s.window_start)
+        won = bool(s.win)
+        theo_wins += int(won)
+
+        q = s.entry_down_price if s.direction == "DOWN" else s.entry_up_price
+        valid_q = q is not None and float(q) > 0
+        q_val = float(q) if valid_q else None
+
+        ev = None
+        if valid_q:
+            ev = (float(s.ev_at_entry) if s.ev_at_entry is not None
+                  else _shadow_realized_ev(v, won, q_val))
+            theo_quotes.append(q_val)
+        if ev is not None:
+            theo_ev_list.append(ev)
+            theo_cum_ev += ev
+
+        be = _shadow_breakeven(v, q_val) if q_val is not None else None
+
+        # 护栏判定
+        is_pass = _is_guarded_pass(q_val, effective_guard, entry_bands) if (effective_guard is not None or entry_bands is not None) else True
+        reject_reason = None
+        if not is_pass:
+            rejected_n += 1
+            if won:
+                rejected_wins += 1
+            else:
+                rejected_losses += 1
+            if ev is not None:
+                rejected_ev_sum += ev
+            if q_val is None:
+                reject_reason = "缺失真实报价"
+            elif effective_guard is not None and q_val >= effective_guard:
+                reject_reason = f"超护栏(报价{q_val:.3f}≥{effective_guard:.3f})"
+            elif entry_bands is not None:
+                reject_reason = "不在进场白名单区间"
+            else:
+                reject_reason = "未满足入场条件"
+        else:
+            guarded_n += 1
+            guarded_wins += int(won)
+            if ev is not None:
+                guarded_ev_list.append(ev)
+                guarded_cum_ev += ev
+
+        # 匹配同窗口实盘订单
+        live_o = orders_by_ws.get(ws)
+        live_order_dict = None
+        if live_o is not None:
+            amt_usdt = 0.0
+            try:
+                amt_usdt = float(Decimal(str(live_o.amount_in or 0)) / Decimal(10**18))
+            except Exception:
+                amt_usdt = 0.0
+            avg_p = (live_o.quote_json or {}).get("averagePrice")
+            avg_p_val = float(avg_p) if avg_p is not None else None
+            p_kind = _order_price_kind(live_o)
+
+            if live_o.status == "FILLED":
+                live_filled_n += 1
+                if live_o.win is True:
+                    live_filled_wins += 1
+                if live_o.pnl is not None:
+                    pnl_f = float(live_o.pnl)
+                    live_total_pnl += pnl_f
+                    live_cum_pnl += pnl_f
+                if avg_p_val is not None:
+                    live_fill_prices.append(avg_p_val)
+
+            live_order_dict = {
+                "id": live_o.id,
+                "order_id": live_o.order_id,
+                "status": live_o.status,
+                "amount_usdt": round(amt_usdt, 2),
+                "average_price": avg_p_val,
+                "price_kind": p_kind,
+                "win": live_o.win,
+                "pnl": round(float(live_o.pnl), 4) if live_o.pnl is not None else None,
+                "settle_outcome": live_o.settle_outcome,
+                "error_message": live_o.error_message,
+                "created_at": live_o.created_at.isoformat() if live_o.created_at else None,
+                "settled_at": live_o.settled_at.isoformat() if live_o.settled_at else None,
+            }
+
+        aligned_items.append({
+            "window_start": ws,
+            "direction": s.direction or "DOWN",
+            "entry_price": q_val,
+            "win": won,
+            "ev": round(ev, 4) if ev is not None else None,
+            "breakeven": round(be, 4) if be is not None else None,
+            "guarded_pass": is_pass,
+            "reject_reason": reject_reason,
+            "live_order": live_order_dict,
+        })
+
+        curves.append({
+            "i": idx,
+            "ts": ws,
+            "cum_ev_theoretical": round(theo_cum_ev, 4),
+            "cum_ev_guarded": round(guarded_cum_ev, 4),
+            "cum_pnl_live": round(live_cum_pnl, 4) if len(order_rows) > 0 else None,
+            "win_rate_theoretical": round(theo_wins / idx, 4),
+            "win_rate_guarded": round(guarded_wins / guarded_n, 4) if guarded_n else None,
+        })
+
+        # 报价分桶统计
+        if q_val is not None:
+            for b_label, b_min, b_max in buckets_def:
+                if b_min <= q_val < b_max:
+                    st = bucket_stats[b_label]
+                    st["signals"] += 1
+                    if won:
+                        st["wins"] += 1
+                    if ev is not None:
+                        st["ev_sum"] += ev
+                    if live_order_dict and live_order_dict["status"] == "FILLED":
+                        st["live_orders"] += 1
+                        if live_order_dict["win"]:
+                            st["live_wins"] += 1
+                        if live_order_dict["pnl"] is not None:
+                            st["live_pnl"] += live_order_dict["pnl"]
+                    break
+
+        # 时段分桶统计 (UTC)
+        hr = datetime.fromtimestamp(ws / 1000, tz=timezone.utc).hour
+        for h_label, h_min, h_max in hour_def:
+            if h_min <= hr < h_max:
+                hst = hour_stats[h_label]
+                hst["signals"] += 1
+                if won:
+                    hst["wins"] += 1
+                if ev is not None:
+                    hst["ev_sum"] += ev
+                if live_order_dict and live_order_dict["status"] == "FILLED":
+                    hst["live_orders"] += 1
+                    if live_order_dict["win"]:
+                        hst["live_wins"] += 1
+                    if live_order_dict["pnl"] is not None:
+                        hst["live_pnl"] += live_order_dict["pnl"]
+                break
+
+    # 规范化分桶数据
+    quote_bucket_list = []
+    for b_label, _, _ in buckets_def:
+        st = bucket_stats[b_label]
+        sig_n = st["signals"]
+        lo_n = st["live_orders"]
+        quote_bucket_list.append({
+            "range": st["range"],
+            "signals": sig_n,
+            "wins": st["wins"],
+            "win_rate": round(st["wins"] / sig_n, 4) if sig_n else None,
+            "avg_ev": round(st["ev_sum"] / sig_n, 4) if sig_n else None,
+            "live_orders": lo_n,
+            "live_wins": st["live_wins"],
+            "live_win_rate": round(st["live_wins"] / lo_n, 4) if lo_n else None,
+            "live_pnl": round(st["live_pnl"], 2) if lo_n else None,
+        })
+
+    hour_bucket_list = []
+    for h_label, _, _ in hour_def:
+        hst = hour_stats[h_label]
+        sig_n = hst["signals"]
+        lo_n = hst["live_orders"]
+        hour_bucket_list.append({
+            "hour_range": hst["hour_range"],
+            "signals": sig_n,
+            "wins": hst["wins"],
+            "win_rate": round(hst["wins"] / sig_n, 4) if sig_n else None,
+            "avg_ev": round(hst["ev_sum"] / sig_n, 4) if sig_n else None,
+            "live_orders": lo_n,
+            "live_wins": hst["live_wins"],
+            "live_win_rate": round(hst["live_wins"] / lo_n, 4) if lo_n else None,
+            "live_pnl": round(hst["live_pnl"], 2) if lo_n else None,
+        })
+
+    n_total = len(sh_rows)
+    avg_theo_q = (sum(theo_quotes) / len(theo_quotes)) if theo_quotes else None
+    avg_live_p = (sum(live_fill_prices) / len(live_fill_prices)) if live_fill_prices else None
+    slippage_bps = (
+        round((avg_live_p - avg_theo_q) * 10000, 1)
+        if avg_live_p is not None and avg_theo_q is not None else None
+    )
+
+    # 倒序截取供表格展示（支持通过 limit 参数截取最新记录）
+    items_out = list(reversed(aligned_items))[:limit]
+
+    return {
+        "version": v,
+        "desc": desc,
+        "family": (
+            "candlestick_reversal" if v.startswith(("candle_hm_", "candidate_"))
+            else getattr(SHADOW_VERSION_SPECS.get(v), "family", "legacy")
+        ),
+        "role": next((spec["role"] for spec in CANDLESTICK_LOGICAL_SPECS if spec["signal_id"] == v), "STRATEGY"),
+        "guard_price": effective_guard,
+        "bench_winrate": bwr,
+        "summary": {
+            "total_signals": n_total,
+            "theoretical_wins": theo_wins,
+            "theoretical_win_rate": round(theo_wins / n_total, 4) if n_total else None,
+            "theoretical_avg_ev": round(sum(theo_ev_list) / len(theo_ev_list), 4) if theo_ev_list else None,
+            "theoretical_cum_ev": round(theo_cum_ev, 4),
+            "guarded_signals": guarded_n,
+            "guarded_wins": guarded_wins,
+            "guarded_win_rate": round(guarded_wins / guarded_n, 4) if guarded_n else None,
+            "guarded_pass_rate": round(guarded_n / n_total, 4) if n_total else None,
+            "guarded_avg_ev": round(sum(guarded_ev_list) / len(guarded_ev_list), 4) if guarded_ev_list else None,
+            "guarded_cum_ev": round(guarded_cum_ev, 4),
+            "rejected_signals": rejected_n,
+            "rejected_wins": rejected_wins,
+            "rejected_losses": rejected_losses,
+            "rejected_win_rate": round(rejected_wins / rejected_n, 4) if rejected_n else None,
+            "avoided_loss_ev": round(-rejected_ev_sum, 4) if rejected_n else 0.0,
+            "live_orders_count": len(order_rows),
+            "live_filled_count": live_filled_n,
+            "live_wins": live_filled_wins,
+            "live_win_rate": round(live_filled_wins / live_filled_n, 4) if live_filled_n else None,
+            "live_total_pnl": round(live_total_pnl, 2),
+            "live_avg_pnl": round(live_total_pnl / live_filled_n, 4) if live_filled_n else None,
+            "avg_quote_price": round(avg_theo_q, 4) if avg_theo_q is not None else None,
+            "avg_live_fill_price": round(avg_live_p, 4) if avg_live_p is not None else None,
+            "slippage_bps": slippage_bps,
+        },
+        "curves": curves[-500:],
+        "quote_buckets": quote_bucket_list,
+        "hour_buckets": hour_bucket_list,
+        "orders": items_out,
+    }
+
+
 # ============================================================
 # 信号体检（2026-10-06）：影子+实盘统一健康指标、红黄绿灯、转红微信告警
 # 只建议不自动处置；LLM 诊断仅留口（services.signal_health_service.llm_diagnose_hook）
