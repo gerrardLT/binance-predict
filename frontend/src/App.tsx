@@ -597,6 +597,13 @@ const api = {
   getCompareLive: () =>
     authFetch('/api/sentiment/agent/deep-learn/compare/live').then(r => r.json()),
   getAgentHealth: () => authFetch('/api/agent/health').then(r => r.json()),
+  // 信号体检（影子+实盘统一红黄绿灯；下钻；AI 诊断留口）
+  getSignalsHealth: (refresh = false) =>
+    authFetch(`/api/signals/health${refresh ? '?refresh=true' : ''}`).then(r => r.json()),
+  getSignalsHealthDetail: (scope: string, key: string) =>
+    authFetch(`/api/signals/health/detail?scope=${scope}&key=${encodeURIComponent(key)}`).then(r => r.json()),
+  postSignalsHealthDiagnose: (scope: string, key: string) =>
+    authFetch(`/api/signals/health/diagnose?scope=${scope}&key=${encodeURIComponent(key)}`, { method: 'POST' }).then(r => r.json()),
   getAgentEvolution: (days = 30) =>
     authFetch(`/api/sentiment/agent/evolution?days=${days}`).then(r => r.json()),
   getFakeBreakoutStatus: () => authFetch('/api/fake-breakout/status').then(r => r.json()),
@@ -4842,7 +4849,7 @@ function EvolutionModal({ onClose }: { onClose: () => void }) {
 }
 
 // ============================================================
-// 运行监控 Tab（GET /api/agent/health，30s 轮询）
+// Agent 运行健康子视图（GET /api/agent/health，30s 轮询；原「运行监控」页内容）
 // ============================================================
 
 function healthTone(status: string): { dot: string; text: string; label: string } {
@@ -4865,7 +4872,7 @@ function fmtNum(v: unknown, digits = 2): string {
   return v.toFixed(digits)
 }
 
-function MonitorTab() {
+function AgentHealthView() {
   const [report, setReport] = useState<HealthReport | null>(null)
   const [err, setErr] = useState('')
 
@@ -4999,6 +5006,478 @@ function MonitorTab() {
           </table>
         )}
       </Card>
+    </div>
+  )
+}
+
+// ============================================================
+// 运行监控 Tab（2026-10-06 改造 P1/P2/P3 完整版）：信号体检（影子+实盘统一红黄绿灯、Regime分桶、死因诊断、共振矩阵）
+// 数据：GET /api/signals/health（60s 轮询，后端 5min 缓存）；下钻 /health/detail；AI 诊断仅预留。
+// 口径：红灯 = 优势已变负的后验概率 ≥90% 且 n≥30；只建议，不自动关通道。
+// ============================================================
+
+interface SignalHealthMetrics {
+  n: number; wins: number; win_rate: number | null; win_rate_ci95: [number, number] | null
+  avg_ev: number | null; mean_breakeven: number | null; edge: number | null
+  p_edge_negative: number | null; bench_win_rate: number | null; p_below_bench: number | null
+  ev_ex_top1: number | null; ev_ex_top3: number | null; ev_ex_top5: number | null
+  top5_share: number | null; last_ts: number | null
+  recent20: { n: number; win_rate: number | null; avg_ev: number | null } | null
+  prev20: { n: number; win_rate: number | null; avg_ev: number | null } | null
+}
+type HealthLight = 'GRAY' | 'GREEN' | 'YELLOW' | 'RED'
+type DeathStatus = 'ALIVE' | 'EXPIRED' | 'SPURIOUS'
+
+interface ChangePointInfo {
+  change_ts: number | null
+  peak_cum_ev: number
+  current_cum_ev: number
+  drawdown_ev: number
+  post_peak_n: number
+  is_declining: boolean
+}
+
+interface ChannelCorrelation {
+  channel_a: string
+  channel_b: string
+  shared_windows: number
+  jaccard: number
+  agreement_rate: number
+}
+
+interface SignalHealthRow {
+  scope: 'live' | 'shadow'; key: string; light: HealthLight; reasons: string[]
+  metrics: SignalHealthMetrics; family: string | null; market_period: string | null
+  enabled: boolean; retired: boolean; active: boolean
+  death_status?: DeathStatus
+  death_reason?: string
+  change_point?: ChangePointInfo | null
+}
+
+interface SignalHealthReport {
+  generated_at: number; tally_active: Record<HealthLight, number>
+  thresholds: Record<string, number>; rows: SignalHealthRow[]
+  correlations?: ChannelCorrelation[]
+}
+
+interface HealthBucket {
+  segment: string; n: number; win_rate: number; win_rate_ci95: [number, number]
+  avg_ev: number | null; small_sample: boolean
+}
+
+interface SignalHealthDetail {
+  scope: string; key: string; light: HealthLight; reasons: string[]; metrics: SignalHealthMetrics
+  series: { ts: number; i: number; cum_ev: number; roll20_win: number | null; p_neg: number | null }[]
+  price_buckets: HealthBucket[]; hour_buckets: HealthBucket[]
+  trend_4h_buckets?: HealthBucket[]; trend_24h_buckets?: HealthBucket[]; volatility_buckets?: HealthBucket[]
+  death_status?: DeathStatus; death_reason?: string
+  change_point?: ChangePointInfo | null
+  history: { date: string; light: HealthLight; n: number; win_rate: number | null; avg_ev: number | null; p_edge_negative: number | null }[]
+  diagnosis_payload: Record<string, unknown>
+}
+
+const HEALTH_LIGHT: Record<HealthLight, { label: string; color: string; order: number }> = {
+  RED: { label: '红灯', color: 'var(--negative)', order: 0 },
+  YELLOW: { label: '黄灯', color: 'var(--warning)', order: 1 },
+  GREEN: { label: '绿灯', color: 'var(--positive)', order: 2 },
+  GRAY: { label: '样本不足', color: 'var(--ink-55)', order: 3 },
+}
+
+function LightDot({ light }: { light: HealthLight }) {
+  return <span className="inline-block w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: HEALTH_LIGHT[light].color }} title={HEALTH_LIGHT[light].label} />
+}
+
+function DeathBadge({ status, reason }: { status?: DeathStatus; reason?: string }) {
+  if (!status || status === 'ALIVE') return null
+  const isExp = status === 'EXPIRED'
+  return (
+    <span
+      className={`rounded-pill px-1.5 py-0.5 text-[9px] font-bold shrink-0 ${isExp ? 'bg-warning-soft text-warning' : 'bg-negative-soft text-negative'}`}
+      title={reason ?? (isExp ? '曾显著盈利后衰减' : '从未建立超额优势')}
+    >
+      {isExp ? '衰减' : '虚假'}
+    </span>
+  )
+}
+
+function BucketTable({ title, rows, hint }: { title: string; rows: HealthBucket[]; hint: string }) {
+  return (
+    <div>
+      <div className="text-xs font-bold text-ink-95 mb-1">{title} <HelpHint text={hint} /></div>
+      <table className="w-full text-[11px]">
+        <thead><tr className="text-ink-55 border-b border-line-soft">
+          <th className="py-1 text-left">区间</th><th className="py-1 text-right">n</th>
+          <th className="py-1 text-right">胜率</th><th className="py-1 text-right">95%区间</th><th className="py-1 text-right">均EV</th>
+        </tr></thead>
+        <tbody>{rows.map(b => (
+          <tr key={b.segment} className={`border-b border-line-soft ${b.small_sample ? 'text-ink-55' : ''}`}>
+            <td className="py-1 font-mono">{b.segment}{b.small_sample && <span className="ml-1 text-warning" title="样本不足 10，仅供参考">*</span>}</td>
+            <td className="py-1 text-right font-mono">{b.n}</td>
+            <td className="py-1 text-right font-mono">{performancePct(b.win_rate)}</td>
+            <td className="py-1 text-right font-mono">{performancePct(b.win_rate_ci95[0], 0)}~{performancePct(b.win_rate_ci95[1], 0)}</td>
+            <td className={`py-1 text-right font-mono ${signClass(b.avg_ev)}`}>{performanceSigned(b.avg_ev)}</td>
+          </tr>))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+function SignalHealthDrill({ scope, keyName, onClose }: { scope: string; keyName: string; onClose: () => void }) {
+  const [d, setD] = useState<SignalHealthDetail | null>(null)
+  const [err, setErr] = useState('')
+  const [diag, setDiag] = useState<Record<string, unknown> | null>(null)
+  const [diagBusy, setDiagBusy] = useState(false)
+  const [bucketTab, setBucketTab] = useState<'quote' | 'regime'>('quote')
+
+  useEffect(() => {
+    let alive = true
+    setD(null); setErr(''); setDiag(null)
+    api.getSignalsHealthDetail(scope, keyName)
+      .then((r: SignalHealthDetail & { detail?: string }) => {
+        if (!alive) return
+        if (r.metrics) setD(r)
+        else setErr(r.detail ?? '加载失败')
+      })
+      .catch(() => { if (alive) setErr('下钻数据获取失败') })
+    return () => { alive = false }
+  }, [scope, keyName])
+
+  const runDiagnose = async () => {
+    setDiagBusy(true)
+    try { setDiag(await api.postSignalsHealthDiagnose(scope, keyName)) }
+    catch { setDiag({ status: 'error', message: '请求失败' }) }
+    finally { setDiagBusy(false) }
+  }
+
+  const m = d?.metrics
+  const cp = d?.change_point
+  return (
+    <div className="bg-card rounded-card border border-line p-4 space-y-3">
+      <div className="flex items-center gap-2 flex-wrap">
+        {d && <LightDot light={d.light} />}
+        <span className="font-bold text-sm text-ink-95">{SIGNAL_INFO[keyName]?.name ?? keyName}</span>
+        <span className="text-[11px] text-ink-55 font-mono">{scope === 'live' ? '实盘' : '影子'} · {keyName}</span>
+        {d?.death_status && d.death_status !== 'ALIVE' && (
+          <DeathBadge status={d.death_status} reason={d.death_reason} />
+        )}
+        <button onClick={onClose} className="ml-auto px-2 py-0.5 text-[11px] rounded-pill bg-sunken text-ink-80 hover:bg-sunken-hover transition">收起</button>
+      </div>
+      {!d && <div className="text-center text-ink-55 py-6 text-sm">{err || '加载下钻中...'}</div>}
+      {d && m && (
+        <>
+          {d.reasons.length > 0 && (
+            <ul className="text-xs text-ink-80 bg-sunken rounded-sm px-3 py-2 space-y-0.5">{d.reasons.map((r, i) => <li key={i}>· {r}</li>)}</ul>
+          )}
+
+          {cp?.is_declining && (
+            <div className="text-xs rounded-sm bg-warning-soft text-warning px-3 py-2 flex items-center justify-between">
+              <span>
+                ⚠️ <strong>结构拐折点预警</strong>：该通道在 {cp.change_ts ? performanceTime(cp.change_ts) : '--'} 达到累计收益峰值 ({cp.peak_cum_ev} EV)，此后衰退 {cp.post_peak_n} 笔，累计回撤 <strong>-{cp.drawdown_ev} EV</strong>
+              </span>
+            </div>
+          )}
+
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-x-6">
+            <MetricKV label="样本 n" value={m.n} />
+            <MetricKV label="胜率" value={`${performancePct(m.win_rate)}（${m.win_rate_ci95 ? `${performancePct(m.win_rate_ci95[0], 0)}~${performancePct(m.win_rate_ci95[1], 0)}` : '--'}）`} />
+            <MetricKV label="平均保本" value={performancePct(m.mean_breakeven)} />
+            <MetricKV label="优势 = 胜率−保本" value={performanceSigned(m.edge == null ? null : m.edge * 100, '%', 1)} />
+            <MetricKV label="平均 EV" value={performanceSigned(m.avg_ev, '', 3)} />
+            <MetricKV label="剔除最赚1/3/5单" value={`${performanceSigned(m.ev_ex_top1, '', 2)} / ${performanceSigned(m.ev_ex_top3, '', 2)} / ${performanceSigned(m.ev_ex_top5, '', 2)}`} />
+            <MetricKV label="前5单占正收益" value={performancePct(m.top5_share, 0)} />
+            <MetricKV label="优势变负概率" value={performancePct(m.p_edge_negative, 0)} />
+            <MetricKV label="冻结基准胜率" value={performancePct(m.bench_win_rate)} />
+            <MetricKV label="低于基准 p 值" value={m.p_below_bench == null ? '--' : m.p_below_bench.toFixed(3)} />
+            <MetricKV label="近20 / 前20 胜率" value={`${performancePct(m.recent20?.win_rate, 0)} / ${performancePct(m.prev20?.win_rate, 0)}`} />
+            <MetricKV label="死因判定" value={d.death_status === 'ALIVE' ? '存活中' : d.death_status === 'EXPIRED' ? '过期衰减' : '假规律'} />
+          </div>
+
+          {d.series.length > 1 && (
+            <div>
+              <div className="text-xs font-bold text-ink-95 mb-1">
+                累计 EV 与「优势变负概率」走势 <HelpHint text="左轴=累计EV（每笔单位本金）；右轴=优势变负概率与滚动20胜率。红色虚线=红灯线90%：概率升破该线表示优势已很可能为负。" />
+              </div>
+              <ResponsiveContainer width="100%" height={240}>
+                <ComposedChart data={d.series}>
+                  <CartesianGrid stroke="var(--line-soft)" />
+                  <XAxis dataKey="ts" tickFormatter={performanceTime} minTickGap={50} tick={{ fontSize: 10, fill: 'var(--ink-55)' }} />
+                  <YAxis yAxisId="l" tick={{ fontSize: 10, fill: 'var(--ink-55)' }} />
+                  <YAxis yAxisId="r" orientation="right" domain={[0, 1]} tickFormatter={(v: number) => (Math.round(v * 100) + '%')} tick={{ fontSize: 10, fill: 'var(--ink-55)' }} />
+                  <Tooltip contentStyle={TOOLTIP_STYLE} labelStyle={TOOLTIP_LABEL_STYLE} itemStyle={TOOLTIP_ITEM_STYLE} labelFormatter={v => performanceTime(Number(v))} />
+                  <Legend />
+                  <ReferenceLine yAxisId="r" y={0.9} stroke="var(--negative)" strokeDasharray="5 4" />
+                  <Line yAxisId="l" name="累计EV" dataKey="cum_ev" stroke="var(--chart-1)" strokeWidth={2} dot={false} />
+                  <Line yAxisId="r" name="优势变负概率" dataKey="p_neg" stroke="var(--negative)" strokeWidth={1.5} dot={false} connectNulls />
+                  <Line yAxisId="r" name="滚动20胜率" dataKey="roll20_win" stroke="var(--chart-3)" strokeWidth={1.5} dot={false} connectNulls />
+                </ComposedChart>
+              </ResponsiveContainer>
+            </div>
+          )}
+
+          {/* 分桶维度切换：报价与时段 / 行情与波动 */}
+          <div className="space-y-2 border-t border-line-soft pt-2">
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-bold text-ink-95">分桶诊断维度</span>
+              <div className="flex items-center gap-0.5 bg-sunken rounded-pill p-0.5 border border-line-soft">
+                <button
+                  className={`px-2 py-0.5 rounded-pill text-[11px] font-semibold transition ${bucketTab === 'quote' ? 'bg-brand text-white' : 'text-ink-55 hover:text-ink-80'}`}
+                  onClick={() => setBucketTab('quote')}
+                >
+                  报价与时段
+                </button>
+                <button
+                  className={`px-2 py-0.5 rounded-pill text-[11px] font-semibold transition ${bucketTab === 'regime' ? 'bg-brand text-white' : 'text-ink-55 hover:text-ink-80'}`}
+                  onClick={() => setBucketTab('regime')}
+                >
+                  趋势与波动 (P2 Regime)
+                </button>
+              </div>
+            </div>
+
+            {bucketTab === 'quote' && (
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                <BucketTable title="按入场价分桶" rows={d.price_buckets} hint="探索性分析：小样本桶（带*）仅供参考；发现的规律必须经预注册与前向验证后才能变成护栏，不可直接改实盘。" />
+                <BucketTable title="按 UTC 时段分桶" rows={d.hour_buckets} hint="以窗口起点的 UTC 小时分 6 档（北京时间 +8）。探索性分析，同上纪律。" />
+              </div>
+            )}
+
+            {bucketTab === 'regime' && (
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                <BucketTable title="4h 趋势分层" rows={d.trend_4h_buckets || []} hint="触发时点前 48 根 5m K 收益（严格事前口径）。" />
+                <BucketTable title="24h 趋势分层" rows={d.trend_24h_buckets || []} hint="触发时点前 288 根 5m K 收益（事前口径）。" />
+                <BucketTable title="4h 波动率分层" rows={d.volatility_buckets || []} hint="过去 48 根 5m K 收益率波动标准差。" />
+              </div>
+            )}
+          </div>
+
+          {d.history.length > 1 && (
+            <div className="text-[11px] text-ink-55">
+              日快照（近 {Math.min(14, d.history.length)} 天）：
+              {d.history.slice(-14).map(h => (
+                <span key={h.date} className="inline-flex items-center gap-1 mr-2"
+                  title={h.date + ' n=' + h.n + ' 胜率' + performancePct(h.win_rate) + ' 变负概率' + performancePct(h.p_edge_negative, 0)}>
+                  <LightDot light={h.light} /><span className="font-mono">{h.date.slice(5)}</span>
+                </span>
+              ))}
+            </div>
+          )}
+
+          <div className="border-t border-line-soft pt-3">
+            <div className="flex items-center gap-2">
+              <button onClick={runDiagnose} disabled={diagBusy}
+                className="px-2.5 py-1 text-xs rounded-pill border border-line text-ink-80 hover:border-brand transition disabled:opacity-40">
+                {diagBusy ? '诊断中…' : '🤖 AI 诊断'}
+              </button>
+              <span className="text-[11px] text-ink-55">预留接口：模型尚未接入，点击可查看将提交给模型的结构化输入</span>
+            </div>
+            {diag && (
+              <div className="mt-2 text-xs bg-sunken rounded-sm p-3 space-y-1.5">
+                <div className="text-ink-80">{String(diag.message ?? diag.summary ?? diag.status)}</div>
+                {diag.payload != null && (
+                  <details>
+                    <summary className="cursor-pointer text-ink-55">查看诊断输入（JSON）</summary>
+                    <pre className="mt-1 max-h-60 overflow-auto text-[10px] font-mono text-ink-80 whitespace-pre-wrap break-all">{JSON.stringify(diag.payload, null, 2)}</pre>
+                  </details>
+                )}
+              </div>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+function MonitorTab() {
+  const [view, setView] = useState<'signals' | 'agent'>('signals')
+  const [report, setReport] = useState<SignalHealthReport | null>(null)
+  const [err, setErr] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [scope, setScope] = useState<'all' | 'live' | 'shadow'>('all')
+  const [onlyActive, setOnlyActive] = useState(true)
+  const [lightFilter, setLightFilter] = useState<'all' | HealthLight>('all')
+  const [sel, setSel] = useState<{ scope: string; key: string } | null>(null)
+  const [showCorrelations, setShowCorrelations] = useState(false)
+
+  const load = useCallback((force = false) => {
+    setLoading(true)
+    api.getSignalsHealth(force)
+      .then((d: SignalHealthReport) => {
+        if (d && Array.isArray(d.rows)) { setReport(d); setErr('') } else setErr('信号体检返回异常')
+      })
+      .catch(() => setErr('信号体检获取失败'))
+      .finally(() => setLoading(false))
+  }, [])
+
+  useEffect(() => {
+    if (view !== 'signals') return
+    load()
+    const t = setInterval(() => load(), 60_000)
+    return () => clearInterval(t)
+  }, [view, load])
+
+  const rows = useMemo(() => {
+    if (!report) return []
+    return report.rows
+      .filter(r => (scope === 'all' || r.scope === scope) && (!onlyActive || r.active) && (lightFilter === 'all' || r.light === lightFilter))
+      .sort((a, b) => HEALTH_LIGHT[a.light].order - HEALTH_LIGHT[b.light].order || b.metrics.n - a.metrics.n)
+  }, [report, scope, onlyActive, lightFilter])
+
+  const chip = (on: boolean) => 'px-2 py-0.5 rounded-pill text-[11px] font-semibold transition ' + (on ? 'bg-brand text-white' : 'text-ink-55 hover:text-ink-80')
+  const tally = report?.tally_active
+  const redPct = Math.round((report?.thresholds.red_p_neg ?? 0.9) * 100)
+  const minN = report?.thresholds.min_n ?? 30
+  const corrs = report?.correlations || []
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center gap-0.5 bg-sunken rounded-pill p-0.5 border border-line-soft w-fit">
+        <button className={chip(view === 'signals')} onClick={() => setView('signals')}>信号体检</button>
+        <button className={chip(view === 'agent')} onClick={() => setView('agent')}>Agent 运行健康</button>
+      </div>
+
+      {view === 'agent' && <AgentHealthView />}
+
+      {view === 'signals' && (
+        <>
+          <div className="bg-card rounded-card border border-line px-5 py-3 space-y-2">
+            <div className="flex items-center justify-between gap-3 flex-wrap">
+              <div className="flex items-center gap-4 flex-wrap text-sm">
+                <span className="font-bold text-ink-95">在线通道体检</span>
+                {tally && (['RED', 'YELLOW', 'GREEN', 'GRAY'] as HealthLight[]).map(l => (
+                  <button key={l} onClick={() => setLightFilter(f => (f === l ? 'all' : l))}
+                    className={'flex items-center gap-1.5 text-xs ' + (lightFilter === l ? 'font-bold underline' : '')}>
+                    <LightDot light={l} />{HEALTH_LIGHT[l].label} <span className="font-mono">{tally[l]}</span>
+                  </button>
+                ))}
+                <HelpHint text={'红灯=优势已变负的后验概率≥' + redPct + '%且样本≥' + minN + '；黄灯=优势疑似变负/前向显著低于冻结基准/收益靠右尾（剔除最赚5单后≤0）；灰=样本不足不下结论。统计仅计「在线」通道（影子开启或实盘开启）。系统只给建议，不会自动关闭任何通道。'} />
+              </div>
+              <div className="flex items-center gap-2 text-[11px] text-ink-55">
+                {report && <span className="font-mono">{new Date(report.generated_at).toLocaleString('zh-CN')}</span>}
+                <button onClick={() => load(true)} disabled={loading}
+                  className="px-2 py-0.5 rounded-pill bg-sunken text-ink-80 hover:bg-sunken-hover transition disabled:opacity-40">
+                  {loading ? '计算中…' : '立即重算'}
+                </button>
+              </div>
+            </div>
+            <div className="flex items-center gap-3 flex-wrap text-[11px] text-ink-55">
+              <div className="flex items-center gap-0.5 bg-sunken rounded-pill p-0.5 border border-line-soft">
+                {([['all', '全部'], ['live', '实盘'], ['shadow', '影子']] as const).map(([k, l]) => (
+                  <button key={k} className={chip(scope === k)} onClick={() => setScope(k)}>{l}</button>
+                ))}
+              </div>
+              <label className="flex items-center gap-1 cursor-pointer">
+                <input type="checkbox" checked={onlyActive} onChange={e => setOnlyActive(e.target.checked)} />仅在线通道
+              </label>
+              {corrs.length > 0 && (
+                <button
+                  onClick={() => setShowCorrelations(s => !s)}
+                  className={`px-2 py-0.5 rounded-pill border transition ${showCorrelations ? 'bg-brand text-white border-brand' : 'border-line text-ink-80 hover:border-brand'}`}
+                >
+                  {showCorrelations ? '收起组合共振' : `查看通道共振 (${corrs.length}对)`}
+                </button>
+              )}
+              <span>共 {rows.length} 行 · 点行下钻</span>
+            </div>
+          </div>
+
+          {/* 组合相关性与同窗共振卡片 (P3) */}
+          {showCorrelations && corrs.length > 0 && (
+            <div className="bg-card rounded-card border border-line p-4 space-y-2">
+              <div className="flex items-center justify-between">
+                <div className="text-xs font-bold text-ink-95">
+                  通道间同窗共振分析 (Top 20 重叠通道对)
+                  <HelpHint text="展示在同一 5m/15m 窗口同时触发的不同通道。Jaccard 越高说明两个通道在同一个赌注上同时押注，组合风险集中；同向率表示两通道同时触发时方向相同比例。" />
+                </div>
+                <button onClick={() => setShowCorrelations(false)} className="text-xs text-ink-55 hover:text-ink-95">关闭</button>
+              </div>
+              <div className="overflow-x-auto max-h-56 overflow-y-auto">
+                <table className="w-full text-[11px]">
+                  <thead>
+                    <tr className="text-ink-55 border-b border-line-soft">
+                      <th className="py-1 text-left">通道 A</th>
+                      <th className="py-1 text-left">通道 B</th>
+                      <th className="py-1 text-right">同窗触发数</th>
+                      <th className="py-1 text-right">Jaccard 重叠度</th>
+                      <th className="py-1 text-right">同向一致率</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {corrs.map((c, idx) => (
+                      <tr key={idx} className="border-b border-line-soft hover:bg-card-hover">
+                        <td className="py-1 font-medium">{SIGNAL_INFO[c.channel_a.split(':')[1]]?.name ?? c.channel_a}</td>
+                        <td className="py-1 font-medium">{SIGNAL_INFO[c.channel_b.split(':')[1]]?.name ?? c.channel_b}</td>
+                        <td className="py-1 text-right font-mono">{c.shared_windows}</td>
+                        <td className="py-1 text-right font-mono font-bold text-brand">{(c.jaccard * 100).toFixed(1)}%</td>
+                        <td className="py-1 text-right font-mono">{performancePct(c.agreement_rate)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {!report && <div className="text-center text-ink-55 py-12 text-sm">{err || '加载信号体检中...'}</div>}
+
+          {report && (
+            <div className="bg-card rounded-card border border-line overflow-x-auto">
+              <table className="w-full min-w-[980px] text-xs">
+                <thead><tr className="text-ink-55 border-b border-line">
+                  <th className="py-2 px-2 text-left">通道</th><th className="py-2 px-2 text-left">来源</th>
+                  <th className="py-2 px-2 text-right">n</th><th className="py-2 px-2 text-right">胜率</th>
+                  <th className="py-2 px-2 text-right">保本</th><th className="py-2 px-2 text-right">优势</th>
+                  <th className="py-2 px-2 text-right">均EV</th><th className="py-2 px-2 text-right">剔Top5</th>
+                  <th className="py-2 px-2 text-right">变负概率</th>
+                  <th className="py-2 px-2 text-center">状态</th>
+                  <th className="py-2 px-2 text-left">提示</th>
+                </tr></thead>
+                <tbody>
+                  {rows.map(r => {
+                    const m = r.metrics
+                    const on = sel?.scope === r.scope && sel.key === r.key
+                    const cp = r.change_point
+                    return (
+                      <tr key={r.scope + ':' + r.key} onClick={() => setSel(on ? null : { scope: r.scope, key: r.key })}
+                        className={'border-b border-line-soft cursor-pointer ' + (on ? 'bg-brand-soft' : 'hover:bg-card-hover')}>
+                        <td className="py-1.5 px-2 whitespace-nowrap">
+                          <span className="inline-flex items-center gap-1.5">
+                            <LightDot light={r.light} />
+                            <span className="font-medium">{SIGNAL_INFO[r.key]?.name ?? r.key}</span>
+                            {!r.active && <span className="rounded-pill bg-sunken px-1.5 py-0.5 text-[9px] text-ink-55">{r.retired ? '已退役' : '已下线'}</span>}
+                          </span>
+                        </td>
+                        <td className="py-1.5 px-2 text-ink-55 whitespace-nowrap">{r.scope === 'live' ? '实盘' : '影子'}{r.market_period ? ' · ' + r.market_period : ''}</td>
+                        <td className="py-1.5 px-2 text-right font-mono">{m.n}</td>
+                        <td className="py-1.5 px-2 text-right font-mono">{performancePct(m.win_rate)}</td>
+                        <td className="py-1.5 px-2 text-right font-mono">{performancePct(m.mean_breakeven)}</td>
+                        <td className={'py-1.5 px-2 text-right font-mono ' + signClass(m.edge)}>{performanceSigned(m.edge == null ? null : m.edge * 100, '%', 1)}</td>
+                        <td className={'py-1.5 px-2 text-right font-mono ' + signClass(m.avg_ev)}>{performanceSigned(m.avg_ev, '', 3)}</td>
+                        <td className={'py-1.5 px-2 text-right font-mono ' + signClass(m.ev_ex_top5)}>{performanceSigned(m.ev_ex_top5, '', 3)}</td>
+                        <td className="py-1.5 px-2 text-right font-mono">{performancePct(m.p_edge_negative, 0)}</td>
+                        <td className="py-1.5 px-2 text-center whitespace-nowrap">
+                          {r.death_status && r.death_status !== 'ALIVE' ? (
+                            <DeathBadge status={r.death_status} reason={r.death_reason} />
+                          ) : cp?.is_declining ? (
+                            <span className="rounded-pill px-1.5 py-0.5 text-[9px] font-bold bg-warning-soft text-warning" title={`拐折回撤 -${cp.drawdown_ev} EV`}>拐折</span>
+                          ) : (
+                            <span className="text-[10px] text-ink-55 font-mono">正常</span>
+                          )}
+                        </td>
+                        <td className="py-1.5 px-2 text-ink-80 max-w-[280px] truncate" title={r.reasons.join('；')}>{r.reasons[0] ?? ''}</td>
+                      </tr>
+                    )
+                  })}
+                  {rows.length === 0 && <tr><td colSpan={11} className="py-8 text-center text-ink-55">当前筛选下无通道</td></tr>}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {sel && <SignalHealthDrill scope={sel.scope} keyName={sel.key} onClose={() => setSel(null)} />}
+        </>
+      )}
     </div>
   )
 }

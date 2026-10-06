@@ -37,6 +37,9 @@ class LiveOrder:
     status: str | None = None
     policy_version: str | None = None
     trigger_ts: int | None = None
+    ret_4h: float | None = None
+    ret_24h: float | None = None
+    vol_4h: float | None = None
 
 
 def _positive_float(value: Any) -> float | None:
@@ -490,6 +493,26 @@ def _segment_label(order: LiveOrder, segment_by: str) -> str:
         return order.policy_version or "LEGACY_UNKNOWN"
     if segment_by == "stake":
         return _stake_bucket(actual_cost(order))
+    if segment_by == "trend_4h":
+        if order.ret_4h is None: return "LEGACY_UNKNOWN"
+        pct = order.ret_4h * 100.0
+        if pct < -1.0: return "急跌(<-1%)"
+        if pct <= 0.0: return "偏弱(-1%~0)"
+        if pct <= 1.0: return "偏强(0~+1%)"
+        return "大涨(>+1%)"
+    if segment_by == "trend_24h":
+        if order.ret_24h is None: return "LEGACY_UNKNOWN"
+        pct = order.ret_24h * 100.0
+        if pct < -2.0: return "暴跌(<-2%)"
+        if pct <= 0.0: return "下行(-2%~0)"
+        if pct <= 2.0: return "上行(0~+2%)"
+        return "过热(>+2%)"
+    if segment_by == "volatility":
+        if order.vol_4h is None: return "LEGACY_UNKNOWN"
+        pct = order.vol_4h * 100.0
+        if pct < 0.15: return "低波动"
+        if pct <= 0.30: return "中波动"
+        return "高波动"
     return "LEGACY_UNKNOWN"
 
 

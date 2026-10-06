@@ -1730,3 +1730,28 @@ class ShadowExecutionAssessment(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now(),
     )
+
+
+class SignalHealthSnapshot(Base):
+    """信号体检日快照：每 (scope, key, UTC 日) 一行，当日内被每小时体检覆盖更新。
+
+    scope: live | shadow | sentiment；key: 通道/影子版本名（情绪为 daily）。
+    用途：回看指标自身走势（衰减是否加速）、重启后恢复红黄绿灯基线、情绪数据日留存。
+    """
+    __tablename__ = "signal_health_snapshots"
+    __table_args__ = (
+        UniqueConstraint("scope", "key", "snap_date", name="uq_signal_health_scope_key_date"),
+        Index("ix_signal_health_scope_key", "scope", "key"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    scope: Mapped[str] = mapped_column(String(16), nullable=False)
+    key: Mapped[str] = mapped_column(String(96), nullable=False)
+    snap_date: Mapped[str] = mapped_column(String(10), nullable=False, comment="UTC 日 YYYY-MM-DD")
+    light: Mapped[str] = mapped_column(String(8), nullable=False, comment="GRAY|GREEN|YELLOW|RED")
+    n: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    reasons: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    metrics: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )

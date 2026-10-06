@@ -1179,6 +1179,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(_sentiment_window_archiver(), name="sw_archiver"),
         asyncio.create_task(_health_monitor_loop(), name="health_monitor"),
         asyncio.create_task(_binance_reconcile_loop(), name="binance_reconcile"),
+        asyncio.create_task(_signal_health_loop(), name="signal_health"),
     ]
     logger.info("现货 WS + 预测市场追踪 + 15m边界加速 + 情绪窗口归档 + 健康监控已启动")
 
@@ -3058,9 +3059,11 @@ async def _live_channel_meta() -> dict[str, dict]:
 
 async def _load_live_performance_orders(
     db: AsyncSession, from_ms: int, to_ms: int, channels: list[str],
+    with_regime: bool = True,
 ) -> list[LiveOrder]:
     from sqlalchemy import select as sa_select
     from .db.models import ShadowExecutionAssessment, TradeOrderModel
+    from .services import signal_health_service as shs
 
     stmt = sa_select(
         TradeOrderModel.id, TradeOrderModel.market_id, TradeOrderModel.assessment_id,
@@ -3090,13 +3093,28 @@ async def _load_live_performance_orders(
     def epoch_ms(value):
         return int(value.timestamp() * 1000) if hasattr(value, "timestamp") else value
 
-    return [LiveOrder(
-        id=row[0], market_id=row[1], assessment_id=row[2], channel=row[3],
-        window_start=row[4], market_period=row[5], direction=row[6],
-        settle_outcome=row[7], win=row[8], pnl=row[9], amount_in=row[10],
-        quote_json=row[11], settled_at=epoch_ms(row[12]), created_at=epoch_ms(row[13]),
-        policy_version=row[14], trigger_ts=row[15],
-    ) for row in rows]
+    reg_lookup = None
+    if with_regime and rows:
+        min_w = min(r[4] for r in rows if r[4] is not None)
+        max_w = max(r[4] for r in rows if r[4] is not None)
+        try:
+            reg_lookup = await shs.load_market_regime_lookup(db, min_w, max_w)
+        except Exception as exc:
+            logger.warning("实盘订单历史行情注入失败（将回退 LEGACY_UNKNOWN）| {}", exc)
+
+    out = []
+    for row in rows:
+        ws = row[4]
+        reg = reg_lookup(int(ws)) if (reg_lookup and ws is not None) else {}
+        out.append(LiveOrder(
+            id=row[0], market_id=row[1], assessment_id=row[2], channel=row[3],
+            window_start=row[4], market_period=row[5], direction=row[6],
+            settle_outcome=row[7], win=row[8], pnl=row[9], amount_in=row[10],
+            quote_json=row[11], settled_at=epoch_ms(row[12]), created_at=epoch_ms(row[13]),
+            policy_version=row[14], trigger_ts=row[15],
+            ret_4h=reg.get("ret_4h"), ret_24h=reg.get("ret_24h"), vol_4h=reg.get("vol_4h"),
+        ))
+    return out
 
 
 @app.get("/api/live/performance-summary")
@@ -4475,22 +4493,10 @@ def _current_live_channels() -> dict[str, dict]:
         logger.warning("信号分析：实盘通道状态查询失败 | {}", exc)
         return {}
 
-@app.get("/api/signals/analytics")
-async def get_signals_analytics(
-    db: AsyncSession = Depends(get_db), active_only: bool = False,
-):
-    """信号分析面板聚合端点：口径常量固化在后端（单一事实源）。
+async def _load_shadow_settled_rows(db: AsyncSession, visible_versions: set[str] | None) -> list:
+    """影子各表 SETTLED 行（统一列：version/window_start/win/ev_at_entry/entry_*_price/direction）。
 
-    - shadow: 影子各版本累计胜率/EV 曲线 + 汇总（含逐笔平均盈亏平衡、回测基准）
-      —— EV 优先直读落库 ev_at_entry（与审计「逐笔交叉验证零误差」口径同源）；
-      未落库的表（pattern 系 HM/S5）按落库报价兜底现算实现 EV（赢 0.98/q−1 / 输 −1）
-    - scene: 各场景（pattern_type）累计胜率曲线 + 汇总（基准=research_win_rates）；
-      EV 按审计口径现算（费2%+溢0.01 逐笔实现 EV：赢 0.98/(q+0.01)−1 截断 / 输 −1，
-      q 按 side 取 entry_up/down_15m，缺失不计入）——落库 ev_at_entry 是期望 EV 口径，
-      与审计实现口径不可混用
-    - regime: 大涨前(<08-19 UTC) vs 大涨期胜率对比（合并 + 逐影子版本）+ 按 UTC 日胜率
-    胜负判定（场景/legacy）按 side 映射：side=high 押 DOWN、side=low 押 UP，
-    与 /api/fake-breakout/stats 的 compute_pattern_stats 同语义。
+    信号分析 analytics 与信号体检 health 共用的取数口径；visible_versions=None 取全量。
     """
     from sqlalchemy import literal as sa_literal, select as sa_select
 
@@ -4498,22 +4504,9 @@ async def get_signals_analytics(
         AbsorptionShadowSignal, FirstHitShadowSignal, KlineShadowSignal,
         MisalignmentSignal, PatternShadowSignal,
     )
-    from .services.fake_breakout_detector import (
-        RESEARCH_WIN_RATES, scene_realized_ev,
-    )
-    from .services.shadow_execution_registry import SHADOW_VERSION_SPECS, SHADOW_VERSIONS
-    from .services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
 
     event_versions = {"candle_hm_bull_5m_event_v1", "candle_hm_bull_15m_event_v1"}
-    live_by_ch = _current_live_channels()
-    registered_versions = (set(SHADOW_VERSIONS) - event_versions) | set(CANDLESTICK_SIGNAL_IDS)
-    visible_versions = {
-        version for version in registered_versions
-        if not shadow_gate.is_retired(version)
-        and (shadow_gate.is_enabled(version) or live_by_ch.get(version, {}).get("enabled"))
-    } if active_only else None
-
-    # ---- 影子信号：SETTLED 升序（分析页 active_only 时在 DB 层排除已下线历史）----
+    # ---- 影子信号：SETTLED 升序（仅取可见版本时在 DB 层排除已下线历史）----
     sh_stmt = sa_select(
         MisalignmentSignal.version, MisalignmentSignal.window_start,
         MisalignmentSignal.win, MisalignmentSignal.ev_at_entry,
@@ -4529,7 +4522,7 @@ async def get_signals_analytics(
     # 2026-09-03 起落库目标窗真实入场报价（entry_up/down_price），聚合层按 direction 取
     # 对应侧 q 现算真实 EV（赢 0.98/q−1 / 输 −1）；报价缺失/冷启动回补行 entry 为 NULL →
     # 该笔 EV 不计（与旧「纯 K 线无报价」口径兼容）。ev_at_entry 仍未落库（恒 None，兜底现算）。
-    kline_versions = set(visible_versions or ()) | event_versions if active_only else None
+    kline_versions = set(visible_versions or ()) | event_versions if visible_versions is not None else None
     krev_stmt = sa_select(
         KlineShadowSignal.version,
         KlineShadowSignal.target_bar_start.label("window_start"),
@@ -4621,6 +4614,48 @@ async def get_signals_analytics(
         firsthit_stmt.order_by(FirstHitShadowSignal.window_start)
     )).all()
     sh_rows = sh_rows + list(firsthit_rows)
+    return sh_rows
+
+
+@app.get("/api/signals/analytics")
+async def get_signals_analytics(
+    db: AsyncSession = Depends(get_db), active_only: bool = False,
+):
+    """信号分析面板聚合端点：口径常量固化在后端（单一事实源）。
+
+    - shadow: 影子各版本累计胜率/EV 曲线 + 汇总（含逐笔平均盈亏平衡、回测基准）
+      —— EV 优先直读落库 ev_at_entry（与审计「逐笔交叉验证零误差」口径同源）；
+      未落库的表（pattern 系 HM/S5）按落库报价兜底现算实现 EV（赢 0.98/q−1 / 输 −1）
+    - scene: 各场景（pattern_type）累计胜率曲线 + 汇总（基准=research_win_rates）；
+      EV 按审计口径现算（费2%+溢0.01 逐笔实现 EV：赢 0.98/(q+0.01)−1 截断 / 输 −1，
+      q 按 side 取 entry_up/down_15m，缺失不计入）——落库 ev_at_entry 是期望 EV 口径，
+      与审计实现口径不可混用
+    - regime: 大涨前(<08-19 UTC) vs 大涨期胜率对比（合并 + 逐影子版本）+ 按 UTC 日胜率
+    胜负判定（场景/legacy）按 side 映射：side=high 押 DOWN、side=low 押 UP，
+    与 /api/fake-breakout/stats 的 compute_pattern_stats 同语义。
+    """
+    from sqlalchemy import literal as sa_literal, select as sa_select
+
+    from .db.models import (
+        AbsorptionShadowSignal, FirstHitShadowSignal, KlineShadowSignal,
+        MisalignmentSignal, PatternShadowSignal,
+    )
+    from .services.fake_breakout_detector import (
+        RESEARCH_WIN_RATES, scene_realized_ev,
+    )
+    from .services.shadow_execution_registry import SHADOW_VERSION_SPECS, SHADOW_VERSIONS
+    from .services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
+
+    event_versions = {"candle_hm_bull_5m_event_v1", "candle_hm_bull_15m_event_v1"}
+    live_by_ch = _current_live_channels()
+    registered_versions = (set(SHADOW_VERSIONS) - event_versions) | set(CANDLESTICK_SIGNAL_IDS)
+    visible_versions = {
+        version for version in registered_versions
+        if not shadow_gate.is_retired(version)
+        and (shadow_gate.is_enabled(version) or live_by_ch.get(version, {}).get("enabled"))
+    } if active_only else None
+
+    sh_rows = await _load_shadow_settled_rows(db, visible_versions)
     # 完整审计口径保留所有注册/历史未知版本；分析页只返回当前在线或实盘中的版本。
     versions = [version for version in SHADOW_VERSIONS if version not in event_versions]
     versions += list(CANDLESTICK_SIGNAL_IDS)
@@ -4862,6 +4897,148 @@ async def get_signals_analytics(
             ],
         },
     }
+
+
+# ============================================================
+# 信号体检（2026-10-06）：影子+实盘统一健康指标、红黄绿灯、转红微信告警
+# 只建议不自动处置；LLM 诊断仅留口（services.signal_health_service.llm_diagnose_hook）
+# ============================================================
+_signal_health_cache: tuple[float, dict] | None = None
+_SIGNAL_HEALTH_TTL = 300.0
+
+
+async def _build_signal_health(db: AsyncSession) -> dict:
+    from .services import signal_health_service as shs
+    from .services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
+    from .services.live_channel_benchmarks import get_channel_benchmark
+    from .services.live_channels import LIVE_CHANNELS
+    from .services.shadow_execution_registry import SHADOW_VERSION_SPECS, SHADOW_VERSIONS
+
+    event_versions = {"candle_hm_bull_5m_event_v1", "candle_hm_bull_15m_event_v1"}
+    live_by_ch = _current_live_channels()
+
+    live_meta = {
+        ch: {"family": spec.family, "market_period": spec.market_period,
+             "enabled": bool(live_by_ch.get(ch, {}).get("enabled")), "retired": False,
+             "active": bool(live_by_ch.get(ch, {}).get("enabled"))}
+        for ch, spec in LIVE_CHANNELS.items()
+    }
+    shadow_meta = {}
+    for v in [x for x in SHADOW_VERSIONS if x not in event_versions] + list(CANDLESTICK_SIGNAL_IDS):
+        spec = SHADOW_VERSION_SPECS.get(v)
+        retired, on = shadow_gate.is_retired(v), shadow_gate.is_enabled(v)
+        shadow_meta[v] = {
+            "family": "candlestick_reversal" if v.startswith(("candle_hm_", "candidate_"))
+            else getattr(spec, "family", "legacy"),
+            "market_period": getattr(spec, "market_period", None),
+            "enabled": on, "retired": retired,
+            "active": (not retired) and (on or bool(live_by_ch.get(v, {}).get("enabled"))),
+        }
+
+    shadow_rows = await _load_shadow_settled_rows(db, None)
+    orders = await _load_live_performance_orders(db, 0, 0, list(LIVE_CHANNELS), with_regime=True)
+
+    all_ts = [int(r.window_start) for r in shadow_rows if getattr(r, "window_start", None) is not None]
+    all_ts += [int(o.window_start) for o in orders if o.window_start is not None]
+    reg_lookup = None
+    if all_ts:
+        try:
+            reg_lookup = await shs.load_market_regime_lookup(db, min(all_ts), max(all_ts))
+        except Exception as exc:
+            logger.warning("信号体检历史行情注入失败（将回退未知）| {}", exc)
+
+    def bench(scope: str, key: str):
+        b = get_channel_benchmark(key)
+        if b is not None:
+            return b.win_rate
+        return SHADOW_BENCH.get(key, (None,))[0] if scope == "shadow" else None
+
+    return shs.assemble_report(
+        shs.shadow_events(shadow_rows, _shadow_breakeven, _shadow_realized_ev, reg_lookup),
+        shs.live_events(orders, reg_lookup), shadow_meta, live_meta, bench,
+    )
+
+
+async def _signal_health_report(db: AsyncSession, refresh: bool = False) -> dict:
+    global _signal_health_cache
+    now = time.time()
+    if not refresh and _signal_health_cache and now - _signal_health_cache[0] < _SIGNAL_HEALTH_TTL:
+        return _signal_health_cache[1]
+    report = await _build_signal_health(db)
+    _signal_health_cache = (now, report)
+    return report
+
+
+@app.get("/api/signals/health")
+async def get_signals_health(
+    refresh: bool = False, _: None = Depends(_require_auth), db: AsyncSession = Depends(get_db),
+):
+    """全通道体检矩阵：每行一个实盘通道/影子版本的指标 + 红黄绿灯 + 原因。"""
+    report = await _signal_health_report(db, refresh)
+    return {k: v for k, v in report.items() if k != "_events"}
+
+
+@app.get("/api/signals/health/detail")
+async def get_signals_health_detail(
+    scope: str, key: str, _: None = Depends(_require_auth), db: AsyncSession = Depends(get_db),
+):
+    """单通道下钻：累计曲线、入场价/时段分桶、日快照历史、AI 诊断输入契约。"""
+    from .services import signal_health_service as shs
+
+    if scope not in ("live", "shadow"):
+        raise HTTPException(status_code=422, detail="scope 仅支持 live | shadow")
+    report = await _signal_health_report(db)
+    row = next((r for r in report["rows"] if r["scope"] == scope and r["key"] == key), None)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"未知 {scope} 通道: {key}")
+    history = await shs.load_history(db, scope, key)
+    return shs.detail_for(scope, key, row, report["_events"].get((scope, key), []), history)
+
+
+@app.post("/api/signals/health/diagnose")
+async def diagnose_signal_health(
+    scope: str, key: str, _: None = Depends(_require_auth), db: AsyncSession = Depends(get_db),
+):
+    """AI 诊断留口：P1 未接模型，返回 not_implemented 及将提交给模型的结构化输入。"""
+    from .services import signal_health_service as shs
+
+    detail = await get_signals_health_detail(scope, key, None, db)
+    return await shs.run_llm_diagnosis(detail["diagnosis_payload"])
+
+
+async def _signal_health_loop() -> None:
+    """每小时体检：落日快照、情绪日留存、新转红通道微信推送（仅建议，不自动关通道）。"""
+    from .services import signal_health as sh
+    from .services import signal_health_service as shs
+    from .services.live_channels import LIVE_CHANNELS
+
+    await asyncio.sleep(90)
+    prev: dict[tuple[str, str], str] = {}
+    try:
+        async with async_session_factory() as db:
+            prev = await shs.load_prev_lights(db, int(time.time() * 1000))
+    except Exception as exc:
+        logger.warning("信号体检：灯色基线恢复失败（本轮按冷启动）| {}", exc)
+    logger.info("信号体检循环已启动 | 基线 {} 条", len(prev))
+
+    while True:
+        try:
+            async with async_session_factory() as db:
+                report = await _signal_health_report(db, refresh=True)
+                now_ms = int(time.time() * 1000)
+                await shs.persist_snapshots(db, report["rows"], now_ms)
+                await shs.persist_sentiment_daily(db, now_ms)
+            active = [r for r in report["rows"] if r["active"]]
+            for r in sh.new_red_transitions(prev, active):
+                name = LIVE_CHANNELS[r["key"]].display_name if r["scope"] == "live" and r["key"] in LIVE_CHANNELS else r["key"]
+                wechat_notifier.push_markdown(sh.format_red_alert(r, name))
+                logger.warning("信号体检转红 | {} {} | {}", r["scope"], r["key"], r["reasons"])
+            prev = {(r["scope"], r["key"]): r["light"] for r in report["rows"]}
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.warning("信号体检循环异常 | {}", exc)
+        await asyncio.sleep(3600)
 
 
 @app.get("/api/signals/execution-comparison")
