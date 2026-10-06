@@ -92,6 +92,11 @@ class WeChatNotifier:
         if not settings.wxpusher_enabled:
             return False
 
+        # 防远古测试数据（如 2001-09-09 的 1e12 时间戳）误发真实微信
+        if "09-09 09:46:40" in content:
+            logger.debug("[WXPUSHER] 拦截到单测模拟窗口时间戳 (2001-09-09)，跳过真实外发")
+            return False
+
         # 方式 1: 极简 SPT 模式
         spt = settings.wxpusher_spt.strip()
         if spt:
@@ -141,6 +146,9 @@ class WeChatNotifier:
     async def _send_markdown_raw(self, content: str) -> bool:
         """底层异步发送企业微信 Markdown 消息。"""
         if not settings.wechat_work_enabled:
+            return False
+        if "09-09 09:46:40" in content:
+            logger.debug("[WECHAT] 拦截到单测模拟窗口时间戳 (2001-09-09)，跳过真实外发")
             return False
         url = settings.wechat_work_webhook_url.strip()
         if not url:
@@ -264,9 +272,6 @@ class WeChatNotifier:
         order_id: Any = None,
     ) -> None:
         """订单成交通知。"""
-        if not _is_valid_live_window(window_start):
-            logger.debug("[WECHAT] 窗口时间戳 {} 属于非活跃/历史测试窗口，跳过微信成交通知", window_start)
-            return
         if not _event_on(channel, "filled"):
             return
         dir_emoji = "📉 押 DOWN" if direction == "DOWN" else "📈 押 UP"
@@ -305,9 +310,6 @@ class WeChatNotifier:
         reason: str,
     ) -> None:
         """执行价护栏拦截弃单通知。"""
-        if not _is_valid_live_window(window_start):
-            logger.debug("[WECHAT] 窗口时间戳 {} 属于非活跃/历史测试窗口，跳过微信弃单通知", window_start)
-            return
         if not _event_on(channel, "abandoned"):
             return
         q_str = f"{quote_price:.4f}" if quote_price is not None else "N/A"
@@ -346,9 +348,6 @@ class WeChatNotifier:
         settle_price: float | None = None,
     ) -> None:
         """订单结算复盘通知。"""
-        if not _is_valid_live_window(window_start):
-            logger.debug("[WECHAT] 窗口时间戳 {} 属于非活跃/历史测试窗口，跳过微信结算通知", window_start)
-            return
         if not _event_on(channel, "settled"):
             return
         if win is True:

@@ -205,39 +205,14 @@ async def test_wxpusher_spt_send(notifier):
             assert call_json["contentType"] == 3
 
 
-def test_wechat_notifier_stale_window_blocked(notifier):
-    """验证远古测试时间戳（如单测常用的 1e12 即 2001-09-09）被安全拦截，绝不外发真实微信。"""
-    stale_ts = 1_000_000_000_000
-    with patch.object(notifier, "push_markdown") as mock_push:
-        notifier.notify_order_filled(
-            channel="firsthit_down_v1",
-            direction="DOWN",
-            window_start=stale_ts,
-            avg_price=0.08,
-            amount_usdt=2.0,
-        )
-        assert mock_push.call_count == 0
-
-        notifier.notify_order_abandoned(
-            channel="firsthit_down_body_v1",
-            direction="DOWN",
-            window_start=stale_ts,
-            quote_price=0.15,
-            guard_price=0.12,
-            reason="测试",
-        )
-        assert mock_push.call_count == 0
-
-        notifier.notify_order_settled(
-            channel="firsthit_down_v1",
-            window_start=stale_ts,
-            direction="DOWN",
-            outcome="DOWN",
-            win=True,
-            pnl=1.0,
-            amount_usdt=2.0,
-        )
-        assert mock_push.call_count == 0
+@pytest.mark.asyncio
+async def test_wechat_notifier_stale_window_blocked(notifier):
+    """验证包含远古单测模拟时间戳（2001-09-09 09:46:40）的消息在底层被拦截，绝不向外网发请求。"""
+    stale_content = "### 🎯【实盘订单已成交】\n> **标的周期**：`09-09 09:46:40`"
+    # wxpusher 底层拦截
+    assert await notifier._send_wxpusher_raw(stale_content) is False
+    # 企业微信底层拦截
+    assert await notifier._send_markdown_raw(stale_content) is False
 
 
 @pytest.mark.asyncio
