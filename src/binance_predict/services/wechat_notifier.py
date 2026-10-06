@@ -24,6 +24,21 @@ from .notification_config import notify_config
 
 TZ_BJT = timezone(timedelta(hours=8))
 
+# 窗口新鲜度阈值（7 天）：防历史回补/单测数据（如 2001 年 WINDOW_START）误发真实微信
+MAX_WINDOW_AGE_MS = 7 * 86_400_000
+
+
+def _is_valid_live_window(window_ms: int | float | None) -> bool:
+    """验证窗口时间是否属于当前真实实盘窗口（拒绝远古测试数据或异常历史数据）。"""
+    if window_ms is None or float(window_ms) <= 0:
+        return False
+    # 2026 年的时间戳约为 1.78e12 ms，若时间戳远小于此（如单测常用的 1e12 即 2001 年）直接阻断
+    now_ms = time.time() * 1000
+    ms = float(window_ms)
+    if ms < 1.7e12 or abs(now_ms - ms) > MAX_WINDOW_AGE_MS:
+        return False
+    return True
+
 
 def fmt_bjt(ms: int | float | None, with_date: bool = True) -> str:
     """毫秒时间戳/秒时间戳 -> 北京时间字符串。"""
@@ -249,6 +264,9 @@ class WeChatNotifier:
         order_id: Any = None,
     ) -> None:
         """订单成交通知。"""
+        if not _is_valid_live_window(window_start):
+            logger.debug("[WECHAT] 窗口时间戳 {} 属于非活跃/历史测试窗口，跳过微信成交通知", window_start)
+            return
         if not _event_on(channel, "filled"):
             return
         dir_emoji = "📉 押 DOWN" if direction == "DOWN" else "📈 押 UP"
@@ -287,6 +305,9 @@ class WeChatNotifier:
         reason: str,
     ) -> None:
         """执行价护栏拦截弃单通知。"""
+        if not _is_valid_live_window(window_start):
+            logger.debug("[WECHAT] 窗口时间戳 {} 属于非活跃/历史测试窗口，跳过微信弃单通知", window_start)
+            return
         if not _event_on(channel, "abandoned"):
             return
         q_str = f"{quote_price:.4f}" if quote_price is not None else "N/A"
@@ -325,6 +346,9 @@ class WeChatNotifier:
         settle_price: float | None = None,
     ) -> None:
         """订单结算复盘通知。"""
+        if not _is_valid_live_window(window_start):
+            logger.debug("[WECHAT] 窗口时间戳 {} 属于非活跃/历史测试窗口，跳过微信结算通知", window_start)
+            return
         if not _event_on(channel, "settled"):
             return
         if win is True:

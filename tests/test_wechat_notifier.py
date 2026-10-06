@@ -121,6 +121,8 @@ def test_wechat_radar_dedup(notifier):
 
 
 def test_wechat_notifier_channel_formatting(notifier):
+    import time
+    now_ms = int(time.time() * 1000)
     with patch.object(settings, "wechat_radar_enabled", True), \
          patch.object(notifier, "push_markdown") as mock_push:
         
@@ -129,7 +131,7 @@ def test_wechat_notifier_channel_formatting(notifier):
             radar_type="15m 经典孕线反转",
             channel="hm_inside_15m_v2",
             direction="DOWN",
-            target_time_ms=1725900000000,
+            target_time_ms=now_ms,
             lead_seconds=90,
             max_exec_price=0.30,
             features_desc="前根大实体",
@@ -144,7 +146,7 @@ def test_wechat_notifier_channel_formatting(notifier):
         notifier.notify_order_filled(
             channel="quote_contrarian_v2",
             direction="DOWN",
-            window_start=1725900000000,
+            window_start=now_ms,
             avg_price=0.25,
             amount_usdt=5.0,
             shares=20.0,
@@ -158,7 +160,7 @@ def test_wechat_notifier_channel_formatting(notifier):
         notifier.notify_order_abandoned(
             channel="x4_v2",
             direction="DOWN",
-            window_start=1725900000000,
+            window_start=now_ms,
             quote_price=0.55,
             guard_price=0.50,
             reason="报价超出护栏",
@@ -170,7 +172,7 @@ def test_wechat_notifier_channel_formatting(notifier):
         # 4. 结算复盘
         notifier.notify_order_settled(
             channel="s5_deep_z20_v1",
-            window_start=1725900000000,
+            window_start=now_ms,
             direction="DOWN",
             outcome="DOWN",
             win=True,
@@ -201,6 +203,41 @@ async def test_wxpusher_spt_send(notifier):
             call_json = mock_post.call_args[1]["json"]
             assert call_json["spt"] == "spt_test123"
             assert call_json["contentType"] == 3
+
+
+def test_wechat_notifier_stale_window_blocked(notifier):
+    """验证远古测试时间戳（如单测常用的 1e12 即 2001-09-09）被安全拦截，绝不外发真实微信。"""
+    stale_ts = 1_000_000_000_000
+    with patch.object(notifier, "push_markdown") as mock_push:
+        notifier.notify_order_filled(
+            channel="firsthit_down_v1",
+            direction="DOWN",
+            window_start=stale_ts,
+            avg_price=0.08,
+            amount_usdt=2.0,
+        )
+        assert mock_push.call_count == 0
+
+        notifier.notify_order_abandoned(
+            channel="firsthit_down_body_v1",
+            direction="DOWN",
+            window_start=stale_ts,
+            quote_price=0.15,
+            guard_price=0.12,
+            reason="测试",
+        )
+        assert mock_push.call_count == 0
+
+        notifier.notify_order_settled(
+            channel="firsthit_down_v1",
+            window_start=stale_ts,
+            direction="DOWN",
+            outcome="DOWN",
+            win=True,
+            pnl=1.0,
+            amount_usdt=2.0,
+        )
+        assert mock_push.call_count == 0
 
 
 @pytest.mark.asyncio

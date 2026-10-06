@@ -12,11 +12,26 @@ import os
 os.environ.setdefault("DEEPSEEK_API_KEY", "test-dummy-key")
 os.environ.setdefault("DASHSCOPE_API_KEY", "test-dummy-key")
 
+# 测试环境硬性关闭外部微信推送凭据，彻底杜绝单测泄露消息到真实用户微信
+os.environ["WXPUSHER_ENABLED"] = "false"
+os.environ["WECHAT_WORK_ENABLED"] = "false"
+os.environ["WXPUSHER_SPT"] = ""
+os.environ["WXPUSHER_APP_TOKEN"] = ""
+os.environ["WECHAT_WORK_WEBHOOK_URL"] = ""
+
 import asyncio
 from collections import deque
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def suppress_real_wechat_push(monkeypatch):
+    """全局拦截测试向真实微信外发消息（防跑单测时骚扰真实微信）。"""
+    from binance_predict.services.wechat_notifier import wechat_notifier
+    monkeypatch.setattr(wechat_notifier, "_send_wxpusher_raw", AsyncMock(return_value=True))
+    monkeypatch.setattr(wechat_notifier, "_send_markdown_raw", AsyncMock(return_value=True))
 
 
 @pytest.fixture
