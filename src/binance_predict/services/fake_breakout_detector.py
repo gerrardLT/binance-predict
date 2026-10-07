@@ -290,6 +290,19 @@ def is_momentum_fade(
     return hit, close_pos if hit else None
 
 
+def s2_is_refire(
+    prev_cycle: int,
+    last_eval_cycle: int | None,
+    last_hit_cycle: int | None,
+) -> bool:
+    """S2 续发判定：连续评估的上一周期也按完整口径命中 S2。
+
+    S2 依赖盘中真实跌破当时的 4h 支撑，冷启动时不能仅凭历史 K 线还原；
+    内存状态不连续时放行，避免用近似条件误杀首个真实信号。
+    """
+    return last_eval_cycle == prev_cycle - 1 and last_hit_cycle == prev_cycle - 1
+
+
 def s4_is_refire(
     prev_cycle: int,
     last_eval_cycle: int | None,
@@ -464,7 +477,10 @@ class FakeBreakoutDetector:
         # S1 入场变体钩子（main 装配注入 S4VariantShadowDetector.on_s1_entry）：
         # 正式 S1 命中 → 早确认(+2min BTC 已跌) / 低吸(DOWN 价≤0.45) 两条影子+实盘通道。
         self._on_s1_entry: Callable[[dict], None] | None = None
-        # S4 续发判定状态：本进程最近一次完成 S4 评估的周期 / 最近一次 S4 形态命中的周期
+        # S2/S4 续发判定状态：本进程最近一次完成评估的周期 / 最近一次正式形态命中的周期
+        self._s2_last_eval_cycle: int | None = None
+        self._s2_last_hit_cycle: int | None = None
+        self._s2_refire_skip_count: int = 0
         self._s4_last_eval_cycle: int | None = None
         self._s4_last_hit_cycle: int | None = None
         self._s4_refire_skip_count: int = 0
@@ -809,11 +825,25 @@ class FakeBreakoutDetector:
                 sig_k["volume"], vol_ma, pos4h=pos4h,
             )
             if ok:
-                await self._fire_confirmed_signal(
-                    side, rec, sig_k, close_pos, vol_ratio, cur_cycle, now_ms,
-                    version=self._active_version, shadow=False,
-                    pattern_type=pattern_type or "bull_exhaust",
-                )
+                refire = False
+                if pattern_type == "bear_exhaust":
+                    refire = s2_is_refire(
+                        prev_cycle, self._s2_last_eval_cycle, self._s2_last_hit_cycle,
+                    )
+                    # 被跳过的 S2 仍属正式形态命中，使连续第三、第四根继续判为续发。
+                    self._s2_last_hit_cycle = prev_cycle
+                if refire:
+                    self._s2_refire_skip_count += 1
+                    logger.info(
+                        "S2 续发跳过 | 周期 {} 上一周期也命中完整 S2 口径 | 量比 {:.2f}",
+                        prev_cycle, vol_ratio or 0.0,
+                    )
+                else:
+                    await self._fire_confirmed_signal(
+                        side, rec, sig_k, close_pos, vol_ratio, cur_cycle, now_ms,
+                        version=self._active_version, shadow=False,
+                        pattern_type=pattern_type or "bull_exhaust",
+                    )
             else:
                 self._confirm_miss_count += 1
                 logger.info(
@@ -835,6 +865,7 @@ class FakeBreakoutDetector:
                         version=sv["version"], shadow=True,
                         pattern_type=s_pt or "bull_exhaust",
                     )
+        self._s2_last_eval_cycle = prev_cycle
 
         # S4 momentum_fade 独立检查：仅无 high 侧破位 pending 的周期执行
         # （破位周期若 K 同时满足 S4 定义必为 S1 子集，已被上面优先处理）
@@ -2113,6 +2144,7 @@ class FakeBreakoutDetector:
             "shadow_versions": [s["version"] for s in self._shadow_versions],
             "daily_count": self._daily_count,
             "daily_date": self._daily_date,
+            "s2_refire_skip_count": self._s2_refire_skip_count,
             "s4_refire_skip_count": self._s4_refire_skip_count,
             "eps": settings.fake_breakout_eps,
             "cooldown_seconds": settings.fake_breakout_cooldown_seconds,

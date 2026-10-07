@@ -395,6 +395,105 @@ async def test_status_snapshot_exposes_scene_state() -> None:
     assert snap["pending_breaks"]["low"]["broken_level"] == 90.0
     assert snap["confirm_retries"] == 1
     assert snap["last_cycle_id"] == 2071
+    assert snap["s2_refire_skip_count"] == 0
+
+
+# ============================================================
+# S2 跳过续发（连续周期完整命中 bear_exhaust 只保留首发）
+# ============================================================
+
+M15 = 900_000
+
+
+def _s2_bar(cycle: int, volume: float = 100.0) -> dict:
+    """收阴 K；volume=100 对 20 根均量 40 的量比 2.5 ≥ 2.0。"""
+    return {"open_time": cycle * M15, "open": 105.0, "high": 106.0, "low": 100.0,
+            "close": 101.0, "volume": volume}
+
+
+def _s2_klines(cycle: int, volume: float = 100.0) -> list[dict]:
+    hist = [_s2_bar(cycle - 20 + i, volume=40.0) for i in range(20)]
+    return hist + [_s2_bar(cycle, volume=volume)]
+
+
+def _s2_detector(seqs: list[list[dict]]) -> tuple[FakeBreakoutDetector, list[int]]:
+    class _Collector:
+        store = SimpleNamespace(mid_price=100.0)
+
+        async def fetch_recent_klines(self, interval: str, limit: int) -> list[dict]:
+            return seqs.pop(0)
+
+    d = FakeBreakoutDetector(collector=_Collector(), pm_15m_latest={})  # type: ignore[arg-type]
+    fired: list[int] = []
+
+    async def fake_fire(side, rec, sig_k, close_pos, vol_ratio, cur_cycle, now_ms,
+                        version="v1", shadow=False, pattern_type=None):
+        if pattern_type == "bear_exhaust" and not shadow:
+            fired.append(rec["cycle_id"])
+
+    d._fire_confirmed_signal = fake_fire  # type: ignore[method-assign]
+    return d, fired
+
+
+def _low_due(cycle: int) -> dict:
+    return {"low": {"cycle_id": cycle, "level": "4h", "broken_level": 100.0,
+                    "break_price": 99.9, "break_time": 0}}
+
+
+async def _run(d: FakeBreakoutDetector, cycle: int, due: dict) -> None:
+    await d._confirm_and_fire(due, cycle, cycle + 1, (cycle + 1) * M15, retry=0)
+
+
+@pytest.mark.asyncio
+async def test_s2_refire_chain_keeps_only_first() -> None:
+    """连续三个周期完整命中：只首发，后两次跳过（第三次仍因第二次被记为命中而跳过）。"""
+    d, fired = _s2_detector([_s2_klines(100), _s2_klines(101), _s2_klines(102)])
+    for c in (100, 101, 102):
+        await _run(d, c, _low_due(c))
+    assert fired == [100]
+    assert d.status_snapshot["s2_refire_skip_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_s2_refire_chain_broken_by_miss_fires_again() -> None:
+    """中间周期未命中（缩量）→ 链断，之后再次命中重新作为首发。"""
+    d, fired = _s2_detector(
+        [_s2_klines(100), _s2_klines(101, volume=50.0), _s2_klines(102)])
+    for c in (100, 101, 102):
+        await _run(d, c, _low_due(c))
+    assert fired == [100, 102]
+    assert d.status_snapshot["s2_refire_skip_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_s2_no_breakout_between_breaks_chain() -> None:
+    """中间周期无破位（due 为空）也断链：续发以「紧邻上一周期命中」为准。"""
+    d, fired = _s2_detector([_s2_klines(100), _s2_klines(101), _s2_klines(102)])
+    await _run(d, 100, _low_due(100))
+    await _run(d, 101, {})
+    await _run(d, 102, _low_due(102))
+    assert fired == [100, 102]
+
+
+@pytest.mark.asyncio
+async def test_s2_gap_cycle_and_cold_start_fire() -> None:
+    """冷启动首个 S2 放行；评估周期不连续（跳过一个周期）也不算续发。"""
+    d, fired = _s2_detector([_s2_klines(100), _s2_klines(102)])
+    await _run(d, 100, _low_due(100))   # 冷启动：内存无上一周期 → 放行
+    await _run(d, 102, _low_due(102))   # 101 未评估：不连续 → 放行
+    assert fired == [100, 102]
+    assert d.status_snapshot["s2_refire_skip_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_s2_non_hit_does_not_pollute_refire_state() -> None:
+    """缩量未命中的周期不记为命中：下一周期的真 S2 是首发。"""
+    d, fired = _s2_detector([_s2_klines(100, volume=50.0), _s2_klines(101)])
+    await _run(d, 100, _low_due(100))
+    await _run(d, 101, _low_due(101))
+    assert fired == [101]
+    assert d.status_snapshot["s2_refire_skip_count"] == 0
+
 
 # ============================================================
 # S5 bull_exhaust_confirm（S1 +5min 回落确认，2026-08-18）
