@@ -2237,8 +2237,9 @@ function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }
 // 失败单 amount_in=0、token_id=""、均价是报价不是成交价，混在主列表里会污染盈亏阅读）
 const DEFAULT_ORDERS_PAGE_SIZE = 20
 
-function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
+function OrdersCard({ orders, liveChannelSet, syncing, syncResult, onSyncBinance }: {
   orders: Record<string, unknown>[]
+  liveChannelSet: Set<string>
   syncing: boolean
   syncResult: Record<string, unknown> | null
   onSyncBinance: () => void
@@ -2264,13 +2265,21 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
     return true
   }
 
+  // 「仅实盘」范围判定：以后端多通道状态 API 返回的当前注册实盘通道清单为权威
+  // （退役通道已移出注册表，自然被排除；清单未加载完成时退回字符串启发式兜底）
+  const inLiveScope = (sig: unknown) => {
+    const s = String(sig ?? '').trim()
+    if (liveChannelSet.size > 0) return liveChannelSet.has(s)
+    return isLiveOrder(s)
+  }
+
   // 失败单严格分流：主 Tab 只留非 FAILED（FILLED / PENDING / 未知状态都在），失败 Tab 只留 FAILED
   const activeOrders = orders.filter(o => String(o.status ?? '') !== 'FAILED')
   const failedOrders = orders.filter(o => String(o.status ?? '') === 'FAILED')
   const base = orderTab === 'active' ? activeOrders : failedOrders
 
-  // 通道范围过滤：LIVE_ONLY（默认）时剔除非实盘订单；通道下拉列表跟随当前范围生成
-  const scopedBase = fChannel === 'LIVE_ONLY' ? base.filter(o => isLiveOrder(o.signal_version)) : base
+  // 通道范围过滤：LIVE_ONLY（默认）时只保留当前注册实盘通道的订单；通道下拉列表跟随当前范围生成
+  const scopedBase = fChannel === 'LIVE_ONLY' ? base.filter(o => inLiveScope(o.signal_version)) : base
 
   const channels = Array.from(new Set(
     scopedBase.map(o => String(o.signal_version ?? '')).filter(v => v && v !== '--'))).sort()
@@ -3201,6 +3210,10 @@ function LiveTradeTab() {
   const regTs = wallet?.registered_time as number | undefined
   // 多通道实盘：live = live_channels status（channels[] 见 LiveChannelStatus）
   const liveChannels = Array.isArray(live?.channels) ? live.channels as LiveChannelStatus[] : []
+  // 当前注册实盘通道名集合（退役通道已移出注册表）：供订单记录「仅实盘」筛选使用
+  const liveChannelNames = useMemo(
+    () => new Set(liveChannels.map(c => String(c.channel))),
+    [liveChannels])
   const liveDefaults = (live?.defaults ?? {}) as Record<string, unknown>
 
   // 通道 pnl 快速索引；列表默认按信号 EV、真实胜率依次降序，无已结算单者排末尾。
@@ -3941,7 +3954,7 @@ function LiveTradeTab() {
       {/* 订单记录保留在主区；表现诊断与资金变化通过右侧抽屉查看。 */}
       {/* 最近订单：主区账户状态下方 */}
       <div className="lg:col-span-2">
-        <OrdersCard orders={orders} syncing={syncing} syncResult={syncResult} onSyncBinance={handleSyncBinance} />
+        <OrdersCard orders={orders} liveChannelSet={liveChannelNames} syncing={syncing} syncResult={syncResult} onSyncBinance={handleSyncBinance} />
       </div>
     </div>
 
