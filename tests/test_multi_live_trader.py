@@ -6272,4 +6272,46 @@ async def test_trade_test_future_window_too_soon_rejected(monkeypatch) -> None:
     assert "距开盘不足 5 秒" in out["error"]
 
 
+@pytest.mark.asyncio
+async def test_after_fill_notifies_actual_average_price_and_shares(monkeypatch) -> None:
+    """验证 _after_fill 正确从 order/quote_json 提取实际 average_price 与 shares 并通知微信。"""
+    from binance_predict.services.multi_live_trader import MultiLiveTrader
+    from binance_predict.services.wechat_notifier import wechat_notifier
+    from unittest.mock import MagicMock
+
+    t = MultiLiveTrader(trader=None)
+    cfg = MagicMock()
+    cfg.amount_usdt = 5.0
+    cfg.fire_total = 0
+
+    captured = {}
+    def mock_notify(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(wechat_notifier, "notify_order_filled", mock_notify)
+
+    # 模拟 prediction_trading 返回的实际订单快照（含 average_price, quote_json）
+    order_snapshot = {
+        "id": 9999,
+        "status": "FILLED",
+        "signal_version": "absorption_follow_td150_v1",
+        "window_start": 1789670100000,
+        "direction": "DOWN",
+        "average_price": 0.62,
+        "quote_json": {
+            "averagePrice": 0.62,
+            "filledShareQty": 8.06,
+        },
+    }
+
+    await t._after_fill(order_snapshot, "absorption_follow_td150_v1", cfg)
+
+    assert captured.get("avg_price") == 0.62
+    assert captured.get("shares") == 8.06
+    assert captured.get("channel") == "absorption_follow_td150_v1"
+    assert captured.get("direction") == "DOWN"
+    assert captured.get("order_id") == 9999
+
+
+
 

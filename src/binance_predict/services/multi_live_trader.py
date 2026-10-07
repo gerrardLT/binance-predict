@@ -1828,13 +1828,21 @@ class MultiLiveTrader:
         # 企微成交通知
         if order.get("status") == "FILLED":
             try:
+                raw_avg = order.get("average_price") or order.get("avg_price") or 0.0
+                qj = order.get("quote_json")
+                if isinstance(qj, dict):
+                    if not raw_avg:
+                        raw_avg = qj.get("averagePrice") or 0.0
+                shares_val = order.get("shares")
+                if shares_val is None and isinstance(qj, dict):
+                    shares_val = qj.get("filledShareQty")
                 wechat_notifier.notify_order_filled(
                     channel=channel,
                     direction=str(order.get("direction", "")),
                     window_start=int(order.get("window_start", 0)),
-                    avg_price=float(order.get("avg_price", 0.0)),
+                    avg_price=float(raw_avg),
                     amount_usdt=float(order.get("amount_usdt", cfg.amount_usdt)),
-                    shares=float(order.get("shares")) if order.get("shares") is not None else None,
+                    shares=float(shares_val) if shares_val is not None else None,
                     order_id=order.get("id"),
                 )
             except Exception as exc:
