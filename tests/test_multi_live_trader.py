@@ -374,7 +374,8 @@ def test_channels_registry_shape() -> None:
         # firsthit 族（默认全 OFF，用户确认独立下单）。
         # 2026-10-05：G7 全系六通道、K10 两版、process_recovery 已退役移出注册表
         # （剔 Top5 赢单后影子 EV 全负，见 RETIRED_CHANNEL_SPECS 注释）。
-        "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1",
+        # 2026-10-06：G3 升级为 v2 双波峰版（firsthit_down_chg_v2），v1 退役归档。
+        "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v2",
         # 2026-09-08 firsthit G4 交互门（G1∩G3，默认 OFF；⚠非独立暴露，见 live_channels 注释）
         "firsthit_down_g4_v1",
         # 2026-09-09 15m 经典孕线反转双通道 + 2026-09-13 5m HM 精选通道（默认全 OFF）
@@ -399,6 +400,7 @@ def test_channels_registry_shape() -> None:
         "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",
         "firsthit_down_k10_v1", "firsthit_down_k10_profit_v1",
         "process_recovery_down_v1",
+        "firsthit_down_chg_v1",
     }
     assert not (set(LIVE_CHANNELS) & set(RETIRED_CHANNELS))
     by = {**RETIRED_CHANNEL_SPECS, **LIVE_CHANNELS}
@@ -2078,14 +2080,14 @@ def _firsthit_btc_curve(btc_open: float = 100.0, btc_trig: float = 100.3, npts: 
 async def test_firsthit_enabled_channels_registered(monkeypatch) -> None:
     """firsthit G0/G1/G3 三个通道已注册，默认关闭，护栏按约定值。"""
     from binance_predict.services.live_channels import LIVE_CHANNELS
-    assert all(ch in LIVE_CHANNELS for ch in ["firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1"])
+    assert all(ch in LIVE_CHANNELS for ch in ["firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v2"])
     cfgs = parse_channel_config()
-    assert not cfgs["firsthit_down_v1"].enabled and not cfgs["firsthit_down_body_v1"].enabled and not cfgs["firsthit_down_chg_v1"].enabled
+    assert not cfgs["firsthit_down_v1"].enabled and not cfgs["firsthit_down_body_v1"].enabled and not cfgs["firsthit_down_chg_v2"].enabled
     assert cfgs["firsthit_down_v1"].amount_usdt == 2.0
     assert cfgs["firsthit_down_v1"].max_daily_orders == 100
     assert cfgs["firsthit_down_v1"].max_exec_price is None       # 缺省回落 spec.auto_max_exec
     assert cfgs["firsthit_down_body_v1"].max_exec_price is None
-    assert cfgs["firsthit_down_chg_v1"].max_exec_price is None
+    assert cfgs["firsthit_down_chg_v2"].max_exec_price is None
 
 
 @pytest.mark.asyncio
@@ -2118,7 +2120,7 @@ async def test_firsthit_g1_g3_gate_rejects_high_chg_or_large_body(monkeypatch) -
     fake = _FakeTrader()
     # chg 较大（+45bp）、body_r 较大（≈0.9）；2026-09-10 起盘前 veto 阈值 |chg|>50bp，
     # 100.45 → +45bp 安全远离贴线（浮点 (100.5/100-1)*1e4 = 50.00000000000004 会误拦）
-    t = _make_trader(monkeypatch, fake, channels=["firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1"])
+    t = _make_trader(monkeypatch, fake, channels=["firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v2"])
     dn_p = _firsthit_down_curve(trigger_q=0.07, npts=20)
     btc_p = _firsthit_btc_curve(btc_open=100.0, btc_trig=100.45, npts=20)  # chg≈+45bp
     REL_T_SEC = 120
@@ -2128,7 +2130,7 @@ async def test_firsthit_g1_g3_gate_rejects_high_chg_or_large_body(monkeypatch) -
                     window_btc_curve=btc_p, window_down_curve=dn_p)
     assert "firsthit_down_v1" in fired
     assert "firsthit_down_body_v1" not in fired
-    assert "firsthit_down_chg_v1" not in fired
+    assert "firsthit_down_chg_v2" not in fired
     await _drain(t)
     assert fake.calls[-1]["signal_version"] == "firsthit_down_v1"
 
@@ -2163,9 +2165,9 @@ async def test_firsthit_three_channels_independent_fill(monkeypatch) -> None:
             pts.append({"t": ts, "v": v})
         return pts
 
-    _three_ch = ["firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v1"]
+    _three_ch = ["firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v2"]
     _three_ov = {"firsthit_down_body_v1": {"enabled": True, "max_exec_price": 0.12},
-                 "firsthit_down_chg_v1": {"enabled": True, "max_exec_price": 0.09}}
+                 "firsthit_down_chg_v2": {"enabled": True, "max_exec_price": 0.09}}
 
     # ---- 场景 A：首触 105s（早峰下界带内）→ 三通道各自下单 ----
     fakeA = _FakeTrader()
@@ -2190,9 +2192,9 @@ async def test_firsthit_three_channels_independent_fill(monkeypatch) -> None:
                     down_price=0.5, btc_price=100.02,
                     window_entry_price=100.0,
                     window_btc_curve=btc_p, window_down_curve=dn_p)
-    # fired=同步层派生任务（G3 版本门过、带门在异步任务内裁决）→ 三通道都在；
-    # 实际下单（fake.calls）由带门拦掉 G3。
-    assert set(fired) == set(_three_ch)
+    # fired=同步层派生任务（G3v2 原生双波峰门禁不过直接同步短路拦截）→ 仅 G0/G1 派生；
+    # 实际下单（fake.calls）同样只有 G0/G1。
+    assert set(fired) == {"firsthit_down_v1", "firsthit_down_body_v1"}
     await _drain(t)
     assert {c["signal_version"] for c in fake.calls} == {
         "firsthit_down_v1", "firsthit_down_body_v1"
@@ -2234,8 +2236,8 @@ async def test_firsthit_three_channels_independent_fill(monkeypatch) -> None:
     #      → 剩余时间硬门拦截（末段反转概率断崖）----
     fakeE = _FakeTrader()
     tE = _make_trader(monkeypatch, fakeE,
-                      channels=["firsthit_down_chg_v1"],
-                      overrides={"firsthit_down_chg_v1": {"enabled": True, "max_exec_price": 0.09}})
+                      channels=["firsthit_down_chg_v2"],
+                      overrides={"firsthit_down_chg_v2": {"enabled": True, "max_exec_price": 0.09}})
     dnE = _firsthit_down_curve(trigger_q=0.07, npts=20, trigger_idx=15)   # t=225s 带内
     btcE = _btc_curve_with_trigger(15)
     monkeypatch.setattr(milt.time, "time", lambda: (WINDOW_START + 245_000) / 1000)  # 剩余 55s<60s
@@ -2249,8 +2251,8 @@ async def test_firsthit_three_channels_independent_fill(monkeypatch) -> None:
     # ---- 场景 F：首触 240s（主峰上界带外）→ G3 被拦 ----
     fakeF = _FakeTrader()
     tF = _make_trader(monkeypatch, fakeF,
-                      channels=["firsthit_down_v1", "firsthit_down_chg_v1"],
-                      overrides={"firsthit_down_chg_v1": {"enabled": True, "max_exec_price": 0.09}})
+                      channels=["firsthit_down_v1", "firsthit_down_chg_v2"],
+                      overrides={"firsthit_down_chg_v2": {"enabled": True, "max_exec_price": 0.09}})
     dnF = _firsthit_down_curve(trigger_q=0.07, npts=20, trigger_idx=16)   # t=240s
     btcF = _btc_curve_with_trigger(16)
     monkeypatch.setattr(milt.time, "time", lambda: (WINDOW_START + 241_000) / 1000)
@@ -2268,8 +2270,8 @@ async def test_g3_pin_btc_to_first_touch_eliminates_timing_drift(monkeypatch) ->
     """G3 时点漂移根治验证：首触时刻 chg>+2.82bp，即便后续采样 BTC 回落，实盘坚决不开火。"""
     fake = _FakeTrader()
     t = _make_trader(monkeypatch, fake,
-                     channels=["firsthit_down_chg_v1"],
-                     overrides={"firsthit_down_chg_v1": {"enabled": True, "max_exec_price": 0.09}})
+                     channels=["firsthit_down_chg_v2"],
+                     overrides={"firsthit_down_chg_v2": {"enabled": True, "max_exec_price": 0.09}})
 
     # 构造曲线：首触发生在 105s (trigger_idx=7)，此时 BTC=+10.0bp（超 +2.82bp）
     # 随后 BTC 在 225s 回落至 +0.0bp
@@ -2719,7 +2721,7 @@ def test_status_shape(monkeypatch) -> None:
     assert s["defaults"]["amount_usdt"] == 2.0
     assert s["defaults"]["max_daily_orders"] == 100
     from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
-    assert len(s["channels"]) == 55 + len(CANDLESTICK_SIGNAL_IDS)
+    assert len(s["channels"]) == 56 + len(CANDLESTICK_SIGNAL_IDS)
     by = {c["channel"]: c for c in s["channels"]}
     c = by["quote_contrarian_v1"]
     assert c["enabled"] is True and c["enabled_at_startup"] is True
@@ -5404,9 +5406,9 @@ def test_limit_order_channels_marked_in_registry() -> None:
         "hm_inside_5m_v2",
         "hm_inside_15m_v2",
         "ih_inside_15m_v2",
-        # 2026-10-05：G3 利润带改造 LIMIT→MARKET（限价成交条件=价格继续恶化，
-        # 曾把实盘样本逆向选择到晚段深价；G7/K10 系通道已退役移出清单）
-        "firsthit_down_chg_v1",
+        # 2026-10-06：G3v2 升级为独立版本，继承 MARKET（限价成交条件=价格继续恶化，
+        # 曾把实盘样本逆向选择到晚段深价；v1 历史归档移入退役清单）
+        "firsthit_down_chg_v2",
     ]
     for ch in expected_market_channels:
         spec = LIVE_CHANNELS.get(ch)

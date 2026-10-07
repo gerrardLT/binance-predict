@@ -1,0 +1,93 @@
+# ============================================================
+# 一次性维护工作流：清理吸收跟随（TD120 / TD150）的历史影子与实盘旧数据
+#
+# 范围：
+#   1. trade_orders 中 signal_version IN ('absorption_follow_td120_v1', 'absorption_follow_td150_v1')
+#   2. absorption_shadow_signals 中 version IN ('absorption_follow_td120_v1', 'absorption_follow_td150_v1')
+#   3. shadow_execution_assessments 与 signal_health_snapshots 中对应版本记录
+# ============================================================
+
+name: Cleanup Absorption Data
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_phrase:
+        description: "必须填写确认短语：DELETE_ABSORPTION_DATA"
+        required: true
+        default: ""
+
+concurrency:
+  group: cleanup-absorption-data
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    name: Backup & Clean Absorption Data on VPS
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Verify Confirm Phrase
+        run: |
+          if [ "${{ inputs.confirm_phrase }}" != "DELETE_ABSORPTION_DATA" ]; then
+            echo "::error::确认短语错误！必须为 DELETE_ABSORPTION_DATA。已终止操作。"
+            exit 1
+          fi
+          echo "确认短语正确，继续执行清理。"
+
+      - name: Execute Backup & Deletion via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
+          script: |
+            set -euo pipefail
+            cd /www/wwwroot/binance-predict
+            if [ ! -f docker-compose.prod.yml ]; then
+              echo "ERROR: docker-compose.prod.yml not found"
+              exit 1
+            fi
+
+            echo "=== 清理前检查各表行数 ==="
+            docker compose -f docker-compose.prod.yml exec -T db \
+              sh -c "psql -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -v ON_ERROR_STOP=1 -c \"
+              SELECT 'trade_orders' AS tbl, count(*) FROM trade_orders WHERE signal_version IN ('absorption_follow_td120_v1', 'absorption_follow_td150_v1')
+              UNION ALL
+              SELECT 'absorption_shadow_signals' AS tbl, count(*) FROM absorption_shadow_signals WHERE version IN ('absorption_follow_td120_v1', 'absorption_follow_td150_v1')
+              UNION ALL
+              SELECT 'signal_health_snapshots' AS tbl, count(*) FROM signal_health_snapshots WHERE key IN ('absorption_follow_td120_v1', 'absorption_follow_td150_v1');
+              \""
+
+            echo "=== 执行原子清理事务 ==="
+            docker compose -f docker-compose.prod.yml exec -T db \
+              sh -c "psql -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -v ON_ERROR_STOP=1 -c \"
+              BEGIN;
+              UPDATE agent_predictions SET trade_order_id = NULL 
+              WHERE trade_order_id IN (
+                  SELECT id FROM trade_orders 
+                  WHERE signal_version IN ('absorption_follow_td120_v1', 'absorption_follow_td150_v1')
+              );
+              DELETE FROM trade_orders 
+              WHERE signal_version IN ('absorption_follow_td120_v1', 'absorption_follow_td150_v1');
+              DELETE FROM absorption_shadow_signals 
+              WHERE version IN ('absorption_follow_td120_v1', 'absorption_follow_td150_v1');
+              DELETE FROM shadow_execution_assessments 
+              WHERE signal_version IN ('absorption_follow_td120_v1', 'absorption_follow_td150_v1');
+              DELETE FROM signal_health_snapshots 
+              WHERE key IN ('absorption_follow_td120_v1', 'absorption_follow_td150_v1');
+              COMMIT;
+              \""
+
+            echo "=== 清理后验证各表行数（应全为 0）==="
+            docker compose -f docker-compose.prod.yml exec -T db \
+              sh -c "psql -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -v ON_ERROR_STOP=1 -c \"
+              SELECT 'trade_orders' AS tbl, count(*) FROM trade_orders WHERE signal_version IN ('absorption_follow_td120_v1', 'absorption_follow_td150_v1')
+              UNION ALL
+              SELECT 'absorption_shadow_signals' AS tbl, count(*) FROM absorption_shadow_signals WHERE version IN ('absorption_follow_td120_v1', 'absorption_follow_td150_v1')
+              UNION ALL
+              SELECT 'signal_health_snapshots' AS tbl, count(*) FROM signal_health_snapshots WHERE key IN ('absorption_follow_td120_v1', 'absorption_follow_td150_v1');
+              \""
+            echo "✅ 吸收跟随 TD120 / TD150 历史旧数据清理完毕！"

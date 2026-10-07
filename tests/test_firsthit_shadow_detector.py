@@ -232,7 +232,30 @@ def test_gate_of_g4_is_intersection_of_g1_and_g3():
         g3 = _gate_of("firsthit_down_chg_v1", ext)
         g4 = _gate_of("firsthit_down_g4_v1", ext)
         assert g4 is expect, f"chg={chg} body={body}"
-        assert g4 is (g1 and g3), "G4 必须恒等于 G1∧G3"
+
+
+def test_gate_of_g3_v2_dual_bands_and_price_guards():
+    """G3v2 影子门禁：chg<=2.82 ∧ q>=0.07 ∧ [105,120)s ∪ [210,240)s 双波峰。"""
+    base = {
+        "q": 0.08, "trigger_ts": START + 110_000, "td_sec": 110,
+        "chg_bps": 2.0, "body_r": 0.50, "wick01": 0.0, "rng_bps": 5.0,
+        "npts": 20, "dvol": None, "dpar": None,
+    }
+    # 早峰带内 [105, 120)s
+    assert _gate_of("firsthit_down_chg_v2", {**base, "td_sec": 110}) is True
+    # 主峰带内 [210, 240)s
+    assert _gate_of("firsthit_down_chg_v2", {**base, "td_sec": 225}) is True
+    # 两峰之间空谷 (120, 210)s -> False
+    assert _gate_of("firsthit_down_chg_v2", {**base, "td_sec": 150}) is False
+    # 末段衰竭期 >=240s -> False
+    assert _gate_of("firsthit_down_chg_v2", {**base, "td_sec": 245}) is False
+    # 深价 q < 0.07 -> False
+    assert _gate_of("firsthit_down_chg_v2", {**base, "td_sec": 110, "q": 0.05}) is False
+    # chg 超门限 -> False
+    assert _gate_of("firsthit_down_chg_v2", {**base, "td_sec": 110, "chg_bps": 3.0}) is False
+    # 字段缺失 -> False
+    assert _gate_of("firsthit_down_chg_v2", {**base, "chg_bps": None}) is False
+    assert _gate_of("firsthit_down_chg_v2", {**base, "td_sec": None}) is False
 
 
 def test_gate_of_g4_boundary_inclusive_and_none_guard():
@@ -435,7 +458,8 @@ async def test_process_window_triggers_g0(monkeypatch):
     await d._process_window(w)
     versions = [r.version for r in session.added]
     assert "firsthit_down_v1" in versions
-    assert "firsthit_down_chg_v1" in versions      # chg=0.5bp ≤ 2.82bp → G3 同窗命中
+    assert "firsthit_down_chg_v2" in versions      # chg=0.5bp ≤ 2.82bp 且双峰带内 → G3v2 同窗命中
+    assert "firsthit_down_chg_v1" not in versions  # v1 已退役被 gate 拦截不落表
     assert len(session.added) == 3 and session.committed == 3   # G0+G3+G3 early 独立 commit
     row = [r for r in session.added if r.version == "firsthit_down_v1"][0]
     assert row.status == "SETTLED"
@@ -493,7 +517,8 @@ async def test_process_window_triggers_k10_versions_with_audit_fields(monkeypatc
     assert "firsthit_down_k10_v1" not in by_version, "退役版本不得落库"
     assert "firsthit_down_k10_profit_v1" not in by_version, "退役版本不得落库"
     assert "firsthit_down_v1" in by_version, "G0 照常采集"
-    assert "firsthit_down_chg_v1" in by_version, "G3 照常采集"
+    assert "firsthit_down_chg_v2" in by_version, "G3v2 照常采集"
+    assert "firsthit_down_chg_v1" not in by_version, "G3v1 已退役不落表"
 
 
 @pytest.mark.asyncio
@@ -597,6 +622,7 @@ def test_versions_isolated_from_trading_path():
         "process_recovery_down_v1",
         "firsthit_down_g7_v1", "g7_streak_v1", "g7_wick20_v1",
         "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",
+        "firsthit_down_chg_v1",
     }, "退役名单与 spec 集不一致"
 
 
@@ -618,6 +644,7 @@ def test_specs_self_consistent():
         "firsthit_down_g7_v1", "g7_streak_v1", "g7_wick20_v1",
         "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",
         "firsthit_down_btcsoft_v1",
+        "firsthit_down_chg_v2",
     }
     for v, name in FIRSTHIT_SPECS:
         assert len(v) <= 32, f"{v} 超出 DB 列宽 String(32)"
@@ -705,6 +732,6 @@ async def test_process_window_persists_btcsoft(monkeypatch):
     await d._process_window(w)
     versions = [r.version for r in session.added]
     assert "firsthit_down_btcsoft_v1" in versions, "错杀门满足应落表"
-    assert "firsthit_down_chg_v1" in versions, "G3 门（母集）同时命中"
+    assert "firsthit_down_chg_v2" in versions, "G3v2 门（母集）同时命中"
     row = next(r for r in session.added if r.version == "firsthit_down_btcsoft_v1")
     assert row.entry_down_price == pytest.approx(0.08)

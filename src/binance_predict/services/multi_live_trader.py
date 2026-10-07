@@ -145,8 +145,8 @@ FIRSTHIT_SLIPPAGE_TOL_RATIO = 1.03            # 2026-09-11 新增：下单护拦
 # 的仅有两个正 EV 波峰区——早波峰 105~120s（胜率 13.8%，EV+0.607）与主波峰 210~240s
 # （胜率 10.1%，EV+0.265）× 浅价 q≥0.07；坚决避开 240s+（剩余<60s）衰竭区与 285s+ 归零深渊。
 # 三件套之二：带门（本常量区）与下单时刻剩余门（_fire_firsthit，下调至 60s 打通 220-240s 主峰）；
-# 三件套之一 LIMIT→MARKET 在 live_channels。仅约束实盘通道；G3 影子版本继续全样本采集。
-G3_LIVE_CHANNEL = "firsthit_down_chg_v1"
+# 三件套之一 LIMIT→MARKET 在 live_channels。仅约束实盘通道；G3v2 影子版本双波峰独立采集。
+G3_LIVE_CHANNEL = "firsthit_down_chg_v2"
 G3_LIVE_TD_BANDS_S = ((105.0, 120.0), (210.0, 240.0))  # 触发时刻双波峰带（距窗开秒，含下界不含上界）
 G3_LIVE_Q_MIN = 0.07                                   # 浅价下界（触发报价，过滤深水归零单）
 G3_LIVE_MIN_REMAIN_S = 60.0                            # 下单时刻距窗末剩余硬门（60s，防>240s末段追单）

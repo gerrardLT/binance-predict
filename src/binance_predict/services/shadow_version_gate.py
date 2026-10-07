@@ -57,6 +57,8 @@ RETIRED_VERSIONS: frozenset[str] = frozenset({
     "g7_q05_v1", "g7_t270_v1",
     "firsthit_down_k10_v1", "firsthit_down_k10_profit_v1",
     "process_recovery_down_v1",
+    # 2026-10-06：旧 G3v1 升级为 v2 双波峰版，旧版停止新落表，数据归档供历史对账。
+    "firsthit_down_chg_v1",
 })
 
 

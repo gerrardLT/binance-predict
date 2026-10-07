@@ -264,17 +264,13 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
         "firsthit_down_body_v1", "firsthit", "5m", "DOWN", 0.15,
         "首触G1小实体 body_r≤0.35（押DOWN）", order_type="LIMIT",
     ),
-    # G3（2026-10-06 双波峰利润带改造）：实盘执行限定在 15S 细粒度分桶（4549 笔
-    # 母事件）定位的仅有两个正 EV 波峰——早峰 105~120s（13.8%/EV+0.607）与
-    # 主峰 210~240s（10.1%/EV+0.265）× 浅价 q≥0.07；坚决避开 240s+ 衰竭区
-    # （240-300s 占 41% 样本暴亏 -124U）与 285s+ 归零深渊（4.97%/-121U）。
-    # 叠加下单时刻剩余 ≥60s 硬门（80s→60s，打通 220-240s 主峰死区）与
-    # LIMIT→MARKET（限价逆向选择修复：曾把 32% 信号层胜率打成 5% 实盘）。
-    # 带门在 multi_live_trader 执行层实施，影子版本仍全样本采集（研究资产）。
-    # 护栏 0.09 语义随 MARKET 变为弃单线，动态护栏（q×1.03）继续生效。
-    "firsthit_down_chg_v1": ChannelSpec(
-        "firsthit_down_chg_v1", "firsthit", "5m", "DOWN", 0.09,
-        "首触G3偏离·双波峰版 触发105-120s/210-240s∧q≥0.07（押DOWN）",
+    # G3v2（2026-10-06 双波峰利润带改造）：升级为独立 v2 版本，实盘与影子从 0 开始。
+    # 彻底告别 v1 历史逆向选择与时点漂移；实盘与影子完全同源：触发 105~120s / 210~240s
+    # 且浅价 q≥0.07（4549 笔前向事件 15S 分桶验证：早峰 13.8%/EV+0.607，主峰 10.1%/EV+0.265）。
+    # 锁定首触 BTC 特征、下单剩余 ≥60s 硬门、MARKET 市价单、动态护栏（q×1.03）。
+    "firsthit_down_chg_v2": ChannelSpec(
+        "firsthit_down_chg_v2", "firsthit", "5m", "DOWN", 0.09,
+        "首触G3偏离v2·双波峰版 触发105-120s/210-240s∧q≥0.07（押DOWN）",
     ),
     # 2026-10-05：K10 两版移入 RETIRED_CHANNEL_SPECS——影子本身负 EV
     # （−0.44/−0.42，剔 Top5 后 −0.95），信号已死非执行问题；盈利版的末 60s
@@ -457,6 +453,11 @@ RETIRED_CHANNEL_SPECS: dict[str, ChannelSpec] = {
     "process_recovery_down_v1": ChannelSpec(
         "process_recovery_down_v1", "process_recovery", "5m", "DOWN", 0.35,
         "过程恢复双确认（押DOWN）",
+    ),
+    # 2026-10-06 退役：旧 G3v1 升级为 v2 双波峰版，旧数据归档保留供历史审计。
+    "firsthit_down_chg_v1": ChannelSpec(
+        "firsthit_down_chg_v1", "firsthit", "5m", "DOWN", 0.09,
+        "首触G3价格偏离（已退役：已升级为v2双波峰版）", order_type="MARKET",
     ),
 }
 

@@ -81,6 +81,8 @@ _VERSION_ROWS: tuple[tuple[str, SourceType, str, str, str], ...] = (
     # 报价错杀版（2026-10-05）：G3 门 ∩ 浅价 q≥0.07 ∩ 触发前 60 采样点 BTC 未上行；
     # forward 母体 ex-ante 扫描候选，仅影子前向验证。
     ("firsthit_down_btcsoft_v1", SourceType.FIRSTHIT, "5m", "same_window_first_touch", "down"),
+    # G3v2 双波峰版（2026-10-06 升级）：双波峰利润带原生门，与实盘严格同口径。
+    ("firsthit_down_chg_v2", SourceType.FIRSTHIT, "5m", "same_window_first_touch", "down"),
     ("hm_inside_15m_v2", SourceType.KLINE, "15m", "target_bar", "row"),
     ("ih_inside_15m_v2", SourceType.KLINE, "15m", "target_bar", "row"),
     ("hm_inside_5m_v2", SourceType.KLINE, "5m", "target_bar", "row"),

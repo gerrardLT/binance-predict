@@ -1181,8 +1181,13 @@ const SIGNAL_INFO: Record<string, { name: string; desc: string; retired?: boolea
     desc: 'G0 + body_r≤0.35（首触前 BTC 路径归一实体小，震荡而非单边跑出去）。默认关闭；与 G0/G3 独立下单，不做跨版本互斥，每通道每窗至多一单。执行价护栏 0.12，实际成交均价高于护栏弃单。confirm 段已 burned，护栏非前向胜率背书。',
   },
   firsthit_down_chg_v1: {
-    name: '首触G3偏离·双波峰版（押DOWN）',
-    desc: '【2026-10-06 双波峰改造；影子口径不变仍全样本采集】信号门 G0+chg≤+2.82bp 不变；实盘执行限定两个正 EV 波峰：触发 105~120s（早峰 13.8%/EV+0.607）与 210~240s（主峰 10.1%/EV+0.265）× 浅价 q≥0.07（4549 笔母事件 15S 分桶定位）；坚决避开 240s+ 衰竭区（占 41% 样本暴亏）与 285s+ 归零深渊（胜率 4.97%）。MARKET 市价单（原 LIMIT 限价曾把成交逆向选择到晚段深价：20 单 83% 晚触全输），下单时刻距窗末剩余 ≥60s 弃单（80s→60s 打通 220-240s 主峰）。默认关闭；护栏=触发价×1.03 动态护栏。⚠️对比实盘与影子时须把影子按同门（双峰带内子集）过滤，全样本直比口径不可比。',
+    name: '首触G3偏离v1（押DOWN）',
+    desc: '【已退役：已升级为v2双波峰版】历史v1口径：G0+chg≤+2.82bp，因全窗无差别采集包含末段失血单且历史实盘存在LIMIT逆向选择，已归档封存供对账。',
+    retired: true,
+  },
+  firsthit_down_chg_v2: {
+    name: '首触G3偏离v2·双波峰版（押DOWN）',
+    desc: '【2026-10-06 升级从0起跑】信号门 G0+chg≤+2.82bp；实盘与影子完全同源：限定两个正 EV 波峰 触发 105~120s（早峰 13.8%/EV+0.607）与 210~240s（主峰 10.1%/EV+0.265）× 浅价 q≥0.07（4549 笔前向事件 15S 分桶验证）；坚决避开 240s+ 衰竭区与 285s+ 归零深渊。MARKET 市价单，下单时刻距窗末剩余 ≥60s 弃单，锁定首触时刻 BTC 特征杜绝时点漂移。默认关闭；护栏=触发价×1.03 动态护栏。',
   },
   firsthit_down_chg_early180_v1: {
     name: '首触G3前3分钟研究版（押DOWN）',
@@ -6883,7 +6888,8 @@ const SHADOW_META: Record<string, { label: string; color: string }> = {
   // 2026-09-07/08 首触反转族（专用表 firsthit_shadow_signals，影子+实盘通道）
   firsthit_down_v1: { label: '首触G0 基底 q∈(0.005,0.1]→DOWN', color: 'var(--chart-3)' },
   firsthit_down_body_v1: { label: '首触G1 body_r≤0.35→DOWN', color: 'var(--chart-4)' },
-  firsthit_down_chg_v1: { label: '首触G3 chg≤+2.82bp→DOWN', color: 'var(--chart-5)' },
+  firsthit_down_chg_v1: { label: '首触G3 v1 (已退役)', color: 'var(--chart-5)' },
+  firsthit_down_chg_v2: { label: '首触G3v2 双波峰版 105-120s/210-240s→DOWN', color: 'var(--chart-5)' },
   firsthit_down_chg_early180_v1: { label: '首触G3前3分钟→DOWN', color: 'var(--chart-3)' },
   firsthit_down_k10_early180_v1: { label: '首触K10前3分钟→DOWN', color: 'var(--chart-5)' },
   process_recovery_down_v1: { label: '过程恢复双确认→DOWN', color: 'var(--chart-4)' },
@@ -6954,7 +6960,8 @@ const ANALYTICS_EXTRA_DESC: Record<string, string> = {
   scene_bear_exhaust_opt_v1: 'S2 空头耗尽优化版：完全复用原 S2（跌破4小时支撑、15分钟收阴、量比≥2），再排除极端放量（量比≥4）和最近14日区间下方33%（pos14d<0.33）；保留后押下一15分钟 UP。14日高低点严格截止信号K收盘，无未来函数；历史不足或区间无波动保守不触发。720d n=975、胜率58.97%，前后半段均改善；影子持续采集，同名实盘通道默认关闭，护栏0.57，与原S2同窗互斥。',
   firsthit_down_v1: '首触反转 G0 基底（对照组）：5m 窗内 DOWN token 报价**首次**进入 (0.005, 0.1]（深折价，市场判定几乎不会跌）的采样点 → 按该时刻真实报价买 DOWN，押注最终结算 DOWN =「反转」的影子信号，仅记录不下单。触发时刻特征严格 ex-ante（只读 ≤触发时刻采样）：chg_bps（BTC 相对开盘涨跌）、body_r（|btc@触−开盘|/路径 max−min 归一实体）、npts（路径采样点数，<8 整窗不落表=路径太稀疏特征不可信）。落专用表 firsthit_shadow_signals，G1/G3 为 G0 的纯子集（同表 version 隔离、全特征落库，交叉门 G4=body∧chg 可事后重构）。44d 回测基底 EV +0.22（日聚类 CI[+0.10,+0.35]），EV 按逐事件真实触发价现算：赢 0.98/q−1 / 输 −1（禁用任何均值/分位代理）。预注册裁决（4 周前向）：若 G0 前向 EV 日聚类 CI **上界** < 0 → DOWN 侧 edge 消失，整族否决重来。',
   firsthit_down_body_v1: '首触反转 G1 小实体：G0 基底 + body_r ≤ 0.35 门禁（触发时刻 BTC 相对开盘的净位移只占窗内路径振幅的 ≤35%，即价格来回震荡而非单边跑出去）→ 按首触时刻真实 DOWN 报价买 DOWN 的影子信号，仅记录不下单。研究口径：45 维条件扫描中 body_r≤0.35 是唯一扛住 FDR 多重校正的形态门（q=0.007，logit 控 t+t² 后 β=+1.28 p=0.000），排除时间分段混淆。严格 ex-ante 时间切分两段考试：calib EV +1.44 → confirm EV +1.59（两段日聚类 CI 下界均 > 0）。落专用表 firsthit_shadow_signals（G0 纯子集，version 隔离），EV 逐事件真实触发价现算：赢 0.98/q−1 / 输 −1。预注册裁决（4 周前向）：通过 = 前向触发率 P ≥ 12% 且 EV 日聚类 CI 下界 > 0。',
-  firsthit_down_chg_v1: '首触反转 G3 价格偏离：G0 基底 + chg_bps ≤ +2.82bp 门禁（触发时刻 BTC 相对窗开盘涨幅不超过 +2.82 个基点，即深折价并非由 BTC 真涨造成，属报价错杀而非信息驱动）→ 按首触时刻真实 DOWN 报价买 DOWN 的影子信号，仅记录不下单。研究口径：logit 控 t+t² 后 β=+0.07 p=0.000（chg 越低反转概率越高，单调）。严格 ex-ante 时间切分两段考试：calib EV +0.39 → confirm EV +0.97（confirm 段更强但样本少）。落专用表 firsthit_shadow_signals（G0 纯子集，version 隔离），EV 逐事件真实触发价现算：赢 0.98/q−1 / 输 −1。预注册裁决（4 周前向）：通过 = 前向触发率 P ≥ 10% 且 EV 日聚类 CI 下界 > 0。',
+  firsthit_down_chg_v1: '首触反转 G3 价格偏离（已退役）：历史v1口径因全窗无差别采集包含末段失血单且历史实盘存在LIMIT逆向选择，已归档封存供对账。',
+  firsthit_down_chg_v2: '首触反转 G3v2 双波峰版：G0基底 + chg_bps≤+2.82bp 门禁，实盘与影子完全同源，限定两个正 EV 波峰 105~120s（早峰 13.8%/EV+0.607）与 210~240s（主峰 10.1%/EV+0.265）× 浅价 q≥0.07。4549 笔前向母事件 15S 分桶验证，彻底避开 240s+ 衰竭区与 285s+ 归零深渊。影子与实盘同步从 0 笔干净数据全新起跑。',
   firsthit_down_chg_early180_v1: 'G3前3分钟研究版：实际决策t<180秒、chg≤+2.82bp，按决策点真实DOWN报价记录。前向验证，实盘默认关闭。',
   firsthit_down_k10_early180_v1: 'K10前3分钟研究版：真实首触前缀t<180秒，G3且z≤1.85567，缺前序K线不开火。前向验证，实盘默认关闭。',
   process_recovery_down_v1: '过程段首个DOWN低价点建立观察；BTC回收≥35%与token回升≥0.02同点成立才确认。确认t<180秒、0.15<q≤0.35；使用确认价而非触达价。后验候选，无独立盲测背书，实盘默认关闭。',

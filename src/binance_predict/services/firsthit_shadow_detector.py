@@ -81,11 +81,16 @@ FIRSTHIT_SPECS: list[tuple[str, str]] = [
     # BTC 侧无涨势 = 报价错杀而非信息驱动。来源：forward 母事件 ex-ante 扫描
     # 87 笔 18.4%/EV+1.02（剔 Top5 赢单后 +0.33）；多重比较未校正，仅影子前向裁决。
     ("firsthit_down_btcsoft_v1", "G3门∧浅价q≥0.07∧触发前60点BTC未上行"),
+    # G3v2 双波峰版（2026-10-06 升级）：触发 105~120s / 210~240s ∩ chg≤+2.82bp ∩ 浅价 q≥0.07。
+    # 彻底告别 v1 历史逆向选择与时点漂移，影子从 0 开始全新起跑，与实盘严格同口径。
+    ("firsthit_down_chg_v2", "G3双波峰版 105-120s/210-240s∧chg≤+2.82bp∧q≥0.07"),
 ]
 Q_LO, Q_HI = 0.005, 0.1      # 首触报价区间 (0.005, 0.1]
 BODY_R_GATE = 0.35           # G1 门：路径归一实体 ≤ 0.35
 CHG_BPS_GATE = 2.82          # G3 门：BTC 相对开盘涨幅 ≤ +2.82 bp
 BTCSOFT_Q_MIN = 0.07         # 报价错杀门：浅价下界（0.07 ≤ q ≤ 0.1）
+G3_V2_BANDS_S = ((105, 120), (210, 240))  # G3v2 双波峰时间窗
+G3_V2_Q_MIN = 0.07           # G3v2 浅价下界
 MIN_PTS = 8                  # 路径质量门：触发前 btc 采样点数 ≥ 8（v2 主分析口径）
 K10_VERSIONS = frozenset({"firsthit_down_k10_v1", "firsthit_down_k10_profit_v1", K10_EARLY})
 K10_Z_MAX = 1.8556725686410152
@@ -381,6 +386,14 @@ def _gate_of(
         return ext["body_r"] is not None and ext["body_r"] <= BODY_R_GATE
     if version == "firsthit_down_chg_v1":
         return ext["chg_bps"] is not None and ext["chg_bps"] <= CHG_BPS_GATE
+    if version == "firsthit_down_chg_v2":
+        td = ext.get("td_sec")
+        q = ext.get("q")
+        chg = ext.get("chg_bps")
+        if td is None or q is None or chg is None:
+            return False
+        in_band = any(lo <= float(td) < hi for lo, hi in G3_V2_BANDS_S)
+        return in_band and float(q) >= G3_V2_Q_MIN and float(chg) <= CHG_BPS_GATE
     if version == "firsthit_down_btcsoft_v1":
         # 报价错杀版：G3 门 ∩ 浅价 ∩ 触发前 60 采样点 BTC 未上行。
         # btc_speed_60_bps 缺失（60s 前无采样）一律不放行——宁缺毋假。
