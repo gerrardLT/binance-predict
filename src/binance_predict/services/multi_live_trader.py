@@ -1663,9 +1663,9 @@ class MultiLiveTrader:
                 dyn_guard = resolve_max_exec(spec, cfg)
             else:
                 if channel == G3_LIVE_CHANNEL:
-                    # 利润带门三件套之三：下单时刻距窗末剩余 ≥80s 硬门（I/O 等待后
+                    # 利润带门三件套之三：下单时刻距窗末剩余 ≥60s 硬门（I/O 等待后
                     # 复核实际墙钟）。末段反转概率断崖（240s+ 触发胜率 6.1%、
-                    # 280s+ EV −0.256），且 G3 历史实盘 83% 成交单堆积在此区间。
+                    # 280s+ EV −0.256），打通 220~240s 主峰死区同时严防末段违规追单。
                     if time.time() * 1000 > window_start + 300_000 - G3_LIVE_MIN_REMAIN_S * 1000:
                         logger.info(
                             "多通道实盘：{} 下单时刻剩余<{:.0f}s，弃单 | 窗口 {}",

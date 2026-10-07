@@ -1,0 +1,126 @@
+# ============================================================
+# 运维工作流：精确恢复吸收跟随（TD120 / TD150）最近的新数据
+#
+# 功能：
+#   1. 恢复 9月14日 实盘订单（仅保留最后运行阶段的真实订单，排除早期的旧失败单）
+#   2. 从数据库现存的 sentiment_windows 快速回补 9月15日至今的全部新前向影子信号
+# ============================================================
+
+name: Restore Recent Absorption Data
+
+on:
+  workflow_dispatch:
+    inputs:
+      restore_live_orders:
+        description: "是否恢复 9月14日 的实盘订单 (true/false)"
+        required: true
+        default: "true"
+      rebuild_recent_shadow:
+        description: "是否从 sentiment_windows 重放回补 9月15日至今的影子信号 (true/false)"
+        required: true
+        default: "true"
+
+concurrency:
+  group: restore-absorption-data
+  cancel-in-progress: false
+
+jobs:
+  restore:
+    name: Restore Recent Data on VPS
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Execute Selective Restore via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
+          script: |
+            set -euo pipefail
+            cd /www/wwwroot/binance-predict
+            if [ ! -f docker-compose.prod.yml ]; then
+              echo "ERROR: docker-compose.prod.yml not found"
+              exit 1
+            fi
+
+            echo "=== 正在重放 9月15日 至今的新影子信号 ==="
+            # 调用应用内轻量重放逻辑：重放 2026-09-15 00:00:00 UTC (1789430400000) 之后的窗口
+            docker compose -f docker-compose.prod.yml exec -T backend \
+              python3 -c "
+            import asyncio, math
+            from sqlalchemy import select, func
+            from binance_predict.db.engine import async_session_factory
+            from binance_predict.db.models import SentimentWindow, AbsorptionShadowSignal
+            from binance_predict.services.absorption_shadow_detector import ABSORPTION_SPECS, _extract, _calibrate, _outcome_of, _ev_at_entry, CALIB_BUFFER_MS
+
+            async def replay_recent():
+                cutoff_ms = 1789430400000 # 2026-09-15 00:00:00 UTC
+                async with async_session_factory() as session:
+                    # 1. 查 9月15日 之后的归档窗口
+                    stmt = select(SentimentWindow).where(SentimentWindow.start_time >= cutoff_ms).order_by(SentimentWindow.start_time.asc())
+                    wins = (await session.execute(stmt)).scalars().all()
+                    print(f'找到 9月15日 至今已归档窗口: {len(wins)} 个')
+                    
+                    # 2. 拉取前置 14 天用于标定缓冲
+                    calib_start = cutoff_ms - CALIB_BUFFER_MS
+                    stmt_c = select(SentimentWindow).where(SentimentWindow.start_time >= calib_start, SentimentWindow.start_time < cutoff_ms).order_by(SentimentWindow.start_time.asc())
+                    calib_wins = (await session.execute(stmt_c)).scalars().all()
+                    print(f'加载前置标定窗口: {len(calib_wins)} 个')
+                    
+                    buffers = {v: [] for v in ABSORPTION_SPECS}
+                    for w in calib_wins:
+                        st = int(w.start_time)
+                        for v, td in ABSORPTION_SPECS.items():
+                            ext = _extract(w, float(td))
+                            if ext: buffers[v].append((st, ext['btc_move'], ext['up_move']))
+                    
+                    inserted = 0
+                    for w in wins:
+                        outcome = _outcome_of(w)
+                        if not outcome: continue
+                        st_ms = int(w.start_time)
+                        ed_ms = int(w.end_time)
+                        for version, td in ABSORPTION_SPECS.items():
+                            ext = _extract(w, float(td))
+                            if not ext: continue
+                            buf = buffers[version]
+                            cutoff = st_ms - CALIB_BUFFER_MS
+                            buf = [(s, bm, um) for (s, bm, um) in buf if cutoff <= s < st_ms]
+                            buffers[version] = buf + [(st_ms, ext['btc_move'], ext['up_move'])]
+                            fitted = _calibrate([(bm, um) for (_, bm, um) in buf])
+                            if not fitted: continue
+                            k, b, disp_gate, under_gate = fitted
+                            bm, um = ext['btc_move'], ext['up_move']
+                            if abs(bm) < disp_gate: continue
+                            resid = um - (k * bm + b)
+                            under = -math.copysign(1.0, bm) * resid
+                            if under < under_gate: continue
+                            
+                            bet, q_real = ext['bet'], ext['q_real']
+                            win = outcome == bet
+                            ev = _ev_at_entry(win, q_real)
+                            session.add(AbsorptionShadowSignal(
+                                version=version, window_start=st_ms, window_end=ed_ms, td=int(td),
+                                direction=bet, k=k, b=b, disp_gate=disp_gate, under_gate=under_gate,
+                                calib_n=len(buf), btc_move_bp=bm, up_move_pp=um, resid_pp=resid, under_pp=under,
+                                dvol=ext['dvol'], dpar=ext['dpar'], entry_up_price=ext['up_pr_d'], entry_down_price=ext['dn_pr_d'],
+                                entry_quote_ts=ext['entry_ts'], entry_quote_kind='real', settle_outcome=outcome,
+                                win=win, ev_at_entry=ev, status='SETTLED',
+                            ))
+                            inserted += 1
+                    await session.commit()
+                    print(f'✅ 成功重放并恢复 9月15日 至今的新影子信号: {inserted} 条！')
+
+            asyncio.run(replay_recent())
+            "
+
+            echo "=== 检查恢复后影子数据状态 ==="
+            docker compose -f docker-compose.prod.yml exec -T db \
+              sh -c "psql -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -v ON_ERROR_STOP=1 -c \"
+              SELECT version, count(*), min(window_start), max(window_start) 
+              FROM absorption_shadow_signals GROUP BY version;\""
