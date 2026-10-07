@@ -2244,6 +2244,7 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
   onSyncBinance: () => void
 }) {
   const [orderTab, setOrderTab] = useState<'active' | 'failed'>('active')
+  const [fLiveScope, setFLiveScope] = useState<'LIVE' | 'ALL'>('LIVE')
   const [fStatus, setFStatus] = useState('ALL')
   const [fChannel, setFChannel] = useState('ALL')
   const [fDirection, setFDirection] = useState('ALL')
@@ -2252,6 +2253,15 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
   const [page, setPage] = useState(1)
   const [sortField, setSortField] = useState<'time' | 'amount' | 'pnl'>('time')
   const [sortAsc, setSortAsc] = useState(false)
+
+  // 判断是否为真正由实盘自动化策略下的订单（排除手动测试单、平仓单及纯影子假说通道）
+  const isLiveOrder = (sig: unknown) => {
+    const s = String(sig ?? '').trim()
+    if (!s || s === '--') return false
+    if (s.startsWith('manual_test') || s.startsWith('manual_close')) return false
+    if (s.includes('shadow') || s.includes('candidate_')) return false
+    return true
+  }
 
   // 失败单严格分流：主 Tab 只留非 FAILED（FILLED / PENDING / 未知状态都在），失败 Tab 只留 FAILED
   const activeOrders = orders.filter(o => String(o.status ?? '') !== 'FAILED')
@@ -2262,6 +2272,7 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
     base.map(o => String(o.signal_version ?? '')).filter(v => v && v !== '--'))).sort()
   const kw = fKeyword.trim().toLowerCase()
   const filtered = base.filter(o => {
+    if (orderTab === 'active' && fLiveScope === 'LIVE' && !isLiveOrder(o.signal_version)) return false
     if (orderTab === 'active' && fStatus !== 'ALL' && String(o.status ?? '') !== fStatus) return false
     if (fChannel !== 'ALL' && String(o.signal_version ?? '') !== fChannel) return false
     if (fDirection !== 'ALL' && String(o.direction ?? '') !== fDirection) return false
@@ -2297,13 +2308,13 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
   const settledCount = settledOrders.length
   const totalPnl = settledOrders.reduce(
     (s, o) => s + (typeof o.pnl === 'number' ? (o.pnl as number) : 0), 0)
-  const filterActive = fStatus !== 'ALL' || fChannel !== 'ALL' || fDirection !== 'ALL' || fKeyword !== ''
+  const filterActive = fStatus !== 'ALL' || fChannel !== 'ALL' || fDirection !== 'ALL' || fKeyword !== '' || fLiveScope !== 'LIVE'
   const selectCls = 'px-1.5 py-0.5 border border-line rounded-sm text-xs text-ink-80 bg-card'
   // 分页：筛选变化时回到第 1 页；超出范围时钳位（避免删数据后空白页）
-  useEffect(() => { setPage(1) }, [fStatus, fChannel, fDirection, fKeyword, pageSize])
+  useEffect(() => { setPage(1) }, [fStatus, fChannel, fDirection, fKeyword, fLiveScope, pageSize])
   // 切 Tab 必须清筛选：否则主 Tab 选的 FILLED 会让失败 Tab 直接空白
   useEffect(() => {
-    setFStatus('ALL'); setFChannel('ALL'); setFDirection('ALL'); setFKeyword(''); setPage(1)
+    setFStatus('ALL'); setFChannel('ALL'); setFDirection('ALL'); setFKeyword(''); setFLiveScope('LIVE'); setPage(1)
   }, [orderTab])
 
   const actualPageSize = pageSize > 0 ? pageSize : Math.max(1, filtered.length)
@@ -2466,6 +2477,17 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
       <div className="flex items-center justify-between mb-2 gap-2 flex-wrap">
         <div className="flex items-center gap-1.5 flex-wrap">
           {orderTab === 'active' && (
+            <select
+              value={fLiveScope}
+              onChange={e => setFLiveScope(e.target.value as 'LIVE' | 'ALL')}
+              className={selectCls}
+              title="按实盘订单或全量筛选"
+            >
+              <option value="LIVE">仅实盘</option>
+              <option value="ALL">全量</option>
+            </select>
+          )}
+          {orderTab === 'active' && (
             <select value={fStatus} onChange={e => setFStatus(e.target.value)} className={selectCls} title="按订单状态筛选">
               <option value="ALL">全部状态</option>
               <option value="FILLED">已成交 FILLED</option>
@@ -2492,7 +2514,7 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
           />
           {filterActive && (
             <button
-              onClick={() => { setFStatus('ALL'); setFChannel('ALL'); setFDirection('ALL'); setFKeyword('') }}
+              onClick={() => { setFStatus('ALL'); setFChannel('ALL'); setFDirection('ALL'); setFKeyword(''); setFLiveScope('LIVE') }}
               className="px-1.5 py-0.5 text-xs text-brand hover:underline"
             >清除筛选</button>
           )}
