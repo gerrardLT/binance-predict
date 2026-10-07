@@ -7405,10 +7405,19 @@ function ShadowSignalDetailModal({
   const [data, setData] = useState<ShadowSignalDetailResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [activeTab, setActiveTab] = useState<'chart' | 'buckets' | 'orders'>('orders')
+  const [activeTab, setActiveTab] = useState<'chart' | 'funnel' | 'buckets' | 'orders'>('orders')
+
+  // 复合筛选器
   const [orderFilter, setOrderFilter] = useState<'ALL' | 'GUARDED' | 'REJECTED' | 'LIVE' | 'WIN' | 'LOSS'>('ALL')
+  const [dirFilter, setDirFilter] = useState<'ALL' | 'UP' | 'DOWN'>('ALL')
+  const [liveStatusFilter, setLiveStatusFilter] = useState<'ALL' | 'FILLED' | 'FAILED' | 'NONE'>('ALL')
+  const [searchKw, setSearchKw] = useState('')
+  const [sortField, setSortField] = useState<'time' | 'price' | 'ev' | 'pnl'>('time')
+  const [sortAsc, setSortAsc] = useState<boolean>(false)
+
+  // 分页
   const [page, setPage] = useState(1)
-  const [pageSize, setPageSize] = useState(20)
+  const [pageSize, setPageSize] = useState(25)
 
   const loadDetail = useCallback(() => {
     setLoading(true)
@@ -7429,34 +7438,164 @@ function ShadowSignalDetailModal({
   }, [loadDetail])
 
   const s = data?.summary
+  const allOrders = data?.orders ?? []
 
+  // 排序与多重筛选
   const filteredOrders = useMemo(() => {
-    const list = data?.orders ?? []
-    return list.filter(o => {
-      if (orderFilter === 'GUARDED') return o.guarded_pass
-      if (orderFilter === 'REJECTED') return !o.guarded_pass
-      if (orderFilter === 'LIVE') return o.live_order != null
-      if (orderFilter === 'WIN') return o.win === true
-      if (orderFilter === 'LOSS') return o.win === false
-      return true
-    })
-  }, [data?.orders, orderFilter])
+    const rawOrders = data?.orders ?? []
+    const kw = searchKw.trim().toLowerCase()
+    return rawOrders.filter(o => {
+      // 主状态过滤
+      if (orderFilter === 'GUARDED' && !o.guarded_pass) return false
+      if (orderFilter === 'REJECTED' && o.guarded_pass) return false
+      if (orderFilter === 'LIVE' && !o.live_order) return false
+      if (orderFilter === 'WIN' && o.win !== true) return false
+      if (orderFilter === 'LOSS' && o.win !== false) return false
 
+      // 方向过滤
+      if (dirFilter !== 'ALL' && o.direction !== dirFilter) return false
+
+      // 实盘状态过滤
+      if (liveStatusFilter === 'FILLED' && o.live_order?.status !== 'FILLED') return false
+      if (liveStatusFilter === 'FAILED' && o.live_order?.status !== 'FAILED') return false
+      if (liveStatusFilter === 'NONE' && o.live_order != null) return false
+
+      // 关键词搜索
+      if (kw) {
+        const timeStr = performanceTime(o.window_start).toLowerCase()
+        const dirStr = o.direction.toLowerCase()
+        const rejectStr = (o.reject_reason ?? '').toLowerCase()
+        const orderIdStr = (o.live_order?.order_id ?? '').toLowerCase()
+        const errMsg = (o.live_order?.error_message ?? '').toLowerCase()
+        if (!timeStr.includes(kw) && !dirStr.includes(kw) && !rejectStr.includes(kw) && !orderIdStr.includes(kw) && !errMsg.includes(kw)) {
+          return false
+        }
+      }
+
+      return true
+    }).sort((a, b) => {
+      let diff = 0
+      if (sortField === 'time') {
+        diff = a.window_start - b.window_start
+      } else if (sortField === 'price') {
+        diff = (a.entry_price ?? -1) - (b.entry_price ?? -1)
+      } else if (sortField === 'ev') {
+        diff = (a.ev ?? -999) - (b.ev ?? -999)
+      } else if (sortField === 'pnl') {
+        diff = (a.live_order?.pnl ?? -9999) - (b.live_order?.pnl ?? -9999)
+      }
+      return sortAsc ? diff : -diff
+    })
+  }, [data?.orders, orderFilter, dirFilter, liveStatusFilter, searchKw, sortField, sortAsc])
+
+  // 当前筛选下的聚合统计
+  const filteredStats = useMemo(() => {
+    const total = filteredOrders.length
+    if (total === 0) return null
+    const wins = filteredOrders.filter(o => o.win === true).length
+    const guarded = filteredOrders.filter(o => o.guarded_pass).length
+    const guardedWins = filteredOrders.filter(o => o.guarded_pass && o.win === true).length
+    const liveFilled = filteredOrders.filter(o => o.live_order?.status === 'FILLED')
+    const liveWins = liveFilled.filter(o => o.live_order?.win === true).length
+    const livePnlSum = liveFilled.reduce((acc, o) => acc + (o.live_order?.pnl ?? 0), 0)
+    const evValid = filteredOrders.filter(o => o.ev != null)
+    const evSum = evValid.reduce((acc, o) => acc + (o.ev ?? 0), 0)
+
+    return {
+      total,
+      winRate: total > 0 ? wins / total : 0,
+      guardedPassRate: total > 0 ? guarded / total : 0,
+      guardedWinRate: guarded > 0 ? guardedWins / guarded : null,
+      avgEv: evValid.length > 0 ? evSum / evValid.length : 0,
+      liveFilledCount: liveFilled.length,
+      liveWinRate: liveFilled.length > 0 ? liveWins / liveFilled.length : null,
+      liveTotalPnl: livePnlSum,
+    }
+  }, [filteredOrders])
+
+  // 分页计算
   const totalPages = Math.max(1, Math.ceil(filteredOrders.length / pageSize))
   const safePage = Math.min(page, totalPages)
   const pageOrders = filteredOrders.slice((safePage - 1) * pageSize, safePage * pageSize)
+
+  // 常用功能：导出当前筛选结果为 CSV
+  const exportCsv = () => {
+    if (filteredOrders.length === 0) return
+    const headers = [
+      '窗口开始时间', '格式化时间', '押注方向', '理论入场价', '理论胜负', '理论实现EV',
+      '护栏判定', '弃单原因', '实盘状态', '实盘订单ID', '实盘成交均价', '均价类型',
+      '实盘金额USDT', '实盘盈亏USDT', '实盘胜负'
+    ]
+    const csvRows = [headers.join(',')]
+    for (const o of filteredOrders) {
+      const lo = o.live_order
+      const row = [
+        o.window_start,
+        `"${performanceTime(o.window_start)}"`,
+        o.direction,
+        o.entry_price ?? '',
+        o.win == null ? '' : o.win ? 'WIN' : 'LOSS',
+        o.ev ?? '',
+        o.guarded_pass ? 'PASS' : 'REJECT',
+        `"${o.reject_reason ?? ''}"`,
+        lo?.status ?? 'NONE',
+        lo?.order_id ?? '',
+        lo?.average_price ?? '',
+        lo?.price_kind ?? '',
+        lo?.amount_usdt ?? '',
+        lo?.pnl ?? '',
+        lo?.win == null ? '' : lo.win ? 'WIN' : 'LOSS',
+      ]
+      csvRows.push(row.join(','))
+    }
+    const blob = new Blob(['\ufeff' + csvRows.join('\n')], { type: 'text/csv;charset=utf-8;' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `shadow_detail_${version}_${new Date().toISOString().slice(0, 10)}.csv`
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  // 走势与回撤曲线增强数据（Watermark & Drawdown）
+  const chartEnhancedData = useMemo(() => {
+    if (!data?.curves) return []
+    let peakEv = -Infinity
+    return data.curves.map(p => {
+      const ev = p.cum_ev_guarded
+      if (ev > peakEv) peakEv = ev
+      const dd = peakEv > -Infinity ? ev - peakEv : 0
+      return {
+        ...p,
+        peak_ev: peakEv,
+        drawdown_ev: +dd.toFixed(4),
+      }
+    })
+  }, [data?.curves])
+
+  // 执行漏斗阶段柱状图数据
+  const funnelData = useMemo(() => {
+    if (!s) return []
+    return [
+      { stage: '1.理论信号', count: s.total_signals, rate: '100%', fill: 'var(--chart-1)' },
+      { stage: '2.护栏通过', count: s.guarded_signals, rate: pct1(s.guarded_pass_rate), fill: 'var(--chart-2)' },
+      { stage: '3.实盘派单', count: s.live_orders_count, rate: s.guarded_signals > 0 ? pct1(s.live_orders_count / s.guarded_signals) : '0%', fill: 'var(--chart-3)' },
+      { stage: '4.实际成交', count: s.live_filled_count, rate: s.live_orders_count > 0 ? pct1(s.live_filled_count / s.live_orders_count) : '0%', fill: 'var(--positive)' },
+      { stage: '5.实盘胜单', count: s.live_wins, rate: s.live_filled_count > 0 ? pct1(s.live_wins / s.live_filled_count) : '0%', fill: 'var(--brand)' },
+    ]
+  }, [s])
 
   const info = SIGNAL_INFO[version]
   const displayName = info?.name ?? version
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-overlay p-4" onClick={onClose}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-overlay p-3 md:p-6" onClick={onClose}>
       <div
-        className="bg-card rounded-panel border border-line w-full max-w-5xl max-h-[90vh] flex flex-col shadow-xl"
+        className="bg-card rounded-panel border border-line w-full max-w-6xl max-h-[92vh] flex flex-col shadow-2xl"
         onClick={e => e.stopPropagation()}
       >
-        {/* 头部 */}
-        <div className="px-5 py-3.5 border-b border-line flex items-center justify-between shrink-0 bg-sunken rounded-t-panel">
+        {/* 头部导航 */}
+        <div className="px-5 py-3 border-b border-line flex items-center justify-between shrink-0 bg-sunken rounded-t-panel">
           <div>
             <div className="flex items-center gap-2 flex-wrap">
               <span className="font-bold text-sm text-ink-95">{displayName}</span>
@@ -7465,10 +7604,10 @@ function ShadowSignalDetailModal({
                 <>
                   <span className="ds-badge ds-badge-neutral">{signalFamilyLabel(data.family)}</span>
                   {data.guard_price != null && (
-                    <span className="ds-badge ds-badge-indigo">护栏 ≤ {data.guard_price}</span>
+                    <span className="ds-badge ds-badge-indigo">执行护栏 ≤ {data.guard_price}</span>
                   )}
                   {data.bench_winrate != null && (
-                    <span className="ds-badge ds-badge-violet">基准 {pct1(data.bench_winrate)}</span>
+                    <span className="ds-badge ds-badge-violet">回测基准 {pct1(data.bench_winrate)}</span>
                   )}
                 </>
               )}
@@ -7477,16 +7616,24 @@ function ShadowSignalDetailModal({
           </div>
           <div className="flex items-center gap-2">
             <button
+              onClick={exportCsv}
+              disabled={filteredOrders.length === 0}
+              className="px-2.5 py-1 text-xs rounded-sm border border-line bg-card hover:bg-sunken text-ink-80 transition disabled:opacity-40 font-medium"
+              title="导出当前筛选的订单列表为 CSV"
+            >
+              📥 导出 CSV
+            </button>
+            <button
               onClick={loadDetail}
               disabled={loading}
               className="px-2.5 py-1 text-xs rounded-sm border border-line bg-card hover:bg-sunken text-ink-80 transition disabled:opacity-40"
-              title="刷新最新订单与对比数据"
+              title="重新获取最新数据"
             >
               {loading ? '刷新中…' : '🔄 刷新'}
             </button>
             <button
               onClick={onClose}
-              className="text-ink-55 hover:text-ink-95 text-lg leading-none px-1.5 py-0.5 rounded-sm hover:bg-sunken"
+              className="text-ink-55 hover:text-ink-95 text-xl leading-none px-2 py-0.5 rounded-sm hover:bg-sunken"
             >
               ✕
             </button>
@@ -7495,7 +7642,7 @@ function ShadowSignalDetailModal({
 
         {/* 核心 KPI 矩阵 */}
         {s && (
-          <div className="grid grid-cols-2 md:grid-cols-5 gap-2 px-5 py-3 border-b border-line-soft bg-card shrink-0">
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2 px-5 py-2.5 border-b border-line-soft bg-card shrink-0">
             <div className="p-2 rounded-sm bg-sunken border border-line-soft">
               <div className="text-[10px] text-ink-55">信号与通过率</div>
               <div className="font-mono font-bold text-sm text-ink-95">
@@ -7512,7 +7659,7 @@ function ShadowSignalDetailModal({
                 {pct1(s.guarded_win_rate)} <span className="text-[11px] font-normal text-ink-40">({s.guarded_wins}胜)</span>
               </div>
               <div className="text-[10px] text-ink-55 mt-0.5">
-                全量理论 <span className="font-mono text-ink-80">{pct1(s.theoretical_win_rate)}</span>
+                全量理论 <span className="font-mono text-ink-80">{pct1(s.theoretical_win_rate)}</span> · 基准 <span className="font-mono">{pct1(data.bench_winrate)}</span>
               </div>
             </div>
 
@@ -7540,7 +7687,7 @@ function ShadowSignalDetailModal({
               <div className="text-[10px] text-ink-55">护栏避损与执行价</div>
               <div className="font-mono font-bold text-sm text-ink-95">
                 拦截 {s.rejected_signals} 笔
-                <span className="text-[11px] font-normal text-positive ml-1">
+                <span className={`text-[11px] font-normal ml-1 ${s.avoided_loss_ev >= 0 ? 'text-positive' : 'text-negative'}`}>
                   ({s.avoided_loss_ev >= 0 ? '+' : ''}{s.avoided_loss_ev.toFixed(2)} EV)
                 </span>
               </div>
@@ -7555,14 +7702,14 @@ function ShadowSignalDetailModal({
         )}
 
         {/* 标签栏 */}
-        <div className="flex items-center gap-2 px-5 py-2 border-b border-line-soft bg-sunken text-xs shrink-0">
+        <div className="flex items-center gap-2 px-5 py-2 border-b border-line-soft bg-sunken text-xs shrink-0 flex-wrap">
           <button
             onClick={() => setActiveTab('orders')}
             className={`px-3 py-1 font-semibold rounded-sm transition ${
               activeTab === 'orders' ? 'bg-brand text-white shadow-xs' : 'text-ink-80 hover:text-ink-95 bg-card border border-line-soft'
             }`}
           >
-            📋 逐笔订单与实盘对齐 ({data?.orders.length ?? 0})
+            📋 逐笔订单与实盘对齐 ({allOrders.length})
           </button>
           <button
             onClick={() => setActiveTab('chart')}
@@ -7570,7 +7717,15 @@ function ShadowSignalDetailModal({
               activeTab === 'chart' ? 'bg-brand text-white shadow-xs' : 'text-ink-80 hover:text-ink-95 bg-card border border-line-soft'
             }`}
           >
-            📈 累计曲线走势对比
+            📈 累计收益 & 胜率演进
+          </button>
+          <button
+            onClick={() => setActiveTab('funnel')}
+            className={`px-3 py-1 font-semibold rounded-sm transition ${
+              activeTab === 'funnel' ? 'bg-brand text-white shadow-xs' : 'text-ink-80 hover:text-ink-95 bg-card border border-line-soft'
+            }`}
+          >
+            🔽 执行漏斗 & 逐笔回报
           </button>
           <button
             onClick={() => setActiveTab('buckets')}
@@ -7578,40 +7733,99 @@ function ShadowSignalDetailModal({
               activeTab === 'buckets' ? 'bg-brand text-white shadow-xs' : 'text-ink-80 hover:text-ink-95 bg-card border border-line-soft'
             }`}
           >
-            📊 报价分桶与时段归因
+            📊 报价分档 & 时段归因
           </button>
         </div>
 
-        {/* 内容区 */}
+        {/* 主内容区 */}
         <div className="flex-1 min-h-0 overflow-auto p-4">
-          {loading && <div className="text-center text-ink-55 py-12 text-xs">加载订单与分析数据中…</div>}
-          {error && <div className="text-center text-negative py-12 text-xs">{error}</div>}
+          {loading && <div className="text-center text-ink-55 py-16 text-xs">加载订单与分析数据中…</div>}
+          {error && <div className="text-center text-negative py-16 text-xs">{error}</div>}
 
           {!loading && !error && data && (
             <>
-              {/* Tab 1: 逐笔订单表格 */}
+              {/* Tab 1: 逐笔订单表格（强化筛选+排序+动态统计） */}
               {activeTab === 'orders' && (
                 <div className="space-y-3">
-                  {/* 表格工具栏 */}
-                  <div className="flex items-center justify-between gap-2 flex-wrap text-xs">
-                    <div className="flex items-center gap-2">
-                      <span className="text-ink-55">筛选:</span>
+                  {/* 复合筛选栏 */}
+                  <div className="p-2.5 bg-sunken rounded-sm border border-line-soft flex items-center justify-between gap-2.5 flex-wrap text-xs">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <input
+                        type="text"
+                        placeholder="搜索时间 / 单号 / 状态 / 拒单原因..."
+                        value={searchKw}
+                        onChange={e => { setSearchKw(e.target.value); setPage(1) }}
+                        className="px-2 py-0.5 border border-line rounded-sm text-xs text-ink-80 bg-card w-52"
+                      />
+
                       <select
                         value={orderFilter}
                         onChange={e => { setOrderFilter(e.target.value as typeof orderFilter); setPage(1) }}
                         className="px-2 py-0.5 border border-line rounded-sm text-xs text-ink-80 bg-card"
                       >
-                        <option value="ALL">全部记录 ({data?.orders.length ?? 0})</option>
+                        <option value="ALL">全部信号状态</option>
                         <option value="GUARDED">仅护栏通过</option>
                         <option value="REJECTED">仅护栏拦截/弃单</option>
-                        <option value="LIVE">仅有实盘下单</option>
+                        <option value="LIVE">仅有实盘记录</option>
                         <option value="WIN">仅理论胜单</option>
                         <option value="LOSS">仅理论负单</option>
                       </select>
-                      <span className="text-ink-40">|</span>
-                      <span className="text-ink-55">
-                        显示 {filteredOrders.length} 笔（第 {safePage} / {totalPages} 页）
-                      </span>
+
+                      <select
+                        value={dirFilter}
+                        onChange={e => { setDirFilter(e.target.value as typeof dirFilter); setPage(1) }}
+                        className="px-2 py-0.5 border border-line rounded-sm text-xs text-ink-80 bg-card"
+                      >
+                        <option value="ALL">全部方向</option>
+                        <option value="DOWN">仅押 DOWN</option>
+                        <option value="UP">仅押 UP</option>
+                      </select>
+
+                      <select
+                        value={liveStatusFilter}
+                        onChange={e => { setLiveStatusFilter(e.target.value as typeof liveStatusFilter); setPage(1) }}
+                        className="px-2 py-0.5 border border-line rounded-sm text-xs text-ink-80 bg-card"
+                      >
+                        <option value="ALL">全部实盘状态</option>
+                        <option value="FILLED">仅实盘已成交</option>
+                        <option value="FAILED">仅实盘失败/被拒</option>
+                        <option value="NONE">仅未下实盘单</option>
+                      </select>
+
+                      <div className="flex items-center gap-1 border-l border-line-soft pl-2">
+                        <span className="text-ink-55">排序:</span>
+                        <select
+                          value={sortField}
+                          onChange={e => setSortField(e.target.value as typeof sortField)}
+                          className="px-2 py-0.5 border border-line rounded-sm text-xs text-ink-80 bg-card"
+                        >
+                          <option value="time">按时间</option>
+                          <option value="price">按入场价</option>
+                          <option value="ev">按理论EV</option>
+                          <option value="pnl">按实盘盈亏</option>
+                        </select>
+                        <button
+                          onClick={() => setSortAsc(!sortAsc)}
+                          className="px-1.5 py-0.5 rounded-sm border border-line bg-card text-ink-80 hover:text-brand"
+                        >
+                          {sortAsc ? '▲ 升序' : '▼ 降序'}
+                        </button>
+                      </div>
+
+                      {(searchKw || orderFilter !== 'ALL' || dirFilter !== 'ALL' || liveStatusFilter !== 'ALL') && (
+                        <button
+                          onClick={() => {
+                            setSearchKw('')
+                            setOrderFilter('ALL')
+                            setDirFilter('ALL')
+                            setLiveStatusFilter('ALL')
+                            setPage(1)
+                          }}
+                          className="text-brand hover:underline px-1"
+                        >
+                          重置筛选
+                        </button>
+                      )}
                     </div>
 
                     <div className="flex items-center gap-2">
@@ -7622,12 +7836,25 @@ function ShadowSignalDetailModal({
                         className="px-2 py-0.5 border border-line rounded-sm text-xs text-ink-80 bg-card"
                       >
                         <option value={15}>15 笔</option>
-                        <option value={30}>30 笔</option>
+                        <option value={25}>25 笔</option>
                         <option value={50}>50 笔</option>
                         <option value={100}>100 笔</option>
                       </select>
                     </div>
                   </div>
+
+                  {/* 动态筛选汇总条 */}
+                  {filteredStats && (
+                    <div className="px-3 py-1.5 bg-brand-soft/40 border border-brand/20 rounded-sm text-[11px] text-ink-80 flex items-center gap-4 flex-wrap">
+                      <span>当前视图: <strong className="font-mono text-ink-95">{filteredStats.total}</strong> 笔</span>
+                      <span>理论胜率: <strong className="font-mono text-brand">{pct1(filteredStats.winRate)}</strong></span>
+                      <span>单均 EV: <strong className="font-mono">{evFmt(filteredStats.avgEv)}</strong></span>
+                      <span>护栏通过率: <strong className="font-mono">{pct1(filteredStats.guardedPassRate)}</strong></span>
+                      <span>实盘成交: <strong className="font-mono">{filteredStats.liveFilledCount}</strong> 笔</span>
+                      <span>实盘胜率: <strong className="font-mono">{pct1(filteredStats.liveWinRate)}</strong></span>
+                      <span>实盘盈亏: <strong className={`font-mono font-bold ${filteredStats.liveTotalPnl >= 0 ? 'text-positive' : 'text-negative'}`}>{filteredStats.liveTotalPnl >= 0 ? '+' : ''}{filteredStats.liveTotalPnl.toFixed(2)}U</strong></span>
+                    </div>
+                  )}
 
                   {/* 逐笔明细对齐表 */}
                   <div className="overflow-x-auto border border-line rounded-sm">
@@ -7651,7 +7878,7 @@ function ShadowSignalDetailModal({
                         {pageOrders.length === 0 ? (
                           <tr>
                             <td colSpan={11} className="py-8 text-center text-ink-55">
-                              当前筛选下无匹配记录
+                              当前筛选条件下无匹配订单
                             </td>
                           </tr>
                         ) : (
@@ -7754,13 +7981,20 @@ function ShadowSignalDetailModal({
                     </table>
                   </div>
 
-                  {/* 分页器 */}
+                  {/* 分页控制 */}
                   {totalPages > 1 && (
                     <div className="flex items-center justify-between gap-2 mt-2 text-xs">
                       <span className="text-ink-55">
-                        共 {filteredOrders.length} 条记录
+                        共 {filteredOrders.length} 笔 · 第 {safePage} / {totalPages} 页
                       </span>
                       <div className="flex items-center gap-1">
+                        <button
+                          disabled={safePage <= 1}
+                          onClick={() => setPage(1)}
+                          className="px-2 py-0.5 border border-line rounded-sm disabled:opacity-40 hover:border-brand"
+                        >
+                          首页
+                        </button>
                         <button
                           disabled={safePage <= 1}
                           onClick={() => setPage(safePage - 1)}
@@ -7778,28 +8012,29 @@ function ShadowSignalDetailModal({
                         >
                           下一页
                         </button>
+                        <button
+                          disabled={safePage >= totalPages}
+                          onClick={() => setPage(totalPages)}
+                          className="px-2 py-0.5 border border-line rounded-sm disabled:opacity-40 hover:border-brand"
+                        >
+                          末页
+                        </button>
                       </div>
                     </div>
                   )}
                 </div>
               )}
 
-              {/* Tab 2: 走势曲线图表 */}
+              {/* Tab 2: 走势曲线与回撤走势（增强版图表） */}
               {activeTab === 'chart' && (
                 <div className="space-y-4">
-                  <div className="p-3 bg-sunken rounded-sm border border-line-soft text-xs space-y-1">
-                    <div className="font-semibold text-ink-95">曲线走势对比口径：</div>
-                    <div className="text-ink-55 flex items-center gap-4 flex-wrap">
-                      <span><span className="inline-block w-2.5 h-2.5 rounded-full bg-brand mr-1"></span>带护栏实际累计 EV（已过滤超价/贴线弃单）</span>
-                      <span><span className="inline-block w-2.5 h-2.5 rounded-full bg-chart-1 mr-1"></span>全量理论累计 EV（原始全量影子信号）</span>
-                      <span><span className="inline-block w-2.5 h-2.5 rounded-full bg-positive mr-1"></span>实盘累计真实盈亏 PnL (USDT)</span>
-                    </div>
-                  </div>
-
                   <div className="border border-line rounded-sm p-3 bg-card">
-                    <div className="text-xs font-bold text-ink-95 mb-2">累计收益与盈亏走势 (EV vs USDT)</div>
-                    <ResponsiveContainer width="100%" height={280}>
-                      <ComposedChart data={data.curves}>
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-xs font-bold text-ink-95">累计收益与实盘盈亏走势 (Cumulative EV vs Real PnL)</span>
+                      <span className="text-[11px] text-ink-55">左轴=EV（理论/带护栏） · 右轴=USDT（实盘真实净盈亏）</span>
+                    </div>
+                    <ResponsiveContainer width="100%" height={260}>
+                      <ComposedChart data={chartEnhancedData}>
                         <CartesianGrid stroke="var(--line-soft)" />
                         <XAxis
                           dataKey="ts"
@@ -7853,10 +8088,14 @@ function ShadowSignalDetailModal({
                     </ResponsiveContainer>
                   </div>
 
+                  {/* 胜率演进折线图 */}
                   <div className="border border-line rounded-sm p-3 bg-card">
-                    <div className="text-xs font-bold text-ink-95 mb-2">前向滚动胜率演进</div>
-                    <ResponsiveContainer width="100%" height={220}>
-                      <LineChart data={data.curves}>
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-xs font-bold text-ink-95">前向胜率演进 (Rolling Win Rate)</span>
+                      <span className="text-[11px] text-ink-55">橙色虚线=冻结回测基准胜率</span>
+                    </div>
+                    <ResponsiveContainer width="100%" height={200}>
+                      <LineChart data={chartEnhancedData}>
                         <CartesianGrid stroke="var(--line-soft)" />
                         <XAxis
                           dataKey="ts"
@@ -7876,10 +8115,10 @@ function ShadowSignalDetailModal({
                         />
                         <Legend />
                         {data.bench_winrate != null && (
-                          <ReferenceLine y={data.bench_winrate} stroke="var(--warning)" strokeDasharray="5 3" label="回测基准" />
+                          <ReferenceLine y={data.bench_winrate} stroke="var(--warning)" strokeDasharray="5 3" label="基准胜率" />
                         )}
                         <Line
-                          name="带护栏胜率"
+                          name="带护栏实际胜率"
                           dataKey="win_rate_guarded"
                           stroke="var(--brand)"
                           strokeWidth={2}
@@ -7887,7 +8126,7 @@ function ShadowSignalDetailModal({
                           connectNulls
                         />
                         <Line
-                          name="理论全量胜率"
+                          name="全量理论胜率"
                           dataKey="win_rate_theoretical"
                           stroke="var(--ink-40)"
                           strokeWidth={1.5}
@@ -7897,27 +8136,154 @@ function ShadowSignalDetailModal({
                       </LineChart>
                     </ResponsiveContainer>
                   </div>
+
+                  {/* 回撤深度面积图 */}
+                  <div className="border border-line rounded-sm p-3 bg-card">
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-xs font-bold text-ink-95">累计 EV 回撤深度 (Drawdown Under Water)</span>
+                      <span className="text-[11px] text-ink-55">展示该信号历史回撤幅度与持续时间</span>
+                    </div>
+                    <ResponsiveContainer width="100%" height={180}>
+                      <AreaChart data={chartEnhancedData}>
+                        <CartesianGrid stroke="var(--line-soft)" />
+                        <XAxis
+                          dataKey="ts"
+                          type="number"
+                          domain={['dataMin', 'dataMax']}
+                          scale="time"
+                          tickFormatter={performanceTime}
+                          tick={{ fontSize: 10, fill: 'var(--ink-55)' }}
+                        />
+                        <YAxis tick={{ fontSize: 10, fill: 'var(--ink-55)' }} />
+                        <Tooltip
+                          contentStyle={TOOLTIP_STYLE}
+                          labelStyle={TOOLTIP_LABEL_STYLE}
+                          itemStyle={TOOLTIP_ITEM_STYLE}
+                          labelFormatter={v => performanceTime(Number(v))}
+                          formatter={v => [`${v} EV`, '回撤深度']}
+                        />
+                        <Area
+                          type="monotone"
+                          dataKey="drawdown_ev"
+                          name="EV回撤"
+                          stroke="var(--negative)"
+                          fill="var(--negative-soft)"
+                          fillOpacity={0.6}
+                          isAnimationActive={false}
+                        />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  </div>
                 </div>
               )}
 
-              {/* Tab 3: 分桶与归因 */}
+              {/* Tab 3: 执行漏斗与逐笔回报分布 */}
+              {activeTab === 'funnel' && (
+                <div className="space-y-4">
+                  {/* 执行转化漏斗 */}
+                  <div className="border border-line rounded-sm p-4 bg-card">
+                    <div className="text-xs font-bold text-ink-95 mb-1">
+                      执行转化漏斗 (Execution Conversion Funnel)
+                    </div>
+                    <p className="text-[11px] text-ink-55 mb-3">
+                      量化从理论信号触发到最终实盘成交与获利的每一层损耗率，定位执行瓶颈。
+                    </p>
+                    <ResponsiveContainer width="100%" height={220}>
+                      <BarChart data={funnelData} layout="vertical" margin={{ left: 20, right: 30, top: 10, bottom: 10 }}>
+                        <CartesianGrid stroke="var(--line-soft)" horizontal={false} />
+                        <XAxis type="number" tick={{ fontSize: 10, fill: 'var(--ink-55)' }} />
+                        <YAxis dataKey="stage" type="category" tick={{ fontSize: 11, fill: 'var(--ink-95)' }} width={80} />
+                        <Tooltip
+                          contentStyle={TOOLTIP_STYLE}
+                          labelStyle={TOOLTIP_LABEL_STYLE}
+                          itemStyle={TOOLTIP_ITEM_STYLE}
+                          formatter={(v, _, item) => [`${v} 笔 (转化率: ${(item?.payload as { rate?: string })?.rate ?? '--'})`, '数量']}
+                        />
+                        <Bar dataKey="count" radius={[0, 4, 4, 0]}>
+                          {funnelData.map((entry, index) => (
+                            <Cell key={`cell-${index}`} fill={entry.fill} />
+                          ))}
+                        </Bar>
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+
+                  {/* 逐笔理论回报与实盘盈亏柱图 */}
+                  <div className="border border-line rounded-sm p-3 bg-card">
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-xs font-bold text-ink-95">逐笔收益柱状图 (Per-Trade Return Sequence)</span>
+                      <span className="text-[11px] text-ink-55">近 60 笔信号理论 EV 与实盘盈亏 (USDT)</span>
+                    </div>
+                    <ResponsiveContainer width="100%" height={200}>
+                      <BarChart
+                        data={allOrders.slice(-60).map((o: ShadowDetailOrderItem, idx: number) => ({
+                          idx: idx + 1,
+                          time: performanceTime(o.window_start),
+                          ev: o.ev ?? 0,
+                          pnl: o.live_order?.pnl ?? 0,
+                        }))}
+                        margin={{ top: 10, right: 10, left: 0, bottom: 0 }}
+                      >
+                        <CartesianGrid stroke="var(--line-soft)" />
+                        <XAxis dataKey="idx" tick={{ fontSize: 10, fill: 'var(--ink-55)' }} />
+                        <YAxis tick={{ fontSize: 10, fill: 'var(--ink-55)' }} />
+                        <Tooltip
+                          contentStyle={TOOLTIP_STYLE}
+                          labelStyle={TOOLTIP_LABEL_STYLE}
+                          itemStyle={TOOLTIP_ITEM_STYLE}
+                          labelFormatter={(idx, list) => {
+                            const row = list[0]?.payload as { time?: string } | undefined
+                            return `第 ${idx} 笔 · ${row?.time ?? ''}`
+                          }}
+                          formatter={(v, n) => [typeof v === 'number' ? `${v.toFixed(3)} ${n === 'ev' ? 'EV' : 'U'}` : '--', n === 'ev' ? '理论EV' : '实盘PnL']}
+                        />
+                        <ReferenceLine y={0} stroke="var(--line)" />
+                        <Bar dataKey="ev" name="理论EV" fill="var(--chart-1)" radius={[2, 2, 0, 0]}>
+                          {allOrders.slice(-60).map((entry: ShadowDetailOrderItem, index: number) => (
+                            <Cell key={`cell-${index}`} fill={(entry.ev ?? 0) >= 0 ? 'var(--positive)' : 'var(--negative)'} />
+                          ))}
+                        </Bar>
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+              )}
+
+              {/* Tab 4: 报价分桶与时段归因 */}
               {activeTab === 'buckets' && (
                 <div className="space-y-4">
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    {/* 报价区间分桶 */}
-                    <div className="border border-line rounded-sm p-3 bg-card">
-                      <div className="text-xs font-bold text-ink-95 mb-2">
-                        按入场报价分档表现 (Quote Buckets)
-                      </div>
+                  {/* 报价区间柱状图对比 */}
+                  <div className="border border-line rounded-sm p-3 bg-card">
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-xs font-bold text-ink-95">报价分档信号量与胜率分布 (Quote Buckets)</span>
+                      <span className="text-[11px] text-ink-55">柱高=信号数 · 折线=胜率</span>
+                    </div>
+                    <ResponsiveContainer width="100%" height={220}>
+                      <ComposedChart data={data.quote_buckets}>
+                        <CartesianGrid stroke="var(--line-soft)" />
+                        <XAxis dataKey="range" tick={{ fontSize: 10, fill: 'var(--ink-80)' }} />
+                        <YAxis yAxisId="n" tick={{ fontSize: 10, fill: 'var(--ink-55)' }} />
+                        <YAxis yAxisId="wr" orientation="right" domain={[0, 1]} tick={{ fontSize: 10, fill: 'var(--ink-55)' }} tickFormatter={v => `${(v * 100).toFixed(0)}%`} />
+                        <Tooltip contentStyle={TOOLTIP_STYLE} labelStyle={TOOLTIP_LABEL_STYLE} itemStyle={TOOLTIP_ITEM_STYLE} />
+                        <Legend />
+                        <Bar yAxisId="n" name="信号数" dataKey="signals" fill="var(--chart-1)" radius={[3, 3, 0, 0]} />
+                        <Bar yAxisId="n" name="实盘单" dataKey="live_orders" fill="var(--positive)" radius={[3, 3, 0, 0]} />
+                        <Line yAxisId="wr" name="理论胜率" dataKey="win_rate" stroke="var(--brand)" strokeWidth={2} dot={{ r: 3 }} />
+                        <Line yAxisId="wr" name="实盘胜率" dataKey="live_win_rate" stroke="var(--warning)" strokeWidth={2} dot={{ r: 3 }} />
+                      </ComposedChart>
+                    </ResponsiveContainer>
+
+                    <div className="overflow-x-auto mt-3">
                       <table className="w-full text-xs">
                         <thead>
-                          <tr className="border-b border-line text-ink-55">
+                          <tr className="border-b border-line text-ink-55 bg-sunken">
                             <th className="py-1 px-1.5 text-left">报价档位</th>
                             <th className="py-1 px-1.5 text-right">信号数</th>
                             <th className="py-1 px-1.5 text-right">理论胜率</th>
                             <th className="py-1 px-1.5 text-right">单均EV</th>
                             <th className="py-1 px-1.5 text-right">实盘单数</th>
-                            <th className="py-1 px-1.5 text-right">实盘PnL</th>
+                            <th className="py-1 px-1.5 text-right">实盘胜率</th>
+                            <th className="py-1 px-1.5 text-right">实盘盈亏</th>
                           </tr>
                         </thead>
                         <tbody>
@@ -7934,6 +8300,7 @@ function ShadowSignalDetailModal({
                                 {evFmt(b.avg_ev)}
                               </td>
                               <td className="py-1 px-1.5 text-right font-mono text-ink-80">{b.live_orders || '--'}</td>
+                              <td className="py-1 px-1.5 text-right font-mono font-medium text-brand">{pct1(b.live_win_rate)}</td>
                               <td className={`py-1 px-1.5 text-right font-mono font-bold ${
                                 b.live_pnl == null ? 'text-ink-40' : b.live_pnl >= 0 ? 'text-positive' : 'text-negative'
                               }`}>
@@ -7944,21 +8311,40 @@ function ShadowSignalDetailModal({
                         </tbody>
                       </table>
                     </div>
+                  </div>
 
-                    {/* UTC 时段分档 */}
-                    <div className="border border-line rounded-sm p-3 bg-card">
-                      <div className="text-xs font-bold text-ink-95 mb-2">
-                        按 UTC 时段分布表现 (Hour Buckets)
-                      </div>
+                  {/* 时段分布图表对比 */}
+                  <div className="border border-line rounded-sm p-3 bg-card">
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-xs font-bold text-ink-95">UTC 时段信号分布与胜率 (Hour Buckets)</span>
+                      <span className="text-[11px] text-ink-55">柱高=信号数 · 折线=胜率</span>
+                    </div>
+                    <ResponsiveContainer width="100%" height={220}>
+                      <ComposedChart data={data.hour_buckets}>
+                        <CartesianGrid stroke="var(--line-soft)" />
+                        <XAxis dataKey="hour_range" tick={{ fontSize: 10, fill: 'var(--ink-80)' }} />
+                        <YAxis yAxisId="n" tick={{ fontSize: 10, fill: 'var(--ink-55)' }} />
+                        <YAxis yAxisId="wr" orientation="right" domain={[0, 1]} tick={{ fontSize: 10, fill: 'var(--ink-55)' }} tickFormatter={v => `${(v * 100).toFixed(0)}%`} />
+                        <Tooltip contentStyle={TOOLTIP_STYLE} labelStyle={TOOLTIP_LABEL_STYLE} itemStyle={TOOLTIP_ITEM_STYLE} />
+                        <Legend />
+                        <Bar yAxisId="n" name="信号数" dataKey="signals" fill="var(--chart-2)" radius={[3, 3, 0, 0]} />
+                        <Bar yAxisId="n" name="实盘单" dataKey="live_orders" fill="var(--positive)" radius={[3, 3, 0, 0]} />
+                        <Line yAxisId="wr" name="理论胜率" dataKey="win_rate" stroke="var(--brand)" strokeWidth={2} dot={{ r: 3 }} />
+                        <Line yAxisId="wr" name="实盘胜率" dataKey="live_win_rate" stroke="var(--warning)" strokeWidth={2} dot={{ r: 3 }} />
+                      </ComposedChart>
+                    </ResponsiveContainer>
+
+                    <div className="overflow-x-auto mt-3">
                       <table className="w-full text-xs">
                         <thead>
-                          <tr className="border-b border-line text-ink-55">
+                          <tr className="border-b border-line text-ink-55 bg-sunken">
                             <th className="py-1 px-1.5 text-left">UTC 时段</th>
                             <th className="py-1 px-1.5 text-right">信号数</th>
                             <th className="py-1 px-1.5 text-right">理论胜率</th>
                             <th className="py-1 px-1.5 text-right">单均EV</th>
                             <th className="py-1 px-1.5 text-right">实盘单数</th>
-                            <th className="py-1 px-1.5 text-right">实盘PnL</th>
+                            <th className="py-1 px-1.5 text-right">实盘胜率</th>
+                            <th className="py-1 px-1.5 text-right">实盘盈亏</th>
                           </tr>
                         </thead>
                         <tbody>
@@ -7975,6 +8361,7 @@ function ShadowSignalDetailModal({
                                 {evFmt(b.avg_ev)}
                               </td>
                               <td className="py-1 px-1.5 text-right font-mono text-ink-80">{b.live_orders || '--'}</td>
+                              <td className="py-1 px-1.5 text-right font-mono font-medium text-brand">{pct1(b.live_win_rate)}</td>
                               <td className={`py-1 px-1.5 text-right font-mono font-bold ${
                                 b.live_pnl == null ? 'text-ink-40' : b.live_pnl >= 0 ? 'text-positive' : 'text-negative'
                               }`}>
