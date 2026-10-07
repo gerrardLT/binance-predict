@@ -2237,18 +2237,15 @@ function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }
 // 失败单 amount_in=0、token_id=""、均价是报价不是成交价，混在主列表里会污染盈亏阅读）
 const DEFAULT_ORDERS_PAGE_SIZE = 20
 
-function OrdersCard({ orders, liveChannelSet, syncing, syncResult, onSyncBinance }: {
+function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
   orders: Record<string, unknown>[]
-  liveChannelSet: Set<string>
   syncing: boolean
   syncResult: Record<string, unknown> | null
   onSyncBinance: () => void
 }) {
   const [orderTab, setOrderTab] = useState<'active' | 'failed'>('active')
   const [fStatus, setFStatus] = useState('ALL')
-  // 通道筛选默认「仅实盘」（LIVE_ONLY）：只显示实盘自动化策略通道订单，
-  // 排除手动测试单（manual_test*/manual_close*）与纯影子假说通道（*shadow*/candidate_*）
-  const [fChannel, setFChannel] = useState<'LIVE_ONLY' | 'ALL' | string>('LIVE_ONLY')
+  const [fChannel, setFChannel] = useState('ALL')
   const [fDirection, setFDirection] = useState('ALL')
   const [fKeyword, setFKeyword] = useState('')
   const [pageSize, setPageSize] = useState<number>(DEFAULT_ORDERS_PAGE_SIZE)
@@ -2256,37 +2253,17 @@ function OrdersCard({ orders, liveChannelSet, syncing, syncResult, onSyncBinance
   const [sortField, setSortField] = useState<'time' | 'amount' | 'pnl'>('time')
   const [sortAsc, setSortAsc] = useState(false)
 
-  // 判断是否为真正由实盘自动化策略下的订单（排除手动测试单、平仓单及纯影子假说通道）
-  const isLiveOrder = (sig: unknown) => {
-    const s = String(sig ?? '').trim()
-    if (!s || s === '--') return false
-    if (s.startsWith('manual_test') || s.startsWith('manual_close')) return false
-    if (s.includes('shadow') || s.includes('candidate_')) return false
-    return true
-  }
-
-  // 「仅实盘」范围判定：以后端多通道状态 API 返回的当前注册实盘通道清单为权威
-  // （退役通道已移出注册表，自然被排除；清单未加载完成时退回字符串启发式兜底）
-  const inLiveScope = (sig: unknown) => {
-    const s = String(sig ?? '').trim()
-    if (liveChannelSet.size > 0) return liveChannelSet.has(s)
-    return isLiveOrder(s)
-  }
-
   // 失败单严格分流：主 Tab 只留非 FAILED（FILLED / PENDING / 未知状态都在），失败 Tab 只留 FAILED
   const activeOrders = orders.filter(o => String(o.status ?? '') !== 'FAILED')
   const failedOrders = orders.filter(o => String(o.status ?? '') === 'FAILED')
   const base = orderTab === 'active' ? activeOrders : failedOrders
 
-  // 通道范围过滤：LIVE_ONLY（默认）时只保留当前注册实盘通道的订单；通道下拉列表跟随当前范围生成
-  const scopedBase = fChannel === 'LIVE_ONLY' ? base.filter(o => inLiveScope(o.signal_version)) : base
-
   const channels = Array.from(new Set(
-    scopedBase.map(o => String(o.signal_version ?? '')).filter(v => v && v !== '--'))).sort()
+    base.map(o => String(o.signal_version ?? '')).filter(v => v && v !== '--'))).sort()
   const kw = fKeyword.trim().toLowerCase()
-  const filtered = scopedBase.filter(o => {
-    if (fChannel !== 'ALL' && fChannel !== 'LIVE_ONLY' && String(o.signal_version ?? '') !== fChannel) return false
+  const filtered = base.filter(o => {
     if (orderTab === 'active' && fStatus !== 'ALL' && String(o.status ?? '') !== fStatus) return false
+    if (fChannel !== 'ALL' && String(o.signal_version ?? '') !== fChannel) return false
     if (fDirection !== 'ALL' && String(o.direction ?? '') !== fDirection) return false
     if (kw) {
       const idStr = String(o.id ?? '').toLowerCase()
@@ -2320,13 +2297,13 @@ function OrdersCard({ orders, liveChannelSet, syncing, syncResult, onSyncBinance
   const settledCount = settledOrders.length
   const totalPnl = settledOrders.reduce(
     (s, o) => s + (typeof o.pnl === 'number' ? (o.pnl as number) : 0), 0)
-  const filterActive = fChannel !== 'LIVE_ONLY' || fStatus !== 'ALL' || fDirection !== 'ALL' || fKeyword !== ''
+  const filterActive = fStatus !== 'ALL' || fChannel !== 'ALL' || fDirection !== 'ALL' || fKeyword !== ''
   const selectCls = 'px-1.5 py-0.5 border border-line rounded-sm text-xs text-ink-80 bg-card'
   // 分页：筛选变化时回到第 1 页；超出范围时钳位（避免删数据后空白页）
   useEffect(() => { setPage(1) }, [fStatus, fChannel, fDirection, fKeyword, pageSize])
-  // 切 Tab 必须清筛选：否则主 Tab 选的 FILLED 会让失败 Tab 直接空白（通道回默认「仅实盘」）
+  // 切 Tab 必须清筛选：否则主 Tab 选的 FILLED 会让失败 Tab 直接空白
   useEffect(() => {
-    setFStatus('ALL'); setFChannel('LIVE_ONLY'); setFDirection('ALL'); setFKeyword(''); setPage(1)
+    setFStatus('ALL'); setFChannel('ALL'); setFDirection('ALL'); setFKeyword(''); setPage(1)
   }, [orderTab])
 
   const actualPageSize = pageSize > 0 ? pageSize : Math.max(1, filtered.length)
@@ -2495,9 +2472,8 @@ function OrdersCard({ orders, liveChannelSet, syncing, syncResult, onSyncBinance
               <option value="PENDING">待定 PENDING</option>
             </select>
           )}
-          <select value={fChannel} onChange={e => setFChannel(e.target.value)} className={selectCls} title="按信号通道筛选（默认仅实盘自动化策略通道）">
-            <option value="LIVE_ONLY">仅实盘</option>
-            <option value="ALL">全部通道（含测试/影子）</option>
+          <select value={fChannel} onChange={e => setFChannel(e.target.value)} className={selectCls} title="按信号通道筛选">
+            <option value="ALL">全部通道</option>
             {channels.map(v => (
               <option key={v} value={v}>{SIGNAL_INFO[v]?.name ?? v}</option>
             ))}
@@ -2516,7 +2492,7 @@ function OrdersCard({ orders, liveChannelSet, syncing, syncResult, onSyncBinance
           />
           {filterActive && (
             <button
-              onClick={() => { setFStatus('ALL'); setFChannel('LIVE_ONLY'); setFDirection('ALL'); setFKeyword('') }}
+              onClick={() => { setFStatus('ALL'); setFChannel('ALL'); setFDirection('ALL'); setFKeyword('') }}
               className="px-1.5 py-0.5 text-xs text-brand hover:underline"
             >清除筛选</button>
           )}
@@ -3210,10 +3186,6 @@ function LiveTradeTab() {
   const regTs = wallet?.registered_time as number | undefined
   // 多通道实盘：live = live_channels status（channels[] 见 LiveChannelStatus）
   const liveChannels = Array.isArray(live?.channels) ? live.channels as LiveChannelStatus[] : []
-  // 当前注册实盘通道名集合（退役通道已移出注册表）：供订单记录「仅实盘」筛选使用
-  const liveChannelNames = useMemo(
-    () => new Set(liveChannels.map(c => String(c.channel))),
-    [liveChannels])
   const liveDefaults = (live?.defaults ?? {}) as Record<string, unknown>
 
   // 通道 pnl 快速索引；列表默认按信号 EV、真实胜率依次降序，无已结算单者排末尾。
@@ -3954,7 +3926,7 @@ function LiveTradeTab() {
       {/* 订单记录保留在主区；表现诊断与资金变化通过右侧抽屉查看。 */}
       {/* 最近订单：主区账户状态下方 */}
       <div className="lg:col-span-2">
-        <OrdersCard orders={orders} liveChannelSet={liveChannelNames} syncing={syncing} syncResult={syncResult} onSyncBinance={handleSyncBinance} />
+        <OrdersCard orders={orders} syncing={syncing} syncResult={syncResult} onSyncBinance={handleSyncBinance} />
       </div>
     </div>
 
