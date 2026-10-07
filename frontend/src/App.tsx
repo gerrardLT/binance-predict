@@ -2244,9 +2244,10 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
   onSyncBinance: () => void
 }) {
   const [orderTab, setOrderTab] = useState<'active' | 'failed'>('active')
-  const [fLiveScope, setFLiveScope] = useState<'LIVE' | 'ALL'>('LIVE')
   const [fStatus, setFStatus] = useState('ALL')
-  const [fChannel, setFChannel] = useState('ALL')
+  // 通道筛选默认「仅实盘」（LIVE_ONLY）：只显示实盘自动化策略通道订单，
+  // 排除手动测试单（manual_test*/manual_close*）与纯影子假说通道（*shadow*/candidate_*）
+  const [fChannel, setFChannel] = useState<'LIVE_ONLY' | 'ALL' | string>('LIVE_ONLY')
   const [fDirection, setFDirection] = useState('ALL')
   const [fKeyword, setFKeyword] = useState('')
   const [pageSize, setPageSize] = useState<number>(DEFAULT_ORDERS_PAGE_SIZE)
@@ -2268,13 +2269,15 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
   const failedOrders = orders.filter(o => String(o.status ?? '') === 'FAILED')
   const base = orderTab === 'active' ? activeOrders : failedOrders
 
+  // 通道范围过滤：LIVE_ONLY（默认）时剔除非实盘订单；通道下拉列表跟随当前范围生成
+  const scopedBase = fChannel === 'LIVE_ONLY' ? base.filter(o => isLiveOrder(o.signal_version)) : base
+
   const channels = Array.from(new Set(
-    base.map(o => String(o.signal_version ?? '')).filter(v => v && v !== '--'))).sort()
+    scopedBase.map(o => String(o.signal_version ?? '')).filter(v => v && v !== '--'))).sort()
   const kw = fKeyword.trim().toLowerCase()
-  const filtered = base.filter(o => {
-    if (orderTab === 'active' && fLiveScope === 'LIVE' && !isLiveOrder(o.signal_version)) return false
+  const filtered = scopedBase.filter(o => {
+    if (fChannel !== 'ALL' && fChannel !== 'LIVE_ONLY' && String(o.signal_version ?? '') !== fChannel) return false
     if (orderTab === 'active' && fStatus !== 'ALL' && String(o.status ?? '') !== fStatus) return false
-    if (fChannel !== 'ALL' && String(o.signal_version ?? '') !== fChannel) return false
     if (fDirection !== 'ALL' && String(o.direction ?? '') !== fDirection) return false
     if (kw) {
       const idStr = String(o.id ?? '').toLowerCase()
@@ -2308,13 +2311,13 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
   const settledCount = settledOrders.length
   const totalPnl = settledOrders.reduce(
     (s, o) => s + (typeof o.pnl === 'number' ? (o.pnl as number) : 0), 0)
-  const filterActive = fStatus !== 'ALL' || fChannel !== 'ALL' || fDirection !== 'ALL' || fKeyword !== '' || fLiveScope !== 'LIVE'
+  const filterActive = fChannel !== 'LIVE_ONLY' || fStatus !== 'ALL' || fDirection !== 'ALL' || fKeyword !== ''
   const selectCls = 'px-1.5 py-0.5 border border-line rounded-sm text-xs text-ink-80 bg-card'
   // 分页：筛选变化时回到第 1 页；超出范围时钳位（避免删数据后空白页）
-  useEffect(() => { setPage(1) }, [fStatus, fChannel, fDirection, fKeyword, fLiveScope, pageSize])
-  // 切 Tab 必须清筛选：否则主 Tab 选的 FILLED 会让失败 Tab 直接空白
+  useEffect(() => { setPage(1) }, [fStatus, fChannel, fDirection, fKeyword, pageSize])
+  // 切 Tab 必须清筛选：否则主 Tab 选的 FILLED 会让失败 Tab 直接空白（通道回默认「仅实盘」）
   useEffect(() => {
-    setFStatus('ALL'); setFChannel('ALL'); setFDirection('ALL'); setFKeyword(''); setFLiveScope('LIVE'); setPage(1)
+    setFStatus('ALL'); setFChannel('LIVE_ONLY'); setFDirection('ALL'); setFKeyword(''); setPage(1)
   }, [orderTab])
 
   const actualPageSize = pageSize > 0 ? pageSize : Math.max(1, filtered.length)
@@ -2477,25 +2480,15 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
       <div className="flex items-center justify-between mb-2 gap-2 flex-wrap">
         <div className="flex items-center gap-1.5 flex-wrap">
           {orderTab === 'active' && (
-            <select
-              value={fLiveScope}
-              onChange={e => setFLiveScope(e.target.value as 'LIVE' | 'ALL')}
-              className={selectCls}
-              title="按实盘订单或全量筛选"
-            >
-              <option value="LIVE">仅实盘</option>
-              <option value="ALL">全量</option>
-            </select>
-          )}
-          {orderTab === 'active' && (
             <select value={fStatus} onChange={e => setFStatus(e.target.value)} className={selectCls} title="按订单状态筛选">
               <option value="ALL">全部状态</option>
               <option value="FILLED">已成交 FILLED</option>
               <option value="PENDING">待定 PENDING</option>
             </select>
           )}
-          <select value={fChannel} onChange={e => setFChannel(e.target.value)} className={selectCls} title="按信号通道筛选">
-            <option value="ALL">全部通道</option>
+          <select value={fChannel} onChange={e => setFChannel(e.target.value)} className={selectCls} title="按信号通道筛选（默认仅实盘自动化策略通道）">
+            <option value="LIVE_ONLY">仅实盘</option>
+            <option value="ALL">全部通道（含测试/影子）</option>
             {channels.map(v => (
               <option key={v} value={v}>{SIGNAL_INFO[v]?.name ?? v}</option>
             ))}
@@ -2514,7 +2507,7 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
           />
           {filterActive && (
             <button
-              onClick={() => { setFStatus('ALL'); setFChannel('ALL'); setFDirection('ALL'); setFKeyword(''); setFLiveScope('LIVE') }}
+              onClick={() => { setFStatus('ALL'); setFChannel('LIVE_ONLY'); setFDirection('ALL'); setFKeyword('') }}
               className="px-1.5 py-0.5 text-xs text-brand hover:underline"
             >清除筛选</button>
           )}
