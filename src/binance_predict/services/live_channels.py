@@ -72,6 +72,10 @@ class ChannelSpec:
     # 下单层入场价白名单（x4_v3）：决策点真实成交均价须落在任一 [lo,hi) 区间，
     # 否则 FAILED 弃单（prediction_trading 报价后检查，含 FOK 重试轮复检）。
     # None = 不启用（既有通道零影响）；研究冻结口径，不进 parse_channel_config 可覆盖项。
+    # 低波门禁（蜡烛 5m 家族）：1h 实现波动率 7 日分位 ≤ 该值不开仓（贴线拒单，
+    # 含边界）；决策时信息（窗口开始前 1m 收盘，无前视），数据缺失保守弃单。
+    # None = 不启用；研究冻结口径，不进 parse_channel_config 可覆盖项。
+    min_rv_pct: float | None = None
 
 
 def _qe_guard(version: str) -> float:
@@ -361,8 +365,17 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
 
 # 蜡烛逻辑版本共享 5m/15m 物理事件，但各自可独立注册/热调。默认配置仍全 OFF；
 # 护栏取冻结报价期胜率 × 0.98（费后理论最大保本入场价），不因注册自动下单。
+# 2026-10-09 方案A（用户拍板）：5m 长下影家族低波门禁——1h 实现波动率 7 日分位
+# ≤0.30（含贴线）不开仓。归因四口径（c2_live 39 / fam_live 115 / c2_shadow 153 /
+# fam_shadow 199）避输:丢赢 1.4~1.9:1、fam_live 费后 +63→+129U、拆半稳定；
+# 被弃赢单均为 +5U 级小赢，0.2~0.3 价位大赢单全在高波段保留。口径实现见
+# multi_live_trader.compute_rv_1h_pct7d（与审计 prep.feats 同源）；15m 版本与
+# candidate_* 假说版不在研究范围，不加门。仅 candle_hm_bull_5m_*（长下影家族，
+# 含 asia 时段子集）生效。
+CANDLE_5M_MIN_RV_PCT = 0.30
 for _candle_spec in CANDLESTICK_LOGICAL_SPECS:
     _version = _candle_spec["signal_id"]
+    _is_5m_wick = _candle_spec["timeframe"] == "5m" and _version.startswith("candle_hm_bull_5m_")
     LIVE_CHANNELS[_version] = ChannelSpec(
         _version,
         "candlestick_reversal",
@@ -370,6 +383,7 @@ for _candle_spec in CANDLESTICK_LOGICAL_SPECS:
         CANDLESTICK_DIRECTIONS[_version],
         round(CANDLESTICK_BACKTEST[_version][0] * 0.98, 4),
         CANDLESTICK_DISPLAY_NAMES[_version],
+        min_rv_pct=CANDLE_5M_MIN_RV_PCT if _is_5m_wick else None,
     )
 
 

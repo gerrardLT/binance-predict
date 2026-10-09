@@ -1751,7 +1751,7 @@ async def test_brkrv_disabled_no_fire(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_candlestick_live_channel_defaults_off_and_fires_only_when_enabled(monkeypatch) -> None:
-    """蜡烛通道注册但默认停火；手工启用后才经统一交易链路开火。"""
+    """蜡烛通道注册但默认停火；手工启用后才经统一交易链路开火（低波门禁注入高波动放行）。"""
     version = "candle_hm_bull_5m_consensus2_shadow_v1"
     sig = {
         "version": version,
@@ -1768,6 +1768,7 @@ async def test_candlestick_live_channel_defaults_off_and_fires_only_when_enabled
 
     enabled_fake = _FakeTrader()
     enabled = _make_trader(monkeypatch, enabled_fake, channels=[version])
+    _stub_high_vol_klines(monkeypatch, enabled, WINDOW_START)
     enabled.on_candlestick_signal(sig)
     await _drain(enabled)
     assert len(enabled_fake.calls) == 1
@@ -1779,11 +1780,12 @@ async def test_candlestick_live_channel_defaults_off_and_fires_only_when_enabled
 
 @pytest.mark.asyncio
 async def test_candlestick_same_window_labels_share_one_fill(monkeypatch) -> None:
-    """同一物理蜡烛事件多标签命中时，同周期最多成交一笔。"""
+    """同一物理蜡烛事件多标签命中时，同周期最多成交一笔（低波门禁注入高波动放行）。"""
     primary = "candle_hm_bull_5m_consensus2_shadow_v1"
     component = "candle_hm_bull_5m_ret3_component_shadow_v1"
     fake = _FakeTrader()
     t = _make_trader(monkeypatch, fake, channels=[primary, component])
+    _stub_high_vol_klines(monkeypatch, t, WINDOW_START)
     base = {
         "market_start": WINDOW_START,
         "market_end": WINDOW_END,
@@ -1796,6 +1798,161 @@ async def test_candlestick_same_window_labels_share_one_fill(monkeypatch) -> Non
 
     assert len(fake.calls) == 1
     assert fake.calls[0]["signal_version"] in {primary, component}
+
+
+# ============================================================
+# 组：蜡烛 5m 长下影家族低波门禁（2026-10-09 方案A）
+# 1h 实现波动率 7 日分位 ≤ 0.30（含贴线）不开仓；数据缺失保守弃单。
+# ============================================================
+
+def _rv_klines(window_start_ms: int, high_vol: bool, n: int = 7 * 1440 + 61) -> list[dict]:
+    """合成 7 日 1m K 线：尾部 80 根切换波动档，其余恒定微幅交替。
+
+    high_vol=True → 末小时大幅交替 → 分位接近 1；False → 全程等幅交替 →
+    所有滚动窗 sd 相同 → 分位 0.0（死水）。
+    """
+    bars: list[dict] = []
+    price = 100.0
+    for i in range(n):
+        t = window_start_ms - (n - i) * 60_000
+        amp = 0.004 if (high_vol and i >= n - 80) else 1e-5
+        price *= 1.0 + (amp if i % 2 else -amp)
+        bars.append({"open_time": t, "close": price})
+    return bars
+
+
+def _stub_high_vol_klines(monkeypatch, t: MultiLiveTrader, window_start_ms: int) -> None:
+    """既有蜡烛用例共用：注入高波动 1m 桩让低波门禁放行（保持原用例意图）。"""
+    bars = _rv_klines(window_start_ms, high_vol=True)
+
+    async def _fetch(_iv, _limit, end_ms):
+        return bars if end_ms == window_start_ms else []
+
+    t.kline_ending_at_fetcher = _fetch
+
+
+def test_compute_rv_1h_pct7d_pure_caliber() -> None:
+    """纯函数口径：等幅序列分位 0.0；末小时放量分位 >0.9；样本不足/历史够不到 → None。"""
+    from binance_predict.services.multi_live_trader import compute_rv_1h_pct7d
+
+    ws = 1_800_000_000_000
+    # 等幅交替（死水）：所有滚动窗 sd 同量级 → 分位接近 0（浮点尾差使个别窗
+    # 严格小于现值，断言阈值语义即可，门禁判定 ≤0.30 成立）
+    bars = _rv_klines(ws, high_vol=False)
+    pct_lo = compute_rv_1h_pct7d([(b["open_time"], b["close"]) for b in bars], ws)
+    assert pct_lo is not None and pct_lo < 0.1
+    # 末小时大幅交替：历史微幅窗全部严格小于 → 分位接近 1
+    bars_hi = _rv_klines(ws, high_vol=True)
+    pct_hi = compute_rv_1h_pct7d([(b["open_time"], b["close"]) for b in bars_hi], ws)
+    assert pct_hi is not None and pct_hi > 0.9
+    # 样本不足（< 61 根）
+    assert compute_rv_1h_pct7d([(ws - (i + 1) * 60_000, 100.0) for i in range(60)], ws) is None
+    # 历史够不到 7 日前（首根太新）→ None
+    short_hist = [(ws - (i + 1) * 60_000, 100.0 + i) for i in range(200)]
+    assert compute_rv_1h_pct7d(short_hist, ws) is None
+
+
+@pytest.mark.asyncio
+async def test_candlestick_5m_low_rv_gate_blocks_flat_market(monkeypatch) -> None:
+    """死水市场（全程等幅交替，分位 0.0）→ 零下单，落 rv_low_vol_skip 拒单记录。"""
+    version = "candle_hm_bull_5m_consensus2_shadow_v1"
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=[version])
+    bars = _rv_klines(WINDOW_START, high_vol=False)
+
+    async def _fetch(_iv, _limit, end_ms):
+        return bars if end_ms == WINDOW_START else []
+
+    t.kline_ending_at_fetcher = _fetch
+    recorded: list[dict] = []
+
+    async def _rec(self, channel, ws, *, reason, rejected, input_snapshot=None):
+        recorded.append({"channel": channel, "reason": reason, "rejected": rejected,
+                         "input_snapshot": input_snapshot})
+
+    monkeypatch.setattr(MultiLiveTrader, "_record_strategy_outcome", _rec)
+    t.on_candlestick_signal({
+        "version": version, "market_start": WINDOW_START, "market_end": WINDOW_END,
+        "direction": "DOWN", "signal_bar_start": WINDOW_START - 300_000,
+    })
+    await _drain(t)
+    assert fake.calls == []
+    assert len(recorded) == 1
+    assert recorded[0]["reason"] == "rv_low_vol_skip"
+    assert recorded[0]["rejected"] is True
+    assert recorded[0]["input_snapshot"]["rv_pct"] < 0.30  # 死水分位（远低于阈值）
+
+
+@pytest.mark.asyncio
+async def test_candlestick_5m_low_rv_gate_data_missing_skips(monkeypatch) -> None:
+    """K 线拉不到（fetcher 未注入）→ 数据缺失保守弃单，rejected=False。"""
+    version = "candle_hm_bull_5m_consensus2_shadow_v1"
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=[version])
+    recorded: list[dict] = []
+
+    async def _rec(self, channel, ws, *, reason, rejected, input_snapshot=None):
+        recorded.append({"reason": reason, "rejected": rejected})
+
+    monkeypatch.setattr(MultiLiveTrader, "_record_strategy_outcome", _rec)
+    t.on_candlestick_signal({
+        "version": version, "market_start": WINDOW_START, "market_end": WINDOW_END,
+        "direction": "DOWN", "signal_bar_start": WINDOW_START - 300_000,
+    })
+    await _drain(t)
+    assert fake.calls == []
+    assert recorded == [{"reason": "rv_data_missing", "rejected": False}]
+
+
+@pytest.mark.asyncio
+async def test_candlestick_5m_low_rv_gate_boundary_threshold(monkeypatch) -> None:
+    """阈值贴线：分位恰 0.30 拒、0.299999 拒、0.300001 放行（≤ 语义含贴线）。"""
+    version = "candle_hm_bull_5m_consensus2_shadow_v1"
+    sig = {
+        "version": version, "market_start": WINDOW_START, "market_end": WINDOW_END,
+        "direction": "DOWN", "signal_bar_start": WINDOW_START - 300_000,
+    }
+
+    async def _fire_case(monkeypatch, pct: float | None) -> int:
+        fake = _FakeTrader()
+        t = _make_trader(monkeypatch, fake, channels=[version])
+
+        async def _rv(_ws):
+            return pct
+
+        monkeypatch.setattr(t, "_rv_pct_at", _rv)
+
+        async def _rec(self, *_a, **_k):
+            return None
+
+        monkeypatch.setattr(MultiLiveTrader, "_record_strategy_outcome", _rec)
+        t.on_candlestick_signal(sig)
+        await _drain(t)
+        return len(fake.calls)
+
+    assert await _fire_case(monkeypatch, 0.30) == 0        # 贴线拒单
+    assert await _fire_case(monkeypatch, 0.299999) == 0    # 越界拒单
+    assert await _fire_case(monkeypatch, 0.300001) == 1    # 放行下单
+
+
+@pytest.mark.asyncio
+async def test_candlestick_low_rv_gate_scope_only_5m_wick_family(monkeypatch) -> None:
+    """门禁范围：15m 蜡烛版与 candidate_* 观察版不加门（fetcher 缺失仍放行）。"""
+    # 正向口径：7 个 candle_hm_bull_5m_* 长下影版本全部挂 0.30（live_channels 冻结值）
+    wick_5m = {v: s for v, s in LIVE_CHANNELS.items() if v.startswith("candle_hm_bull_5m_")}
+    assert len(wick_5m) == 7
+    assert all(s.min_rv_pct == 0.30 for s in wick_5m.values())
+    for version in ("candle_hm_bull_15m_consensus3_shadow_v1",
+                    "candidate_5m_ret3_up_lower_bear_l50b50m0_shadow_hyp_v1"):
+        fake = _FakeTrader()
+        t = _make_trader(monkeypatch, fake, channels=[version])
+        assert t._specs[version].min_rv_pct is None  # 口径源：live_channels 注册表
+        t.on_candlestick_signal({
+            "version": version, "market_start": WINDOW_START, "market_end": WINDOW_END,
+            "direction": "DOWN", "signal_bar_start": WINDOW_START - 300_000,
+        })
+        await _drain(t)
+        assert len(fake.calls) == 1, version
 
 
 @pytest.mark.asyncio

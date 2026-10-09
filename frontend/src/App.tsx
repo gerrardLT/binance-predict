@@ -1268,7 +1268,7 @@ const SIGNAL_INFO: Record<string, { name: string; desc: string; retired?: boolea
   // 共享 5m/15m 物理事件，各逻辑版本独立注册实盘；不收录会让订单表/通道面板退回裸英文 ID。
   candle_hm_bull_5m_consensus2_shadow_v1: {
     name: '5m长下影·至少2趋势',
-    desc: '蜡烛反转族 5m 主影子：阳线、下影≥50%、实体≤50%、上影≤10%，且 ret3/ret5_majority/ma10 至少两种上涨 → 押次根 5m DOWN。与对照/归因版本共享物理事件，实盘按逻辑版本独立派单。',
+    desc: '蜡烛反转族 5m 主影子：阳线、下影≥50%、实体≤50%、上影≤10%，且 ret3/ret5_majority/ma10 至少两种上涨 → 押次根 5m DOWN。实盘叠加入场层低波门禁（1h 实现波动率 7 日分位 ≤0.30 弃单）。与对照/归因版本共享物理事件，实盘按逻辑版本独立派单。',
   },
   candle_hm_bull_5m_consensus3_shadow_v1: {
     name: '5m长下影·三趋势对照',
@@ -9252,8 +9252,6 @@ function RegimeByVersionTable({
 
   return (
     <div className="space-y-6">
-      <ShadowExecutionComparisonCard data={executionComparison} unavailable={executionUnavailable} />
-
       {/* 控制栏 */}
       <div className="flex items-center gap-4 flex-wrap text-xs">
         <label className="flex items-center gap-1.5 cursor-pointer text-ink-80">
@@ -9342,7 +9340,7 @@ function RegimeByVersionTable({
       )}
 
       <details className="ds-card">
-        <summary className="cursor-pointer px-4 py-3 text-sm font-semibold text-ink-95">旧版影子：在线采集与统计（展开查看）<HelpHint text="保留旧版在线采集、前向胜率、回测基准与保本线；新版前向证据及执行漏斗见页面顶部。" /></summary>
+        <summary className="cursor-pointer px-4 py-3 text-sm font-semibold text-ink-95">旧版影子：在线采集与统计（展开查看）<HelpHint text="保留旧版在线采集、前向胜率、回测基准与保本线；新版前向证据及执行漏斗见页面底部。" /></summary>
         <div className="space-y-6 px-2 pb-2">
       {/* 旧版影子入口与完整在线采集指标一并折叠。 */}
       {analytics && featuredShadowKeys.map(k => {
@@ -9448,6 +9446,8 @@ function RegimeByVersionTable({
         )}
       </Card>
       </details>
+
+      <ShadowExecutionComparisonCard data={executionComparison} unavailable={executionUnavailable} />
     </div>
   )
 }

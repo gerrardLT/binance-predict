@@ -151,6 +151,87 @@ G3_LIVE_TD_BANDS_S = ((105.0, 120.0), (210.0, 240.0))  # 触发时刻双波峰�
 G3_LIVE_Q_MIN = 0.07                                   # 浅价下界（触发报价，过滤深水归零单）
 G3_LIVE_MIN_REMAIN_S = 60.0                            # 下单时刻距窗末剩余硬门（60s，防>240s末段追单）
 
+# 蜡烛 5m 长下影家族低波门禁（2026-10-09 方案A，用户拍板）：1h 实现波动率 7 日
+# 分位 ≤ 阈值不开仓（死水市反转无燃料）。阈值挂在 ChannelSpec.min_rv_pct
+# （live_channels.CANDLE_5M_MIN_RV_PCT），此处只管口径与判定；与审计
+# prep.feats rv_1h_pct7d 同源（研究冻结口径，勿单独改参数）。
+RV_HIST_BARS = 7 * 1440   # 7 日分位窗口（1m 对数收益根数）
+RV_NOW_BARS = 60          # 现值窗口 = 1h
+
+
+def compute_rv_1h_pct7d(bars: list[tuple[int, float]], window_start_ms: int) -> float | None:
+    """1h 实现波动率在过去 7 日的分位（研究冻结口径，与审计 prep.feats 同源）。
+
+    bars：升序 (open_time, close)，全部已收盘（open_time + 60s ≤ window_start，
+    严格 ex-ante）。r = 相邻可得 1m 的对数收益（标签 = 后一根 open_time，
+    缺口按位置相邻同 prep 的 diff 语义）；rv_now = 标签 ∈ [ws-60m, ws-1m] 的
+    r 样本标准差（ddof=1 同 pandas）；分位 = 标签 ∈ [ws-7d, ws-1m] 切片上
+    rolling(60).std < rv_now 的占比（严格小于；头 59 个不足窗按 False 计入
+    分母，与 pandas「NaN<rv 得 False、.mean() 除以切片全长」一致）。与 prep
+    逐点对齐验证过：166 个研究窗最大偏差 1/10080（末窗自比 ulp 噪声），
+    阈值决策零翻转。样本不足（现值窗 < 2 根 / 历史够不到 7 日前）或含非正价
+    → None，调用方保守弃单。滑动和实现 O(n)（10k 滚动窗不重复求和）。
+    """
+    n = len(bars)
+    if n < 2:
+        return None
+    try:
+        logs = [math.log(float(c)) for _, c in bars]
+    except (TypeError, ValueError):
+        return None
+    minute_ms = 60_000
+    hist_lo = window_start_ms - RV_HIST_BARS * minute_ms
+    now_lo = window_start_ms - RV_NOW_BARS * minute_ms
+    hist_hi = window_start_ms - minute_ms
+    if bars[0][0] > hist_lo:
+        return None  # 历史够不到 7 日前（拉取不足/失败）→ 保守不可判
+    r_hist: list[float] = []
+    r_now: list[float] = []
+    for i in range(1, n):
+        t = bars[i][0]
+        v = logs[i] - logs[i - 1]
+        if now_lo <= t <= hist_hi:
+            r_now.append(v)
+        if hist_lo <= t <= hist_hi:
+            r_hist.append(v)
+    if len(r_now) < 2:
+        return None
+    w = RV_NOW_BARS
+
+    def _sd(win: list[float]) -> float:
+        m = sum(win) / w
+        var = sum((x - m) ** 2 for x in win) / (w - 1)
+        return math.sqrt(var) if var > 0.0 else 0.0
+
+    if len(r_hist) < w:
+        return None
+    rv_now = _sd(r_now) if len(r_now) == w else _stdev_partial(r_now)
+    s = sum(r_hist[:w])
+    s2 = sum(x * x for x in r_hist[:w])
+    below = cnt = 0
+    for i in range(w - 1, len(r_hist)):
+        if i > w - 1:
+            out_x, in_x = r_hist[i - w], r_hist[i]
+            s += in_x - out_x
+            s2 += in_x * in_x - out_x * out_x
+        var = (s2 - s * s / w) / (w - 1)
+        sd = math.sqrt(var) if var > 0.0 else 0.0
+        cnt += 1
+        if sd < rv_now:
+            below += 1
+    if cnt == 0:
+        return None
+    # 分母 = 7 日切片全长（含头 59 个不足窗位置）：pandas 比较里 NaN < rv 为
+    # False 而非 NaN，.mean() 除以全部标签位——与 prep 口径严格一致，勿改。
+    return below / len(r_hist)
+
+
+def _stdev_partial(vals: list[float]) -> float:
+    """不足 60 根时的现值波动（pandas Series.std 对 <60 根仍给值，同语义）。"""
+    m = sum(vals) / len(vals)
+    var = sum((x - m) ** 2 for x in vals) / (len(vals) - 1)
+    return math.sqrt(var) if var > 0.0 else 0.0
+
 
 def _g3_live_band_veto(ext: dict) -> str | None:
     """G3 实盘双波峰利润带门：触发时刻不在 [105,120)s / [210,240)s 或 q<0.07 → 拦截（仅实盘通道）。"""
@@ -1560,12 +1641,45 @@ class MultiLiveTrader:
             logger.warning("多通道实盘：S2 条件单下单任务异常 | {} | {} | {}",
                            channel, _fmt_win(market_start), exc)
 
+    async def _rv_pct_at(self, window_start_ms: int) -> float | None:
+        """决策时点（窗口开始前最后一根 1m 收盘）的 1h 波动 7 日分位。
+
+        按根数拉 7 日 + 61 根 1m（endTime=窗口开始，严格 ex-ante）；fetcher
+        未注入 / 拉取失败 / 样本不足 → None（调用方保守弃单）。
+        """
+        if self.kline_ending_at_fetcher is None:
+            return None
+        bars = await self.kline_ending_at_fetcher(
+            "1m", RV_HIST_BARS + RV_NOW_BARS + 1, window_start_ms)
+        if not bars:
+            return None
+        return compute_rv_1h_pct7d(
+            [(int(b["open_time"]), float(b["close"])) for b in bars], window_start_ms)
+
     async def _fire_nextbar(self, channel: str, sig: dict) -> None:
         spec = self._specs[channel]
         cfg = self._configs[channel]
         market_start = int(sig["market_start"])
         prediction = str(sig.get("direction") or spec.direction)  # 冻结方向（本族恒 UP）
         try:
+            # 低波门禁（蜡烛 5m 长下影家族，2026-10-09 方案A）：决策时点 1h 波动
+            # 7 日分位 ≤ 阈值（含贴线）不开仓；K 线拉不到/样本不足 → 保守弃单。
+            # 影子侧口径不变（全部事件照常落表），前向对照由审计管线做反事实。
+            if spec.min_rv_pct is not None:
+                pct = await self._rv_pct_at(market_start)
+                if pct is None or pct <= spec.min_rv_pct:
+                    logger.info(
+                        "多通道实盘：{} 低波门禁未过，弃单 | 窗口 {} | rv_pct={} | 阈值 {}",
+                        channel, _fmt_win(market_start),
+                        "数据缺失" if pct is None else f"{pct:.4f}", spec.min_rv_pct)
+                    await self._record_strategy_outcome(
+                        channel,
+                        market_start,
+                        reason="rv_data_missing" if pct is None else "rv_low_vol_skip",
+                        rejected=pct is not None,
+                        input_snapshot={"rv_pct": pct, "min_rv_pct": spec.min_rv_pct},
+                    )
+                    return
             assessment_context, proceed = await self._prepare_runtime_execution(
                 channel,
                 market_start,
