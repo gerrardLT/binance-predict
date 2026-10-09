@@ -73,13 +73,18 @@ def test_contrarian_z_variants_are_record_only() -> None:
         assert spec.live_channel is None
 
 
-def test_s4_variants_are_record_only() -> None:
-    for version in ("s4_delay60_v1", "s4_hiconf_v1"):
-        spec = SHADOW_VERSION_SPECS[version]
-        assert spec.source_type is SourceType.KLINE
-        assert spec.market_period == "15m"
-        assert spec.family == "scene"
-        assert spec.live_channel is None
+def test_s4_variants_split_between_live_and_record_only() -> None:
+    """延迟入场（2026-10-09 注册同名实盘）/ 高信心档（record-only）。"""
+    delay = SHADOW_VERSION_SPECS["s4_delay60_v1"]
+    assert delay.source_type is SourceType.KLINE
+    assert delay.market_period == "15m"
+    assert delay.family == "scene"
+    assert delay.live_channel == "s4_delay60_v1" and delay.live_retired is False
+    hiconf = SHADOW_VERSION_SPECS["s4_hiconf_v1"]
+    assert hiconf.source_type is SourceType.KLINE
+    assert hiconf.market_period == "15m"
+    assert hiconf.family == "scene"
+    assert hiconf.live_channel is None
 
 
 def test_s1_entry_variants_have_same_name_live_channels() -> None:

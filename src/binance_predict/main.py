@@ -220,7 +220,7 @@ absorption_shadow_detector: AbsorptionShadowDetector | None = None
 # 只记录不下注）
 s2_cond_shadow_detector: S2CondShadowDetector | None = None
 s2_optimized_shadow_detector: S2OptimizedShadowDetector | None = None
-# S4 派生影子（s4_delay60_v1 / s4_hiconf_v1，record-only，不接实盘钩子）；
+# S4 派生影子（s4_delay60_v1 影子+实盘通道默认 OFF / s4_hiconf_v1 record-only）；
 # 同实例另承载 S1 入场变体 s1_early2_v1 / s1_dip45_v1（影子 + 实盘通道，实盘默认关闭）
 s4_variant_shadow_detector: S4VariantShadowDetector | None = None
 
@@ -1436,8 +1436,8 @@ async def lifespan(app: FastAPI):
     if fake_breakout_detector is not None:
         fake_breakout_detector._on_s2_optimized = s2_optimized_shadow_detector.evaluate
 
-    # S4 派生影子（2026-10-04）：延迟入场（+60s BTC 已回落）/ 高信心档（连阳≥5∧cp≥0.9），
-    # 只落 kline_shadow_signals，不注册实盘通道、不挂下单钩子。
+    # S4 派生影子（2026-10-04）：延迟入场（+60s BTC 已回落，2026-10-09 起注册同名
+    # 实盘通道默认 OFF）/ 高信心档（连阳≥5∧cp≥0.9，record-only 不接下单钩子）。
     global s4_variant_shadow_detector
     s4_variant_shadow_detector = S4VariantShadowDetector(
         collector=collector,
@@ -1517,7 +1517,8 @@ async def lifespan(app: FastAPI):
                 multi_live_trader.on_s5_deep_signal)
             fake_breakout_detector._on_s1_dynamic_fired = (
                 multi_live_trader.on_s1_dynamic_signal)
-        # S1 入场变体（早确认 / 低吸）实盘钩子：通道默认关闭，影子落表独立于开关
+        # S4/S1 入场变体（延迟确认 / 早确认 / 低吸）实盘钩子：通道默认关闭，
+        # 影子落表独立于开关；payload.version 路由，scene_signal_id = 父场景信号 id。
         if s4_variant_shadow_detector is not None:
             s4_variant_shadow_detector._on_live_fire = (
                 multi_live_trader.on_s1_variant_signal)
@@ -4371,7 +4372,7 @@ SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     "s2_cond_t5d_v1": (0.448, None, "S2条件t=5剔深: 同S2派生→次周期t=5(+300s)0<ln(开盘/px5)<15bp(中度回落剔深)→押次周期15m UP(收阳赢)（720d触发643/2176=29.5%/0.89天,价-only胜率44.8%；剔深单均优于t=4全深度；真实EV前向现算,报价表研究EV+0.283属乐观上界）"),
     # S4 派生影子（2026-10-04，record-only）：胜率基准 = 720d K 线重放（生产纯函数）；
     # EV 由真实报价前向现算（延迟入场入场价更高，研究 EV 未扣 20U 深度滑点）
-    "s4_delay60_v1": (0.662, None, "S4延迟入场: 正式S4(已跳过续发)+目标窗第1根1m收盘<开盘(BTC已回落)才按+60s真实DOWN报价入场→押15m DOWN（720d重放 n=837 胜率66.2%；predict.fun真实盘口 P1/P2 均EV +0.119/+0.107；仅记录不下单）"),
+    "s4_delay60_v1": (0.662, None, "S4延迟入场: 正式S4(已跳过续发)+目标窗第1根1m收盘<开盘(BTC已回落)才按+60s真实DOWN报价入场→押15m DOWN（720d重放 n=837 胜率66.2%；predict.fun真实盘口 P1/P2 均EV +0.119/+0.107；影子+实盘通道(默认关闭)）"),
     "s4_hiconf_v1": (0.632, None, "S4高信心档: 连阳≥5(含信号K)∧收盘位置≥0.9，允许破位周期→押次周期15m DOWN（720d重放 n=399 胜率63.2%；真实盘口 P1/P2 均EV +0.119/+0.147；与S1重叠约52%，仅记录不下单）"),
     "s1_early2_v1": (0.717, None, "S1早确认(S1m2): 正式S1命中+目标窗第2根1m收盘<开盘(BTC已回落)→+2min按真实DOWN报价入场→押15m DOWN（720d重放 n=1283 胜率71.7%；predict.fun真实盘口 P1/P2 均EV +0.118/+0.099，S5为+0.015/+0.080；与S5重叠76%；影子+实盘通道(默认关闭)）"),
     "s1_dip45_v1": (0.439, None, "S1低吸: 正式S1命中后+62/122/182/302/482s首次DOWN报价≤0.42(≈真实成交0.45)即入场→押15m DOWN（真实盘口 P1/P2 均EV +0.097/+0.199，n57/n123，随机窗口对照−0.074/+0.011；与S1开盘单同向叠加敞口；影子+实盘通道(默认关闭)）"),

@@ -1080,7 +1080,7 @@ const SIGNAL_INFO: Record<string, { name: string; desc: string; retired?: boolea
   },
   s4_delay60_v1: {
     name: 'S4延迟入场·首分钟回落（押DOWN）',
-    desc: '【仅记录，不实盘】正式 S4（已跳过续发）命中后，等目标窗第 1 根 1m 收盘：BTC 低于窗口开盘才按 +60s 真实 DOWN 报价入场，否则放弃。720 天重放 n=837、胜率 66.2%；predict.fun 真实盘口两段均EV +0.119 / +0.107。入场价约 0.62（比开盘贵），研究 EV 未扣 20U 深度滑点，待前向验证。',
+    desc: '正式S4命中后，等目标窗第1根1m收盘<窗口开盘（BTC已回落）才按+60s真实DOWN报价入场，押15m DOWN。720d重放 n=837、胜率66.2%；predict.fun真实盘口两段均EV +0.119/+0.107。同名实盘通道已注册（默认关闭），护栏0.65；与S4开盘单同窗同向叠加敞口。',
   },
   s4_hiconf_v1: {
     name: 'S4高信心档·连阳≥5（押DOWN）',

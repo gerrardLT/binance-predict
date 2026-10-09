@@ -1,4 +1,4 @@
-"""S4 跳过续发（实盘+影子同口径，检测器层）与 S4 派生影子（延迟入场 / 高信心档，record-only）。
+"""S4 跳过续发（实盘+影子同口径，检测器层）与 S4 派生影子（延迟入场·影子+实盘 / 高信心档 record-only）。
 
 续发 = 上一根 15m 本身也是正式 S4 触发（上一窗押 DOWN 已输、连阳延长再触发）。
 不触 DB/网络：collector 替身返回固定 K 线，_fire_confirmed_signal 捕获替身。
@@ -122,6 +122,20 @@ async def test_refire_chain_skips_second_and_third_trigger() -> None:
     assert [f["cycle"] for f in fired if f["pattern_type"] == "momentum_fade"] == [100]
     assert d.status_snapshot["s4_refire_skip_count"] == 2
     assert [p["market_start_15m"] for p in delay] == [101 * M15]
+
+
+@pytest.mark.asyncio
+async def test_delay_payload_carries_parent_signal_id() -> None:
+    """正式 S4 落库成功 → 延迟入场 payload.id = 父信号 id（实盘订单 scene_signal_id 溯源）。"""
+    d, _, delay, _ = _det([_seq_upto(100, 3)])
+
+    async def fake_fire(side, rec, sig_k, close_pos, vol_ratio, cur_cycle, now_ms,
+                        version="v1", shadow=False, pattern_type=None):
+        return SimpleNamespace(id=55)
+
+    d._fire_confirmed_signal = fake_fire  # type: ignore[method-assign]
+    await d._confirm_and_fire({}, prev_cycle=100, cur_cycle=101, now_ms=101 * M15, retry=0)
+    assert [p.get("id") for p in delay] == [55]
 
 
 @pytest.mark.asyncio
@@ -267,13 +281,60 @@ async def test_delay_records_when_first_minute_dropped(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_delay_fires_live_when_first_minute_dropped(monkeypatch) -> None:
+    """2026-10-09 注册实盘：首分钟回落确认 → 实盘钩子（含父 S4 信号 id）+ 影子落表。"""
+    sess = _Sess()
+    _patch(monkeypatch, sess, WS + 70_000)
+    det = S4VariantShadowDetector(_C1m({"open_time": WS, "open": 100.0, "close": 99.8}), PM)
+    det._running = True
+    live: list[dict] = []
+    det._on_live_fire = live.append
+    await det._confirm(S4_DELAY_VERSION, {**SIG, "id": 9})
+    assert live == [{"version": S4_DELAY_VERSION, "id": 9, "pattern_type": S4_DELAY_VERSION,
+                     "side": "high", "market_start_15m": WS,
+                     "market_end_15m": WS + M15}]
+    assert len(sess.added) == 1
+
+
+@pytest.mark.asyncio
+async def test_delay_live_aborts_without_parent_signal_id(monkeypatch) -> None:
+    """父 S4 落库失败（payload 无 id）→ 放弃实盘派单（订单无 scene_signal_id 不可结算）；影子照常落表。"""
+    sess = _Sess()
+    _patch(monkeypatch, sess, WS + 70_000)
+    det = S4VariantShadowDetector(_C1m({"open_time": WS, "open": 100.0, "close": 99.8}), PM)
+    det._running = True
+    live: list[dict] = []
+    det._on_live_fire = live.append
+    await det._confirm(S4_DELAY_VERSION, SIG)   # SIG 无 id 字段
+    assert live == []
+    assert len(sess.added) == 1
+
+
+@pytest.mark.asyncio
 async def test_delay_skips_when_first_minute_not_dropped(monkeypatch) -> None:
     sess = _Sess()
     _patch(monkeypatch, sess, WS + 70_000)
     det = S4VariantShadowDetector(_C1m({"open_time": WS, "open": 100.0, "close": 100.0}), PM)
     det._running = True
-    await det._confirm(S4_DELAY_VERSION, SIG)
-    assert sess.added == []
+    live: list[dict] = []
+    det._on_live_fire = live.append
+    await det._confirm(S4_DELAY_VERSION, {**SIG, "id": 9})
+    assert sess.added == [] and live == []
+
+
+@pytest.mark.asyncio
+async def test_delay_live_fires_even_when_shadow_offline(monkeypatch) -> None:
+    """影子下线不阻止已启用的实盘（两开关独立，同 s1_early2_v1）；影子不落行。"""
+    sess = _Sess()
+    _patch(monkeypatch, sess, WS + 70_000)
+    monkeypatch.setattr(s4v.shadow_gate, "is_enabled", lambda _v: False)
+    monkeypatch.setattr(s4v, "is_live_enabled", lambda v: v == S4_DELAY_VERSION)
+    det = S4VariantShadowDetector(_C1m({"open_time": WS, "open": 100.0, "close": 99.8}), PM)
+    det._running = True
+    live: list[dict] = []
+    det._on_live_fire = live.append
+    await det._confirm(S4_DELAY_VERSION, {**SIG, "id": 9})
+    assert len(live) == 1 and sess.added == []
 
 
 @pytest.mark.asyncio
@@ -449,13 +510,19 @@ async def test_s1_variant_live_hook_exception_does_not_block_shadow(monkeypatch)
     assert len(sess.added) == 1
 
 def test_s1_spawn_gate_shadow_or_live(monkeypatch) -> None:
-    """派生门：影子开 或 实盘开 任一即派生；都关不派生；S4 两版不受实盘开关影响。"""
+    """派生门：影子开 或 实盘开 任一即派生；都关不派生；record-only 版不看实盘开关。"""
     monkeypatch.setattr(s4v.shadow_gate, "is_enabled", lambda _v: False)
     monkeypatch.setattr(s4v, "is_live_enabled", lambda _v: False)
     det = S4VariantShadowDetector(_CMulti([]), {})
     det._running = True
     det.on_s1_entry(S1SIG)
+    det.on_delay({**SIG, "id": 9})
     assert det._watched == set()
     monkeypatch.setattr(s4v, "is_live_enabled", lambda v: v == S1_DIP_VERSION)
     det.on_hiconf(SIG)
-    assert det._watched == set()                       # S4 版不看实盘开关
+    assert det._watched == set()                       # 高信心档 record-only：不看实盘开关
+    det.on_delay({**SIG, "id": 9})
+    assert det._watched == set()                       # 实盘只开 s1_dip45：delay 仍不派生
+    monkeypatch.setattr(s4v, "is_live_enabled", lambda v: v == S4_DELAY_VERSION)
+    det.on_delay({**SIG, "id": 9})
+    assert det._watched == {(S4_DELAY_VERSION, WS)}    # delay 实盘开 → 派生

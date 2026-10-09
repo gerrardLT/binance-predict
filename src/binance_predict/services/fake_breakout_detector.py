@@ -469,9 +469,11 @@ class FakeBreakoutDetector:
         # S1 动态路由实盘钩子：仅动态门判定为实际模拟入场时派发；影子 gate
         # 与实盘开关独立（影子下线不阻止已显式启用的真单，实盘关闭仍持续采集）。
         self._on_s1_dynamic_fired: Callable[[dict], None] | None = None
-        # S4 派生影子钩子（record-only，main 装配注入 S4VariantShadowDetector）：
-        # _on_s4_delay：非续发的正式 S4 命中 → +60s 回落确认影子；
-        # _on_s4_hiconf：连阳≥5∧cp≥0.9（含破位周期）→ 高信心档影子。
+        # S4 派生影子钩子（main 装配注入 S4VariantShadowDetector）：
+        # _on_s4_delay：非续发的正式 S4 命中 → +60s 回落确认影子+实盘通道
+        #   （2026-10-09 注册实盘 s4_delay60_v1，payload.id = 父 S4 信号 id，
+        #   供订单 scene_signal_id 溯源结算）；
+        # _on_s4_hiconf：连阳≥5∧cp≥0.9（含破位周期）→ 高信心档影子（record-only）。
         self._on_s4_delay: Callable[[dict], None] | None = None
         self._on_s4_hiconf: Callable[[dict], None] | None = None
         # S1 入场变体钩子（main 装配注入 S4VariantShadowDetector.on_s1_entry）：
@@ -907,12 +909,16 @@ class FakeBreakoutDetector:
                     "break_price": sig_k["close"],
                     "break_time": sig_open_time,
                 }
-                await self._fire_confirmed_signal(
+                fired_signal = await self._fire_confirmed_signal(
                     "high", synthetic_rec, sig_k, m_close_pos, None, cur_cycle, now_ms,
                     version=self._active_version, shadow=False,
                     pattern_type="momentum_fade",
                 )
                 self._notify_s4_variant(self._on_s4_delay, {
+                    # id = 父 S4 信号行 id：延迟入场实盘单 scene_signal_id 溯源锚点
+                    #（结算回读 FakeBreakoutSignal）；落库失败（None）则不带 id，
+                    # 影子照常记录、实盘侧 sig.get("id") 缺失由检测器放弃实盘派单。
+                    "id": fired_signal.id if fired_signal is not None else None,
                     "signal_bar_start": sig_open_time,
                     "market_start_15m": next_start,
                     "market_end_15m": next_end,
@@ -953,12 +959,15 @@ class FakeBreakoutDetector:
         version: str = "v1",
         shadow: bool = False,
         pattern_type: str = "bull_exhaust",  # bull_exhaust | bear_exhaust | momentum_fade
-    ) -> None:
+    ) -> FakeBreakoutSignal | None:
         """场景命中信号：冷却/日限检查、落表与推送（目标周期 = 次周期 cur_cycle）。
+
+        返回落库成功的信号行（冷却中 / 落库失败返回 None）——S4 延迟入场
+        变体用返回的 signal.id 做订单 scene_signal_id 溯源锚点。
 
         M4：version 标记参数版本；shadow=True 时只落表不发邮件、不计日限、
         独立冷却键——影子信号仅用于实盘对照，不影响正式信号流。
-        
+
         pattern_type：具体模式类型（由 classify_close_pattern 返回）
         """
         eps = settings.fake_breakout_eps
@@ -967,7 +976,7 @@ class FakeBreakoutDetector:
 
         # 风控 1：冷却（双保险；pending 每周期覆盖已保证每方向每周期最多一条）
         if now_ms - self._last_signal_at.get(key, 0) < settings.fake_breakout_cooldown_seconds * 1000:
-            return
+            return None
 
         self._daily_rollover(now_ms)
         # 风控 2：日内上限计数——影子信号不占日限。2026-08-28 邮件推送挪到
@@ -1018,7 +1027,7 @@ class FakeBreakoutDetector:
                 await session.refresh(signal)
         except Exception as exc:
             logger.error("场景信号落表失败 | {}", exc)
-            return
+            return None
 
         self._last_signal_at[key] = now_ms
         if not shadow:
@@ -1082,6 +1091,7 @@ class FakeBreakoutDetector:
         # 邮件推送已挪到结算回读后（_settle_15m，2026-08-28）：触发不再发
         # 预告邮件，结算置 SETTLED 后按 通道开关 → 实盘成交闸（FILLED）推
         # 复盘邮件，被实盘门禁拦下的信号不再推。
+        return signal
 
     def _notify_signal_fired(self, signal: FakeBreakoutSignal) -> None:
         """实盘钩子（同步接口，fire-and-forget）：正式信号 fire 后通知执行器。

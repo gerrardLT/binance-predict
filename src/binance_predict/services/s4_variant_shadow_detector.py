@@ -1,14 +1,18 @@
-"""S4 动量衰竭派生影子（record-only，不下单）：延迟入场 / 高信心档；
+"""S4 动量衰竭派生影子：延迟入场（影子+实盘通道）/ 高信心档（record-only）；
 另承载 S1 入场变体（早确认 / 低吸：影子 + 实盘通道共用同一触发，实盘默认关闭）。
 
 四个版本均由 FakeBreakoutDetector 在 15m 周期收盘确认时派生，落 kline_shadow_signals，
-押目标 15m 周期 DOWN，用完整 15m K 线结算。S4 两版仅记录，不接实盘钩子；
-S1 两版命中时另经 _on_live_fire 通知 MultiLiveTrader（通道未启用即无动作）。
+押目标 15m 周期 DOWN，用完整 15m K 线结算。s4_hiconf 仅记录不接实盘钩子；
+其余三版命中时另经 _on_live_fire 通知 MultiLiveTrader（通道未启用即无动作）。
 
-- s4_delay60_v1：正式 S4（已跳过续发）命中后，等目标窗第 1 根 1m 收盘（+60s），
-  若该 1m 收盘 < 窗口开盘（BTC 已回落）才记录，入场价快照 +60s 后的真实 DOWN 报价。
+- s4_delay60_v1（2026-10-09 注册实盘）：正式 S4（已跳过续发）命中后，等目标窗
+  第 1 根 1m 收盘（+60s），若该 1m 收盘 < 窗口开盘（BTC 已回落）才入场，
+  入场价快照 +60s 后的真实 DOWN 投价。
   依据：predict.fun 真实盘口 2026-05→10-03，P1 均EV +0.119（n56）/ P2 +0.107（n96），
   720d K 线重放 n=837 胜率 66.2%。入场价更高（≈0.62），未扣 20U 深度滑点。
+  实盘通道同名（默认 OFF），订单 scene_signal_id = 父 S4 信号 id；与
+  scene_momentum_fade 同窗同向（S4 开盘单 +60s 确认单叠加敞口），叠加敞口
+  提示见 live_channels 注释。
 - s4_hiconf_v1：连阳≥5（含信号K）∧ close_pos≥0.9，允许破位周期（与 S1 重叠约 52%）。
   依据：720d 重放 n=399 胜率 63.2%；真实盘口 P1/P2 均EV +0.119/+0.147（n26/n52）。
 - s1_early2_v1（S1m2）：正式 S1 命中后，目标窗第 2 根 1m 收盘 < 窗口开盘（BTC 已回落）
@@ -39,8 +43,10 @@ S4_DELAY_VERSION = "s4_delay60_v1"
 S4_HICONF_VERSION = "s4_hiconf_v1"
 S1_EARLY_VERSION = "s1_early2_v1"
 S1_DIP_VERSION = "s1_dip45_v1"
-S1_VARIANT_VERSIONS = (S1_EARLY_VERSION, S1_DIP_VERSION)  # 另有实盘通道，名与 live_channels 一致
-S4_VARIANT_VERSIONS = (S4_DELAY_VERSION, S4_HICONF_VERSION, *S1_VARIANT_VERSIONS)
+# 另有同名实盘通道的版本（live_channels 同名注册，默认 OFF）：
+# 实盘开关开启时即使影子下线也照常派生（两开关独立，同 s1_dyn_sq_v1）。
+LIVE_VARIANT_VERSIONS = (S4_DELAY_VERSION, S1_EARLY_VERSION, S1_DIP_VERSION)
+S4_VARIANT_VERSIONS = (S4_DELAY_VERSION, S4_HICONF_VERSION, S1_EARLY_VERSION, S1_DIP_VERSION)
 BAR_MS_15M = 900_000
 DELAY_MS = 60_000            # 目标窗第 1 根 1m 收盘时刻
 GRACE_MS = 8_000             # 收盘后缓冲（等 1m K 落库 / 报价缓存刷新）
@@ -63,7 +69,7 @@ PENDING_EXPIRE_MS = 4 * 3_600_000
 RULE_TEXT = {
     S4_DELAY_VERSION: (
         "S4延迟入场：正式S4(连阳≥3+光头阳,无破位,已跳过续发)命中后，目标窗第1根1m收盘<窗口开盘"
-        "(BTC已回落)才入场，入场价取+60s真实DOWN报价；押目标15m DOWN。仅记录不下单。"
+        "(BTC已回落)才入场，入场价取+60s真实DOWN报价；押目标15m DOWN。影子+同名实盘通道(默认关闭)。"
     ),
     S1_EARLY_VERSION: (
         "S1早确认(S1m2)：正式S1命中后，目标窗第2根1m收盘<窗口开盘(BTC已回落)才在+2min入场，"
@@ -117,7 +123,7 @@ class S4VariantShadowDetector:
         self._watched: set[tuple[str, int]] = set()
         self._trigger_count = 0
         self._settle_count = 0
-        # S1 变体实盘钩子（main 注入 MultiLiveTrader.on_s1_variant_signal）；与影子 gate 独立
+        # S1/S4 派生实盘钩子（main 注入 MultiLiveTrader.on_s1_variant_signal）；与影子 gate 独立
         self._on_live_fire = None
 
     # ---------------- 钩子（FakeBreakoutDetector 同步调用，异常不外抛）----------------
@@ -133,10 +139,10 @@ class S4VariantShadowDetector:
 
     def _spawn(self, version: str, sig: dict) -> None:
         try:
-            # S1 变体：影子下线不阻止已启用的实盘（两个开关独立，同 s1_dyn_sq_v1）
+            # 同名实盘通道版本：影子下线不阻止已启用的实盘（两个开关独立，同 s1_dyn_sq_v1）
             if not self._running or not (
                 shadow_gate.is_enabled(version)
-                or (version in S1_VARIANT_VERSIONS and is_live_enabled(version))
+                or (version in LIVE_VARIANT_VERSIONS and is_live_enabled(version))
             ):
                 return
             key = (version, int(sig["market_start_15m"]))
@@ -153,7 +159,7 @@ class S4VariantShadowDetector:
         try:
             ws = int(sig["market_start_15m"])
             snap = {"close_pos": sig.get("close_pos"), "hi_break": sig.get("hi_break")}
-            if version in S1_VARIANT_VERSIONS:
+            if version in (S1_EARLY_VERSION, S1_DIP_VERSION):
                 await self._confirm_s1_variant(version, sig, ws)
                 return
             if version == S4_DELAY_VERSION:
@@ -162,10 +168,15 @@ class S4VariantShadowDetector:
                 if not first_minute_dropped(bar, ws):
                     return
                 snap.update(m1_open=float(bar["open"]), m1_close=float(bar["close"]))
+                up, down, ts = snapshot_entry_quote(self._pm_15m_latest, ws)
+                # 与 S1 变体同序：先实盘后落表（时效优先）；id 缺失（父 S4 落库
+                # 失败）时放弃实盘派单——无 scene_signal_id 溯源的订单不可结算。
+                self._fire_live(version, sig, ws)
+                await self._record(version, int(sig["signal_bar_start"]), ws, snap, up, down, ts)
             else:
                 await self._sleep_until(ws + GRACE_MS)
-            up, down, ts = snapshot_entry_quote(self._pm_15m_latest, ws)
-            await self._record(version, int(sig["signal_bar_start"]), ws, snap, up, down, ts)
+                up, down, ts = snapshot_entry_quote(self._pm_15m_latest, ws)
+                await self._record(version, int(sig["signal_bar_start"]), ws, snap, up, down, ts)
         except asyncio.CancelledError:
             pass
         except Exception as exc:
@@ -200,19 +211,28 @@ class S4VariantShadowDetector:
         await self._record(version, int(sig["signal_bar_start"]), ws, snap, up, down, ts)
 
     def _fire_live(self, version: str, sig: dict, ws: int) -> None:
-        """同步 fire-and-forget；通道未启用时执行器直接返回，异常不影响影子落表。"""
+        """同步 fire-and-forget；通道未启用时执行器直接返回，异常不影响影子落表。
+
+        sig["id"] = 父场景信号行 id（订单 scene_signal_id 溯源锚点，结算回读
+        FakeBreakoutSignal）；缺失（父信号落库失败/旧 payload）→ 放弃实盘派单，
+        无溯源锚点的订单不可结算（宁少勿多）。
+        """
         from .shadow_forward_evidence import observe_kline
         observe_kline({"version": version, "market_start": ws,
                        "market_end": ws + BAR_MS_15M, "direction": "DOWN"})
         if self._on_live_fire is None:
             return
         try:
+            sig_id = sig.get("id")
+            if sig_id is None:
+                logger.warning("S4派生实盘派单放弃：父信号 id 缺失 | {} | 窗口 {}", version, ws)
+                return
             self._on_live_fire({
-                "version": version, "id": sig["id"], "pattern_type": version, "side": "high",
+                "version": version, "id": int(sig_id), "pattern_type": version, "side": "high",
                 "market_start_15m": ws, "market_end_15m": ws + BAR_MS_15M,
             })
         except Exception as exc:
-            logger.warning("S1变体实盘钩子异常（不影响影子）| {} | {}", version, exc)
+            logger.warning("S4派生实盘钩子异常（不影响影子）| {} | {}", version, exc)
 
     async def _first_two_minutes(self, ws: int) -> tuple[dict | None, dict | None]:
         deadline = ws + EARLY_MS + EARLY_MAX_WAIT_MS

@@ -46,6 +46,9 @@ _FROZEN_BENCHMARKS: dict[str, tuple[float, int | None]] = {
     # 取真实盘口 05→10 的样本胜率（n=57+123），EV 均由真实报价前向现算。
     "s1_early2_v1": (0.717, 1283),
     "s1_dip45_v1": (0.439, 180),
+    # S4 延迟入场（2026-10-09 注册实盘）：720d K 线重放（生产纯函数），与
+    # main.py:SHADOW_BENCH 同口径（护栏 0.65 = 0.662×0.98）。
+    "s4_delay60_v1": (0.662, 837),
     "firsthit_down_g4_v1": (0.157, 300),
     "firsthit_down_g7_v1": (0.192, 260),
     "g7_streak_v1": (0.193, 202),

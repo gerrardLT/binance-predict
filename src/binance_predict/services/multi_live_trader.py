@@ -124,7 +124,10 @@ REGIME_RETRY_DELAY_S = 30.0         # v4 ret24 K 线拉取失败延迟重查（�
 STREAK_RETRY_DELAY_S = 5.0          # v3 非连涨 15m K 线拉取失败延迟重查（末收根已归档，短等即可）
 S5_DEEP_CHANNEL = "s5_deep_z20_v1"  # 与 fake_breakout_detector.S5_DEEP_VERSION 同名（对账对齐）
 S1_DYNAMIC_CHANNEL = "s1_dyn_sq_v1"  # 与 fake_breakout_detector.S1_DYNAMIC_VERSION 同名
-S1_VARIANT_CHANNELS = ("s1_early2_v1", "s1_dip45_v1")  # 与 s4_variant_shadow_detector.S1_VARIANT_VERSIONS 同名
+# S4/S1 派生入场变体通道（与 s4_variant_shadow_detector.LIVE_VARIANT_VERSIONS 同名）：
+# s4_delay60_v1（+60s 首分钟回落确认）/ s1_early2_v1（+2min 早确认）/ s1_dip45_v1（低吸）。
+# 统一经 on_s1_variant_signal 钩子路由（payload.version 即通道名）。
+S1_VARIANT_CHANNELS = ("s4_delay60_v1", "s1_early2_v1", "s1_dip45_v1")
 MARKET_WARMUP_INTERVAL_S = 60.0     # 市场列表后台预热间隔（未来 15m 周期预缓存，2026-08-30）
 ABS_LIVE_JUDGE_GRACE_S = 20.0       # absorption 判定新鲜度：t_rel 超 TD+此值 → 本窗放弃
                                     # （2026-10-06 优化：从 90s 收窄至 20s，阻断 180~240s
@@ -1460,9 +1463,10 @@ class MultiLiveTrader:
             logger.warning("多通道实盘：S1动态路由钩子异常（不影响检测循环）| {}", exc)
 
     def on_s1_variant_signal(self, sig: dict) -> None:
-        """S1 入场变体钩子（早确认 / 低吸）：payload.version 即通道名；通道默认关闭。
+        """S4/S1 派生入场变体钩子（延迟确认 / 早确认 / 低吸）：payload.version 即通道名；
+        通道默认关闭。
 
-        同步 fire-and-forget，命中时点即下单（+2min / 低吸触发点）；异常只告警不抛。
+        同步 fire-and-forget，命中时点即下单（+60s / +2min / 低吸触发点）；异常只告警不抛。
         """
         try:
             channel = str(sig.get("version") or "")

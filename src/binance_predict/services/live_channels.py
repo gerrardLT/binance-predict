@@ -151,6 +151,19 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     "scene_momentum_fade": ChannelSpec(
         "scene_momentum_fade", "scene", "15m", "DOWN", 0.55, "场景S4 动量衰竭（押DOWN）",
     ),
+    # S4 延迟入场（2026-10-09 用户拍板注册实盘，默认 OFF）：正式 S4 命中后等目标窗
+    # 第 1 根 1m 收盘 < 窗口开盘（BTC 已回落）才在 +60s 入场押 DOWN（S1m2 同款
+    # 「先确认后买」机制，检测器 s4_variant_shadow_detector 确认后经
+    # on_s1_variant_signal 钩子派单）。护栏 0.65 = 720d 重放胜率 66.2%×0.98
+    # （费后保本入场价）略下方；入场价≈0.62 高于开盘 S4 单，EV 基准为研究代理
+    # 模型（P1/P2 均EV +0.119/+0.107，未扣 20U 深度滑点），前向真实 EV 由影子
+    # 目标窗报价现算。订单 scene_signal_id = 父 S4 信号 id（结算走 FakeBreakoutSignal）。
+    # ⚠️ 与 scene_momentum_fade 同父事件、同窗、同押 DOWN：S4 开盘单与延迟确认单
+    # 是同向叠加敞口（未并入互斥组——两者入场时点/价位互补，先并行前向观测，
+    # 与 s1_early2_v1 对 S5 的处理一致）；同时开启时金额应保守。
+    "s4_delay60_v1": ChannelSpec(
+        "s4_delay60_v1", "scene", "15m", "DOWN", 0.65, "S4延迟入场·首分钟回落（押DOWN）",
+    ),
     # S5 深档（2026-09-03 影子 → 实盘小金额前向验证）：S5 确认钩子 z5≤−20bp 子集，
     # 通道名与 fake_breakout_detector.S5_DEEP_VERSION 同名（订单 signal_version 与
     # 影子版本对账对齐）；+5min 确认即下单（15m 市场）。护栏 0.88：盈亏平衡入场价
