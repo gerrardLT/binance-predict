@@ -191,7 +191,16 @@ def _aggregate(rows: list[Any], orders: dict[int, Any]) -> dict[str, Any]:
         "funnel": funnel,
         "returns": {
             "theoretical_fixed_1u": _fixed(theoretical_returns),
+            # Compatibility alias: this is gate-subset settlement reference, not execution PnL.
             "executable_fixed_1u": _fixed(executable_returns),
+            "gate_subset_reference_fixed_1u": _fixed(executable_returns),
+            "execution_quote_estimate": {"n": 0, "sum": None, "avg": None},
+            "semantics": {
+                "executable_fixed_1u": "门禁子集结算参考（兼容字段），不是可执行收益",
+                "execution_quote_estimate": "未提供已冻结金额报价证据，不估算成交收益",
+                "fees": "参考公式费用假设未核实；实际收益仅取订单 pnl",
+                "holding": "持有到结算，未验证提前退出",
+            },
             "actual": {
                 "settled_n": actual_n, "stake": actual_stake, "pnl": actual_pnl,
                 "roi": actual_pnl / actual_stake if actual_stake else None,
@@ -269,6 +278,133 @@ def build_execution_comparison_from_rows(rows: Iterable[Any], orders: Iterable[A
             **_aggregate(group, selected_orders),
         })
     result["curves"] = _curves(rows_list, selected_orders)
+    from .shadow_forward_evidence import COHORT, PROFILE, quote_returns
+    forward = [row for row in rows_list if str(_value(row, "policy_version", "")).startswith("forward-v2-")]
+    estimates = [(row, quote_returns(row)) for row in forward]
+    live = [row for row in forward if (_value(row, "input_snapshot", {}) or {}).get("capture_mode") == "LIVE"]
+    evaluable = [row for row, estimate in estimates if estimate]
+    windows = {(_value(row, "market_period"), _value(row, "target_window_start")) for row in evaluable}
+    days = {int(_value(row, "target_window_start")) // 86_400_000 for row in evaluable}
+    ladder = {}
+    amounts = {"1", "5", "10"} | {amount for _, values in estimates for amount in values}
+    for amount in sorted(amounts, key=float):
+        values = [value[amount] for _, value in estimates if amount in value]
+        stake = sum(value["stake"] for value in values)
+        from statistics import mean, stdev
+        daily = {}
+        for row, estimate in estimates:
+            if amount in estimate:
+                day = int(_value(row, "target_window_start")) // 86_400_000
+                daily[day] = daily.get(day, 0.0) + estimate[amount]["stress_3pct"]
+        cluster = list(daily.values())
+        lower = mean(cluster)-2.58*stdev(cluster)/len(cluster)**.5 if len(cluster) >= 14 else None
+        ladder[amount] = {"daily_clusters": len(cluster), "daily_mean_lower_99pct": lower,
+                          "uncertainty": "日聚类正态近似；非独立事件不得当独立样本",
+                          "n": len(values), "stake": stake,
+                          "pnl": sum(value["pnl"] for value in values),
+                          "stress_1pct": sum(value["stress_1pct"] for value in values),
+                          "stress_3pct": sum(value["stress_3pct"] for value in values),
+                          "missing": len(live)-len(values), "actual_fill_n": 0}
+    # Never sum candidate/control, different versions or changing profiles as a portfolio.
+    grouped_evidence = {}
+    for row, estimate in estimates:
+        key = (str(_value(row, "signal_version")), str(_value(row, "policy_version")))
+        grouped_evidence.setdefault(key, []).append((row, estimate))
+    evidence_series = []
+    for (version, policy), group in sorted(grouped_evidence.items()):
+        for amount in sorted(amounts, key=float):
+            usable = sorted([(row, values[amount]) for row, values in group if amount in values],
+                            key=lambda item: int(_value(item[0], "target_window_start")))
+            cumulative = peak = drawdown = 0.0
+            buckets = {}
+            daily = {}
+            overlap = Counter()
+            for row, value in usable:
+                cumulative += value["pnl"]
+                peak = max(peak, cumulative)
+                drawdown = max(drawdown, peak-cumulative)
+                start = int(_value(row, "target_window_start"))
+                daily[start//86_400_000] = daily.get(start//86_400_000, 0.0)+value["stress_3pct"]
+                overlap[start] += 1
+                price = (( _value(row, "quote_snapshot", {}) or {}).get("ladder", {}).get(amount, {})).get("average_price", 0)
+                bucket = "<0.10" if price < .1 else ("0.10–0.25" if price < .25 else "≥0.25")
+                item = buckets.setdefault(bucket, {"n": 0, "pnl": 0.0})
+                item["n"] += 1
+                item["pnl"] += value["pnl"]
+            wins = sorted([value["pnl"] for _, value in usable if value["pnl"] > 0], reverse=True)
+            missing = Counter()
+            for row, values in group:
+                if amount in values:
+                    continue
+                if _value(row, "strategy_eligible") is not True:
+                    missing["strategy_rejected_or_unknown"] += 1
+                elif not (_value(row, "decision_snapshot", {}) or {}).get("shadow_capacity", {}).get("accepted"):
+                    missing["capacity_rejected_or_unknown"] += 1
+                elif _value(row, "theoretical_outcome") not in {"UP", "DOWN"}:
+                    missing["unsettled"] += 1
+                else:
+                    missing["quote_missing_stale_or_guard_rejected"] += 1
+            clusters = list(daily.values())
+            from statistics import mean, stdev
+            evidence_series.append({"signal_version": version, "policy_version": policy, "amount": amount,
+                "n": len(usable), "pnl": cumulative, "max_drawdown": drawdown,
+                "without_top_win_pnl": cumulative-(wins[0] if wins else 0),
+                "top_win_positive_share": wins[0]/sum(wins) if wins else None,
+                "price_buckets": buckets, "missing": dict(missing), "overlapping_windows": sum(n>1 for n in overlap.values()),
+                "independent_windows": len(overlap), "independent_days": len(daily),
+                "daily_mean_lower_99pct": mean(clusters)-2.58*stdev(clusters)/len(clusters)**.5 if len(clusters)>=14 else None})
+    ladder = {}  # Compatibility field: mixed-version totals deliberately unavailable.
+    pairs = {}
+    for row, value in estimates:
+        key = (_value(row, "target_window_start"), _value(row, "direction"))
+        pairs.setdefault(key, {})[_value(row, "signal_version")] = value
+    paired = [pair for pair in pairs.values() if pair.get("firsthit_control") and pair.get("firsthit_recovery")]
+    result["forward_evidence"] = {
+        "cohort": "按series.policy_version独立分组", "profile": PROFILE, "live_n": len(live),
+        "top_level_observation_only": True,
+        "cohorts": sorted({str(_value(row, "policy_version")) for row in forward}),
+        "overflow_counts": dict(__import__("binance_predict.services.shadow_forward_evidence", fromlist=["OVERFLOW_COUNTS"]).OVERFLOW_COUNTS),
+        "archive_n": len(forward)-len(live), "independent_windows": len(windows),
+        "independent_days": len(days), "ladder": ladder, "series": evidence_series,
+        "pair_details": [{"window_start": key[0], "direction": key[1],
+                          "versions": sorted(pair), "missing_versions": [v for v in
+                          ("firsthit_control", "firsthit_recovery") if not pair.get(v)]}
+                         for key, pair in sorted(pairs.items())],
+        "paired_same_window_direction": len(paired), "pair_missing": len(pairs)-len(paired),
+        "eligible": False, "auto_enable": False,
+        "blocking_reasons": ["费用仍为假设，报价不证明成交", "运营门禁与全家族实时等价尚未覆盖"] +
+            (["独立窗口不足"] if len(windows) < PROFILE["minimum_windows"] else []) +
+            (["独立交易日不足"] if len(days) < PROFILE["minimum_days"] else []),
+    }
+    # Registry coverage is independent of observed samples: missing families remain visible.
+    result["coverage_matrix"] = [
+        {
+            "signal_version": version, "family": spec.family,
+            "market_period": spec.market_period, "retired": spec.live_retired,
+            "rows": sum(_value(row, "signal_version") == version for row in rows_list),
+            "forward_admission": False,
+            "live_frozen_n": sum(_value(row, "signal_version") == version and
+                (_value(row, "input_snapshot", {}) or {}).get("capture_mode") == "LIVE" and
+                str(_value(row, "policy_version", "")).startswith("forward-v2-") for row in rows_list),
+            "archive_or_legacy_n": sum(_value(row, "signal_version") == version and not
+                str(_value(row, "policy_version", "")).startswith("forward-v2-") for row in rows_list),
+            "capture_capability": "LIVE_ENTRY" if version in {
+                "firsthit_down_chg_v2", "absorption_follow_td120_v1", "absorption_follow_td150_v1"
+            } else ("LIVE_ENTRY" if any(_value(row, "signal_version") == version for row in live)
+                    else "ARCHIVE_OR_LEGACY_ONLY"),
+            "blocking_reasons": (["费用与成交未验证，实时入口不等于准入"] if version in {
+                "firsthit_down_chg_v2", "absorption_follow_td120_v1", "absorption_follow_td150_v1"
+            } or any(_value(row, "signal_version") == version for row in live)
+                else ["该版本尚无已声明实时等价适配，归档阻塞；G3不能代表其他首触版本"]),
+        }
+        for version, spec in SHADOW_VERSION_SPECS.items()
+        if not spec.live_retired
+    ]
+    result["admission"] = {
+        "eligible": False, "auto_enable": False,
+        "health_is_admission": False,
+        "blocking_reasons": ["历史统一账本不能替代新 cohort 前向证据"],
+    }
     return result
 
 
@@ -303,4 +439,25 @@ async def build_execution_comparison(
         "policy_version": policy_version, "from": from_ts, "to": to_ts,
         "market_period": market_period, "include_retired": include_retired,
     }
-    return build_execution_comparison_from_rows(rows, orders, scope=scope)
+    result = build_execution_comparison_from_rows(rows, orders, scope=scope)
+    from .shadow_forward_evidence import COHORT
+    forward_stmt = select(ShadowExecutionAssessment).where(
+        ShadowExecutionAssessment.policy_version.like("forward-v2-%"))
+    if signal_versions is not None:
+        forward_stmt = forward_stmt.where(ShadowExecutionAssessment.signal_version.in_(signal_versions))
+    if policy_version is not None:
+        forward_stmt = forward_stmt.where(ShadowExecutionAssessment.policy_version == policy_version)
+    if not include_retired:
+        forward_stmt = forward_stmt.where(ShadowExecutionAssessment.retired.is_not(True))
+    if from_ts is not None:
+        forward_stmt = forward_stmt.where(ShadowExecutionAssessment.target_window_start >= from_ts)
+    if to_ts is not None:
+        forward_stmt = forward_stmt.where(ShadowExecutionAssessment.target_window_start < to_ts)
+    if market_period is not None:
+        forward_stmt = forward_stmt.where(ShadowExecutionAssessment.market_period == market_period)
+    forward_rows = list((await session.execute(forward_stmt)).scalars().all())
+    forward_result = build_execution_comparison_from_rows(forward_rows, [], scope=scope)
+    result["forward_evidence"] = forward_result["forward_evidence"]
+    result["coverage_matrix"] = build_execution_comparison_from_rows(
+        rows + [row for row in forward_rows if row not in rows], [], scope=scope)["coverage_matrix"]
+    return result

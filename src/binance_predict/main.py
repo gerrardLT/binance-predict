@@ -1470,6 +1470,7 @@ async def lifespan(app: FastAPI):
     global firsthit_forward_recorder
     if settings.firsthit_forward_enabled:
         firsthit_forward_recorder = FirstHitForwardRecorder(collector=collector)
+        firsthit_forward_recorder.absorption_calibrator = absorption_shadow_detector
         await firsthit_forward_recorder.start()
         logger.info("首触前向 record-only 采集已启动（DOWN recovery≥25% 主候选 + q-only 对照 + UP 镜像；阈值冻结，不下注）")
 
@@ -1536,6 +1537,32 @@ async def lifespan(app: FastAPI):
         # absorption 标定源注入：check() 内联判定读最新标定快照
         # （检测器关闭/未注入 → absorption 通道保守不开火，fail-safe 同 kline_fetcher）
         multi_live_trader.absorption_calibrator = absorption_shadow_detector
+        if firsthit_forward_recorder is not None:
+            from .services.shadow_forward_evidence import configure_forward
+            def read_forward_operations(version, start):
+                from .services.shadow_execution_registry import SHADOW_VERSION_SPECS
+                from .services.live_channels import exclusive_group
+                spec = SHADOW_VERSION_SPECS.get(version)
+                channel = spec.live_channel if spec else version
+                config = multi_live_trader._configs.get(channel)
+                group = exclusive_group(channel)
+                filled = multi_live_trader._window_filled.get(start, set())
+                blockers = sorted(set(group or ()) & set(filled))
+                balance = (_wallet_view.get("prediction_balance_available")
+                           if time.time()-_wallet_view_ts.get("balance", 0) < 30 else None)
+                from .services.shadow_forward_evidence import cached_daily_count
+                daily = cached_daily_count(channel, multi_live_trader._count_filled_today) if config else None
+                return {"available_balance": balance, "daily_count": daily,
+                        "max_daily_orders": getattr(config, "max_daily_orders", None),
+                        "exclusive_known": not bool(group) or bool(filled),
+                        "exclusive_blocker": blockers[0] if blockers else None}
+            configure_forward(configs=lambda: multi_live_trader._configs,
+                              quote_client=firsthit_forward_recorder._trader,
+                              operational_reader=read_forward_operations)
+            from .services import shadow_forward_evidence
+            shadow_forward_evidence._live_busy = lambda: (
+                prediction_trader._trade_lock.locked() or
+                any(not task.done() for task in multi_live_trader._tasks))
         _live_status = multi_live_trader.status()
         _enabled = [c["channel"] for c in _live_status["channels"] if c["enabled"]]
         logger.info(
@@ -5396,7 +5423,7 @@ async def _signal_health_loop() -> None:
 
 @app.get("/api/signals/execution-comparison")
 async def get_signals_execution_comparison(
-    policy_version: str = Query(default=EXECUTION_POLICY_VERSION),
+    policy_version: str | None = Query(default=None),
     from_ts: int | None = Query(default=None, alias="from"),
     to_ts: int | None = Query(default=None, alias="to"),
     market_period: str | None = None,

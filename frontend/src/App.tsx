@@ -472,6 +472,13 @@ interface ExecutionComparisonCurvePoint {
   actual_roi: number | null
 }
 interface ExecutionComparison {
+  coverage_matrix?: { signal_version: string; live_frozen_n: number; archive_or_legacy_n: number; capture_capability: string; blocking_reasons: string[] }[]
+  forward_evidence?: {
+    cohort: string; live_n: number; archive_n: number; independent_windows: number; independent_days: number
+    paired_same_window_direction: number; pair_missing: number; blocking_reasons: string[]
+    series?: { signal_version: string; policy_version: string; amount: string; n: number; pnl: number; max_drawdown: number; without_top_win_pnl: number; top_win_positive_share: number | null; missing: Record<string, number> }[]
+    ladder: Record<string, { n: number; stake: number; pnl: number; stress_1pct: number; stress_3pct: number; missing: number }>
+  }
   scope: {
     policy_version: string | null
     from: number | null
@@ -7094,6 +7101,7 @@ function ShadowExecutionComparisonCard({
   const [mapping, setMapping] = useState<'ALL' | 'MAPPED' | 'UNMAPPED'>('ALL')
   const [retired, setRetired] = useState<'ALL' | 'ACTIVE' | 'RETIRED'>('ALL')
   const [policy, setPolicy] = useState('ALL')
+  const [evidenceAmount, setEvidenceAmount] = useState('ALL')
 
   if (!data) {
     return (
@@ -7202,13 +7210,25 @@ function ShadowExecutionComparisonCard({
     ['运营通过', filteredFunnel.operational_eligible], ['执行通过', filteredFunnel.execution_eligible],
     ['已下单', filteredFunnel.submitted], ['已成交', filteredFunnel.filled], ['已结算', filteredFunnel.settled],
   ] as const
-  const help = '理论收益采用已实现结果的固定 1U 公式；实际 ROI = sum(pnl) / sum(stake)，为本金加权口径。unknown（未知）不是拒绝；no mapping（无实盘映射）不是执行失败。执行可行不保证 LIMIT 限价单成交。历史缺失的瞬时配置、市场、余额与互斥状态不会用当前状态反推重建。'
+  const help = '理论与门禁子集均采用参考结算的固定 1U 公式，不是可执行收益，不代表报价或成交；门禁通过不证明实时冻结或前向准入，健康不等于准入。本轮仅持有到结算，未验证提前退出。实际 ROI = sum(pnl) / sum(stake)，为本金加权口径。unknown（未知）不是拒绝；no mapping（无实盘映射）不是执行失败。执行可行不保证 LIMIT 限价单成交。历史缺失的瞬时配置、市场、余额与互斥状态不会用当前状态反推重建。'
   const gapLabel: Record<keyof ExecutionGaps, string> = {
     selection: '策略', operational: '运营', execution: '执行', fill: '成交', settlement: '结算', coverage: '覆盖',
   }
 
   return (
     <Card title="影子信号·理论到实盘执行对比">
+      {data.forward_evidence && <div className="border border-line p-3 mb-3 text-xs">
+        <strong>前向证据：阻塞准入</strong><HelpHint text="报价不是成交；费用为假设，仅持有到结算。旧账本与归档不计实时证据。" />
+        <div className="font-mono">{data.forward_evidence.cohort}</div>
+        <div>实时 {data.forward_evidence.live_n} · 归档 {data.forward_evidence.archive_n} · 独立窗 {data.forward_evidence.independent_windows} · 独立日 {data.forward_evidence.independent_days} · 同窗同向配对 {data.forward_evidence.paired_same_window_direction} · 缺失 {data.forward_evidence.pair_missing}</div>
+        {Object.entries(data.forward_evidence.ladder).map(([amount, value]) => <div key={amount}>{amount}U 报价结算估计：样本 {value.n} · 本金 {value.stake.toFixed(2)} · 净收益 {value.pnl.toFixed(2)} · 压力1% {value.stress_1pct.toFixed(2)} · 压力3% {value.stress_3pct.toFixed(2)} · 缺失 {value.missing}</div>)}
+        <label>证据金额 <select value={evidenceAmount} onChange={e => setEvidenceAmount(e.target.value)}><option value="ALL">全部（独立展示，不合计）</option>{[...new Set(data.forward_evidence.series?.map(row => row.amount))].map(amount => <option key={amount} value={amount}>{amount}U</option>)}</select></label>
+        {data.forward_evidence.series?.filter(row => (!search || row.signal_version.toLowerCase().includes(search)) && (evidenceAmount === 'ALL' || row.amount === evidenceAmount) && (policy === 'ALL' || row.policy_version === policy)).map(row => <div key={`${row.signal_version}-${row.policy_version}-${row.amount}`}>{row.signal_version} · {row.amount}U · 样本 {row.n} · 报价估计收益 {row.pnl.toFixed(2)} · 最大回撤 {row.max_drawdown.toFixed(2)} · 去最大赢单 {row.without_top_win_pnl.toFixed(2)} · 最大赢单占比 {row.top_win_positive_share == null ? '未知' : `${(100*row.top_win_positive_share).toFixed(1)}%`} · 缺失 {Object.values(row.missing).reduce((a,b) => a+b, 0)}</div>)}
+        <div>{data.forward_evidence.blocking_reasons.join('；')}</div>
+        <details><summary>全家族实时与归档覆盖<HelpHint text="零样本不隐去；实时冻结仍须报价、运营和结算证据，归档不可替代准入。" /></summary>
+          {data.coverage_matrix?.map(row => <div key={row.signal_version}>{row.signal_version} · 实时 {row.live_frozen_n} · 归档/旧账本 {row.archive_or_legacy_n} · {row.capture_capability === 'LIVE_ENTRY' ? '已接实时入口' : '仅归档，阻塞'} · {row.blocking_reasons.join('；')}</div>)}
+        </details>
+      </div>}
       <div className="flex items-start gap-1 mb-3 text-xs text-ink-55">
         <span>统一查看信号从理论样本到真实结算的漏斗、收益与缺口。</span><HelpHint text={help} />
       </div>
@@ -7237,7 +7257,7 @@ function ShadowExecutionComparisonCard({
       <div className="grid grid-cols-1 md:grid-cols-3 gap-2 mb-4">
         {[
           ['理论固定 1U', filteredReturns.theoretical_fixed_1u, 'var(--chart-1)'],
-          ['可执行固定 1U', filteredReturns.executable_fixed_1u, 'var(--warning)'],
+          ['门禁子集参考 1U', filteredReturns.executable_fixed_1u, 'var(--warning)'],
         ].map(([label, raw, color]) => {
           const r = raw as FixedUnitReturn
           return <div key={label as string} className="border border-line rounded-sm bg-card p-3">
@@ -7298,7 +7318,7 @@ function ShadowExecutionComparisonCard({
         <div><div className="text-xs text-ink-55 mb-1">固定 1U 累计收益（U）</div><ResponsiveContainer width="100%" height={220}><LineChart data={curves} margin={{ top: 6, right: 12, left: 0, bottom: 0 }}>
           <CartesianGrid stroke="var(--line-soft)" /><XAxis dataKey="timestamp" type="number" domain={['dataMin', 'dataMax']} scale="time" tickFormatter={utcMD} tick={{ fontSize: 11, fill: 'var(--ink-55)', fontFamily: 'var(--font-stack-mono)' }} stroke="var(--ink-55)" />
           <YAxis tick={{ fontSize: 11, fill: 'var(--ink-55)', fontFamily: 'var(--font-stack-mono)' }} stroke="var(--ink-55)" width={48} /><Tooltip contentStyle={TOOLTIP_STYLE} labelStyle={TOOLTIP_LABEL_STYLE} itemStyle={TOOLTIP_ITEM_STYLE} labelFormatter={t => new Date(t as number).toUTCString().slice(0, 16)} formatter={(v, n) => [typeof v === 'number' ? `${v.toFixed(2)} U` : '—', n]} /><Legend />
-          <Line name="理论固定 1U" dataKey="theoretical_fixed_1u" stroke="var(--chart-1)" strokeWidth={2} dot={false} connectNulls isAnimationActive={false} /><Line name="可执行固定 1U" dataKey="executable_fixed_1u" stroke="var(--warning)" strokeWidth={2} dot={false} connectNulls isAnimationActive={false} />
+          <Line name="理论固定 1U" dataKey="theoretical_fixed_1u" stroke="var(--chart-1)" strokeWidth={2} dot={false} connectNulls isAnimationActive={false} /><Line name="门禁子集参考 1U" dataKey="executable_fixed_1u" stroke="var(--warning)" strokeWidth={2} dot={false} connectNulls isAnimationActive={false} />
         </LineChart></ResponsiveContainer></div>
         <div><div className="text-xs text-ink-55 mb-1">实际累计 PnL（USDT）与本金加权 ROI</div><ResponsiveContainer width="100%" height={220}><LineChart data={curves} margin={{ top: 6, right: 8, left: 0, bottom: 0 }}>
           <CartesianGrid stroke="var(--line-soft)" /><XAxis dataKey="timestamp" type="number" domain={['dataMin', 'dataMax']} scale="time" tickFormatter={utcMD} tick={{ fontSize: 11, fill: 'var(--ink-55)', fontFamily: 'var(--font-stack-mono)' }} stroke="var(--ink-55)" />

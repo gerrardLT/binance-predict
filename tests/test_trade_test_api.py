@@ -25,6 +25,19 @@ import pytest
 from binance_predict.models.schemas import ManualTradeTestRequest
 
 
+@pytest.mark.asyncio
+async def test_execution_comparison_default_includes_forward_cohorts(monkeypatch):
+    import inspect
+    import binance_predict.main as m
+    from binance_predict.services import shadow_execution_analytics as analytics
+    default = inspect.signature(m.get_signals_execution_comparison).parameters["policy_version"].default
+    assert default.default is None
+    build = AsyncMock(return_value={"forward_evidence": {"auto_enable": False}})
+    monkeypatch.setattr(analytics, "build_execution_comparison", build)
+    await m.get_signals_execution_comparison(policy_version=None, from_ts=None, to_ts=None, db=object())
+    assert build.await_args.kwargs["policy_version"] is None
+
+
 def _order(**over) -> dict:
     """execute_signal_trade 返回的 dict 快照替身。"""
     base = dict(
@@ -74,6 +87,7 @@ async def test_trade_test_bad_prediction_rejected(monkeypatch) -> None:
 async def test_trade_test_success_fields(monkeypatch) -> None:
     """FILLED → 关键字段回显；window_start 是 5m 对齐值、版本固定 manual_test。"""
     import binance_predict.main as m
+    monkeypatch.setattr(m.time, "time", lambda: 1_800_000_010.0)
 
     seen = {}
 

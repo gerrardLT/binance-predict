@@ -24,6 +24,106 @@ from binance_predict.services.firsthit_forward_recorder import (
 START = 1_800_000_000_000 // 300_000 * 300_000
 
 
+def test_forward_sample_overflow_and_capture_failure_isolated(monkeypatch):
+    from binance_predict.services import shadow_forward_evidence as evidence
+    recorder = FirstHitForwardRecorder(trader=object())
+    recorder._running = True
+    monkeypatch.setattr(evidence, "OVERFLOW_COUNTS", {})
+    sample = dict(window_start=START, window_end=START+300000, ts_ms=START+120000,
+                  btc_open=100, up_curve=[], down_curve=[], btc_curve=[])
+    recorder._tasks = set(range(32))
+    recorder.observe_sample(**sample)
+    assert evidence.OVERFLOW_COUNTS["firsthit_recorder"] == 1
+    recorder._tasks.clear()
+    monkeypatch.setattr(recorder, "_observe_forward_sample",
+                        lambda **kwargs: (_ for _ in ()).throw(ValueError("injected")))
+    recorder.observe_sample(**sample)
+    assert evidence.OVERFLOW_COUNTS["firsthit_recorder"] == 2
+    assert not recorder._tasks
+
+
+@pytest.mark.asyncio
+async def test_g3_old_trigger_is_restored_not_live(monkeypatch):
+    import asyncio
+    from binance_predict.services import firsthit_shadow_detector as detector
+    from binance_predict.services import firsthit_forward_recorder as module
+    from unittest.mock import AsyncMock
+    recorder = FirstHitForwardRecorder(trader=object())
+    recorder._running = True
+    monkeypatch.setattr(recorder, "_observe_absorption", lambda *args: None)
+    monkeypatch.setattr(detector, "extract_firsthit_features", lambda *args, **kwargs: {"trigger_ts": START+110000, "q": .08})
+    monkeypatch.setattr(detector, "_gate_of", lambda *args: True)
+    monkeypatch.setattr(module, "extract_forward_trigger", lambda **kwargs: None)
+    record = AsyncMock()
+    monkeypatch.setattr(recorder, "_record_absorption", record)
+    recorder.observe_sample(window_start=START, window_end=START+300000, ts_ms=START+120000,
+        btc_open=100, up_curve=[], down_curve=[], btc_curve=[])
+    await asyncio.gather(*recorder._tasks)
+    event = record.await_args.args[0]
+    assert event["trigger_ts"] == START+110000
+    assert event["capture_mode"] == "RESTORED"
+
+
+@pytest.mark.asyncio
+async def test_absorption_failed_td_does_not_consume_retry(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from binance_predict.services import live_execution_policy as policy
+    recorder = FirstHitForwardRecorder(trader=object())
+    recorder.absorption_calibrator = SimpleNamespace(live_calibration=lambda version: (1, 0, 1, 1))
+    record = AsyncMock()
+    monkeypatch.setattr(recorder, "_record_absorption", record)
+    selected = [False]
+    monkeypatch.setattr(policy, "evaluate_absorption_policy", lambda **kwargs: SimpleNamespace(eligible=selected[0], prediction="DOWN"))
+    curve = [{"t": START, "v": 100}]
+    recorder._observe_absorption(START, START+300000, START+120000, 100, curve, curve, curve)
+    assert ("absorption_follow_td120_v1", START) not in recorder._abs_seen
+    selected[0] = True
+    recorder._observe_absorption(START, START+300000, START+140000, 100, curve, curve, curve)
+    await asyncio.gather(*recorder._tasks)
+    assert ("absorption_follow_td120_v1", START) in recorder._abs_seen
+    assert record.await_count == 1
+
+
+
+@pytest.mark.asyncio
+async def test_settlement_failure_does_not_advance_watermark(monkeypatch):
+    from types import SimpleNamespace
+    from binance_predict.services import firsthit_forward_recorder as module
+
+    windows = [SimpleNamespace(start_time=START, end_time=START + 300_000),
+               SimpleNamespace(start_time=START + 300_000, end_time=START + 600_000)]
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def execute(self, stmt):
+            return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: windows))
+
+    monkeypatch.setattr(module, "async_session_factory", Session)
+    recorder = FirstHitForwardRecorder(trader=object())
+    recorder._last_window_end = START
+    attempts = []
+
+    async def settle(window):
+        attempts.append(window.start_time)
+        if len(attempts) == 1:
+            raise RuntimeError("temporary database failure")
+
+    monkeypatch.setattr(recorder, "_settle_window", settle)
+    await recorder._poll_once()
+    assert recorder._last_window_end == START
+    assert attempts == [START]
+    await recorder._poll_once()
+    assert attempts == [START, START, START + 300_000]
+    assert recorder._last_window_end == START + 600_000
+
+
 def _curve(values, *, step=15_000):
     return [{"t": START + i * step, "v": value} for i, value in enumerate(values)]
 
@@ -208,7 +308,9 @@ async def test_execution_ladder_is_quote_only_never_places_order():
     trader = _QuoteOnlyTrader()
     recorder = FirstHitForwardRecorder(trader=trader)
     result = await recorder._probe_execution_quotes("DOWN", START, 0.08)
-    assert [call[2] for call in trader.calls] == [1.0, 5.0, 10.0]
+    from binance_predict.services.live_channels import parse_channel_config
+    current = parse_channel_config().get("firsthit_down_chg_v2")
+    assert [call[2] for call in trader.calls] == sorted({1.0, 5.0, 10.0, current.amount_usdt if current else 1.0})
     assert all(result[key]["available"] for key in ("1", "5", "10"))
     assert all(result[key]["latency_ms"] >= 0 for key in ("1", "5", "10"))
 
@@ -222,7 +324,9 @@ async def test_execution_ladder_auto_fetches_missing_wallet_address():
     result = await recorder._probe_execution_quotes("DOWN", START, 0.08)
 
     assert trader.fetch_calls == 1
-    assert [call[2] for call in trader.calls] == [1.0, 5.0, 10.0]
+    from binance_predict.services.live_channels import parse_channel_config
+    current = parse_channel_config().get("firsthit_down_chg_v2")
+    assert [call[2] for call in trader.calls] == sorted({1.0, 5.0, 10.0, current.amount_usdt if current else 1.0})
     assert all(result[key]["available"] for key in ("1", "5", "10"))
     # 补齐后再次触发：地址已在，不重取
     await recorder._probe_execution_quotes("DOWN", START, 0.08)

@@ -326,6 +326,7 @@ class FirstHitForwardRecorder:
         self._seen: set[tuple[str, int]] = set()
         self._last_window_end: int | None = None
         self._counts = {"DOWN": 0, "UP": 0}
+        self._abs_seen = set()
 
     async def start(self) -> None:
         if self._running:
@@ -370,6 +371,35 @@ class FirstHitForwardRecorder:
         """采样循环非阻塞入口；每侧每窗只派一个持久化任务。"""
         if not self._running:
             return
+        from .shadow_forward_evidence import OVERFLOW_COUNTS
+        if len(self._tasks) >= 32:
+            OVERFLOW_COUNTS["firsthit_recorder"] = OVERFLOW_COUNTS.get("firsthit_recorder", 0) + 1
+            return
+        try:
+            self._observe_forward_sample(window_start=window_start, window_end=window_end, ts_ms=ts_ms,
+                btc_open=btc_open, up_curve=up_curve, down_curve=down_curve, btc_curve=btc_curve)
+        except Exception as exc:
+            OVERFLOW_COUNTS["firsthit_recorder"] = OVERFLOW_COUNTS.get("firsthit_recorder", 0) + 1
+            logger.warning("前向采样捕获失败（不影响交易）| {}", exc)
+
+    def _observe_forward_sample(self, *, window_start, window_end, ts_ms, btc_open,
+                                up_curve, down_curve, btc_curve):
+        self._observe_absorption(window_start, window_end, ts_ms, btc_open, up_curve, down_curve, btc_curve)
+        from .firsthit_shadow_detector import extract_firsthit_features, _gate_of
+        ext = extract_firsthit_features(window_start, btc_open, down_curve, btc_curve,
+                                       max_trigger_ts=ts_ms, pin_path_to_first_touch=True,
+                                       pin_btc_to_first_touch=True)
+        version = "firsthit_down_chg_v2"
+        if ext and _gate_of(version, ext) and (version, window_start) not in self._abs_seen:
+            from .shadow_forward_evidence import capture_event
+            self._abs_seen.add((version, window_start))
+            event = capture_event({"window_start": window_start, "window_end": window_end,
+                "trigger_ts": ext["trigger_ts"], "capture_mode": "LIVE" if ext["trigger_ts"] == ts_ms else "RESTORED",
+                "side": "DOWN", "trigger_q": ext["q"],
+                "version": version, "features": ext}, version)
+            task = asyncio.create_task(self._record_absorption(event, True))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
         self._seen = {key for key in self._seen if key[1] >= window_start - 300_000}
         for side in ("DOWN", "UP"):
             snapshot = extract_forward_trigger(
@@ -382,6 +412,9 @@ class FirstHitForwardRecorder:
                 continue
             self._seen.add(key)
             mode = "LIVE" if snapshot["trigger_ts"] == ts_ms else "RESTORED"
+            from .shadow_forward_evidence import capture_event
+            snapshot["_evidence"] = {version: capture_event(snapshot, version) for version in
+                                     ("firsthit_control", "firsthit_recovery")}
             task = asyncio.create_task(
                 self._record_trigger(snapshot, mode),
                 name=f"firsthit_fwd_{side.lower()}_{window_start}",
@@ -389,17 +422,73 @@ class FirstHitForwardRecorder:
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
 
+    def _observe_absorption(self, start, end, ts, btc_open, up_curve, down_curve, btc_curve):
+        from .absorption_shadow_detector import ABSORPTION_SPECS
+        calibrator = getattr(self, "absorption_calibrator", None)
+        if calibrator is None:
+            return
+        from .live_execution_policy import evaluate_absorption_policy
+        up, down, btc = _series(up_curve), _series(down_curve), _series(btc_curve)
+        if not up or not down or not btc or not btc_open:
+            return
+        self._abs_seen = {key for key in self._abs_seen if key[1] >= start-300_000}
+        for version, td in ABSORPTION_SPECS.items():
+            key = (version, start)
+            from .multi_live_trader import ABS_LIVE_JUDGE_GRACE_S
+            if key in self._abs_seen or not 0 <= ts-(start+td*1000) <= ABS_LIVE_JUDGE_GRACE_S*1000:
+                continue
+            fitted = calibrator.live_calibration(version)
+            snapshot = {"window_start": start, "window_end": end, "trigger_ts": ts,
+                        "side": "DOWN", "trigger_q": down[-1]["v"], "version": version,
+                        "calibration": fitted, "btc_open": btc_open, "btc_price": btc[-1]["v"],
+                        "up_open": up[0]["v"], "up_price": up[-1]["v"]}
+            selected = False
+            if fitted is not None:
+                k, b, disp, under = fitted
+                policy = evaluate_absorption_policy(btc_price=btc[-1]["v"], btc_open=btc_open,
+                    up_price=up[-1]["v"], up_open=up[0]["v"], k=k, b=b, disp_gate=disp, under_gate=under)
+                selected = policy.eligible and policy.prediction == "DOWN"
+            if not selected:
+                continue  # Failed TD observation must not consume the first legal opportunity.
+            self._abs_seen.add(key)
+            from .shadow_forward_evidence import capture_event
+            snapshot = capture_event(snapshot, version)
+            task = asyncio.create_task(self._record_absorption(snapshot, selected))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+
+    async def _record_absorption(self, snapshot, selected):
+        from .shadow_forward_evidence import freeze_event
+        try:
+            async with async_session_factory() as session:
+                await freeze_event(session, snapshot, snapshot.get("capture_mode", "LIVE"), {}, snapshot["version"], selected)
+                await session.commit()
+            from .shadow_forward_evidence import probe_ladder
+            execution = (await probe_ladder(snapshot["version"], "DOWN", snapshot["window_start"], "5m",
+                         amount=snapshot["_frozen"]["profile"]["amount_usdt"])
+                         if snapshot.get("capture_mode", "LIVE") == "LIVE" else {})
+            async with async_session_factory() as session:
+                from .shadow_forward_evidence import attach_quotes
+                await attach_quotes(session, snapshot, snapshot["version"], execution)
+                await session.commit()
+        except Exception as exc:
+            logger.warning("吸收前向冻结失败 | {} | {}", snapshot["version"], exc)
+
     async def _record_trigger(self, snapshot: dict, capture_mode: str) -> None:
         key = (snapshot["side"], snapshot["window_start"])
         try:
             async with async_session_factory() as session:
                 await session.execute(
                     pg_insert(FirstHitForwardEvent)
-                    .values(**_event_values(snapshot, capture_mode))
+                    .values(**_event_values({k: v for k, v in snapshot.items() if not k.startswith("_")}, capture_mode))
                     .on_conflict_do_nothing(index_elements=["side", "window_start"])
                 )
                 await session.commit()
 
+            from .shadow_forward_evidence import freeze_firsthit
+            async with async_session_factory() as session:
+                await freeze_firsthit(session, snapshot, capture_mode, {})
+                await session.commit()
             # 恢复历史中的旧触达不能伪装成实时可执行报价。LIVE 模式下报价阶梯
             # 与 ATR 并发，避免非关键 ATR REST 请求延迟时间敏感的执行价快照。
             if capture_mode == "LIVE":
@@ -436,6 +525,8 @@ class FirstHitForwardRecorder:
                     if row.capture_mode == capture_mode:
                         row.execution_quotes = execution
                         row.data_missing = sorted(set(missing))
+                        from .shadow_forward_evidence import freeze_firsthit
+                        await freeze_firsthit(session, snapshot, capture_mode, execution)
                     await session.commit()
             self._counts[snapshot["side"]] += 1
             logger.info(
@@ -469,6 +560,9 @@ class FirstHitForwardRecorder:
     async def _probe_execution_quotes(self, side: str, window_start: int,
                                       trigger_q: float) -> dict[str, dict]:
         """获取报价阶梯；仅 get_quote，不存在 place_order 调用。"""
+        from . import shadow_forward_evidence as evidence
+        if evidence._quote_client is self._trader:
+            return await evidence.probe_ladder("firsthit_down_chg_v2", side, window_start, "5m")
         trader = self._trader
         if trader is None:
             return {}
@@ -484,17 +578,27 @@ class FirstHitForwardRecorder:
                 }}
         results: dict[str, dict] = {}
         try:
-            async with trader._trade_lock:
+            from .shadow_forward_evidence import QUOTE_QUEUE
+            async with QUOTE_QUEUE, trader._trade_lock:
                 await trader.list_markets()
                 market_start = getattr(trader, "_5m_start_date", None)
                 token_id = getattr(trader, "_down_token_id" if side == "DOWN" else "_up_token_id", None)
                 if market_start is None or abs(int(market_start) - window_start) > 2_000 or not token_id:
                     return {"error": {"available": False, "reason": "5m_market_mismatch_or_token_missing"}}
-                for amount in QUOTE_AMOUNTS_USDT:
+                from .live_channels import parse_channel_config
+                configs = parse_channel_config()
+                current = configs.get("firsthit_down_chg_v2")
+                amounts = sorted(set((*QUOTE_AMOUNTS_USDT, current.amount_usdt if current else 1.0)))
+                deadline = time.monotonic() + 4
+                for amount in amounts:
+                    if time.monotonic() >= deadline:
+                        results.setdefault("error", {"available": False, "reason": "quote_budget_exhausted"})
+                        break
                     requested_at = int(time.time() * 1000)
-                    quote = await trader.get_quote(token_id, "BUY", amount_usdt=amount)
+                    quote = await asyncio.wait_for(trader.get_quote(token_id, "BUY", amount_usdt=amount),
+                                                   timeout=max(.01, deadline-time.monotonic()))
                     if not quote:
-                        results[str(int(amount))] = {
+                        results[str(int(amount)) if amount == int(amount) else str(amount)] = {
                             "available": False,
                             "requested_at": requested_at,
                             "error": getattr(trader, "last_api_error", None),
@@ -505,8 +609,8 @@ class FirstHitForwardRecorder:
                     except (TypeError, ValueError):
                         avg_price = None
                     received_at = int(time.time() * 1000)
-                    results[str(int(amount))] = {
-                        "available": avg_price is not None and avg_price > 0,
+                    results[str(int(amount)) if amount == int(amount) else str(amount)] = {
+                        "available": avg_price is not None and math.isfinite(avg_price) and 0 < avg_price < 1,
                         "requested_at": requested_at,
                         "received_at": received_at,
                         "latency_ms": received_at - requested_at,
@@ -550,11 +654,16 @@ class FirstHitForwardRecorder:
                 await self._settle_window(window)
             except Exception as exc:
                 logger.warning("首触前向采集：窗口结算失败 | {} | {}", window.start_time, exc)
+                break  # 保留水位，下轮重试；不得跨过失败窗口。
             self._last_window_end = max(self._last_window_end or 0, int(window.end_time))
 
     async def _settle_window(self, window: SentimentWindow) -> None:
         outcome = window.outcome if window.outcome in {"UP", "DOWN"} else None
         btc_open = window.entry_price if window.entry_price and window.entry_price > 0 else None
+        from .shadow_forward_evidence import settle_firsthit
+        async with async_session_factory() as session:
+            await settle_firsthit(session, int(window.start_time), outcome)
+            await session.commit()
         for side in ("DOWN", "UP"):
             snapshot = extract_forward_trigger(
                 side=side, window_start=int(window.start_time), window_end=int(window.end_time),
@@ -574,6 +683,8 @@ class FirstHitForwardRecorder:
                     session, snapshot, outcome=outcome, future=future,
                     post=post, retrospective=retrospective,
                 )
+                from .shadow_forward_evidence import settle_firsthit
+                await settle_firsthit(session, int(window.start_time), outcome)
                 await session.commit()
 
     def status(self) -> dict:

@@ -58,6 +58,10 @@ class ShadowExecutionProjector:
                         event = adapter.normalize(row)
                         values = await build_assessment_values(session, event)
                         await upsert_assessment(session, values)
+                        if getattr(event, "theoretical_outcome", None) in {"UP", "DOWN"}:
+                            from .shadow_forward_evidence import settle_firsthit
+                            await settle_firsthit(session, event.target_window_start, event.theoretical_outcome,
+                                                  event.market_period, event.signal_version)
                         batch_projected += 1
                     await session.commit()
                     projected += batch_projected
@@ -79,6 +83,10 @@ class ShadowExecutionProjector:
                         event = adapter.normalize(row)
                         values = await build_assessment_values(session, event)
                         await upsert_assessment(session, values)
+                        if getattr(event, "theoretical_outcome", None) in {"UP", "DOWN"}:
+                            from .shadow_forward_evidence import settle_firsthit
+                            await settle_firsthit(session, event.target_window_start, event.theoretical_outcome,
+                                                  event.market_period, event.signal_version)
                     await session.commit()
                     projected += len(changed_rows)
                 except Exception as exc:

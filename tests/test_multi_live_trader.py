@@ -19,6 +19,28 @@ from __future__ import annotations
 
 import asyncio
 import json
+
+
+import pytest
+
+
+@pytest.mark.asyncio
+async def test_shadow_backpressure_never_reserves_live_slots(monkeypatch):
+    from binance_predict.services import shadow_forward_evidence as module
+    from unittest.mock import AsyncMock
+    live = {"fired": set(), "filled": {}, "amount": 2.0}
+    client = SimpleNamespace(list_markets=AsyncMock(), get_quote=AsyncMock(),
+                             place_order=AsyncMock(), fetch_wallet_info=AsyncMock())
+    monkeypatch.setattr(module, "_quote_client", client)
+    monkeypatch.setattr(module, "_live_busy", lambda: True)
+    result = await module.probe_ladder("firsthit_down_chg_v2", "DOWN", 1000, "5m")
+    assert result["error"]["reason"] == "live_priority_backpressure"
+    assert live == {"fired": set(), "filled": {}, "amount": 2.0}
+    client.place_order.assert_not_awaited()
+    client.list_markets.assert_not_awaited()
+    client.get_quote.assert_not_awaited()
+    client.fetch_wallet_info.assert_not_awaited()
+
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone

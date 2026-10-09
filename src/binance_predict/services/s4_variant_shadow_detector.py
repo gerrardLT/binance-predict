@@ -201,6 +201,9 @@ class S4VariantShadowDetector:
 
     def _fire_live(self, version: str, sig: dict, ws: int) -> None:
         """同步 fire-and-forget；通道未启用时执行器直接返回，异常不影响影子落表。"""
+        from .shadow_forward_evidence import observe_kline
+        observe_kline({"version": version, "market_start": ws,
+                       "market_end": ws + BAR_MS_15M, "direction": "DOWN"})
         if self._on_live_fire is None:
             return
         try:

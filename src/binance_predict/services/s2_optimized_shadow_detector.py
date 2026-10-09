@@ -102,6 +102,9 @@ class S2OptimizedShadowDetector:
                 "market_start_15m": target_start,
                 "market_end_15m": int(sig["market_end_15m"]),
             }
+            from .shadow_forward_evidence import observe_kline
+            observe_kline({**payload, "version": "scene_bear_exhaust_opt_v1",
+                           "market_start": target_start, "direction": "UP"})
             hook = self._on_live_fire
             if hook is not None:
                 try:

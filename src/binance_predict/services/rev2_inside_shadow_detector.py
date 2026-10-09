@@ -347,6 +347,9 @@ class Rev2InsideShadowDetector:
         self._dispatch_live(live_payloads)
 
     def _dispatch_live(self, payloads: list[dict]) -> None:
+        from .shadow_forward_evidence import observe_kline
+        for payload in payloads:
+            observe_kline(payload)
         hook = self._on_live_fire
         if hook is None or not payloads:
             return

@@ -10,6 +10,18 @@ from binance_predict.services.shadow_execution_analytics import (
 )
 
 
+def test_reference_return_never_claims_quote_or_forward_admission():
+    result = build_execution_comparison_from_rows([assessment(1)], [], scope={})
+    returns = result["returns"]
+    assert returns["gate_subset_reference_fixed_1u"] == returns["executable_fixed_1u"]
+    assert returns["execution_quote_estimate"]["sum"] is None
+    assert "不是可执行收益" in returns["semantics"]["executable_fixed_1u"]
+    assert result["admission"]["eligible"] is False
+    assert result["admission"]["auto_enable"] is False
+    assert any(row["rows"] == 0 for row in result["coverage_matrix"])
+    assert all(not row["forward_admission"] for row in result["coverage_matrix"])
+
+
 SCOPE = {
     "policy_version": None, "from": None, "to": None,
     "market_period": None, "include_retired": False,
@@ -63,7 +75,7 @@ async def test_execution_comparison_filters_signal_versions_in_query():
 
     await build_execution_comparison(session, signal_versions={"x4_v2", "krev_a_v1"})
 
-    stmt = session.execute.await_args.args[0]
+    stmt = session.execute.await_args_list[0].args[0]
     sql = str(stmt.compile(compile_kwargs={"literal_binds": True}))
     assert "signal_version IN ('x4_v2', 'krev_a_v1')" in sql or (
         "signal_version IN ('krev_a_v1', 'x4_v2')" in sql
@@ -82,7 +94,8 @@ async def test_empty_response_has_null_rates_and_is_json_serializable():
     assert result["versions"] == []
     assert result["curves"] == []
     json.dumps(result)
-    session.execute.assert_awaited_once()
+    assert session.execute.await_count == 2
+    assert result["forward_evidence"]["live_n"] == 0
 
 
 def test_unknown_and_no_mapping_are_isolated_from_rejection_rates():

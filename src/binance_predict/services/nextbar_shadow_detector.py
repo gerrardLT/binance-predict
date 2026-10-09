@@ -276,6 +276,9 @@ class NextbarShadowDetector:
         与影子 gate 解耦（影子下线只停落表，实盘由 trader 侧通道 enabled 管）；
         钩子未装配 = 纯影子模式直接跳过；异常只告警不抛（不阻断影子采集）。
         """
+        from .shadow_forward_evidence import observe_kline
+        for payload in payloads:
+            observe_kline(payload)
         hook = self._on_live_fire
         if hook is None or not payloads:
             return
