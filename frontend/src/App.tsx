@@ -7336,7 +7336,6 @@ function SignalAnalyticsTab() {
   const [analytics, setAnalytics] = useState<SignalsAnalytics | null>(null)
   const [executionComparison, setExecutionComparison] = useState<ExecutionComparison | null>(null)
   const [executionUnavailable, setExecutionUnavailable] = useState('')
-  const [executionRequested, setExecutionRequested] = useState(false)
   const [klines, setKlines] = useState<BtcKline[]>([])
   const [kinterval, setKinterval] = useState<'1d' | '1h'>('1d')
   const [autoRefresh, setAutoRefresh] = useState(true)
@@ -7375,6 +7374,7 @@ function SignalAnalyticsTab() {
     })
   }, [])
 
+  useEffect(() => { loadExecutionComparison() }, [loadExecutionComparison])
   useEffect(() => { load() }, [load])
   useEffect(() => {
     if (!autoRefresh) return
@@ -9252,6 +9252,8 @@ function RegimeByVersionTable({
 
   return (
     <div className="space-y-6">
+      <ShadowExecutionComparisonCard data={executionComparison} unavailable={executionUnavailable} />
+
       {/* 控制栏 */}
       <div className="flex items-center gap-4 flex-wrap text-xs">
         <label className="flex items-center gap-1.5 cursor-pointer text-ink-80">
@@ -9339,7 +9341,10 @@ function RegimeByVersionTable({
         />
       )}
 
-      {/* 新上线影子先给出可见入口；完整指标仍在下方在线采集表。 */}
+      <details className="ds-card">
+        <summary className="cursor-pointer px-4 py-3 text-sm font-semibold text-ink-95">旧版影子：在线采集与统计（展开查看）<HelpHint text="保留旧版在线采集、前向胜率、回测基准与保本线；新版前向证据及执行漏斗见页面顶部。" /></summary>
+        <div className="space-y-6 px-2 pb-2">
+      {/* 旧版影子入口与完整在线采集指标一并折叠。 */}
       {analytics && featuredShadowKeys.map(k => {
         const s = analytics.shadow[k].summary
         const meta = SHADOW_META[k]
@@ -9382,18 +9387,7 @@ function RegimeByVersionTable({
         </div>
       )}
 
-      {/* 执行漏斗已与“实盘表现诊断”高度重叠，默认收进 details，保留审计能力但不再占主页面。 */}
-      <details
-        className="ds-card"
-        onToggle={e => {
-          if (e.currentTarget.open && !executionRequested) {
-            setExecutionRequested(true)
-            loadExecutionComparison()
-          }
-        }}
-      >
-        <summary className="cursor-pointer px-4 py-3 text-sm font-semibold text-ink-95">高级审计：理论影子 → 实盘执行漏斗（展开后加载）</summary>
-        <div className="px-2 pb-2"><ShadowExecutionComparisonCard data={executionComparison} unavailable={executionUnavailable} /></div>
+        </div>
       </details>
 
       {/* 固定 2026-08-19 的历史大涨切片已过时且与现有 regime 分析重叠，仅保留折叠审计。 */}
