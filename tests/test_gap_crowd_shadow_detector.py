@@ -288,3 +288,16 @@ def test_specs_and_window_units() -> None:
     assert gcd.WINDOW_MS == {"5m": 300_000, "15m": 900_000}
     assert gcd.GAP_THRESHOLD == -0.05 and gcd.LATE_FRACTION == 0.5
     assert gcd.MIN_REMAIN_S == 60.0 and (gcd.Q_LO, gcd.Q_HI) == (0.02, 0.98)
+    assert gcd.QUOTE_SUM_TOL == 0.05   # AMENDMENT-2 一致性门容差
+
+
+@pytest.mark.asyncio
+async def test_observe_sample_incoherent_quote_no_row(monkeypatch) -> None:
+    """报价对不一致快照不落表（AMENDMENT-2 硬前置；生产实况 up=0.40/dn=0.27）。"""
+    session = _FakeSession()
+    d = _detector(monkeypatch, session)
+    _ok_gate(monkeypatch)
+    d.observe_sample("5m", WS, WE, WS + 160_000, 0.40, 0.27, 27.5)
+    for t in list(d._persist_tasks):
+        await t
+    assert session.added == [] and d._trigger_count == 0

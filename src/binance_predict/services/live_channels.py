@@ -377,28 +377,7 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
         "brkrv_brk8h_5m_v1", "kline_reversal", "5m", "DOWN", 0.55,
         "BRK假突破8h高回归·5m（押DOWN）",
     ),
-    # --- gap_crowd 族（2026-10-10 研究 run 20261009T191824Z-reversal-state-certainty
-    # 盲测确认 + 用户拍板注册影子+实盘，实盘默认全部 OFF）：
-    # 「窗后半段，预测市场报价比人群投票倾向便宜 ≥5pp → 买便宜侧（UP）」。
-    # 规则冻结：gap = up_price − (1 − down_pct/100) ≤ −0.05、elapsed ≥ 窗长×0.5、
-    # 距收盘 ≥60s、0.02 ≤ up_price ≤ 0.98；判定函数单点事实源见
-    # gap_crowd_shadow_detector.evaluate_gap_crowd（影子与实盘同源同口径）。
-    # 依据（盲测 51 天，首次且唯一一次读取）：5m n=947 胜率 51.4% 均价 0.458
-    # EV +0.036 CI[+0.010,+0.060]；15m n=250 胜率 57.6% 均价 0.479 EV +0.077
-    # CI[+0.016,+0.145]；三费用口径全正；excess vs 报价桶校准两段稳定 +6.8pp。
-    # 护栏 = 盲测胜率 × 0.98（费后保本入场价，与 KREV/CRV/BRK 同口径）：
-    # 5m 51.4%×0.98≈0.504→0.50；15m 57.6%×0.98≈0.564→0.56。
-    # ⚠️ 研究分级 L0（发现段 25 天功效不足未过 FDR，按预注册不得正式晋级）：
-    # 注册实盘仅为前向影子/小金额验证通道，升级条件 5m ≥1500 / 15m ≥600 前向事件
-    # 且滚动 excess≥+4pp（见研究报告 §5）；开启前先看影子前向样本。
-    "gap_crowd_5m_v1": ChannelSpec(
-        "gap_crowd_5m_v1", "gap_crowd", "5m", "UP", 0.50,
-        "报价落后人群·5m后半窗（押UP）",
-    ),
-    "gap_crowd_15m_v1": ChannelSpec(
-        "gap_crowd_15m_v1", "gap_crowd", "15m", "UP", 0.56,
-        "报价落后人群·15m后半窗（押UP）",
-    ),
+    # --- gap_crowd 族已于 2026-10-10 同日证伪退役（见 RETIRED_CHANNEL_SPECS 内说明）---
 }
 
 # 蜡烛逻辑版本共享 5m/15m 物理事件，但各自可独立注册/热调。默认配置仍全 OFF；
@@ -466,6 +445,19 @@ RETIRED_CHANNEL_SPECS: dict[str, ChannelSpec] = {
     "quote_contrarian_v4": ChannelSpec(
         "quote_contrarian_v4", "quote_edge", "5m", "DOWN", _qe_guard("quote_contrarian_v1"),
         "报价反向·下跌周期版", regime_gate=True,
+    ),
+    # --- gap_crowd 族：2026-10-10 注册 → 同日证伪退役（勿重新启用）。
+    # 触发条件只在 up_price/down_price 快照不一致的瞬间成立（盲测 948 事件 100%
+    # 报价和 <0.95、中位 0.91；全样本仅 1.03% 不一致）：记录入场价不可成交，
+    # 一致化入场价重算 EV +0.036 → −0.072、只留一致样本则 0 事件。
+    # 详见研究报告 ERRATUM 与 gap_crowd_shadow_detector 模块头。
+    "gap_crowd_5m_v1": ChannelSpec(
+        "gap_crowd_5m_v1", "gap_crowd", "5m", "UP", 0.50,
+        "报价落后人群·5m后半窗（已证伪退役）",
+    ),
+    "gap_crowd_15m_v1": ChannelSpec(
+        "gap_crowd_15m_v1", "gap_crowd", "15m", "UP", 0.56,
+        "报价落后人群·15m后半窗（已证伪退役）",
     ),
     # ---- 2026-10-05 退役（firsthit 前向深析，与 shadow_version_gate.RETIRED_VERSIONS 同步）：
     # G7 全系六通道（剔 Top5 赢单后 EV −0.34~−0.91，右尾彩票驱动）、K10 两版

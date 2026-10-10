@@ -1,27 +1,27 @@
-"""报价-人群错位（gap_crowd）影子检测器 + 冻结判定规则（2026-10-10 研究轮 promote）。
+"""报价-人群错位（gap_crowd）影子检测器 + 判定规则。
 
-研究出处（隔离研究 run，全部产物哈希锁定）：
+⛔ 2026-10-10 勘误（结论作废，勿据本文件交易）：
+    原研究结论「窗后半段报价比人群倾向便宜 ≥5pp → 买 UP 有费后正 EV」被证伪——
+    该触发条件**只**在 up_price/down_price 快照不一致的瞬间成立（盲测 948 事件
+    100% 报价和 <0.95、中位 0.91；全样本仅 1.03% 不一致、中位和 1.000）。
+    触发价是滞后/偏低值不可成交（生产首单记录价 0.40 vs 实际报价 0.62）。
+    以一致化入场价重算 EV：+0.036 → −0.072（只留一致样本则事件数 0）。
+    ⇒ 两版本已退役（shadow_version_gate.RETIRED_VERSIONS），规则保留仅为审计与
+    防止未来复用；QUOTE_SUM_TOL 一致性门为硬前置。详见研究报告 ERRATUM。
+
+原始研究出处（已被上条勘误推翻，保留供审计）：
     output/research_runs/20261009T191824Z-reversal-state-certainty/
-    （FINAL_REPORT.md §2、holdout/FROZEN_CANDIDATES.json OBS-1/OBS-2）
-    盲测段（2026-08-20→10-09，51 天，首次且唯一一次读取）：
-      5m  n=947 胜率 51.4% 均价 0.458 EV_a +0.036 CI[+0.010,+0.060]
-      15m n=250 胜率 57.6% 均价 0.479 EV_a +0.077 CI[+0.016,+0.145]
-      三费用口径（费于本金/赔付/净利）全正；excess vs 报价桶校准两段稳定 +6.8pp。
-    研究分级：L0（发现段 25 天功效不足未过 FDR，按预注册不得正式晋级）；
-    用户 2026-10-10 拍板注册影子 + 实盘（实盘默认 OFF），以影子前向攒样本复核。
+    （FINAL_REPORT.md §2 与文末 ERRATUM；holdout/FROZEN_CANDIDATES.json OBS-1/OBS-2）
 
-冻结规则（勿动，与研究报告 OBS-1/OBS-2 逐字同口径）：
+冻结规则（含 AMENDMENT-2 一致性门）：
     gap = up_price − (1 − down_pct/100)          # 市场隐含涨概率 − 人群看涨倾向
     触发 = 窗内 elapsed ≥ 窗长×0.5 的首个采样点，且：
-             gap ≤ −0.05、距收盘 ≥60s、0.02 ≤ up_price ≤ 0.98 → 买 UP（报价便宜一侧）
-    入场 = 触发时刻真实 up_price（影子记录真实报价；EV 按 repo 统一口径现算，
-            不含 +0.01 溢价——溢价是实盘成交成本，由实际成交价体现）
-    结算 = 触发窗 sign(close−open)（K 线口径；与研究的结算代理同定义，对齐率 98.3%）
+             gap ≤ −0.05、距收盘 ≥60s、0.02 ≤ up_price ≤ 0.98、
+             |up_price + down_price − 1| ≤ 0.05（AMENDMENT-2，防伪迹快照）
+    入场 = 触发时刻真实 up_price；结算 = 触发窗 sign(close−open)（K 线口径）
 
-影子纪律：只记录不下注。触发即落 PENDING（含触发快照），窗关闭后由结算循环拉
-K 线判胜负 → SETTLED。实盘通道 gap_crowd_5m_v1 / gap_crowd_15m_v1 经
-MultiLiveTrader.check_gap_crowd 采样循环内联判定，与影子共用本模块
-evaluate_gap_crowd 纯函数（同源同口径，单点事实源）。
+影子纪律：只记录不下注。触发即落 PENDING，窗关闭后由结算循环拉 K 线判胜负 →
+SETTLED。实盘通道同名（已退役、默认 OFF）。
 """
 from __future__ import annotations
 
@@ -46,6 +46,16 @@ GAP_THRESHOLD = -0.05        # gap ≤ 此值触发（市场报价比人群倾�
 LATE_FRACTION = 0.5          # 只取窗口后半段（elapsed ≥ 窗长×0.5）
 MIN_REMAIN_S = 60.0          # 距收盘至少 60s（执行可行性门）
 Q_LO, Q_HI = 0.02, 0.98      # 入场报价有效区间
+# ⚠️ 2026-10-10 勘误后新增（AMENDMENT-2）：报价对一致性门。
+# 生产首条信号暴露根因：触发条件（gap≤−0.05）**只会**在 up_price/down_price 快照
+# 不一致的瞬间成立——盲测 948 个触发事件 100% 的 up+down < 0.95（中位 0.91），
+# 而全样本仅 1.03% 的采样不一致（中位和 1.000）。触发时刻的 up_price 是滞后/偏低
+# 值，真实不可成交（实盘首单取到 0.62 而记录价 0.40，被护栏弃单）。
+# 用一致化入场价（1−down_price，均值 0.564 而非 0.458）重算：EV 由 +0.036 变 −0.072；
+# 只保留一致样本则事件数为 0。⇒ 原「报价落后人群」结论系数据伪迹，规则作废
+# （两版本已退役，见 shadow_version_gate.RETIRED_VERSIONS）。本门保留为硬前置：
+# 任何未来复用本模块的调用都不会在伪迹快照上触发。
+QUOTE_SUM_TOL = 0.05         # |up_price + down_price − 1| 超过此值视为快照不一致 → 不判定
 DIRECTION = "UP"             # 固定买便宜侧（gap-low 规则的方向语义）
 FEE_RET = 0.98               # EV = 赢 0.98/q−1 / 输 −1（费 2% 无溢价，repo 统一口径）
 SETTLE_POLL_INTERVAL = 60.0  # 结算循环轮询间隔（秒）
@@ -84,6 +94,11 @@ def evaluate_gap_crowd(
     q = float(up_price)
     if not (Q_LO <= q <= Q_HI):
         return None                                   # 报价越界（无效/单边）
+    # AMENDMENT-2（2026-10-10）：报价对一致性硬前置——不一致快照的 up_price 不可成交。
+    # 容差带 1e-9：0.41+0.54=0.95 的浮点差为 0.050000000000000044，不加容差会把
+    # 名义贴线点（和=0.95）误拒；本门为新规则无研究口径需逐字复刻，边界按名义值含贴线。
+    if abs(q + float(down_price) - 1.0) > QUOTE_SUM_TOL + 1e-9:
+        return None                                   # 报价对不一致（至少一侧滞后）
     gap = q - (1.0 - float(down_pct) / 100.0)
     # ⚠ down_pct 是**百分比**（0-100，与研究读的 prediction_market_samples.down_pct
     # 同口径）；调用方不得传 0-1 小数（main.py 的 down_chance 需 ×100，漏转会退化）。

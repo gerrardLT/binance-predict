@@ -59,6 +59,11 @@ RETIRED_VERSIONS: frozenset[str] = frozenset({
     "process_recovery_down_v1",
     # 2026-10-06：旧 G3v1 升级为 v2 双波峰版，旧版停止新落表，数据归档供历史对账。
     "firsthit_down_chg_v1",
+    # 2026-10-10 证伪退役：gap_crowd（报价-人群错位）——触发条件只在 up/down 报价
+    # 快照不一致的瞬间成立（盲测 948 事件 100% 报价和 <0.95 vs 全样本 1.03%），
+    # 记录入场价不可成交；一致化入场价重算 EV +0.036 → −0.072，只留一致样本则 0 事件。
+    # 结论作废（研究报告 ERRATUM），永久退役防误开启；历史 1 条信号保留供审计。
+    "gap_crowd_5m_v1", "gap_crowd_15m_v1",
 })
 
 

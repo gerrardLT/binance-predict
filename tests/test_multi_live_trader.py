@@ -230,7 +230,7 @@ def test_parse_defaults_all_off(monkeypatch) -> None:
     monkeypatch.setattr(settings, "live_default_max_daily_orders", 100)
     monkeypatch.setattr(settings, "live_channels_json", "")
     cfgs = parse_channel_config()
-    assert len(cfgs) == 41 + len(CANDLESTICK_SIGNAL_IDS)  # 2026-10-09 +s4_delay60_v1；2026-10-10 +gap_crowd×2
+    assert len(cfgs) == 39 + len(CANDLESTICK_SIGNAL_IDS)  # 2026-10-09 +s4_delay60_v1
     assert set(CANDLESTICK_SIGNAL_IDS) <= set(cfgs)
     assert all(not c.enabled for c in cfgs.values())
     assert all(c.amount_usdt == 2.0 for c in cfgs.values())
@@ -407,8 +407,6 @@ def test_channels_registry_shape() -> None:
         "crv_brk50_hi_15m_v1", "crv_brk20_5m_v1",
         # 2026-10-05 BRK 假突破回归双通道（默认全 OFF；与 CRV 同周期突破族同窗互斥）
         "brkrv_brk8h_15m_v1", "brkrv_brk8h_5m_v1",
-        # 2026-10-10 报价-人群错位双通道（默认全 OFF；研究 L0，影子先行）
-        "gap_crowd_5m_v1", "gap_crowd_15m_v1",
     }
     assert set(LIVE_CHANNELS) == expected_existing | set(CANDLESTICK_SIGNAL_IDS)
     assert set(RETIRED_CHANNELS) == {
@@ -425,6 +423,8 @@ def test_channels_registry_shape() -> None:
         "firsthit_down_k10_v1", "firsthit_down_k10_profit_v1",
         "process_recovery_down_v1",
         "firsthit_down_chg_v1",
+        # 2026-10-10 证伪退役：gap_crowd 两版（触发条件只在报价对不一致快照成立）
+        "gap_crowd_5m_v1", "gap_crowd_15m_v1",
     }
     assert not (set(LIVE_CHANNELS) & set(RETIRED_CHANNELS))
     by = {**RETIRED_CHANNEL_SPECS, **LIVE_CHANNELS}
@@ -489,9 +489,6 @@ def test_channels_registry_shape() -> None:
         ("crv_brk20_5m_v1", "5m", "kline_reversal", 0.53),
         ("absorption_follow_td120_v1", "5m", "absorption", 0.78),
         ("absorption_follow_td150_v1", "5m", "absorption", 0.86),
-        # 2026-10-10 gap_crowd：护栏 = 盲测胜率 × 0.98（费后保本价，同 KREV/CRV/BRK 口径）
-        ("gap_crowd_5m_v1", "5m", "gap_crowd", 0.50),
-        ("gap_crowd_15m_v1", "15m", "gap_crowd", 0.56),
     ):
         spec = by[ch]
         assert spec.market_period == period and spec.family == fam
@@ -2911,7 +2908,9 @@ def test_status_shape(monkeypatch) -> None:
     assert s["defaults"]["amount_usdt"] == 2.0
     assert s["defaults"]["max_daily_orders"] == 100
     from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
-    assert len(s["channels"]) == 59 + len(CANDLESTICK_SIGNAL_IDS)  # +s4_delay60_v1；2026-10-10 +gap_crowd×2
+    # 状态列表 = LIVE_CHANNELS + 退役 spec（_with_retired 合并）→ gap_crowd 两版退役后
+    # 仍在合并表内，故基数与注册为在线时同为 59。
+    assert len(s["channels"]) == 59 + len(CANDLESTICK_SIGNAL_IDS)  # +s4_delay60_v1
     by = {c["channel"]: c for c in s["channels"]}
     c = by["quote_contrarian_v1"]
     assert c["enabled"] is True and c["enabled_at_startup"] is True
@@ -6545,6 +6544,28 @@ def test_gap_crowd_rule_boundaries() -> None:
     assert ext15 is not None and ext15["gap"] == pytest.approx(-0.10, abs=1e-9)
 
 
+def test_gap_crowd_quote_coherence_gate() -> None:
+    """AMENDMENT-2 报价对一致性硬前置（2026-10-10 勘误后新增）。
+
+    回归生产首条信号暴露的根因：原规则只在 up/down 报价对不一致的瞬时快照成立
+    （up=0.40/dn=0.27，和 0.67），该快照的 up_price 不可成交（实盘取到 0.62）。
+    门：|up+down−1| ≤ 0.05 才判定；边界含贴线（0.05 放行，0.06 拒绝）。
+    """
+    from binance_predict.services.gap_crowd_shadow_detector import evaluate_gap_crowd
+
+    W = 300_000
+    # 生产实况样本：up=0.40 dn=0.27（和 0.67，gap 名义 −0.325）→ 必须拒绝
+    assert evaluate_gap_crowd("5m", 0, W, 160_000, 0.40, 0.27, 27.5) is None
+    # 同类：和 0.92（触发事件的典型值）→ 拒绝
+    assert evaluate_gap_crowd("5m", 0, W, 160_000, 0.42, 0.50, 53.0) is None
+    # 边界含贴线：和 0.95 放行 / 和 0.94 拒绝
+    ok = evaluate_gap_crowd("5m", 0, W, 160_000, 0.41, 0.54, 53.0)   # 和 0.95，gap=-0.06
+    assert ok is not None
+    assert evaluate_gap_crowd("5m", 0, W, 160_000, 0.42, 0.52, 53.0) is None  # 和 0.94
+    # 上侧同门：和 1.06 拒绝
+    assert evaluate_gap_crowd("5m", 0, W, 160_000, 0.42, 0.64, 53.0) is None
+
+
 @pytest.mark.asyncio
 async def test_gap_crowd_disabled_no_fire(monkeypatch) -> None:
     """默认全 OFF：命中窗口也不开火。"""
@@ -6691,12 +6712,13 @@ def test_gap_crowd_down_pct_unit_contract() -> None:
 
 
 def test_gap_crowd_shadow_versions_registered() -> None:
-    """影子注册表 + 门禁白名单 + benchmark 三处同步（漏一处前端 toggle 422 / 面板不显示）。"""
+    """影子注册表 + 门禁白名单同步；2026-10-10 证伪退役后 live_retired=True。"""
     from binance_predict.services.shadow_execution_registry import (
         SHADOW_VERSION_SPECS, SHADOW_VERSIONS,
     )
     from binance_predict.services.shadow_execution_types import SourceType
-    from binance_predict.services.live_channel_benchmarks import CHANNEL_BENCHMARKS
+    from binance_predict.services.shadow_version_gate import RETIRED_VERSIONS
+    from binance_predict.services.live_channels import RETIRED_CHANNELS
     import binance_predict.main as milt_main
 
     for version, period in (("gap_crowd_5m_v1", "5m"), ("gap_crowd_15m_v1", "15m")):
@@ -6705,9 +6727,7 @@ def test_gap_crowd_shadow_versions_registered() -> None:
         assert spec.source_type is SourceType.GAP_CROWD
         assert spec.market_period == period
         assert spec.target_semantics == "same_window"
-        assert spec.live_channel == version and spec.live_retired is False
-        assert version in milt_main.SHADOW_BENCH
-        assert version in CHANNEL_BENCHMARKS
-    # 盲测基准点估计与护栏推导一致（护栏 = 胜率×0.98）
-    assert CHANNEL_BENCHMARKS["gap_crowd_5m_v1"].win_rate == pytest.approx(0.514)
-    assert CHANNEL_BENCHMARKS["gap_crowd_15m_v1"].win_rate == pytest.approx(0.576)
+        # 证伪退役：影子永久退役 + 实盘通道退役（两处名单必须一致）
+        assert spec.live_channel == version and spec.live_retired is True
+        assert version in RETIRED_VERSIONS and version in RETIRED_CHANNELS
+        assert version in milt_main.SHADOW_BENCH      # 面板仍可查（desc 已标注证伪）

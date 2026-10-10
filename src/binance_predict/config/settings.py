@@ -457,16 +457,14 @@ class Settings(BaseSettings):
     # 只记录不下注，不进 LIVE_CHANNELS；实验期不得改阈值/首次触达/入场时点。
     firsthit_forward_enabled: bool = True
 
-    # --- 报价-人群错位影子信号（gap_crowd 族，2026-10-10）---
-    # 研究 run 20261009T191824Z-reversal-state-certainty 盲测确认（首次且唯一一次读取）：
-    # 5m/15m 窗后半段（elapsed ≥ 窗长×0.5）预测市场报价比人群投票倾向便宜 ≥5pp
-    # （gap = up_price − (1 − down_pct/100) ≤ −0.05）且距收盘 ≥60s → 买便宜侧 UP。
-    # 盲测 5m n=947 胜率 51.4% EV +0.036 CI[+0.010,+0.060]；15m n=250 胜率 57.6%
-    # EV +0.077 CI[+0.016,+0.145]；三费用口径全正、excess vs 报价桶校准两段稳定 +6.8pp。
-    # 研究分级 L0（发现段功效不足未过 FDR）；用户拍板注册影子+实盘（实盘默认 OFF），
-    # 以影子前向样本复核升级条件（5m ≥1500 / 15m ≥600 事件）。触发落 PENDING，
-    # 窗关闭后 K 线口径结算 → SETTLED；只记录不下注，物理隔离于下单路径。
-    gap_crowd_shadow_enabled: bool = True
+    # --- 报价-人群错位影子信号（gap_crowd 族，2026-10-10 注册后同日证伪退役）---
+    # ⛔ 默认关闭：原研究结论（窗后半段 gap≤−0.05 买 UP 有费后正 EV）被证伪——
+    # 触发条件只在 up_price/down_price 快照不一致的瞬间成立（盲测 948 事件 100%
+    # 报价和 <0.95、中位 0.91；全样本仅 1.03% 不一致），记录入场价不可成交
+    # （生产首单记录价 0.40 vs 实际报价 0.62）；一致化入场价重算 EV +0.036 → −0.072、
+    # 只留一致样本则 0 事件。两版本已入 RETIRED_VERSIONS（永久退役）；本开关保留
+    # 仅为审计与未来复用（检测器含 AMENDMENT-2 报价对一致性硬前置，不会在伪迹上触发）。
+    gap_crowd_shadow_enabled: bool = False
 
     # --- S2 条件单影子信号（s2_cond 族，2026-09-06）---
     # 研究结论落地：S2（bear_exhaust，破 4h 支撑+收阴+放量）开盘即买 UP 的 EV≈−0.042
