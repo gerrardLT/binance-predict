@@ -1860,3 +1860,26 @@ class SignalHealthSnapshot(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class CompoundChain(Base):
+    """复利下单链：N 个 5m 窗口依次下注，上一腿赢则把到手股数（本金+利润）滚入下一腿。
+
+    legs: [{ws, stake, order_id, result(None|WIN|LOSS|NOISE), payout, pnl}]，下单即追加，
+    结算后回填 result；重启后由 CompoundChainRunner 按 status=RUNNING 续跑。
+    """
+    __tablename__ = "compound_chains"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    status: Mapped[str] = mapped_column(String(10), nullable=False, server_default="RUNNING",
+                                        comment="RUNNING | DONE | STOPPED")
+    direction: Mapped[str] = mapped_column(String(4), nullable=False)
+    base_amount: Mapped[float] = mapped_column(Float, nullable=False)
+    max_exec_price: Mapped[float] = mapped_column(Float, nullable=False)
+    windows: Mapped[list] = mapped_column(JSONB, nullable=False, comment="各腿窗口起点 ms（升序）")
+    legs: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    stop_reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())

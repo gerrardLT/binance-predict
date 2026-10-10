@@ -777,6 +777,16 @@ const api = {
   // 未来周期市场（手动下单模态框周期选择条；TTL 30s 服务端缓存）
   getFutureMarkets: (period: string, count = 8) =>
     authFetch(`/api/prediction/future-markets?period=${period}&count=${count}`).then(r => r.json()),
+  // 复利下单链：赢则本金+利润滚入下一腿，输即终止
+  postCompound: (base_amount: number, direction: string, windows: number[], max_exec_price: number) =>
+    authFetch('/api/trade/compound', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ base_amount, direction, windows, max_exec_price }),
+    }).then(r => r.json()),
+  getCompound: () => authFetch('/api/trade/compound').then(r => r.json()),
+  stopCompound: (id: number) =>
+    authFetch(`/api/trade/compound/${id}/stop`, { method: 'POST' }).then(r => r.json()),
   // 平仓（SELL）：平掉未结算 BUY 持仓
   postClosePosition: (order_id: number) =>
     authFetch('/api/trade/close', {
@@ -1903,6 +1913,10 @@ function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }
   const [currentWin, setCurrentWin] = useState<Record<string, unknown> | null>(null)
   // 大额（>10U/窗）勾选确认；小单一键直接下
   const [confirmed, setConfirmed] = useState(false)
+  // 复利链：每腿执行价护栏 + 最近链进度（弹窗打开时 10s 轮询）
+  const [chainGuard, setChainGuard] = useState('0.65')
+  const [chains, setChains] = useState<Record<string, unknown>[]>([])
+  const [chainMsg, setChainMsg] = useState('')
 
   const q = (v: unknown) => (typeof v === 'number' ? v : null)
   const nowMs = Date.now() + clockOffset
@@ -2003,6 +2017,50 @@ function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }
       refresh()
     } catch (e) {
       alert(`请求失败: ${(e as Error).message}`)
+    } finally {
+      setBusy(false)
+      setConfirmed(false)
+    }
+  }
+
+  const guardNum = parseFloat(chainGuard)
+  const chainWins = [...targets].sort((x, y) => x - y)
+  const canChain = period === '5m' && amtOk && amtNum <= 10 && !busy && chainWins.length >= 2
+    && guardNum > 0 && guardNum < 1 && (!bigAmount || confirmed)
+
+  const loadChains = () => api.getCompound()
+    .then((d: Record<string, unknown>) => setChains(Array.isArray(d.chains) ? d.chains as Record<string, unknown>[] : []))
+    .catch(() => {})
+  useEffect(() => {
+    if (!open) return
+    loadChains()
+    const t = setInterval(loadChains, 10_000)
+    return () => clearInterval(t)
+  }, [open])
+
+  const handleChain = async () => {
+    if (!canChain) return
+    const names = chainWins.map(ws => fmtHHMM(ws)).join(' → ')
+    if (!window.confirm(
+      `复利下单（${side === 'UP' ? '涨' : '跌'}）
+${names}
+首腿 ${amtNum}U（限 0.1~10U），赢则本金+利润滚入下一腿，输即终止。
+`
+      + `提前下单：本窗报价 ≥0.95（距收盘 >60s）或 距收盘 ≤15s 且领先 ≥3bp 时，即提前押下一腿，
+`
+      + `押注额＝本金+按报价算得的利润。
+`
+      + `代价：提前押上后本窗若反转，当前腿与下一腿一起亏。后续腿本金不封顶，余额不足即终止。
+`
+      + `每腿执行价 ≥ ${guardNum} 弃单并终止。确认真实下单？`)) return
+    setBusy(true)
+    setChainMsg('')
+    try {
+      const res = await api.postCompound(amtNum, side, chainWins, guardNum)
+      setChainMsg(res.error ? `✗ ${String(res.error)}` : `✓ 复利链 #${res.id} 已启动`)
+      loadChains()
+    } catch (e) {
+      setChainMsg(`✗ 请求失败: ${(e as Error).message}`)
     } finally {
       setBusy(false)
       setConfirmed(false)
@@ -2230,6 +2288,63 @@ function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }
                       {r.average_price != null && <span className="ml-1.5">@{String(r.average_price)}</span>}
                       {r.filled_shares != null && <span className="ml-1.5">{String(r.filled_shares)}股</span>}
                       {(r.error || r.error_message) != null && <span className="ml-1.5">{String(r.error ?? r.error_message)}</span>}
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+
+            {/* 复利下单（仅 5m）：选 ≥2 窗，首腿本金，赢则本金+利润滚入下一腿 */}
+            {period === '5m' && (
+              <div className="space-y-1.5 border-t border-line pt-3">
+                <div className="flex items-center gap-2 text-xs">
+                  <label className="text-ink-55 shrink-0">每腿执行价上限</label>
+                  <input type="number" min={0.5} max={0.99} step={0.01} value={chainGuard}
+                    onChange={e => setChainGuard(e.target.value)}
+                    className="ds-input ds-input-numeric w-20" />
+                  <span className="text-[11px] text-ink-55">≥ 即弃单并终止链</span>
+                  <span className="ml-auto text-[11px] text-ink-55">首腿 0.1~10U</span>
+                </div>
+                <button onClick={handleChain} disabled={!canChain}
+                  className="w-full py-2.5 text-sm font-bold rounded-card border border-brand text-brand hover:bg-brand hover:text-white transition disabled:opacity-40"
+                >
+                  {chainWins.length >= 2
+                    ? `复利下单（${side === 'UP' ? '涨' : '跌'} ${amount}U，${chainWins.length} 腿连环）`
+                    : '复利下单（先选 ≥2 个窗口）'}
+                </button>
+                {chainMsg && <div className="text-xs text-ink-80">{chainMsg}</div>}
+                {chains.slice(0, 3).map(c => {
+                  const legs = (Array.isArray(c.legs) ? c.legs : []) as Record<string, unknown>[]
+                  const wins = (Array.isArray(c.windows) ? c.windows : []) as number[]
+                  const running = c.status === 'RUNNING'
+                  return (
+                    <div key={String(c.id)} className="p-2 rounded-sm border border-line text-[11px] space-y-0.5">
+                      <div className="flex items-center gap-2">
+                        <span className="font-bold">#{String(c.id)}</span>
+                        <span>{c.direction === 'UP' ? '涨' : '跌'} {String(c.base_amount)}U</span>
+                        <span className={running ? 'text-brand' : 'text-ink-55'}>
+                          {running ? '进行中' : c.status === 'DONE' ? '已完成' : '已终止'}
+                        </span>
+                        {running && (
+                          <button className="ml-auto text-negative underline"
+                            onClick={() => { if (window.confirm('终止后续腿？已下的腿照常结算（赢单奖金需手动领取）')) api.stopCompound(Number(c.id)).then(loadChains) }}
+                          >终止</button>
+                        )}
+                      </div>
+                      {wins.map((ws, i) => {
+                        const l = legs[i]
+                        const r = l ? String(l.result ?? '') : ''
+                        const label = !l ? '待下单' : r === 'WIN' ? '赢' : r === 'LOSS' ? '输' : r === '' ? '等待结算' : r
+                        const cls = r === 'WIN' ? 'text-positive' : r === 'LOSS' || r === 'FAILED' ? 'text-negative' : 'text-ink-55'
+                        return (
+                          <div key={ws} className="font-mono">
+                            {fmtHHMM(ws)} {l ? `${Number(l.filled).toFixed(2)}U` : ''}
+                            {l && l.shares != null ? ` → ${Number(l.shares).toFixed(2)}股` : ''}
+                            <span className={`ml-1.5 ${cls}`}>{label}</span>
+                          </div>
+                        )
+                      })}
+                      {c.stop_reason != null && <div className="text-ink-55">{String(c.stop_reason)}</div>}
                     </div>
                   )
                 })}

@@ -53,6 +53,7 @@ from .db.models import (
 from .models.schemas import (
     CommitDeepLearnRequest,
     ClosePositionRequest,
+    CompoundChainRequest,
     LoginRequest,
     ManualTradeTestRequest,
     RedeemRequest,
@@ -91,6 +92,7 @@ from .services.shadow_version_gate import shadow_gate
 from .services.notification_config import GLOBAL_CHANNEL, notify_config
 from .services.wechat_notifier import wechat_notifier
 from .services.trade_settler import TradeSettler
+from .services.compound_chain import CompoundChainRunner, validate_plan
 from .services.llm_service import LLMService
 from .services.pattern_reevaluator import pattern_reevaluator
 from .services.prediction_trading import BinancePredictionTrader
@@ -241,6 +243,9 @@ rev2_inside_5m_shadow_detector: Rev2InsideShadowDetector | None = None
 
 # 交易结算器全局实例（P0-2：FILLED 订单结算回填输赢/盈亏，常开）
 trade_settler: TradeSettler | None = None
+
+# 复利下单链运行器（手动触发；状态落 compound_chains，重启续跑）
+compound_runner: CompoundChainRunner | None = None
 
 # 多通道实盘执行器全局实例（MultiLiveTrader：7 通道三族触发，
 # 通道开关/金额/日限各自独立，启动回落 LIVE_CHANNELS_JSON，默认全关）
@@ -1554,6 +1559,19 @@ async def lifespan(app: FastAPI):
     await trade_settler.start()
     logger.info("交易结算器已启动（60s 扫描 FILLED 未结算订单，settled_at 锚点）")
 
+    global compound_runner
+    def _compound_live_quote():
+        """复利提前下单用的实时 5m 报价（_pm_market_info 每 15s 刷新；过期即视为无报价）。"""
+        ts = _pm_market_info.get("updated_ts") or 0
+        if int(time.time() * 1000) - int(ts) > 40_000:
+            return None, None
+        return _pm_market_info.get("up_price"), _pm_market_info.get("down_price")
+
+    compound_runner = CompoundChainRunner(
+        prediction_trader, collector, quote_provider=_compound_live_quote,
+        on_balance_change=lambda: _wallet_view_ts.__setitem__("balance", 0.0))
+    await compound_runner.start()
+
     # 多通道实盘执行器启动（构造/DB覆盖/邮件闸注入已在检测器 start 前完成）
     if multi_live_trader is not None:
         await multi_live_trader.start()
@@ -1712,6 +1730,8 @@ async def lifespan(app: FastAPI):
     # 停止影子版本开关 gate（所有影子检测器已停，最后收后台刷新任务）
     await shadow_gate.stop()
     await notify_config.stop()
+    if compound_runner is not None:
+        await compound_runner.stop()
     # 停止交易结算器
     if trade_settler is not None:
         await trade_settler.stop()
@@ -2807,6 +2827,68 @@ async def manual_trade_test(
         "provider_fee": qj.get("marketProviderFee"),
         "error_message": order.get("error_message"),
     }
+
+
+@app.post("/api/trade/compound")
+async def compound_start(
+    req: CompoundChainRequest,
+    _: None = Depends(_require_auth),
+):
+    """复利下单链：首腿 base_amount，赢则到手股数（本金+利润）滚入下一腿，输即终止。
+
+    首腿本金限 0.1~10U；提前下单可能使最大亏损超过首腿本金。后台运行，状态见 GET /api/trade/compound。
+    """
+    if compound_runner is None:
+        return {"error": "复利运行器未启动"}
+    err = validate_plan(req.base_amount, req.direction, req.windows,
+                        req.max_exec_price, int(time.time() * 1000))
+    if err:
+        return {"error": err}
+    from sqlalchemy import select
+    from .db.models import CompoundChain
+    async with async_session_factory() as db:
+        busy = (await db.execute(
+            select(CompoundChain.id).where(CompoundChain.status == "RUNNING"))).first()
+        if busy:  # 资金互斥：同时只允许一条链，防并发链争用同一笔余额
+            return {"error": f"已有运行中的复利链 #{busy[0]}，请待其结束"}
+        chain = CompoundChain(direction=req.direction, base_amount=req.base_amount,
+                              max_exec_price=req.max_exec_price, windows=req.windows, legs=[])
+        db.add(chain)
+        await db.commit()
+        cid = chain.id
+    compound_runner.spawn(cid)
+    return {"status": "RUNNING", "id": cid}
+
+
+@app.get("/api/trade/compound")
+async def compound_list(_: None = Depends(_require_auth)):
+    from sqlalchemy import select
+    from .db.models import CompoundChain
+    async with async_session_factory() as db:
+        rows = (await db.execute(
+            select(CompoundChain).order_by(CompoundChain.id.desc()).limit(10))).scalars().all()
+    return {"chains": [{
+        "id": c.id, "status": c.status, "direction": c.direction,
+        "base_amount": c.base_amount, "max_exec_price": c.max_exec_price,
+        "windows": c.windows, "legs": c.legs, "stop_reason": c.stop_reason,
+        "created_at": c.created_at.isoformat() if c.created_at else None,
+    } for c in rows]}
+
+
+@app.post("/api/trade/compound/{chain_id}/stop")
+async def compound_stop(chain_id: int, _: None = Depends(_require_auth)):
+    """人工终止：只停止后续腿；已下的腿照常结算（赢单奖金需手动领取）。"""
+    from sqlalchemy import update
+    from .db.models import CompoundChain
+    async with async_session_factory() as db:
+        r = await db.execute(
+            update(CompoundChain)
+            .where(CompoundChain.id == chain_id, CompoundChain.status == "RUNNING")
+            .values(status="STOPPED", stop_reason="人工终止"))
+        await db.commit()
+    if compound_runner is not None and (t := compound_runner._tasks.get(chain_id)):
+        t.cancel()
+    return {"status": "STOPPED" if r.rowcount else "NOOP"}
 
 
 @app.post("/api/trade/close")

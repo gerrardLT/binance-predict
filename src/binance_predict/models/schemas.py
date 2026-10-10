@@ -286,6 +286,15 @@ class ManualTradeTestRequest(BaseModel):
     )
 
 
+class CompoundChainRequest(BaseModel):
+    """复利下单链（POST /api/trade/compound）：5m 窗口依次下注，赢则本金+利润滚入下一腿。"""
+
+    base_amount: float = Field(description="首腿本金（USDT）0.1~10")
+    direction: str = Field(description="全链方向 UP | DOWN")
+    windows: list[int] = Field(description="各腿 5m 窗口起点 ms，升序，2~8 个")
+    max_exec_price: float = Field(default=0.65, description="每腿执行价护栏（0~1，含贴线弃单）")
+
+
 class ClosePositionRequest(BaseModel):
     """平仓请求（POST /api/trade/close，SELL 平掉未结算 BUY 持仓）。"""
 
