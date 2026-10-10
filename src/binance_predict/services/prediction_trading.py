@@ -1163,9 +1163,12 @@ class BinancePredictionTrader:
         return self._future_locks.setdefault(period, asyncio.Lock())
 
     async def get_future_markets_cached(
-        self, period: str, count: int = 8
+        self, period: str, count: int = 8, force: bool = False
     ) -> tuple[list[dict], float]:
         """带 TTL 缓存 + 单飞的未来窗查询。
+
+        Args:
+            force: True 时跳过缓存读（手动刷新用），强制重新扫描；仍写回缓存
 
         Returns:
             (windows, cached_age_sec)：windows 为未来窗列表（升序，最多 count 个）；
@@ -1176,13 +1179,13 @@ class BinancePredictionTrader:
         # 避免按 count 分键导致变 count 即 miss 触发整轮扫描（Low#10 原修法反模式）
         _MAX_COUNT = 8
         hit = self._future_cache.get(period)
-        if hit and now - hit[0] < hit[2]:
+        if not force and hit and now - hit[0] < hit[2]:
             return hit[1][:count], (now - hit[0]) / 1000
         async with self._future_lock(period):
-            # 双检：等锁期间可能已被别的请求刷新
+            # 双检：等锁期间可能已被别的请求刷新（force 时跳过，强制重扫）
             now = int(time.time() * 1000)
             hit = self._future_cache.get(period)
-            if hit and now - hit[0] < hit[2]:
+            if not force and hit and now - hit[0] < hit[2]:
                 return hit[1][:count], (now - hit[0]) / 1000
             windows = await self.scan_future_markets(period, count=_MAX_COUNT)
             # 空结果多为限流/周期边界瞬态：用短 TTL，避免弹窗被 45s 长缓存锁死在「未创建」

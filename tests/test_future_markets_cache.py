@@ -62,3 +62,25 @@ async def test_future_windows_stable_across_scans(monkeypatch):
     second = await t.scan_future_markets("5m", count=8)   # 本轮扫描为空
     assert [r["window_start"] for r in second] == [start]
     assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_force_bypasses_cache(monkeypatch):
+    """手动刷新（force=True）绕过后端 TTL 缓存强制重扫。"""
+    t = BinancePredictionTrader()
+    calls = {"n": 0}
+
+    async def fake_scan(period, count=8):
+        calls["n"] += 1
+        return [{"window_start": calls["n"]}]
+
+    monkeypatch.setattr(t, "scan_future_markets", fake_scan)
+
+    await t.get_future_markets_cached("5m", count=8)
+    assert calls["n"] == 1
+    await t.get_future_markets_cached("5m", count=8)          # 命中缓存，不重扫
+    assert calls["n"] == 1
+
+    windows, age = await t.get_future_markets_cached("5m", count=8, force=True)
+    assert calls["n"] == 2 and age == 0.0
+    assert windows == [{"window_start": 2}]

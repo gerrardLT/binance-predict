@@ -775,8 +775,8 @@ const api = {
       }),
     }).then(r => r.json()),
   // 未来周期市场（手动下单模态框周期选择条；TTL 30s 服务端缓存）
-  getFutureMarkets: (period: string, count = 8) =>
-    authFetch(`/api/prediction/future-markets?period=${period}&count=${count}`).then(r => r.json()),
+  getFutureMarkets: (period: string, count = 8, force = false) =>
+    authFetch(`/api/prediction/future-markets?period=${period}&count=${count}${force ? '&force=true' : ''}`).then(r => r.json()),
   // 复利下单链：赢则本金+利润滚入下一腿，输即终止
   postCompound: (base_amount: number, direction: string, windows: number[], max_exec_price: number) =>
     authFetch('/api/trade/compound', {
@@ -1912,6 +1912,8 @@ function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }
   const [loading, setLoading] = useState(false)
   // 手动刷新计数：bump 触发未来窗立即重扫
   const [reloadTick, setReloadTick] = useState(0)
+  // 上次已消费的刷新计数：reloadTick 变化即强制绕过后端缓存重扫
+  const lastReloadRef = useRef(0)
   const [amount, setAmount] = useState('1')
   const [side, setSide] = useState<'UP' | 'DOWN'>('UP')
   const [busy, setBusy] = useState(false)
@@ -1974,11 +1976,14 @@ function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }
   useEffect(() => {
     if (!open) return
     let alive = true
+    // ↻ 刷新：reloadTick 变化时 force=true 强制后端重扫（否则 45s 内命中缓存看不出变化）
+    const force = reloadTick !== lastReloadRef.current
+    lastReloadRef.current = reloadTick
     // 周期切换/手动刷新时先清掉旧列表：上一周期的窗口立即消失，视觉即时切换
     setFuture([])
-    const load = (spinner: boolean) => {
+    const load = (spinner: boolean, forceScan = false) => {
       if (spinner) setLoading(true)
-      api.getFutureMarkets(period, 8).then((d: Record<string, unknown>) => {
+      api.getFutureMarkets(period, 8, forceScan).then((d: Record<string, unknown>) => {
         if (!alive) return
         const wins = Array.isArray(d.windows) ? d.windows as FutureWindow[] : []
         setCurrentWin((d.current ?? null) as Record<string, unknown> | null)
@@ -1988,7 +1993,7 @@ function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }
       }).catch(() => { if (alive) setFutureErr(true) })
         .finally(() => alive && setLoading(false))
     }
-    load(true)
+    load(true, force)
     // 后台静默刷新（30s）：不闪加载态
     const t = setInterval(() => load(false), 30_000)
     return () => { alive = false; clearInterval(t) }

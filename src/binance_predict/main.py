@@ -2688,6 +2688,7 @@ async def get_quote_preview(_: None = Depends(_require_auth)):
 async def get_future_markets(
     period: str = "5m",
     count: int = 8,
+    force: bool = False,
     _: None = Depends(_require_auth),
 ):
     """未来周期市场列表（手动下单模态框周期选择条用）。
@@ -2702,7 +2703,7 @@ async def get_future_markets(
     if not (1 <= count <= 8):
         return {"error": "count 仅允许 1~8"}
     windows, cached_age = await prediction_trader.get_future_markets_cached(
-        period, count=count)
+        period, count=count, force=force)
     # 当前窗报价/起止（Medium#8）：quote-preview 仅 5m，15m 当前窗价/倒计时
     # 改由本端点从 list_markets 缓存提供
     if period == "5m":
