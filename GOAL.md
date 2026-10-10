@@ -102,6 +102,27 @@
   300 未耗尽）✓ / FINAL_REPORT ✓ / 盲测单次+哈希 ✓ / 三口径 EV 全正仅见于 L0 观察级 ✓
   / 生产零改动、未 commit 未 push ✓。合同按「零正式晋级 + L0 强候选 + 机制结论」交付。
 
+### R5（生产落地：影子+实盘注册 → 审阅 → 推送部署，2026-10-10）
+- 用户指令：把 5m/15m 都注册为影子信号与实盘信号（实盘默认不开启），实施完成审阅无误后推送。
+- 实现（commit 201493f，18 文件 +1451/−70）：
+  - 影子：`gap_crowd_shadow_detector.py`（采样循环喂入 → PENDING → K 线口径结算
+    SETTLED/VOID）+ 新表 `gap_crowd_shadow_signals` + 迁移 `h6c7d8e9f0a1`；
+    registry/adapters/SHADOW_BENCH/benchmarks/analytics 五处同步。
+  - 实盘：`MultiLiveTrader.check_gap_crowd` 内联判定（与影子共用 `evaluate_gap_crowd`
+    纯函数），5m/15m 各自窗口与护栏（0.50/0.56 = 盲测胜率×0.98 保本价），默认 OFF。
+  - 口径保真：与研究 `abs(gap)>=thr` 表达式逐字同构；启动前已开始的窗口不做半途入场。
+- 审阅（独立子代理对抗性审阅）：首轮 **REJECT** —— P0「down_pct 单位错配」（生产传
+  0-1 的 down_chance，而冻结函数按百分比 0-100 计算 → gap 退化为 q−0.995 几乎全窗误触发，
+  会污染影子证据且实盘一开即高频错单）。修复：四个调用点改传百分比
+  （5m `point["down_pct"]` / 15m `round(down_chance×100,1)`）+ 单位契约回归测试；
+  另补影子检测器测试 14 例、修 `_fired` 裁剪与注释。复验 **APPROVE**（无剩余必修项）。
+- 测试与构建：全量 pytest 1531 passed / 15 skipped；前端 build + lint（0 error）。
+- 推送与线上验证：Deploy 流水线 38014852906 全绿；线上 `/api/signals/analytics`
+  含两版本（bench 0.514/0.576、RECORD_ONLY）；`/api/live/channel-diagnostics`
+  显示 enabled=False、max_exec 0.50/0.56、period 5m/15m；影子明细端点可查（新表已建）。
+- 后续（升级条件，研究报告 §5）：影子攒 5m ≥1500 / 15m ≥600 前向事件且滚动
+  excess≥+4pp 才提议升实盘；连续 14 天 excess<0 触发复盘。
+
 ## 执行指示（goal 模式下每轮遵守）
 - 每轮结束把「假设 → 改动 → 结果 → 下一实验」追加到轮次记录，并更新假设账本
 - 只按合同停止条件终止；每轮开始先读本文件与 PREREGISTRATION.md 的冻结约束
