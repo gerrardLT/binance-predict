@@ -193,6 +193,10 @@ class BinancePredictionTrader:
         # 避免模态框频繁打开打满币安 detail 配额
         self._future_cache: dict[str, tuple[int, list[dict], int]] = {}
         self._future_locks: dict[str, asyncio.Lock] = {}
+        # 已发现的未来窗记忆池（period → {start_ms: row}）：币安 topicId 交错分配，
+        # 扫描结果随批次相对锚点的位置漂移；记忆池保证「找到过的窗口不再丢」，
+        # 列表结果因此稳定（2026-10-11）
+        self._future_seen: dict[str, dict[int, dict]] = {}
         # TTL 45s > 前端 30s 轮询间隔，避免每次轮询都 miss 重扫（Low#11）
         self._future_cache_ttl_ms = 45_000
         # 空结果 TTL：扫描偶发被限流/边界返回空，长缓存会把弹窗锁死在「未创建」；
@@ -1032,11 +1036,14 @@ class BinancePredictionTrader:
         """
         now_ms = int(time.time() * 1000)
         await self.list_markets()
-        rows = [
-            {
+        # 记忆池：累积已发现的未来窗（跨调用），并剔除已开盘的
+        seen = self._future_seen.setdefault(period, {})
+        for k in [k for k in seen if k <= now_ms]:
+            seen.pop(k, None)
+        for start, e in self._future_markets.get(period, {}).items():
+            seen[start] = {
                 "window_start": start,
                 "window_end": e.get("end_date"),
-                "ahead_sec": round((start - now_ms) / 1000, 1),
                 "trading_status": "OPEN",
                 "up_price": e.get("up_price"),
                 "down_price": e.get("down_price"),
@@ -1045,24 +1052,35 @@ class BinancePredictionTrader:
                 "topic_id": e.get("topic_id"),
                 "available": True,
             }
-            for start, e in sorted(self._future_markets.get(period, {}).items())
-        ]
-        if rows:
-            return rows[:count]
-        return await self._scan_future_via_detail(period, count, budget, now_ms)
+        if len(seen) < count:
+            # list 不含未来窗（2026-10-11 实测只返回当前市场）→ ID 扫描兜底
+            for r in await self._scan_future_via_detail(period, count, budget, now_ms):
+                seen[r["window_start"]] = r
+        rows = []
+        for k in sorted(seen):
+            r = dict(seen[k])
+            r["ahead_sec"] = round((k - now_ms) / 1000, 1)  # 记忆行按当前时刻重算
+            rows.append(r)
+        return rows[:count]
 
     async def _scan_future_via_detail(
         self, period: str, count: int, budget: int, now_ms: int
     ) -> list[dict]:
-        """兜底：list 无未来窗时按 marketTopicId 猜测扫描（并发分块 + 提前终止）。"""
+        """兜底：list 无未来窗时按 marketTopicId 双向扫描（对称向外 + 提前终止）。
+
+        币安 topicId 跨币种/周期交错分配，未来窗可能落在锚点之后也可能之前
+        （兄弟函数 _fetch_market_via_detail 已按双向处理）；旧实现只向后扫，
+        当批次落在锚点前时恒空、窗口数随批次位置漂移（2026-10-11 修）。
+        对称向外扫（anchor±1, ±2 …）让两侧近处窗口都能尽快命中。
+        """
         anchor_tuple = await self._list_btc_anchor(period)
         if not anchor_tuple:
             return []
         anchor, _ = anchor_tuple
 
         prefix = f"btc-updown-{period}-"
-        tids = list(range(anchor + 1, anchor + budget + 1))
-        WAVE = 20  # 每波并发 20 个 detail；波间退避，凑够即停
+        WAVE = 10          # 每侧每波 10 个（对称两侧合计 20 并发，与原突发量一致）
+        MISS_STREAK = 300  # 单侧连续未命中上限（须大于批次间最大夹杂间隔）
         collected: list[dict] = []
 
         def _to_row(tid: int, d: dict | None) -> dict | None:
@@ -1094,26 +1112,31 @@ class BinancePredictionTrader:
                 "available": True,
             }
 
-        miss_streak = 0
+        miss = {1: 0, -1: 0}  # 锚点两侧各自的连续未命中计数
         rate_limited = False
         try:
-            for i in range(0, len(tids), WAVE):
-                wave = tids[i:i + WAVE]
+            for i in range(1, budget + 1, WAVE):
+                if len(collected) >= count:
+                    break  # 提前终止：已凑够
+                wave: list[int] = []
+                for k in range(i, min(i + WAVE, budget + 1)):
+                    wave.extend((anchor - k, anchor + k))  # 对称向外
                 details = await asyncio.gather(
                     *(self._detail_one(t) for t in wave), return_exceptions=True)
                 for tid, d in zip(wave, details):
+                    side = 1 if tid > anchor else -1
                     if isinstance(d, DetailRateLimited):
                         rate_limited = True
                         continue
                     if isinstance(d, BaseException):
-                        miss_streak += 1
+                        miss[side] += 1
                         continue
                     row = _to_row(tid, d)
                     if row is not None:
                         collected.append(row)
-                        miss_streak = 0
+                        miss[side] = 0
                     else:
-                        miss_streak += 1
+                        miss[side] += 1
                 if rate_limited:
                     # 限流即中止本轮：继续打波会升级 418 封禁，
                     # 拖垮与下单热路径共享的 Key/配额；返回已收集结果
@@ -1121,12 +1144,8 @@ class BinancePredictionTrader:
                         "scan_future_via_detail | {} | 命中限流，中止本轮（已收集 {}）",
                         period, len(collected))
                     break
-                if len(collected) >= count:
-                    break  # 提前终止：已凑够，不再打后续波
-                if miss_streak >= 300:
-                    # 连续 300 个 ID 无 BTC 命中：到达创建前沿（后续 ID 均未创建）。
-                    # 阈值须大于两创建批次间的最大夹杂间隔（实测批次间夹数百个
-                    # 其他市场 ID，旧阈值 60 会在批次间提前停 → 误报「未创建」）
+                if miss[1] >= MISS_STREAK and miss[-1] >= MISS_STREAK:
+                    # 两侧均连续 300 个 ID 无 BTC 命中：到达创建前沿
                     break
                 # 波间退避：平滑突发，冲击 sapi 配额
                 await asyncio.sleep(0.2)
@@ -1134,6 +1153,9 @@ class BinancePredictionTrader:
             logger.warning("_scan_future_via_detail | {} | {}", period, e)
 
         collected.sort(key=lambda r: r["window_start"])
+        logger.info(
+            "scan_future_via_detail | {} | anchor={} budget={} 命中 {} 个{}",
+            period, anchor, budget, len(collected), "（限流中止）" if rate_limited else "")
         return collected[:count]
 
     def _future_lock(self, period: str) -> asyncio.Lock:

@@ -31,3 +31,34 @@ async def test_empty_scan_uses_short_ttl(monkeypatch):
     assert calls["n"] == 2
     assert windows == [{"window_start": 111, "window_end": 222}]
     assert t._future_cache["5m"][2] == t._future_cache_ttl_ms
+
+
+@pytest.mark.asyncio
+async def test_future_windows_stable_across_scans(monkeypatch):
+    """记忆池：首次扫描到的窗口，即使后续扫描返回空也要保留（列表不再随扫描漂移）。"""
+    import time
+
+    t = BinancePredictionTrader()
+    start = int(time.time() * 1000) + 300_000
+    row = {"window_start": start, "window_end": start + 300_000, "ahead_sec": 300.0,
+           "trading_status": "OPEN", "up_price": 0.5, "down_price": 0.5,
+           "up_token": "u", "down_token": "d", "topic_id": 1, "available": True}
+    calls = {"n": 0}
+
+    async def fake_list_markets():
+        t._future_markets = {}
+        return []
+
+    async def fake_scan(period, count, budget, now_ms):
+        calls["n"] += 1
+        return [dict(row)] if calls["n"] == 1 else []
+
+    monkeypatch.setattr(t, "list_markets", fake_list_markets)
+    monkeypatch.setattr(t, "_scan_future_via_detail", fake_scan)
+
+    first = await t.scan_future_markets("5m", count=8)
+    assert [r["window_start"] for r in first] == [start]
+
+    second = await t.scan_future_markets("5m", count=8)   # 本轮扫描为空
+    assert [r["window_start"] for r in second] == [start]
+    assert calls["n"] == 2
