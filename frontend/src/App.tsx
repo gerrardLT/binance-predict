@@ -2046,7 +2046,7 @@ function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }
 ${names}
 首腿 ${amtNum}U（限 0.1~10U），赢则本金+利润滚入下一腿，输即终止。
 `
-      + `提前下单：本窗报价 ≥0.95（距收盘 >60s）或 距收盘 ≤15s 且领先 ≥3bp 时，即提前押下一腿，
+      + `提前下单：本窗报价 ≥0.95（距收盘 60~150s）或 距收盘 ≤15s 且领先 ≥3bp 时，即提前押下一腿，
 `
       + `押注额＝本金+按报价算得的利润。
 `

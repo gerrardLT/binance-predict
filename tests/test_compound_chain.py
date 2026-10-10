@@ -29,10 +29,11 @@ def test_decide_and_next_stake():
 
 
 def test_early_trigger_rules():
-    # 条件①：剩余 >60s 且领先一侧报价 ≥0.95
+    # 条件①：剩余 60~150s 且领先一侧报价 ≥0.95
     assert early_trigger("UP", 0.96, 0.04, 100.0, 100.0, 120_000) == "quote"
     assert early_trigger("UP", 0.94, 0.06, 100.0, 100.0, 120_000) is None  # 报价不够
     assert early_trigger("UP", 0.96, 0.04, 100.0, 100.0, 50_000) is None   # 剩余不足 60s
+    assert early_trigger("UP", 0.96, 0.04, 100.0, 100.0, 200_000) is None  # 剩余超 150s 上限
     # 条件②：剩余 ≤15s 且 |现价−开盘| ≥3bp 且方向一致
     assert early_trigger("UP", 0.60, 0.40, 100.04, 100.0, 10_000) == "lead"
     assert early_trigger("DOWN", 0.40, 0.60, 99.96, 100.0, 10_000) == "lead"

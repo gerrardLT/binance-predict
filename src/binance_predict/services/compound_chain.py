@@ -4,7 +4,7 @@
 - 全链同一方向、同一执行价护栏；输即终止。提前下单使最大亏损可能扩大到「当前腿 + 已提前下的下一腿」。
 - 提前下单（用户拍板 2026-10-10）：腿 N 成交后盯本窗实时报价与 BTC 领先幅度，命中任一条件
   即把腿 N+1 提前押上，锚定开盘附近的 0.5 报价（未来窗开盘报价中位 0.51，89% 落在 0.45~0.55）：
-    ① 距收盘 >60s 且领先一侧报价 ≥0.95
+    ① 距收盘 60~150s 且领先一侧报价 ≥0.95
     ② 距收盘 ≤15s 且 |现价−开盘| ≥3bp 且方向与下注一致
   两条件都未命中则退回「收盘后按 K 线定输赢再下」的保守路径。
 - 判赢输用币安 5m K 线 open/close（与 sentiment 归档同源），不等 7 分钟的结算器。
@@ -40,6 +40,7 @@ VERSION_PREFIX = "manual_chain_"
 POLL_S = 2                # 提前下单条件的盯盘间隔
 EARLY_QUOTE = 0.95        # 条件① 领先一侧报价阈值
 EARLY_QUOTE_MIN_REMAIN_MS = 60_000
+EARLY_QUOTE_MAX_REMAIN_MS = 150_000   # 条件① 上限：开盘前段冲高易回落，只在末段触发
 LEAD_MS = 15_000          # 条件② 距收盘时间
 LEAD_MIN_BP = 3.0         # 条件② 领先幅度（bp）
 
@@ -97,7 +98,7 @@ def early_trigger(direction: str, up: float | None, down: float | None,
         return None
     if ("UP" if up >= down else "DOWN") != direction:
         return None  # 市场领先方向已与下注方向相反：不下
-    if remain_ms > EARLY_QUOTE_MIN_REMAIN_MS and max(up, down) >= EARLY_QUOTE:
+    if EARLY_QUOTE_MIN_REMAIN_MS < remain_ms <= EARLY_QUOTE_MAX_REMAIN_MS and max(up, down) >= EARLY_QUOTE:
         return "quote"
     if remain_ms <= LEAD_MS and mid and open_price and open_price > 0:
         bp = (mid - open_price) / open_price * 1e4
