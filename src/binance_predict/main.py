@@ -5417,10 +5417,21 @@ async def _build_signal_health(db: AsyncSession) -> dict:
             return b.win_rate
         return SHADOW_BENCH.get(key, (None,))[0] if scope == "shadow" else None
 
-    return shs.assemble_report(
+    report = shs.assemble_report(
         shs.shadow_events(shadow_rows, _shadow_breakeven, _shadow_realized_ev, reg_lookup),
         shs.live_events(orders, reg_lookup), shadow_meta, live_meta, bench,
     )
+    # 影子检测器运行态（2026-10-10 新增）：让「采集是否在跑」无需等信号即可自查——
+    # 采样循环型检测器（gap_crowd / absorption）不在 kline 落表链路里，此前无任何
+    # 可观测口径，新版本上线后只能靠「有没有落表」间接判断（触发稀时无法区分
+    # 「没触发」与「检测器没跑」）。纯内存快照，零 DB 成本。
+    report["detectors"] = {
+        "gap_crowd": (gap_crowd_shadow_detector.status()
+                      if gap_crowd_shadow_detector is not None else None),
+        "absorption": (absorption_shadow_detector.status()
+                       if absorption_shadow_detector is not None else None),
+    }
+    return report
 
 
 async def _signal_health_report(db: AsyncSession, refresh: bool = False) -> dict:

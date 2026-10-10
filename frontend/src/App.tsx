@@ -175,6 +175,9 @@ interface HealthReport {
   calibration: CalibrationBucket[]
   scheduler: Record<string, unknown>
   llm: Record<string, unknown>
+  // 影子检测器运行态（2026-10-10）：采样循环型检测器（gap_crowd/absorption）的
+  // 触发/结算计数与 fired 窗口数；null = 未装配（开关关闭或装配失败）
+  detectors?: Record<string, Record<string, unknown> | null>
   summary: string
 }
 
@@ -1359,7 +1362,7 @@ const EXECUTION_BADGE: Record<string, { label: string; cls: string }> = {
 const FAMILY_LABELS: Record<string, string> = {
   candlestick_reversal: '蜡烛反转', kline_reversal: 'K线反转', combo: '组合条件',
   kline: 'K线/组合', misalignment: '情绪/报价', pattern: '形态触价',
-  absorption: '吸收跟随', firsthit: '首触反转',
+  absorption: '吸收跟随', firsthit: '首触反转', gap_crowd: '报价-人群错位',
   scene: '场景突破', quote_edge: '报价边缘', x4: '情绪错位',
   s2_cond: 'S2条件', nextbar: '次根方向', legacy: '其他',
 }
@@ -1367,7 +1370,7 @@ const ROLE_LABELS: Record<string, string> = {
   PRIMARY: '主版本', CONTROL: '严格对照', COMPONENT: '归因组件',
   HYPOTHESIS: '预注册潜力', STRATEGY: '策略',
 }
-const FAMILY_ORDER = ['candlestick_reversal', 'scene', 'quote_edge', 'x4', 's2_cond', 'nextbar', 'absorption', 'firsthit', 'combo', 'kline_reversal', 'pattern', 'misalignment', 'kline', 'legacy']
+const FAMILY_ORDER = ['candlestick_reversal', 'scene', 'quote_edge', 'x4', 'gap_crowd', 's2_cond', 'nextbar', 'absorption', 'firsthit', 'combo', 'kline_reversal', 'pattern', 'misalignment', 'kline', 'legacy']
 const familyRank = (family: string) => {
   const rank = FAMILY_ORDER.indexOf(family)
   return rank < 0 ? FAMILY_ORDER.length : rank
@@ -5086,6 +5089,24 @@ function AgentHealthView() {
           ) : (
             Object.entries(report.llm).map(([k, v]) => (
               <MetricKV key={k} label={k} value={typeof v === 'object' ? JSON.stringify(v) : String(v)} />
+            ))
+          )}
+        </Card>
+
+        {/* 影子检测器运行态（2026-10-10）：采样循环型检测器不看「有没有落表」也能判断
+            是否在跑——触发稀时（如 gap_crowd 约 19 次/天）此前无法区分「没触发」与「没跑」 */}
+        <Card title="影子检测器">
+          {Object.keys(report.detectors || {}).length === 0 ? (
+            <div className="text-center text-ink-55 py-3 text-xs">无数据</div>
+          ) : (
+            Object.entries(report.detectors || {}).map(([k, v]) => (
+              <MetricKV
+                key={k}
+                label={k}
+                value={v == null
+                  ? '未装配'
+                  : Object.entries(v).map(([kk, vv]) => `${kk}=${vv}`).join(' · ')}
+              />
             ))
           )}
         </Card>
