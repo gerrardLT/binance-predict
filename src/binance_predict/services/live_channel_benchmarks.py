@@ -59,6 +59,10 @@ _FROZEN_BENCHMARKS: dict[str, tuple[float, int | None]] = {
     "hm_inside_15m_v2": (0.557, 237),
     "ih_inside_15m_v2": (0.546, 183),
     "hm_inside_5m_v2": (0.585, 371),
+    # 报价-人群错位族（2026-10-10）：盲测段点估计（首次且唯一一次读取），
+    # 与 main.py:SHADOW_BENCH 同口径（护栏 = 胜率×0.98 费后保本价）。
+    "gap_crowd_5m_v1": (0.514, 947),
+    "gap_crowd_15m_v1": (0.576, 250),
     **{channel: (win_rate, sample_size)
        for channel, (win_rate, _ev, sample_size) in CANDLESTICK_BACKTEST.items()},
 }

@@ -39,12 +39,14 @@ EXPECTED_ANALYTICS_VERSIONS = (
     # 2026-10-05 BRK 假突破回归族（两个确认级，同名实盘默认 OFF）
     "brkrv_brk8h_15m_v1", "brkrv_brk8h_5m_v1",
     "candle_hm_bull_5m_event_v1", "candle_hm_bull_15m_event_v1",
+    # 2026-10-10 报价-人群错位族（gap_crowd_shadow_signals 表，同名实盘默认 OFF）
+    "gap_crowd_5m_v1", "gap_crowd_15m_v1",
 )
 
 
 def test_registry_matches_all_physical_shadow_versions_in_order() -> None:
     assert SHADOW_VERSIONS == EXPECTED_ANALYTICS_VERSIONS
-    assert len(SHADOW_VERSION_SPECS) == 70
+    assert len(SHADOW_VERSION_SPECS) == 72
     for version in ("candle_hm_bull_5m_event_v1", "candle_hm_bull_15m_event_v1"):
         spec = SHADOW_VERSION_SPECS[version]
         assert spec.family == "candlestick_reversal"

@@ -104,6 +104,11 @@ _VERSION_ROWS: tuple[tuple[str, SourceType, str, str, str], ...] = (
     # 不在此投影表重复展开，避免同窗主版本/严格子集/组件被统计成多次事件。
     ("candle_hm_bull_5m_event_v1", SourceType.KLINE, "5m", "target_bar", "row"),
     ("candle_hm_bull_15m_event_v1", SourceType.KLINE, "15m", "target_bar", "row"),
+    # 报价-人群错位族（2026-10-10 研究 run 20261009T191824Z-reversal-state-certainty
+    # 盲测确认 + 用户拍板注册影子+实盘，实盘默认 OFF）：窗后半段 gap≤−0.05 → 买 UP；
+    # 同窗入场（same_window），direction 按行（row，恒 UP）。
+    ("gap_crowd_5m_v1", SourceType.GAP_CROWD, "5m", "same_window", "row"),
+    ("gap_crowd_15m_v1", SourceType.GAP_CROWD, "15m", "same_window", "row"),
 )
 
 
@@ -141,6 +146,8 @@ def _family_of(version: str, source: SourceType) -> str:
         return "kline_reversal"
     if version.startswith(("hm_touch_", "s5_deep_", "s1_dyn_")):
         return "pattern"
+    if version.startswith("gap_crowd_"):
+        return "gap_crowd"
     return source.value
 
 SHADOW_VERSION_SPECS: dict[str, ShadowVersionSpec] = {}

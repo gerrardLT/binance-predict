@@ -14,6 +14,9 @@
   AbsorptionShadowDetector 滚动缓冲）→ 跟随 BTC 位移方向押注（动态 UP/DOWN，5m 市场）。
 - firsthit：5m 采样循环按本窗完整历史重放 DOWN 首次进入 (0.005,0.1] 的触发点，
   复用 firsthit_shadow_detector 的特征/门纯函数 → 命中后买 DOWN（5m 市场）。
+- gap_crowd：采样循环喂价内联判定（5m 与 15m 市场各自调用）——窗后半段预测市场报价
+  比人群投票倾向便宜 ≥5pp → 买便宜侧 UP；判定函数与影子同源
+  （gap_crowd_shadow_detector.evaluate_gap_crowd 纯函数）。
 
 护栏数值依据：盈亏平衡入场价 entry* = wr×(1−FEE)（干净口径历史胜率）：
 S1 wr64.4%→0.63 / S5 78.5%→0.77 / S2 53.6%→0.525 / S4 55.4%→0.54 /
@@ -373,6 +376,28 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     "brkrv_brk8h_5m_v1": ChannelSpec(
         "brkrv_brk8h_5m_v1", "kline_reversal", "5m", "DOWN", 0.55,
         "BRK假突破8h高回归·5m（押DOWN）",
+    ),
+    # --- gap_crowd 族（2026-10-10 研究 run 20261009T191824Z-reversal-state-certainty
+    # 盲测确认 + 用户拍板注册影子+实盘，实盘默认全部 OFF）：
+    # 「窗后半段，预测市场报价比人群投票倾向便宜 ≥5pp → 买便宜侧（UP）」。
+    # 规则冻结：gap = up_price − (1 − down_pct/100) ≤ −0.05、elapsed ≥ 窗长×0.5、
+    # 距收盘 ≥60s、0.02 ≤ up_price ≤ 0.98；判定函数单点事实源见
+    # gap_crowd_shadow_detector.evaluate_gap_crowd（影子与实盘同源同口径）。
+    # 依据（盲测 51 天，首次且唯一一次读取）：5m n=947 胜率 51.4% 均价 0.458
+    # EV +0.036 CI[+0.010,+0.060]；15m n=250 胜率 57.6% 均价 0.479 EV +0.077
+    # CI[+0.016,+0.145]；三费用口径全正；excess vs 报价桶校准两段稳定 +6.8pp。
+    # 护栏 = 盲测胜率 × 0.98（费后保本入场价，与 KREV/CRV/BRK 同口径）：
+    # 5m 51.4%×0.98≈0.504→0.50；15m 57.6%×0.98≈0.564→0.56。
+    # ⚠️ 研究分级 L0（发现段 25 天功效不足未过 FDR，按预注册不得正式晋级）：
+    # 注册实盘仅为前向影子/小金额验证通道，升级条件 5m ≥1500 / 15m ≥600 前向事件
+    # 且滚动 excess≥+4pp（见研究报告 §5）；开启前先看影子前向样本。
+    "gap_crowd_5m_v1": ChannelSpec(
+        "gap_crowd_5m_v1", "gap_crowd", "5m", "UP", 0.50,
+        "报价落后人群·5m后半窗（押UP）",
+    ),
+    "gap_crowd_15m_v1": ChannelSpec(
+        "gap_crowd_15m_v1", "gap_crowd", "15m", "UP", 0.56,
+        "报价落后人群·15m后半窗（押UP）",
     ),
 }
 

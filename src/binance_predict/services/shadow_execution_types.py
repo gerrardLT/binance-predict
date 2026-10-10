@@ -17,6 +17,7 @@ class SourceType(str, Enum):
     PATTERN = "pattern"
     ABSORPTION = "absorption"
     FIRSTHIT = "firsthit"
+    GAP_CROWD = "gap_crowd"
 
 
 class ExecutionMode(str, Enum):

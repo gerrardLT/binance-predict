@@ -457,6 +457,17 @@ class Settings(BaseSettings):
     # 只记录不下注，不进 LIVE_CHANNELS；实验期不得改阈值/首次触达/入场时点。
     firsthit_forward_enabled: bool = True
 
+    # --- 报价-人群错位影子信号（gap_crowd 族，2026-10-10）---
+    # 研究 run 20261009T191824Z-reversal-state-certainty 盲测确认（首次且唯一一次读取）：
+    # 5m/15m 窗后半段（elapsed ≥ 窗长×0.5）预测市场报价比人群投票倾向便宜 ≥5pp
+    # （gap = up_price − (1 − down_pct/100) ≤ −0.05）且距收盘 ≥60s → 买便宜侧 UP。
+    # 盲测 5m n=947 胜率 51.4% EV +0.036 CI[+0.010,+0.060]；15m n=250 胜率 57.6%
+    # EV +0.077 CI[+0.016,+0.145]；三费用口径全正、excess vs 报价桶校准两段稳定 +6.8pp。
+    # 研究分级 L0（发现段功效不足未过 FDR）；用户拍板注册影子+实盘（实盘默认 OFF），
+    # 以影子前向样本复核升级条件（5m ≥1500 / 15m ≥600 事件）。触发落 PENDING，
+    # 窗关闭后 K 线口径结算 → SETTLED；只记录不下注，物理隔离于下单路径。
+    gap_crowd_shadow_enabled: bool = True
+
     # --- S2 条件单影子信号（s2_cond 族，2026-09-06）---
     # 研究结论落地：S2（bear_exhaust，破 4h 支撑+收阴+放量）开盘即买 UP 的 EV≈−0.042
     # 不赚钱；等次周期窗内 t=4/t=5 判价的条件单更优（价跌时 UP token 变便宜，低买 UP 的

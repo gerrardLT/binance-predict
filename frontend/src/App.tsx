@@ -1179,6 +1179,14 @@ const SIGNAL_INFO: Record<string, { name: string; desc: string; retired?: boolea
     name: '吸收跟随·TD150（随BTC方向）',
     desc: '同 TD120 机制，TD=窗开 150s（多给 30s 让报价反应，触发更少、欠反应更纯）。真实价复核 RECENT EV +0.105 CI[+0.050,+0.165]（胜率 88.5%）；护栏 0.86（88.5%×0.98 下方）。与 TD120 同窗互斥（至多一单成交）。',
   },
+  gap_crowd_5m_v1: {
+    name: '报价落后人群·5m后半窗（押UP）',
+    desc: '5m 窗后半段（elapsed≥150s），预测市场 UP 报价比人群投票倾向便宜 ≥5 个百分点（gap=up_price−(1−down_pct/100)≤−0.05）且距收盘≥60s → 买便宜侧 UP。机制：平台报价更新慢于人群信息，错位在窗内被纠正（触发后 |gap| 平均收缩 −0.07~−0.09，参与人数越多超额越大）。研究盲测（51 天首次读取）n=947 胜率 51.4% 均价 0.458 EV +0.036 CI[+0.010,+0.060]，三费用口径全正。⚠ 研究分级 L0（发现段功效不足未过 FDR）：实盘默认关闭，护栏 0.50（51.4%×0.98 保本价）；建议先看影子前向样本（≥1500 事件且滚动 excess≥+4pp）。',
+  },
+  gap_crowd_15m_v1: {
+    name: '报价落后人群·15m后半窗（押UP）',
+    desc: '同 5m 口径，作用于 15m 市场（elapsed≥450s 且 gap≤−0.05 且距收盘≥60s）→ 买便宜侧 UP。研究盲测 n=250 胜率 57.6% 均价 0.479 EV +0.077 CI[+0.016,+0.145]，高参与度组超额最高（+17.3pp）。⚠ 研究分级 L0（15m 发现段仅 6 天报价，样本更薄）：实盘默认关闭，护栏 0.56（57.6%×0.98 保本价）；建议先看影子前向样本（≥600 事件）。',
+  },
   firsthit_down_v1: {
     name: '首触G0基底（押DOWN）',
     desc: '5m 窗内 DOWN 报价首次进入 (0.005,0.1] → 买 DOWN；实时重放本窗完整历史，只认真实第一触。默认关闭；开启后每通道每窗至多一单。G0/G1/G3 为用户确认的独立下单通道，同窗三门全中且全开启时最多 3 单。执行价护栏 0.08，实际成交均价高于护栏弃单，不追价。',
@@ -6914,6 +6922,9 @@ const SHADOW_META: Record<string, { label: string; color: string }> = {
   hm_inside_15m_v2: { label: '15m 孕线上吊线 Inside Bar→DOWN', color: 'var(--chart-2)' },
   ih_inside_15m_v2: { label: '15m 孕线倒垂线 Inside Bar→UP', color: 'var(--chart-3)' },
   hm_inside_5m_v2: { label: '5m 孕线上吊线精选 Inside Bar→DOWN', color: 'var(--chart-4)' },
+  // 2026-10-10 报价-人群错位族（专用表 gap_crowd_shadow_signals，影子+实盘通道默认OFF）
+  gap_crowd_5m_v1: { label: '报价落后人群 5m后半窗→UP', color: 'var(--chart-9)' },
+  gap_crowd_15m_v1: { label: '报价落后人群 15m后半窗→UP', color: 'var(--chart-10)' },
 }
 /* 场景曲线色 = chart-1..5。
    注意：label 是 recharts 的 dataKey 本身，改 label 会同时改曲线与图例（AGENTS.md 明示），
@@ -6932,6 +6943,8 @@ const SCENE_META: Record<string, { label: string; color: string }> = {
 // 2026-09-04 退役的纯影子版本（hm_touch_down_v1/v2、quote_momentum_v3）在此前置
 // 【已退役：理由】，与 SIGNAL_INFO 的口径一致——说明保留供审计，但不得让人误以为还在采集。
 const ANALYTICS_EXTRA_DESC: Record<string, string> = {
+  gap_crowd_5m_v1: '报价-人群错位·5m（2026-10-10 研究 run 20261009T191824Z-reversal-state-certainty 盲测确认）：5m 窗后半段（elapsed≥150s）预测市场 UP 报价比人群投票倾向便宜 ≥5pp（gap=up_price−(1−down_pct/100)≤−0.05）且距收盘 ≥60s → 买便宜侧 UP。机制：平台报价更新慢于人群信息，错位在窗内被纠正（|gap| 平均收缩 −0.07~−0.09；参与人数越多超额越大，高参与组 excess +7.3pp）。盲测 51 天（首次且唯一一次读取）n=947 胜率 51.4% 均价 0.458 EV +0.036 CI[+0.010,+0.060]，三费用口径全正、excess vs 报价桶校准两段稳定 +6.8pp。⚠ 研究分级 L0（发现段 25 天功效不足未过 FDR，按预注册不得正式晋级）：影子持续记录，同名实盘通道默认关闭，护栏 0.50（51.4%×0.98 保本价）。升级条件：前向 ≥1500 事件且滚动 excess≥+4pp，连续 14 天 excess<0 触发复盘。',
+  gap_crowd_15m_v1: '报价-人群错位·15m：同 5m 口径作用于 15m 市场（elapsed≥450s 且 gap≤−0.05 且距收盘 ≥60s）→ 买便宜侧 UP。盲测 n=250 胜率 57.6% 均价 0.479 EV +0.077 CI[+0.016,+0.145]，高参与度组 excess +17.3pp。⚠ 研究分级 L0（15m 隔离带仅 6 天报价，发现段样本更薄）：影子持续记录，实盘默认关闭，护栏 0.56（57.6%×0.98 保本价）。升级条件：前向 ≥600 事件且滚动 excess≥+4pp。',
   krev_a_v1: 'K 线反转 A：15m 距前低≤−0.09 ATR + 5 根高效率阴跌 + 周期内 3 根 5m 子阴齐跌 → 押次根 15m 收阳 UP。影子持续记录；同名实盘通道默认关闭，护栏 0.629，仅开盘后 90 秒内的新鲜命中派单。',
   krev_b_v1: 'K 线反转 B：15m 区间贴底 + 5 根高效率阴跌 + 周期内 3 根 5m 子阴齐跌 → 押次根 15m 收阳 UP。影子持续记录；同名实盘通道默认关闭，护栏 0.621，仅开盘后 90 秒内的新鲜命中派单。',
   crv_hi_brk20_15m_v1: 'CRV 高位突破：15m 阳线突破 20 根高 ∧ pos100>0.90 → 押次根收阴 DOWN。2026-10-04 720D 预注册穷举+90D 盲测 n=212 胜率 63.7%（下界 57.0%），13/13 月为正。影子持续记录；同名实盘通道默认关闭，护栏 0.62。',

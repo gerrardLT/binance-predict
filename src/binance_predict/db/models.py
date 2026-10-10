@@ -1214,6 +1214,111 @@ class AbsorptionShadowSignal(Base):
 
 
 # ============================================================
+# 报价-人群错位影子信号表（gap_crowd 族，2026-10-10）
+# ============================================================
+
+class GapCrowdShadowSignal(Base):
+    """报价-人群错位影子信号（gap_crowd 族）：5m/15m 窗后半段，预测市场报价比
+    人群投票倾向便宜 ≥5pp 时买便宜一侧（UP）的前向重放。
+
+    冻结口径（研究 run 20261009T191824Z-reversal-state-certainty，盲测确认；规则冻结勿动）：
+      gap = up_price − (1 − down_pct/100)（市场隐含涨概率 − 人群看涨倾向）；
+      触发 = 窗内 elapsed ≥ 窗长×0.5 的首个采样点，且 gap ≤ −0.05、距收盘 ≥60s、
+        0.02 ≤ up_price ≤ 0.98 → 买 UP；
+      结算 = 触发窗 sign(close−open)（K 线口径，与研究的结算代理同定义）。
+      盲测（2026-08-20→10-09）：5m n=947 胜率 51.4% EV+0.036 CI[+0.010,+0.060]；
+      15m n=250 胜率 57.6% EV+0.077 CI[+0.016,+0.145]；三费用口径全正。
+      研究分级 L0（发现段功效不足未过 FDR）；用户拍板注册影子+实盘（实盘默认 OFF），
+      以影子前向样本复核升级条件（5m ≥1500 事件 / 15m ≥600 事件）。
+    只记录不下注：触发落 PENDING（采样循环内联，与实盘同一采样点），窗关闭后由
+    结算循环拉 K 线判胜负 → SETTLED；平局/超期 → VOID（不污染统计）。
+    本表不被下单代码引用（实盘对账走 signal_version+window_start）。
+    """
+    __tablename__ = "gap_crowd_shadow_signals"
+    __table_args__ = (
+        UniqueConstraint("version", "window_start", name="uq_gap_crowd_version_window"),
+        Index("ix_gap_crowd_status", "status"),
+        Index("ix_gap_crowd_window_start", "window_start"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    version: Mapped[str] = mapped_column(
+        String(32), nullable=False,
+        comment="信号口径版本：gap_crowd_5m_v1 / gap_crowd_15m_v1",
+    )
+    market_period: Mapped[str] = mapped_column(
+        String(5), nullable=False, default="5m", server_default="5m",
+        comment="市场周期：5m | 15m（与 PredictionMarketSample.market_period 同语义）",
+    )
+    window_start: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, comment="触发窗 start_time（ms）"
+    )
+    window_end: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, comment="触发窗 end_time（ms）"
+    )
+    trigger_ts: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, comment="触发采样时刻（ms，窗内首个满足全部门）"
+    )
+    elapsed_s: Mapped[float] = mapped_column(
+        Float, nullable=False, comment="触发时点窗内已耗时（秒）"
+    )
+    remain_s: Mapped[float] = mapped_column(
+        Float, nullable=False, comment="触发时点距收盘剩余（秒，≥60）"
+    )
+    gap: Mapped[float] = mapped_column(
+        Float, nullable=False, comment="gap = up_price − (1 − down_pct/100)（≤−0.05 触发）"
+    )
+    down_pct: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="触发时刻人群看跌倾向（%，原表口径）"
+    )
+    direction: Mapped[str] = mapped_column(
+        String(4), nullable=False, default="UP", comment="押注方向：恒 UP（买报价便宜侧）"
+    )
+    up_price: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="触发时刻 UP token 报价"
+    )
+    down_price: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="触发时刻 DOWN token 报价"
+    )
+    participants: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="触发时刻参与人数（机制分层维度，不作门）"
+    )
+    trade_volume: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="触发时刻成交量（机制分层维度，不作门）"
+    )
+    # ---- 入场报价（触发时刻真实 token 价，与 quote_edge/absorption 同口径）----
+    entry_up_price: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="入场 UP token 真实价（押 UP 的入场价，无溢价）"
+    )
+    entry_down_price: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="入场 DOWN token 真实价（审计对照）"
+    )
+    entry_quote_ts: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, comment="入场报价采样时刻（ms，= trigger_ts）"
+    )
+    entry_quote_kind: Mapped[str | None] = mapped_column(
+        String(8), nullable=True, comment="报价来源：real（token 价）"
+    )
+    # ---- 结算（K 线口径，窗关闭后结算循环写入）----
+    settle_outcome: Mapped[str | None] = mapped_column(
+        String(10), nullable=True, comment="触发窗结算方向 UP | DOWN（K 线 sign(close−open)）"
+    )
+    win: Mapped[bool | None] = mapped_column(
+        Boolean, nullable=True, comment="命中 = 窗 outcome == direction"
+    )
+    ev_at_entry: Mapped[float | None] = mapped_column(
+        Float, nullable=True, comment="单注 EV（真实价口径）：赢 0.98/q−1 / 输 −1（费 2% 无溢价）"
+    )
+    status: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="PENDING", server_default="PENDING",
+        comment="PENDING（待结算）| SETTLED（已结算）| VOID（平局/超期无数据）",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+# ============================================================
 # 5m DOWN 首触反转影子信号表（firsthit_down 族，2026-09-07）
 # ============================================================
 

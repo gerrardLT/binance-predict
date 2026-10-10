@@ -1,4 +1,4 @@
-"""Pure adapters from the five legacy shadow tables to normalized events."""
+"""Pure adapters from the six legacy shadow tables to normalized events."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,6 +9,7 @@ from sqlalchemy import and_, select
 from binance_predict.db.models import (
     AbsorptionShadowSignal,
     FirstHitShadowSignal,
+    GapCrowdShadowSignal,
     KlineShadowSignal,
     MisalignmentSignal,
     PatternShadowSignal,
@@ -194,6 +195,16 @@ SHADOW_SOURCE_ADAPTERS: tuple[ShadowSourceAdapter, ...] = (
         lambda r: "DOWN", _firsthit_entry,
         lambda r: int(r.trigger_ts),
         lambda r: int(r.trigger_ts),
+        lambda _r: None,
+    ),
+    # gap_crowd 族（2026-10-10）：报价-人群错位，同窗入场（买便宜侧 UP），
+    # 触发时刻 = trigger_ts；结算走 K 线口径（settle_outcome/win 落库）。
+    ShadowSourceAdapter(
+        SourceType.GAP_CROWD, GapCrowdShadowSignal,
+        lambda r: int(r.window_start), lambda r: int(r.window_start),
+        lambda r: str(r.direction), _entry_price,
+        lambda r: int(r.trigger_ts),
+        lambda r: _optional_int(r.entry_quote_ts),
         lambda _r: None,
     ),
 )

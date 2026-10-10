@@ -64,6 +64,7 @@ from .models.schemas import (
     NotifyConfigResetRequest,
 )
 from .services.absorption_shadow_detector import AbsorptionShadowDetector
+from .services.gap_crowd_shadow_detector import GapCrowdShadowDetector
 from .services.agent_scheduler import AgentScheduler
 from .services.brk_reversion_detector import BrkReversionDetector
 from .services.combo_shadow_detector import ComboShadowDetector
@@ -214,6 +215,7 @@ candlestick_shadow_detector: CandlestickShadowDetector | None = None
 # 吸收/欠反应跟随影子检测器全局实例（absorption_follow_v1 族：TD120/150 双 variant
 # trailing 14d 滚动标定，报价对 BTC 位移欠反应→跟随补涨，只记录不下注）
 absorption_shadow_detector: AbsorptionShadowDetector | None = None
+gap_crowd_shadow_detector: GapCrowdShadowDetector | None = None
 
 # S2 条件单影子检测器全局实例（s2_cond_t4_v1/s2_cond_t5d_v1 族：实盘 S2(bear_exhaust)
 # 派生窗内 t=4/t=5 判价条件确认 → 押次周期 UP，落 kline_shadow_signals version 隔离，
@@ -309,6 +311,28 @@ async def _handle_15m_quote(quote_15m, ts_ms: int, *, persist: bool) -> None:
             await db.commit()
     except Exception as e:
         logger.warning("15m 市场采样入库失败: {}", e)
+    # gap_crowd 族（15m）：仅 15s 对齐采样路径判定（persist=True，与研究 15s 采样
+    # 网格同口径；边界加速路径 persist=False 不参与）。与影子同一采样点、同源纯函数。
+    try:
+        if quote_15m.start_date and quote_15m.end_date and quote_15m.down_chance is not None:
+            # ⚠ 单位：evaluate_gap_crowd 的 down_pct 是**百分比**（0-100，与
+            # prediction_market_samples.down_pct 同口径）；quote_15m.down_chance 是
+            # 0-1 小数，必须 ×100 后传入（漏转会让 gap 退化为 q−0.995 全窗误触发）。
+            down_pct_15m = round(quote_15m.down_chance * 100, 1)
+            if multi_live_trader is not None:
+                multi_live_trader.check_gap_crowd(
+                    "15m", int(quote_15m.start_date), int(quote_15m.end_date), ts_ms,
+                    quote_15m.up_price, quote_15m.down_price, down_pct_15m,
+                )
+            if gap_crowd_shadow_detector is not None:
+                gap_crowd_shadow_detector.observe_sample(
+                    "15m", int(quote_15m.start_date), int(quote_15m.end_date), ts_ms,
+                    quote_15m.up_price, quote_15m.down_price, down_pct_15m,
+                    quote_15m.participants,
+                    float(quote_15m.trade_volume) if quote_15m.trade_volume is not None else None,
+                )
+    except Exception as e:
+        logger.warning("gap_crowd 15m 判定异常: {}", e)
 
 
 async def _pm_15m_edge_accelerator() -> None:
@@ -623,6 +647,23 @@ async def _prediction_market_tracker() -> None:
                                 (p["up_price"] for p in _pm_history
                                  if p.get("up_price") is not None), None),
                             window_down_curve=_window_down_curve,
+                        )
+                        # gap_crowd 族（5m）：与影子同一采样点内联判定（同源纯函数），
+                        # 命中即真单押 UP（护栏=盲测胜率×0.98 保本价，默认 OFF）。
+                        # ⚠ 单位：evaluate_gap_crowd 的 down_pct 是**百分比**（0-100，
+                        # 与研究读的 prediction_market_samples.down_pct 同口径），
+                        # 必须传 point["down_pct"]（= round(down_chance×100,1)），
+                        # 不能传 0-1 的 down_chance——否则 gap 计算退化为
+                        # q−(1−0.0053)≈q−0.995，几乎所有窗都会误触发。
+                        multi_live_trader.check_gap_crowd(
+                            "5m", _window_start, int(_current_window_end), aligned_ts,
+                            up_price, down_price, point["down_pct"],
+                        )
+                    if gap_crowd_shadow_detector is not None:
+                        gap_crowd_shadow_detector.observe_sample(
+                            "5m", _window_start, int(_current_window_end), aligned_ts,
+                            up_price, down_price, point["down_pct"],
+                            point["participants"], point["trade_volume"],
                         )
 
         except asyncio.CancelledError:
@@ -1407,6 +1448,18 @@ async def lifespan(app: FastAPI):
         await absorption_shadow_detector.start()
         logger.info("吸收影子检测器已启动（TD120/TD150 双 variant trailing 14d 滚动标定，RECENT real EV +0.052/+0.105；影子落表 + 实盘标定快照已就绪，开火由 trader 侧 enabled 管）")
 
+    # 报价-人群错位影子（gap_crowd 族，2026-10-10）：研究 run
+    # 20261009T191824Z-reversal-state-certainty 盲测确认（5m EV+0.036 n=947 /
+    # 15m EV+0.077 n=250，三费用口径全正）。采样循环喂入（5m 与 15m 各自）→
+    # 首触发落 PENDING → 窗关闭后 K 线口径结算 SETTLED。只记录不下注；
+    # 实盘通道 gap_crowd_5m_v1/15m_v1 由 trader 侧 check_gap_crowd 内联判定
+    # （同一 evaluate_gap_crowd 纯函数，同源同口径），默认 OFF。
+    global gap_crowd_shadow_detector
+    if settings.gap_crowd_shadow_enabled:
+        gap_crowd_shadow_detector = GapCrowdShadowDetector(collector=collector)
+        await gap_crowd_shadow_detector.start()
+        logger.info("报价-人群错位影子检测器已启动（5m/15m 双周期，gap≤−0.05 后半窗买 UP；影子落表 + 实盘通道默认 OFF）")
+
     # S2 条件单影子信号（s2_cond 族，2026-09-06 promote）：实盘 S2(bear_exhaust，破 4h
     # 支撑+收阴+放量) 派生——次周期窗内 t=4(+240s) 价<开盘（全深度）/ t=5(+300s) 0<回落
     # <15bp（剔深）两版条件确认 → 押次周期 15m UP，落 kline_shadow_signals（与
@@ -1641,6 +1694,8 @@ async def lifespan(app: FastAPI):
     # 停止吸收/欠反应跟随影子检测器
     if absorption_shadow_detector is not None:
         await absorption_shadow_detector.stop()
+    if gap_crowd_shadow_detector is not None:
+        await gap_crowd_shadow_detector.stop()
     # 停止 S2 条件单 / S2 优化版影子检测器
     if s2_cond_shadow_detector is not None:
         await s2_cond_shadow_detector.stop()
@@ -4385,6 +4440,15 @@ SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     "hm_inside_15m_v2": (0.557, None, "15m孕线上吊线: 前置高点大阳+Inside Bar+下影≥45%上影≤10% → 押次根15m DOWN（720d n=237 胜率55.7%，30d 60.0%；MARKET 单护栏0.30含贴线弃单；EV按目标窗真实报价前向现算）"),
     "ih_inside_15m_v2": (0.546, None, "15m孕线倒垂线: 前置低点大阴+Inside Bar+上影≥45%下影≤10% → 押次根15m UP（720d n=183 胜率54.6%，30d 77.8%；MARKET 单护栏0.30含贴线弃单；EV按目标窗真实报价前向现算）"),
     "hm_inside_5m_v2": (0.585, None, "5m孕线上吊线精选: 前置高点大阳+Inside Bar+下影[75%,90%)上影≤10% → 押次根5m DOWN（720d n=371 胜率58.5%，30d 71.4%；MARKET 单护栏0.30含贴线弃单；EV按目标窗真实报价前向现算）"),
+    # 报价-人群错位族（2026-10-10 研究 run 20261009T191824Z-reversal-state-certainty
+    # 盲测确认 + 用户拍板注册影子+实盘、实盘默认 OFF）：窗后半段
+    # gap = up_price − (1 − down_pct/100) ≤ −0.05 → 买便宜侧 UP。
+    # bench 胜率 = 盲测段（2026-08-20→10-09，首次且唯一一次读取）点估计；
+    # EV 由影子/实盘真实报价前向现算（研究 EV 含 +0.01 执行溢价，属实盘成交成本）。
+    # ⚠️ 研究分级 L0（发现段功效不足未过 FDR）：升级条件见研究报告 §5
+    # （5m ≥1500 / 15m ≥600 前向事件且滚动 excess≥+4pp）。
+    "gap_crowd_5m_v1": (0.514, None, "报价落后人群·5m后半窗: elapsed≥150s 且 gap≤−0.05 且距收盘≥60s → 买 UP（盲测 n=947 胜率51.4% EV+0.036 CI[+0.010,+0.060]；护栏0.50=0.514×0.98 保本价；影子+实盘通道(默认关闭)）"),
+    "gap_crowd_15m_v1": (0.576, None, "报价落后人群·15m后半窗: elapsed≥450s 且 gap≤−0.05 且距收盘≥60s → 买 UP（盲测 n=250 胜率57.6% EV+0.077 CI[+0.016,+0.145]；护栏0.56=0.576×0.98 保本价；影子+实盘通道(默认关闭)）"),
 }
 for _channel, _benchmark in CHANNEL_BENCHMARKS.items():
     if _channel in SHADOW_BENCH:
@@ -4533,8 +4597,8 @@ async def _load_shadow_settled_rows(db: AsyncSession, visible_versions: set[str]
     from sqlalchemy import literal as sa_literal, select as sa_select
 
     from .db.models import (
-        AbsorptionShadowSignal, FirstHitShadowSignal, KlineShadowSignal,
-        MisalignmentSignal, PatternShadowSignal,
+        AbsorptionShadowSignal, FirstHitShadowSignal, GapCrowdShadowSignal,
+        KlineShadowSignal, MisalignmentSignal, PatternShadowSignal,
     )
 
     event_versions = {"candle_hm_bull_5m_event_v1", "candle_hm_bull_15m_event_v1"}
@@ -4646,6 +4710,25 @@ async def _load_shadow_settled_rows(db: AsyncSession, visible_versions: set[str]
         firsthit_stmt.order_by(FirstHitShadowSignal.window_start)
     )).all()
     sh_rows = sh_rows + list(firsthit_rows)
+    # gap_crowd 族（gap_crowd_shadow_signals 表，2026-10-10 并入）：5m/15m 窗后半段
+    # 报价比人群倾向便宜 ≥5pp → 买便宜侧 UP 的前向重放。触发时刻真实 token 价入场，
+    # 窗关闭后 K 线口径结算（SETTLED）；逐笔 ev_at_entry 已落库，聚合直读。
+    # 只取 SETTLED（VOID 平局/超期不污染统计）。
+    gap_crowd_stmt = sa_select(
+        GapCrowdShadowSignal.version,
+        GapCrowdShadowSignal.window_start,
+        GapCrowdShadowSignal.win,
+        GapCrowdShadowSignal.ev_at_entry,
+        GapCrowdShadowSignal.entry_down_price,
+        GapCrowdShadowSignal.entry_up_price,
+        GapCrowdShadowSignal.direction,
+    ).where(GapCrowdShadowSignal.status == "SETTLED")
+    if visible_versions is not None:
+        gap_crowd_stmt = gap_crowd_stmt.where(GapCrowdShadowSignal.version.in_(visible_versions))
+    gap_crowd_rows = (await db.execute(
+        gap_crowd_stmt.order_by(GapCrowdShadowSignal.window_start)
+    )).all()
+    sh_rows = sh_rows + list(gap_crowd_rows)
     return sh_rows
 
 

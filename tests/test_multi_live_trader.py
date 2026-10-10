@@ -230,7 +230,7 @@ def test_parse_defaults_all_off(monkeypatch) -> None:
     monkeypatch.setattr(settings, "live_default_max_daily_orders", 100)
     monkeypatch.setattr(settings, "live_channels_json", "")
     cfgs = parse_channel_config()
-    assert len(cfgs) == 39 + len(CANDLESTICK_SIGNAL_IDS)  # 2026-10-09 +s4_delay60_v1
+    assert len(cfgs) == 41 + len(CANDLESTICK_SIGNAL_IDS)  # 2026-10-09 +s4_delay60_v1；2026-10-10 +gap_crowd×2
     assert set(CANDLESTICK_SIGNAL_IDS) <= set(cfgs)
     assert all(not c.enabled for c in cfgs.values())
     assert all(c.amount_usdt == 2.0 for c in cfgs.values())
@@ -407,6 +407,8 @@ def test_channels_registry_shape() -> None:
         "crv_brk50_hi_15m_v1", "crv_brk20_5m_v1",
         # 2026-10-05 BRK 假突破回归双通道（默认全 OFF；与 CRV 同周期突破族同窗互斥）
         "brkrv_brk8h_15m_v1", "brkrv_brk8h_5m_v1",
+        # 2026-10-10 报价-人群错位双通道（默认全 OFF；研究 L0，影子先行）
+        "gap_crowd_5m_v1", "gap_crowd_15m_v1",
     }
     assert set(LIVE_CHANNELS) == expected_existing | set(CANDLESTICK_SIGNAL_IDS)
     assert set(RETIRED_CHANNELS) == {
@@ -487,6 +489,9 @@ def test_channels_registry_shape() -> None:
         ("crv_brk20_5m_v1", "5m", "kline_reversal", 0.53),
         ("absorption_follow_td120_v1", "5m", "absorption", 0.78),
         ("absorption_follow_td150_v1", "5m", "absorption", 0.86),
+        # 2026-10-10 gap_crowd：护栏 = 盲测胜率 × 0.98（费后保本价，同 KREV/CRV/BRK 口径）
+        ("gap_crowd_5m_v1", "5m", "gap_crowd", 0.50),
+        ("gap_crowd_15m_v1", "15m", "gap_crowd", 0.56),
     ):
         spec = by[ch]
         assert spec.market_period == period and spec.family == fam
@@ -2906,7 +2911,7 @@ def test_status_shape(monkeypatch) -> None:
     assert s["defaults"]["amount_usdt"] == 2.0
     assert s["defaults"]["max_daily_orders"] == 100
     from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
-    assert len(s["channels"]) == 57 + len(CANDLESTICK_SIGNAL_IDS)  # +s4_delay60_v1
+    assert len(s["channels"]) == 59 + len(CANDLESTICK_SIGNAL_IDS)  # +s4_delay60_v1；2026-10-10 +gap_crowd×2
     by = {c["channel"]: c for c in s["channels"]}
     c = by["quote_contrarian_v1"]
     assert c["enabled"] is True and c["enabled_at_startup"] is True
@@ -6500,3 +6505,209 @@ async def test_after_fill_notifies_actual_average_price_and_shares(monkeypatch) 
 
 
 
+
+
+# ============================================================
+# 组 6h：gap_crowd 族（报价-人群错位，2026-10-10 研究 run 注册）
+# 研究出处：output/research_runs/20261009T191824Z-reversal-state-certainty/
+# （盲测 5m n=947 EV+0.036 CI[+0.010,+0.060] / 15m n=250 EV+0.077；规则冻结）
+# ============================================================
+
+def test_gap_crowd_rule_boundaries() -> None:
+    """冻结规则边界（与研究报告逐字同口径）：后半窗/距收盘/gap 阈值/报价越界/缺数据。"""
+    from binance_predict.services.gap_crowd_shadow_detector import evaluate_gap_crowd
+
+    W5 = 300_000
+    # 触发：elapsed=160s、up=0.40、down_pct=53 → gap = 0.40−0.47 = −0.07
+    ext = evaluate_gap_crowd("5m", 0, W5, 160_000, 0.40, 0.60, 53.0)
+    assert ext is not None and ext["prediction"] == "UP" and ext["eligible"] is True
+    assert ext["gap"] == pytest.approx(-0.07, abs=1e-9)
+    assert ext["remain_s"] == pytest.approx(140.0)
+    # 前半窗（elapsed<150s）不触发
+    assert evaluate_gap_crowd("5m", 0, W5, 149_000, 0.40, 0.60, 53.0) is None
+    # 后半窗贴线（elapsed=150s）与距收盘贴线（remain=60s）均触发（含贴线）
+    assert evaluate_gap_crowd("5m", 0, W5, 150_000, 0.40, 0.60, 53.0) is not None
+    assert evaluate_gap_crowd("5m", 0, W5, 240_000, 0.40, 0.60, 53.0) is not None
+    # 距收盘 <60s 不触发
+    assert evaluate_gap_crowd("5m", 0, W5, 241_000, 0.40, 0.60, 53.0) is None
+    # gap 未达阈值（−0.04）不触发
+    assert evaluate_gap_crowd("5m", 0, W5, 160_000, 0.43, 0.57, 53.0) is None
+    # 报价越界（q≤0.02 / q≥0.98）不触发
+    assert evaluate_gap_crowd("5m", 0, W5, 160_000, 0.01, 0.99, 53.0) is None
+    assert evaluate_gap_crowd("5m", 0, W5, 160_000, 0.99, 0.01, 10.0) is None
+    # 数据缺失不触发（fail-safe）
+    assert evaluate_gap_crowd("5m", 0, W5, 160_000, None, 0.60, 53.0) is None
+    assert evaluate_gap_crowd("5m", 0, W5, 160_000, 0.40, None, 53.0) is None
+    assert evaluate_gap_crowd("5m", 0, W5, 160_000, 0.40, 0.60, None) is None
+    # 15m：elapsed≥450s 才进入后半窗
+    assert evaluate_gap_crowd("15m", 0, 900_000, 449_000, 0.35, 0.65, 55.0) is None
+    ext15 = evaluate_gap_crowd("15m", 0, 900_000, 450_000, 0.35, 0.65, 55.0)
+    assert ext15 is not None and ext15["gap"] == pytest.approx(-0.10, abs=1e-9)
+
+
+@pytest.mark.asyncio
+async def test_gap_crowd_disabled_no_fire(monkeypatch) -> None:
+    """默认全 OFF：命中窗口也不开火。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake)
+    assert t.check_gap_crowd(
+        "5m", WINDOW_START, WINDOW_END, WINDOW_START + 160_000,
+        0.40, 0.60, 53.0) == []
+    await _drain(t)
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_gap_crowd_fires_up_on_eligible(monkeypatch) -> None:
+    """5m 命中：押 UP、market_period=5m、护栏 0.50（盲测胜率×0.98）。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["gap_crowd_5m_v1"])
+    t._gap_armed_from_ms = 0  # 测试窗口起点为 2001 年：豁免「启动后才开始」守卫
+    fired = t.check_gap_crowd(
+        "5m", WINDOW_START, WINDOW_END, WINDOW_START + 160_000,
+        0.40, 0.60, 53.0)
+    assert fired == ["gap_crowd_5m_v1"]
+    await _drain(t)
+    assert len(fake.calls) == 1
+    call = fake.calls[0]
+    assert call["signal_version"] == "gap_crowd_5m_v1"
+    assert call["prediction"] == "UP"
+    assert call["market_period"] == "5m"
+    assert call["window_start"] == WINDOW_START
+    assert call["max_exec_price"] == 0.50
+    assert call["amount_usdt"] == 2.0
+
+
+@pytest.mark.asyncio
+async def test_gap_crowd_no_fire_when_gate_missing(monkeypatch) -> None:
+    """资格门正反例：前半窗 / 距收盘<60s / gap 不足 / 报价越界 → 均不开火。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["gap_crowd_5m_v1"])
+    t._gap_armed_from_ms = 0  # 测试窗口起点为 2001 年：豁免「启动后才开始」守卫
+    for ts, up, dn, dpct in (
+        (WINDOW_START + 100_000, 0.40, 0.60, 53.0),   # 前半窗
+        (WINDOW_START + 245_000, 0.40, 0.60, 53.0),   # 距收盘 55s
+        (WINDOW_START + 160_000, 0.45, 0.55, 53.0),   # gap=−0.02
+        (WINDOW_START + 160_000, 0.01, 0.99, 53.0),   # 报价越界
+    ):
+        assert t.check_gap_crowd("5m", WINDOW_START, WINDOW_END, ts, up, dn, dpct) == []
+    await _drain(t)
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_gap_crowd_same_window_single_fire(monkeypatch) -> None:
+    """每通道每窗至多一单：命中后同窗后续采样不重复开火。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["gap_crowd_5m_v1"])
+    t._gap_armed_from_ms = 0  # 测试窗口起点为 2001 年：豁免「启动后才开始」守卫
+    assert t.check_gap_crowd(
+        "5m", WINDOW_START, WINDOW_END, WINDOW_START + 160_000,
+        0.40, 0.60, 53.0) == ["gap_crowd_5m_v1"]
+    assert t.check_gap_crowd(
+        "5m", WINDOW_START, WINDOW_END, WINDOW_START + 175_000,
+        0.38, 0.62, 54.0) == []
+    await _drain(t)
+    assert len(fake.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_gap_crowd_period_isolation(monkeypatch) -> None:
+    """周期隔离：5m 判定不动 15m 通道；15m 判定用 15m 窗口与护栏 0.56。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["gap_crowd_5m_v1", "gap_crowd_15m_v1"])
+    t._gap_armed_from_ms = 0  # 测试窗口起点为 2001 年：豁免「启动后才开始」守卫
+    # 5m 调用：只开 5m 通道
+    assert t.check_gap_crowd(
+        "5m", WINDOW_START, WINDOW_END, WINDOW_START + 160_000,
+        0.40, 0.60, 53.0) == ["gap_crowd_5m_v1"]
+    # 15m 调用（15m 窗口：elapsed 500s）
+    w15 = WINDOW_START
+    assert t.check_gap_crowd(
+        "15m", w15, w15 + 900_000, w15 + 500_000, 0.35, 0.65, 55.0) == ["gap_crowd_15m_v1"]
+    await _drain(t)
+    by_ch = {c["signal_version"]: c for c in fake.calls}
+    assert set(by_ch) == {"gap_crowd_5m_v1", "gap_crowd_15m_v1"}
+    assert by_ch["gap_crowd_15m_v1"]["market_period"] == "15m"
+    assert by_ch["gap_crowd_15m_v1"]["max_exec_price"] == 0.56
+    assert by_ch["gap_crowd_15m_v1"]["window_start"] == w15
+
+
+@pytest.mark.asyncio
+async def test_gap_crowd_stop_rejects(monkeypatch) -> None:
+    """stop 后拒绝派生新下单任务。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["gap_crowd_5m_v1"])
+    t._gap_armed_from_ms = 0  # 测试窗口起点为 2001 年：豁免「启动后才开始」守卫
+    t._stopped = True
+    assert t.check_gap_crowd(
+        "5m", WINDOW_START, WINDOW_END, WINDOW_START + 160_000,
+        0.40, 0.60, 53.0) == []
+    await _drain(t)
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_gap_crowd_startup_window_guard(monkeypatch) -> None:
+    """启动守卫：窗口起点早于执行器启动时刻 → 不做半途入场（研究只验证首触发）。
+
+    回归口径：重启/中途启用时正在进行的窗口，其「首个满足门」的采样点未被观测，
+    此时入场无研究证据（护栏/EV 均按首触发口径标定）→ 宁缺毋滥。
+    """
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["gap_crowd_5m_v1"])
+    # armed 基准设为窗口之后：本窗视为「启动前已开始」
+    t._gap_armed_from_ms = WINDOW_START + 1
+    assert t.check_gap_crowd(
+        "5m", WINDOW_START, WINDOW_END, WINDOW_START + 160_000,
+        0.40, 0.60, 53.0) == []
+    await _drain(t)
+    assert fake.calls == []
+    # 起点等于基准（启动瞬间开始的新窗）→ 放行
+    t._gap_armed_from_ms = WINDOW_START
+    assert t.check_gap_crowd(
+        "5m", WINDOW_START, WINDOW_END, WINDOW_START + 160_000,
+        0.40, 0.60, 53.0) == ["gap_crowd_5m_v1"]
+    await _drain(t)
+    assert len(fake.calls) == 1
+
+
+def test_gap_crowd_down_pct_unit_contract() -> None:
+    """单位契约（回归 2026-10-10 审阅 P0）：evaluate_gap_crowd 的 down_pct 是**百分比**
+    （0-100，与研究读的 prediction_market_samples.down_pct 同口径）。
+
+    生产喂入点必须传百分比（main.py 5m 用 point["down_pct"]=round(down_chance×100,1)，
+    15m 用 round(quote_15m.down_chance×100,1)）。若误传 0-1 小数，gap 会退化成
+    q−(1−0.0053)≈q−0.995，几乎每个后半窗都误触发（影子证据污染 + 实盘高频错单）。
+    """
+    from binance_predict.services.gap_crowd_shadow_detector import evaluate_gap_crowd
+
+    W = 300_000
+    # 正确单位（53.0%）：q=0.45 → gap=−0.02 不触发
+    assert evaluate_gap_crowd("5m", 0, W, 160_000, 0.45, 0.55, 53.0) is None
+    # 错误单位（0.53 当百分比=0.53%）：同一报价被误判为深度便宜 → 触发（gap≈−0.545）
+    wrong = evaluate_gap_crowd("5m", 0, W, 160_000, 0.45, 0.55, 0.53)
+    assert wrong is not None and wrong["gap"] == pytest.approx(-0.5447, abs=1e-3)
+
+
+def test_gap_crowd_shadow_versions_registered() -> None:
+    """影子注册表 + 门禁白名单 + benchmark 三处同步（漏一处前端 toggle 422 / 面板不显示）。"""
+    from binance_predict.services.shadow_execution_registry import (
+        SHADOW_VERSION_SPECS, SHADOW_VERSIONS,
+    )
+    from binance_predict.services.shadow_execution_types import SourceType
+    from binance_predict.services.live_channel_benchmarks import CHANNEL_BENCHMARKS
+    import binance_predict.main as milt_main
+
+    for version, period in (("gap_crowd_5m_v1", "5m"), ("gap_crowd_15m_v1", "15m")):
+        assert version in SHADOW_VERSIONS
+        spec = SHADOW_VERSION_SPECS[version]
+        assert spec.source_type is SourceType.GAP_CROWD
+        assert spec.market_period == period
+        assert spec.target_semantics == "same_window"
+        assert spec.live_channel == version and spec.live_retired is False
+        assert version in milt_main.SHADOW_BENCH
+        assert version in CHANNEL_BENCHMARKS
+    # 盲测基准点估计与护栏推导一致（护栏 = 胜率×0.98）
+    assert CHANNEL_BENCHMARKS["gap_crowd_5m_v1"].win_rate == pytest.approx(0.514)
+    assert CHANNEL_BENCHMARKS["gap_crowd_15m_v1"].win_rate == pytest.approx(0.576)

@@ -15,7 +15,8 @@ collector.fetch_recent_klines 用 AsyncMock patch。
   （赢 0.98/q−1 / 输 −1）；kline 系无报价恒空
 - 影子版本 = 冻结基准 ∪ 数据中出现版本（新版本 bench=None 容错）
 - 场景信号过滤 = 排除 SceneParamVersion 中 SHADOW 版本名（ACTIVE 演进名视为正式）；
-  端点共 7 次 db.execute（影子行 → KREV 行 → pattern 行 → absorption 行 → firsthit 行 → SHADOW 版本名 → 场景行）
+  端点共 8 次 db.execute（影子行 → KREV 行 → pattern 行 → absorption 行 → firsthit 行
+  → gap_crowd 行 → SHADOW 版本名 → 场景行）
 - K 线缓存键 = interval:档位（limit 归档到固定档），上游失败 10s 负缓存
 """
 
@@ -140,22 +141,35 @@ def _absorption_row(**over) -> SimpleNamespace:
     return SimpleNamespace(**base)
 
 
+def _gap_crowd_row(**over) -> SimpleNamespace:
+    """gap_crowd 影子行替身（gap_crowd_shadow_signals）：ev_at_entry 已落库（真实价口径，
+    聚合直读）；direction 恒 UP（买报价便宜侧）。"""
+    base = dict(
+        version="gap_crowd_5m_v1", window_start=1_000_000_000_000,
+        win=True, ev_at_entry=0.36, entry_down_price=None,
+        entry_up_price=0.458, direction="UP",
+    )
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
 def _make_db(shadow_rows, scene_rows, krev_rows=(), pattern_rows=(),
-             absorption_rows=(), firsthit_rows=()) -> AsyncMock:
+             absorption_rows=(), firsthit_rows=(), gap_crowd_rows=()) -> AsyncMock:
     db = AsyncMock()
-    r1, r2, r3, r4, r5, r6, r7 = (MagicMock() for _ in range(7))
+    r1, r2, r3, r4, r5, r6, r7, r8 = (MagicMock() for _ in range(8))
     # 端点用指定列 SELECT，结果直接 .all()（不再 .scalars()）；
-    # 7 次查询顺序（2026-09-07 新增 firsthit）：
-    #   影子行 → KREV 行 → pattern 行 → absorption 行 → firsthit 行 →
+    # 8 次查询顺序（2026-09-07 新增 firsthit；2026-10-10 新增 gap_crowd）：
+    #   影子行 → KREV 行 → pattern 行 → absorption 行 → firsthit 行 → gap_crowd 行 →
     #   SceneParamVersion SHADOW 版本名（默认空）→ 场景行
     r1.all.return_value = shadow_rows
     r2.all.return_value = krev_rows
     r3.all.return_value = pattern_rows
     r4.all.return_value = absorption_rows
     r5.all.return_value = firsthit_rows
-    r6.all.return_value = []
-    r7.all.return_value = scene_rows
-    db.execute = AsyncMock(side_effect=[r1, r2, r3, r4, r5, r6, r7])
+    r6.all.return_value = gap_crowd_rows
+    r7.all.return_value = []
+    r8.all.return_value = scene_rows
+    db.execute = AsyncMock(side_effect=[r1, r2, r3, r4, r5, r6, r7, r8])
     return db
 
 
@@ -458,6 +472,8 @@ async def test_analytics_empty_db() -> None:
         "crv_dnex_15m_v1", "crv_brk20_5m_v1", "crv_os_st4_5m_v1", "crv_hi_z3_15m_v1",
         # 2026-10-05 BRK 假突破回归族（两个确认级）
         "brkrv_brk8h_15m_v1", "brkrv_brk8h_5m_v1",
+        # 2026-10-10 报价-人群错位族（两个周期，同名实盘默认 OFF）
+        "gap_crowd_5m_v1", "gap_crowd_15m_v1",
     }
     from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
     assert set(out["shadow"].keys()) == expected | set(CANDLESTICK_SIGNAL_IDS)
@@ -737,6 +753,40 @@ async def test_analytics_absorption_merged_from_shadow_table() -> None:
     # DOWN 侧报价 → 盈亏平衡 0.52/0.98；bench 取 td150 real 基
     assert a150["summary"]["avg_breakeven"] == pytest.approx(0.52 / 0.98, abs=1e-9)
     assert a150["summary"]["bench_winrate"] == 0.885 and a150["summary"]["bench_ev"] == 0.105
+
+
+@pytest.mark.asyncio
+async def test_analytics_gap_crowd_merged_from_shadow_table() -> None:
+    """gap_crowd 行（gap_crowd_shadow_signals 表，第 6 UNION 分支）并入影子统计：
+    ev_at_entry 已落库 → 聚合直读；盈亏平衡按 UP 侧入场报价（q/0.98 无溢价）；
+    两周期各自成组，bench 取盲测冻结基准（0.514 / 0.576）。"""
+    import binance_predict.main as m
+
+    ev_up = 0.98 / 0.458 - 1.0
+    rows = [
+        _gap_crowd_row(version="gap_crowd_5m_v1", window_start=1_000,
+                       win=True, ev_at_entry=ev_up, direction="UP", entry_up_price=0.458),
+        _gap_crowd_row(version="gap_crowd_5m_v1", window_start=2_000,
+                       win=False, ev_at_entry=-1.0, direction="UP", entry_up_price=0.46),
+        _gap_crowd_row(version="gap_crowd_15m_v1", window_start=1_500,
+                       win=True, ev_at_entry=0.98 / 0.479 - 1.0,
+                       direction="UP", entry_up_price=0.479),
+    ]
+    db = _make_db([], [], gap_crowd_rows=rows)
+    out = await m.get_signals_analytics(db)
+
+    g5 = out["shadow"]["gap_crowd_5m_v1"]
+    assert g5["summary"]["n"] == 2 and g5["summary"]["win_rate"] == pytest.approx(0.5)
+    assert g5["summary"]["avg_ev"] == pytest.approx((ev_up - 1.0) / 2, rel=1e-9)
+    # UP 侧报价均值 / 0.98（非 x4 系，无溢价）
+    assert g5["summary"]["avg_breakeven"] == pytest.approx(
+        ((0.458 / 0.98) + (0.46 / 0.98)) / 2, abs=1e-9)
+    assert g5["summary"]["bench_winrate"] == pytest.approx(0.514)
+
+    g15 = out["shadow"]["gap_crowd_15m_v1"]
+    assert g15["summary"]["n"] == 1 and g15["summary"]["win_rate"] == 1.0
+    assert g15["summary"]["avg_breakeven"] == pytest.approx(0.479 / 0.98, abs=1e-9)
+    assert g15["summary"]["bench_winrate"] == pytest.approx(0.576)
 
 
 def test_shadow_breakeven_x4_family_includes_premium() -> None:

@@ -73,6 +73,7 @@ from .firsthit_early import (
 )
 from .process_recovery import VERSION as PROCESS_RECOVERY_VERSION, extract_process_recovery
 from .absorption_shadow_detector import ABSORPTION_SPECS
+from .gap_crowd_shadow_detector import evaluate_gap_crowd
 from .btc_regime import regime_feed
 from .live_execution_policy import config_fingerprint, evaluate_absorption_policy
 from .shadow_execution_registry import SHADOW_VERSION_SPECS
@@ -334,6 +335,9 @@ class MultiLiveTrader:
         # absorption 窗开快照：window_start → (up_open, btc_open)（本窗首个有效采样建立，
         # 超 2h 修剪；窗开快照缺失 → TD 判定跳过，与影子「特征不可算不评估」同口径）
         self._abs_open: dict[int, tuple[float, float]] = {}
+        # gap_crowd 窗口守卫基准：只处理本执行器启动后才开始的窗口（半途入场无研究证据，
+        # 与 gap_crowd_shadow_detector._started_ms 同口径）
+        self._gap_armed_from_ms = int(time.time() * 1000)
         # 同窗互斥槽：市场窗口 → 本窗已成交的互斥组通道（至多一单成交，见 _exec_with_exclusive）
         self._window_filled: dict[int, set[str]] = {}
         self._group_locks: dict[tuple[tuple[str, ...], int], asyncio.Lock] = {}
@@ -823,6 +827,107 @@ class MultiLiveTrader:
                     task.add_done_callback(self._tasks.discard)
                     fired.append(ch)
         return fired
+
+    # ------------------------------------------------------------------
+    # gap_crowd 族：采样循环喂价内联判定（5m 与 15m 市场各自调用）
+    # ------------------------------------------------------------------
+
+    def check_gap_crowd(self, period: str, window_start_ms: int, window_end_ms: int,
+                        ts_ms: int, up_price: float | None,
+                        down_price: float | None, down_pct: float | None) -> list[str]:
+        """每次采样调用一次（5m 与 15m 市场各自）；返回本轮开火的通道名列表。
+
+        判定规则与影子同源（gap_crowd_shadow_detector.evaluate_gap_crowd 纯函数，
+        单点事实源）：窗后半段（elapsed ≥ 窗长×0.5）报价比人群倾向便宜 ≥5pp
+        （gap = up_price − (1 − down_pct/100) ≤ −0.05）且距收盘 ≥60s、报价在
+        [0.02,0.98] → 买 UP。逐采样判定，同窗首个命中即占位（每通道每窗至多一单）。
+        数据缺失/未过门 → 不触发（fail-safe，与影子保守口径一致）。
+        """
+        if self._stopped:
+            return []
+        fired: list[str] = []
+        for ch, spec in self._specs.items():
+            try:
+                if spec.family != "gap_crowd" or spec.market_period != period:
+                    continue
+                if window_start_ms < self._gap_armed_from_ms:
+                    # 启动前已开始的窗口不做半途入场：研究验证的是「窗内首个满足
+                    # 全部门的采样点」，重启/中途启用后加入的触发点无研究证据。
+                    continue
+                cfg = self._configs[ch]
+                if not cfg.enabled or window_start_ms in cfg.fired:
+                    continue
+                ext = evaluate_gap_crowd(
+                    period, window_start_ms, window_end_ms, ts_ms,
+                    up_price, down_price, down_pct,
+                )
+                if ext is None:
+                    continue                     # 未到后半窗/未达 gap 阈值/报价越界
+                cfg.fired.add(window_start_ms)
+                task = asyncio.create_task(
+                    self._fire_gap_crowd(
+                        ch, window_start_ms, ext, float(up_price)),
+                    name=f"live_gap_crowd_{ch}_{window_start_ms}",
+                )
+                self._tasks.add(task)
+                task.add_done_callback(self._tasks.discard)
+                fired.append(ch)
+            except Exception as exc:
+                # 单通道异常只跳过本通道，不让它打断采样循环（同 quote_edge 教训）
+                logger.error(
+                    "多通道实盘：gap_crowd 单通道 {} 判定异常，跳过本通道 | 窗口 {} | {}",
+                    ch, _fmt_win(window_start_ms), exc, exc_info=True)
+                continue
+        return fired
+
+    async def _fire_gap_crowd(self, channel: str, window_start: int,
+                              ext: dict, up_price: float) -> None:
+        """gap_crowd 下单任务：买 UP（报价便宜侧），复用统一护栏/日限/防重链路。
+
+        护栏 = 通道 auto_max_exec（盲测胜率×0.98 费后保本价）：实际成交均价 ≥ 护栏
+        （含贴线）由 prediction_trading 弃单——保护「报价已不便宜」的劣态成交。
+        market_period 取通道 spec（5m/15m），15m 走锚定守卫（须在 _15m_markets
+        登记本窗市场，缺失拒单，不追错周期）。
+        """
+        spec = self._specs[channel]
+        cfg = self._configs[channel]
+        win_label = _fmt_win(window_start)
+        try:
+            assessment_context, proceed = await self._prepare_runtime_execution(
+                channel,
+                window_start,
+                "UP",
+                input_snapshot={
+                    "t_rel": ext["t_rel"],
+                    "remain_s": ext["remain_s"],
+                    "gap": ext["gap"],
+                    "up_price": up_price,
+                },
+            )
+            if not proceed:
+                return
+            logger.info(
+                "多通道实盘开火 | {} | 报价-人群错位押 UP | 窗口 {} | t=+{:.0f}s "
+                "gap={:+.3f} up={:.3f} | 金额 {} | 护栏 {}",
+                channel, win_label, ext["t_rel"], ext["gap"], up_price,
+                cfg.amount_usdt, resolve_max_exec(spec, cfg),
+            )
+            order = await self._exec_with_exclusive(
+                channel,
+                prediction="UP",
+                amount_usdt=cfg.amount_usdt,
+                signal_version=channel,
+                window_start=window_start,
+                max_exec_price=resolve_max_exec(spec, cfg),
+                market_period=spec.market_period,
+                entry_band_whitelist=spec.entry_band_whitelist,
+                order_type=spec.order_type,
+                assessment_context=assessment_context,
+            )
+            await self._after_fill(order, channel, cfg)
+        except Exception as exc:
+            logger.warning("多通道实盘：gap_crowd 下单任务异常 | {} | {} | {}",
+                           channel, win_label, exc)
 
     @staticmethod
     def _pass_live_v2_guard(version: str, btc_price: float | None,
