@@ -1487,19 +1487,25 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
     let alive = true
     let ws: WebSocket | null = null
     let pollTimer: number | null = null
-    let wsLive = false
     setLive('init')
     setBars([])
     setView({ i0: 0, count: 60 })
     previousBarCountRef.current = 0
 
-    // 代理返回的是对象数组（open_time/open/...），整体替换 120 根
+    // 代理返回对象数组（open_time/open/...）：与已有 bars 按时间合并补历史，
+    // 已在手的（WS 推送）同刻数据优先保留，避免旧快照顶掉新柱
     const applyProxy = (raw: unknown) => {
       const next: KlineBar[] = (Array.isArray(raw) ? raw : []).map(r => {
         const k = r as Record<string, unknown>
         return { t: Number(k.open_time), o: Number(k.open), h: Number(k.high), l: Number(k.low), c: Number(k.close), v: Number(k.volume) }
       })
-      if (alive) setBars(next.slice(-120))
+      if (!alive || !next.length) return
+      setBars(prev => {
+        if (!prev.length) return next.slice(-120)
+        const byT = new Map(next.map(b => [b.t, b]))
+        for (const b of prev) byT.set(b.t, b)   // WS 新柱优先
+        return [...byT.values()].sort((a, b) => a.t - b.t).slice(-120)
+      })
     }
     const mergeKline = (k: KlineBar) => {
       if (!alive) return
@@ -1519,8 +1525,8 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
       const tick = async () => {
         try {
           const d = await api.getBtcKlinesLive(chartPeriod, 120)
-          // WS 已接管实时后不再用代理响应覆盖（避免旧数据顶掉新推送）
-          if (alive && !wsLive) applyProxy(d?.klines)
+          // 无论 WS 是否已接管都合并：WS 先握手时若丢弃代理历史，bars 只剩 1 根会卡在「加载中」
+          if (alive) applyProxy(d?.klines)
         } catch { /* 轮询失败静默等下一轮 */ }
       }
       tick()
@@ -1533,7 +1539,7 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
     startPoll()
     try {
       ws = new WebSocket(`${BINANCE_WS}/btcusdt@kline_${chartPeriod}`)
-      ws.onopen = () => { if (alive) { wsLive = true; setLive('ws'); stopPoll() } }
+      ws.onopen = () => { if (alive) setLive('ws') }
       ws.onmessage = ev => {
         try {
           const msg = JSON.parse(ev.data)
@@ -1543,7 +1549,7 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
         } catch { /* 非 kline 消息忽略 */ }
       }
       ws.onerror = () => { if (alive) startPoll() }
-      ws.onclose = () => { if (alive) { wsLive = false; startPoll() } }
+      ws.onclose = () => { if (alive) startPoll() }
     } catch {
       startPoll()
     }
@@ -1974,9 +1980,11 @@ function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }
       if (spinner) setLoading(true)
       api.getFutureMarkets(period, 8).then((d: Record<string, unknown>) => {
         if (!alive) return
-        setFuture(Array.isArray(d.windows) ? d.windows as FutureWindow[] : [])
+        const wins = Array.isArray(d.windows) ? d.windows as FutureWindow[] : []
         setCurrentWin((d.current ?? null) as Record<string, unknown> | null)
         setFutureErr(false)
+        // 静默轮询拿到空结果不覆盖已有列表：多为限流瞬态，避免把窗口清空而误报「未创建」
+        if (spinner || wins.length > 0) setFuture(wins)
       }).catch(() => { if (alive) setFutureErr(true) })
         .finally(() => alive && setLoading(false))
     }
