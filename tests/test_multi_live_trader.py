@@ -2449,6 +2449,8 @@ async def test_firsthit_enabled_channels_registered(monkeypatch) -> None:
     assert cfgs["firsthit_down_v1"].max_exec_price is None       # 缺省回落 spec.auto_max_exec
     assert cfgs["firsthit_down_body_v1"].max_exec_price is None
     assert cfgs["firsthit_down_chg_v2"].max_exec_price is None
+    # 2026-10-13：v2 通道护栏 0.09→0.101（首触价贴 Q_HI=0.1，0.09 会把全部信号判超价弃单）
+    assert LIVE_CHANNELS["firsthit_down_chg_v2"].auto_max_exec == 0.101
 
 
 @pytest.mark.asyncio
