@@ -376,6 +376,22 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
         "crv_brk20_5m_v1", "kline_reversal", "5m", "DOWN", 0.53,
         "CRV 5m突破20高反转（押DOWN）",
     ),
+    # --- crv_dnbrk24 下破吞没族（2026-10-12 复核研究 run 20261012T084631Z-
+    # kline-regime-transition「A 信号下破半」，用户拍板注册影子+实盘，默认 OFF）：
+    # 「阴线吞没 ∧ 收盘跌破前 24 根低 → 押次根收阳 UP」——与 CRV 突破族方向相反
+    # （那条押 DOWN），事件不重叠。15m 样本外(288d) n=249 胜率 61.9%（发现 59.2%/
+    # 验证 60.6%/盲测 63.4%/前向 62.5%），护栏 0.606=61.9%×0.98；5m 样本外 n=888
+    # 胜率 55.7%（盲测段 52.2% 偏弱，相对「仅破24低」对照仅 +1.1pp），护栏 0.546
+    # 刻意只放行便宜 UP。检测器 crv_shadow_detector 落 kline_shadow_signals，新鲜
+    # 命中经 on_kline_reversal_signal 钩子派单（目标根开盘 ≤90s）。---
+    "crv_dnbrk24_15m_v1": ChannelSpec(
+        "crv_dnbrk24_15m_v1", "kline_reversal", "15m", "UP", 0.606,
+        "CRV下破吞没24低反转（押UP）",
+    ),
+    "crv_dnbrk24_5m_v1": ChannelSpec(
+        "crv_dnbrk24_5m_v1", "kline_reversal", "5m", "UP", 0.546,
+        "CRV 5m下破吞没24低反转（押UP）",
+    ),
     # --- BRK 假突破回归族（2026-10-05 研究 run 20261005T051500Z-sentiment-kline-reversal
     # 影子 promote + 用户拍板注册实盘，默认全部 OFF）：
     # 「收盘突破前 32/96 根（8 小时）高点 → 次根收阴」的假突破回归——本轮研究三段

@@ -472,6 +472,8 @@ async def test_analytics_empty_db() -> None:
         "crv_dnex_15m_v1", "crv_brk20_5m_v1", "crv_os_st4_5m_v1", "crv_hi_z3_15m_v1",
         # 2026-10-05 BRK 假突破回归族（两个确认级）
         "brkrv_brk8h_15m_v1", "brkrv_brk8h_5m_v1",
+        # 2026-10-12 复核「A 信号下破半」下破吞没族（两个确认级，默认 OFF）
+        "crv_dnbrk24_15m_v1", "crv_dnbrk24_5m_v1",
         # 2026-10-10 报价-人群错位族（两个周期，同名实盘默认 OFF）
         "gap_crowd_5m_v1", "gap_crowd_15m_v1",
     }

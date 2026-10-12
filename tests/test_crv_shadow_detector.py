@@ -63,6 +63,18 @@ def _breakout_rows(spike_high: float | None = None, break_close: float | None = 
     return rows
 
 
+def _band_rows(n: int, tf_ms: int, last: tuple[float, float, float, float] | None = None) -> list[dict]:
+    """n 根确定性交替带（低点恒 99.69，prior_lo24 可控）+ 可选末根 (o,h,l,c)。"""
+    rows = []
+    for i in range(n):
+        o, c = (99.7, 100.3) if i % 2 == 0 else (100.3, 99.7)
+        rows.append(_mk(tf_ms, i, o, max(o, c) + 0.01, min(o, c) - 0.01, c))
+    if last is not None:
+        lo, hi, o, c = last
+        rows.append(_mk(tf_ms, n, o, hi, lo, c))
+    return rows
+
+
 def _spec(version: str) -> dict:
     return next(s for s in CRV_SHADOW_SPECS if s["version"] == version)
 
@@ -100,6 +112,14 @@ def _research_reference(rows: list[dict], tf_ms: int) -> dict:
     feat["prior_hi20"] = shift1(roll(np.max, h, 20))
     feat["prior_lo20"] = shift1(roll(np.min, l, 20))
     feat["prior_hi50"] = shift1(roll(np.max, h, 50))
+    feat["prior_lo24"] = shift1(roll(np.min, l, 24))
+    # engulf：阴线吞没（当前实体 > 1.5×前一实体 ∧ 方向反转；前一根缺失不触发）
+    prev_body = shift1(feat["body"])
+    prev_sign = shift1(np.sign(c - o))
+    with np.errstate(invalid="ignore"):
+        engulf = (np.sign(c - o) != prev_sign) & (np.sign(c - o) != 0) & (feat["body"] > 1.5 * prev_body)
+    engulf[np.isnan(prev_body)] = False
+    feat["engulf"] = engulf
     lo100, hi100 = roll(np.min, l, 100), roll(np.max, h, 100)
     feat["pos100"] = (c - lo100) / (hi100 - lo100 + 1e-12)
     # z20：(close − roll_mean(c,20)) / roll_std(c,20,ddof=1).clip(1e-12)
@@ -152,10 +172,11 @@ def test_feature_bitwise_parity_vs_research_reference(seed: int) -> None:
     feat = compute_crv_features(kl)
     ref = _research_reference(rows, 900_000)
     tail = slice(105, 130)  # 全部 warmup（pos100=100/atr=14/滚动20/50）之后
-    for key in ("up", "dn", "prior_hi20", "prior_lo20", "prior_hi50", "pos100",
-                "z20", "atr", "streak"):
+    for key in ("up", "dn", "prior_hi20", "prior_lo20", "prior_hi50", "prior_lo24",
+                "pos100", "z20", "atr", "streak"):
         mine, ref_v = feat[key][tail], ref[key][tail]
         assert np.array_equal(mine, ref_v), f"{key} 与研究参照不一致"
+    assert np.array_equal(feat["engulf"][tail], ref["engulf"][tail]), "engulf 与研究参照不一致"
     assert np.allclose(feat["rsi"][tail], np.nan_to_num(ref["rsi"][tail], nan=-1), atol=1e-8)
     # 六个 spec 的掩码逐位一致
     for spec in CRV_SHADOW_SPECS:
@@ -283,6 +304,43 @@ def test_os_st4_positive_and_streak_negatives() -> None:
     # streak==3 → 不命中
     feat3 = compute_crv_features(_to_klines(_os_rows(3), 300_000))
     assert _tail_hits(feat3, "crv_os_st4_5m_v1", n_tail=1) == []
+
+
+def test_dnbrk24_positive_and_negatives() -> None:
+    """阴线吞没∧跌破前24低（2026-10-12 复核「A 信号下破半」）正例 + 三类反例。"""
+    # 正例：末根阴线实体 1.0 > 1.5×前一实体(0.6)=0.9 且跌破前低(99.69) → 命中
+    rows_p = _band_rows(129, 900_000, last=(99.3, 100.35, 100.3, 99.3))
+    feat_p = compute_crv_features(_to_klines(rows_p, 900_000))
+    assert len(rows_p) - 1 in _tail_hits(feat_p, "crv_dnbrk24_15m_v1", n_tail=1)
+    # 反例 1：阴线破低但小实体（未吞没）→ 不命中
+    rows_small = _band_rows(129, 900_000, last=(99.6, 99.75, 99.7, 99.6))
+    feat_small = compute_crv_features(_to_klines(rows_small, 900_000))
+    assert _tail_hits(feat_small, "crv_dnbrk24_15m_v1", n_tail=1) == []
+    # 反例 2：吞没但未跌破前 24 低（收盘 99.7 > 前低 99.69）→ 不命中
+    rows_nb = _band_rows(129, 900_000, last=(99.7, 100.85, 100.7, 99.7))
+    feat_nb = compute_crv_features(_to_klines(rows_nb, 900_000))
+    assert feat_nb["engulf"][len(rows_nb) - 1] and not bool(
+        spec_mask(_spec("crv_dnbrk24_15m_v1"), feat_nb)[len(rows_nb) - 1])
+    assert _tail_hits(feat_nb, "crv_dnbrk24_15m_v1", n_tail=1) == []
+    # 反例 3：阳线吞没（方向非阴）→ 不命中
+    rows_up = _band_rows(129, 900_000, last=(99.0, 100.35, 99.0, 100.0))
+    feat_up = compute_crv_features(_to_klines(rows_up, 900_000))
+    assert _tail_hits(feat_up, "crv_dnbrk24_15m_v1", n_tail=1) == []
+
+
+def test_dnbrk24_warmup_nan_not_trigger() -> None:
+    """prior_lo24 需 24 根 trailing；不足 → NaN → 不触发（NaN 保守）。"""
+    rows = _band_rows(20, 900_000)
+    feat = compute_crv_features(_to_klines(rows, 900_000))
+    assert np.all(np.isnan(feat["prior_lo24"]))
+    assert _tail_hits(feat, "crv_dnbrk24_15m_v1", n_tail=20) == []
+
+
+def test_dnbrk24_5m_spec_and_mask() -> None:
+    """5m 版本同样注册且掩码口径一致。"""
+    rows = _band_rows(129, 300_000, last=(99.3, 100.35, 100.3, 99.3))
+    feat = compute_crv_features(_to_klines(rows, 300_000))
+    assert len(rows) - 1 in _tail_hits(feat, "crv_dnbrk24_5m_v1", n_tail=1)
 
 
 # ============================================================
@@ -451,6 +509,9 @@ def test_crv_live_channels_registered_default_off() -> None:
         "crv_brk20_15m_v1": ("15m", "DOWN", 0.57),
         "crv_brk50_hi_15m_v1": ("15m", "DOWN", 0.59),
         "crv_brk20_5m_v1": ("5m", "DOWN", 0.53),
+        # 2026-10-12 复核「A 信号下破半」：方向与突破族相反（押 UP）
+        "crv_dnbrk24_15m_v1": ("15m", "UP", 0.606),
+        "crv_dnbrk24_5m_v1": ("5m", "UP", 0.546),
     }
     for version, (period, direction, guard) in expected.items():
         spec = LIVE_CHANNELS[version]
@@ -470,6 +531,9 @@ def test_crv_live_channels_registered_default_off() -> None:
     assert grp == {"crv_hi_brk20_15m_v1", "crv_brk20_15m_v1", "crv_brk50_hi_15m_v1",
                    "brkrv_brk8h_15m_v1"}
     assert exclusive_group("crv_brk20_5m_v1") == {"crv_brk20_5m_v1", "brkrv_brk8h_5m_v1"}
+    # 下破吞没族事件集与突破族完全不相交（阴线破低 vs 阳线破高），不并入其互斥组
+    assert exclusive_group("crv_dnbrk24_15m_v1") is None
+    assert exclusive_group("crv_dnbrk24_5m_v1") is None
 
 
 def test_crv_versions_in_shadow_projection() -> None:
@@ -481,9 +545,10 @@ def test_crv_versions_in_shadow_projection() -> None:
         spec = SHADOW_VERSION_SPECS[version]
         assert spec.family == "kline_reversal"
         assert spec.direction_mode == "row"
-    # 四个确认级映射同名实盘通道；两个探索级无实盘映射
+    # 确认级映射同名实盘通道；探索/观察级无实盘映射
     for version in ("crv_hi_brk20_15m_v1", "crv_brk20_15m_v1",
-                    "crv_brk50_hi_15m_v1", "crv_brk20_5m_v1"):
+                    "crv_brk50_hi_15m_v1", "crv_brk20_5m_v1",
+                    "crv_dnbrk24_15m_v1", "crv_dnbrk24_5m_v1"):
         assert SHADOW_VERSION_SPECS[version].live_channel == version
     for version in ("crv_dnex_15m_v1", "crv_os_st4_5m_v1", "crv_hi_z3_15m_v1"):
         assert SHADOW_VERSION_SPECS[version].live_channel is None
@@ -492,3 +557,17 @@ def test_crv_versions_in_shadow_projection() -> None:
 def test_settings_default_on() -> None:
     from binance_predict.config.settings import settings
     assert settings.crv_shadow_enabled is True
+
+
+def test_dnbrk24_versions_in_shadow_bench() -> None:
+    """防回归：dnbrk24 两版本已登记 main.SHADOW_BENCH——面板基准与
+    /api/shadow/toggle 白名单的唯一事实源（漏注册会导致面板下线按钮 422）。"""
+    from binance_predict.main import SHADOW_BENCH
+
+    assert "crv_dnbrk24_15m_v1" in SHADOW_BENCH
+    assert "crv_dnbrk24_5m_v1" in SHADOW_BENCH
+    # 冻结基准胜率：样本外(验证+盲测+前向)口径 15m 61.85% / 5m 55.74%
+    assert SHADOW_BENCH["crv_dnbrk24_15m_v1"][0] == 0.6185
+    assert SHADOW_BENCH["crv_dnbrk24_5m_v1"][0] == 0.5574
+    assert SHADOW_BENCH["crv_dnbrk24_15m_v1"][1] is None
+    assert SHADOW_BENCH["crv_dnbrk24_5m_v1"][1] is None

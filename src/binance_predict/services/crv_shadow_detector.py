@@ -23,6 +23,13 @@
         阳线∧pos100>0.90∧z20>+2∧恰连3阳 → 押次根收阴 DOWN
         disc n=190 62.1%（Wilson95%下界 55.0%，全场深度3最高）/ val n=74 67.6%（n<100
         未达冻结晋级门槛）；180/90/30D 58.7%/56.8%/56.3% 不衰减。晋级由前向影子裁决。
+    crv_dnbrk24_15m_v1 / crv_dnbrk24_5m_v1（2026-10-12 复核研究 run
+        20261012T084631Z-kline-regime-transition 的「A 信号下破半」，确认级）：
+        阴线吞没（当前实体 > 1.5×前实体 ∧ 方向反转）∧ 收盘跌破前 24 根低 → 押次根收阳 UP。
+        15m 样本外(验证+盲测+前向 288d) n=249 胜率 61.9%（发现 59.2%/验证 60.6%/
+        盲测 63.4%/前向 62.5%），相对「仅破24低无吞没」+6.3pp；护栏 0.606（61.9%×0.98）。
+        5m 样本外 n=888 胜率 55.7%（盲测段 52.2% 偏弱），相对对照仅 +1.1pp；
+        护栏 0.546 刻意只放行便宜 UP。两版本均默认实盘 OFF。
 
 口径保真（影子阶段的生命线）：
     特征公式逐位移植研究 features.py（trailing 滚动窗、prior 高低点显式 shift、
@@ -110,6 +117,22 @@ CRV_SHADOW_SPECS: list[dict] = [
         "direction": "DOWN",           # 三因子观察级：高位∧z20>+2∧恰连3阳 → 次根收阴
         "condition_text": "up & pos100>0.90 & z20>+2 & streak==3 → 次根收阴DOWN（观察级，仅影子）",
     },
+    {
+        "version": "crv_dnbrk24_15m_v1",
+        "tf": "15m",
+        "discovery_id": "dnbrk20261012_15m",
+        "kind": "dnbrk24",
+        "direction": "UP",             # 阴线吞没∧跌破24低 → 次根收阳 UP（2026-10-12 复核）
+        "condition_text": "dn & engulf(实体>1.5×前实体) & close<prior24低 → 次根收阳UP",
+    },
+    {
+        "version": "crv_dnbrk24_5m_v1",
+        "tf": "5m",
+        "discovery_id": "dnbrk20261012_5m",
+        "kind": "dnbrk24",
+        "direction": "UP",
+        "condition_text": "dn & engulf(实体>1.5×前实体) & close<prior24低(5m) → 次根收阳UP",
+    },
 ]
 CRV_VERSIONS = [s["version"] for s in CRV_SHADOW_SPECS]
 CRV_VERSIONS_BY_TF: dict[str, list[str]] = {
@@ -185,6 +208,16 @@ def compute_crv_features(kl: Klines) -> dict:
     prior_hi20 = _shift1(roll_max(h, 20))
     prior_lo20 = _shift1(roll_min(l, 20))
     prior_hi50 = _shift1(roll_max(h, 50))
+    # prior_lo24：下破吞没族（crv_dnbrk24_*）用，收盘跌破前 24 根低
+    prior_lo24 = _shift1(roll_min(l, 24))
+    # engulf：阴线吞没（2026-10-12 复核口径）——当前根与前一实体方向相反，且当前
+    # 实体 > 1.5×前一实体。前一根缺失（首根/断点）→ 不触发。
+    prev_body = _shift1(body)
+    prev_sign = _shift1(np.sign(c - o))
+    with np.errstate(invalid="ignore"):
+        engulf = ((np.sign(c - o) != prev_sign) & (np.sign(c - o) != 0)
+                  & (body > 1.5 * prev_body))
+    engulf[np.isnan(prev_body)] = False
     # pos100：(close − roll_min(l,100)) / (roll_max(h,100) − roll_min(l,100) + 1e-12)
     lo100, hi100 = roll_min(l, 100), roll_max(h, 100)
     with np.errstate(invalid="ignore", divide="ignore"):
@@ -240,6 +273,7 @@ def compute_crv_features(kl: Klines) -> dict:
     return {
         "close": c, "up": up, "dn": dn, "body": body,
         "prior_hi20": prior_hi20, "prior_lo20": prior_lo20, "prior_hi50": prior_hi50,
+        "prior_lo24": prior_lo24, "engulf": engulf,
         "pos100": pos100, "z20": z20, "atr": atr, "rsi": rsi, "streak": streak,
         "near_lo20": near_lo20,
     }
@@ -281,6 +315,10 @@ def spec_mask(spec: dict, feat: dict) -> np.ndarray:
     if kind == "hi_z3":
         return (feat["up"] & _gt(feat["pos100"], 0.90) & _gt(feat["z20"], 2.0)
                 & (feat["streak"] == 3))
+    if kind == "dnbrk24":
+        # 阴线吞没 ∧ 收盘跌破前 24 根低 → 押次根收阳 UP（2026-10-12 复核研究
+        # run 20261012T084631Z 的「A 信号下破半」；15m 样本外 61.9% / 5m 55.7%）
+        return feat["dn"] & feat["engulf"] & _lt(c, feat["prior_lo24"])
     raise ValueError(f"未知 CRV spec.kind: {kind}")
 
 
@@ -482,6 +520,13 @@ class CrvShadowDetector:
         if not np.isnan(feat["prior_lo20"][idx]):
             snapshot["dist_prior_lo20"] = round(
                 float(feat["close"][idx] - feat["prior_lo20"][idx]), 6)
+        # dnbrk24 审计字段：吞没实体比 与 距 24 低（供实时值与研究口径对照）
+        prev_body_v = feat["body"][idx - 1] if idx > 0 else np.nan
+        if not np.isnan(prev_body_v) and prev_body_v > 0:
+            snapshot["body_prev_ratio"] = round(float(feat["body"][idx] / prev_body_v), 6)
+        if not np.isnan(feat["prior_lo24"][idx]):
+            snapshot["dist_prior_lo24"] = round(
+                float(feat["close"][idx] - feat["prior_lo24"][idx]), 6)
         # 目标窗入场报价快照（窗口对齐+近开盘守卫；缺失/回补 → None，该笔 EV 不计）
         up_q, down_q, q_ts = snapshot_entry_quote(self._pm_by_tf[tf], target_bar_start)
         session.add(KlineShadowSignal(

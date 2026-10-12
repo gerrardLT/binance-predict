@@ -230,7 +230,7 @@ def test_parse_defaults_all_off(monkeypatch) -> None:
     monkeypatch.setattr(settings, "live_default_max_daily_orders", 100)
     monkeypatch.setattr(settings, "live_channels_json", "")
     cfgs = parse_channel_config()
-    assert len(cfgs) == 39 + len(CANDLESTICK_SIGNAL_IDS)  # 2026-10-09 +s4_delay60_v1
+    assert len(cfgs) == 41 + len(CANDLESTICK_SIGNAL_IDS)  # 2026-10-12 +crv_dnbrk24_15m/5m_v1
     assert set(CANDLESTICK_SIGNAL_IDS) <= set(cfgs)
     assert all(not c.enabled for c in cfgs.values())
     assert all(c.amount_usdt == 2.0 for c in cfgs.values())
@@ -407,6 +407,8 @@ def test_channels_registry_shape() -> None:
         "crv_brk50_hi_15m_v1", "crv_brk20_5m_v1",
         # 2026-10-05 BRK 假突破回归双通道（默认全 OFF；与 CRV 同周期突破族同窗互斥）
         "brkrv_brk8h_15m_v1", "brkrv_brk8h_5m_v1",
+        # 2026-10-12 复核「A 信号下破半」下破吞没双通道（默认全 OFF；押 UP）
+        "crv_dnbrk24_15m_v1", "crv_dnbrk24_5m_v1",
     }
     assert set(LIVE_CHANNELS) == expected_existing | set(CANDLESTICK_SIGNAL_IDS)
     assert set(RETIRED_CHANNELS) == {
@@ -3085,8 +3087,8 @@ def test_status_shape(monkeypatch) -> None:
     assert s["defaults"]["max_daily_orders"] == 100
     from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
     # 状态列表 = LIVE_CHANNELS + 退役 spec（_with_retired 合并）→ gap_crowd 两版退役后
-    # 仍在合并表内，故基数与注册为在线时同为 59。
-    assert len(s["channels"]) == 59 + len(CANDLESTICK_SIGNAL_IDS)  # +s4_delay60_v1
+    # 仍在合并表内；2026-10-12 加 crv_dnbrk24_15m/5m_v1 两通道后基数 59→61。
+    assert len(s["channels"]) == 61 + len(CANDLESTICK_SIGNAL_IDS)
     by = {c["channel"]: c for c in s["channels"]}
     c = by["quote_contrarian_v1"]
     assert c["enabled"] is True and c["enabled_at_startup"] is True
