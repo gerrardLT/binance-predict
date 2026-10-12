@@ -237,6 +237,44 @@ def _stdev_partial(vals: list[float]) -> float:
     return math.sqrt(var) if var > 0.0 else 0.0
 
 
+# 距 24h 低点门（场景 S2，2026-10-12 实盘归因，用户拍板）：入场时点 BTC 距最近
+# 24h 最低点的百分比距离 ≥ 阈值不开仓——浅回调里的「破 4h 低」不是空头耗尽而是
+# 下跌趋势中的正常回撤（接刀）。阈值挂在 ChannelSpec.max_low24_gap_pct
+# （live_channels），此处只管口径与判定。
+# ⚠️ 口径必须严格 ex-ante：只用窗口开始前已收盘的 5m K。归因脚本第一版把入场
+# 当根 5m 的 low 算进 24h 低点（该根尚未收盘＝前视），效应被放大近一个量级
+# （p 0.002→0.048、名义最优阈值 0.45%→0.40%）；kline_ending_at_fetcher 只返回
+# open_time + 5m ≤ 窗口开始 的根，天然规避。
+LOW24_WINDOW_BARS = 288   # 24h / 5m
+LOW24_MIN_BARS = 200      # 样本不足（<200 根）→ None，调用方保守弃单
+
+
+def low24_gap_pct(bars: list[dict], window_start_ms: int) -> float | None:
+    """入场时点距最近 24h 最低点的百分比距离（研究冻结口径，严格 ex-ante）。
+
+    bars：5m K 线（含 open_time / low / close），窗口开始前已收盘的根才计入
+    （open_time + 5m ≤ window_start_ms，且不早于 window_start_ms − 24h）；
+    参考价取最后一根已收盘 5m 的收盘价。样本不足 / 非正价 / 字段缺失 → None，
+    调用方保守弃单。
+    """
+    closed = sorted(
+        (b for b in bars
+         if window_start_ms - 86_400_000 <= int(b["open_time"])
+         and int(b["open_time"]) + 300_000 <= window_start_ms),
+        key=lambda b: int(b["open_time"]),
+    )
+    if len(closed) < LOW24_MIN_BARS:
+        return None
+    try:
+        lo = min(float(b["low"]) for b in closed)
+        ref = float(closed[-1]["close"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if lo <= 0.0 or ref <= 0.0:
+        return None
+    return (ref / lo - 1.0) * 100.0
+
+
 def _g3_live_band_veto(ext: dict) -> str | None:
     """G3 实盘双波峰利润带门：触发时刻不在 [105,120)s / [210,240)s 或 q<0.07 → 拦截（仅实盘通道）。"""
     td = ext.get("td_sec")
@@ -472,12 +510,17 @@ class MultiLiveTrader:
         reason: str,
         rejected: bool,
         input_snapshot: dict | None = None,
+        direction: str = "DOWN",
     ) -> None:
-        """Record a final async strategy gate result without affecting its decision."""
+        """Record a final async strategy gate result without affecting its decision.
+
+        direction 默认 DOWN 保持既有调用方（蜡烛族）行为不变；场景 S2 门禁
+        传真实押注方向，避免审计记录方向错标。
+        """
         await self._ensure_runtime_assessment(
             channel,
             window_start,
-            "DOWN",
+            direction,
             input_snapshot=input_snapshot,
             stage=TerminalStage.STRATEGY,
             reason=(
@@ -1596,6 +1639,29 @@ class MultiLiveTrader:
         # side=high（多头耗尽/动量衰竭）押 DOWN；side=low（空头耗尽）押 UP
         prediction = "DOWN" if sig.get("side") == "high" else "UP"
         try:
+            # 距 24h 低点门（场景 S2，2026-10-12 实盘归因）：入场时点距 24h 最低点
+            # ≥ 阈值（含贴线）不开仓；K 线拉不到/样本不足 → 保守弃单。影子侧口径
+            # 不变（全部事件照常落表），前向对照由弃单审计记录做反事实。
+            if spec.max_low24_gap_pct is not None:
+                gap = await self._low24_gap_pct_at(market_start)
+                if gap is None or gap >= spec.max_low24_gap_pct:
+                    logger.info(
+                        "多通道实盘：{} 距 24h 低点门未过，弃单 | 窗口 {} | gap={}% | 阈值 {}%",
+                        channel, _fmt_win(market_start),
+                        "数据缺失" if gap is None else f"{gap:.3f}",
+                        spec.max_low24_gap_pct)
+                    await self._record_strategy_outcome(
+                        channel,
+                        market_start,
+                        reason="low24_gap_missing" if gap is None else "low24_gap_too_far",
+                        rejected=gap is not None,
+                        direction=prediction,
+                        input_snapshot={
+                            "low24_gap_pct": gap,
+                            "max_low24_gap_pct": spec.max_low24_gap_pct,
+                        },
+                    )
+                    return
             assessment_context, proceed = await self._prepare_runtime_execution(
                 channel,
                 market_start,
@@ -1618,6 +1684,7 @@ class MultiLiveTrader:
                 market_period="15m",
                 scene_signal_id=int(sig["id"]),
                 order_type=spec.order_type,
+                entry_band_whitelist=spec.entry_band_whitelist,
                 assessment_context=assessment_context,
             )
             await self._after_fill(order, channel, cfg)
@@ -1749,6 +1816,20 @@ class MultiLiveTrader:
         except Exception as exc:
             logger.warning("多通道实盘：S2 条件单下单任务异常 | {} | {} | {}",
                            channel, _fmt_win(market_start), exc)
+
+    async def _low24_gap_pct_at(self, window_start_ms: int) -> float | None:
+        """入场时点距最近 24h 最低点的百分比距离（严格 ex-ante）。
+
+        按根数拉 288 根 5m（endTime=窗口开始，只含已收盘根）；fetcher 未注入 /
+        拉取失败 / 样本不足 → None（调用方保守弃单）。
+        """
+        if self.kline_ending_at_fetcher is None:
+            return None
+        bars = await self.kline_ending_at_fetcher(
+            "5m", LOW24_WINDOW_BARS, window_start_ms)
+        if not bars:
+            return None
+        return low24_gap_pct(bars, window_start_ms)
 
     async def _rv_pct_at(self, window_start_ms: int) -> float | None:
         """决策时点（窗口开始前最后一根 1m 收盘）的 1h 波动 7 日分位。
