@@ -166,11 +166,19 @@ async def patch_assessment(session: AsyncSession, patch: AssessmentPatch) -> Non
     advances = literal(candidate_rank) >= _rank_case(table.c.terminal_stage)
     # Stage/reason advance monotonically. A lower-stage late patch may fill facts
     # that are still NULL, but must not overwrite facts captured at a later stage.
+    # ⚠️ 绑定值必须显式带上列类型（literal(value, table.c[key].type)）：CASE/COALESCE
+    # 里裸字面量推断不出类型，JSONB 的 dict 会以裸 dict 发给 asyncpg →
+    # DataError: 'dict' object has no attribute 'encode'（2026-09-20 71a57fc 把
+    # else_ 换成 func.coalesce 后引入，导致此后所有带 *_snapshot 的评估写入
+    # 整行回滚：订单 assessment_id 恒 NULL、弃单审计记录丢失）。
     guarded = {
         key: (
             case((advances, value), else_=table.c[key])
             if key in {"terminal_stage", "reason_code"}
-            else case((advances, value), else_=func.coalesce(table.c[key], value))
+            else case(
+                (advances, literal(value, table.c[key].type)),
+                else_=func.coalesce(table.c[key], literal(value, table.c[key].type)),
+            )
         )
         for key, value in values.items()
     }

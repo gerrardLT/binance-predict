@@ -5,6 +5,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.types import NullType
 
 from binance_predict.services.shadow_execution_registry import SHADOW_VERSION_SPECS
 from binance_predict.services.shadow_execution_store import (
@@ -152,6 +154,38 @@ async def test_late_fact_patch_fills_eligibility_without_regressing_terminal_sta
     assert "execution_eligible=casewhen" in compact
     assert "coalesce(shadow_execution_assessments.strategy_eligible" in compact
     assert "terminal_stage=casewhen" in compact
+
+
+@pytest.mark.asyncio
+async def test_patch_assessment_binds_jsonb_with_column_type() -> None:
+    """回归（2026-09-20 71a57fc 引入）：CASE/COALESCE 内的绑定值必须带列类型。
+
+    裸字面量在 CASE 里推断成 NullType → asyncpg 收到裸 dict 报
+    `DataError: 'dict' object has no attribute 'encode'`，整条评估写入随事务回滚
+    （订单 assessment_id 恒 NULL、弃单审计记录全丢、对账器无行可绑）。
+    """
+    session = SimpleNamespace(execute=AsyncMock())
+
+    await patch_assessment(session, AssessmentPatch(
+        assessment_id=11,
+        stage=TerminalStage.OPERATIONAL,
+        reason=ReasonCode.PASSED,
+        config_snapshot={"entry_band_whitelist": [[0.5, 1.01]]},
+        input_snapshot={"side": "low"},
+        amount_usdt=2.0,
+    ))
+
+    stmt = session.execute.await_args.args[0]
+    compiled = stmt.compile(dialect=postgresql.dialect())
+    binds = list(compiled.binds.values())
+
+    dict_binds = [bp for bp in binds if isinstance(bp.value, dict)]
+    assert len(dict_binds) >= 2  # config_snapshot / input_snapshot
+    assert all(isinstance(bp.type, JSONB) for bp in dict_binds), (
+        "JSONB 绑定丢了类型: " + str([type(bp.type).__name__ for bp in dict_binds]))
+    # 标量字段同样不得退化为 NullType（否则 asyncpg 也收不到可编码的值）
+    scalar_binds = [bp for bp in binds if isinstance(bp.value, float)]
+    assert scalar_binds and all(not isinstance(bp.type, NullType) for bp in scalar_binds)
 
 
 @dataclass
