@@ -465,6 +465,8 @@ async def test_analytics_empty_db() -> None:
         "firsthit_down_btcsoft_v1",
         # 2026-10-06 首触 G3v2 双波峰版
         "firsthit_down_chg_v2",
+        # 2026-10-13 首触分桶组合 D/E（q≥0.07∩chg≤3.5bp，同名实盘默认 OFF）
+        "firsthit_down_chg35_d_v1", "firsthit_down_chg35_e_v1",
         # rev2 孕线反转族
         "hm_inside_15m_v2", "ih_inside_15m_v2", "hm_inside_5m_v2",
         # 2026-10-04 CRV 情绪反转族（四个确认级 + 两个三因子探索级 + 观察级）

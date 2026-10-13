@@ -88,6 +88,7 @@ from .firsthit_shadow_detector import (
     extract_firsthit_features,
     extract_k10_kline_features,
     _gate_of as firsthit_gate_of,
+    CHG35_VERSIONS,
 )
 from .live_channels import (
     LIVE_CHANNELS,
@@ -799,8 +800,9 @@ class MultiLiveTrader:
                                 or int(version_ext["trigger_ts"]) != int(ts_ms)
                             )):
                             continue
-                    elif ch == G3_LIVE_CHANNEL:
+                    elif ch == G3_LIVE_CHANNEL or ch in CHG35_VERSIONS:
                         # 2026-10-06 根除 G3 时点漂移：锁定首触时刻 BTC 计算 chg_bps，与影子严格对齐
+                        # （2026-10-13 分桶 D/E 同口径）
                         version_ext = extract_firsthit_features(
                             window_start_ms, float(window_entry_price),
                             window_down_curve, window_btc_curve,
@@ -1887,7 +1889,7 @@ class MultiLiveTrader:
                     return
                 dyn_guard = resolve_max_exec(spec, cfg)
             else:
-                if channel == G3_LIVE_CHANNEL:
+                if channel == G3_LIVE_CHANNEL or channel in CHG35_VERSIONS:
                     # 利润带门三件套之三：下单时刻距窗末剩余 ≥60s 硬门（I/O 等待后
                     # 复核实际墙钟）。末段反转概率断崖（240s+ 触发胜率 6.1%、
                     # 280s+ EV −0.256），打通 220~240s 主峰死区同时严防末段违规追单。

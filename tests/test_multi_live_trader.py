@@ -230,7 +230,7 @@ def test_parse_defaults_all_off(monkeypatch) -> None:
     monkeypatch.setattr(settings, "live_default_max_daily_orders", 100)
     monkeypatch.setattr(settings, "live_channels_json", "")
     cfgs = parse_channel_config()
-    assert len(cfgs) == 41 + len(CANDLESTICK_SIGNAL_IDS)  # 2026-10-12 +crv_dnbrk24_15m/5m_v1
+    assert len(cfgs) == 43 + len(CANDLESTICK_SIGNAL_IDS)  # 2026-10-13 +firsthit_down_chg35_d/e_v1
     assert set(CANDLESTICK_SIGNAL_IDS) <= set(cfgs)
     assert all(not c.enabled for c in cfgs.values())
     assert all(c.amount_usdt == 2.0 for c in cfgs.values())
@@ -398,6 +398,8 @@ def test_channels_registry_shape() -> None:
         # （剔 Top5 赢单后影子 EV 全负，见 RETIRED_CHANNEL_SPECS 注释）。
         # 2026-10-06：G3 升级为 v2 双波峰版（firsthit_down_chg_v2），v1 退役归档。
         "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v2",
+        # 2026-10-13 分桶组合 D/E（q≥0.07∩chg≤3.5bp∩首触分桶，默认 OFF）
+        "firsthit_down_chg35_d_v1", "firsthit_down_chg35_e_v1",
         # 2026-09-08 firsthit G4 交互门（G1∩G3，默认 OFF；⚠非独立暴露，见 live_channels 注释）
         "firsthit_down_g4_v1",
         # 2026-09-09 15m 经典孕线反转双通道 + 2026-09-13 5m HM 精选通道（默认全 OFF）
@@ -2476,6 +2478,76 @@ async def test_firsthit_three_channels_independent_fill(monkeypatch) -> None:
         "首触 240s 越主峰上界（[210,240)s 开区间），G3 不得下单"
 
 
+def _chg35_btc_curve(trigger_idx: int, chg_bps: float) -> list[dict]:
+    """冲高后回落曲线：i=trigger_idx 处 BTC 相对开盘 100.0 恰为 chg_bps（上影 3bp，过盘前 veto）。"""
+    trig = 100.0 * (1.0 + chg_bps / 1e4)
+    peak = trig + 0.03
+    pts = [{"t": WINDOW_START, "v": 100.0}]
+    for i in range(1, 20):
+        v = peak if i < trigger_idx else trig
+        pts.append({"t": WINDOW_START + i * 15_000, "v": v})
+    return pts
+
+@pytest.mark.asyncio
+async def test_chg35_buckets_live_default_off_and_gates(monkeypatch) -> None:
+    """分桶 D/E 实盘通道（2026-10-13）：默认 OFF；开启后 q≥0.07∧chg≤3.5bp∧首触分桶才下单。
+
+    - 2.82<chg≤3.5 是 G3v2 拒而 D/E 放行的区间（chg=3.0bp）
+    - 桶：D=[105,195)∪[210,240)；E=[105,150)∪[180,195)∪[210,240)；195-210 谷底两者都不下单
+    - 下单时刻距窗末剩余 <60s 弃单；护栏为动态 q×1.03
+    """
+    from binance_predict.services.live_channels import LIVE_CHANNELS, parse_channel_config
+    d, e, g = "firsthit_down_chg35_d_v1", "firsthit_down_chg35_e_v1", "firsthit_down_chg_v2"
+    cfgs = parse_channel_config()
+    assert not cfgs[d].enabled and not cfgs[e].enabled          # 默认关闭
+    assert cfgs[d].max_exec_price is None and cfgs[e].max_exec_price is None
+    for ch in (d, e):
+        spec = LIVE_CHANNELS[ch]
+        assert spec.family == "firsthit" and spec.market_period == "5m"
+        assert spec.direction == "DOWN" and spec.order_type == "MARKET"
+        assert spec.auto_max_exec == 0.101
+
+    ov = {ch: {"enabled": True, "max_exec_price": 0.101} for ch in (d, e, g)}
+
+    async def run(td_s: int, chg: float, wall_s: float | None = None,
+                  q: float = 0.08, channels=(d, e, g)):
+        fake = _FakeTrader()
+        t = _make_trader(monkeypatch, fake, channels=list(channels), overrides=ov)
+        idx = td_s // 15
+        dn = _firsthit_down_curve(trigger_q=q, npts=20, trigger_idx=idx)
+        btc = _chg35_btc_curve(idx, chg)
+        wall = (td_s + 1) if wall_s is None else wall_s
+        monkeypatch.setattr(milt.time, "time", lambda: (WINDOW_START + wall * 1000) / 1000)
+        t.check(WINDOW_START, WINDOW_END, WINDOW_START + td_s * 1000,
+                down_price=q, btc_price=100.0 * (1 + chg / 1e4),
+                window_entry_price=100.0, window_btc_curve=btc, window_down_curve=dn)
+        await _drain(t)
+        return fake
+
+    # 225s 主峰带 + chg=3.0bp：D/E 下单，G3v2(chg≤2.82) 不下单
+    f = await run(225, 3.0)
+    assert {c["signal_version"] for c in f.calls} == {d, e}
+    assert all(c["prediction"] == "DOWN" and c["market_period"] == "5m" for c in f.calls)
+    assert abs(f.calls[0]["max_exec_price"] - 0.08 * 1.03) < 1e-4   # 动态护栏 q×1.03，不用 0.101
+    # chg=3.49 内、3.6 越界（3.5 贴线含边界由 test_gate_of_chg35_price_and_chg_boundaries 直测；
+    # 曲线构造的浮点误差会让 3.5 算成 3.5000000000007，故实盘链路用例避开恰好边界）
+    assert {c["signal_version"] for c in (await run(225, 3.49)).calls} == {d, e}
+    assert (await run(225, 3.6)).calls == []
+    # chg≤2.82 时 G3v2 也同窗下单（互不互斥，已在注释声明）
+    assert {c["signal_version"] for c in (await run(225, 2.0)).calls} == {d, e, g}
+    # 桶边界：150-180 仅 D；195-210 谷底都不下单；105 首段 D/E 都下单
+    assert {c["signal_version"] for c in (await run(165, 3.0, channels=(d, e))).calls} == {d}
+    assert (await run(195, 3.0, channels=(d, e))).calls == []
+    assert (await run(210 - 15, 3.0, channels=(d, e))).calls == []
+    assert {c["signal_version"] for c in (await run(105, 3.0, channels=(d, e))).calls} == {d, e}
+    assert {c["signal_version"] for c in (await run(180, 3.0, channels=(d, e))).calls} == {d, e}
+    # q<0.07 深水单被浅价门拦截
+    assert (await run(225, 3.0, q=0.05, channels=(d, e))).calls == []
+    # 首触在 240s 之后（上界开区间）不下单
+    assert (await run(240, 3.0, channels=(d, e))).calls == []
+    # 下单时刻剩余 <60s（墙钟 245s）：带内触发也弃单
+    assert (await run(225, 3.0, wall_s=245, channels=(d, e))).calls == []
+
 @pytest.mark.asyncio
 async def test_g3_pin_btc_to_first_touch_eliminates_timing_drift(monkeypatch) -> None:
     """G3 时点漂移根治验证：首触时刻 chg>+2.82bp，即便后续采样 BTC 回落，实盘坚决不开火。"""
@@ -2934,7 +3006,7 @@ def test_status_shape(monkeypatch) -> None:
     from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
     # 状态列表 = LIVE_CHANNELS + 退役 spec（_with_retired 合并）→ gap_crowd 两版退役后
     # 仍在合并表内；2026-10-12 加 crv_dnbrk24_15m/5m_v1 两通道后基数 59→61。
-    assert len(s["channels"]) == 61 + len(CANDLESTICK_SIGNAL_IDS)
+    assert len(s["channels"]) == 63 + len(CANDLESTICK_SIGNAL_IDS)  # 2026-10-13 +firsthit_down_chg35_d/e_v1
     by = {c["channel"]: c for c in s["channels"]}
     c = by["quote_contrarian_v1"]
     assert c["enabled"] is True and c["enabled_at_startup"] is True

@@ -84,6 +84,11 @@ FIRSTHIT_SPECS: list[tuple[str, str]] = [
     # G3v2 双波峰版（2026-10-06 升级）：触发 105~120s / 210~240s ∩ chg≤+2.82bp ∩ 浅价 q≥0.07。
     # 彻底告别 v1 历史逆向选择与时点漂移，影子从 0 开始全新起跑，与实盘严格同口径。
     ("firsthit_down_chg_v2", "G3双波峰版 105-120s/210-240s∧chg≤+2.82bp∧q≥0.07"),
+    # 2026-10-13 分桶组合版 D/E（75D 线上采样回测，样本内择优，仅影子/小额实盘前向裁决）：
+    # q≥0.07 ∩ chg≤+3.5bp ∩ 首触 15s 分桶。D=可执行桶(<240s)去掉 195-210；
+    # E=D 再去掉 150-180。E ⊂ D，同窗同开会对 E 事件叠加下注。
+    ("firsthit_down_chg35_d_v1", "分桶D q≥0.07∧chg≤+3.5bp∧首触[105,195)∪[210,240)"),
+    ("firsthit_down_chg35_e_v1", "分桶E q≥0.07∧chg≤+3.5bp∧首触[105,150)∪[180,195)∪[210,240)"),
 ]
 Q_LO, Q_HI = 0.005, 0.1      # 首触报价区间 (0.005, 0.1]
 BODY_R_GATE = 0.35           # G1 门：路径归一实体 ≤ 0.35
@@ -91,6 +96,14 @@ CHG_BPS_GATE = 2.82          # G3 门：BTC 相对开盘涨幅 ≤ +2.82 bp
 BTCSOFT_Q_MIN = 0.07         # 报价错杀门：浅价下界（0.07 ≤ q ≤ 0.1）
 G3_V2_BANDS_S = ((105, 120), (210, 240))  # G3v2 双波峰时间窗
 G3_V2_Q_MIN = 0.07           # G3v2 浅价下界
+CHG35_GATE = 3.5             # 分桶 D/E：BTC 相对开盘涨幅上限（bp，含边界）
+CHG35_Q_MIN = 0.07           # 分桶 D/E：浅价下界
+# 分桶 D/E 首触时间窗（秒，含下界不含上界）；上限 240s 保证下单时刻剩余 ≥60s 可执行。
+CHG35_BANDS_S: dict[str, tuple[tuple[int, int], ...]] = {
+    "firsthit_down_chg35_d_v1": ((105, 195), (210, 240)),
+    "firsthit_down_chg35_e_v1": ((105, 150), (180, 195), (210, 240)),
+}
+CHG35_VERSIONS = frozenset(CHG35_BANDS_S)
 MIN_PTS = 8                  # 路径质量门：触发前 btc 采样点数 ≥ 8（v2 主分析口径）
 K10_VERSIONS = frozenset({"firsthit_down_k10_v1", "firsthit_down_k10_profit_v1", K10_EARLY})
 K10_Z_MAX = 1.8556725686410152
@@ -394,6 +407,14 @@ def _gate_of(
             return False
         in_band = any(lo <= float(td) < hi for lo, hi in G3_V2_BANDS_S)
         return in_band and float(q) >= G3_V2_Q_MIN and float(chg) <= CHG_BPS_GATE
+    if version in CHG35_VERSIONS:
+        td = ext.get("td_sec")
+        q = ext.get("q")
+        chg = ext.get("chg_bps")
+        if td is None or q is None or chg is None:
+            return False
+        in_band = any(lo <= float(td) < hi for lo, hi in CHG35_BANDS_S[version])
+        return in_band and float(q) >= CHG35_Q_MIN and float(chg) <= CHG35_GATE
     if version == "firsthit_down_btcsoft_v1":
         # 报价错杀版：G3 门 ∩ 浅价 ∩ 触发前 60 采样点 BTC 未上行。
         # btc_speed_60_bps 缺失（60s 前无采样）一律不放行——宁缺毋假。

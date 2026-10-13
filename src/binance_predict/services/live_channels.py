@@ -301,6 +301,19 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
         "firsthit_down_chg_v2", "firsthit", "5m", "DOWN", 0.101,
         "首触G3偏离v2·双波峰版 触发105-120s/210-240s∧q≥0.07（押DOWN）",
     ),
+    # 2026-10-13 分桶组合 D/E（q≥0.07 ∩ chg≤+3.5bp ∩ 首触 15s 分桶；75D 线上采样回测，
+    # 样本内择优，默认 OFF，影子+小额实盘前向裁决）。门由 firsthit_shadow_detector._gate_of
+    # 单点定义，影子与实盘同源；首触 <240s 保证下单剩余 ≥60s。
+    # 护栏 0.101 仅作用于面板「带护栏」口径；实盘下单走动态护栏 q×1.03（同 G3v2）。
+    # ⚠ E ⊂ D 且与 G3v2 事件重叠：firsthit 全族不设同窗互斥，同开会对同一事件重复下注。
+    "firsthit_down_chg35_d_v1": ChannelSpec(
+        "firsthit_down_chg35_d_v1", "firsthit", "5m", "DOWN", 0.101,
+        "首触分桶D q≥0.07∧chg≤3.5bp 首触[105,195)∪[210,240)（押DOWN）",
+    ),
+    "firsthit_down_chg35_e_v1": ChannelSpec(
+        "firsthit_down_chg35_e_v1", "firsthit", "5m", "DOWN", 0.101,
+        "首触分桶E q≥0.07∧chg≤3.5bp 首触[105,150)∪[180,195)∪[210,240)（押DOWN）",
+    ),
     # 2026-10-05：K10 两版移入 RETIRED_CHANNEL_SPECS——影子本身负 EV
     # （−0.44/−0.42，剔 Top5 后 −0.95），信号已死非执行问题；盈利版的末 60s
     # veto 在实盘路径曾整体失效（17 单全部距窗末<60s 成交），一并退役。

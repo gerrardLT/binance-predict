@@ -83,6 +83,9 @@ _VERSION_ROWS: tuple[tuple[str, SourceType, str, str, str], ...] = (
     ("firsthit_down_btcsoft_v1", SourceType.FIRSTHIT, "5m", "same_window_first_touch", "down"),
     # G3v2 双波峰版（2026-10-06 升级）：双波峰利润带原生门，与实盘严格同口径。
     ("firsthit_down_chg_v2", SourceType.FIRSTHIT, "5m", "same_window_first_touch", "down"),
+    # 2026-10-13 分桶组合 D/E（q≥0.07 ∩ chg≤3.5bp ∩ 首触 15s 分桶），同名实盘默认 OFF。
+    ("firsthit_down_chg35_d_v1", SourceType.FIRSTHIT, "5m", "same_window_first_touch", "down"),
+    ("firsthit_down_chg35_e_v1", SourceType.FIRSTHIT, "5m", "same_window_first_touch", "down"),
     ("hm_inside_15m_v2", SourceType.KLINE, "15m", "target_bar", "row"),
     ("ih_inside_15m_v2", SourceType.KLINE, "15m", "target_bar", "row"),
     ("hm_inside_5m_v2", SourceType.KLINE, "5m", "target_bar", "row"),

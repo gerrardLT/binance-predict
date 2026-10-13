@@ -258,6 +258,58 @@ def test_gate_of_g3_v2_dual_bands_and_price_guards():
     assert _gate_of("firsthit_down_chg_v2", {**base, "td_sec": None}) is False
 
 
+def test_gate_of_chg35_buckets_d_and_e():
+    """分桶 D/E：q>=0.07 ∧ chg<=3.5(含贴线) ∧ 首触秒数落入各自桶集合（上界开区间）。"""
+    base = {
+        "q": 0.08, "trigger_ts": START + 110_000, "td_sec": 110,
+        "chg_bps": 2.0, "body_r": 0.50, "wick01": 0.0, "rng_bps": 5.0,
+        "npts": 20, "dvol": None, "dpar": None,
+    }
+    d, e = "firsthit_down_chg35_d_v1", "firsthit_down_chg35_e_v1"
+    # (td_sec, D 期望, E 期望)：D=[105,195)∪[210,240)；E=[105,150)∪[180,195)∪[210,240)
+    cases = [
+        (104, False, False),   # 下界之外（也是 npts>=8 的最早可能触发点之前）
+        (105, True, True),     # 下界含
+        (149, True, True),
+        (150, True, False),    # E 去掉 150-180
+        (179, True, False),
+        (180, True, True),
+        (194, True, True),
+        (195, False, False),   # 195-210 谷底桶，D/E 都排除
+        (209, False, False),
+        (210, True, True),
+        (239, True, True),
+        (240, False, False),   # 上界开区间：下单剩余需 >=60s
+        (270, False, False),
+    ]
+    for td, exp_d, exp_e in cases:
+        ext = {**base, "td_sec": td}
+        assert _gate_of(d, ext) is exp_d, f"D td={td}"
+        assert _gate_of(e, ext) is exp_e, f"E td={td}"
+    # E 是 D 的子集
+    for td in range(0, 301):
+        ext = {**base, "td_sec": td}
+        assert not _gate_of(e, ext) or _gate_of(d, ext)
+
+
+def test_gate_of_chg35_price_and_chg_boundaries():
+    base = {
+        "q": 0.08, "trigger_ts": START + 110_000, "td_sec": 225,
+        "chg_bps": 2.0, "body_r": 0.50, "wick01": 0.0, "rng_bps": 5.0,
+        "npts": 20, "dvol": None, "dpar": None,
+    }
+    for v in ("firsthit_down_chg35_d_v1", "firsthit_down_chg35_e_v1"):
+        assert _gate_of(v, {**base, "chg_bps": 3.5}) is True        # 贴线含
+        assert _gate_of(v, {**base, "chg_bps": 3.5001}) is False    # 越界
+        assert _gate_of(v, {**base, "chg_bps": 2.9}) is True        # 2.82<chg<=3.5 是 G3v2 拒而本版放行的区间
+        assert _gate_of("firsthit_down_chg_v2", {**base, "chg_bps": 2.9}) is False
+        assert _gate_of(v, {**base, "q": 0.07}) is True             # 浅价下界含
+        assert _gate_of(v, {**base, "q": 0.0699}) is False
+        assert _gate_of(v, {**base, "q": None}) is False
+        assert _gate_of(v, {**base, "chg_bps": None}) is False
+        assert _gate_of(v, {**base, "td_sec": None}) is False
+
+
 def test_gate_of_g4_boundary_inclusive_and_none_guard():
     """G4 贴线判定（含边界，与 G1/G3 同口径 ≤）+ 特征缺失 None 守卫 → 不落表。"""
     base = {
@@ -460,7 +512,9 @@ async def test_process_window_triggers_g0(monkeypatch):
     assert "firsthit_down_v1" in versions
     assert "firsthit_down_chg_v2" in versions      # chg=0.5bp ≤ 2.82bp 且双峰带内 → G3v2 同窗命中
     assert "firsthit_down_chg_v1" not in versions  # v1 已退役被 gate 拦截不落表
-    assert len(session.added) == 3 and session.committed == 3   # G0+G3+G3 early 独立 commit
+    # t=119s 在 D/E 的 [105,*) 首段内且 chg=0.5bp≤3.5bp → 分桶 D/E 同窗命中
+    assert "firsthit_down_chg35_d_v1" in versions and "firsthit_down_chg35_e_v1" in versions
+    assert len(session.added) == 5 and session.committed == 5   # G0+G3+G3 early+D+E 独立 commit
     row = [r for r in session.added if r.version == "firsthit_down_v1"][0]
     assert row.status == "SETTLED"
     assert row.win is True and row.settle_outcome == "DOWN"
@@ -645,6 +699,7 @@ def test_specs_self_consistent():
         "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",
         "firsthit_down_btcsoft_v1",
         "firsthit_down_chg_v2",
+        "firsthit_down_chg35_d_v1", "firsthit_down_chg35_e_v1",
     }
     for v, name in FIRSTHIT_SPECS:
         assert len(v) <= 32, f"{v} 超出 DB 列宽 String(32)"
