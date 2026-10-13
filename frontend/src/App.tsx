@@ -1841,11 +1841,12 @@ function KlineMini({ period: orderPeriod, nowMs, radarSignals }: {
             })}
           </svg>
 
-          {/* 悬浮数据卡片：仅保留决策所需的时间、收价与本根涨跌 */}
+          {/* 悬浮数据卡片：仅保留决策所需的时间、开收价与本根涨跌 */}
           {hoverBar != null && hover != null && (
             <div className="absolute z-10 pointer-events-none rounded border border-line/60 bg-card/60 backdrop-blur-sm px-2 py-1 text-[10px] font-mono text-ink-95 shadow-sm"
               style={{ left: `${Math.min(78, Math.max(0, (hover.vx / W) * 100))}%`, top: 8 }}>
               <span>{new Date(hoverBar.t).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</span>
+              <span className="ml-1.5 text-ink-80">开 {hoverBar.o.toFixed(1)}</span>
               <span className="mx-1.5 font-bold">收 {hoverBar.c.toFixed(1)}</span>
               <span className={hoverBar.c >= hoverBar.o ? 'text-positive font-bold' : 'text-negative font-bold'}>
                 {hoverBar.c >= hoverBar.o ? '+' : ''}{(((hoverBar.c - hoverBar.o) / hoverBar.o) * 100).toFixed(2)}%
