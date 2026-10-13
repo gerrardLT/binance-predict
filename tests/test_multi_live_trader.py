@@ -1271,29 +1271,6 @@ def _scene_sig(pattern_type: str, side: str, sig_id: int = 42) -> dict:
             "market_end_15m": MARKET_START_15M + 900_000}
 
 
-def _low24_klines(window_start_ms: int, gap_pct: float, n: int = 288) -> list[dict]:
-    """合成 n 根已收盘 5m K：24h 最低点固定 100.0，末根收盘 = 100×(1+gap%)。
-
-    因此 low24_gap_pct 恰为 gap_pct（末根收盘距 24h 低点的百分比距离）。
-    """
-    ref = 100.0 * (1.0 + gap_pct / 100.0)
-    return [
-        {"open_time": window_start_ms - (n - i) * 300_000,
-         "open": 100.0, "high": ref, "low": 100.0, "close": ref}
-        for i in range(n)
-    ]
-
-
-def _stub_low24_klines(t: MultiLiveTrader, window_start_ms: int, gap_pct: float) -> None:
-    """注入 5m K 线桩：仅对目标窗口返回合成序列，其他 endTime 返回空。"""
-    bars = _low24_klines(window_start_ms, gap_pct)
-
-    async def _fetch(_iv, _limit, end_ms):
-        return bars if end_ms == window_start_ms else []
-
-    t.kline_ending_at_fetcher = _fetch
-
-
 @pytest.mark.asyncio
 async def test_scene_s1_down_15m(monkeypatch) -> None:
     """S1（多头耗尽，side=high）→ 15m 市场押 DOWN，护栏 0.70（2026-08-30 盘口校准）。"""
@@ -1405,11 +1382,10 @@ async def test_s1_dynamic_and_original_s1_same_window_exclusive(monkeypatch) -> 
 async def test_scene_s2_up_15m(monkeypatch) -> None:
     """S2（空头耗尽，side=low）→ 15m 市场押 UP，护栏 0.65（2026-08-30 盘口校准）。
 
-    2026-10-12 起 S2 另挂距 24h 低点门，需注入「新鲜新低」K 线桩放行。
+    无 K 线依赖：距 24h 低点门 2026-10-13 已撤回，fetcher 未注入也照常开火。
     """
     fake = _FakeTrader()
     t = _make_trader(monkeypatch, fake, channels=["scene_bear_exhaust"])
-    _stub_low24_klines(t, MARKET_START_15M, gap_pct=0.20)
     t.on_scene_signal(_scene_sig("bear_exhaust", "low"))
     await _drain(t)
     call = fake.calls[0]
@@ -1417,6 +1393,8 @@ async def test_scene_s2_up_15m(monkeypatch) -> None:
     assert call["signal_version"] == "scene_bear_exhaust"
     assert call["market_period"] == "15m"
     assert call["max_exec_price"] == 0.65
+    # 入场价白名单经 _fire_scene 透传到下单层（此前场景路径未透传，会静默失效）
+    assert call["entry_band_whitelist"] == ((0.50, 1.01),)
 
 
 @pytest.mark.asyncio
@@ -1441,7 +1419,6 @@ async def test_scene_s2_variants_same_window_exclusive(monkeypatch) -> None:
         monkeypatch, fake,
         channels=["scene_bear_exhaust", "scene_bear_exhaust_opt_v1"],
     )
-    _stub_low24_klines(t, MARKET_START_15M, gap_pct=0.20)
     t.on_scene_signal(_scene_sig("bear_exhaust", "low", sig_id=1))
     await _drain(t)
     t.on_scene_signal(_scene_sig("bear_exhaust_opt_v1", "low", sig_id=1))
@@ -1513,149 +1490,18 @@ async def test_scene_unknown_pattern_and_bad_payload_swallowed(monkeypatch) -> N
 
 
 # ------------------------------------------------------------
-# 组 5b：S2 距 24h 低点门（2026-10-12 实盘归因）
+# 组 5b：S2 入场价白名单（2026-10-12；距 24h 低点门 2026-10-13 已撤回）
 # ------------------------------------------------------------
 
-def test_low24_gap_pct_pure_caliber() -> None:
-    """纯函数口径：只吃已收盘且在 24h 窗内的 5m 根；样本不足/非正价 → None。"""
-    from binance_predict.services.multi_live_trader import (
-        LOW24_MIN_BARS, LOW24_WINDOW_BARS, low24_gap_pct,
-    )
-
-    ws = 1_800_000_000_000
-    assert LOW24_WINDOW_BARS == 288 and LOW24_MIN_BARS == 200
-    assert abs(low24_gap_pct(_low24_klines(ws, 0.45), ws) - 0.45) < 1e-9
-    # 未收盘的当根（open_time == ws）不算：即便 low 极低也不影响判定
-    dirty = _low24_klines(ws, 0.45) + [{"open_time": ws, "low": 1.0, "close": 1.0}]
-    assert abs(low24_gap_pct(dirty, ws) - 0.45) < 1e-9
-    # 早于 24h 窗的根不算
-    older = ([{"open_time": ws - 86_400_000 - 300_000, "low": 1.0, "close": 1.0}]
-             + _low24_klines(ws, 0.45))
-    assert abs(low24_gap_pct(older, ws) - 0.45) < 1e-9
-    # 样本不足
-    assert low24_gap_pct(_low24_klines(ws, 0.45, n=LOW24_MIN_BARS - 1), ws) is None
-    # 非正价 → None（fail-safe）
-    zero = _low24_klines(ws, 0.45)
-    zero[-1]["close"] = 0.0
-    assert low24_gap_pct(zero, ws) is None
-    # 字段缺失 → None
-    assert low24_gap_pct([{"open_time": ws - 300_000}] * 300, ws) is None
-
-
-def test_scene_s2_entry_gates_registered() -> None:
-    """注册表口径源：S2 挂两道入场门，同族其他场景通道零影响。"""
+def test_scene_s2_entry_whitelist_registered() -> None:
+    """注册表口径源：S2 只挂入场价白名单 ≥0.50，同族其他场景通道零影响。"""
     from binance_predict.services.live_channels import LIVE_CHANNELS
 
-    spec = LIVE_CHANNELS["scene_bear_exhaust"]
-    assert spec.entry_band_whitelist == ((0.50, 1.01),)
-    assert spec.max_low24_gap_pct == 0.45
+    assert LIVE_CHANNELS["scene_bear_exhaust"].entry_band_whitelist == ((0.50, 1.01),)
+    assert not hasattr(LIVE_CHANNELS["scene_bear_exhaust"], "max_low24_gap_pct")
     for other in ("scene_bull_exhaust", "scene_bear_exhaust_opt_v1",
                   "scene_bull_exhaust_confirm", "scene_momentum_fade"):
         assert LIVE_CHANNELS[other].entry_band_whitelist is None
-        assert LIVE_CHANNELS[other].max_low24_gap_pct is None
-
-
-def _patch_recorded(monkeypatch) -> list[dict]:
-    recorded: list[dict] = []
-
-    async def _rec(self, channel, ws, *, reason, rejected,
-                   input_snapshot=None, direction="DOWN"):
-        recorded.append({"channel": channel, "reason": reason, "rejected": rejected,
-                         "input_snapshot": input_snapshot, "direction": direction})
-
-    monkeypatch.setattr(MultiLiveTrader, "_record_strategy_outcome", _rec)
-    return recorded
-
-
-@pytest.mark.asyncio
-async def test_scene_s2_low24_gap_gate_blocks_shallow_dip(monkeypatch) -> None:
-    """浅回调（距 24h 低 0.80% ≥ 0.45%）→ 弃单，落 low24_gap_too_far 审计记录。"""
-    fake = _FakeTrader()
-    t = _make_trader(monkeypatch, fake, channels=["scene_bear_exhaust"])
-    _stub_low24_klines(t, MARKET_START_15M, gap_pct=0.80)
-    recorded = _patch_recorded(monkeypatch)
-
-    t.on_scene_signal(_scene_sig("bear_exhaust", "low"))
-    await _drain(t)
-
-    assert fake.calls == []
-    assert len(recorded) == 1
-    assert recorded[0]["reason"] == "low24_gap_too_far"
-    assert recorded[0]["rejected"] is True
-    assert recorded[0]["direction"] == "UP"          # S2 押 UP，审计方向不得错标
-    assert abs(recorded[0]["input_snapshot"]["low24_gap_pct"] - 0.80) < 1e-6
-    assert recorded[0]["input_snapshot"]["max_low24_gap_pct"] == 0.45
-
-
-@pytest.mark.asyncio
-async def test_scene_s2_low24_gap_gate_boundary_semantics(monkeypatch) -> None:
-    """阈值两侧 epsilon 内判定方向：略高弃单、略低放行（比较为 >=，含贴线）。
-
-    不用「gap 恰等于阈值」做断言：0.45% 的构造值在浮点下算出 0.44999999999999485，
-    精确等值测试会假失败；这里用 ±1e-6 把比较算符钉死在阈值处。
-    """
-    fake_hi = _FakeTrader()
-    t_hi = _make_trader(monkeypatch, fake_hi, channels=["scene_bear_exhaust"])
-    _stub_low24_klines(t_hi, MARKET_START_15M, gap_pct=0.450001)
-    rec_hi = _patch_recorded(monkeypatch)
-    t_hi.on_scene_signal(_scene_sig("bear_exhaust", "low"))
-    await _drain(t_hi)
-    assert fake_hi.calls == []
-    assert rec_hi[0]["reason"] == "low24_gap_too_far"
-
-    fake_lo = _FakeTrader()
-    t_lo = _make_trader(monkeypatch, fake_lo, channels=["scene_bear_exhaust"])
-    _stub_low24_klines(t_lo, MARKET_START_15M, gap_pct=0.449999)
-    rec_lo = _patch_recorded(monkeypatch)
-    t_lo.on_scene_signal(_scene_sig("bear_exhaust", "low"))
-    await _drain(t_lo)
-    assert rec_lo == []
-    assert [c["signal_version"] for c in fake_lo.calls] == ["scene_bear_exhaust"]
-
-
-@pytest.mark.asyncio
-async def test_scene_s2_low24_gap_gate_allows_fresh_low(monkeypatch) -> None:
-    """真·新低（距 24h 低 0.20% < 0.45%）→ 正常开火押 UP。"""
-    fake = _FakeTrader()
-    t = _make_trader(monkeypatch, fake, channels=["scene_bear_exhaust"])
-    _stub_low24_klines(t, MARKET_START_15M, gap_pct=0.20)
-    recorded = _patch_recorded(monkeypatch)
-
-    t.on_scene_signal(_scene_sig("bear_exhaust", "low"))
-    await _drain(t)
-
-    assert recorded == []
-    assert [c["signal_version"] for c in fake.calls] == ["scene_bear_exhaust"]
-    assert fake.calls[0]["prediction"] == "UP"
-    # 入场价白名单经 _fire_scene 透传到下单层（此前场景路径未透传）
-    assert fake.calls[0]["entry_band_whitelist"] == ((0.50, 1.01),)
-
-
-@pytest.mark.asyncio
-async def test_scene_s2_low24_gap_gate_data_missing_skips(monkeypatch) -> None:
-    """K 线拉不到（fetcher 未注入）→ 保守弃单，rejected=False。"""
-    fake = _FakeTrader()
-    t = _make_trader(monkeypatch, fake, channels=["scene_bear_exhaust"])
-    recorded = _patch_recorded(monkeypatch)
-
-    t.on_scene_signal(_scene_sig("bear_exhaust", "low"))
-    await _drain(t)
-
-    assert fake.calls == []
-    assert len(recorded) == 1
-    assert recorded[0]["reason"] == "low24_gap_missing"
-    assert recorded[0]["rejected"] is False
-    assert recorded[0]["input_snapshot"]["low24_gap_pct"] is None
-
-
-@pytest.mark.asyncio
-async def test_scene_s2_low24_gap_gate_not_applied_to_sibling_channels(monkeypatch) -> None:
-    """未挂该门的场景通道（S1）不受影响：不注入 K 线桩也照常开火。"""
-    fake = _FakeTrader()
-    t = _make_trader(monkeypatch, fake, channels=["scene_bull_exhaust"])
-    t.on_scene_signal(_scene_sig("bull_exhaust", "high"))
-    await _drain(t)
-    assert [c["signal_version"] for c in fake.calls] == ["scene_bull_exhaust"]
 
 
 # ============================================================
