@@ -269,9 +269,7 @@ class Rev2InsideShadowDetector:
 
     async def _check_radar(self) -> None:
         """提前预警雷达：探测当前正在走的 15m K 线是否初具孕线反转雏形。"""
-        if self._timeframe != "15m" or not settings.wechat_radar_enabled or not (
-            settings.wechat_work_enabled or settings.wxpusher_enabled
-        ):
+        if self._timeframe != "15m":
             return
         try:
             raw_15m = await self._collector.fetch_klines_raw("15m", WARMUP_BARS)
@@ -288,6 +286,13 @@ class Rev2InsideShadowDetector:
 
             kl15 = _to_klines(raw_15m, self._bar_ms)
             hits = evaluate_rev2_patterns(kl15, 1, self._specs)
+            active_keys = {
+                f"radar_rev2_{hit['spec']['version']}_{bar_start}" for hit in hits
+            }
+            all_keys = {
+                f"radar_rev2_{spec['version']}_{bar_start}" for spec in self._specs
+            }
+            wechat_notifier.withdraw_pre_trade_radars(all_keys - active_keys)
             for hit in hits:
                 spec = hit["spec"]
                 channel = spec["version"]

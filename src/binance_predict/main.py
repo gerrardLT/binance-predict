@@ -4562,7 +4562,7 @@ for _candle_spec in CANDLESTICK_LOGICAL_SPECS:
 
 # BTC K 线图表缓存：interval:档位 -> (缓存时刻, klines)，避免前端轮询打爆 Binance。
 # limit 就近向上归档到固定档位，防止任意 limit 枚举缓存键绕过保护。
-_BTC_KLINE_LIMIT_TIERS = (30, 60, 120, 168, 200)
+_BTC_KLINE_LIMIT_TIERS = (30, 60, 120, 168, 200, 500)
 _btc_kline_cache: dict[str, tuple[float, list[dict]]] = {}
 _BTC_KLINE_CACHE_TTL = 60.0
 # 短负缓存：interval -> 上次上游失败时刻（10s 内直接返回空，避免轮询连环打上游）
@@ -4582,7 +4582,7 @@ async def get_btc_klines(
     """
     if interval not in ("1m", "5m", "15m", "1h", "4h", "1d"):
         raise HTTPException(status_code=422, detail=f"interval 仅支持 1m/5m/15m/1h/4h/1d: {interval}")
-    limit = max(10, min(limit, 200))
+    limit = max(10, min(limit, 500))
     now = time.time()
     if now - _btc_kline_fail.get(interval, 0.0) < _BTC_KLINE_FAIL_TTL:
         return {"interval": interval, "klines": []}
@@ -4602,6 +4602,31 @@ async def get_btc_klines(
     else:
         _btc_kline_fail[interval] = now
     return {"interval": interval, "klines": klines[-limit:] if klines else []}
+
+
+@app.get("/api/signals/radar")
+async def get_live_signal_radar(_: None = Depends(_require_auth)):
+    """当前仍可能触发下单的实盘候选信号；仅返回已启用通道。"""
+    now_ms = int(time.time() * 1000)
+    if multi_live_trader is None:
+        return {"server_time_ms": now_ms, "signals": []}
+    channels = {
+        row["channel"]: row
+        for row in multi_live_trader.status()["channels"]
+        if row["enabled"]
+    }
+    signals = []
+    for event in wechat_notifier.radar_snapshot(now_ms):
+        channel = channels.get(event["channel"])
+        if channel is None:
+            continue
+        signals.append({
+            **event,
+            "display_name": channel["display_name"],
+            "market_period": channel["market_period"],
+            "max_exec_price": channel["max_exec_price"],
+        })
+    return {"server_time_ms": now_ms, "signals": signals}
 
 
 def _shadow_breakeven(version: str, q: float) -> float:

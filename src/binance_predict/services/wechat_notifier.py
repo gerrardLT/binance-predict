@@ -71,6 +71,8 @@ class WeChatNotifier:
         self._daily: tuple[int, int] = (-1, 0)
         # 预警去重集合: key -> timestamp，防止同一窗口同一事件被重复预警
         self._sent_warnings: dict[str, float] = {}
+        # 下单弹窗读取的进程内候选快照；目标时刻过后即由读取端剔除。
+        self._radar_events: dict[str, dict[str, Any]] = {}
 
     def _try_bump_daily(self, now_ms: int) -> bool:
         """检查并自增日消息数。"""
@@ -83,9 +85,27 @@ class WeChatNotifier:
         return True
 
     def reset_daily_count(self) -> None:
-        """测试或调试钩子：重置日计数与去重。"""
+        """测试或调试钩子：重置日计数、去重与候选快照。"""
         self._daily = (-1, 0)
         self._sent_warnings.clear()
+        self._radar_events.clear()
+
+    def radar_snapshot(self, now_ms: int | None = None) -> list[dict[str, Any]]:
+        """返回尚未到目标时刻的候选信号，按目标时刻升序。"""
+        now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+        self._radar_events = {
+            key: event for key, event in self._radar_events.items()
+            if int(event["target_time_ms"]) > now_ms
+        }
+        return sorted(
+            (dict(event) for event in self._radar_events.values()),
+            key=lambda event: int(event["target_time_ms"]),
+        )
+
+    def withdraw_pre_trade_radars(self, dedup_keys: set[str]) -> None:
+        """撤回已不再满足实时形态的候选信号。"""
+        for key in dedup_keys:
+            self._radar_events.pop(key, None)
 
     async def _send_wxpusher_raw(self, content: str) -> bool:
         """底层异步发送 WxPusher 微信消息（永久免费，直达普通微信）。"""
@@ -224,13 +244,27 @@ class WeChatNotifier:
         dedup_key: str,
         note: str = "系统将在倒计时结束后按策略自动挂单，请根据需要看盘或干预。"
     ) -> None:
-        """发送提前预警通知（留出缓冲时间供人工决策）。"""
-        if not settings.wechat_radar_enabled:
-            return
-        if not _event_on(channel, "radar"):
+        """记录提前预警候选，并按配置发送微信通知。"""
+        now = time.time()
+        now_ms = int(now * 1000)
+        self._radar_events = {
+            key: event for key, event in self._radar_events.items()
+            if int(event["target_time_ms"]) > now_ms
+        }
+        if target_time_ms > now_ms:
+            self._radar_events[dedup_key] = {
+                "radar_type": radar_type,
+                "channel": channel,
+                "direction": direction,
+                "target_time_ms": target_time_ms,
+                "max_exec_price": max_exec_price,
+                "features_desc": features_desc,
+                "detected_at_ms": now_ms,
+            }
+
+        if not settings.wechat_radar_enabled or not _event_on(channel, "radar"):
             return
 
-        now = time.time()
         # 10 分钟内的同一 key 幂等去重
         if dedup_key in self._sent_warnings and (now - self._sent_warnings[dedup_key]) < 600:
             return

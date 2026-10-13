@@ -163,6 +163,34 @@ def test_15m_short_wick_above_ten_percent_rejected() -> None:
     assert evaluate_rev2_patterns(ih, 1) == []
 
 
+@pytest.mark.asyncio
+async def test_15m_radar_withdraws_candidate_after_pattern_invalidates(monkeypatch) -> None:
+    """未收盘孕线形态后续失效时，弹窗候选须在下一轮撤回。"""
+    rows = _hm_rows(BAR_MS_15M, lower_r=0.80, upper_r=0.05)
+    invalid_rows = [dict(row) for row in rows]
+    invalid_rows[-1]["high"] = rows[-2]["high"] + 1.0
+    collector = MagicMock()
+    collector.fetch_klines_raw = AsyncMock(side_effect=[rows, invalid_rows])
+    notifier = MagicMock()
+    monkeypatch.setattr(rev2_mod, "wechat_notifier", notifier)
+    bar_start = rows[-1]["open_time"]
+    monkeypatch.setattr(
+        rev2_mod.time, "time", lambda: (bar_start + BAR_MS_15M - 90_000) / 1000
+    )
+    detector = Rev2InsideShadowDetector(collector, timeframe="15m")
+
+    await detector._check_radar()
+    notifier.notify_pre_trade_radar.assert_called_once()
+    hm_key = f"radar_rev2_hm_inside_15m_v2_{bar_start}"
+    ih_key = f"radar_rev2_ih_inside_15m_v2_{bar_start}"
+    notifier.withdraw_pre_trade_radars.assert_called_once_with({ih_key})
+
+    notifier.reset_mock()
+    await detector._check_radar()
+    notifier.notify_pre_trade_radar.assert_not_called()
+    notifier.withdraw_pre_trade_radars.assert_called_once_with({hm_key, ih_key})
+
+
 @pytest.mark.parametrize(
     ("lower_r", "expected"),
     [(0.7499, False), (0.75, True), (0.8999, True), (0.90, False)],

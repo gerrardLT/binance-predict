@@ -718,6 +718,7 @@ const api = {
   // 实时口径 K 线代理（含当前未收盘 K，不走缓存）：一键下单实时图轮询基线
   getBtcKlinesLive: (interval: string, limit: number) =>
     authFetch(`/api/chart/btc-klines?interval=${interval}&limit=${limit}&include_open=true`).then(r => r.json()),
+  getLiveSignalRadar: () => authFetch('/api/signals/radar').then(r => r.json()),
   getSignalsAnalytics: () => authFetch('/api/signals/analytics?active_only=true').then(r => r.json()),
   getSignalsExecutionComparison: (): Promise<ExecutionComparison> =>
     authFetch('/api/signals/execution-comparison?active_only=true').then(r => {
@@ -1452,27 +1453,24 @@ const fmtMMSS = (sec: number) =>
 // 数据源：后端代理 /api/chart/btc-klines 5s 轮询为基线（浏览器无需可达币安，
 // 任何网络都能出图）；币安 WS 直连可用时自动升级为实时推送、断开回落轮询。
 // 自绘 SVG 蜡烛图（不依赖 recharts 蜡烛支持）。
-// 周期可切 1m/5m/15m/1h/1d，含量能副图（MA20 均量），并显示所选下单周期当前窗收盘倒计时。
+// 周期可切 1m/5m/15m/1h/4h/1d，含量能副图（MA20 均量），并显示所选下单周期当前窗收盘倒计时。
 // ============================================================
 
 interface KlineBar { t: number; o: number; h: number; l: number; c: number; v: number }
+interface LiveRadarSignal {
+  radar_type: string
+  channel: string
+  display_name: string
+  direction: 'UP' | 'DOWN'
+  target_time_ms: number
+  max_exec_price: number
+  features_desc: string
+  market_period: string
+}
 
 const BINANCE_WS = 'wss://stream.binance.com:9443/ws'
-
-// 计算单值序列 EMA
-function computeEmaSeries(bars: KlineBar[], span: number): (number | null)[] {
-  const k = 2 / (span + 1)
-  let prevEma: number | null = null
-  return bars.map((b, idx) => {
-    if (idx === 0) {
-      prevEma = b.c
-      return prevEma
-    }
-    if (prevEma == null) return null
-    prevEma = b.c * k + prevEma * (1 - k)
-    return prevEma
-  })
-}
+const KLINE_HISTORY_LIMIT = 500
+const KLINE_DEFAULT_VIEW = 90
 
 // 计算单值序列简单移动平均（量能 MA 用；窗口不足返回 null）
 function computeSmaSeries(values: number[], span: number): (number | null)[] {
@@ -1484,13 +1482,16 @@ function computeSmaSeries(values: number[], span: number): (number | null)[] {
   })
 }
 
-function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs: number }) {
-  // 独立选看 K 线周期，可看 1m/5m/15m/1h/1d，初始跟随下单周期
-  const [chartPeriod, setChartPeriod] = useState<'1m' | '5m' | '15m' | '1h' | '1d'>(orderPeriod)
+function KlineMini({ period: orderPeriod, nowMs, radarSignals }: {
+  period: '5m' | '15m'
+  nowMs: number
+  radarSignals: LiveRadarSignal[]
+}) {
+  // 独立选看 K 线周期，可看 1m/5m/15m/1h/4h/1d，初始跟随下单周期
+  const [chartPeriod, setChartPeriod] = useState<'1m' | '5m' | '15m' | '1h' | '4h' | '1d'>(orderPeriod)
   const [bars, setBars] = useState<KlineBar[]>([])
   const [live, setLive] = useState<'ws' | 'proxy' | 'init'>('init')
-  const [showIndicators, setShowIndicators] = useState(true)
-  const [view, setView] = useState({ i0: 0, count: 60 })
+  const [view, setView] = useState({ i0: 0, count: KLINE_DEFAULT_VIEW })
   const previousBarCountRef = useRef(0)
 
   // 当外部下单周期切换时同步更新默认看盘周期
@@ -1503,9 +1504,10 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
     let alive = true
     let ws: WebSocket | null = null
     let pollTimer: number | null = null
+    let needsHistory = true
     setLive('init')
     setBars([])
-    setView({ i0: 0, count: 60 })
+    setView({ i0: 0, count: KLINE_DEFAULT_VIEW })
     previousBarCountRef.current = 0
 
     // 代理返回对象数组（open_time/open/...）：与已有 bars 按时间合并补历史，
@@ -1517,10 +1519,10 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
       })
       if (!alive || !next.length) return
       setBars(prev => {
-        if (!prev.length) return next.slice(-120)
+        if (!prev.length) return next.slice(-KLINE_HISTORY_LIMIT)
         const byT = new Map(next.map(b => [b.t, b]))
         for (const b of prev) byT.set(b.t, b)   // WS 新柱优先
-        return [...byT.values()].sort((a, b) => a.t - b.t).slice(-120)
+        return [...byT.values()].sort((a, b) => a.t - b.t).slice(-KLINE_HISTORY_LIMIT)
       })
     }
     const mergeKline = (k: KlineBar) => {
@@ -1529,7 +1531,7 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
         if (!prev.length) return [k]
         const last = prev[prev.length - 1]
         if (k.t === last.t) return [...prev.slice(0, -1), k]
-        if (k.t > last.t) return [...prev, k].slice(-120)
+        if (k.t > last.t) return [...prev, k].slice(-KLINE_HISTORY_LIMIT)
         return prev
       })
     }
@@ -1540,9 +1542,12 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
       setLive('proxy')
       const tick = async () => {
         try {
-          const d = await api.getBtcKlinesLive(chartPeriod, 120)
-          // 无论 WS 是否已接管都合并：WS 先握手时若丢弃代理历史，bars 只剩 1 根会卡在「加载中」
-          if (alive) applyProxy(d?.klines)
+          const d = await api.getBtcKlinesLive(chartPeriod, needsHistory ? KLINE_HISTORY_LIMIT : 10)
+          // 首次补齐历史，之后只轮询最近 10 根；WS 先握手时也不会只剩 1 根。
+          if (alive) {
+            applyProxy(d?.klines)
+            if (Array.isArray(d?.klines) && d.klines.length > 1) needsHistory = false
+          }
         } catch { /* 轮询失败静默等下一轮 */ }
       }
       tick()
@@ -1594,12 +1599,7 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
   const i0 = Math.max(0, Math.min(view.i0, Math.max(0, n - count)))
   const slice = bars.slice(i0, i0 + count)
 
-  // 全量计算 EMA 再切片，保证连续性
-  const ema7Full = useMemo(() => computeEmaSeries(bars, 7), [bars])
-  const ema25Full = useMemo(() => computeEmaSeries(bars, 25), [bars])
-  const ema7Slice = ema7Full.slice(i0, i0 + count)
-  const ema25Slice = ema25Full.slice(i0, i0 + count)
-  // 量能 MA20（全量算再切片，与 EMA 同套路）
+  // 量能 MA20（全量算再切片，保证连续性）
   const volMaFull = useMemo(() => computeSmaSeries(bars.map(b => b.v), 20), [bars])
   const volMaSlice = volMaFull.slice(i0, i0 + count)
 
@@ -1649,6 +1649,7 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
   // 所选下单周期当前窗收盘倒计时
   const orderStep = orderPeriod === '5m' ? 300_000 : 900_000
   const remain = Math.max(0, Math.floor(((Math.floor(nowMs / orderStep) + 1) * orderStep - nowMs) / 1000))
+  const activeRadarSignals = radarSignals.filter(signal => signal.target_time_ms > nowMs)
 
   // 坐标（基于当前显示 slice 计算真实高低极值；绘图边界另加留白）
   let dataLow = Infinity
@@ -1671,25 +1672,9 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
   // 4 档水平参考价格线
   const yTicks = [0.15, 0.40, 0.65, 0.90].map(ratio => chartLow + ratio * (chartHigh - chartLow))
 
-  // 生成折线 path
-  const buildLinePath = (values: (number | null)[]) => {
-    let d = ''
-    values.forEach((v, idx) => {
-      if (v == null) return
-      const cx = idx * bw + bw / 2
-      const cy = y(v)
-      d += d === '' ? `M ${cx} ${cy}` : ` L ${cx} ${cy}`
-    })
-    return d
-  }
-
-  const ema7Path = buildLinePath(ema7Slice)
-  const ema25Path = buildLinePath(ema25Slice)
-
   // 量能副图：比例尺基于可见 slice，紧凑数字格式
   const volMax = Math.max(1e-9, ...slice.map(b => b.v)) * 1.15
   const vy = (v: number) => CHART_H + VOL_H - (v / volMax) * VOL_H
-  const fmtVol = (v: number) => (v >= 1000 ? `${(v / 1000).toFixed(2)}k` : v.toFixed(1))
   const buildVolLinePath = (values: (number | null)[]) => {
     let d = ''
     values.forEach((v, idx) => {
@@ -1706,7 +1691,7 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
         <span className="font-bold text-xs text-ink-95">BTC 实时 K 线</span>
         {/* 独立看盘周期切换 */}
         <div className="flex items-center gap-0.5 bg-sunken rounded-pill p-0.5 border border-line-soft">
-          {(['1m', '5m', '15m', '1h', '1d'] as const).map(p => (
+          {(['1m', '5m', '15m', '1h', '4h', '1d'] as const).map(p => (
             <button
               key={p}
               onClick={() => setChartPeriod(p)}
@@ -1716,13 +1701,6 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
             </button>
           ))}
         </div>
-        <button
-          onClick={() => setShowIndicators(v => !v)}
-          className={`px-2 py-0.5 rounded border text-[10px] transition ${showIndicators ? 'border-brand text-brand bg-brand-soft/40' : 'border-line text-ink-55'}`}
-          title="切换 EMA 7 与 EMA 25 均线显示"
-        >
-          EMA 7/25
-        </button>
         <span className="flex items-center gap-0.5 ml-1" title="滚轮缩放 · 拖拽平移 · 悬停看数据">
           <button onClick={() => setView(v => {
             const c = Math.max(15, Math.round(v.count * 0.8))
@@ -1732,17 +1710,12 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
             const c = Math.min(Math.max(n, 15), Math.round(v.count * 1.25))
             return { i0: Math.max(0, Math.min(n - c, v.i0)), count: c }
           })} className="px-1.5 py-0.5 rounded border border-line text-[10px] text-ink-55 hover:border-brand">－</button>
-          <button onClick={() => setView({ i0: Math.max(0, n - 60), count: Math.min(60, Math.max(n, 15)) })}
+          <button onClick={() => setView({ i0: Math.max(0, n - KLINE_DEFAULT_VIEW), count: Math.min(KLINE_DEFAULT_VIEW, Math.max(n, 15)) })}
             className="px-1.5 py-0.5 rounded border border-line text-[10px] text-ink-55 hover:border-brand">重置</button>
         </span>
 
-        {showIndicators && (
-          <div className="flex items-center gap-2 text-[10px] font-mono ml-1">
-            <span className="text-[#f59e0b]">■ EMA7</span>
-            <span className="text-[#06b6d4]">■ EMA25</span>
-          </div>
-        )}
         <span className="text-[10px] font-mono text-[#a78bfa]">■ 量MA20</span>
+        <span className="text-[10px] text-ink-55">显示 {Math.min(slice.length, count)} / {n} 根</span>
 
         <div className="ml-auto flex items-center gap-2 text-xs">
           <span className="font-mono text-[11px] font-bold tabular-nums" title={`当前下单周期 (${orderPeriod}) 窗口收盘倒计时`}>
@@ -1754,6 +1727,8 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
         </div>
       </div>
 
+      <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_250px] gap-2">
+        <div className="min-w-0">
       {n > 1 ? (
         <div ref={wrapRef} className="relative select-none">
           <svg viewBox={`0 0 ${W} ${H}`} className="w-full rounded-sm bg-sunken cursor-crosshair" style={{ height: 320 }}
@@ -1789,14 +1764,6 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
                 </g>
               )
             })}
-
-            {/* EMA 均线 */}
-            {showIndicators && (
-              <>
-                <path d={ema7Path} fill="none" stroke="#f59e0b" strokeWidth={1.5} opacity={0.85} />
-                <path d={ema25Path} fill="none" stroke="#06b6d4" strokeWidth={1.5} opacity={0.85} />
-              </>
-            )}
 
             {/* 视口高点与低点标注 */}
             {slice.length > 0 && (
@@ -1874,37 +1841,58 @@ function KlineMini({ period: orderPeriod, nowMs }: { period: '5m' | '15m'; nowMs
             })}
           </svg>
 
-          {/* 悬浮数据卡片 */}
+          {/* 悬浮数据卡片：仅保留决策所需的时间、收价与本根涨跌 */}
           {hoverBar != null && hover != null && (
-            <div className="absolute z-10 pointer-events-none rounded-card border border-line bg-card/95 backdrop-blur px-3 py-1.5 text-[11px] font-mono text-ink-95 shadow-lg space-y-0.5"
-              style={{ left: `${Math.min(70, Math.max(0, (hover.vx / W) * 100))}%`, top: 8 }}>
-              <div className="font-bold border-b border-line-soft pb-0.5 mb-0.5">
-                {new Date(hoverBar.t).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} · {chartPeriod} 现货
-              </div>
-              <div className="flex justify-between gap-3 text-ink-80">
-                <span>开: {hoverBar.o.toFixed(1)}</span>
-                <span>高: {hoverBar.h.toFixed(1)}</span>
-              </div>
-              <div className="flex justify-between gap-3 text-ink-80">
-                <span>低: {hoverBar.l.toFixed(1)}</span>
-                <span className="font-bold">收: {hoverBar.c.toFixed(1)}</span>
-              </div>
-              <div className="flex justify-between gap-3 text-ink-80">
-                <span>量: {fmtVol(hoverBar.v)}</span>
-                <span>均量: {volMaSlice[hover.i] != null ? fmtVol(volMaSlice[hover.i] as number) : '--'}</span>
-              </div>
-              <div className={hoverBar.c >= hoverBar.o ? 'text-positive font-bold' : 'text-negative font-bold'}>
-                涨跌: {hoverBar.c >= hoverBar.o ? '+' : ''}{(((hoverBar.c - hoverBar.o) / hoverBar.o) * 100).toFixed(2)}%
-                <span className="text-ink-55 font-normal ml-2">振幅: {(((hoverBar.h - hoverBar.l) / hoverBar.l) * 100).toFixed(2)}%</span>
-              </div>
+            <div className="absolute z-10 pointer-events-none rounded border border-line/60 bg-card/60 backdrop-blur-sm px-2 py-1 text-[10px] font-mono text-ink-95 shadow-sm"
+              style={{ left: `${Math.min(78, Math.max(0, (hover.vx / W) * 100))}%`, top: 8 }}>
+              <span>{new Date(hoverBar.t).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</span>
+              <span className="mx-1.5 font-bold">收 {hoverBar.c.toFixed(1)}</span>
+              <span className={hoverBar.c >= hoverBar.o ? 'text-positive font-bold' : 'text-negative font-bold'}>
+                {hoverBar.c >= hoverBar.o ? '+' : ''}{(((hoverBar.c - hoverBar.o) / hoverBar.o) * 100).toFixed(2)}%
+              </span>
             </div>
           )}
         </div>
       ) : (
         <div className="h-[280px] flex items-center justify-center rounded-sm bg-sunken text-xs text-ink-55">
-          BTC 实时 K 线加载中…（支持 1m/5m/15m/1h/1d · 含量能，经服务器代理获取）
+          BTC 实时 K 线加载中…（支持 1m/5m/15m/1h/4h/1d · 含量能，经服务器代理获取）
         </div>
       )}
+        </div>
+        <aside className="rounded-sm border border-line-soft bg-sunken/70 p-2.5 min-h-[160px] lg:h-[320px] lg:overflow-y-auto">
+          <div className="flex items-center justify-between border-b border-line-soft pb-1.5 mb-2">
+            <span className="font-bold text-xs text-ink-95">实盘提前预警</span>
+            <span className="text-[10px] text-ink-55">{activeRadarSignals.length} 个候选</span>
+          </div>
+          {activeRadarSignals.length === 0 ? (
+            <div className="h-[220px] flex flex-col items-center justify-center text-center text-[11px] text-ink-55 leading-5">
+              <span>暂无临近信号</span>
+              <span>当前支持 S1/S2、孕线与 x4</span>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {activeRadarSignals.map(signal => {
+                const remainSec = Math.max(0, Math.floor((signal.target_time_ms - nowMs) / 1000))
+                const up = signal.direction === 'UP'
+                return (
+                  <div key={`${signal.channel}-${signal.target_time_ms}`} className="rounded border border-line bg-card/70 p-2 space-y-1">
+                    <div className="flex items-start justify-between gap-2">
+                      <span className="font-semibold text-[11px] text-ink-95 leading-4">{SIGNAL_INFO[signal.channel]?.name ?? signal.display_name}</span>
+                      <span className={`font-bold font-mono text-[11px] ${up ? 'text-positive' : 'text-negative'}`}>{signal.direction}</span>
+                    </div>
+                    <div className="flex justify-between text-[10px] font-mono text-ink-55">
+                      <span>{signal.market_period} · 护栏 {signal.max_exec_price.toFixed(3)}</span>
+                      <span className="font-bold text-warning">{fmtMMSS(remainSec)}</span>
+                    </div>
+                    <div className="text-[10px] leading-4 text-ink-80">{signal.features_desc}</div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+          <div className="mt-2 text-[9px] leading-4 text-ink-55">候选不等于下单；收盘确认、报价与护栏仍可能否决。</div>
+        </aside>
+      </div>
     </div>
   )
 }
@@ -1941,6 +1929,7 @@ function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }
   const [chainGuard, setChainGuard] = useState('0.65')
   const [chains, setChains] = useState<Record<string, unknown>[]>([])
   const [chainMsg, setChainMsg] = useState('')
+  const [radarSignals, setRadarSignals] = useState<LiveRadarSignal[]>([])
 
   const q = (v: unknown) => (typeof v === 'number' ? v : null)
   const nowMs = Date.now() + clockOffset
@@ -2067,6 +2056,17 @@ function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }
     return () => clearInterval(t)
   }, [open])
 
+  useEffect(() => {
+    if (!open) return
+    let alive = true
+    const loadRadar = () => api.getLiveSignalRadar()
+      .then((d: { signals?: LiveRadarSignal[] }) => { if (alive) setRadarSignals(Array.isArray(d.signals) ? d.signals : []) })
+      .catch(() => { if (alive) setRadarSignals([]) })
+    loadRadar()
+    const t = setInterval(loadRadar, 5_000)
+    return () => { alive = false; clearInterval(t) }
+  }, [open])
+
   const handleChain = async () => {
     if (!canChain) return
     const names = chainWins.map(ws => fmtHHMM(ws)).join(' → ')
@@ -2118,7 +2118,7 @@ ${names}
             role="dialog"
             aria-modal="true"
             aria-label="一键下单与BTC实时行情"
-            className="fixed bottom-20 right-4 sm:right-6 z-50 w-[880px] max-w-[96vw] max-h-[90vh] overflow-y-auto bg-card rounded-card border border-line p-5 space-y-3 text-sm shadow-2xl"
+            className="fixed bottom-20 right-4 sm:right-6 z-50 w-[1180px] max-w-[96vw] max-h-[90vh] overflow-y-auto bg-card rounded-card border border-line p-5 space-y-3 text-sm shadow-2xl"
           >
             {/* 标题 + 周期切换 */}
             <div className="flex items-center justify-between">
@@ -2155,8 +2155,8 @@ ${names}
               </span>
             </div>
 
-            {/* 实时 K 线：币安 BTC 现货，支持 1m/5m/15m 查看 + EMA 均线 + 标尺刻度 */}
-            <KlineMini period={period} nowMs={nowMs} />
+            {/* 实时 K 线：币安 BTC 现货，支持长历史缩放与同源实盘候选预警 */}
+            <KlineMini period={period} nowMs={nowMs} radarSignals={radarSignals} />
 
             {/* 窗口多选（核心）：当前 + 未来窗，点选高亮；
                 另提供「下期起连选 N 窗」快捷钮——自动选中从下一周期起往后 N 个可用窗 */}

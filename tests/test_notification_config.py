@@ -195,6 +195,54 @@ def test_wechat_event_and_field_gates(svc, monkeypatch) -> None:
         assert "获得股数" not in body
 
 
+def test_radar_snapshot_records_without_wechat_and_expires(monkeypatch) -> None:
+    """弹窗候选独立于微信外发开关；目标时刻到达后立即剔除。"""
+    n = WeChatNotifier()
+    monkeypatch.setattr("time.time", lambda: 2_000_000_000.0)
+    with patch.object(settings, "wechat_radar_enabled", False), \
+         patch.object(n, "push_markdown") as mock_push:
+        n.notify_pre_trade_radar(
+            radar_type="15m 场景阻力/支撑破位",
+            channel="scene_bear_exhaust",
+            direction="UP",
+            target_time_ms=2_000_000_090_000,
+            lead_seconds=90,
+            max_exec_price=0.65,
+            features_desc="等待周期收盘质量确认",
+            dedup_key="radar_scene_low_1",
+        )
+        # 同 key 更新而非重复积累。
+        n.notify_pre_trade_radar(
+            radar_type="15m 场景阻力/支撑破位",
+            channel="scene_bear_exhaust",
+            direction="UP",
+            target_time_ms=2_000_000_090_000,
+            lead_seconds=80,
+            max_exec_price=0.65,
+            features_desc="等待周期收盘质量确认",
+            dedup_key="radar_scene_low_1",
+        )
+
+    assert mock_push.call_count == 0
+    events = n.radar_snapshot(2_000_000_000_000)
+    assert len(events) == 1
+    assert events[0]["channel"] == "scene_bear_exhaust"
+    n.withdraw_pre_trade_radars({"radar_scene_low_1"})
+    assert n.radar_snapshot(2_000_000_000_000) == []
+
+    n.notify_pre_trade_radar(
+        radar_type="15m 场景阻力/支撑破位",
+        channel="scene_bear_exhaust",
+        direction="UP",
+        target_time_ms=2_000_000_090_000,
+        lead_seconds=80,
+        max_exec_price=0.65,
+        features_desc="等待周期收盘质量确认",
+        dedup_key="radar_scene_low_2",
+    )
+    assert n.radar_snapshot(2_000_000_090_000) == []
+
+
 def test_wechat_low_balance_gate(svc, monkeypatch) -> None:
     import binance_predict.services.wechat_notifier as wn
     monkeypatch.setattr(wn, "notify_config", svc)

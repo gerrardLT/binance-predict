@@ -236,6 +236,56 @@ async def test_btc_klines_1m_and_include_open(monkeypatch) -> None:
     m._btc_kline_fail.clear()
 
 
+@pytest.mark.asyncio
+async def test_btc_klines_live_limit_clamped_to_500(monkeypatch) -> None:
+    """实时图最多取 500 根，供长历史缩放且不允许无界请求。"""
+    import binance_predict.main as m
+
+    m._btc_kline_fail.clear()
+    raw = [{"open_time": i} for i in range(600)]
+    fetch_raw = AsyncMock(return_value=raw)
+    monkeypatch.setattr(m.collector, "fetch_klines_raw", fetch_raw)
+
+    out = await m.get_btc_klines(interval="5m", limit=999, include_open=True)
+
+    fetch_raw.assert_awaited_once_with("5m", 500)
+    assert len(out["klines"]) == 500
+    assert out["klines"][0]["open_time"] == 100
+    m._btc_kline_fail.clear()
+
+
+# ============================================================
+# /api/signals/radar + /api/signals/analytics
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_live_signal_radar_only_returns_enabled_channels(monkeypatch) -> None:
+    """候选栏只暴露已开启的实盘通道，并采用运行时护栏/名称。"""
+    import binance_predict.main as m
+
+    channels = [
+        {"channel": "scene_bear_exhaust", "display_name": "场景S2", "market_period": "15m",
+         "direction": "UP", "enabled": True, "max_exec_price": 0.61},
+        {"channel": "x4_v2", "display_name": "情绪错位", "market_period": "5m",
+         "direction": "DOWN", "enabled": False, "max_exec_price": 0.50},
+    ]
+    events = [
+        {"channel": "scene_bear_exhaust", "direction": "UP", "target_time_ms": 123,
+         "max_exec_price": 0.65, "radar_type": "scene", "features_desc": "破位", "detected_at_ms": 1},
+        {"channel": "x4_v2", "direction": "DOWN", "target_time_ms": 456,
+         "max_exec_price": 0.50, "radar_type": "x4", "features_desc": "错位", "detected_at_ms": 2},
+    ]
+    monkeypatch.setattr(m, "multi_live_trader", SimpleNamespace(status=lambda: {"channels": channels}))
+    monkeypatch.setattr(m.wechat_notifier, "radar_snapshot", lambda _now_ms: events)
+
+    out = await m.get_live_signal_radar(None)
+
+    assert [row["channel"] for row in out["signals"]] == ["scene_bear_exhaust"]
+    assert out["signals"][0]["display_name"] == "场景S2"
+    assert out["signals"][0]["max_exec_price"] == 0.61
+
+
 # ============================================================
 # /api/signals/analytics
 # ============================================================
