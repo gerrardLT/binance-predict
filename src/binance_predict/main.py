@@ -1632,9 +1632,11 @@ async def lifespan(app: FastAPI):
                               quote_client=firsthit_forward_recorder._trader,
                               operational_reader=read_forward_operations)
             from .services import shadow_forward_evidence
+            # 背压只认实盘下单临界区（交易锁）；不再看 multi_live_trader._tasks
+            # ——该集合含分钟级睡眠任务（市场预热/回填延迟/x4 等待），任何在途任务
+            # 即背压会让研究阶梯长期饿死（2026-10-09→10-14 实测 100% 背压、零覆盖）。
             shadow_forward_evidence._live_busy = lambda: (
-                prediction_trader._trade_lock.locked() or
-                any(not task.done() for task in multi_live_trader._tasks))
+                shadow_forward_evidence.live_lock_busy(prediction_trader))
         _live_status = multi_live_trader.status()
         _enabled = [c["channel"] for c in _live_status["channels"] if c["enabled"]]
         logger.info(
@@ -3812,6 +3814,10 @@ async def _sync_binance_orders_impl() -> dict:
                             assessment_id=int(assessment_id),
                             stage=TerminalStage.FILL,
                             reason=reason,
+                            # 对账只处理币安侧存在的订单 → 已证明进入执行；
+                            # 显式回填 execution_eligible，避免占位期被对账器
+                            # 写成 False 后永远停在 False（2026-10-14）。
+                            execution_eligible=True,
                         ),
                     )
             except Exception as exc:

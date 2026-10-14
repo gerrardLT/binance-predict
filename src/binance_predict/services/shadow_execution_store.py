@@ -184,3 +184,40 @@ async def patch_assessment(session: AsyncSession, patch: AssessmentPatch) -> Non
     }
     guarded["updated_at"] = func.now()
     await session.execute(update(table).where(table.c.id == patch.assessment_id).values(**guarded))
+
+
+async def backfill_eligibility(
+    session: AsyncSession,
+    *,
+    assessment_id: int,
+    strategy_eligible: bool | None = None,
+    operational_eligible: bool | None = None,
+    execution_eligible: bool | None = None,
+) -> None:
+    """只补仍为 NULL 的资格列，绝不改 terminal_stage/reason_code。
+
+    对账场景专用（2026-10-14）：订单事实能证明资格，但当评估已带更具体的
+    阶段/原因（如护栏弃单的 EXECUTION/EXEC_PRICE_GUARD）时，`patch_assessment`
+    的同级覆盖会把具体原因改写成泛化文案。此函数只填空值，让卡在对账
+    WHERE 条件里的旧行能凭资格列补齐而离场，同时保留运行时写入的原因。
+    """
+    table = ShadowExecutionAssessment.__table__
+    values: dict[str, Any] = {}
+    for key, value in (
+        ("strategy_eligible", strategy_eligible),
+        ("operational_eligible", operational_eligible),
+        ("execution_eligible", execution_eligible),
+    ):
+        if value is None:
+            continue
+        column = table.c[key]
+        # 同 patch_assessment：CASE 内绑定值必须显式带列类型，避免裸字面量类型推断失败。
+        values[key] = case(
+            (column.is_(None), literal(value, column.type)), else_=column
+        )
+    if not values:
+        return
+    values["updated_at"] = func.now()
+    await session.execute(
+        update(table).where(table.c.id == assessment_id).values(**values)
+    )

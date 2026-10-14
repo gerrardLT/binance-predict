@@ -10,26 +10,47 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from binance_predict.db.models import ShadowExecutionAssessment, TradeOrderModel
 
 from .shadow_execution_registry import SHADOW_VERSION_SPECS
-from .shadow_execution_store import get_or_create_runtime_assessment, patch_assessment
-from .shadow_execution_types import AssessmentPatch, ReasonCode, TerminalStage
+from .shadow_execution_store import (
+    backfill_eligibility,
+    get_or_create_runtime_assessment,
+    patch_assessment,
+)
+from .shadow_execution_types import (
+    AssessmentPatch,
+    ReasonCode,
+    TerminalStage,
+    stage_rank,
+)
 
 
 @dataclass(frozen=True)
 class ReconcileReport:
     scanned: int = 0
     linked: int = 0
+    backfilled: int = 0
     skipped: int = 0
     duplicate_exchange_orders: int = 0
 
 
 def _order_terminal(order: TradeOrderModel) -> tuple[TerminalStage, ReasonCode]:
-    if not str(order.order_id or "").strip():
-        return TerminalStage.UNKNOWN, ReasonCode.SOURCE_MISSING
+    """由订单事实推导终态；先看 status 再看是否有交易所单号。
+
+    2026-10-14 修复：旧实现把「无 order_id」一律判为 UNKNOWN/SOURCE_MISSING，
+    于是护栏/市场/报价类弃单（有评估绑定、无单号）永远补不上资格列，
+    对账每轮重复扫同一批最早旧单、游标卡死（生产实测 scanned=200 linked=0）。
+    """
+    has_order_id = bool(str(order.order_id or "").strip())
     status = str(order.status or "").upper()
     if status == "PENDING":
         return TerminalStage.ORDER, ReasonCode.ORDER_PENDING
     if status == "FAILED":
-        return TerminalStage.FILL, ReasonCode.ORDER_FAILED
+        # 有单号=已提交后被拒/取消；无单号=执行前弃单（护栏/市场/报价）。
+        # 两者都是执行阶段事实，区别只在是否进入交易所。
+        return (
+            (TerminalStage.FILL, ReasonCode.ORDER_FAILED)
+            if has_order_id
+            else (TerminalStage.EXECUTION, ReasonCode.ORDER_FAILED)
+        )
     if status == "FILLED" and order.settled_at is not None:
         outcome = str(order.settle_outcome or "").upper()
         reason = (
@@ -77,7 +98,7 @@ async def reconcile_shadow_execution_orders(
         _legacy_order_statement(batch_size)
     )).scalars().all())
 
-    linked = skipped = 0
+    linked = backfilled = skipped = 0
     for order in rows:
         version = str(order.signal_version)
         spec = SHADOW_VERSION_SPECS.get(version)
@@ -99,20 +120,34 @@ async def reconcile_shadow_execution_orders(
                     direction=str(order.direction),
                 )
                 stage, reason = _order_terminal(order)
-                if stage is not TerminalStage.UNKNOWN:
-                    # 订单已经存在即证明策略与操作门均通过；是否进入执行由
-                    # 报价/下单事实决定。旧账本缺这三列时在对账阶段补齐。
+                # 订单已经存在即证明策略与操作门均通过；是否进入执行由交易所
+                # 单号事实决定（无单号=执行前弃单，execution_eligible=False）。
+                has_order_id = bool(str(order.order_id or "").strip())
+                eligibility = {
+                    "strategy_eligible": True,
+                    "operational_eligible": True,
+                    "execution_eligible": has_order_id,
+                }
+                if (
+                    stage is not TerminalStage.UNKNOWN
+                    and stage_rank(stage.value) > stage_rank(assessment.terminal_stage)
+                ):
                     await patch_assessment(
                         session,
                         AssessmentPatch(
                             assessment_id=int(assessment.id),
                             stage=stage,
                             reason=reason,
-                            strategy_eligible=True,
-                            operational_eligible=True,
-                            execution_eligible=bool(order.order_id),
+                            **eligibility,
                         ),
                     )
+                else:
+                    # 不推进（同级或更低，含运行时已写更具体原因的护栏弃单）：
+                    # 只补仍为 NULL 的资格列，保留已有 stage/reason。
+                    await backfill_eligibility(
+                        session, assessment_id=int(assessment.id), **eligibility
+                    )
+                    backfilled += 1
                 result = await session.execute(
                     update(TradeOrderModel)
                     .where(
@@ -147,6 +182,7 @@ async def reconcile_shadow_execution_orders(
     return ReconcileReport(
         scanned=len(rows),
         linked=linked,
+        backfilled=backfilled,
         skipped=skipped,
         duplicate_exchange_orders=duplicates,
     )

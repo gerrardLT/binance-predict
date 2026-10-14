@@ -80,7 +80,7 @@ async def test_project_once_is_one_batch_per_adapter(monkeypatch):
     monkeypatch.setattr(projector_mod, "build_assessment_values", AsyncMock(return_value={}))
     monkeypatch.setattr(projector_mod, "upsert_assessment", AsyncMock())
     reconcile = AsyncMock(return_value=SimpleNamespace(
-        scanned=0, linked=0, skipped=0, duplicate_exchange_orders=0))
+        scanned=0, linked=0, backfilled=0, skipped=0, duplicate_exchange_orders=0))
     monkeypatch.setattr(projector_mod, "reconcile_shadow_execution_orders", reconcile)
 
     assert await projector.project_once() == 2
@@ -112,7 +112,7 @@ async def test_project_once_refreshes_changed_source_status(monkeypatch):
         projector_mod,
         "reconcile_shadow_execution_orders",
         AsyncMock(return_value=SimpleNamespace(
-            scanned=0, linked=0, skipped=0, duplicate_exchange_orders=0)),
+            scanned=0, linked=0, backfilled=0, skipped=0, duplicate_exchange_orders=0)),
     )
 
     assert await projector.project_once() == 1
@@ -141,7 +141,7 @@ async def test_commit_failure_keeps_cursor_and_continues_next_adapter(monkeypatc
         projector_mod,
         "reconcile_shadow_execution_orders",
         AsyncMock(return_value=SimpleNamespace(
-            scanned=0, linked=0, skipped=0, duplicate_exchange_orders=0)),
+            scanned=0, linked=0, backfilled=0, skipped=0, duplicate_exchange_orders=0)),
     )
 
     assert await projector.project_once() == 1

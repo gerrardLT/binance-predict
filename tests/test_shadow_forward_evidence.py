@@ -129,6 +129,64 @@ def test_amount_out_requires_positive_integer():
         assert not valid_amount_out(value)
 
 
+def test_live_busy_tracks_only_trade_lock():
+    """背压只看实盘交易锁：分钟级睡眠任务（预热/回填/x4 等待）不得算忙。"""
+    from binance_predict.services.shadow_forward_evidence import live_lock_busy
+
+    class _Trader:
+        def __init__(self):
+            self._trade_lock = asyncio.Lock()
+
+    trader = _Trader()
+    assert live_lock_busy(trader) is False
+    trader._trade_lock = None
+    assert live_lock_busy(trader) is False
+    assert live_lock_busy(SimpleNamespace()) is False
+
+    class _SleepingTasks:
+        """模拟 multi_live_trader：有在途睡眠任务但没有下单临界区。"""
+
+        def __init__(self):
+            self._trade_lock = asyncio.Lock()
+            self._tasks = {object()}
+
+    assert live_lock_busy(_SleepingTasks()) is False
+
+    async def _hold() -> bool:
+        holder = _Trader()
+        async with holder._trade_lock:
+            return live_lock_busy(holder)
+
+    assert asyncio.run(_hold()) is True
+
+
+@pytest.mark.asyncio
+async def test_probe_ladder_reports_wallet_and_quote_failures(monkeypatch):
+    """钱包地址缺失提前返回可读原因；单档报价失败保留币安原文。"""
+    from binance_predict.services import shadow_forward_evidence as module
+    client = SimpleNamespace(
+        _wallet_address="", _5m_start_date=1000, _down_token_id="token",
+        fetch_wallet_info=AsyncMock(return_value=None),
+        list_markets=AsyncMock(), get_quote=AsyncMock(return_value=None),
+        last_api_error="HTTP 400: walletAddress",
+    )
+    monkeypatch.setattr(module, "_quote_client", client)
+    monkeypatch.setattr(module, "_quote_cache", {})
+    monkeypatch.setattr(module, "_live_busy", None)
+    monkeypatch.setattr(module, "current_amount", lambda version: None)
+
+    blocked = await module.probe_ladder("a", "DOWN", 1000, "5m")
+    assert blocked == {"error": {"available": False, "reason": "wallet_address_unavailable"}}
+    client.list_markets.assert_not_awaited()
+
+    client._wallet_address = "address"
+    client.fetch_wallet_info.reset_mock()
+    failed = await module.probe_ladder("a", "DOWN", 1000, "5m")
+    assert failed["1"]["available"] is False
+    assert failed["1"]["error"] == "HTTP 400: walletAddress"
+    assert client.get_quote.await_count == 3
+
+
 def test_quotes_are_not_fills_and_archive_is_not_forward():
     from binance_predict.services.shadow_forward_evidence import PROFILE
     row = {"config_snapshot": {"hash": PROFILE_HASH, "profile": PROFILE},

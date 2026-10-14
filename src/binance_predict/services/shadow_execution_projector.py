@@ -99,10 +99,10 @@ class ShadowExecutionProjector:
                 report = await reconcile_shadow_execution_orders(
                     session, batch_size=self.batch_size)
                 await session.commit()
-                if report.linked or report.skipped or report.duplicate_exchange_orders:
+                if report.linked or report.backfilled or report.skipped or report.duplicate_exchange_orders:
                     logger.info(
-                        "统一影子执行账本旧订单对账完成 | scanned={} linked={} skipped={} duplicates={}",
-                        report.scanned, report.linked, report.skipped,
+                        "统一影子执行账本旧订单对账完成 | scanned={} linked={} backfilled={} skipped={} duplicates={}",
+                        report.scanned, report.linked, report.backfilled, report.skipped,
                         report.duplicate_exchange_orders,
                     )
             except Exception as exc:

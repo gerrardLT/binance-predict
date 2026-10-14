@@ -18,7 +18,7 @@ forward-v2 cohort 由版本、运行时金额与规则组成的实际冻结 prof
 
 实际首触策略目前仅适配 firsthit_down_chg_v2（G3）；control/recovery 是对照，不是现役策略。其他 firsthit 版本不由 G3 代表，coverage 明确归档阻塞。K线入口接入不等于全族实时等价认证。
 
-共享报价按窗口/周期/方向/token/金额缓存500ms，保留原始 requested_at/received_at；报价早于新冻结 trigger 的事件被收益层拒绝，不能改写时间戳冒充新报价。实盘锁或在途任务活跃时 shadow 背压，不新增请求；不抢实盘锁，不取消正在执行的实盘任务。已经在途的shadow HTTP不支持抢占。首触生产入口复用同一共享报价设施。
+共享报价按窗口/周期/方向/token/金额缓存500ms，保留原始 requested_at/received_at；报价早于新冻结 trigger 的事件被收益层拒绝，不能改写时间戳冒充新报价。实盘下单临界区（交易锁）被占用时 shadow 背压，不新增请求；不抢实盘锁，不取消正在执行的实盘任务。已经在途的shadow HTTP不支持抢占。（2026-10-14 修订：背压只认交易锁，不再把 `multi_live_trader._tasks` 里的分钟级睡眠任务当作忙——旧口径使研究阶梯自 10-09 起 100% 饿死、1/5/10U 阶梯零覆盖；报价并发仍由 QUOTE_QUEUE ≤8 等待/2s 上限自限。）首触生产入口复用同一共享报价设施。
 
 ## 统计局限
 

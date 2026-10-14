@@ -10,6 +10,7 @@ from sqlalchemy.types import NullType
 
 from binance_predict.services.shadow_execution_registry import SHADOW_VERSION_SPECS
 from binance_predict.services.shadow_execution_store import (
+    backfill_eligibility,
     build_assessment_values,
     patch_assessment,
     upsert_assessment,
@@ -193,6 +194,39 @@ class _Snapshot:
     status: ReasonCode
     created_at: datetime
     opaque: object
+
+
+@pytest.mark.asyncio
+async def test_backfill_eligibility_only_fills_nulls_and_never_touches_stage() -> None:
+    """对账回填（2026-10-14）：只在列为 NULL 时写资格，SET 子句不碰 stage/reason。"""
+    session = SimpleNamespace(execute=AsyncMock())
+
+    await backfill_eligibility(
+        session, assessment_id=12, strategy_eligible=True,
+        operational_eligible=True, execution_eligible=False,
+    )
+
+    stmt = session.execute.await_args.args[0]
+    compiled = stmt.compile(dialect=postgresql.dialect())
+    sql = str(compiled)
+    compact = sql.replace(" ", "").lower()
+    assert "strategy_eligible=casewhen" in compact
+    assert "operational_eligible=casewhen" in compact
+    assert "execution_eligible=casewhen" in compact
+    assert compact.count("isnull") == 3  # 每列都带 IS NULL 守卫，不覆盖已有值
+    assert "terminal_stage" not in sql and "reason_code" not in sql
+    boolean_binds = [
+        bp for bp in compiled.binds.values()
+        if isinstance(bp.value, bool)
+    ]
+    # 每个资格列一个带类型的布尔绑定（编译产物会同时保留匿名与具名两种参数键）。
+    assert len({bp.value for bp in boolean_binds}) == 2
+    assert len(boolean_binds) >= 3
+    assert all(not isinstance(bp.type, NullType) for bp in boolean_binds)
+
+    idle = SimpleNamespace(execute=AsyncMock())
+    await backfill_eligibility(idle, assessment_id=12)
+    idle.execute.assert_not_awaited()
 
 
 def test_sanitizer_redacts_nested_secrets_and_normalizes_values() -> None:

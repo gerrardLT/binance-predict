@@ -203,6 +203,22 @@ _quote_cache = {}
 _live_busy = None
 
 
+def live_lock_busy(trader) -> bool:
+    """实盘背压信号 = 下单临界区（交易锁）被占用，只看锁、不看任务集合。
+
+    `multi_live_trader._tasks` 里含分钟级睡眠任务（市场预热、回填延迟、
+    x4 决策点等待），"任何在途任务即背压"会让研究阶梯长期饿死：
+    2026-10-09→10-14 实测 100% live_priority_backpressure、1/5/10U 阶梯
+    零覆盖。报价走独立客户端与独立锁（不抢实盘锁），并发由 QUOTE_QUEUE
+    （≤8 等待、2s 上限）自限，故只需避开真正的下单临界区。
+    """
+    lock = getattr(trader, "_trade_lock", None)
+    try:
+        return bool(lock is not None and lock.locked())
+    except Exception:
+        return False
+
+
 async def probe_ladder(version, side, start, period, *, amount=None):
     client = _quote_client
     if client is None:
@@ -215,6 +231,11 @@ async def probe_ladder(version, side, start, period, *, amount=None):
             async with asyncio.timeout(4):
                 if not getattr(client, "_wallet_address", ""):
                     await client.fetch_wallet_info()
+                # 钱包地址缺失时 get_quote 恒被币安 -1102 拒收（2026-09-17→10-04
+                # 三档全 error 的根因）；提前返回可读原因，不再发出必然失败的请求。
+                if not getattr(client, "_wallet_address", ""):
+                    return {"error": {"available": False,
+                                      "reason": "wallet_address_unavailable"}}
                 await client.list_markets()
                 if period == "15m":
                     market = client._15m_markets.get(start, {})
@@ -249,7 +270,10 @@ async def probe_ladder(version, side, start, period, *, amount=None):
                         "available": price is not None and math.isfinite(price) and 0 < price < 1,
                         "requested_at": requested, "received_at": received,
                         "latency_ms": received-requested, "token_id": token,
-                        "amount_out": (quote or {}).get("amountOut")}
+                        "amount_out": (quote or {}).get("amountOut"),
+                        # 报价失败时保留币安原文（与首触 fallback 路径同口径），
+                        # 否则阶梯只剩 available=False、事后无法归因。
+                        "error": (None if quote else getattr(client, "last_api_error", None))}
                     _quote_cache[key] = (time.monotonic(), dict(result[str(int(stake)) if stake == int(stake) else str(stake)]))
                     if len(_quote_cache) > 128:
                         _quote_cache.clear()

@@ -44,12 +44,18 @@ def _order(**overrides):
 @pytest.mark.parametrize(
     ("order", "expected"),
     [
+        (_order(status="PENDING"), (TerminalStage.ORDER, ReasonCode.ORDER_PENDING)),
         (
             _order(status="PENDING", order_id=None),
-            (TerminalStage.UNKNOWN, ReasonCode.SOURCE_MISSING),
+            (TerminalStage.ORDER, ReasonCode.ORDER_PENDING),
         ),
-        (_order(status="PENDING"), (TerminalStage.ORDER, ReasonCode.ORDER_PENDING)),
         (_order(status="FAILED"), (TerminalStage.FILL, ReasonCode.ORDER_FAILED)),
+        # 无交易所单号的 FAILED=执行前弃单（护栏/市场/报价）：必须是执行阶段事实，
+        # 否则资格列永远补不上、对账游标卡死（2026-10-14 修复）。
+        (
+            _order(status="FAILED", order_id=None),
+            (TerminalStage.EXECUTION, ReasonCode.ORDER_FAILED),
+        ),
         (_order(status="FILLED"), (TerminalStage.FILL, ReasonCode.ORDER_FILLED)),
         (
             _order(
@@ -109,19 +115,23 @@ class _Session:
 async def test_reconcile_links_exact_key_and_advances_proven_terminal(monkeypatch) -> None:
     order = _order(status="FILLED")
     session = _Session([order], update_rowcounts=[1], duplicates=2)
-    assessment = SimpleNamespace(id=41)
+    assessment = SimpleNamespace(id=41, terminal_stage="UNKNOWN", reason_code="SOURCE_MISSING")
     get_or_create = AsyncMock(return_value=assessment)
     patch = AsyncMock()
+    backfill = AsyncMock()
     monkeypatch.setattr(reconciler_mod, "get_or_create_runtime_assessment", get_or_create)
     monkeypatch.setattr(reconciler_mod, "patch_assessment", patch)
+    monkeypatch.setattr(reconciler_mod, "backfill_eligibility", backfill)
 
     report = await reconcile_shadow_execution_orders(session)
 
     assert report.scanned == 1
     assert report.linked == 1
+    assert report.backfilled == 0
     assert report.skipped == 0
     assert report.duplicate_exchange_orders == 2
     assert session.nested_entries == 1
+    backfill.assert_not_awaited()
     kwargs = get_or_create.await_args.kwargs
     assert kwargs["signal_version"] == "quote_contrarian_v2"
     assert kwargs["target_window_start"] == 1_000
@@ -137,15 +147,68 @@ async def test_reconcile_links_exact_key_and_advances_proven_terminal(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_reconcile_backfills_guard_reject_without_regressing_reason(monkeypatch) -> None:
+    """护栏弃单（有评估、无单号、已写具体原因）只补资格列，不改 stage/reason。"""
+    order = _order(status="FAILED", order_id=None)
+    session = _Session([order], update_rowcounts=[0], duplicates=0)
+    assessment = SimpleNamespace(
+        id=43, terminal_stage="EXECUTION", reason_code="EXEC_PRICE_GUARD"
+    )
+    get_or_create = AsyncMock(return_value=assessment)
+    patch = AsyncMock()
+    backfill = AsyncMock()
+    monkeypatch.setattr(reconciler_mod, "get_or_create_runtime_assessment", get_or_create)
+    monkeypatch.setattr(reconciler_mod, "patch_assessment", patch)
+    monkeypatch.setattr(reconciler_mod, "backfill_eligibility", backfill)
+
+    report = await reconcile_shadow_execution_orders(session)
+
+    assert (report.scanned, report.linked, report.backfilled, report.skipped) == (1, 0, 1, 0)
+    patch.assert_not_awaited()
+    kwargs = backfill.await_args.kwargs
+    assert kwargs["assessment_id"] == 43
+    assert kwargs["strategy_eligible"] is True
+    assert kwargs["operational_eligible"] is True
+    assert kwargs["execution_eligible"] is False
+
+
+@pytest.mark.asyncio
+async def test_reconcile_advances_legacy_reject_to_execution_stage(monkeypatch) -> None:
+    """旧账本（stage=UNKNOWN）里的无单号弃单：推进到 EXECUTION/ORDER_FAILED。"""
+    order = _order(status="FAILED", order_id=None)
+    session = _Session([order], update_rowcounts=[1], duplicates=0)
+    assessment = SimpleNamespace(id=44, terminal_stage="UNKNOWN", reason_code="LEGACY_UNKNOWN")
+    get_or_create = AsyncMock(return_value=assessment)
+    patch = AsyncMock()
+    backfill = AsyncMock()
+    monkeypatch.setattr(reconciler_mod, "get_or_create_runtime_assessment", get_or_create)
+    monkeypatch.setattr(reconciler_mod, "patch_assessment", patch)
+    monkeypatch.setattr(reconciler_mod, "backfill_eligibility", backfill)
+
+    report = await reconcile_shadow_execution_orders(session)
+
+    assert (report.scanned, report.linked, report.backfilled, report.skipped) == (1, 1, 0, 0)
+    backfill.assert_not_awaited()
+    written = patch.await_args.args[1]
+    assert written.stage is TerminalStage.EXECUTION
+    assert written.reason is ReasonCode.ORDER_FAILED
+    assert written.execution_eligible is False
+
+
+@pytest.mark.asyncio
 async def test_reconcile_savepoint_failure_does_not_block_later_order(monkeypatch) -> None:
     rows = [_order(id=1, order_id="ORD-1"), _order(id=2, order_id="ORD-2")]
     session = _Session(rows, update_rowcounts=[1], duplicates=0)
     get_or_create = AsyncMock(
-        side_effect=[RuntimeError("conflict"), SimpleNamespace(id=42)]
+        side_effect=[
+            RuntimeError("conflict"),
+            SimpleNamespace(id=42, terminal_stage="UNKNOWN", reason_code="SOURCE_MISSING"),
+        ]
     )
     patch = AsyncMock()
     monkeypatch.setattr(reconciler_mod, "get_or_create_runtime_assessment", get_or_create)
     monkeypatch.setattr(reconciler_mod, "patch_assessment", patch)
+    monkeypatch.setattr(reconciler_mod, "backfill_eligibility", AsyncMock())
 
     report = await reconcile_shadow_execution_orders(session)
 
