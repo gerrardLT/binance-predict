@@ -3956,14 +3956,19 @@ async def _sync_binance_orders_impl() -> dict:
             else:
                 actual_avg_price = limit_price
             
-            row.quote_json = {
-                # ✅ 修复#3 完成：使用实际成交均价=filledUsdtAmount/filledShareQty
-                # FOK 部分成交或 LIMIT 被动成交的真实价格
-                "averagePrice": actual_avg_price,
-                "filledShareQty": bo.get("filledShareQty"),
-                "binanceOrderStatus": bo_status,
-                "source": "binance_history_sync",
-            }
+            # 增量更新 quote_json（2026-10-14 P1）：浅拷贝已有字典，保留原始
+            # get-quote 响应（quotedAvgPrice/fillSource/amountIn/amountOut/
+            # feeAmount/feeRateBps/slippageBps/timestamp 等）；若此前未存 quotedAvgPrice，
+            # 将原始 averagePrice 留底作为报价均价，再用币安历史实际成交均价覆盖 averagePrice。
+            qj = dict(row.quote_json or {})
+            if qj.get("quotedAvgPrice") is None and qj.get("averagePrice") is not None:
+                qj["quotedAvgPrice"] = qj.get("averagePrice")
+            qj["averagePrice"] = actual_avg_price
+            if bo.get("filledShareQty") is not None:
+                qj["filledShareQty"] = bo.get("filledShareQty")
+            qj["binanceOrderStatus"] = bo_status
+            qj["source"] = "binance_history_sync"
+            row.quote_json = qj
             # P2a：失败单补写归因文案（旧代码置 None → 前端「说明」列空白，
             # 无法区分 FOK 空成交 / 部分成交 / 其他终态）
             if row.status == "FILLED":

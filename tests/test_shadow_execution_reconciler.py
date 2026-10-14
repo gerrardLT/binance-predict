@@ -233,3 +233,27 @@ async def test_reconcile_skips_unregistered_version_without_guessing(monkeypatch
     assert report == reconciler_mod.ReconcileReport(scanned=1, linked=0, skipped=1)
     assert session.nested_entries == 0
     get_or_create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_scans_registered_scene_and_candle_orders(monkeypatch) -> None:
+    """2026-10-14 P1：场景通道与蜡烛实盘通道的订单不再被视为 unregistered 跳过。"""
+    rows = [
+        _order(id=1, signal_version="scene_bull_exhaust", order_id="EX-S1", status="FILLED"),
+        _order(id=2, signal_version="candle_hm_bull_5m_consensus2_shadow_v1", order_id=None, status="FAILED"),
+    ]
+    session = _Session(rows, update_rowcounts=[1, 1], duplicates=0)
+    assessment = SimpleNamespace(id=55, terminal_stage="UNKNOWN", reason_code="SOURCE_MISSING")
+    get_or_create = AsyncMock(return_value=assessment)
+    patch = AsyncMock()
+    backfill = AsyncMock()
+    monkeypatch.setattr(reconciler_mod, "get_or_create_runtime_assessment", get_or_create)
+    monkeypatch.setattr(reconciler_mod, "patch_assessment", patch)
+    monkeypatch.setattr(reconciler_mod, "backfill_eligibility", backfill)
+
+    report = await reconcile_shadow_execution_orders(session)
+
+    assert report.scanned == 2
+    assert report.skipped == 0
+    assert report.linked == 2
+    assert get_or_create.await_count == 2

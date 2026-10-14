@@ -115,6 +115,35 @@ _VERSION_ROWS: tuple[tuple[str, SourceType, str, str, str], ...] = (
     # 同窗入场（same_window），direction 按行（row，恒 UP）。
     ("gap_crowd_5m_v1", SourceType.GAP_CROWD, "5m", "same_window", "row"),
     ("gap_crowd_15m_v1", SourceType.GAP_CROWD, "15m", "same_window", "row"),
+    # ------------------------------------------------------------------
+    # 2026-10-14 P1 补齐：在 LIVE_CHANNELS 中有实盘通道、但在旧账本白名单
+    # 漏登记的 22 个通道。登记后：① 实盘订单对账不再 skipped；② 运行时
+    # 拦截（日限/互斥/防重）正确记录 assessment 痕迹；③ 漏斗与分析端点正常汇总。
+    # ------------------------------------------------------------------
+    # 4 个场景实盘通道（15m K线形态/破位）：
+    ("scene_bull_exhaust", SourceType.KLINE, "15m", "target_bar", "row"),
+    ("scene_bull_exhaust_confirm", SourceType.KLINE, "15m", "target_bar", "row"),
+    ("scene_bear_exhaust", SourceType.KLINE, "15m", "target_bar", "row"),
+    ("scene_momentum_fade", SourceType.KLINE, "15m", "target_bar", "row"),
+    # 18 个蜡烛反转逻辑实盘通道（长影短实体族，同名实盘通道）：
+    ("candle_hm_bull_5m_consensus2_shadow_v1", SourceType.KLINE, "5m", "target_bar", "row"),
+    ("candle_hm_bull_5m_consensus3_shadow_v1", SourceType.KLINE, "5m", "target_bar", "row"),
+    ("candle_hm_bull_15m_union_shadow_v1", SourceType.KLINE, "15m", "target_bar", "row"),
+    ("candle_hm_bull_15m_consensus3_shadow_v1", SourceType.KLINE, "15m", "target_bar", "row"),
+    ("candle_hm_bull_5m_ret5_majority_component_shadow_v1", SourceType.KLINE, "5m", "target_bar", "row"),
+    ("candle_hm_bull_5m_ret3_component_shadow_v1", SourceType.KLINE, "5m", "target_bar", "row"),
+    ("candle_hm_bull_15m_ret3_component_shadow_v1", SourceType.KLINE, "15m", "target_bar", "row"),
+    ("candle_hm_bull_15m_ma10_component_shadow_v1", SourceType.KLINE, "15m", "target_bar", "row"),
+    ("candle_hm_bull_5m_volume_mid_high_shadow_hyp_v1", SourceType.KLINE, "5m", "target_bar", "row"),
+    ("candle_hm_bull_5m_trend4h_up_shadow_hyp_v1", SourceType.KLINE, "5m", "target_bar", "row"),
+    ("candle_hm_bull_5m_asia_shadow_hyp_v1", SourceType.KLINE, "5m", "target_bar", "row"),
+    ("candle_hm_bull_15m_q45_55_shadow_hyp_v1", SourceType.KLINE, "15m", "target_bar", "row"),
+    ("candle_hm_bull_15m_trend1h_up_shadow_hyp_v1", SourceType.KLINE, "15m", "target_bar", "row"),
+    ("candle_hm_bull_15m_asia_shadow_hyp_v1", SourceType.KLINE, "15m", "target_bar", "row"),
+    ("candidate_5m_ret5_majority_up_upper_bull_l70b30m10_shadow_hyp_v1", SourceType.KLINE, "5m", "target_bar", "row"),
+    ("candidate_5m_ret3_up_lower_bear_l50b50m0_shadow_hyp_v1", SourceType.KLINE, "5m", "target_bar", "row"),
+    ("candidate_15m_ret5_majority_up_lower_bull_l50b40m10_shadow_hyp_v1", SourceType.KLINE, "15m", "target_bar", "row"),
+    ("candidate_15m_ret3_down_upper_bull_l50b40m10_shadow_hyp_v1", SourceType.KLINE, "15m", "target_bar", "row"),
 )
 
 
@@ -129,7 +158,7 @@ def _live_mapping(version: str) -> tuple[str | None, bool]:
 def _family_of(version: str, source: SourceType) -> str:
     if version.startswith("process_recovery_"):
         return "process_recovery"
-    if version.startswith("candle_hm_bull_"):
+    if version.startswith(("candle_hm_bull_", "candidate_")):
         return "candlestick_reversal"
     if version.startswith(("quote_", "late_night_")):
         return "quote_edge"
@@ -141,8 +170,9 @@ def _family_of(version: str, source: SourceType) -> str:
         return "absorption"
     if version.startswith("s2_cond_"):
         return "s2_cond"
-    if version in ("scene_bear_exhaust_opt_v1", "s4_delay60_v1", "s4_hiconf_v1",
-                   "s1_early2_v1", "s1_dip45_v1"):
+    if version.startswith("scene_") or version in (
+        "s4_delay60_v1", "s4_hiconf_v1", "s1_early2_v1", "s1_dip45_v1"
+    ):
         return "scene"
     if version.startswith("combo_"):
         return "combo"
@@ -162,7 +192,7 @@ for _version, _source, _period, _target, _direction in _VERSION_ROWS:
     SHADOW_VERSION_SPECS[_version] = ShadowVersionSpec(
         _version, _source, _period, _target, _direction, _live, _retired,
         family=_family_of(_version, _source),
-        role=("EVENT" if _version.startswith("candle_hm_bull_") else "STRATEGY"),
+        role=("EVENT" if _version.endswith("_event_v1") else "STRATEGY"),
     )
 SHADOW_VERSIONS: tuple[str, ...] = tuple(SHADOW_VERSION_SPECS)
 

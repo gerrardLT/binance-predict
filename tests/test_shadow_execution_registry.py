@@ -44,17 +44,43 @@ EXPECTED_ANALYTICS_VERSIONS = (
     "candle_hm_bull_5m_event_v1", "candle_hm_bull_15m_event_v1",
     # 2026-10-10 报价-人群错位族（gap_crowd_shadow_signals 表，同名实盘默认 OFF）
     "gap_crowd_5m_v1", "gap_crowd_15m_v1",
+    # 2026-10-14 补齐 22 个 live_channels 实盘通道登记（4 scene + 18 candle）
+    "scene_bull_exhaust", "scene_bull_exhaust_confirm", "scene_bear_exhaust", "scene_momentum_fade",
+    "candle_hm_bull_5m_consensus2_shadow_v1", "candle_hm_bull_5m_consensus3_shadow_v1",
+    "candle_hm_bull_15m_union_shadow_v1", "candle_hm_bull_15m_consensus3_shadow_v1",
+    "candle_hm_bull_5m_ret5_majority_component_shadow_v1", "candle_hm_bull_5m_ret3_component_shadow_v1",
+    "candle_hm_bull_15m_ret3_component_shadow_v1", "candle_hm_bull_15m_ma10_component_shadow_v1",
+    "candle_hm_bull_5m_volume_mid_high_shadow_hyp_v1", "candle_hm_bull_5m_trend4h_up_shadow_hyp_v1",
+    "candle_hm_bull_5m_asia_shadow_hyp_v1", "candle_hm_bull_15m_q45_55_shadow_hyp_v1",
+    "candle_hm_bull_15m_trend1h_up_shadow_hyp_v1", "candle_hm_bull_15m_asia_shadow_hyp_v1",
+    "candidate_5m_ret5_majority_up_upper_bull_l70b30m10_shadow_hyp_v1",
+    "candidate_5m_ret3_up_lower_bear_l50b50m0_shadow_hyp_v1",
+    "candidate_15m_ret5_majority_up_lower_bull_l50b40m10_shadow_hyp_v1",
+    "candidate_15m_ret3_down_upper_bull_l50b40m10_shadow_hyp_v1",
 )
 
 
 def test_registry_matches_all_physical_shadow_versions_in_order() -> None:
     assert SHADOW_VERSIONS == EXPECTED_ANALYTICS_VERSIONS
-    assert len(SHADOW_VERSION_SPECS) == 76
+    assert len(SHADOW_VERSION_SPECS) == 98
     for version in ("candle_hm_bull_5m_event_v1", "candle_hm_bull_15m_event_v1"):
         spec = SHADOW_VERSION_SPECS[version]
         assert spec.family == "candlestick_reversal"
         assert spec.role == "EVENT"
         assert spec.live_channel is None
+
+    # 验证新补齐的场景通道与蜡烛策略通道属性
+    for sc in ("scene_bull_exhaust", "scene_bull_exhaust_confirm", "scene_bear_exhaust", "scene_momentum_fade"):
+        spec = SHADOW_VERSION_SPECS[sc]
+        assert spec.family == "scene"
+        assert spec.role == "STRATEGY"
+        assert spec.live_channel == sc
+
+    for cand in ("candle_hm_bull_5m_consensus2_shadow_v1", "candidate_15m_ret5_majority_up_lower_bull_l50b40m10_shadow_hyp_v1"):
+        spec = SHADOW_VERSION_SPECS[cand]
+        assert spec.family == "candlestick_reversal"
+        assert spec.role == "STRATEGY"
+        assert spec.live_channel == cand
 
 
 def test_registry_covers_every_source_adapter() -> None:

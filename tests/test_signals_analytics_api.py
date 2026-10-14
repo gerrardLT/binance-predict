@@ -526,9 +526,12 @@ async def test_analytics_empty_db() -> None:
         "brkrv_brk8h_15m_v1", "brkrv_brk8h_5m_v1",
         # 2026-10-12 复核「A 信号下破半」下破吞没族（两个确认级，默认 OFF）
         "crv_dnbrk24_15m_v1", "crv_dnbrk24_5m_v1",
-        # 2026-10-10 报价-人群错位族（两个周期，同名实盘默认 OFF）
-        "gap_crowd_5m_v1", "gap_crowd_15m_v1",
-    }
+            # 2026-10-10 报价-人群错位族（两个周期，同名实盘默认 OFF）
+            "gap_crowd_5m_v1", "gap_crowd_15m_v1",
+            # 2026-10-14 补齐 4 个经典场景实盘通道
+            "scene_bull_exhaust", "scene_bull_exhaust_confirm",
+            "scene_bear_exhaust", "scene_momentum_fade",
+        }
     from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
     assert set(out["shadow"].keys()) == expected | set(CANDLESTICK_SIGNAL_IDS)
     assert "candle_hm_bull_5m_event_v1" not in out["shadow"]

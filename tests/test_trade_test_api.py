@@ -925,6 +925,69 @@ async def test_sync_binance_backfills_pending_rows(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_sync_binance_preserves_existing_quote_json_fields(monkeypatch) -> None:
+    """2026-10-14 P1：对账更新 quote_json 增量保留已有字段（不整行覆盖抹杀）。"""
+    import binance_predict.main as m
+    from contextlib import asynccontextmanager
+
+    monkeypatch.setattr(m.prediction_trader, "_api_key", "k")
+    monkeypatch.setattr(m.prediction_trader, "_wallet_address", "0xW")
+
+    async def _history(limit=50):
+        return [{"orderId": "B-PRESERVE", "slug": "btc-updown-5m-1787418600",
+                 "status": "FILLED", "filledUsdtAmount": "1",
+                 "price": "0.58", "filledShareQty": "1.72"}]
+
+    monkeypatch.setattr(m.prediction_trader, "query_order_history", _history)
+
+    matched = SimpleNamespace(
+        id=77, window_start=1_787_418_600_000, status="PENDING",
+        order_id=None, amount_in="0",
+        quote_json={
+            "quoteId": "Q-12345",
+            "averagePrice": 0.51,
+            "requestedAmountIn": "1000000000000000000",
+            "feeAmount": "20000000000000000",
+            "feeRateBps": 200,
+            "slippageBps": 1200,
+            "timestamp": 1787418605000,
+            "marketExtId": "3271890",
+        },
+        error_message=None, market_period="5m",
+    )
+
+    db = AsyncMock()
+    result = MagicMock()
+    result.scalars.return_value.all.return_value = [matched]
+    db.execute = AsyncMock(return_value=result)
+
+    @asynccontextmanager
+    async def _factory():
+        yield db
+
+    monkeypatch.setattr(m, "async_session_factory", _factory)
+
+    out = await m.sync_binance_orders(_=None)
+    assert out["synced"] == 1
+    qj = matched.quote_json
+    # 原始 averagePrice 自动保留到 quotedAvgPrice
+    assert qj["quotedAvgPrice"] == 0.51
+    # averagePrice 订正为币安实际成交均价（computed = 1 / 1.72 ≈ 0.5814）
+    assert abs(qj["averagePrice"] - 1.0 / 1.72) < 1e-6
+    assert qj["filledShareQty"] == "1.72"
+    assert qj["binanceOrderStatus"] == "FILLED"
+    assert qj["source"] == "binance_history_sync"
+    # 原始 get-quote 响应字段全部完好保留
+    assert qj["quoteId"] == "Q-12345"
+    assert qj["requestedAmountIn"] == "1000000000000000000"
+    assert qj["feeAmount"] == "20000000000000000"
+    assert qj["feeRateBps"] == 200
+    assert qj["slippageBps"] == 1200
+    assert qj["timestamp"] == 1787418605000
+    assert qj["marketExtId"] == "3271890"
+
+
+@pytest.mark.asyncio
 async def test_sync_binance_advances_linked_assessment(monkeypatch) -> None:
     """币安终态对账与订单同事务推进账本到 FILL，不增加外部请求。"""
     import binance_predict.main as m
