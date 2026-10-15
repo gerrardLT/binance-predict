@@ -1398,7 +1398,7 @@ async def test_scene_s2_up_15m(monkeypatch) -> None:
     assert call["market_period"] == "15m"
     assert call["max_exec_price"] == 0.65
     # 入场价白名单经 _fire_scene 透传到下单层（此前场景路径未透传，会静默失效）
-    assert call["entry_band_whitelist"] == ((0.50, 1.01),)
+    assert call["entry_band_whitelist"] == ((0.55, 0.65),)
 
 
 @pytest.mark.asyncio
@@ -1494,18 +1494,80 @@ async def test_scene_unknown_pattern_and_bad_payload_swallowed(monkeypatch) -> N
 
 
 # ------------------------------------------------------------
-# 组 5b：S2 入场价白名单（2026-10-12；距 24h 低点门 2026-10-13 已撤回）
+# 组 5b：S2 入场价白名单（2026-10-12 ≥0.50；2026-10-15 收紧 [0.55,0.65)；
+# 距 24h 低点门 2026-10-13 已撤回）
 # ------------------------------------------------------------
 
 def test_scene_s2_entry_whitelist_registered() -> None:
-    """注册表口径源：S2 只挂入场价白名单 ≥0.50，同族其他场景通道零影响。"""
+    """注册表口径源：S2 挂入场价白名单 [0.55,0.65)，同族其他场景通道零影响。"""
     from binance_predict.services.live_channels import LIVE_CHANNELS
 
-    assert LIVE_CHANNELS["scene_bear_exhaust"].entry_band_whitelist == ((0.50, 1.01),)
+    assert LIVE_CHANNELS["scene_bear_exhaust"].entry_band_whitelist == ((0.55, 0.65),)
     assert not hasattr(LIVE_CHANNELS["scene_bear_exhaust"], "max_low24_gap_pct")
     for other in ("scene_bull_exhaust", "scene_bear_exhaust_opt_v1",
                   "scene_bull_exhaust_confirm", "scene_momentum_fade"):
         assert LIVE_CHANNELS[other].entry_band_whitelist is None
+
+
+@pytest.mark.asyncio
+async def test_scene_s2_whitelist_band_055_065_matrix(monkeypatch) -> None:
+    """S2 2026-10-15 白名单收紧为 [0.55,0.65)（左闭右开）边界矩阵：
+
+    0.50（旧下限）与 0.5499（越下界）→ 白名单弃单且币安零请求；
+    0.55（贴下界，左闭）与 0.6499（上界内侧）→ 放行成交；
+    0.65 贴护栏线 → 执行价护栏先拦（护栏文案，白名单不触达）。
+    依据：PREDEXON 五档费后深审 [0.50,0.55) 带 EV≈0 / [0.55,0.65) 带胜率 75.8%
+    （样本内择带，前向裁决线=带内 ≥30 笔平均费后 EV ≤0 即回退，见 live_channels 注释）。
+    """
+    trader = _make_real_trader(monkeypatch)
+    from binance_predict.services.live_channels import LIVE_CHANNELS
+    bands = LIVE_CHANNELS["scene_bear_exhaust"].entry_band_whitelist
+    assert bands == ((0.55, 0.65),)
+
+    # 1. 带外（0.50 旧下限 / 0.5499 越下界）：白名单拦下，币安零请求
+    for q, amount_out in ((0.50, "10"), (0.5499, "9.09")):
+        updates, place_calls = _stub_whitelist_trade(
+            monkeypatch, trader,
+            quotes=[{"averagePrice": q, "amountIn": "5", "amountOut": amount_out,
+                     "quoteId": f"Q-{q}"}],
+            confirms=[])
+        order = await trader.execute_signal_trade(
+            "UP", 5.0, "scene_bear_exhaust", WINDOW_START,
+            max_exec_price=0.65, market_period="15m", entry_band_whitelist=bands)
+        assert order["status"] == "FAILED"
+        assert "入场价白名单弃单" in updates[0][1]["error_message"]
+        assert place_calls == []
+
+    # 2. 带内放行：0.55（左闭贴线）/ 0.6499（上界内侧）
+    for q, amount_out in ((0.55, "9.09"), (0.6499, "7.69")):
+        trader._15m_markets[WINDOW_START] = {
+            "end_date": WINDOW_START + 900_000,
+            "up_token": "T-S2W-UP", "down_token": "T-S2W-DOWN",
+            "up_price": q, "down_price": round(1 - q, 4),
+        }
+        updates, place_calls = _stub_whitelist_trade(
+            monkeypatch, trader,
+            quotes=[{"averagePrice": q, "amountIn": "5", "amountOut": amount_out,
+                     "quoteId": f"Q-{q}"}],
+            confirms=[{"orderId": "ORD-1", "status": "FILLED", "price": f"{q}"}])
+        order = await trader.execute_signal_trade(
+            "UP", 5.0, "scene_bear_exhaust", WINDOW_START,
+            max_exec_price=0.65, market_period="15m", entry_band_whitelist=bands)
+        assert order["status"] == "FILLED"
+        assert place_calls == [f"Q-{q}"]
+
+    # 3. 0.65 贴护栏线：执行价护栏先拦（avg >= 0.65 贴线弃单），白名单不触达
+    updates, place_calls = _stub_whitelist_trade(
+        monkeypatch, trader,
+        quotes=[{"averagePrice": 0.65, "amountIn": "5", "amountOut": "7.69",
+                 "quoteId": "Q-0.65"}],
+        confirms=[])
+    order = await trader.execute_signal_trade(
+        "UP", 5.0, "scene_bear_exhaust", WINDOW_START,
+        max_exec_price=0.65, market_period="15m", entry_band_whitelist=bands)
+    assert order["status"] == "FAILED"
+    assert "执行价护栏弃单" in updates[0][1]["error_message"]
+    assert place_calls == []
 
 
 # ============================================================

@@ -1082,7 +1082,7 @@ const SIGNAL_INFO: Record<string, { name: string; desc: string; retired?: boolea
   },
   scene_bear_exhaust: {
     name: '场景S2 空头耗尽（押UP）',
-    desc: '15m 周期跌破 4h 支撑 + 收阴 + 放量 → 次周期开盘押 UP（胜率 53.6%，盈亏平衡 0.525）。护栏 0.65。',
+    desc: '15m 周期跌破 4h 支撑 + 收阴 + 放量 → 次周期开盘押 UP（胜率 53.6%，盈亏平衡 0.525）。入场价带 [0.55,0.65)：报价 <0.55 白名单弃单、≥0.65 护栏弃单（2026-10-15 收紧；带内历史胜率更高属样本内证据，前向验证中）。',
   },
   scene_bear_exhaust_opt_v1: {
     name: '场景S2 空头耗尽·温和放量非低位（押UP）',
