@@ -5348,6 +5348,25 @@ interface SignalHealthReport {
   generated_at: number; tally_active: Record<HealthLight, number>
   thresholds: Record<string, number>; rows: SignalHealthRow[]
   correlations?: ChannelCorrelation[]
+  calibration?: CalibrationReport
+}
+
+// 买贵校准监控（2026-10-16）：实盘订单 通道×行情档 的「实际胜率 vs 入场价保本线」桶级矩阵
+interface CalibrationRow {
+  lens: string; lens_label: string; bucket: string
+  entity: string; entity_kind: 'pooled' | 'channel'; display_name: string
+  direction: 'DOWN' | 'UP' | null; enabled?: boolean
+  n: number; wins: number; win_rate: number | null; be_n?: number
+  mean_breakeven: number | null; edge: number | null
+  p_edge_negative: number | null; avg_ev: number | null; avg_price: number | null
+  light: HealthLight; reasons: string[]; small_sample: boolean
+}
+
+interface CalibrationReport {
+  generated_at: number
+  lenses: Record<string, CalibrationRow[]>
+  thresholds: Record<string, number>
+  note?: string
 }
 
 interface HealthBucket {
@@ -5360,6 +5379,7 @@ interface SignalHealthDetail {
   series: { ts: number; i: number; cum_ev: number; roll20_win: number | null; p_neg: number | null }[]
   price_buckets: HealthBucket[]; hour_buckets: HealthBucket[]
   trend_4h_buckets?: HealthBucket[]; trend_24h_buckets?: HealthBucket[]; volatility_buckets?: HealthBucket[]
+  up_streak_buckets?: HealthBucket[]
   death_status?: DeathStatus; death_reason?: string
   change_point?: ChangePointInfo | null
   history: { date: string; light: HealthLight; n: number; win_rate: number | null; avg_ev: number | null; p_edge_negative: number | null }[]
@@ -5533,10 +5553,11 @@ function SignalHealthDrill({ scope, keyName, onClose }: { scope: string; keyName
             )}
 
             {bucketTab === 'regime' && (
-              <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
                 <BucketTable title="4h 趋势分层" rows={d.trend_4h_buckets || []} hint="触发时点前 48 根 5m K 收益（严格事前口径）。" />
                 <BucketTable title="24h 趋势分层" rows={d.trend_24h_buckets || []} hint="触发时点前 288 根 5m K 收益（事前口径）。" />
                 <BucketTable title="4h 波动率分层" rows={d.volatility_buckets || []} hint="过去 48 根 5m K 收益率波动标准差。" />
+                <BucketTable title="5m 连续收阳分层" rows={d.up_streak_buckets || []} hint="触发时点前 5 分钟 K 连续收阳的根数（「一直涨」的强多头口径）。探索性分析，同上纪律。" />
               </div>
             )}
           </div>
@@ -5575,6 +5596,76 @@ function SignalHealthDrill({ scope, keyName, onClose }: { scope: string; keyName
           </div>
         </>
       )}
+    </div>
+  )
+}
+
+// 买贵校准监控卡片（2026-10-16）：数据来自 /api/signals/health 的 calibration 字段。
+// 回答「什么行情档里，实际胜率低于入场价保本线（买贵了）」：合并层（按方向）+通道层。
+// 起因：DOWN 单在 5m 连涨≥4 根段 ROI 单调转负、深跌追单 ROI -45%（2026-10-15 实测）。
+const CALIBRATION_LENS: Record<string, string> = { ret_24h: '24小时行情', up_streak_5m: '5m连续收阳' }
+
+function CalibrationMonitorCard({ cal }: { cal: CalibrationReport }) {
+  const [lens, setLens] = useState<string>('up_streak_5m')
+  const [onlyEnabled, setOnlyEnabled] = useState(true)
+  const rows = useMemo(
+    () => (cal.lenses[lens] || []).filter(r => r.entity_kind === 'pooled' || !onlyEnabled || r.enabled),
+    [cal, lens, onlyEnabled],
+  )
+  return (
+    <div className="bg-card rounded-card border border-line p-4 space-y-2">
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <div className="flex items-center gap-2 text-sm">
+          <span className="font-bold text-ink-95">买贵校准监控</span>
+          <HelpHint text={'「买贵」＝该行情档内实际胜率低于入场价的保本线（含费）。红灯＝胜率落后已具统计置信（变负概率≥90% 且样本≥25）并微信告警；黄灯＝≥75% 疑似；灰＝样本不足（<15）。这只是体检仪表，不会自动改护栏或关通道——是否减仓/暂停由你决定。5m连续收阳＝下单时刻前 5 分钟 K 连续收阳的根数（「一直涨」的强多头口径）。'} />
+        </div>
+        <div className="flex items-center gap-2 text-[11px] text-ink-55">
+          <div className="flex items-center gap-0.5 bg-sunken rounded-pill p-0.5 border border-line-soft">
+            {Object.entries(CALIBRATION_LENS).map(([k, l]) => (
+              <button key={k} onClick={() => setLens(k)}
+                className={'px-2 py-0.5 rounded-pill text-[11px] font-semibold transition ' + (lens === k ? 'bg-brand text-white' : 'text-ink-55 hover:text-ink-80')}>{l}</button>
+            ))}
+          </div>
+          <label className="flex items-center gap-1 cursor-pointer">
+            <input type="checkbox" checked={onlyEnabled} onChange={e => setOnlyEnabled(e.target.checked)} />仅在线通道
+          </label>
+        </div>
+      </div>
+      <div className="overflow-x-auto max-h-96 overflow-y-auto">
+        <table className="w-full min-w-[880px] text-xs">
+          <thead><tr className="text-ink-55 border-b border-line">
+            <th className="py-1.5 px-2 text-left">对象</th><th className="py-1.5 px-2 text-left">行情档</th>
+            <th className="py-1.5 px-2 text-right">n</th><th className="py-1.5 px-2 text-right">胜率</th>
+            <th className="py-1.5 px-2 text-right">保本线</th><th className="py-1.5 px-2 text-right">校准差</th>
+            <th className="py-1.5 px-2 text-right">变负概率</th><th className="py-1.5 px-2 text-right">均EV</th>
+            <th className="py-1.5 px-2 text-left">提示</th>
+          </tr></thead>
+          <tbody>
+            {rows.map(r => (
+              <tr key={r.lens + ':' + r.entity + ':' + r.bucket} className="border-b border-line-soft hover:bg-card-hover">
+                <td className="py-1.5 px-2 whitespace-nowrap">
+                  <span className="inline-flex items-center gap-1.5">
+                    <LightDot light={r.light} />
+                    <span className={r.entity_kind === 'pooled' ? 'font-bold' : 'font-medium'}>{r.display_name}</span>
+                    <span className="text-[9px] text-ink-55">{r.direction === 'DOWN' ? '押DOWN' : r.direction === 'UP' ? '押UP' : ''}</span>
+                    {r.entity_kind === 'pooled' && <span className="rounded-pill bg-sunken px-1.5 py-0.5 text-[9px] text-ink-55">全系统合并</span>}
+                    {r.entity_kind === 'channel' && !r.enabled && <span className="rounded-pill bg-sunken px-1.5 py-0.5 text-[9px] text-ink-55">已下线</span>}
+                  </span>
+                </td>
+                <td className="py-1.5 px-2 whitespace-nowrap">{r.bucket}</td>
+                <td className="py-1.5 px-2 text-right font-mono">{r.n}{r.small_sample && <span className="text-ink-55" title="样本不足不下结论">⁻</span>}</td>
+                <td className="py-1.5 px-2 text-right font-mono">{performancePct(r.win_rate)}</td>
+                <td className="py-1.5 px-2 text-right font-mono">{performancePct(r.mean_breakeven)}</td>
+                <td className={'py-1.5 px-2 text-right font-mono ' + signClass(r.edge)}>{performanceSigned(r.edge == null ? null : r.edge * 100, '%', 1)}</td>
+                <td className="py-1.5 px-2 text-right font-mono">{performancePct(r.p_edge_negative, 0)}</td>
+                <td className={'py-1.5 px-2 text-right font-mono ' + signClass(r.avg_ev)}>{performanceSigned(r.avg_ev, '', 3)}</td>
+                <td className="py-1.5 px-2 text-ink-80 max-w-[300px] truncate" title={r.reasons.join('；')}>{r.reasons[0] ?? ''}</td>
+              </tr>
+            ))}
+            {rows.length === 0 && <tr><td colSpan={9} className="py-6 text-center text-ink-55">当前透镜下无校准数据</td></tr>}
+          </tbody>
+        </table>
+      </div>
     </div>
   )
 }
@@ -5764,6 +5855,8 @@ function MonitorTab() {
               </table>
             </div>
           )}
+
+          {report?.calibration && <CalibrationMonitorCard cal={report.calibration} />}
 
           {sel && <SignalHealthDrill scope={sel.scope} keyName={sel.key} onClose={() => setSel(null)} />}
         </>

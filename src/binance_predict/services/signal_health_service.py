@@ -15,6 +15,30 @@ from binance_predict.services import signal_health as sh
 llm_diagnose_hook: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
 
 
+def _empty_regime() -> dict[str, float | None]:
+    return {"ret_4h": None, "ret_24h": None, "vol_4h": None, "up_streak_5m": None}
+
+
+def up_streak_series(prices: list[float | None]) -> list[int | None]:
+    """逐窗 5m 连续收阳根数：价格严格高于前窗 +1 连涨累计，否则清零；缺价 → None。
+
+    与「5 分钟 K 一根接一根收阳」的肉眼口径一致（窗口起点价≈前窗收盘价）。
+    """
+    out: list[int | None] = []
+    streak: int | None = None
+    for i, p in enumerate(prices):
+        if p is None:
+            streak = None
+        elif i == 0 or prices[i - 1] is None:
+            streak = 0
+        elif p > prices[i - 1]:
+            streak = (streak or 0) + 1
+        else:
+            streak = 0
+        out.append(streak)
+    return out
+
+
 async def run_llm_diagnosis(payload: dict[str, Any]) -> dict[str, Any]:
     if llm_diagnose_hook is None:
         return {"status": "not_implemented", "message": "AI 诊断尚未接入；下方为将提交给模型的结构化输入。",
@@ -41,12 +65,13 @@ async def load_market_regime_lookup(db, min_ts: int | None = None, max_ts: int |
 
     res = (await db.execute(query.order_by(SentimentWindow.start_time.asc()))).all()
     if not res:
-        return lambda ts: {"ret_4h": None, "ret_24h": None, "vol_4h": None}
+        return lambda ts: _empty_regime()
 
     # 构造按 start_time 升序的有序列表
     times = [int(r[0]) for r in res]
     prices = [float(r[1]) if r[1] is not None and float(r[1]) > 0 else None for r in res]
     n = len(times)
+    streaks = up_streak_series(prices)
 
     # 预计算每个索引的 ret_4h(前48窗), ret_24h(前288窗), vol_4h(前48窗收益标准差)
     regime_cache: dict[int, dict[str, float | None]] = {}
@@ -80,7 +105,8 @@ async def load_market_regime_lookup(db, min_ts: int | None = None, max_ts: int |
                 mean_r = sum(rets) / len(rets)
                 v4 = math.sqrt(sum((x - mean_r) ** 2 for x in rets) / (len(rets) - 1))
 
-        regime_cache[t] = {"ret_4h": r4, "ret_24h": r24, "vol_4h": v4}
+        regime_cache[t] = {"ret_4h": r4, "ret_24h": r24, "vol_4h": v4,
+                           "up_streak_5m": streaks[i]}
 
     def lookup(ts: int) -> dict[str, float | None]:
         # 寻找 <= ts 且最接近的 5m 窗口整点
@@ -89,8 +115,8 @@ async def load_market_regime_lookup(db, min_ts: int | None = None, max_ts: int |
             matched_t = times[idx]
             # 必须在 15 分钟误差范围内
             if abs(ts - matched_t) <= 900_000:
-                return regime_cache.get(matched_t, {"ret_4h": None, "ret_24h": None, "vol_4h": None})
-        return {"ret_4h": None, "ret_24h": None, "vol_4h": None}
+                return regime_cache.get(matched_t, _empty_regime())
+        return _empty_regime()
 
     return lookup
 
@@ -139,10 +165,15 @@ def live_events(
             continue
         ts = int(o.window_start)
         reg = regime_lookup(ts) if regime_lookup else {}
+        streak = getattr(o, "up_streak_5m", None)
+        if streak is None:
+            streak = reg.get("up_streak_5m")
         out[o.channel].append({
             "ts": ts, "win": win, "ev": unit_return(o),
             "be": break_even(o)["break_even_probability"], "q": confirmed_execution_price(o),
+            "direction": o.direction,
             "ret_4h": reg.get("ret_4h"), "ret_24h": reg.get("ret_24h"), "vol_4h": reg.get("vol_4h"),
+            "up_streak_5m": streak,
         })
     for evs in out.values():
         evs.sort(key=lambda e: e["ts"])
@@ -200,12 +231,114 @@ def assemble_report(
     }
 
 
+# ---------------- 买贵校准监控（2026-10-16）：实盘订单 通道×行情档 校准矩阵 ----------------
+# 2026-10-15 实测背景：DOWN 单在 5m 连涨 ≥4 根段 ROI 转负（+8%→-22% 单调恶化）、
+# 深跌(ret24≤-2%)追单 ROI -45%。本监控把「该行情档实际胜率是否低于入场价保本线」
+# 做成常驻仪表：全系统合并(按方向) + 在线通道两层，桶级转红走既有微信告警链路。
+
+CALIBRATION_LENSES: tuple[tuple[str, str, Callable[[sh.Event], str], list[str]], ...] = (
+    ("ret_24h", "24小时行情",
+     lambda e: sh.ret_24h_label(e.get("ret_24h")), list(sh._TREND_24H_LABELS)),
+    ("up_streak_5m", "5m连续收阳",
+     lambda e: sh.up_streak_label(e.get("up_streak_5m")), list(sh.UP_STREAK_LABELS)),
+)
+
+
+def build_calibration_report(
+    live_ev: Mapping[str, list[sh.Event]],
+    live_meta: Mapping[str, Mapping[str, Any]],
+    channel_direction: Mapping[str, str] | None = None,
+    channel_display: Mapping[str, str] | None = None,
+    now_ms: int | None = None,
+) -> dict[str, Any]:
+    """实盘买贵校准报告：lenses[透镜] = [pooled(按方向) + 通道] × 行情档 的桶级校准行。
+
+    通道收录口径：enabled 在线，或注册表内且历史单 ≥30（下线通道也保留体检视野）；
+    未注册的退役通道名不单列（其单仍计入 pooled 按方向合并）。
+    """
+    channel_direction = channel_direction or {}
+    channel_display = channel_display or {}
+    rows_by_lens: dict[str, list[dict[str, Any]]] = {lens: [] for lens, _, _, _ in CALIBRATION_LENSES}
+
+    def _mode_direction(evs: list[sh.Event]) -> str | None:
+        counts: dict[str, int] = {}
+        for e in evs:
+            d = e.get("direction")
+            if d:
+                counts[d] = counts.get(d, 0) + 1
+        return max(counts, key=counts.get) if counts else None
+
+    def _append(evs: list[sh.Event], entity: str, kind: str, name: str,
+                dirn: str | None, enabled: bool = True) -> None:
+        for lens, lens_label, fn, labels in CALIBRATION_LENSES:
+            for r in sh.calibration_rows(evs, lens, fn, labels):
+                r.update(entity=entity, entity_kind=kind, display_name=name,
+                         direction=dirn, lens_label=lens_label, enabled=enabled)
+                rows_by_lens[lens].append(r)
+
+    # 合并层：全系统按方向（跨通道，回答「什么行情下整体在买贵」）
+    for dirn in ("DOWN", "UP"):
+        pooled = [e for evs in live_ev.values() for e in evs if e.get("direction") == dirn]
+        if pooled:
+            _append(pooled, f"ALL_{dirn}", "pooled",
+                    "全部DOWN单" if dirn == "DOWN" else "全部UP单", dirn)
+
+    # 通道层
+    for ch in sorted(live_ev):
+        evs = live_ev[ch]
+        if not evs:
+            continue
+        info = live_meta.get(ch)
+        if info is None:
+            continue  # 未注册的退役通道不单列
+        if not (info.get("enabled") or len(evs) >= 30):
+            continue
+        dirn = channel_direction.get(ch) or _mode_direction(evs)
+        _append(evs, ch, "channel",
+                channel_display.get(ch) or ch, dirn, enabled=bool(info.get("enabled")))
+
+    for lens_rows in rows_by_lens.values():
+        lens_rows.sort(key=lambda r: (0 if r["entity_kind"] == "pooled" else 1,
+                                      -(r["n"] or 0)))
+
+    return {
+        "generated_at": now_ms or int(time.time() * 1000),
+        "lenses": rows_by_lens,
+        "thresholds": {
+            "bucket_min_n": sh.BUCKET_MIN_N, "bucket_red_min_n": sh.BUCKET_RED_MIN_N,
+            "bucket_red_p_neg": sh.BUCKET_RED_P_NEG, "bucket_yellow_p_neg": sh.BUCKET_YELLOW_P_NEG,
+        },
+        "note": "体检仪表非门禁：红灯只告警不改护栏；桶级样本天然小，靠后验概率自保护。",
+    }
+
+
+def calibration_snapshot_rows(cal: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+    """校准报告 → SignalHealthSnapshot 持久化行（scope=calibration，每小时覆盖当日）。"""
+    if not cal:
+        return []
+    rows = []
+    for lens_rows in (cal.get("lenses") or {}).values():
+        for r in lens_rows:
+            rows.append({
+                "scope": "calibration",
+                "key": f"{r['lens']}|{r['entity']}|{r['bucket']}",
+                "light": r["light"],
+                "reasons": r["reasons"],
+                "metrics": {k: r.get(k) for k in (
+                    "n", "wins", "win_rate", "mean_breakeven", "edge",
+                    "p_edge_negative", "avg_ev", "avg_price", "direction",
+                    "lens", "lens_label", "bucket", "entity", "display_name")},
+            })
+    return rows
+
+
 def detail_for(scope: str, key: str, row: Mapping[str, Any], evs: list[sh.Event],
                history: list[dict[str, Any]]) -> dict[str, Any]:
     price, hour = sh.price_buckets(evs), sh.hour_buckets(evs)
     t4 = sh.trend_4h_buckets(evs)
     t24 = sh.trend_24h_buckets(evs)
     vol = sh.volatility_buckets(evs)
+    ustreak = sh.up_streak_buckets(evs)
 
     death_status = row.get("death_status") or "ALIVE"
     change_point = row.get("change_point")
@@ -221,6 +354,7 @@ def detail_for(scope: str, key: str, row: Mapping[str, Any], evs: list[sh.Event]
         "series": sh.series(evs),
         "price_buckets": price, "hour_buckets": hour,
         "trend_4h_buckets": t4, "trend_24h_buckets": t24, "volatility_buckets": vol,
+        "up_streak_buckets": ustreak,
         "death_status": death_status, "death_reason": row.get("death_reason"),
         "change_point": change_point,
         "history": history,

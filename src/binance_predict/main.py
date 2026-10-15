@@ -3281,6 +3281,7 @@ async def _load_live_performance_orders(
             quote_json=row[11], settled_at=epoch_ms(row[12]), created_at=epoch_ms(row[13]),
             policy_version=row[14], trigger_ts=row[15],
             ret_4h=reg.get("ret_4h"), ret_24h=reg.get("ret_24h"), vol_4h=reg.get("vol_4h"),
+            up_streak_5m=reg.get("up_streak_5m"),
         ))
     return out
 
@@ -5550,6 +5551,14 @@ async def _build_signal_health(db: AsyncSession) -> dict:
         shs.shadow_events(shadow_rows, _shadow_breakeven, _shadow_realized_ev, reg_lookup),
         shs.live_events(orders, reg_lookup), shadow_meta, live_meta, bench,
     )
+    # 买贵校准监控（2026-10-16）：实盘订单 通道×行情档（24h趋势 / 5m连涨）的
+    # 「实际胜率 vs 入场价保本线」桶级矩阵；事件复用体检装配，零额外 DB 查询。
+    live_ev_map = {key: evs for (scope, key), evs in report["_events"].items() if scope == "live"}
+    report["calibration"] = shs.build_calibration_report(
+        live_ev_map, live_meta,
+        channel_direction={ch: spec.direction for ch, spec in LIVE_CHANNELS.items()},
+        channel_display={ch: spec.display_name for ch, spec in LIVE_CHANNELS.items()},
+    )
     # 影子检测器运行态（2026-10-10 新增）：让「采集是否在跑」无需等信号即可自查——
     # 采样循环型检测器（gap_crowd / absorption）不在 kline 落表链路里，此前无任何
     # 可观测口径，新版本上线后只能靠「有没有落表」间接判断（触发稀时无法区分
@@ -5632,12 +5641,19 @@ async def _signal_health_loop() -> None:
                 now_ms = int(time.time() * 1000)
                 await shs.persist_snapshots(db, report["rows"], now_ms)
                 await shs.persist_sentiment_daily(db, now_ms)
+                # 买贵校准：桶级快照持久化（scope=calibration，复用同表与转红检测机制）
+                cal_snap = shs.calibration_snapshot_rows(report.get("calibration"))
+                if cal_snap:
+                    await shs.persist_snapshots(db, cal_snap, now_ms)
             active = [r for r in report["rows"] if r["active"]]
             for r in sh.new_red_transitions(prev, active):
                 name = LIVE_CHANNELS[r["key"]].display_name if r["scope"] == "live" and r["key"] in LIVE_CHANNELS else r["key"]
                 wechat_notifier.push_markdown(sh.format_red_alert(r, name))
                 logger.warning("信号体检转红 | {} {} | {}", r["scope"], r["key"], r["reasons"])
-            prev = {(r["scope"], r["key"]): r["light"] for r in report["rows"]}
+            for r in sh.new_red_transitions(prev, cal_snap):
+                wechat_notifier.push_markdown(sh.format_calibration_red_alert(r))
+                logger.warning("买贵校准转红 | {} | {}", r["key"], r["reasons"])
+            prev = {(r["scope"], r["key"]): r["light"] for r in report["rows"] + cal_snap}
         except asyncio.CancelledError:
             break
         except Exception as exc:

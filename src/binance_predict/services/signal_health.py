@@ -145,17 +145,20 @@ def trend_4h_buckets(events: Sequence[Event]) -> list[dict[str, Any]]:
     return _bucket(events, key, _TREND_4H_LABELS)
 
 
+def ret_24h_label(t: float | None) -> str:
+    """24h 趋势档标签（trend_24h_buckets 与买贵校准监控共用一套档位）。"""
+    if t is None:
+        return "未知"
+    pct = t * 100.0
+    if pct < -2.0: return "暴跌(<-2%)"
+    if pct <= 0.0: return "下行(-2%~0)"
+    if pct <= 2.0: return "上行(0~+2%)"
+    return "过热(>+2%)"
+
+
 def trend_24h_buckets(events: Sequence[Event]) -> list[dict[str, Any]]:
     """按 24h BTC 趋势分桶。"""
-    def key(e: Event) -> str:
-        t = e.get("ret_24h")
-        if t is None: return "未知"
-        pct = t * 100.0
-        if pct < -2.0: return "暴跌(<-2%)"
-        if pct <= 0.0: return "下行(-2%~0)"
-        if pct <= 2.0: return "上行(0~+2%)"
-        return "过热(>+2%)"
-    return _bucket(events, key, _TREND_24H_LABELS)
+    return _bucket(events, lambda e: ret_24h_label(e.get("ret_24h")), _TREND_24H_LABELS)
 
 
 def volatility_buckets(events: Sequence[Event]) -> list[dict[str, Any]]:
@@ -168,6 +171,96 @@ def volatility_buckets(events: Sequence[Event]) -> list[dict[str, Any]]:
         if pct <= 0.30: return "中波动"
         return "高波动"
     return _bucket(events, key, _VOL_LABELS)
+
+
+# ---------------- 买贵校准监控（2026-10-16）：通道×行情档的桶级判定 ----------------
+# 体检视角回答「在什么行情下，实际胜率低于入场价的保本线（买贵了）」。
+# 与通道级红灯同一贝叶斯口径（p_edge_negative），但阈值按桶级样本量放宽：
+# 桶内样本天然小于全通道，统计上靠后验概率自保护（样本少到不了高置信）。
+# ⚠️ 这是体检仪表不是门禁：红灯只告警，不自动改护栏/关通道。
+
+BUCKET_MIN_N = 15          # 桶级灰灯线（低于不下结论）
+BUCKET_RED_MIN_N = 25      # 桶级红灯最低样本（低于此最多黄灯）
+BUCKET_RED_P_NEG = 0.90    # 桶级红灯：买贵的后验概率
+BUCKET_YELLOW_P_NEG = 0.75 # 桶级黄灯
+
+UP_STREAK_LABELS = ["0-1根", "2-3根", "4-5根", "6-7根", "≥8根", "未知"]
+
+
+def up_streak_label(v: float | None) -> str:
+    """5m 连续收阳根数档（用户口径的「强多头」＝ 5 分钟 K 一根接一根收阳）。"""
+    if v is None:
+        return "未知"
+    n = int(v)
+    if n <= 1: return "0-1根"
+    if n <= 3: return "2-3根"
+    if n <= 5: return "4-5根"
+    if n <= 7: return "6-7根"
+    return "≥8根"
+
+
+def up_streak_buckets(events: Sequence[Event]) -> list[dict[str, Any]]:
+    """按 5m 连续收阳根数分桶（下钻展示用，胜率口径）。"""
+    return _bucket(events, lambda e: up_streak_label(e.get("up_streak_5m")), UP_STREAK_LABELS)
+
+
+def calibration_metrics(events: Sequence[Event]) -> dict[str, Any]:
+    """桶级校准指标：实际胜率 vs 平均保本线（入场价/0.98 口径，逐单 be 聚合）。"""
+    n = len(events)
+    wins = sum(1 for e in events if e["win"])
+    win_rate = wins / n if n else None
+    bes = [float(e["be"]) for e in events if e.get("be") is not None]
+    evs = [float(e["ev"]) for e in events if e.get("ev") is not None]
+    qs = [float(e["q"]) for e in events if e.get("q") is not None]
+    mean_be = _mean(bes)
+    p_neg = None
+    if n and mean_be is not None:
+        p_neg = float(_beta.cdf(mean_be, 1 + wins, 1 + n - wins))
+    return {
+        "n": n, "wins": wins, "win_rate": win_rate, "be_n": len(bes),
+        "mean_breakeven": mean_be,
+        "edge": (win_rate - mean_be) if (win_rate is not None and mean_be is not None) else None,
+        "p_edge_negative": p_neg, "avg_ev": _mean(evs), "avg_price": _mean(qs),
+    }
+
+
+def classify_calibration(m: dict[str, Any]) -> tuple[str, list[str]]:
+    """桶级红黄绿灯（GRAY | GREEN | YELLOW | RED）。"""
+    if m["n"] < BUCKET_MIN_N:
+        return "GRAY", [f"样本 {m['n']}/{BUCKET_MIN_N}，暂不下结论"]
+    if m["mean_breakeven"] is None:
+        return "GRAY", ["无入场价/保本线数据"]
+    p = m["p_edge_negative"]
+    if p is not None and p >= BUCKET_RED_P_NEG and m["n"] >= BUCKET_RED_MIN_N:
+        return "RED", [f"买贵：胜率 {m['win_rate']:.1%} 低于保本线 {m['mean_breakeven']:.1%}"
+                       f"（变负概率 {p:.0%}，n={m['n']}）"]
+    if p is not None and p >= BUCKET_YELLOW_P_NEG:
+        return "YELLOW", [f"疑似买贵：胜率 {m['win_rate']:.1%} vs 保本 {m['mean_breakeven']:.1%}"
+                          f"（变负概率 {p:.0%}）"]
+    return "GREEN", []
+
+
+def calibration_rows(
+    events: Sequence[Event],
+    lens: str,
+    bucket_fn: Callable[[Event], str],
+    labels: Sequence[str],
+) -> list[dict[str, Any]]:
+    """一组事件按行情档分桶 → 桶级校准行（按 labels 顺序，空桶跳过）。"""
+    groups: dict[str, list[Event]] = {}
+    for e in events:
+        groups.setdefault(bucket_fn(e), []).append(e)
+    rows = []
+    for label in labels:
+        g = groups.get(label)
+        if not g:
+            continue
+        m = calibration_metrics(g)
+        light, reasons = classify_calibration(m)
+        rows.append({"lens": lens, "bucket": label, **m,
+                     "light": light, "reasons": reasons,
+                     "small_sample": m["n"] < BUCKET_MIN_N})
+    return rows
 
 
 # ---------------- P3：死因诊断、变化点检测、相关性分析 ----------------
@@ -377,4 +470,21 @@ def format_red_alert(row: dict[str, Any], display_name: str) -> str:
         f"- 样本 {m['n']} 笔 · 胜率 {m['win_rate']:.1%} · 平均 EV "
         f"{'--' if m['avg_ev'] is None else format(m['avg_ev'], '+.3f')}\n"
         f"- 仅为建议：请到「运行监控」查看下钻，是否关闭由你决定。"
+    )
+
+
+def format_calibration_red_alert(snap_row: dict[str, Any]) -> str:
+    """买贵校准桶转红的微信文案（读 calibration_snapshot_rows 的 metrics 扁平字段）。"""
+    m = snap_row["metrics"]
+    be = m.get("mean_breakeven")
+    wr = m.get("win_rate")
+    ev = m.get("avg_ev")
+    line2 = (f"- 样本 {m.get('n', 0)} 笔 · 胜率 {wr:.1%} · 保本线 {be:.1%} · 平均 EV "
+             f"{'--' if ev is None else format(ev, '+.3f')}")
+    return (
+        f"### ⚠️ 买贵校准转红（{m.get('direction') or '--'} 单）\n"
+        f"**{m.get('display_name') or m.get('entity')}** · {m.get('lens_label')} · {m.get('bucket')}\n"
+        f"- {'；'.join(snap_row['reasons'])}\n"
+        f"{line2}\n"
+        f"- 体检不自动改护栏；处置与否请到「运行监控 → 买贵校准监控」查看。"
     )

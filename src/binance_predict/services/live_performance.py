@@ -40,6 +40,7 @@ class LiveOrder:
     ret_4h: float | None = None
     ret_24h: float | None = None
     vol_4h: float | None = None
+    up_streak_5m: float | None = None
 
 
 def _positive_float(value: Any) -> float | None:
