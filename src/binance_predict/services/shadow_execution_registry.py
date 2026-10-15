@@ -102,6 +102,9 @@ _VERSION_ROWS: tuple[tuple[str, SourceType, str, str, str], ...] = (
     # 2026-10-12 复核研究 run 20261012T084631Z「A 信号下破半」（阴线吞没∧破24低→押UP）
     ("crv_dnbrk24_15m_v1", SourceType.KLINE, "15m", "target_bar", "row"),
     ("crv_dnbrk24_5m_v1", SourceType.KLINE, "5m", "target_bar", "row"),
+    # 2026-10-15 反转研究回顾性验证：放量下破 5m 求值→15m 市场押 UP；大实体突破 5m 押 DOWN
+    ("crv_dnvol20_15m_v1", SourceType.KLINE, "15m", "target_bar", "row"),
+    ("crv_bodybrk20_5m_v1", SourceType.KLINE, "5m", "target_bar", "row"),
     # BRK 假突破回归族（2026-10-05 研究 run 20261005T051500Z）：收盘突破前 8h
     # 高点 → 押次根收阴 DOWN；direction 按行（row）。
     ("brkrv_brk8h_15m_v1", SourceType.KLINE, "15m", "target_bar", "row"),

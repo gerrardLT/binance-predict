@@ -394,6 +394,29 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
         "crv_dnbrk24_5m_v1", "kline_reversal", "5m", "UP", 0.546,
         "CRV 5m下破吞没24低反转（押UP）",
     ),
+    # --- 2026-10-15 反转研究 run 20261015T061535Z-reversal-study「修正后回顾性验证」
+    # 两个新信号（用户拍板注册影子+实盘，默认 OFF）。⚠ 末段 360D 筛选时已被看过，
+    # 研究数字均为回顾性、非独立盲测，影子前向样本才是裁决依据。
+    # crv_dnvol20_15m_v1：5m 阴线∧跌破前20低∧放量(≥1.5×均量)，且该 5m 根为 15m 窗口
+    # 最后一根 → 押下一根 **15m** 收阳 UP（信号 5m 求值、市场 15m）。对齐边界样本
+    # n=2904 胜率 59.1%（训练 59.8%/验证 57.6%/末段 59.2%）。护栏 0.57 = 费后保本价
+    # (59.1%−0.01)/1.02。2026-07→10-14 的 15m 真实盘口回填（Predict.fun，开盘+3.5s，
+    # 五档 VWAP，10U）：185/205 事件可用，VWAP 均值 0.549，不设护栏每份费后 EV +0.095；
+    # 护栏 0.57 仍成交 137 笔、ROI +18.2%。该段合约胜率 66.5% 高于历史 59.1%（9 月
+    # 单月 76% 拉高），属小样本，上线判断以影子前向为准。
+    # 与 crv_dnbrk24_15m_v1 同方向同目标窗（同窗重叠约 12.8%）→ 同组互斥。
+    "crv_dnvol20_15m_v1": ChannelSpec(
+        "crv_dnvol20_15m_v1", "kline_reversal", "15m", "UP", 0.57,
+        "CRV 5m放量下破20低→15m反弹（押UP）",
+    ),
+    # crv_bodybrk20_5m_v1：5m 阳线∧实体/振幅≥0.75∧突破前20高 → 押次根 5m 收阴 DOWN。
+    # n=8649 胜率 55.2%（训练 54.5%/验证 54.8%/末段 56.5%）；护栏 0.53 = 费后保本价
+    # (55.2%−0.01)/1.02。事件集 ⊂ crv_brk20_5m_v1（同向同目标窗）→ 并入其 5m 互斥组。
+    # 月度稳定性弱于信号 2（2026-03 胜率 47%），开启前先看影子前向。
+    "crv_bodybrk20_5m_v1": ChannelSpec(
+        "crv_bodybrk20_5m_v1", "kline_reversal", "5m", "DOWN", 0.53,
+        "CRV 5m大实体突破20高反转（押DOWN）",
+    ),
     # --- BRK 假突破回归族（2026-10-05 研究 run 20261005T051500Z-sentiment-kline-reversal
     # 影子 promote + 用户拍板注册实盘，默认全部 OFF）：
     # 「收盘突破前 32/96 根（8 小时）高点 → 次根收阴」的假突破回归——本轮研究三段
@@ -575,7 +598,10 @@ SAME_WINDOW_EXCLUSIVE: tuple[frozenset[str], ...] = (
     frozenset({"crv_hi_brk20_15m_v1", "crv_brk20_15m_v1", "crv_brk50_hi_15m_v1",
                "brkrv_brk8h_15m_v1"}),
     # 同理 5m 侧：brk8h 事件集 ⊂ brk20 事件集（都开启时同窗至多一单 DOWN）。
-    frozenset({"crv_brk20_5m_v1", "brkrv_brk8h_5m_v1"}),
+    # crv_bodybrk20_5m 事件集 ⊂ crv_brk20_5m（大实体阳线是阳线突破的子集）→ 同组。
+    frozenset({"crv_brk20_5m_v1", "brkrv_brk8h_5m_v1", "crv_bodybrk20_5m_v1"}),
+    # 15m 押 UP：放量下破(5m 求值)与下破吞没同向同目标窗、同窗重叠约 12.8% → 同窗至多一单。
+    frozenset({"crv_dnbrk24_15m_v1", "crv_dnvol20_15m_v1"}),
     # 同周期蜡烛逻辑版本共享物理事件，避免主版/对照/组件/潜力标签重复暴露。
     _CANDLE_5M_CHANNELS,
     _CANDLE_15M_CHANNELS,

@@ -30,6 +30,18 @@
         盲测 63.4%/前向 62.5%），相对「仅破24低无吞没」+6.3pp；护栏 0.606（61.9%×0.98）。
         5m 样本外 n=888 胜率 55.7%（盲测段 52.2% 偏弱），相对对照仅 +1.1pp；
         护栏 0.546 刻意只放行便宜 UP。两版本均默认实盘 OFF。
+    crv_dnvol20_15m_v1 / crv_bodybrk20_5m_v1（2026-10-15 反转研究 run
+        20261015T061535Z-reversal-study 的修正后回顾性验证，两版本均默认实盘 OFF）：
+        crv_dnvol20_15m_v1：5m 阴线 ∧ 收盘跌破前 20 根低 ∧ 成交量 ≥1.5×前 20 根均量，
+        且该 5m 根正好是 15m 窗口最后一根（open_time%15m==10min）→ 押下一根 **15m**
+        收阳 UP。信号在 5m 求值，市场/结算周期为 15m（spec.target_tf）；非边界命中
+        的 5m 事件不触发（它们的目标是跨窗的滚动 15 分钟，无对应合约）。
+        对齐边界 n=2904 胜率 59.1%（训练 59.8%/验证 57.6%/末段 59.2%）。
+        crv_bodybrk20_5m_v1：5m 阳线 ∧ 实体/振幅 ≥0.75 ∧ 收盘突破前 20 根高 → 押次根 5m
+        收阴 DOWN。n=8649 胜率 55.2%（训练 54.5%/验证 54.8%/末段 56.5%）；事件集是
+        crv_brk20_5m_v1 的严格子集（同方向同目标窗），已并入其 5m 互斥组。
+        ⚠ 末段 360D 在筛选时已被看过，所有数字是回顾性，不是独立盲测，影子前向样本
+        才是裁决依据。
 
 口径保真（影子阶段的生命线）：
     特征公式逐位移植研究 features.py（trailing 滚动窗、prior 高低点显式 shift、
@@ -60,6 +72,8 @@ from binance_predict.services.shadow_entry_quote import snapshot_entry_quote
 from binance_predict.services.shadow_version_gate import shadow_gate
 
 # ---- 冻结口径（研究 run 20261004T083106Z FROZEN_CANDIDATES.json，勿动）----
+# 可选键 target_tf：市场/结算周期（缺省 = tf）。tf 是求值用的 K 线周期，target_tf 是
+# 押注的预测市场与结算 K 线周期（crv_dnvol20_15m_v1：5m 求值、押下一根 15m）。
 CRV_SHADOW_SPECS: list[dict] = [
     {
         "version": "crv_hi_brk20_15m_v1",
@@ -133,10 +147,29 @@ CRV_SHADOW_SPECS: list[dict] = [
         "direction": "UP",
         "condition_text": "dn & engulf(实体>1.5×前实体) & close<prior24低(5m) → 次根收阳UP",
     },
+    {
+        "version": "crv_dnvol20_15m_v1",
+        "tf": "5m",
+        "target_tf": "15m",            # 5m 求值、押下一根 15m（仅 15m 边界收盘的 5m 根）
+        "discovery_id": "dnvol20261015_15m",
+        "kind": "dnvol20",
+        "direction": "UP",
+        "condition_text": "5m dn & close<prior20低 & 量>=1.5×前20均量 & 15m边界收盘 → 次根15m收阳UP",
+    },
+    {
+        "version": "crv_bodybrk20_5m_v1",
+        "tf": "5m",
+        "discovery_id": "bodybrk20261015_5m",
+        "kind": "bodybrk20",
+        "direction": "DOWN",
+        "condition_text": "5m up & 实体/振幅>=0.75 & close>prior20高 → 次根5m收阴DOWN",
+    },
 ]
 CRV_VERSIONS = [s["version"] for s in CRV_SHADOW_SPECS]
+# 按「结算周期」分组（settle/expire 用目标周期的 K 线）；求值按 spec["tf"]
 CRV_VERSIONS_BY_TF: dict[str, list[str]] = {
-    tf: [s["version"] for s in CRV_SHADOW_SPECS if s["tf"] == tf] for tf in ("15m", "5m")
+    tf: [s["version"] for s in CRV_SHADOW_SPECS if s.get("target_tf", s["tf"]) == tf]
+    for tf in ("15m", "5m")
 }
 
 BAR_MS = {"15m": 900_000, "5m": 300_000}
@@ -270,12 +303,23 @@ def compute_crv_features(kl: Klines) -> dict:
             streak[i] = run_len
     with np.errstate(invalid="ignore"):
         near_lo20 = np.abs(c - prior_lo20) < 0.25 * atr
+    # vol_ratio：当前根成交量 / 前 20 根均量（不含当前根；基础币量，与研究 base_volume_high 同口径）
+    # body_ratio：实体 / 振幅（零振幅 → NaN，保守不触发）
+    prior_vol_mean20 = _shift1(roll_mean(kl.v, 20))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        vol_ratio = kl.v / prior_vol_mean20
+        span = h - l
+        body_ratio = np.where(span > 0, body / np.where(span > 0, span, 1.0), np.nan)
+    # b15_end：该根是否为 15m 窗口的最后一根 5m（open_time 距 15m 边界 10 分钟）。
+    # 仅对 5m K 线有意义；15m/其它周期恒 False。
+    b15_end = (kl.t % 900_000) == 600_000
     return {
         "close": c, "up": up, "dn": dn, "body": body,
         "prior_hi20": prior_hi20, "prior_lo20": prior_lo20, "prior_hi50": prior_hi50,
         "prior_lo24": prior_lo24, "engulf": engulf,
         "pos100": pos100, "z20": z20, "atr": atr, "rsi": rsi, "streak": streak,
         "near_lo20": near_lo20,
+        "vol_ratio": vol_ratio, "body_ratio": body_ratio, "b15_end": b15_end,
     }
 
 
@@ -284,6 +328,14 @@ def _gt(a, b) -> np.ndarray:
     a = np.asarray(a, dtype=np.float64)
     b = np.broadcast_to(np.asarray(b, dtype=np.float64), a.shape)
     out = a > b
+    out[np.isnan(a) | np.isnan(b)] = False
+    return out
+
+
+def _ge(a, b) -> np.ndarray:
+    a = np.asarray(a, dtype=np.float64)
+    b = np.broadcast_to(np.asarray(b, dtype=np.float64), a.shape)
+    out = a >= b
     out[np.isnan(a) | np.isnan(b)] = False
     return out
 
@@ -319,6 +371,13 @@ def spec_mask(spec: dict, feat: dict) -> np.ndarray:
         # 阴线吞没 ∧ 收盘跌破前 24 根低 → 押次根收阳 UP（2026-10-12 复核研究
         # run 20261012T084631Z 的「A 信号下破半」；15m 样本外 61.9% / 5m 55.7%）
         return feat["dn"] & feat["engulf"] & _lt(c, feat["prior_lo24"])
+    if kind == "dnvol20":
+        # 5m 阴线 ∧ 跌破前 20 低 ∧ 放量(≥1.5×前20均量) ∧ 15m 边界收盘 → 押下一根 15m 收阳 UP
+        return (feat["dn"] & _lt(c, feat["prior_lo20"]) & _ge(feat["vol_ratio"], 1.5)
+                & feat["b15_end"])
+    if kind == "bodybrk20":
+        # 5m 阳线 ∧ 实体/振幅≥0.75 ∧ 突破前 20 高 → 押次根 5m 收阴 DOWN
+        return (feat["up"] & _ge(feat["body_ratio"], 0.75) & _gt(c, feat["prior_hi20"]))
     raise ValueError(f"未知 CRV spec.kind: {kind}")
 
 
@@ -485,7 +544,9 @@ class CrvShadowDetector:
     async def _record_signal(self, tf: str, session, spec: dict, bar: dict, feat: dict,
                              idx: int, live_payloads: list[dict] | None = None) -> bool:
         """幂等落 PENDING，并为正常轮询中的新鲜命中收集实盘 payload。"""
-        bar_ms = BAR_MS[tf]
+        sig_ms = BAR_MS[tf]
+        target_tf = spec.get("target_tf", tf)  # 市场/结算周期（缺省同信号周期）
+        target_ms = BAR_MS[target_tf]
         start_ms = int(bar["open_time"])
         exists = (await session.execute(
             sa_select(KlineShadowSignal.id).where(
@@ -495,13 +556,13 @@ class CrvShadowDetector:
         )).scalar_one_or_none()
         if exists is not None:
             return False
-        target_bar_start = start_ms + bar_ms
+        target_bar_start = start_ms + sig_ms
         if live_payloads is not None and (
                 0 <= int(time.time() * 1000) - target_bar_start <= CRV_LIVE_MAX_LAG_MS):
             live_payloads.append({
                 "version": spec["version"],
                 "market_start": target_bar_start,
-                "market_end": target_bar_start + bar_ms,
+                "market_end": target_bar_start + target_ms,
                 "direction": spec["direction"],
                 "signal_bar_start": start_ms,
             })
@@ -511,7 +572,7 @@ class CrvShadowDetector:
         snapshot: dict = {}
         streak_v = int(feat["streak"][idx])
         snapshot["streak"] = streak_v
-        for name in ("pos100", "rsi", "z20"):
+        for name in ("pos100", "rsi", "z20", "vol_ratio", "body_ratio"):
             v = float(feat[name][idx])
             if not np.isnan(v):
                 snapshot[name] = round(v, 6)
@@ -528,12 +589,12 @@ class CrvShadowDetector:
             snapshot["dist_prior_lo24"] = round(
                 float(feat["close"][idx] - feat["prior_lo24"][idx]), 6)
         # 目标窗入场报价快照（窗口对齐+近开盘守卫；缺失/回补 → None，该笔 EV 不计）
-        up_q, down_q, q_ts = snapshot_entry_quote(self._pm_by_tf[tf], target_bar_start)
+        up_q, down_q, q_ts = snapshot_entry_quote(self._pm_by_tf[target_tf], target_bar_start)
         session.add(KlineShadowSignal(
             version=spec["version"],
             discovery_id=spec["discovery_id"],
             condition_text=spec["condition_text"],
-            timeframe=tf,
+            timeframe=target_tf,  # 存市场/结算周期（与执行账本 market_period 一致）
             signal_bar_start=start_ms,
             signal_bar_end=target_bar_start,
             direction=spec["direction"],

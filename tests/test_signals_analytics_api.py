@@ -526,6 +526,8 @@ async def test_analytics_empty_db() -> None:
         "brkrv_brk8h_15m_v1", "brkrv_brk8h_5m_v1",
         # 2026-10-12 复核「A 信号下破半」下破吞没族（两个确认级，默认 OFF）
         "crv_dnbrk24_15m_v1", "crv_dnbrk24_5m_v1",
+        # 2026-10-15 反转研究回顾性验证两通道（默认 OFF）
+        "crv_dnvol20_15m_v1", "crv_bodybrk20_5m_v1",
             # 2026-10-10 报价-人群错位族（两个周期，同名实盘默认 OFF）
             "gap_crowd_5m_v1", "gap_crowd_15m_v1",
             # 2026-10-14 补齐 4 个经典场景实盘通道

@@ -90,8 +90,9 @@ def _tail_hits(feat: dict, version: str, n_tail: int = 3) -> list[int]:
 def _research_reference(rows: list[dict], tf_ms: int) -> dict:
     """研究 features.py 公式的独立 numpy 转写（滑窗视图实现，与检测器结构不同）。"""
     arr = {k: np.array([r[k] for r in rows], dtype=np.float64)
-           for k in ("open", "high", "low", "close")}
-    o, h, l, c = arr["open"], arr["high"], arr["low"], arr["close"]
+           for k in ("open", "high", "low", "close", "volume")}
+    o, h, l, c, v = arr["open"], arr["high"], arr["low"], arr["close"], arr["volume"]
+    t = np.array([r["open_time"] for r in rows], dtype=np.int64)
 
     def roll(fn, x, w):
         out = np.full(len(x), np.nan)
@@ -162,6 +163,14 @@ def _research_reference(rows: list[dict], tf_ms: int) -> dict:
     feat["close"] = c
     with np.errstate(invalid="ignore"):
         feat["near_lo20"] = np.abs(c - feat["prior_lo20"]) < 0.25 * feat["atr"]
+    # 2026-10-15 新特征（独立转写）：前 20 根（不含当前）均量比、实体/振幅、15m 边界收盘
+    vr = np.full(len(v), np.nan)
+    for i in range(20, len(v)):
+        vr[i] = v[i] / v[i - 20:i].mean()
+    feat["vol_ratio"] = vr
+    span = h - l
+    feat["body_ratio"] = np.where(span > 0, np.abs(c - o) / np.where(span > 0, span, 1.0), np.nan)
+    feat["b15_end"] = (t % 900_000) == 600_000
     return feat
 
 
@@ -173,10 +182,11 @@ def test_feature_bitwise_parity_vs_research_reference(seed: int) -> None:
     ref = _research_reference(rows, 900_000)
     tail = slice(105, 130)  # 全部 warmup（pos100=100/atr=14/滚动20/50）之后
     for key in ("up", "dn", "prior_hi20", "prior_lo20", "prior_hi50", "prior_lo24",
-                "pos100", "z20", "atr", "streak"):
+                "pos100", "z20", "atr", "streak", "vol_ratio", "body_ratio"):
         mine, ref_v = feat[key][tail], ref[key][tail]
         assert np.array_equal(mine, ref_v), f"{key} 与研究参照不一致"
     assert np.array_equal(feat["engulf"][tail], ref["engulf"][tail]), "engulf 与研究参照不一致"
+    assert np.array_equal(feat["b15_end"][tail], ref["b15_end"][tail])
     assert np.allclose(feat["rsi"][tail], np.nan_to_num(ref["rsi"][tail], nan=-1), atol=1e-8)
     # 六个 spec 的掩码逐位一致
     for spec in CRV_SHADOW_SPECS:
@@ -512,6 +522,9 @@ def test_crv_live_channels_registered_default_off() -> None:
         # 2026-10-12 复核「A 信号下破半」：方向与突破族相反（押 UP）
         "crv_dnbrk24_15m_v1": ("15m", "UP", 0.606),
         "crv_dnbrk24_5m_v1": ("5m", "UP", 0.546),
+        # 2026-10-15 反转研究回顾性验证：放量下破（5m 求值→15m 市场押 UP）/ 大实体突破
+        "crv_dnvol20_15m_v1": ("15m", "UP", 0.57),
+        "crv_bodybrk20_5m_v1": ("5m", "DOWN", 0.53),
     }
     for version, (period, direction, guard) in expected.items():
         spec = LIVE_CHANNELS[version]
@@ -530,9 +543,10 @@ def test_crv_live_channels_registered_default_off() -> None:
     grp = exclusive_group("crv_hi_brk20_15m_v1")
     assert grp == {"crv_hi_brk20_15m_v1", "crv_brk20_15m_v1", "crv_brk50_hi_15m_v1",
                    "brkrv_brk8h_15m_v1"}
-    assert exclusive_group("crv_brk20_5m_v1") == {"crv_brk20_5m_v1", "brkrv_brk8h_5m_v1"}
+    assert exclusive_group("crv_brk20_5m_v1") == {"crv_brk20_5m_v1", "brkrv_brk8h_5m_v1",
+                                                  "crv_bodybrk20_5m_v1"}
     # 下破吞没族事件集与突破族完全不相交（阴线破低 vs 阳线破高），不并入其互斥组
-    assert exclusive_group("crv_dnbrk24_15m_v1") is None
+    assert exclusive_group("crv_dnbrk24_15m_v1") == {"crv_dnbrk24_15m_v1", "crv_dnvol20_15m_v1"}
     assert exclusive_group("crv_dnbrk24_5m_v1") is None
 
 
@@ -548,7 +562,8 @@ def test_crv_versions_in_shadow_projection() -> None:
     # 确认级映射同名实盘通道；探索/观察级无实盘映射
     for version in ("crv_hi_brk20_15m_v1", "crv_brk20_15m_v1",
                     "crv_brk50_hi_15m_v1", "crv_brk20_5m_v1",
-                    "crv_dnbrk24_15m_v1", "crv_dnbrk24_5m_v1"):
+                    "crv_dnbrk24_15m_v1", "crv_dnbrk24_5m_v1",
+                    "crv_dnvol20_15m_v1", "crv_bodybrk20_5m_v1"):
         assert SHADOW_VERSION_SPECS[version].live_channel == version
     for version in ("crv_dnex_15m_v1", "crv_os_st4_5m_v1", "crv_hi_z3_15m_v1"):
         assert SHADOW_VERSION_SPECS[version].live_channel is None
@@ -571,3 +586,178 @@ def test_dnbrk24_versions_in_shadow_bench() -> None:
     assert SHADOW_BENCH["crv_dnbrk24_5m_v1"][0] == 0.5574
     assert SHADOW_BENCH["crv_dnbrk24_15m_v1"][1] is None
     assert SHADOW_BENCH["crv_dnbrk24_5m_v1"][1] is None
+
+
+# ============================================================
+# 2026-10-15 反转研究回顾性验证：crv_dnvol20_15m_v1 / crv_bodybrk20_5m_v1
+# ============================================================
+
+def _rows5(n: int, last: tuple[float, float, float, float] | None = None,
+           last_vol: float = 1.0) -> list[dict]:
+    """5m 确定性交替带（成交量恒 1.0，T0 为 15m 边界）+ 可选末根 (lo,hi,o,c) 与其成交量。"""
+    rows = _band_rows(n, 300_000)
+    if last is not None:
+        lo, hi, o, c = last
+        rows.append({**_mk(300_000, n, o, hi, lo, c), "volume": last_vol})
+    return rows
+
+
+def test_dnvol20_positive_and_negatives() -> None:
+    """放量下破20低∧15m边界收盘：正例 + 缩量/非边界/阳线/未破低 四类反例。"""
+    spec = "crv_dnvol20_15m_v1"
+    # 末根下标 131 → open_time = T0+131*5m，131%3==2 即 15m 窗口最后一根 5m
+    pos = _rows5(131, last=(99.3, 100.35, 100.3, 99.3), last_vol=2.0)
+    feat = compute_crv_features(_to_klines(pos, 300_000))
+    assert feat["b15_end"][len(pos) - 1]
+    assert len(pos) - 1 in _tail_hits(feat, spec, n_tail=1)
+    # 反例 1：量比 1.4 < 1.5 → 不命中；恰 1.5 → 命中（含贴线）
+    low = compute_crv_features(_to_klines(_rows5(131, (99.3, 100.35, 100.3, 99.3), 1.4), 300_000))
+    assert _tail_hits(low, spec, n_tail=1) == []
+    edge = compute_crv_features(_to_klines(_rows5(131, (99.3, 100.35, 100.3, 99.3), 1.5), 300_000))
+    assert len(pos) - 1 in _tail_hits(edge, spec, n_tail=1)
+    # 反例 2：非 15m 边界（末根下标 130，130%3==1）→ 不命中
+    nb = compute_crv_features(_to_klines(_rows5(130, (99.3, 100.35, 100.3, 99.3), 2.0), 300_000))
+    assert not nb["b15_end"][130] and _tail_hits(nb, spec, n_tail=1) == []
+    # 反例 3：阳线（即便放量、边界）→ 不命中
+    up = compute_crv_features(_to_klines(_rows5(131, (99.3, 100.35, 99.3, 100.3), 2.0), 300_000))
+    assert _tail_hits(up, spec, n_tail=1) == []
+    # 反例 4：阴线放量但未跌破前 20 低（收盘 99.7 > 前低 99.69）→ 不命中
+    nobrk = compute_crv_features(_to_klines(_rows5(131, (99.69, 100.35, 100.3, 99.7), 2.0), 300_000))
+    assert _tail_hits(nobrk, spec, n_tail=1) == []
+
+
+def test_dnvol20_never_fires_on_15m_bars() -> None:
+    """15m K 线上 b15_end 恒 False（open_time%15m==0）→ 该 spec 永不命中。"""
+    rows = _band_rows(131, 900_000, last=(99.3, 100.35, 100.3, 99.3))
+    rows[-1] = {**rows[-1], "volume": 5.0}
+    feat = compute_crv_features(_to_klines(rows, 900_000))
+    assert not feat["b15_end"].any()
+    assert _tail_hits(feat, "crv_dnvol20_15m_v1", n_tail=5) == []
+
+
+def test_bodybrk20_positive_and_negatives() -> None:
+    """大实体突破20高：正例 + 长上影/未突破/阴线 反例；实体比 0.75 含贴线。"""
+    spec = "crv_bodybrk20_5m_v1"
+    pos = _rows5(129, last=(99.98, 101.05, 100.0, 101.0))
+    feat = compute_crv_features(_to_klines(pos, 300_000))
+    assert len(pos) - 1 in _tail_hits(feat, spec, n_tail=1)
+    # 长上影（实体 1.0 / 振幅 2.02 < 0.75）→ 不命中
+    wick = compute_crv_features(_to_klines(_rows5(129, (99.98, 102.0, 100.0, 101.0)), 300_000))
+    assert _tail_hits(wick, spec, n_tail=1) == []
+    # 实体占比高但未突破前 20 高 → 不命中
+    nb = compute_crv_features(_to_klines(_rows5(129, (99.99, 100.21, 100.0, 100.2)), 300_000))
+    assert nb["body_ratio"][len(pos) - 1] > 0.75 and _tail_hits(nb, spec, n_tail=1) == []
+    # 阴线 → 不命中
+    dn = compute_crv_features(_to_klines(_rows5(129, (99.0, 101.05, 101.0, 99.98)), 300_000))
+    assert _tail_hits(dn, spec, n_tail=1) == []
+    # 贴线：实体/振幅恰 0.75 → 命中（>=）；略小 → 不命中
+    exact = compute_crv_features(_to_klines(_rows5(129, (100.0, 101.0, 100.0, 100.75)), 300_000))
+    assert exact["body_ratio"][len(pos) - 1] == pytest.approx(0.75)
+    assert len(pos) - 1 in _tail_hits(exact, spec, n_tail=1)
+    under = compute_crv_features(_to_klines(_rows5(129, (100.0, 101.0, 100.0, 100.74)), 300_000))
+    assert _tail_hits(under, spec, n_tail=1) == []
+
+
+def test_new_features_parity_on_5m_random_walk() -> None:
+    """vol_ratio/body_ratio/b15_end 与独立参照逐位一致（5m 随机游走+随机成交量）。"""
+    rng = np.random.default_rng(7)
+    rows, price = [], 100.0
+    for i in range(2400):
+        o = price
+        c = price + rng.normal(0, 0.4)
+        rows.append({**_mk(300_000, i, o, max(o, c) + abs(rng.normal(0, 0.15)),
+                           min(o, c) - abs(rng.normal(0, 0.15)), c),
+                     "volume": float(rng.uniform(0.5, 3.0))})
+        price = c
+    feat = compute_crv_features(_to_klines(rows, 300_000))
+    ref = _research_reference(rows, 300_000)
+    tail = slice(130, 2400)
+    for key in ("vol_ratio", "body_ratio"):
+        assert np.array_equal(feat[key][tail], ref[key][tail]), key
+    assert np.array_equal(feat["b15_end"][tail], ref["b15_end"][tail])
+    assert ref["b15_end"][tail].sum() > 0
+    for version in ("crv_dnvol20_15m_v1", "crv_bodybrk20_5m_v1"):
+        spec = _spec(version)
+        mine, theirs = spec_mask(spec, feat)[tail], spec_mask(spec, ref)[tail]
+        assert mine.sum() > 0, f"{version} 随机序列应至少命中一次，否则本对照无意义"
+        assert np.array_equal(mine, theirs), version
+
+
+def test_dnvol20_groups_by_target_tf() -> None:
+    """5m 求值、押下一根 15m：结算/过期按 15m 分组；bodybrk20 仍归 5m。"""
+    assert "crv_dnvol20_15m_v1" in csd.CRV_VERSIONS_BY_TF["15m"]
+    assert "crv_dnvol20_15m_v1" not in csd.CRV_VERSIONS_BY_TF["5m"]
+    assert "crv_bodybrk20_5m_v1" in csd.CRV_VERSIONS_BY_TF["5m"]
+
+
+@pytest.mark.asyncio
+async def test_dnvol20_record_and_dispatch_use_15m_target(monkeypatch) -> None:
+    rows = _rows5(131, last=(99.3, 100.35, 100.3, 99.3), last_vol=2.0)
+    feat = compute_crv_features(_to_klines(rows, 300_000))
+    idx = len(rows) - 1
+    bar = rows[idx]
+    target = int(bar["open_time"]) + 300_000
+    assert target % 900_000 == 0  # 目标窗恰为 15m 边界
+    session = _FakeSession(rows=[], scalar=None)
+    monkeypatch.setattr(csd.shadow_gate, "is_enabled", lambda _v: True)
+    monkeypatch.setattr(csd.time, "time", lambda: (target + 3_000) / 1000)
+    pm15 = {"start_date": target, "up_price": 0.55, "down_price": 0.45, "updated_ts": target + 2_000}
+    pm5 = {"start_date": target, "up_price": 0.99, "down_price": 0.01, "updated_ts": target + 2_000}
+    d = CrvShadowDetector(collector=None, pm_15m_latest=pm15, pm_5m_info=pm5)
+    payloads: list[dict] = []
+    assert await d._record_signal("5m", session, _spec("crv_dnvol20_15m_v1"), bar, feat, idx, payloads)
+    sig = session.added[0]
+    assert sig.timeframe == "15m" and sig.direction == "UP" and sig.status == "PENDING"
+    assert sig.signal_bar_start == int(bar["open_time"]) and sig.target_bar_start == target
+    assert sig.entry_up_price == 0.55  # 取 15m 报价缓存，而非 5m 缓存的 0.99
+    assert payloads == [{
+        "version": "crv_dnvol20_15m_v1", "market_start": target, "market_end": target + 900_000,
+        "direction": "UP", "signal_bar_start": int(bar["open_time"]),
+    }]
+    assert sig.feature_snapshot["vol_ratio"] == pytest.approx(2.0)
+
+
+@pytest.mark.asyncio
+async def test_bodybrk20_payload_stays_5m(monkeypatch) -> None:
+    rows = _rows5(129, last=(99.98, 101.05, 100.0, 101.0))
+    feat = compute_crv_features(_to_klines(rows, 300_000))
+    idx = len(rows) - 1
+    target = int(rows[idx]["open_time"]) + 300_000
+    session = _FakeSession(rows=[], scalar=None)
+    monkeypatch.setattr(csd.shadow_gate, "is_enabled", lambda _v: True)
+    monkeypatch.setattr(csd.time, "time", lambda: (target + 3_000) / 1000)
+    d = CrvShadowDetector(collector=None, pm_15m_latest={}, pm_5m_info={})
+    payloads: list[dict] = []
+    assert await d._record_signal("5m", session, _spec("crv_bodybrk20_5m_v1"), rows[idx], feat, idx, payloads)
+    assert session.added[0].timeframe == "5m" and session.added[0].direction == "DOWN"
+    assert payloads[0]["market_end"] - payloads[0]["market_start"] == 300_000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("green", "win"), [(True, True), (False, False)])
+async def test_dnvol20_settles_on_15m_bar(monkeypatch, green, win) -> None:
+    """押 UP：下一根 15m 收阳赢，收阴输。"""
+    session = _FakeSession(rows=[_pending("crv_dnvol20_15m_v1", "UP", _TARGET)])
+    monkeypatch.setattr(csd, "async_session_factory", lambda: _FakeSessionCtx(session))
+    d = CrvShadowDetector(collector=None, pm_15m_latest={}, pm_5m_info={})
+    c = 101.5 if green else 99.0
+    closed = [{"open_time": _TARGET, "open": 100.0, "high": 102.0, "low": 98.5, "close": c, "volume": 1.0}]
+    await d._settle_pending("15m", closed)
+    sig = session.rows[0]
+    assert sig.status == "SETTLED" and sig.win is win
+
+
+def test_new_channels_default_off_exclusive_and_bench() -> None:
+    from binance_predict.main import SHADOW_BENCH
+    from binance_predict.services.live_channels import LIVE_CHANNELS, exclusive_group, parse_channel_config
+
+    cfg = parse_channel_config()
+    for v in ("crv_dnvol20_15m_v1", "crv_bodybrk20_5m_v1"):
+        assert LIVE_CHANNELS[v].family == "kline_reversal"
+        assert cfg[v].enabled is False            # 默认不开实盘
+        assert v in SHADOW_BENCH and SHADOW_BENCH[v][1] is None
+    assert LIVE_CHANNELS["crv_dnvol20_15m_v1"].market_period == "15m"
+    assert exclusive_group("crv_dnvol20_15m_v1") == {"crv_dnbrk24_15m_v1", "crv_dnvol20_15m_v1"}
+    assert "crv_bodybrk20_5m_v1" in exclusive_group("crv_brk20_5m_v1")
+    assert SHADOW_BENCH["crv_dnvol20_15m_v1"][0] == 0.5906
+    assert SHADOW_BENCH["crv_bodybrk20_5m_v1"][0] == 0.5517

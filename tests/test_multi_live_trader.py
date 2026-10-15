@@ -230,7 +230,7 @@ def test_parse_defaults_all_off(monkeypatch) -> None:
     monkeypatch.setattr(settings, "live_default_max_daily_orders", 100)
     monkeypatch.setattr(settings, "live_channels_json", "")
     cfgs = parse_channel_config()
-    assert len(cfgs) == 43 + len(CANDLESTICK_SIGNAL_IDS)  # 2026-10-13 +firsthit_down_chg35_d/e_v1
+    assert len(cfgs) == 45 + len(CANDLESTICK_SIGNAL_IDS)  # 2026-10-15 +crv_dnvol20_15m_v1/crv_bodybrk20_5m_v1
     assert set(CANDLESTICK_SIGNAL_IDS) <= set(cfgs)
     assert all(not c.enabled for c in cfgs.values())
     assert all(c.amount_usdt == 2.0 for c in cfgs.values())
@@ -411,6 +411,8 @@ def test_channels_registry_shape() -> None:
         "brkrv_brk8h_15m_v1", "brkrv_brk8h_5m_v1",
         # 2026-10-12 复核「A 信号下破半」下破吞没双通道（默认全 OFF；押 UP）
         "crv_dnbrk24_15m_v1", "crv_dnbrk24_5m_v1",
+        # 2026-10-15 反转研究回顾性验证两通道（默认全 OFF）
+        "crv_dnvol20_15m_v1", "crv_bodybrk20_5m_v1",
     }
     assert set(LIVE_CHANNELS) == expected_existing | set(CANDLESTICK_SIGNAL_IDS)
     assert set(RETIRED_CHANNELS) == {
@@ -3006,7 +3008,7 @@ def test_status_shape(monkeypatch) -> None:
     from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
     # 状态列表 = LIVE_CHANNELS + 退役 spec（_with_retired 合并）→ gap_crowd 两版退役后
     # 仍在合并表内；2026-10-12 加 crv_dnbrk24_15m/5m_v1 两通道后基数 59→61。
-    assert len(s["channels"]) == 63 + len(CANDLESTICK_SIGNAL_IDS)  # 2026-10-13 +firsthit_down_chg35_d/e_v1
+    assert len(s["channels"]) == 65 + len(CANDLESTICK_SIGNAL_IDS)  # 2026-10-15 +crv_dnvol20_15m_v1/crv_bodybrk20_5m_v1
     by = {c["channel"]: c for c in s["channels"]}
     c = by["quote_contrarian_v1"]
     assert c["enabled"] is True and c["enabled_at_startup"] is True
@@ -6827,3 +6829,64 @@ def test_gap_crowd_shadow_versions_registered() -> None:
         assert spec.live_channel == version and spec.live_retired is True
         assert version in RETIRED_VERSIONS and version in RETIRED_CHANNELS
         assert version in milt_main.SHADOW_BENCH      # 面板仍可查（desc 已标注证伪）
+
+
+@pytest.mark.asyncio
+async def test_dnvol20_hook_fires_up_on_15m_market_with_guard(monkeypatch) -> None:
+    """放量下破（5m 求值）→ 押下一根 15m 收阳 UP：market_period=15m、护栏 0.57。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["crv_dnvol20_15m_v1"])
+    t.on_kline_reversal_signal({
+        "version": "crv_dnvol20_15m_v1", "market_start": MARKET_START_15M,
+        "market_end": MARKET_START_15M + 900_000, "direction": "UP",
+        "signal_bar_start": MARKET_START_15M - 300_000,
+    })
+    await _drain(t)
+    assert len(fake.calls) == 1
+    call = fake.calls[0]
+    assert call["prediction"] == "UP" and call["market_period"] == "15m"
+    assert call["window_start"] == MARKET_START_15M and call["max_exec_price"] == 0.57
+
+
+@pytest.mark.asyncio
+async def test_dnvol20_disabled_by_default_no_fire(monkeypatch) -> None:
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=[])
+    t.on_kline_reversal_signal({
+        "version": "crv_dnvol20_15m_v1", "market_start": MARKET_START_15M,
+        "market_end": MARKET_START_15M + 900_000, "direction": "UP",
+        "signal_bar_start": MARKET_START_15M - 300_000,
+    })
+    await _drain(t)
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_dnvol20_exclusive_with_dnbrk24_15m(monkeypatch) -> None:
+    """同向同目标窗：放量下破成交占坑 → 下破吞没 15m 同窗拒单（防双倍押 UP）。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["crv_dnvol20_15m_v1", "crv_dnbrk24_15m_v1"])
+    base = {"market_start": MARKET_START_15M, "market_end": MARKET_START_15M + 900_000,
+            "direction": "UP", "signal_bar_start": MARKET_START_15M - 900_000}
+    t.on_kline_reversal_signal({**base, "version": "crv_dnvol20_15m_v1"})
+    await _drain(t)
+    assert [c["signal_version"] for c in fake.calls] == ["crv_dnvol20_15m_v1"]
+    t.on_kline_reversal_signal({**base, "version": "crv_dnbrk24_15m_v1"})
+    await _drain(t)
+    assert [c["signal_version"] for c in fake.calls] == ["crv_dnvol20_15m_v1"]
+
+
+@pytest.mark.asyncio
+async def test_bodybrk20_hook_fires_down_and_exclusive_with_brk20_5m(monkeypatch) -> None:
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["crv_bodybrk20_5m_v1", "crv_brk20_5m_v1"])
+    base = {"market_start": WINDOW_START, "market_end": WINDOW_END, "direction": "DOWN",
+            "signal_bar_start": WINDOW_START - 300_000}
+    t.on_kline_reversal_signal({**base, "version": "crv_bodybrk20_5m_v1"})
+    await _drain(t)
+    assert [c["signal_version"] for c in fake.calls] == ["crv_bodybrk20_5m_v1"]
+    assert fake.calls[0]["prediction"] == "DOWN" and fake.calls[0]["market_period"] == "5m"
+    assert fake.calls[0]["max_exec_price"] == 0.53
+    t.on_kline_reversal_signal({**base, "version": "crv_brk20_5m_v1"})
+    await _drain(t)
+    assert [c["signal_version"] for c in fake.calls] == ["crv_bodybrk20_5m_v1"]
