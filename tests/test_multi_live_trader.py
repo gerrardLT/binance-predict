@@ -2206,6 +2206,48 @@ async def test_absorption_quote_floor_entry_band_whitelist_applied(monkeypatch) 
     assert place_calls == ["Q2"]
 
 
+@pytest.mark.asyncio
+async def test_absorption_td150_whitelist_excludes_078_081_band(monkeypatch) -> None:
+    """absorption TD150 2026-10-15 优化：白名单挖除 [0.78,0.81) 假摔失血带。
+
+    80 天全量回放（2026-07-26→10-15，DOWN 侧该带 n=47 胜率 68.1% / 费后
+    EV −0.156，为唯一确定性失血带）→ entry_band_whitelist 收紧为
+    ((0.55, 0.78), (0.81, 0.99))。边界矩阵验证左闭右开：
+    0.77（第一带上界内侧）与 0.81（第二带下界）放行；
+    0.78/0.79/0.80（失血带）弃单且币安零请求。"""
+    trader = _make_real_trader(monkeypatch)
+    from binance_predict.services.live_channels import LIVE_CHANNELS
+    bands = LIVE_CHANNELS["absorption_follow_td150_v1"].entry_band_whitelist
+    assert bands == ((0.55, 0.78), (0.81, 0.99))
+
+    # 1. 失血带内（0.78/0.79/0.80）：白名单拦下，币安零请求
+    for q in (0.78, 0.79, 0.80):
+        updates, place_calls = _stub_whitelist_trade(
+            monkeypatch, trader,
+            quotes=[{"averagePrice": q, "amountIn": "5", "amountOut": "6.4",
+                     "quoteId": f"Q-{q}"}],
+            confirms=[])
+        order = await trader.execute_signal_trade(
+            "DOWN", 5.0, "absorption_follow_td150_v1", WINDOW_START,
+            max_exec_price=0.82, market_period="5m", entry_band_whitelist=bands)
+        assert order["status"] == "FAILED"
+        assert "入场价白名单弃单" in updates[0][1]["error_message"]
+        assert place_calls == []
+
+    # 2. 边界放行：0.77（第一带上界内侧）/ 0.81（第二带下界，左闭）
+    for q, amount_out in ((0.77, "6.49"), (0.81, "6.17")):
+        updates, place_calls = _stub_whitelist_trade(
+            monkeypatch, trader,
+            quotes=[{"averagePrice": q, "amountIn": "5", "amountOut": amount_out,
+                     "quoteId": f"Q-{q}"}],
+            confirms=[{"orderId": "ORD-1", "status": "FILLED", "price": f"{q}"}])
+        order = await trader.execute_signal_trade(
+            "DOWN", 5.0, "absorption_follow_td150_v1", WINDOW_START,
+            max_exec_price=0.82, market_period="5m", entry_band_whitelist=bands)
+        assert order["status"] == "FILLED"
+        assert place_calls == [f"Q-{q}"]
+
+
 # ============================================================
 # 组 8：firsthit G0/G1/G3 实时重放（down_curve 历史唯一触发源）
 # ============================================================

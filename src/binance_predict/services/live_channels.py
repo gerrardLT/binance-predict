@@ -247,6 +247,12 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     # 复用 AbsorptionShadowDetector 滚动缓冲。2026-10-06 优化：实盘仅放行 DOWN 顺势
     # （阻断 UP 假冲刺出血点）；宽限期收窄至 20s（禁绝 180~240s 残值期下注）；
     # 配置 entry_band_whitelist=((0.55, 0.99),) 阻断 <0.55 假突破毒单。两版同窗互斥。
+    # 2026-10-15 优化（TD150 挖除 [0.78,0.81) 假摔失血带）：80 天全量回放
+    # （2026-07-26→10-15，生产 15s 报价链 + 币安 5m 结算，DOWN 侧 984 笔）——
+    # [0.78,0.81) 是该侧唯一确定性失血带：n=47 胜率 68.1% / 费后 EV −0.156
+    # （q≈0.79 保本线 80.6% 不可达）；挖除后放行段 [0.55,0.82) 全量 EV
+    # +0.0078→+0.0285、近月 −0.0340→−0.0237。[0.81,0.82) 保留（16/16 全胜，
+    # 与 [0.82,0.90) 高确信段同族）；TD120 未动（实盘默认 OFF，无同等证据）。
     "absorption_follow_td120_v1": ChannelSpec(
         "absorption_follow_td120_v1", "absorption", "5m", "DOWN", 0.78,
         "吸收跟随TD120欠反应→顺势",
@@ -255,7 +261,7 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     "absorption_follow_td150_v1": ChannelSpec(
         "absorption_follow_td150_v1", "absorption", "5m", "DOWN", 0.86,
         "吸收跟随TD150欠反应→顺势",
-        entry_band_whitelist=((0.55, 0.99),),
+        entry_band_whitelist=((0.55, 0.78), (0.81, 0.99)),
     ),
     # --- firsthit 族（2026-09-07 影子 promote）：5m 采样循环按本窗完整历史重放
     # DOWN 首次进入 (0.005,0.1] 的触发点，命中后买 DOWN。所有版本共用
