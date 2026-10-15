@@ -41,6 +41,9 @@ EXPECTED_ANALYTICS_VERSIONS = (
     "crv_dnbrk24_15m_v1", "crv_dnbrk24_5m_v1",
     # 2026-10-15 反转研究回顾性验证（放量下破 5m→15m / 大实体突破 5m，同名实盘默认 OFF）
     "crv_dnvol20_15m_v1", "crv_bodybrk20_5m_v1",
+    # 2026-10-16 KDC 方向确定性四版本（同名实盘默认 OFF）
+    "kdc_s1_96hi_15m_v1", "kdc_s2_ext_15m_v1",
+    "kdc_s3_3up_15m_v1", "kdc_s4_3dn_15m_v1",
     # 2026-10-05 BRK 假突破回归族（两个确认级，同名实盘默认 OFF）
     "brkrv_brk8h_15m_v1", "brkrv_brk8h_5m_v1",
     "candle_hm_bull_5m_event_v1", "candle_hm_bull_15m_event_v1",
@@ -64,7 +67,7 @@ EXPECTED_ANALYTICS_VERSIONS = (
 
 def test_registry_matches_all_physical_shadow_versions_in_order() -> None:
     assert SHADOW_VERSIONS == EXPECTED_ANALYTICS_VERSIONS
-    assert len(SHADOW_VERSION_SPECS) == 100
+    assert len(SHADOW_VERSION_SPECS) == 104  # 2026-10-16 +KDC 四版本
     for version in ("candle_hm_bull_5m_event_v1", "candle_hm_bull_15m_event_v1"):
         spec = SHADOW_VERSION_SPECS[version]
         assert spec.family == "candlestick_reversal"

@@ -126,7 +126,7 @@ def _with_retired(monkeypatch):
     ——「多通道同窗独立开火」/「v2 门禁双模式」/「v3 环境门禁」/「regime」/
     「streak」/「同窗互斥」这些机制无法只用在线通道构造。机制代码仍在生产
     （由 ChannelSpec 标志位驱动），故用退役 spec 当 fixture 继续覆盖；
-    生产注册表现 13 通道。
+    生产注册表见 LIVE_CHANNELS。
     """
     merged = {**RETIRED_CHANNEL_SPECS, **LIVE_CHANNELS}
     monkeypatch.setattr(lc, "LIVE_CHANNELS", merged)
@@ -230,7 +230,7 @@ def test_parse_defaults_all_off(monkeypatch) -> None:
     monkeypatch.setattr(settings, "live_default_max_daily_orders", 100)
     monkeypatch.setattr(settings, "live_channels_json", "")
     cfgs = parse_channel_config()
-    assert len(cfgs) == 45 + len(CANDLESTICK_SIGNAL_IDS)  # 2026-10-15 +crv_dnvol20_15m_v1/crv_bodybrk20_5m_v1
+    assert len(cfgs) == 49 + len(CANDLESTICK_SIGNAL_IDS)  # 2026-10-16 +KDC 四通道
     assert set(CANDLESTICK_SIGNAL_IDS) <= set(cfgs)
     assert all(not c.enabled for c in cfgs.values())
     assert all(c.amount_usdt == 2.0 for c in cfgs.values())
@@ -413,6 +413,9 @@ def test_channels_registry_shape() -> None:
         "crv_dnbrk24_15m_v1", "crv_dnbrk24_5m_v1",
         # 2026-10-15 反转研究回顾性验证两通道（默认全 OFF）
         "crv_dnvol20_15m_v1", "crv_bodybrk20_5m_v1",
+        # 2026-10-16 KDC 方向确定性四通道（默认全 OFF；带点差护栏/高波减仓）
+        "kdc_s1_96hi_15m_v1", "kdc_s2_ext_15m_v1",
+        "kdc_s3_3up_15m_v1", "kdc_s4_3dn_15m_v1",
     }
     assert set(LIVE_CHANNELS) == expected_existing | set(CANDLESTICK_SIGNAL_IDS)
     assert set(RETIRED_CHANNELS) == {
@@ -1832,6 +1835,111 @@ async def test_brkrv_15m_exclusive_with_crv_brk20_15m(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("version", "direction", "guard"),
+    [
+        ("kdc_s1_96hi_15m_v1", "DOWN", 0.64),
+        ("kdc_s2_ext_15m_v1", "DOWN", 0.61),
+        ("kdc_s3_3up_15m_v1", "DOWN", 0.61),
+        ("kdc_s4_3dn_15m_v1", "UP", 0.59),
+    ],
+)
+async def test_kdc_hook_fires_with_frozen_direction_and_guard(
+        monkeypatch, version: str, direction: str, guard: float) -> None:
+    """KDC 四通道：新鲜命中 → 冻结方向派单、护栏=盲测胜率×0.98、基准金额。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=[version])
+    sig = {
+        "version": version, "market_start": MARKET_START_15M,
+        "market_end": MARKET_START_15M + 900_000, "direction": direction,
+        "signal_bar_start": MARKET_START_15M - 900_000,
+    }
+    t.on_kline_reversal_signal(sig)
+    await _drain(t)
+    assert len(fake.calls) == 1
+    call = fake.calls[0]
+    assert call["signal_version"] == version
+    assert call["prediction"] == direction
+    assert call["market_period"] == "15m"
+    assert call["max_exec_price"] == guard
+    assert call["amount_usdt"] == pytest.approx(2.0)  # 无 vol_tier → 基准金额
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cross_cost", "fires"),
+    [(0.05, False), (0.041, False), (0.04, True), (0.02, True), (None, True)],
+)
+async def test_kdc_spread_guard_boundary(monkeypatch, cross_cost, fires: bool) -> None:
+    """点差护栏：cross_cost 严格大于 0.04 弃单（0.04 贴线放行）；缺失不拦。"""
+    version = "kdc_s1_96hi_15m_v1"
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=[version])
+    recorded: list[dict] = []
+
+    async def _rec(self, channel, ws, *, reason, rejected, input_snapshot=None):
+        recorded.append({"reason": reason, "rejected": rejected,
+                         "input_snapshot": input_snapshot})
+
+    monkeypatch.setattr(MultiLiveTrader, "_record_strategy_outcome", _rec)
+    t.on_kline_reversal_signal({
+        "version": version, "market_start": MARKET_START_15M,
+        "market_end": MARKET_START_15M + 900_000, "direction": "DOWN",
+        "signal_bar_start": MARKET_START_15M - 900_000,
+        "cross_cost": cross_cost,
+    })
+    await _drain(t)
+    if fires:
+        assert len(fake.calls) == 1 and recorded == []
+    else:
+        assert fake.calls == []
+        assert len(recorded) == 1
+        assert recorded[0]["reason"] == "spread_guard_skip"
+        assert recorded[0]["rejected"] is True
+        assert recorded[0]["input_snapshot"]["cross_cost"] == pytest.approx(cross_cost)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("vol_tier", "amount"),
+    [("high", 1.0), ("mid", 2.0), ("low", 2.0), ("unknown", 2.0), (None, 2.0)],
+)
+async def test_kdc_highvol_amount_factor(monkeypatch, vol_tier, amount: float) -> None:
+    """高波减仓：vol_tier=high → 金额×0.5；mid/low/unknown/缺失 → 基准。"""
+    version = "kdc_s2_ext_15m_v1"
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=[version])
+    t.on_kline_reversal_signal({
+        "version": version, "market_start": MARKET_START_15M,
+        "market_end": MARKET_START_15M + 900_000, "direction": "DOWN",
+        "signal_bar_start": MARKET_START_15M - 900_000,
+        "vol_tier": vol_tier,
+    })
+    await _drain(t)
+    assert len(fake.calls) == 1
+    assert fake.calls[0]["amount_usdt"] == pytest.approx(amount)
+
+
+@pytest.mark.asyncio
+async def test_kdc_s3_exclusive_with_crv_brk20_15m(monkeypatch) -> None:
+    """同窗互斥（15m）：crv_brk20 成交占坑 → kdc_s3 同窗拒单（同为破高押 DOWN
+    物理事件，防同一根突破阳线双倍敞口）。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake,
+                     channels=["crv_brk20_15m_v1", "kdc_s3_3up_15m_v1"])
+    base = {
+        "market_start": MARKET_START_15M, "market_end": MARKET_START_15M + 900_000,
+        "direction": "DOWN", "signal_bar_start": MARKET_START_15M - 900_000,
+    }
+    t.on_kline_reversal_signal({**base, "version": "crv_brk20_15m_v1"})
+    await _drain(t)
+    assert [c["signal_version"] for c in fake.calls] == ["crv_brk20_15m_v1"]
+    t.on_kline_reversal_signal({**base, "version": "kdc_s3_3up_15m_v1"})
+    await _drain(t)
+    assert [c["signal_version"] for c in fake.calls] == ["crv_brk20_15m_v1"]
+
+
+@pytest.mark.asyncio
 async def test_brkrv_disabled_no_fire(monkeypatch) -> None:
     """BRK：通道关 → 零下单（影子采集照常，互不干扰）。"""
     fake = _FakeTrader()
@@ -3112,7 +3220,7 @@ def test_status_shape(monkeypatch) -> None:
     from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
     # 状态列表 = LIVE_CHANNELS + 退役 spec（_with_retired 合并）→ gap_crowd 两版退役后
     # 仍在合并表内；2026-10-12 加 crv_dnbrk24_15m/5m_v1 两通道后基数 59→61。
-    assert len(s["channels"]) == 65 + len(CANDLESTICK_SIGNAL_IDS)  # 2026-10-15 +crv_dnvol20_15m_v1/crv_bodybrk20_5m_v1
+    assert len(s["channels"]) == 69 + len(CANDLESTICK_SIGNAL_IDS)  # 2026-10-16 +KDC 四通道
     by = {c["channel"]: c for c in s["channels"]}
     c = by["quote_contrarian_v1"]
     assert c["enabled"] is True and c["enabled_at_startup"] is True

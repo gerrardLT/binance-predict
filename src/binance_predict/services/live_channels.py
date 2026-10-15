@@ -79,6 +79,20 @@ class ChannelSpec:
     # 含边界）；决策时信息（窗口开始前 1m 收盘，无前视），数据缺失保守弃单。
     # None = 不启用；研究冻结口径，不进 parse_channel_config 可覆盖项。
     min_rv_pct: float | None = None
+    # 点差护栏（KDC 族 2026-10-16，优化项1）：信号落表时刻两侧展示价之和−1
+    # （up_price+down_price−1，与影子 feature_snapshot.quote_cross_cost 同一缓存快照）
+    # 严格大于该值 → 实盘弃单。None = 不启用。依据：研究 656 窗 PREDEXON +3.5s 盘口，
+    # 点差 >0.04 的 126 事件 EV −0.018（≤0.02 的 772 事件 +0.077）；2026-09 整月
+    # 点差 0.048 恰被拦截。cross_cost 缺失（缓存无快照）→ 不拦（护栏非安全闸，
+    # 价格保护仍由 max_exec_price 承担）。⚠ 阈值按 PREDEXON best_ask−best_bid 校准、
+    # 以币安展示价 cross_cost 代理执行——代理分布由影子 q10/t1 前向数据校验后再
+    # 考虑启用实盘。
+    spread_guard: float | None = None
+    # 高波减仓（KDC 族，优化项2）：信号携带 vol_tier=="high"（ATR20 近500根分位≥0.66）
+    # 时实盘金额乘以该因子（0.5=半仓）。依据：研究 656 窗 EV 低/中/高波 +0.028/
+    # +0.103/+0.042（高波砍半）。tier unknown（数据不足）→ 不减仓（保守=维持基准
+    # 行为）。None = 不启用。影子行记录 vol_tier/atr_pct，前向可按层复核。
+    highvol_amount_factor: float | None = None
 
 
 def _qe_guard(version: str) -> float:
@@ -419,6 +433,39 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
         "crv_dnvol20_15m_v1", "kline_reversal", "15m", "UP", 0.57,
         "CRV 5m放量下破20低→15m反弹（押UP）",
     ),
+    # --- KDC 方向确定性族（2026-10-16 研究 run 20261015T153500Z-kline-directional-
+    # certainty：720d 预注册三段隔离+盲测一次+PREDEXON 报价层 EV 验证+衰退归因。
+    # 四通道实盘默认 OFF，影子常开；带执行层优化 1-4：
+    #   1) spread_guard 点差护栏（信号时刻两侧价和−1 > 0.04 弃单，与影子同源快照）；
+    #   2) highvol_amount_factor=0.5 高波减仓（ATR20 近500根分位≥0.66 时半仓）；
+    #   3) 入场价带只记录不拦截（影子 feature_snapshot.entry_band：<0.52/[0.52,0.55)/
+    #      [0.55,0.58)/≥0.58，研究带 EV +0.143/+0.060/+0.041/−0.033）；
+    #   4) 影子双时点报价（entry_up/down_price≈开盘后首轮询 0~60s + q10_*≈+10s±15s；
+    #      研究回测为 +3.5s 对齐口径，t1 与之不同——显式声明，影子前向统一以 t1/q10
+    #      为准）。护栏=盲测胜率×0.98；报价段(07-01→10-15,10U五档VWAP) EV 见注释。
+    # ⚠ 衰退警示（归因报告 20261015T162800Z）：四信号聚合 EV 全部来自 2026-07/08，
+    #   09 月市场重定价归零、10 月真实胜率塌陷转负——启用实盘前必须先看影子前向
+    #   分月 EV 与错价（W−mid），复活判据=滚动60d K线Δ≤−8pp 且错价回正。---
+    "kdc_s1_96hi_15m_v1": ChannelSpec(
+        "kdc_s1_96hi_15m_v1", "kline_reversal", "15m", "DOWN", 0.64,
+        "KDC破96高收顶反转（押DOWN）",
+        spread_guard=0.04, highvol_amount_factor=0.5,
+    ),
+    "kdc_s2_ext_15m_v1": ChannelSpec(
+        "kdc_s2_ext_15m_v1", "kline_reversal", "15m", "DOWN", 0.61,
+        "KDC超24高冲顶反转（押DOWN）",
+        spread_guard=0.04, highvol_amount_factor=0.5,
+    ),
+    "kdc_s3_3up_15m_v1": ChannelSpec(
+        "kdc_s3_3up_15m_v1", "kline_reversal", "15m", "DOWN", 0.61,
+        "KDC收顶3连阳破20高（押DOWN）",
+        spread_guard=0.04, highvol_amount_factor=0.5,
+    ),
+    "kdc_s4_3dn_15m_v1": ChannelSpec(
+        "kdc_s4_3dn_15m_v1", "kline_reversal", "15m", "UP", 0.59,
+        "KDC破20低3连阴大阴（押UP）",
+        spread_guard=0.04, highvol_amount_factor=0.5,
+    ),
     # crv_bodybrk20_5m_v1：5m 阳线∧实体/振幅≥0.75∧突破前20高 → 押次根 5m 收阴 DOWN。
     # n=8649 胜率 55.2%（训练 54.5%/验证 54.8%/末段 56.5%）；护栏 0.53 = 费后保本价
     # (55.2%−0.01)/1.02。事件集 ⊂ crv_brk20_5m_v1（同向同目标窗）→ 并入其 5m 互斥组。
@@ -605,13 +652,17 @@ SAME_WINDOW_EXCLUSIVE: tuple[frozenset[str], ...] = (
     # hi_brk20 ⊇ brk20 的事件子集、brk50_hi 高度重叠）→ 同窗至多一单成交。
     # BRK 8h 突破回归事件集是 crv_brk20 的子集（前窗更长 ⇒ 更难突破），同押 DOWN
     # 同目标窗 → 并入同组防同一根突破阳线双倍押 DOWN（仅两通道都开启才生效）。
+    # KDC 三条 DOWN 版本（2026-10-16）同为「破 N 根高→押 DOWN」物理事件（96/24+冲量/
+    # 20+3连阳 均落在突破阳线上，事件集与 brk20 族高度重叠）→ 并入同组。
     frozenset({"crv_hi_brk20_15m_v1", "crv_brk20_15m_v1", "crv_brk50_hi_15m_v1",
-               "brkrv_brk8h_15m_v1"}),
+               "brkrv_brk8h_15m_v1", "kdc_s1_96hi_15m_v1", "kdc_s2_ext_15m_v1",
+               "kdc_s3_3up_15m_v1"}),
     # 同理 5m 侧：brk8h 事件集 ⊂ brk20 事件集（都开启时同窗至多一单 DOWN）。
     # crv_bodybrk20_5m 事件集 ⊂ crv_brk20_5m（大实体阳线是阳线突破的子集）→ 同组。
     frozenset({"crv_brk20_5m_v1", "brkrv_brk8h_5m_v1", "crv_bodybrk20_5m_v1"}),
     # 15m 押 UP：放量下破(5m 求值)与下破吞没同向同目标窗、同窗重叠约 12.8% → 同窗至多一单。
-    frozenset({"crv_dnbrk24_15m_v1", "crv_dnvol20_15m_v1"}),
+    # KDC 破20低3连阴大阴（kdc_s4_3dn）同为「跌破 20 低→押 UP」物理事件 → 并入同组。
+    frozenset({"crv_dnbrk24_15m_v1", "crv_dnvol20_15m_v1", "kdc_s4_3dn_15m_v1"}),
     # 同周期蜡烛逻辑版本共享物理事件，避免主版/对照/组件/潜力标签重复暴露。
     _CANDLE_5M_CHANNELS,
     _CANDLE_15M_CHANNELS,

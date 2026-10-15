@@ -22,6 +22,7 @@ from binance_predict.services.crv_shadow_detector import (
     compute_crv_features,
     evaluate_crv,
     spec_mask,
+    atr_pct_tail,
     _to_klines,
 )
 
@@ -171,6 +172,17 @@ def _research_reference(rows: list[dict], tf_ms: int) -> dict:
     span = h - l
     feat["body_ratio"] = np.where(span > 0, np.abs(c - o) / np.where(span > 0, span, 1.0), np.nan)
     feat["b15_end"] = (t % 900_000) == 600_000
+    # 2026-10-16 KDC 新特征（独立转写：prior24/96高、ATR20、6根动量、收盘位置）
+    feat["prior_hi24"] = shift1(roll(max, h, 24))
+    feat["prior_hi96"] = shift1(roll(max, h, 96))
+    tr_full = np.full(len(c), np.nan)
+    for i in range(1, len(c)):
+        tr_full[i] = max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1]))
+    feat["atr20"] = roll(lambda w: float(np.mean(w)), tr_full, 20)
+    dc = np.full(len(c), np.nan)
+    dc[1:] = c[1:] - c[:-1]
+    feat["mom6"] = roll(lambda w: float(np.sum(w)), dc, 6)
+    feat["close_pos"] = np.where(span > 0, (c - l) / np.where(span > 0, span, 1.0), np.nan)
     return feat
 
 
@@ -383,6 +395,14 @@ class _FakeSession:
     def add(self, obj) -> None:
         self.added.append(obj)
 
+    async def flush(self) -> None:  # KDC 路径取 id 用；假会话无自增
+        for i, obj in enumerate(self.added, start=1):
+            if getattr(obj, "id", None) is None:
+                try:
+                    obj.id = i
+                except AttributeError:
+                    pass
+
     async def commit(self) -> None:
         self.committed = True
 
@@ -542,11 +562,14 @@ def test_crv_live_channels_registered_default_off() -> None:
     # 阳线事件子集、同押 DOWN 同目标窗 → 同窗至多一单成交）
     grp = exclusive_group("crv_hi_brk20_15m_v1")
     assert grp == {"crv_hi_brk20_15m_v1", "crv_brk20_15m_v1", "crv_brk50_hi_15m_v1",
-                   "brkrv_brk8h_15m_v1"}
+                   "brkrv_brk8h_15m_v1", "kdc_s1_96hi_15m_v1", "kdc_s2_ext_15m_v1",
+                   "kdc_s3_3up_15m_v1"}
     assert exclusive_group("crv_brk20_5m_v1") == {"crv_brk20_5m_v1", "brkrv_brk8h_5m_v1",
                                                   "crv_bodybrk20_5m_v1"}
-    # 下破吞没族事件集与突破族完全不相交（阴线破低 vs 阳线破高），不并入其互斥组
-    assert exclusive_group("crv_dnbrk24_15m_v1") == {"crv_dnbrk24_15m_v1", "crv_dnvol20_15m_v1"}
+    # 下破吞没族事件集与突破族完全不相交（阴线破低 vs 阳线破高），不并入其互斥组；
+    # 2026-10-16 起 KDC 破20低3连阴（押 UP 同向同窗）并入本组
+    assert exclusive_group("crv_dnbrk24_15m_v1") == {"crv_dnbrk24_15m_v1", "crv_dnvol20_15m_v1",
+                                                     "kdc_s4_3dn_15m_v1"}
     assert exclusive_group("crv_dnbrk24_5m_v1") is None
 
 
@@ -757,7 +780,295 @@ def test_new_channels_default_off_exclusive_and_bench() -> None:
         assert cfg[v].enabled is False            # 默认不开实盘
         assert v in SHADOW_BENCH and SHADOW_BENCH[v][1] is None
     assert LIVE_CHANNELS["crv_dnvol20_15m_v1"].market_period == "15m"
-    assert exclusive_group("crv_dnvol20_15m_v1") == {"crv_dnbrk24_15m_v1", "crv_dnvol20_15m_v1"}
+    assert exclusive_group("crv_dnvol20_15m_v1") == {
+        "crv_dnbrk24_15m_v1", "crv_dnvol20_15m_v1", "kdc_s4_3dn_15m_v1"}
     assert "crv_bodybrk20_5m_v1" in exclusive_group("crv_brk20_5m_v1")
     assert SHADOW_BENCH["crv_dnvol20_15m_v1"][0] == 0.5906
     assert SHADOW_BENCH["crv_bodybrk20_5m_v1"][0] == 0.5517
+
+
+# ============================================================
+# KDC 方向确定性四版本（2026-10-16，研究 run 20261015T153500Z 冻结口径）
+# ============================================================
+
+def test_atr_pct_tail_rank_and_insufficient() -> None:
+    """ATR20 近500根分位：最大→1.0、最小→1/500、不足/NaN→None。"""
+    arr = np.concatenate([np.full(499, 1.0), [2.0]])
+    assert atr_pct_tail(arr, 499) == 1.0
+    arr2 = np.concatenate([np.full(499, 1.0), [0.5]])
+    assert atr_pct_tail(arr2, 499) == pytest.approx(1.0 / 500)
+    assert atr_pct_tail(np.full(300, 1.0), 299) is None
+    assert atr_pct_tail(np.full(500, np.nan), 499) is None
+
+
+def test_kdc_s1_96hi_positive_and_negatives() -> None:
+    """破96高收顶：正例 + 长上影/未突破 反例；close_pos 0.8 含贴线。"""
+    spec = "kdc_s1_96hi_15m_v1"
+    pos = _band_rows(97, 900_000, last=(100.0, 102.0, 99.9, 101.9))
+    feat = compute_crv_features(_to_klines(pos, 900_000))
+    assert feat["close_pos"][-1] > 0.8 and feat["close"][-1] > feat["prior_hi96"][-1]
+    assert len(pos) - 1 in _tail_hits(feat, spec, n_tail=1)
+    # 反例1：破96高但收在区间下沿（长上影 close_pos<0.8）→ 不命中
+    wick = compute_crv_features(
+        _to_klines(_band_rows(97, 900_000, (100.0, 104.0, 99.9, 101.0)), 900_000))
+    assert wick["close"][-1] > wick["prior_hi96"][-1] and wick["close_pos"][-1] < 0.8
+    assert _tail_hits(wick, spec, n_tail=1) == []
+    # 反例2：收顶但未破 96 高 → 不命中
+    nb = compute_crv_features(
+        _to_klines(_band_rows(97, 900_000, (99.7, 100.4, 99.68, 100.3)), 900_000))
+    assert nb["close_pos"][-1] > 0.8 and nb["close"][-1] < nb["prior_hi96"][-1]
+    assert _tail_hits(nb, spec, n_tail=1) == []
+    # 贴线：close_pos 恰 0.8 → 命中（>=）；略小 → 不命中
+    # 贴线：close_pos 恰 0.8（l=100,c=104,h=105 → 4/5 二进制精确）→ 命中（>=）
+    edge = compute_crv_features(
+        _to_klines(_band_rows(97, 900_000, (100.0, 105.0, 100.0, 104.0)), 900_000))
+    assert edge["close_pos"][-1] == pytest.approx(0.8)
+    assert len(pos) - 1 in _tail_hits(edge, spec, n_tail=1)
+    under = compute_crv_features(
+        _to_klines(_band_rows(97, 900_000, (100.0, 105.0, 100.0, 103.99)), 900_000))
+    assert _tail_hits(under, spec, n_tail=1) == []
+
+
+def test_kdc_s2_ext_positive_and_negatives() -> None:
+    """超24高≥1ATR∧6根冲顶：正例（6根连涨冲出）+ 冲出不足反例；阈值含贴线。"""
+    spec = "kdc_s2_ext_15m_v1"
+    rows = _band_rows(130, 900_000)
+    price = rows[-1]["close"]
+    for k in range(5):  # 前 5 根小步连涨（+0.10），末根大跳 +1.5 冲出 24 高
+        o = price
+        price += 0.10
+        rows.append(_mk(900_000, 130 + k, o, price + 0.02, o - 0.02, price))
+    o = price
+    price += 1.5
+    rows.append(_mk(900_000, 135, o, price + 0.05, o - 0.05, price))
+    feat = compute_crv_features(_to_klines(rows, 900_000))
+    i = len(rows) - 1
+    assert (feat["close"][i] - feat["prior_hi24"][i]) / feat["atr20"][i] >= 1.0
+    assert feat["mom6"][i] / feat["atr20"][i] >= 2.0
+    assert i in _tail_hits(feat, spec, n_tail=1)
+    # 反例：6 根连涨但冲出幅度 <1×ATR → 不命中
+    rows2 = _band_rows(130, 900_000)
+    price = rows2[-1]["close"]
+    for k in range(6):
+        o = price
+        price += 0.06
+        rows2.append(_mk(900_000, 130 + k, o, price + 0.02, o - 0.02, price))
+    f2 = compute_crv_features(_to_klines(rows2, 900_000))
+    j = len(rows2) - 1
+    assert (f2["close"][j] - f2["prior_hi24"][j]) / f2["atr20"][j] < 1.0
+    assert _tail_hits(f2, spec, n_tail=1) == []
+
+
+def test_kdc_s3_3up_positive_and_negatives() -> None:
+    """收顶3连阳破20高：正例 + 长上影反例 + 第3根阴线反例。"""
+    spec = "kdc_s3_3up_15m_v1"
+
+    def _rows3(third: tuple[float, float, float, float]) -> list[dict]:
+        rows = _band_rows(100, 900_000)
+        rows.append(_mk(900_000, 100, 99.7, 100.35, 99.69, 100.3))   # 阳线1
+        rows.append(_mk(900_000, 101, 100.3, 100.95, 100.29, 100.9))  # 阳线2
+        lo, hi, o, c = third
+        rows.append(_mk(900_000, 102, o, hi, lo, c))
+        return rows
+
+    pos = _rows3((100.85, 103.0, 100.9, 102.9))
+    feat = compute_crv_features(_to_klines(pos, 900_000))
+    assert feat["streak"][-1] == 3 and feat["close_pos"][-1] > 0.8
+    assert len(pos) - 1 in _tail_hits(feat, spec, n_tail=1)
+    wick = compute_crv_features(_to_klines(_rows3((100.85, 104.5, 100.9, 101.6)), 900_000))
+    assert wick["streak"][-1] == 3 and wick["close_pos"][-1] < 0.8
+    assert _tail_hits(wick, spec, n_tail=1) == []
+    rows = _band_rows(100, 900_000)
+    rows.append(_mk(900_000, 100, 99.7, 100.35, 99.69, 100.3))
+    rows.append(_mk(900_000, 101, 100.3, 100.95, 100.29, 100.9))
+    # 第3根阴线（o=103.5>c=102.9）但收顶(close_pos=0.806)且破20高 → 仅连阳断裂
+    rows.append(_mk(900_000, 102, 103.5, 103.6, 100.0, 102.9))
+    two = compute_crv_features(_to_klines(rows, 900_000))
+    assert two["close_pos"][-1] > 0.8 and two["close"][-1] > two["prior_hi20"][-1]
+    assert _tail_hits(two, spec, n_tail=1) == []
+
+
+def test_kdc_s4_3dn_positive_and_negatives() -> None:
+    """破20低3连阴大阴：正例 + 小实体反例 + 第3根阳线反例；0.75 含贴线。"""
+    spec = "kdc_s4_3dn_15m_v1"
+
+    def _rows4(third: tuple[float, float, float, float]) -> list[dict]:
+        rows = _band_rows(100, 900_000)
+        rows.append(_mk(900_000, 100, 100.3, 100.35, 99.69, 99.75))  # 阴线1
+        rows.append(_mk(900_000, 101, 99.75, 99.8, 99.1, 99.2))      # 阴线2
+        lo, hi, o, c = third
+        rows.append(_mk(900_000, 102, o, hi, lo, c))
+        return rows
+
+    pos = _rows4((97.0, 99.25, 99.2, 97.1))
+    feat = compute_crv_features(_to_klines(pos, 900_000))
+    assert feat["body_ratio"][-1] > 0.75 and feat["close"][-1] < feat["prior_lo20"][-1]
+    assert len(pos) - 1 in _tail_hits(feat, spec, n_tail=1)
+    small = compute_crv_features(_to_klines(_rows4((97.0, 99.25, 99.2, 98.6)), 900_000))
+    assert small["close"][-1] < small["prior_lo20"][-1]
+    assert small["body_ratio"][-1] < 0.75
+    assert _tail_hits(small, spec, n_tail=1) == []
+    rows = _band_rows(100, 900_000)
+    rows.append(_mk(900_000, 100, 100.3, 100.35, 99.69, 99.75))
+    rows.append(_mk(900_000, 101, 99.75, 99.8, 99.1, 99.2))
+    # 第3根阳线（o=97.0<c=98.0）破低且大实体 → 仅连阴断裂
+    rows.append(_mk(900_000, 102, 97.0, 98.1, 96.9, 98.0))
+    two = compute_crv_features(_to_klines(rows, 900_000))
+    assert two["close"][-1] < two["prior_lo20"][-1] and two["body_ratio"][-1] > 0.75
+    assert _tail_hits(two, spec, n_tail=1) == []
+
+
+def test_kdc_features_parity_random_walk() -> None:
+    """KDC 新特征与独立 numpy 参照逐位一致；四版本掩码在随机序列上与参照全等。"""
+    rng = np.random.default_rng(20261015)
+    rows, price = [], 100.0
+    for i in range(700):
+        o = price
+        c = price + rng.normal(0, 0.5)
+        rows.append({**_mk(900_000, i, o, max(o, c) + abs(rng.normal(0, 0.2)),
+                           min(o, c) - abs(rng.normal(0, 0.2)), c),
+                     "volume": float(rng.uniform(0.5, 3.0))})
+        price = c
+    kl = _to_klines(rows, 900_000)
+    feat = compute_crv_features(kl)
+    o, h, l, c = kl.o, kl.h, kl.l, kl.c
+    from numpy.lib.stride_tricks import sliding_window_view as swv
+
+    def _roll(fn, x, w):
+        out = np.full(len(x), np.nan)
+        out[w - 1:] = fn(swv(x, w), axis=1)
+        return out
+
+    def _shift1(x):
+        out = np.full(len(x), np.nan)
+        out[1:] = x[:-1]
+        return out
+
+    pc = _shift1(c)
+    tr = np.full(len(c), np.nan)
+    tr[1:] = np.maximum.reduce([h[1:] - l[1:], np.abs(h[1:] - pc[1:]), np.abs(l[1:] - pc[1:])])
+    ref = {
+        "prior_hi24": _shift1(_roll(np.max, h, 24)),
+        "prior_hi96": _shift1(_roll(np.max, h, 96)),
+        "atr20": _roll(np.mean, tr, 20),
+        "mom6": _roll(np.sum, c - pc, 6),
+        "close_pos": np.where((h - l) > 0, (c - l) / np.where((h - l) > 0, h - l, 1.0), np.nan),
+    }
+    tail = slice(130, 700)
+    for key in ref:
+        a, b = feat[key][tail], ref[key][tail]
+        assert np.array_equal(a[np.isfinite(a)], b[np.isfinite(b)]), key
+    ph20 = _shift1(_roll(np.max, h, 20))
+    pl20 = _shift1(_roll(np.min, l, 20))
+    br = np.where((h - l) > 0, np.abs(c - o) / np.where((h - l) > 0, h - l, 1.0), np.nan)
+
+    def _run3(mask):
+        out = np.ones(len(c), bool)
+        for k in (1, 2):
+            sh = np.roll(mask, k)
+            sh[:k] = False
+            out &= sh
+        return out
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        expected = {
+            "kdc_s1_96hi_15m_v1": (ref["close_pos"] >= 0.8) & (c > ref["prior_hi96"]),
+            "kdc_s2_ext_15m_v1": ((c - ref["prior_hi24"]) / ref["atr20"] >= 1.0)
+                                  & (ref["mom6"] / ref["atr20"] >= 2.0),
+            "kdc_s3_3up_15m_v1": ((ref["close_pos"] >= 0.8) & (c > o) & _run3(c > o)
+                                  & (c > ph20)),
+            "kdc_s4_3dn_15m_v1": ((c < pl20) & (c < o) & _run3(c < o) & (br >= 0.75)),
+        }
+    for version, theirs in expected.items():
+        mine = spec_mask(_spec(version), feat)[tail]
+        assert mine.sum() > 0, f"{version} 随机序列应至少命中一次，否则本对照无意义"
+        assert np.array_equal(mine, theirs[tail]), version
+
+
+@pytest.mark.asyncio
+async def test_kdc_record_snapshot_and_payload_consistency(monkeypatch) -> None:
+    """KDC 落表：cross_cost/vol_tier/entry_band 与 payload 同源；unknown 层不留 atr_pct。"""
+    rows = _band_rows(97, 900_000, last=(100.0, 102.0, 99.9, 101.9))
+    feat = compute_crv_features(_to_klines(rows, 900_000))
+    idx = len(rows) - 1
+    bar = rows[idx]
+    target = int(bar["open_time"]) + 900_000
+    session = _FakeSession(rows=[], scalar=None)
+    monkeypatch.setattr(csd.shadow_gate, "is_enabled", lambda _v: True)
+    monkeypatch.setattr(csd.time, "time", lambda: (target + 3_000) / 1000)
+    pm15 = {"start_date": target, "up_price": 0.56, "down_price": 0.53,
+            "updated_ts": target + 2_000}
+    d = CrvShadowDetector(collector=None, pm_15m_latest=pm15, pm_5m_info={})
+    payloads: list[dict] = []
+    row = await d._record_signal(
+        "15m", session, _spec("kdc_s1_96hi_15m_v1"), bar, feat, idx, payloads)
+    assert row is not None
+    snap = session.added[0].feature_snapshot
+    assert snap["quote_cross_cost"] == pytest.approx(0.56 + 0.53 - 1.0)
+    assert snap["entry_band"] == "[0.52,0.55)"      # DOWN 押注取 down 价 0.53
+    assert snap["vol_tier"] == "unknown"            # idx<499 → 无 atr_pct
+    assert "atr_pct" not in snap
+    assert payloads[0]["cross_cost"] == pytest.approx(0.09)
+    assert payloads[0]["vol_tier"] == "unknown"
+    assert payloads[0]["direction"] == "DOWN"
+    assert "q10_up" not in snap                      # 双时点第二档由 +10s 任务异步补
+
+
+@pytest.mark.asyncio
+async def test_kdc_record_high_vol_tier(monkeypatch) -> None:
+    """末根巨幅 → ATR20 近500根分位 1.0 → vol_tier=high（实盘半仓依据）。"""
+    rows = _band_rows(560, 900_000, last=(100.0, 104.0, 96.0, 101.9))
+    feat = compute_crv_features(_to_klines(rows, 900_000))
+    idx = len(rows) - 1
+    assert csd.atr_pct_tail(feat["atr20"], idx) == 1.0
+    target = int(rows[idx]["open_time"]) + 900_000
+    session = _FakeSession(rows=[], scalar=None)
+    monkeypatch.setattr(csd.shadow_gate, "is_enabled", lambda _v: True)
+    monkeypatch.setattr(csd.time, "time", lambda: (target + 3_000) / 1000)
+    d = CrvShadowDetector(collector=None, pm_15m_latest={}, pm_5m_info={})
+    payloads: list[dict] = []
+    await d._record_signal(
+        "15m", session, _spec("kdc_s2_ext_15m_v1"), rows[idx], feat, idx, payloads)
+    snap = session.added[0].feature_snapshot
+    assert snap["vol_tier"] == "high"
+    assert snap["atr_pct"] == 1.0
+    assert payloads[0]["vol_tier"] == "high"         # 无报价缓存 → cross_cost 缺省 None
+    assert payloads[0]["cross_cost"] is None
+
+
+@pytest.mark.asyncio
+async def test_kdc_q10_snapshot_writes_fields(monkeypatch) -> None:
+    """+10s 二次报价：窗口对齐守卫通过 → feature_snapshot 增补 q10_* 且保留原字段。"""
+    row = SimpleNamespace(id=7, feature_snapshot={"atr_pct": 0.9})
+    session = _FakeSession(rows=[], scalar=row)
+    monkeypatch.setattr(csd, "async_session_factory", lambda: _FakeSessionCtx(session))
+    pm15 = {"start_date": T0, "up_price": 0.55, "down_price": 0.50,
+            "updated_ts": T0 + 9_000}
+    d = CrvShadowDetector(collector=None, pm_15m_latest=pm15, pm_5m_info={})
+    await d._q10_snapshot(7, 0.0, T0, "15m")
+    assert row.feature_snapshot == {"atr_pct": 0.9, "q10_up": 0.55,
+                                    "q10_down": 0.50, "q10_ts": T0 + 9_000}
+
+
+def test_kdc_channels_registry_and_bench() -> None:
+    """四通道默认 OFF、护栏/优化字段/互斥组/基准表/影子账本注册齐备。"""
+    from binance_predict.main import SHADOW_BENCH
+    from binance_predict.services.live_channels import (
+        LIVE_CHANNELS, exclusive_group, parse_channel_config)
+    from binance_predict.services.shadow_execution_registry import SHADOW_VERSION_SPECS
+
+    guards = {"kdc_s1_96hi_15m_v1": 0.64, "kdc_s2_ext_15m_v1": 0.61,
+              "kdc_s3_3up_15m_v1": 0.61, "kdc_s4_3dn_15m_v1": 0.59}
+    cfg = parse_channel_config()
+    for v, g in guards.items():
+        spec = LIVE_CHANNELS[v]
+        assert spec.family == "kline_reversal" and spec.market_period == "15m"
+        assert spec.auto_max_exec == g
+        assert spec.spread_guard == 0.04 and spec.highvol_amount_factor == 0.5
+        assert cfg[v].enabled is False            # 默认不开实盘
+        assert v in SHADOW_BENCH and SHADOW_BENCH[v][1] is None
+        assert v in SHADOW_VERSION_SPECS
+    assert LIVE_CHANNELS["kdc_s4_3dn_15m_v1"].direction == "UP"
+    assert exclusive_group("kdc_s1_96hi_15m_v1") == exclusive_group("crv_brk20_15m_v1")
+    assert "kdc_s2_ext_15m_v1" in exclusive_group("crv_brk50_hi_15m_v1")
+    assert "kdc_s4_3dn_15m_v1" in exclusive_group("crv_dnbrk24_15m_v1")

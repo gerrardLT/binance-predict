@@ -1201,6 +1201,22 @@ const SIGNAL_INFO: Record<string, { name: string; desc: string; retired?: boolea
     name: 'CRV 5m大实体突破20高反转（押DOWN）',
     desc: '5m 阳线 ∧ 实体/振幅 ≥0.75 ∧ 收盘突破前 20 根高 → 押次根 5m 收阴 DOWN。n=8649 胜率 55.2%（训练 54.5%/验证 54.8%/末段 56.5%）；月度波动大（2026-03 胜率 47%）。⚠ 回顾性数字，非独立盲测。默认实盘关闭，护栏 0.53（费后保本价）；事件集为 CRV 5m 突破通道的子集，同窗互斥。',
   },
+  kdc_s1_96hi_15m_v1: {
+    name: 'KDC破96高收顶反转（押DOWN）',
+    desc: '15m 收在最高 20%（(c−l)/range≥0.8）∧ 收盘破前 96 根（=24小时）高 → 押次根收阴 DOWN。720D 预注册三段隔离研究，盲测 n=134 胜率 65.7%（K 线边际全场最强）；报价层验证（2026-07→10，10U 五档 VWAP）W=0.640、EV +0.096/份——但分月拆解全部来自 7-8 月，9 月市场重定价归零、10 月真实胜率塌陷转负。默认实盘关闭，护栏 0.64=盲测胜率×0.98；带点差护栏 0.04（两侧价和−1 超限弃单）与高波半仓（ATR 分位≥0.66）；影子记录入场价带与双时点报价（首轮询 + 开盘+10s）。启用前先看影子前向分月 EV。',
+  },
+  kdc_s2_ext_15m_v1: {
+    name: 'KDC超24高冲顶反转（押DOWN）',
+    desc: '15m 收盘超前 24 根高 ≥1×ATR20 ∧ 6 根累计涨幅 ≥2×ATR20 → 押次根收阴 DOWN。盲测 n=119 胜率 63.0%；报价层 EV +0.034（7-8 月正、9 月归零、10 月负，同族共性）。默认实盘关闭，护栏 0.61；同带点差护栏/高波半仓/价带记录/双时点报价；与 CRV 15m 突破族同窗互斥。',
+  },
+  kdc_s3_3up_15m_v1: {
+    name: 'KDC收顶3连阳破20高（押DOWN）',
+    desc: '15m 收在最高 20% ∧ 3 连阳 ∧ 收盘破前 20 根高 → 押次根收阴 DOWN。盲测 n=145 胜率 62.8%；报价层 EV +0.069。默认实盘关闭，护栏 0.61；同带执行层优化四件套；与 CRV 15m 突破族同窗互斥。',
+  },
+  kdc_s4_3dn_15m_v1: {
+    name: 'KDC破20低3连阴大阴（押UP）',
+    desc: '15m 收盘破前 20 根低 ∧ 3 连阴 ∧ 大实体阴（实体/振幅≥0.75）→ 押次根收阳 UP。盲测 n=116 胜率 60.3%；报价层 EV +0.083（CI 跨 0）。10 月唯一未死的方向（归因研究：镜像 UP 侧 10 月 K 线边际仍 +8.1pp）。默认实盘关闭，护栏 0.59；同带执行层优化四件套；与下破吞没/放量下破 15m 通道同窗互斥。',
+  },
   absorption_follow_td120_v1: {
     name: '吸收跟随·TD120（随BTC方向）',
     desc: '5m 窗内 BTC 明显位移而 UP 报价欠跟随（粘滞=知情者顶住人群吸筹的脚印）→ 跟随 BTC 位移方向下注（btc 涨押 UP/跌押 DOWN）。窗开 120s 双快照判定；滚动 14 天标定（弹性 k/位移门 p50/欠反应门 p80，严格 ex-ante，与影子同源）。真实价复核 RECENT EV +0.065 CI[+0.006,+0.123]（胜率 79.8%）；护栏 0.78（79.8%×0.98 下方）。与 TD150 同窗互斥（至多一单成交）。',
@@ -7152,6 +7168,10 @@ const SHADOW_META: Record<string, { label: string; color: string }> = {
   crv_dnbrk24_5m_v1: { label: 'CRV 5m下破吞没24低→UP', color: 'var(--chart-8)' },
   crv_dnvol20_15m_v1: { label: 'CRV 5m放量下破→15m UP', color: 'var(--chart-3)' },
   crv_bodybrk20_5m_v1: { label: 'CRV 5m大实体突破20高→DOWN', color: 'var(--chart-6)' },
+  kdc_s1_96hi_15m_v1: { label: 'KDC破96高收顶→DOWN', color: 'var(--chart-5)' },
+  kdc_s2_ext_15m_v1: { label: 'KDC超24高冲顶→DOWN', color: 'var(--chart-7)' },
+  kdc_s3_3up_15m_v1: { label: 'KDC收顶3连阳破20高→DOWN', color: 'var(--chart-9)' },
+  kdc_s4_3dn_15m_v1: { label: 'KDC破20低3连阴大阴→UP', color: 'var(--chart-2)' },
   s5_deep_z20_v1: { label: 'S5深档 z5≤-20bp→DOWN', color: 'var(--chart-10)' },
   s1_dyn_sq_v1: { label: 'S1动态轧空路由→DOWN', color: 'var(--chart-1)' },
   quote_momentum_v3: { label: 'A 报价动量v3(非连涨)→DOWN', color: 'var(--chart-1)' },

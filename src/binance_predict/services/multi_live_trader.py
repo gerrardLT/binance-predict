@@ -1801,14 +1801,40 @@ class MultiLiveTrader:
             )
             if not proceed:
                 return
+            # KDC 族点差护栏（优化项1，2026-10-16）：payload.cross_cost 与影子
+            # feature_snapshot.quote_cross_cost 出自同一缓存快照（crv_shadow_detector
+            # ._record_signal 落表时计算）；严格大于阈值弃单并记 outcome。
+            # 缺失（None）不拦——价格安全仍由 max_exec_price 承担，本护栏只过滤
+            # 宽点差窗（研究：点差>0.04 事件 EV −0.018，2026-09 整月点差 0.048）。
+            if spec.spread_guard is not None:
+                cc = sig.get("cross_cost")
+                if cc is not None and float(cc) > spec.spread_guard:
+                    logger.info(
+                        "多通道实盘：{} 点差护栏弃单 | 窗口 {} | cross_cost={:.4f} > {}",
+                        channel, _fmt_win(market_start), float(cc), spec.spread_guard)
+                    await self._record_strategy_outcome(
+                        channel,
+                        market_start,
+                        reason="spread_guard_skip",
+                        rejected=True,
+                        input_snapshot={"cross_cost": float(cc),
+                                        "spread_guard": spec.spread_guard},
+                    )
+                    return
+            # KDC 族高波减仓（优化项2）：vol_tier=="high"（ATR20 近500根分位≥0.66，
+            # 与影子行同值）→ 金额×factor；unknown/缺失 → 维持基准金额（保守=基准行为）。
+            amount = cfg.amount_usdt
+            if (spec.highvol_amount_factor is not None
+                    and sig.get("vol_tier") == "high"):
+                amount = cfg.amount_usdt * spec.highvol_amount_factor
             logger.info(
                 "多通道实盘开火 | {} | K线次根信号押 {} | 窗口 {} | 金额 {} | 护栏 {}",
-                channel, prediction, _fmt_win(market_start), cfg.amount_usdt,
+                channel, prediction, _fmt_win(market_start), amount,
                 resolve_max_exec(spec, cfg))
             order = await self._exec_with_exclusive(
                 channel,
                 prediction=prediction,
-                amount_usdt=cfg.amount_usdt,
+                amount_usdt=amount,
                 signal_version=channel,
                 window_start=market_start,
                 max_exec_price=resolve_max_exec(spec, cfg),

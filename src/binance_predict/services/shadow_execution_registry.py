@@ -105,6 +105,14 @@ _VERSION_ROWS: tuple[tuple[str, SourceType, str, str, str], ...] = (
     # 2026-10-15 反转研究回顾性验证：放量下破 5m 求值→15m 市场押 UP；大实体突破 5m 押 DOWN
     ("crv_dnvol20_15m_v1", SourceType.KLINE, "15m", "target_bar", "row"),
     ("crv_bodybrk20_5m_v1", SourceType.KLINE, "5m", "target_bar", "row"),
+    # KDC 方向确定性族（2026-10-16 研究 run 20261015T153500Z）：15m 极值反转
+    # 四版本（破96高收顶/超24高冲顶/收顶3连阳破20高 押 DOWN；破20低3连阴大阴 押
+    # UP）；direction 按行（row）。影子行附执行层优化快照（quote_cross_cost/
+    # vol_tier/entry_band/q10_*）。
+    ("kdc_s1_96hi_15m_v1", SourceType.KLINE, "15m", "target_bar", "row"),
+    ("kdc_s2_ext_15m_v1", SourceType.KLINE, "15m", "target_bar", "row"),
+    ("kdc_s3_3up_15m_v1", SourceType.KLINE, "15m", "target_bar", "row"),
+    ("kdc_s4_3dn_15m_v1", SourceType.KLINE, "15m", "target_bar", "row"),
     # BRK 假突破回归族（2026-10-05 研究 run 20261005T051500Z）：收盘突破前 8h
     # 高点 → 押次根收阴 DOWN；direction 按行（row）。
     ("brkrv_brk8h_15m_v1", SourceType.KLINE, "15m", "target_bar", "row"),
@@ -181,7 +189,7 @@ def _family_of(version: str, source: SourceType) -> str:
         return "combo"
     if version.startswith(("nb_", "hm_inside_", "ih_inside_")):
         return "nextbar"
-    if version.startswith(("krev_", "rev_", "crv_", "brkrv_")):
+    if version.startswith(("krev_", "rev_", "crv_", "brkrv_", "kdc_")):
         return "kline_reversal"
     if version.startswith(("hm_touch_", "s5_deep_", "s1_dyn_")):
         return "pattern"

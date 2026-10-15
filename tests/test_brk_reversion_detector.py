@@ -320,7 +320,8 @@ def test_brkrv_live_channels_registered_default_off() -> None:
     # 15m：并入 CRV 15m 突破族互斥组（同一根突破阳线事件子集、同押 DOWN）
     grp15 = exclusive_group("brkrv_brk8h_15m_v1")
     assert grp15 == {"crv_hi_brk20_15m_v1", "crv_brk20_15m_v1",
-                     "crv_brk50_hi_15m_v1", "brkrv_brk8h_15m_v1"}
+                     "crv_brk50_hi_15m_v1", "brkrv_brk8h_15m_v1",
+                     "kdc_s1_96hi_15m_v1", "kdc_s2_ext_15m_v1", "kdc_s3_3up_15m_v1"}
     # 5m：与 crv_brk20_5m 同窗互斥（brk8h ⊂ brk20 事件集）
     grp5 = exclusive_group("brkrv_brk8h_5m_v1")
     assert grp5 == {"crv_brk20_5m_v1", "brkrv_brk8h_5m_v1", "crv_bodybrk20_5m_v1"}

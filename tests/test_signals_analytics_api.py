@@ -528,6 +528,9 @@ async def test_analytics_empty_db() -> None:
         "crv_dnbrk24_15m_v1", "crv_dnbrk24_5m_v1",
         # 2026-10-15 反转研究回顾性验证两通道（默认 OFF）
         "crv_dnvol20_15m_v1", "crv_bodybrk20_5m_v1",
+        # 2026-10-16 KDC 方向确定性四通道（默认 OFF）
+        "kdc_s1_96hi_15m_v1", "kdc_s2_ext_15m_v1",
+        "kdc_s3_3up_15m_v1", "kdc_s4_3dn_15m_v1",
             # 2026-10-10 报价-人群错位族（两个周期，同名实盘默认 OFF）
             "gap_crowd_5m_v1", "gap_crowd_15m_v1",
             # 2026-10-14 补齐 4 个经典场景实盘通道
@@ -1204,5 +1207,3 @@ async def test_shadow_signal_detail_api() -> None:
     # 检查 curves
     assert len(res["curves"]) == 3
     assert res["curves"][0]["cum_ev_theoretical"] == pytest.approx(0.98/0.07 - 1)
-
-
