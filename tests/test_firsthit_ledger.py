@@ -11,7 +11,8 @@ import pytest
 
 from binance_predict.research.firsthit_ledger import (
     AUDIT_VERSION,
-    EXPECTED_SAMPLES_PER_WINDOW,
+    _GRAIN_CUTOFF_MS,
+    _expected_samples,
     FEATURE_VERSION,
     build_window_audit,
     build_mother_event,
@@ -71,9 +72,15 @@ def test_window_audit_no_firsthit():
     assert row["firsthit_detected"] is False
     assert row["exclusion_reason"] == "no_firsthit"
     assert row["audit_version"] == AUDIT_VERSION
-    assert row["expected_samples"] == EXPECTED_SAMPLES_PER_WINDOW
+    assert row["expected_samples"] == _expected_samples(int(w.start_time))  # 切换前窗 → 20（15s 口径）
     assert row["actual_samples"] == 10
     assert row["down_pts"] == 10 and row["btc_pts"] == 10
+
+
+def test_expected_samples_grain_switch():
+    """采样粒度 15s→5s（2026-10-16）：切换前窗期望 20 点、之后 60 点。"""
+    assert _expected_samples(_GRAIN_CUTOFF_MS - 1) == 20
+    assert _expected_samples(_GRAIN_CUTOFF_MS) == 60
 
 
 def test_window_audit_sparse_path_excluded():

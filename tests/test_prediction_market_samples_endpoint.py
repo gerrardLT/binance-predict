@@ -79,7 +79,7 @@ def test_default_period_is_5m_and_has_volume_fields(authed_client):
     assert resp.status_code == 200
     body = resp.json()
     assert body["period"] == "5m"
-    assert body["poll_interval_sec"] == 15
+    assert body["poll_interval_sec"] == 5  # 2026-10-16 采样粒度 15s→5s
     pts = body["points"]
     assert pts, "应返回采样点"
     # 量能字段是本端点相对 15m 端点的关键增量

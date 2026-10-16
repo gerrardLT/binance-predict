@@ -3,9 +3,8 @@ BTC 预测市场多通道实盘 + 影子信号系统 - FastAPI 主应用
 
 系统入口文件，负责：
 1. 初始化服务（数据采集、多通道实盘执行器、影子检测器、交易结算）
-2. 管理应用生命周期（lifespan）：装配并启动 MultiLiveTrader（13 通道实盘，
-   2026-09-04 退役 8 通道、2026-09-06 影子 promote 5 通道 + x4_v3 并行注册后；口径源
-   live_channels.LIVE_CHANNELS）
+2. 管理应用生命周期（lifespan）：装配并启动 MultiLiveTrader（通道注册表口径源
+   live_channels.LIVE_CHANNELS，默认全 OFF）
    + 多个影子检测器（KREV/HM/反转/nextbar/combo/X4/报价 edge，只记录不下注）
    + 场景检测器（FakeBreakoutDetector）；AgentScheduler 四阶段闭环仅在
    agent_loop_enabled=True 时启动（2026-08-16 起默认退役）
@@ -121,9 +120,9 @@ llm_service = LLMService()
 prediction_trader = BinancePredictionTrader()
 market_data_service = PredictionMarketDataService()  # 只读市场数据（与交易模块读写分离）
 
-# 预测市场情绪追踪：每 15s 轮询 UP/DOWN token 报价
+# 预测市场情绪追踪：每 5s 轮询 UP/DOWN token 报价（2026-10-16 前为 15s，历史行 15s/新行 5s 混存）
 from collections import deque as _deque
-_pm_history: _deque = _deque(maxlen=2000)  # 约 8 小时（15s × 2000）
+_pm_history: _deque = _deque(maxlen=6000)  # 约 8.3 小时（5s × 6000）
 
 # Fix #5/#6: 全局状态写入锁，保护 tracker/archiver 共享变量的读写一致性
 _state_lock = asyncio.Lock()
@@ -237,6 +236,10 @@ firsthit_shadow_detector: FirstHitShadowDetector | None = None
 # 只记录不下注，实时触达后保存只读可执行报价，归档后补路径与结算。
 firsthit_forward_recorder: FirstHitForwardRecorder | None = None
 
+# 前向「可执行报价」专用只读客户端（2026-10-15）：仅当首触前向采集关闭时创建，
+# 供 shadow_forward_evidence.probe_ladder 询 1/5/10U 报价；绝不下单。
+shadow_quote_trader: BinancePredictionTrader | None = None
+
 # Rev2 孕线反转影子检测器：5m / 15m 独立实例，支持实盘开火钩子
 rev2_inside_shadow_detector: Rev2InsideShadowDetector | None = None
 rev2_inside_5m_shadow_detector: Rev2InsideShadowDetector | None = None
@@ -260,16 +263,22 @@ research_scheduler: "ResearchScheduler | None" = None
 # ============================================================
 
 # 边界加速采样参数：15m 周期边界后短窗口内加密刷新（只刷内存缓存，不落库）。
-# 目的：入场报价快照观测点从开盘后 ~20s 推到 ~8s 内；cycle_open_price（周期
-# 锚点 P(S)）滞后从 ≤15s 压到 ≤2s。DB 采样粒度不变（15s 对齐，归档/曲面口径不变）。
+# 目的：入场报价快照观测点从开盘后 ~5s 推到 ~2s 内；cycle_open_price（周期
+# 锚点 P(S)）滞后从 ≤5s 压到 ≤2s。（2026-10-16 起 tracker 主采样已为 5s；
+# 此前 DB 粒度为 15s——历史行 15s / 新行 5s 混存，跨段统计须按时间戳。）
 EDGE_ACCEL_INTERVAL_S = 2      # 加密刷新间隔
 EDGE_ACCEL_WINDOW_MS = 40_000  # 15m 边界后的加速窗口
+
+# tracker 主采样间隔（秒）：2026-10-16 起 5s 全量采样（此前 15s），对齐到该间隔的
+# 整数边界（:00/:05/…）。PREDICT 触发阈值（settings.agent_predict_trigger_samples=30，
+# 30×5s≈150s 半窗）与 _pm_history 容量（6000，约 8.3h）均按此间隔换算，改动须同步。
+PM_POLL_INTERVAL_S = 5
 
 
 async def _handle_15m_quote(quote_15m, ts_ms: int, *, persist: bool) -> None:
     """15m 市场通道：切换检测（cycle_open 快照）+ 缓存刷新 + 可选落库。
 
-    两条路径共用：tracker 15s 对齐采样（persist=True）与边界加速协程
+    两条路径共用：tracker 5s 对齐采样（persist=True）与边界加速协程
     （persist=False）。切换检测基于 end_date 变化，天然幂等——两路径
     并发调用安全（单线程事件循环，逐 key 赋值段无 await 不交错）。
     """
@@ -316,7 +325,7 @@ async def _handle_15m_quote(quote_15m, ts_ms: int, *, persist: bool) -> None:
             await db.commit()
     except Exception as e:
         logger.warning("15m 市场采样入库失败: {}", e)
-    # gap_crowd 族（15m）：仅 15s 对齐采样路径判定（persist=True，与研究 15s 采样
+    # gap_crowd 族（15m）：仅 tracker 对齐采样路径判定（persist=True，与研究采样
     # 网格同口径；边界加速路径 persist=False 不参与）。与影子同一采样点、同源纯函数。
     try:
         if quote_15m.start_date and quote_15m.end_date and quote_15m.down_chance is not None:
@@ -366,7 +375,7 @@ async def _pm_15m_edge_accelerator() -> None:
 
 async def _prediction_market_tracker() -> None:
     """
-    预测市场情绪追踪：每 15s 轮询 UP/DOWN token 报价
+    预测市场情绪追踪：每 5s 轮询 UP/DOWN token 报价（2026-10-16 前为 15s）
 
     通过 PredictionMarketDataService（只读）获取报价数据，
     记录到 _pm_history（内存）+ prediction_market_samples（DB）。
@@ -379,7 +388,6 @@ async def _prediction_market_tracker() -> None:
     global _last_closed_window_end, _last_closed_window_entry_price, _last_closed_window_exit_price
     global _pm_5m_cycle_open_price, _pm_5m_cycle_open_end
 
-    POLL_INTERVAL = 15  # 秒
     _restored_current_window = False  # 标记是否已从 DB 恢复当前窗口数据
 
     # 启动时校准 Binance 服务器时钟
@@ -391,13 +399,13 @@ async def _prediction_market_tracker() -> None:
 
     while True:
         try:
-            # 对齐到本地时间 15 秒整数边界（:00, :15, :30, :45）
+            # 对齐到本地时间 5 秒整数边界（:00, :05, :10, …）
             now = time.time()
             local = time.localtime(now)
             local_sec_in_min = local.tm_sec
-            sleep_sec = (POLL_INTERVAL - (local_sec_in_min % POLL_INTERVAL)) % POLL_INTERVAL
+            sleep_sec = (PM_POLL_INTERVAL_S - (local_sec_in_min % PM_POLL_INTERVAL_S)) % PM_POLL_INTERVAL_S
             if sleep_sec < 0.1:
-                sleep_sec = POLL_INTERVAL
+                sleep_sec = PM_POLL_INTERVAL_S
             await asyncio.sleep(sleep_sec)
 
             # Fix #13: 使用 UTC 时间戳计算对齐后的毫秒时间戳，
@@ -1071,7 +1079,7 @@ def setup_logging() -> None:
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     setup_logging()
-    logger.info("BTC 5min LLM 预测系统 V3 启动中...")
+    logger.info("Binance Prediction 系统启动中...")
 
     # 1. 数据库表初始化
     # 优先使用 Alembic 迁移（alembic upgrade head），若无迁移则 fallback 到 create_all
@@ -1561,7 +1569,7 @@ async def lifespan(app: FastAPI):
 
     global compound_runner
     def _compound_live_quote():
-        """复利提前下单用的实时 5m 报价（_pm_market_info 每 15s 刷新；过期即视为无报价）。"""
+        """复利提前下单用的实时 5m 报价（_pm_market_info 每 5s 刷新；过期即视为无报价）。"""
         ts = _pm_market_info.get("updated_ts") or 0
         if int(time.time() * 1000) - int(ts) > 40_000:
             return None, None
@@ -1609,34 +1617,46 @@ async def lifespan(app: FastAPI):
         # absorption 标定源注入：check() 内联判定读最新标定快照
         # （检测器关闭/未注入 → absorption 通道保守不开火，fail-safe 同 kline_fetcher）
         multi_live_trader.absorption_calibrator = absorption_shadow_detector
-        if firsthit_forward_recorder is not None:
-            from .services.shadow_forward_evidence import configure_forward
-            def read_forward_operations(version, start):
-                from .services.shadow_execution_registry import SHADOW_VERSION_SPECS
-                from .services.live_channels import exclusive_group
-                spec = SHADOW_VERSION_SPECS.get(version)
-                channel = spec.live_channel if spec else version
-                config = multi_live_trader._configs.get(channel)
-                group = exclusive_group(channel)
-                filled = multi_live_trader._window_filled.get(start, set())
-                blockers = sorted(set(group or ()) & set(filled))
-                balance = (_wallet_view.get("prediction_balance_available")
-                           if time.time()-_wallet_view_ts.get("balance", 0) < 30 else None)
-                from .services.shadow_forward_evidence import cached_daily_count
-                daily = cached_daily_count(channel, multi_live_trader._count_filled_today) if config else None
-                return {"available_balance": balance, "daily_count": daily,
-                        "max_daily_orders": getattr(config, "max_daily_orders", None),
-                        "exclusive_known": not bool(group) or bool(filled),
-                        "exclusive_blocker": blockers[0] if blockers else None}
-            configure_forward(configs=lambda: multi_live_trader._configs,
-                              quote_client=firsthit_forward_recorder._trader,
-                              operational_reader=read_forward_operations)
-            from .services import shadow_forward_evidence
-            # 背压只认实盘下单临界区（交易锁）；不再看 multi_live_trader._tasks
-            # ——该集合含分钟级睡眠任务（市场预热/回填延迟/x4 等待），任何在途任务
-            # 即背压会让研究阶梯长期饿死（2026-10-09→10-14 实测 100% 背压、零覆盖）。
-            shadow_forward_evidence._live_busy = lambda: (
-                shadow_forward_evidence.live_lock_busy(prediction_trader))
+        # 前向「可执行报价」阶梯（1/5/10U get_quote）与首触前向研究开关解耦（2026-10-15）：
+        # 原实现只在 firsthit_forward_recorder 存在时 configure_forward，关闭首触前向研究
+        # 会让所有 K 线族影子（含蜡烛逻辑标签）的阶梯静默消失、面板「可执行报价」恒空。
+        # 有 recorder 时复用它自建的独立报价客户端（不碰真钱 trader 状态与交易锁）；
+        # 否则新建一个专用只读客户端，关闭时 aclose。
+        from .services.shadow_forward_evidence import configure_forward
+        global shadow_quote_trader
+        quote_trader = (firsthit_forward_recorder._trader
+                        if firsthit_forward_recorder is not None else None)
+        if quote_trader is None:
+            quote_trader = BinancePredictionTrader()
+            shadow_quote_trader = quote_trader
+
+        def read_forward_operations(version, start):
+            from .services.shadow_execution_registry import SHADOW_VERSION_SPECS
+            from .services.live_channels import exclusive_group
+            spec = SHADOW_VERSION_SPECS.get(version)
+            channel = spec.live_channel if spec else version
+            config = multi_live_trader._configs.get(channel)
+            group = exclusive_group(channel)
+            filled = multi_live_trader._window_filled.get(start, set())
+            blockers = sorted(set(group or ()) & set(filled))
+            balance = (_wallet_view.get("prediction_balance_available")
+                       if time.time()-_wallet_view_ts.get("balance", 0) < 30 else None)
+            from .services.shadow_forward_evidence import cached_daily_count
+            daily = cached_daily_count(channel, multi_live_trader._count_filled_today) if config else None
+            return {"available_balance": balance, "daily_count": daily,
+                    "max_daily_orders": getattr(config, "max_daily_orders", None),
+                    "exclusive_known": not bool(group) or bool(filled),
+                    "exclusive_blocker": blockers[0] if blockers else None}
+
+        configure_forward(configs=lambda: multi_live_trader._configs,
+                          quote_client=quote_trader,
+                          operational_reader=read_forward_operations)
+        from .services import shadow_forward_evidence
+        # 背压只认实盘下单临界区（交易锁）；不再看 multi_live_trader._tasks
+        # ——该集合含分钟级睡眠任务（市场预热/回填延迟/x4 等待），任何在途任务
+        # 即背压会让研究阶梯长期饿死（2026-10-09→10-14 实测 100% 背压、零覆盖）。
+        shadow_forward_evidence._live_busy = lambda: (
+            shadow_forward_evidence.live_lock_busy(prediction_trader))
         _live_status = multi_live_trader.status()
         _enabled = [c["channel"] for c in _live_status["channels"] if c["enabled"]]
         logger.info(
@@ -1729,6 +1749,10 @@ async def lifespan(app: FastAPI):
     # 停止冻结首触前向 record-only 采集器
     if firsthit_forward_recorder is not None:
         await firsthit_forward_recorder.stop()
+    # 关闭前向报价专用只读客户端（仅首触采集关闭时创建；未创建则跳过）
+    if shadow_quote_trader is not None:
+        await shadow_quote_trader.aclose()
+        shadow_quote_trader = None  # 复位：防同进程二次 lifespan 残留已关闭客户端
     # 停止影子版本开关 gate（所有影子检测器已停，最后收后台刷新任务）
     await shadow_gate.stop()
     await notify_config.stop()
@@ -2119,9 +2143,10 @@ async def get_fake_breakout_signal_path(
     signal_id: int,
     db: AsyncSession = Depends(get_db),
 ):
-    """信号次周期路径：15s 采样还原的 BTC 价格 + 15m 市场 DOWN/UP 报价双轨。
+    """信号次周期路径：采样还原的 BTC 价格 + 15m 市场 DOWN/UP 报价双轨。
 
-    数据源 prediction_market_samples（market_period='15m'，2026-08-13 起积累），
+    数据源 prediction_market_samples（market_period='15m'，2026-08-13 起积累；
+    采样粒度 2026-10-16 前 15s、之后 5s，按时间戳区分），
     区间 = 信号周期锚点 [market_start_15m, market_end_15m)。用于 S5/S6/S7
     入场时点研究：早期窗口（t≤4）涨/跌态报价、+5m 确认点、真实结算对照。
     更早的信号无采样，has_data=false。
@@ -4233,18 +4258,18 @@ async def get_prediction_market_chart():
     """
     获取 Binance BTC 5 分钟涨跌预测市场实时数据
 
-    返回每 15s 采样的 UP/DOWN chance 百分比时序数据，
+    返回每 5s 采样的（2026-10-16 前为 15s）UP/DOWN chance 百分比时序数据，
     以及当前 5 分钟市场的元数据（参与者、交易量、截止时间等）。
     """
     # Fix #5/#6: 在锁下快照读取，确保 history 和 market_info 一致性
-    # Fix #16: 限制返回最近 400 个点（约 1.5 小时），避免响应体过大
+    # Fix #16: 限制返回最近 1200 个点（5s 粒度约 100 分钟），避免响应体过大
     async with _state_lock:
-        history_snapshot = list(_pm_history)[-400:]
+        history_snapshot = list(_pm_history)[-1200:]
         market_snapshot = dict(_pm_market_info)
 
     return {
         "symbol": settings.symbol,
-        "poll_interval_sec": 15,
+        "poll_interval_sec": 5,
         "points": history_snapshot,
         "market": market_snapshot,
     }
@@ -4252,18 +4277,18 @@ async def get_prediction_market_chart():
 
 @app.get("/api/chart/prediction-market/15m")
 async def get_prediction_market_chart_15m(
-    limit: int = 400,
+    limit: int = 1200,
     since: int = 0,
     db: AsyncSession = Depends(get_db),
 ):
     """
     获取 15 分钟预测市场采样曲线（从 prediction_market_samples 查 market_period='15m'）
 
-    默认返回最近 400 个点（约 100 分钟，覆盖多个 15m 期次）的 UP/DOWN 报价与
+    默认返回最近 1200 个点（5s 粒度约 100 分钟，覆盖多个 15m 期次）的 UP/DOWN 报价与
     BTC 快照价；market 字段为检测器缓存的最新 15m 市场快照（到期时刻等）。
 
     历史导出（S6 定价分析用）：since>0 时按时间正序返回 timestamp>=since 的
-    前 limit 条（上限 50000，约 12.5 天），配合响应中的 oldest_ts 可翻页遍历。
+    前 limit 条（上限 50000；15s 历史段约 8~12 天、5s 段约 3 天），配合响应中的 oldest_ts 可翻页遍历。
     """
     from sqlalchemy import asc as sa_asc, desc as sa_desc, select as sa_select
 
@@ -4309,7 +4334,7 @@ async def get_prediction_market_chart_15m(
         ]
     return {
         "symbol": settings.symbol,
-        "poll_interval_sec": 15,
+        "poll_interval_sec": 5,
         "points": points,
         "market": dict(_pm_15m_latest),
         "oldest_ts": points[0]["timestamp"] if points else None,
@@ -4320,7 +4345,7 @@ async def get_prediction_market_chart_15m(
 async def get_prediction_market_samples(
     period: str = "5m",
     since: int = 0,
-    limit: int = 400,
+    limit: int = 1200,
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -4374,7 +4399,7 @@ async def get_prediction_market_samples(
     return {
         "symbol": settings.symbol,
         "period": period,
-        "poll_interval_sec": 15,
+        "poll_interval_sec": 5,
         "points": points,
         "oldest_ts": points[0]["timestamp"] if points else None,
     }
@@ -4688,6 +4713,175 @@ def _shadow_realized_ev(version: str, win: bool, q: float | None) -> float | Non
     return (0.98 / entry - 1.0) if win else -1.0
 
 
+# ============================================================
+# 前向「可执行报价」口径（2026-10-15）
+# 触发当刻按金额 get_quote 询得的可成交价，落在统一执行账本
+# shadow_execution_assessments（policy_version=forward-v2-*）。与
+# /api/signals/execution-comparison 同源同表；此处只做面板展示用的轻量聚合，
+# 不参与准入裁决，也绝不与「护栏反算（行情快照价）」混算。
+# ============================================================
+_FORWARD_POLICY_PREFIX = "forward-v2-"
+_EXEC_QUOTE_CALIBER = "trigger_time_get_quote_not_fill"
+# 前向行取数边界：本端点被前端每 60s 轮询，且每行含多个 JSONB 快照，不能无限量加载。
+# 45 天足够覆盖「可执行口径是否为正」的判断窗口；面板显式回传该窗口，避免被读成全量。
+_FORWARD_QUOTE_LOOKBACK_DAYS = 45
+_FORWARD_QUOTE_ROW_LIMIT = 5000
+
+
+def _amount_key(value) -> str | None:
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not amount > 0:
+        return None
+    return str(int(amount)) if amount == int(amount) else f"{amount:g}"
+
+
+def _execution_quote_summary(rows: list) -> dict | None:
+    """按档位聚合前向可执行报价（get_quote 估计，非成交）；无可用样本 → None。
+
+    头条数字取「冻结运行时金额」档（该版本真钱实际会下的金额），缺该档时取最小档；
+    逐档明细全保留。护栏取该档冻结值——同一版本中途改过护栏则列出全部取值、头条留空。
+    """
+    from .services.shadow_forward_evidence import quote_returns
+
+    buckets: dict[str, dict] = {}
+    runtime_hits: dict[str, int] = {}
+    evaluated = 0
+    live_n = 0
+    legacy_guard_n = 0
+    for row in rows:
+        if (getattr(row, "input_snapshot", None) or {}).get("capture_mode") == "LIVE":
+            live_n += 1
+        estimates = quote_returns(row)
+        if not estimates:
+            continue
+        evaluated += 1
+        profile = (getattr(row, "config_snapshot", None) or {}).get("profile") or {}
+        rules = profile.get("runtime_rules") or {}
+        # 2026-10-15 之前冻结的画像没有 runtime_guard_resolved：其护栏可能是 PROFILE
+        # 统一默认 0.50，而非该通道当时的生效护栏 → 逐档护栏留空并计数，避免误读。
+        if not rules.get("runtime_guard_resolved"):
+            legacy_guard_n += 1
+        runtime_amount = _amount_key(profile.get("amount_usdt"))
+        if runtime_amount in estimates:
+            runtime_hits[runtime_amount] = runtime_hits.get(runtime_amount, 0) + 1
+        for amount, value in estimates.items():
+            bucket = buckets.setdefault(
+                amount, {"n": 0, "wins": 0, "pnl": 0.0, "prices": [], "guards": set()})
+            bucket["n"] += 1
+            bucket["wins"] += int(bool(getattr(row, "theoretical_win", None)))
+            bucket["pnl"] += float(value["pnl"])
+            if isinstance(value.get("price"), (int, float)):
+                bucket["prices"].append(float(value["price"]))
+            if isinstance(value.get("guard_price"), (int, float)):
+                bucket["guards"].add(round(float(value["guard_price"]), 6))
+    if not buckets:
+        return None
+    primary = (max(runtime_hits, key=lambda key: runtime_hits[key]) if runtime_hits
+               else min(buckets, key=float))
+    amounts = {}
+    for amount in sorted(buckets, key=float):
+        bucket = buckets[amount]
+        guards = sorted(bucket["guards"])
+        amounts[amount] = {
+            "n": bucket["n"],
+            "win_rate": bucket["wins"] / bucket["n"] if bucket["n"] else None,
+            "avg_price": (sum(bucket["prices"]) / len(bucket["prices"])) if bucket["prices"] else None,
+            "avg_ev": bucket["pnl"] / bucket["n"] if bucket["n"] else None,
+            "cum_ev": round(bucket["pnl"], 4),
+            "guard_price": guards[0] if len(guards) == 1 else None,
+            "guard_prices": guards,
+        }
+    head = amounts[primary]
+    return {
+        "n": len(rows),
+        "live_n": live_n,
+        "quote_n": evaluated,
+        "coverage": (evaluated / live_n) if live_n else None,
+        # 修复前冻结画像的行数（护栏可能非当时生效值）：>0 时该档护栏口径存疑
+        "legacy_guard_n": legacy_guard_n,
+        "amount": primary,
+        "win_rate": head["win_rate"],
+        "avg_price": head["avg_price"],
+        "avg_ev": head["avg_ev"],
+        "cum_ev": head["cum_ev"],
+        "guard_price_frozen": head["guard_price"],
+        "amounts": amounts,
+        "caliber": _EXEC_QUOTE_CALIBER,
+        # 取数窗口（前端每 60s 轮询，故有界）：这些数字是「近 N 天」而非全量
+        "lookback_days": _FORWARD_QUOTE_LOOKBACK_DAYS,
+    }
+
+
+def _execution_quote_of_row(row) -> dict | None:
+    """单窗可执行报价（冻结运行时金额档优先，缺则取最小可用档）；无样本 → None。"""
+    from .services.shadow_forward_evidence import quote_returns
+
+    estimates = quote_returns(row)
+    if not estimates:
+        return None
+    profile = (getattr(row, "config_snapshot", None) or {}).get("profile") or {}
+    runtime_amount = _amount_key(profile.get("amount_usdt"))
+    amount = runtime_amount if runtime_amount in estimates else min(estimates, key=float)
+    value = estimates[amount]
+    return {
+        "amount": amount,
+        "price": value.get("price"),
+        "ev": round(float(value["pnl"]), 4),
+        "guard_price": value.get("guard_price"),
+        "fill": False,
+        "caliber": _EXEC_QUOTE_CALIBER,
+    }
+
+
+async def _load_forward_assessment_rows(db: AsyncSession, versions: set[str] | None) -> list:
+    """统一账本前向行（forward-v2-*）：仅取近 _FORWARD_QUOTE_LOOKBACK_DAYS 天、最多
+    _FORWARD_QUOTE_ROW_LIMIT 行（按目标窗倒序）。versions=None 取全量版本。"""
+    from sqlalchemy import select as sa_select
+
+    from .db.models import ShadowExecutionAssessment
+
+    since = int(time.time() * 1000) - _FORWARD_QUOTE_LOOKBACK_DAYS * 86_400_000
+    stmt = sa_select(ShadowExecutionAssessment).where(
+        ShadowExecutionAssessment.policy_version.like(_FORWARD_POLICY_PREFIX + "%"),
+        ShadowExecutionAssessment.target_window_start >= since,
+    )
+    if versions is not None:
+        stmt = stmt.where(ShadowExecutionAssessment.signal_version.in_(sorted(versions)))
+    stmt = stmt.order_by(ShadowExecutionAssessment.target_window_start.desc()).limit(
+        _FORWARD_QUOTE_ROW_LIMIT)
+    return list((await db.execute(stmt)).scalars().all())
+
+
+def _forward_rows_by_version(rows: list) -> dict[str, list]:
+    grouped: dict[str, list] = {}
+    for row in rows:
+        grouped.setdefault(str(row.signal_version), []).append(row)
+    return grouped
+
+
+def _quote_caliber_of(rows: list) -> str | None:
+    """该版本入场观察价来源口径；新旧混合/历史行如实标注。
+
+    2026-10-15 前的历史行没有 entry_quote_kind：当时结算会用「目标窗首个 15s 采样」
+    覆盖触发时快照，逐行无法还原来源 → legacy_unknown（不得当 market_snapshot 使用）。
+    完全没有入场价的行（缺报价）不参与口径判定，避免把「无价」误标成历史口径。
+    """
+    kinds = []
+    for row in rows:
+        kind = (getattr(row, "feature_snapshot", None) or {}).get("entry_quote_kind")
+        if kind:
+            kinds.append(kind)
+        elif (getattr(row, "entry_down_price", None) is not None
+              or getattr(row, "entry_up_price", None) is not None):
+            kinds.append("legacy_unknown")
+    if not kinds:
+        return None
+    return kinds[0] if len(set(kinds)) == 1 else "mixed"
+
+
 async def _official_scene_version_filter(db: AsyncSession):
     """正式场景信号的 version 过滤条件：排除 SHADOW 版本名，其余均为正式信号。
 
@@ -4791,6 +4985,8 @@ async def _load_shadow_settled_rows(db: AsyncSession, visible_versions: set[str]
                 entry_down_price=row.entry_down_price,
                 entry_up_price=row.entry_up_price,
                 direction=row.direction,
+                # 观察价来源口径（entry_quote_kind）随标签展开，供面板标注
+                feature_snapshot=row.feature_snapshot,
             ))
     krev_rows = expanded_krev_rows
     # HM 上吊线反弹入场（pattern_shadow_signals 表，2026-09-01 并入）：窗内触价入场影子，
@@ -4887,6 +5083,11 @@ async def get_signals_analytics(
     - regime: 大涨前(<08-19 UTC) vs 大涨期胜率对比（合并 + 逐影子版本）+ 按 UTC 日胜率
     胜负判定（场景/legacy）按 side 映射：side=high 押 DOWN、side=low 押 UP，
     与 /api/fake-breakout/stats 的 compute_pattern_stats 同语义。
+    - 口径元数据（2026-10-15）：summary.quote_caliber 标注入场观察价来源
+      （market_snapshot=触发时市场报价快照 / window_open_sample=目标窗首个采样回落 /
+      legacy_unknown=改动前历史行 / mixed）；summary.guard_caliber 明示 guarded_*
+      是「用当前护栏回算历史」的反事实；summary.execution_quote 给出触发当刻按
+      1/5/10U get_quote 的可执行报价证据（统一账本 forward-v2-*，非成交）。
     """
     from sqlalchemy import literal as sa_literal, select as sa_select
 
@@ -5005,6 +5206,12 @@ async def get_signals_analytics(
                 "guarded_avg_ev": sum(g_evs) / len(g_evs) if g_evs else None,
                 "guarded_cum_ev": round(g_cum_ev, 4) if g_evs else None,
                 "guarded_avg_breakeven": sum(g_bes) / len(g_bes) if g_bes else None,
+                # 口径元数据（2026-10-15）：观察价来源 + 护栏反算性质。
+                # guarded_* 一律是「用当前护栏回算历史」的反事实，不等于当时真钱规则；
+                # 入场价来自行情快照（market/list），不是按金额 get_quote 的可成交价。
+                "quote_caliber": _quote_caliber_of(g),
+                "guard_caliber": ("current_config_recomputed"
+                                  if (effective_guard is not None or entry_bands is not None) else None),
                 # 影子开关状态（前端手动下线能力）：下线版本置灰+可重新上线；
                 # retired=永久退役（代码级硬闸，toggle 拒改，前端不可点开关）
                 "enabled": shadow_gate.is_enabled(v),
@@ -5135,6 +5342,13 @@ async def get_signals_analytics(
         d = daily.setdefault(day, [0, 0])
         d[0] += 1
         d[1] += int(won)
+    # 前向「可执行报价」证据（统一账本 forward-v2-*）：新增一次查询，刻意置于既有查询
+    # 之后以保持取数顺序稳定；与上面的行情快照 EV 并列展示、绝不相加。
+    forward_by_version = _forward_rows_by_version(
+        await _load_forward_assessment_rows(db, set(versions)))
+    for v, block in shadow.items():
+        block["summary"]["execution_quote"] = _execution_quote_summary(
+            forward_by_version.get(v, []))
     return {
         "pump_ts": PUMP_TS_MS,
         "shadow": shadow,
@@ -5162,10 +5376,14 @@ async def get_shadow_signal_detail(
     """单影子信号订单详情与实盘对比分析聚合端点。
 
     - 逐笔对齐：以 window_start 将影子理论事件与同窗口同通道实盘订单 1:1 对齐
-    - 执行漏斗：理论总数、带护栏实际数、实盘下单数、实盘成交数、实盘盈亏
-    - 对比曲线：理论累计EV、带护栏实际累计EV、实盘累计盈亏(USDT)、滚动胜率
-    - 报价分布与分桶：按入场报价分档统计胜率、EV及实盘表现
+    - 执行漏斗：理论总数、护栏反算通过数、实盘下单数、实盘成交数、实盘盈亏
+    - 对比曲线：理论累计EV、护栏反算累计EV、实盘累计盈亏(USDT)、滚动胜率
+    - 报价分布与分桶：按入场观察价分档统计胜率、EV及实盘表现
     - 护栏反事实效果：分析被拦截单若成交的胜率与成功避损/错失EV
+
+    ⚠ 口径（2026-10-15 起显式标注）：entry_price/EV 来自**行情快照价**（market/list），
+    护栏判定是**用当前护栏回算历史**（非当时规则），二者都不是可成交价；触发当刻按
+    金额 get_quote 询得的可执行报价另见 orders[].executable_quote 与 summary.execution_quote。
     """
     from decimal import Decimal
     from sqlalchemy import select as sa_select
@@ -5183,6 +5401,12 @@ async def get_shadow_signal_detail(
     all_sh_rows = await _load_shadow_settled_rows(db, {v})
     sh_rows = [r for r in all_sh_rows if r.version == v and r.win is not None]
     sh_rows.sort(key=lambda r: int(r.window_start or 0))
+    # 1b. 该版本的前向可执行报价行（统一账本 forward-v2-*，按窗口对齐）
+    forward_rows = await _load_forward_assessment_rows(db, {v})
+    forward_by_ws: dict[int, object] = {}
+    for _fr in forward_rows:
+        if _fr.target_window_start is not None:
+            forward_by_ws[int(_fr.target_window_start)] = _fr
 
     # 2. 查询该版本对应的实盘订单
     stmt = sa_select(TradeOrderModel).where(
@@ -5273,6 +5497,11 @@ async def get_shadow_signal_detail(
         ws = int(s.window_start)
         won = bool(s.win)
         theo_wins += int(won)
+        # 观察价来源 + 该窗可执行报价（触发当刻按金额 get_quote，非成交）
+        entry_quote_kind = (getattr(s, "feature_snapshot", None) or {}).get("entry_quote_kind")
+        forward_row = forward_by_ws.get(ws)
+        executable_quote = (_execution_quote_of_row(forward_row)
+                            if forward_row is not None else None)
 
         q = s.entry_down_price if s.direction == "DOWN" else s.entry_up_price
         valid_q = q is not None and float(q) > 0
@@ -5363,6 +5592,10 @@ async def get_shadow_signal_detail(
             "breakeven": round(be, 4) if be is not None else None,
             "guarded_pass": is_pass,
             "reject_reason": reject_reason,
+            # 观察价来源（market_snapshot / window_open_sample / 历史行 None=未知）
+            "entry_quote_kind": entry_quote_kind,
+            # 触发当刻按金额 get_quote 的可执行报价（独立于上面的行情快照价）
+            "executable_quote": executable_quote,
             "live_order": live_order_dict,
         })
 
@@ -5494,6 +5727,11 @@ async def get_shadow_signal_detail(
             "avg_quote_price": round(avg_theo_q, 4) if avg_theo_q is not None else None,
             "avg_live_fill_price": round(avg_live_p, 4) if avg_live_p is not None else None,
             "slippage_bps": slippage_bps,
+            # 口径元数据（2026-10-15）：观察价来源、护栏反算性质、可执行报价证据
+            "quote_caliber": _quote_caliber_of(sh_rows),
+            "guard_caliber": ("current_config_recomputed"
+                              if (effective_guard is not None or entry_bands is not None) else None),
+            "execution_quote": _execution_quote_summary(forward_rows),
         },
         "curves": curves[-500:],
         "quote_buckets": quote_bucket_list,

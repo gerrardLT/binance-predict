@@ -23,7 +23,13 @@ from binance_predict.services.firsthit_shadow_detector import (
 
 AUDIT_VERSION = "window_audit_v1"
 FEATURE_VERSION = "mother_event_v1"
-EXPECTED_SAMPLES_PER_WINDOW = 20  # 300s / 15s 采样
+# 采样粒度切换（2026-10-16）：此前 15s（20 点/5m 窗）、之后 5s（60 点/窗）。
+# 按窗口起点选期望值；部署日边界附近个别窗可能归档差一档，本字段仅作审计提示。
+_GRAIN_CUTOFF_MS = 1792080000000  # 2026-10-16 00:00 UTC+8
+
+
+def _expected_samples(window_start_ms: int) -> int:
+    return 60 if window_start_ms >= _GRAIN_CUTOFF_MS else 20
 
 # streak 门需要前驱 5m K 线，窗内不可判 → 服务侧标签恒 None（离线审计脚本回填）
 _STREAK_VERSIONS = {"g7_streak_v1", "g7_strict_v1"}
@@ -88,7 +94,7 @@ def build_window_audit(window) -> dict:
     return dict(
         window_start=int(window.start_time), window_end=int(window.end_time),
         audit_version=AUDIT_VERSION,
-        expected_samples=EXPECTED_SAMPLES_PER_WINDOW, actual_samples=actual,
+        expected_samples=_expected_samples(int(window.start_time)), actual_samples=actual,
         down_pts=len(dn), up_pts=len(up), btc_pts=len(btc),
         max_gap_ms=max(gaps) if gaps else None,
         raw_firsthit_detected=raw_firsthit,

@@ -277,13 +277,42 @@ interface BtcKline {
   open_time: number; open: number; high: number; low: number; close: number; volume: number
 }
 interface AnalyticsCurvePoint { i: number; ts: number; cum_wr: number; cum_ev: number }
+// 前向「可执行报价」证据（后端统一账本 forward-v2-*）：触发当刻按金额 get_quote 询得的
+// 可成交价，非成交。与「护栏反算（行情快照价）」是两个口径，绝不混算/相加。
+interface ExecutionQuoteAmount {
+  n: number
+  win_rate: number | null
+  avg_price: number | null
+  avg_ev: number | null
+  cum_ev: number
+  guard_price: number | null
+  guard_prices: number[]
+}
+interface ExecutionQuoteSummary {
+  n: number
+  live_n: number
+  quote_n: number
+  coverage: number | null
+  // 修复前冻结画像的行数（护栏可能非当时生效值）→ 该档护栏口径存疑
+  legacy_guard_n?: number
+  // 取数窗口（天）：数字是「近 N 天」而非全量
+  lookback_days?: number
+  amount: string
+  win_rate: number | null
+  avg_price: number | null
+  avg_ev: number | null
+  cum_ev: number | null
+  guard_price_frozen: number | null
+  amounts: Record<string, ExecutionQuoteAmount>
+  caliber: string
+}
 interface ShadowVersionBlock {
   summary: {
     n: number; win_rate: number | null; avg_ev: number | null; cum_ev: number | null
     avg_breakeven: number | null; bench_winrate: number | null; bench_ev: number | null
     bench_max_entry_price: number | null
     desc: string
-    // 带护栏实际数据（过滤掉贴线/超价弃单及白名单外单）：
+    // 护栏反算（用**当前**护栏回算历史，价格来自行情快照，不是成交价）：
     guard_price?: number | null
     guarded_n?: number
     guarded_rejected_n?: number
@@ -293,6 +322,10 @@ interface ShadowVersionBlock {
     guarded_avg_ev?: number | null
     guarded_cum_ev?: number | null
     guarded_avg_breakeven?: number | null
+    // 口径元数据：观察价来源（market_snapshot/window_open_sample/legacy_unknown/mixed）
+    quote_caliber?: string | null
+    guard_caliber?: string | null
+    execution_quote?: ExecutionQuoteSummary | null
     // 影子开关（2026-09-04 前端手动下线能力）：下线=停采集+置灰，历史保留
     enabled?: boolean
     // 永久退役（2026-09-04）：后端 shadow_version_gate.RETIRED_VERSIONS 硬闸，
@@ -359,6 +392,13 @@ interface ShadowDetailOrderItem {
   breakeven: number | null
   guarded_pass: boolean
   reject_reason: string | null
+  // 观察价来源：market_snapshot（触发时市场报价快照）/ window_open_sample（回落首个采样）/ null（改动前历史行）
+  entry_quote_kind?: string | null
+  // 触发当刻按金额 get_quote 的可执行报价（独立于上面的观察价）
+  executable_quote?: {
+    amount: string; price: number | null; ev: number; guard_price: number | null
+    fill: boolean; caliber: string
+  } | null
   live_order: ShadowDetailLiveOrder | null
 }
 
@@ -418,6 +458,9 @@ interface ShadowSignalDetailResponse {
     avg_quote_price: number | null
     avg_live_fill_price: number | null
     slippage_bps: number | null
+    quote_caliber?: string | null
+    guard_caliber?: string | null
+    execution_quote?: ExecutionQuoteSummary | null
   }
   curves: ShadowDetailCurvePoint[]
   quote_buckets: ShadowDetailBucket[]
@@ -4271,7 +4314,7 @@ export default function App() {
   useEffect(() => {
     if (tab !== 'market') return
     refreshPm()
-    const timer = setInterval(refreshPm, 15000)
+    const timer = setInterval(refreshPm, 5000)  // 后端 5s 采样（2026-10-16 前 15s）
     return () => clearInterval(timer)
   }, [tab, refreshPm])
 
@@ -4322,7 +4365,7 @@ export default function App() {
           <div className="space-y-6">
             <Card title="BTC 5分钟内涨或跌（Binance Prediction Markets）">
               <div className="text-xs text-ink-55 mb-3">
-                Binance 预测市场上所有交易者用真金白银投票的看多看空共识。每 15 秒自动刷新。
+                Binance 预测市场上所有交易者用真金白银投票的看多看空共识。每 5 秒自动刷新。
               </div>
               {pmMarket && (
                 <div className="flex flex-wrap gap-4 mb-3 text-xs">
@@ -4363,7 +4406,7 @@ export default function App() {
                   </div>
                 </>
               ) : (
-                <div className="text-center text-ink-55 py-10 text-sm">正在采集数据...每 15 秒采样一次。</div>
+                <div className="text-center text-ink-55 py-10 text-sm">正在采集数据...每 5 秒采样一次。</div>
               )}
             </Card>
 
@@ -6677,7 +6720,7 @@ function FakeBreakoutPanel() {
                     <td className="py-1.5 px-1 text-center">
                       <button onClick={() => togglePath(s.id)}
                         className="text-ink-55 hover:text-indigo leading-none text-xs"
-                        title="展开次周期价格+报价路径（15s 采样，8/13 起有数据）">
+                        title="展开次周期价格+报价路径（15s 采样 8/13–10/16、之后 5s，按时间戳区分）">
                         {expandedIds.has(s.id) ? '▾' : '▸'}
                       </button>
                     </td>
@@ -6750,7 +6793,7 @@ function FakeBreakoutPanel() {
 
 // ============================================================
 // 信号次周期路径面板（行内展开）：价格 ±bp 上板 / DOWN 报价下板
-// 数据源 prediction_market_samples 15s 采样（8/13 起积累），懒加载
+// 数据源 prediction_market_samples 采样（8/13 起积累；10/16 前 15s、之后 5s），懒加载
 // ============================================================
 
 interface SignalPathPoint { off: number; btc: number; down: number; up: number }
@@ -7062,7 +7105,7 @@ function Market15mPanel() {
 
   useEffect(() => {
     refresh()
-    const timer = setInterval(refresh, 15000)
+    const timer = setInterval(refresh, 5000)  // 后端 5s 采样（2026-10-16 前 15s）
     const tickTimer = setInterval(() => setTick(t => t + 1), 1000)  // 倒计时每秒刷新
     return () => { clearInterval(timer); clearInterval(tickTimer) }
   }, [refresh])
@@ -7123,7 +7166,7 @@ function Market15mPanel() {
           </div>
         </>
       ) : (
-        <div className="text-center text-ink-55 py-10 text-sm">正在采集 15m 市场数据...每 15 秒采样一次。</div>
+        <div className="text-center text-ink-55 py-10 text-sm">正在采集 15m 市场数据...每 5 秒采样一次。</div>
       )}
     </Card>
   )
@@ -7355,6 +7398,66 @@ const evFmt = (v: number | null | undefined) =>
   v == null ? '—' : `${v >= 0 ? '+' : ''}${v.toFixed(3)}`
 const utcMD = (ts: number) =>
   new Date(ts).toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit', timeZone: 'UTC' })
+
+// 观察价来源口径（后端 summary.quote_caliber）：面板上任何「EV」都必须标清价格来源，
+// 否则会把行情快照价误读成可成交价（2026-10-15 修正）。
+const QUOTE_CALIBER_LABEL: Record<string, { label: string; hint: string }> = {
+  market_snapshot: {
+    label: '触发时快照价',
+    hint: '入场观察价取自信号触发当刻的市场报价快照（market/list）。是行情价，不是按金额询得的可成交价。',
+  },
+  window_open_sample: {
+    label: '窗口首采样价',
+    hint: '触发时快照缺失，回落为目标窗内首个采样价（10/16 前 15s 粒度、之后 5s 粒度）；采样表不含市场身份，边界采样可能并非目标市场，仅作参考。',
+  },
+  legacy_unknown: {
+    label: '历史口径未知',
+    hint: '2026-10-15 之前落库的行：当时结算会用目标窗首个采样覆盖触发时快照，逐行无法还原来源，不得当可成交价使用。',
+  },
+  mixed: {
+    label: '新旧口径混合',
+    hint: '同一版本同时含改动前的历史行与改动后的新行，观察价来源不一致，曲线两端口径不同。',
+  },
+}
+const quoteCaliberHint = (caliber: string | null | undefined): string => {
+  if (!caliber) return '未标注观察价来源。'
+  const meta = QUOTE_CALIBER_LABEL[caliber]
+  return meta ? `${meta.label}：${meta.hint}` : caliber
+}
+// 「可执行报价」列（1/5/10U get_quote，触发当刻）：与行情快照 EV 并列展示、不相加。
+const EXEC_QUOTE_HINT = '触发当刻按 1/5/10U 分别调用 get_quote 询得的可成交价（含深度），' +
+  '按触发时冻结的护栏过滤后现算的估计收益。是报价不是成交；无样本显示「—」，绝不以 0 冒充；' +
+  '统计窗口为近 45 天。'
+const ExecutionQuoteCells = ({ quote }: { quote?: ExecutionQuoteSummary | null }) => {
+  if (!quote) {
+    return (
+      <>
+        <td className="py-1 px-2 text-right font-mono text-ink-40" title={`${EXEC_QUOTE_HINT}（当前无样本）`}>—</td>
+        <td className="py-1 px-2 text-right font-mono text-ink-40">—</td>
+      </>
+    )
+  }
+  const detail = Object.entries(quote.amounts)
+    .map(([amount, a]) => `${amount}U: n=${a.n} 均价${a.avg_price?.toFixed(3) ?? '—'} 单均EV${a.avg_ev?.toFixed(3) ?? '—'}`)
+    .join(' · ')
+  const legacyGuard = quote.legacy_guard_n ?? 0
+  return (
+    <>
+      <td className="py-1 px-2 text-right font-mono"
+        title={`${EXEC_QUOTE_HINT}\n头条档位 ${quote.amount}U（覆盖率 ${pct1(quote.coverage)}）\n${detail}` +
+          (legacyGuard > 0 ? `\n⚠ ${legacyGuard} 笔为修复前冻结画像，护栏可能非当时生效值` : '')}>
+        <span className="font-bold text-ink-95">{quote.quote_n}</span>
+        <span className="text-ink-40 text-[10px]"> / {quote.live_n}</span>
+        {legacyGuard > 0 && <span className="text-warning text-[10px] ml-1" title="含修复前冻结画像行">⚠</span>}
+      </td>
+      <td className={`py-1 px-2 text-right font-mono font-bold ${
+        quote.avg_ev == null ? 'text-ink-40' : quote.avg_ev >= 0 ? 'text-positive' : 'text-negative'
+      }`} title={`档位 ${quote.amount}U · 均价 ${quote.avg_price?.toFixed(3) ?? '—'} · 冻结护栏 ${quote.guard_price_frozen ?? '—'}`}>
+        {evFmt(quote.avg_ev)}
+      </td>
+    </>
+  )
+}
 
 // 把各版本曲线按时间戳合并成宽表（recharts 单 data 多 Line 需要）
 function mergeCurves(
@@ -7886,7 +7989,8 @@ function ShadowSignalDetailModal({
   const exportCsv = () => {
     if (filteredOrders.length === 0) return
     const headers = [
-      '窗口开始时间', '格式化时间', '押注方向', '理论入场价', '理论胜负', '理论实现EV',
+      '窗口开始时间', '格式化时间', '押注方向', '观察入场价', '观察价来源', '可执行报价', '可执行档位',
+      '理论胜负', '理论实现EV',
       '护栏判定', '弃单原因', '实盘状态', '实盘订单ID', '实盘成交均价', '均价类型',
       '实盘金额USDT', '实盘盈亏USDT', '实盘胜负'
     ]
@@ -7898,6 +8002,9 @@ function ShadowSignalDetailModal({
         `"${performanceTime(o.window_start)}"`,
         o.direction,
         o.entry_price ?? '',
+        o.entry_quote_kind ?? 'legacy_unknown',
+        o.executable_quote?.price ?? '',
+        o.executable_quote?.amount ?? '',
         o.win == null ? '' : o.win ? 'WIN' : 'LOSS',
         o.ev ?? '',
         o.guarded_pass ? 'PASS' : 'REJECT',
@@ -7942,7 +8049,7 @@ function ShadowSignalDetailModal({
     if (!s) return []
     return [
       { stage: '1.理论信号', count: s.total_signals, rate: '100%', fill: 'var(--chart-1)' },
-      { stage: '2.护栏通过', count: s.guarded_signals, rate: pct1(s.guarded_pass_rate), fill: 'var(--chart-2)' },
+      { stage: '2.护栏反算通过', count: s.guarded_signals, rate: pct1(s.guarded_pass_rate), fill: 'var(--chart-2)' },
       { stage: '3.实盘派单', count: s.live_orders_count, rate: s.guarded_signals > 0 ? pct1(s.live_orders_count / s.guarded_signals) : '0%', fill: 'var(--chart-3)' },
       { stage: '4.实际成交', count: s.live_filled_count, rate: s.live_orders_count > 0 ? pct1(s.live_filled_count / s.live_orders_count) : '0%', fill: 'var(--positive)' },
       { stage: '5.实盘胜单', count: s.live_wins, rate: s.live_filled_count > 0 ? pct1(s.live_wins / s.live_filled_count) : '0%', fill: 'var(--brand)' },
@@ -7968,7 +8075,16 @@ function ShadowSignalDetailModal({
                 <>
                   <span className="ds-badge ds-badge-neutral">{signalFamilyLabel(data.family)}</span>
                   {data.guard_price != null && (
-                    <span className="ds-badge ds-badge-indigo">执行护栏 ≤ {data.guard_price}</span>
+                    <span className="ds-badge ds-badge-indigo"
+                      title="用于「护栏反算」的**当前**护栏：它是反事实（用今天的规则回算历史），不是当时生效的真钱护栏。">
+                      反算护栏 ≤ {data.guard_price}
+                    </span>
+                  )}
+                  {data.summary.quote_caliber && (
+                    <span className={data.summary.quote_caliber === 'market_snapshot' ? 'ds-badge ds-badge-neutral' : 'ds-badge ds-badge-warn'}
+                      title={quoteCaliberHint(data.summary.quote_caliber)}>
+                      {QUOTE_CALIBER_LABEL[data.summary.quote_caliber]?.label ?? data.summary.quote_caliber}
+                    </span>
                   )}
                   {data.bench_winrate != null && (
                     <span className="ds-badge ds-badge-violet">回测基准 {pct1(data.bench_winrate)}</span>
@@ -8006,19 +8122,19 @@ function ShadowSignalDetailModal({
 
         {/* 核心 KPI 矩阵 */}
         {s && (
-          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2 px-5 py-2.5 border-b border-line-soft bg-card shrink-0">
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 px-5 py-2.5 border-b border-line-soft bg-card shrink-0">
             <div className="p-2 rounded-sm bg-sunken border border-line-soft">
               <div className="text-[10px] text-ink-55">信号与通过率</div>
               <div className="font-mono font-bold text-sm text-ink-95">
                 {s.guarded_signals} <span className="text-[11px] font-normal text-ink-40">/ {s.total_signals}</span>
               </div>
               <div className="text-[10px] text-ink-55 mt-0.5">
-                护栏通过率 <span className="font-mono font-medium text-brand">{pct1(s.guarded_pass_rate)}</span>
+                护栏反算通过率 <span className="font-mono font-medium text-brand">{pct1(s.guarded_pass_rate)}</span>
               </div>
             </div>
 
             <div className="p-2 rounded-sm bg-sunken border border-line-soft">
-              <div className="text-[10px] text-ink-55">胜率对比（实 vs 理）</div>
+              <div className="text-[10px] text-ink-55">胜率对比（反算 vs 理论）</div>
               <div className="font-mono font-bold text-sm text-brand">
                 {pct1(s.guarded_win_rate)} <span className="text-[11px] font-normal text-ink-40">({s.guarded_wins}胜)</span>
               </div>
@@ -8028,13 +8144,34 @@ function ShadowSignalDetailModal({
             </div>
 
             <div className="p-2 rounded-sm bg-sunken border border-line-soft">
-              <div className="text-[10px] text-ink-55">理论收益（累计 / 单均）</div>
+              <div className="text-[10px] text-ink-55">护栏反算收益（累计 / 单均）</div>
               <div className={`font-mono font-bold text-sm ${s.guarded_cum_ev >= 0 ? 'text-positive' : 'text-negative'}`}>
                 {evFmt(s.guarded_cum_ev)} EV
               </div>
               <div className="text-[10px] text-ink-55 mt-0.5">
-                实际单均 <span className="font-mono">{evFmt(s.guarded_avg_ev)}</span> · 理论 <span className="font-mono">{evFmt(s.theoretical_avg_ev)}</span>
+                反算单均 <span className="font-mono">{evFmt(s.guarded_avg_ev)}</span> · 理论 <span className="font-mono">{evFmt(s.theoretical_avg_ev)}</span>
               </div>
+            </div>
+
+            {/* 可执行报价（触发当刻按金额 get_quote）：与上面的行情快照口径并列、不相加 */}
+            <div className="p-2 rounded-sm bg-sunken border border-line-soft">
+              <div className="text-[10px] text-ink-55" title={EXEC_QUOTE_HINT}>可执行报价（get_quote）</div>
+              {s.execution_quote ? (
+                <>
+                  <div className={`font-mono font-bold text-sm ${(s.execution_quote.avg_ev ?? 0) >= 0 ? 'text-positive' : 'text-negative'}`}>
+                    {evFmt(s.execution_quote.avg_ev)} EV
+                  </div>
+                  <div className="text-[10px] text-ink-55 mt-0.5">
+                    {s.execution_quote.amount}U 档 · 样本 <span className="font-mono">{s.execution_quote.quote_n}</span>/{s.execution_quote.live_n}
+                    · 均价 <span className="font-mono">{s.execution_quote.avg_price?.toFixed(3) ?? '—'}</span>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="font-mono font-bold text-sm text-ink-40">样本不足</div>
+                  <div className="text-[10px] text-ink-55 mt-0.5">尚无触发当刻 1/5/10U 报价样本</div>
+                </>
+              )}
             </div>
 
             <div className="p-2 rounded-sm bg-sunken border border-line-soft">
@@ -8056,7 +8193,7 @@ function ShadowSignalDetailModal({
                 </span>
               </div>
               <div className="text-[10px] text-ink-55 mt-0.5">
-                理论均价 <span className="font-mono">{s.avg_quote_price?.toFixed(3) ?? '--'}</span>
+                快照均价 <span className="font-mono">{s.avg_quote_price?.toFixed(3) ?? '--'}</span>
                 {s.avg_live_fill_price != null && (
                   <> · 实盘 <span className="font-mono">{s.avg_live_fill_price.toFixed(3)}</span></>
                 )}
@@ -8227,7 +8364,8 @@ function ShadowSignalDetailModal({
                         <tr className="border-b border-line bg-sunken text-ink-55">
                           <th className="py-1.5 px-2 text-left">时间 (UTC / 本地)</th>
                           <th className="py-1.5 px-2 text-center">方向</th>
-                          <th className="py-1.5 px-2 text-right">理论入场价</th>
+                          <th className="py-1.5 px-2 text-right" title="观察价：信号触发当刻的市场报价快照（行情价，非可成交价）">观察入场价</th>
+                          <th className="py-1.5 px-2 text-right" title={EXEC_QUOTE_HINT}>可执行报价</th>
                           <th className="py-1.5 px-2 text-center">理论胜负</th>
                           <th className="py-1.5 px-2 text-right">理论单笔EV</th>
                           <th className="py-1.5 px-2 text-center">护栏判定</th>
@@ -8241,7 +8379,7 @@ function ShadowSignalDetailModal({
                       <tbody>
                         {pageOrders.length === 0 ? (
                           <tr>
-                            <td colSpan={11} className="py-8 text-center text-ink-55">
+                            <td colSpan={12} className="py-8 text-center text-ink-55">
                               当前筛选条件下无匹配订单
                             </td>
                           </tr>
@@ -8265,6 +8403,20 @@ function ShadowSignalDetailModal({
                                 </td>
                                 <td className="py-1.5 px-2 text-right font-mono text-ink-95">
                                   {o.entry_price != null ? o.entry_price.toFixed(3) : '--'}
+                                  {o.entry_quote_kind === 'window_open_sample' && (
+                                    <span className="text-[9px] px-0.5 py-0.2 ml-1 rounded-xs bg-warning-soft text-warning"
+                                      title="触发时快照缺失，回落目标窗首个采样价（采样表无市场身份，可能非目标市场）">
+                                      首采样
+                                    </span>
+                                  )}
+                                </td>
+                                <td className="py-1.5 px-2 text-right font-mono"
+                                  title={o.executable_quote
+                                    ? `${EXEC_QUOTE_HINT}\n档位 ${o.executable_quote.amount}U · 冻结护栏 ${o.executable_quote.guard_price ?? '—'}`
+                                    : `${EXEC_QUOTE_HINT}（本窗无样本）`}>
+                                  {o.executable_quote?.price != null
+                                    ? o.executable_quote.price.toFixed(3)
+                                    : <span className="text-ink-40">—</span>}
                                 </td>
                                 <td className="py-1.5 px-2 text-center">
                                   {o.win == null ? (
@@ -8395,7 +8547,7 @@ function ShadowSignalDetailModal({
                   <div className="border border-line rounded-sm p-3 bg-card">
                     <div className="flex items-center justify-between mb-2">
                       <span className="text-xs font-bold text-ink-95">累计收益与实盘盈亏走势 (Cumulative EV vs Real PnL)</span>
-                      <span className="text-[11px] text-ink-55">左轴=EV（理论/带护栏） · 右轴=USDT（实盘真实净盈亏）</span>
+                      <span className="text-[11px] text-ink-55">左轴=EV（理论/护栏反算，均为行情快照价） · 右轴=USDT（实盘真实净盈亏）</span>
                     </div>
                     <ResponsiveContainer width="100%" height={260}>
                       <ComposedChart data={chartEnhancedData}>
@@ -8420,7 +8572,7 @@ function ShadowSignalDetailModal({
                         <ReferenceLine yAxisId="ev" y={0} stroke="var(--line)" strokeDasharray="3 3" />
                         <Line
                           yAxisId="ev"
-                          name="带护栏累计EV"
+                          name="护栏反算累计EV（快照价）"
                           dataKey="cum_ev_guarded"
                           stroke="var(--brand)"
                           strokeWidth={2}
@@ -8429,7 +8581,7 @@ function ShadowSignalDetailModal({
                         />
                         <Line
                           yAxisId="ev"
-                          name="全量理论累计EV"
+                          name="全量理论累计EV（快照价）"
                           dataKey="cum_ev_theoretical"
                           stroke="var(--chart-1)"
                           strokeWidth={1.5}
@@ -8482,7 +8634,7 @@ function ShadowSignalDetailModal({
                           <ReferenceLine y={data.bench_winrate} stroke="var(--warning)" strokeDasharray="5 3" label="基准胜率" />
                         )}
                         <Line
-                          name="带护栏实际胜率"
+                          name="护栏反算胜率"
                           dataKey="win_rate_guarded"
                           stroke="var(--brand)"
                           strokeWidth={2}
@@ -8929,16 +9081,16 @@ function ShadowSignalCard({
               className={`px-2 py-0.5 rounded-xs transition-colors font-medium ${
                 guardMode === 'GUARDED' ? 'bg-card text-brand shadow-xs' : 'text-ink-55 hover:text-ink-80'
               }`}
-              title="仅统计通过实盘执行价护栏及白名单的实际可成交信号"
+              title="护栏反算：用**当前**护栏/白名单回算历史，价格取行情快照（market/list）。是反事实，不是当时真钱规则、也不是可成交价。"
             >
-              带护栏实际
+              护栏反算（快照价）
             </button>
             <button
               onClick={() => setGuardMode('THEORETICAL')}
               className={`px-2 py-0.5 rounded-xs transition-colors font-medium ${
                 guardMode === 'THEORETICAL' ? 'bg-card text-brand shadow-xs' : 'text-ink-55 hover:text-ink-80'
               }`}
-              title="原始全量影子信号（未做任何护栏拦截）"
+              title="原始全量影子信号（未做任何护栏拦截，价格同样取行情快照）"
             >
               全量理论
             </button>
@@ -8947,9 +9099,9 @@ function ShadowSignalCard({
               className={`px-2 py-0.5 rounded-xs transition-colors font-medium ${
                 guardMode === 'BOTH' ? 'bg-card text-brand shadow-xs' : 'text-ink-55 hover:text-ink-80'
               }`}
-              title="同时对比理论与带护栏实际数据"
+              title="同时对比理论、护栏反算与可执行报价（get_quote）三个口径"
             >
-              双口径对比
+              三口径对比
             </button>
           </div>
           {filterActive && (
@@ -8994,29 +9146,33 @@ function ShadowSignalCard({
                   {guardMode === 'BOTH' ? (
                     <>
                       {thSort('n', '实际n / 理论n', 'right')}
-                      {thSort('fill_rate', '成交率', 'right', '带护栏实际成交信号占理论信号的比例')}
-                      {thSort('win_rate', '带护栏实际胜率', 'right')}
+                      {thSort('fill_rate', '通过率', 'right', '护栏反算通过信号占理论信号的比例（用当前护栏回算历史）')}
+                      {thSort('win_rate', '反算胜率', 'right', '护栏反算子集的胜率（价格取行情快照）')}
                       <th className="py-1 px-2 text-right text-ink-40" title="未做护栏过滤的全量影子理论胜率">理论胜率</th>
-                      {thSort('breakeven', '实际保本率', 'right', '带护栏成交信号前向真实入场报价对应的平均保本胜率')}
+                      {thSort('breakeven', '实际保本率', 'right', '护栏反算子集前向真实入场报价对应的平均保本胜率')}
                       <th className="py-1 px-2 text-right" title="冻结回测胜率×0.98：费后理论允许的最高入场价">回测保本价</th>
                       {thSort('bench', '回测胜率', 'right')}
                       {thSort('dev', '偏离(实-基)', 'right')}
-                      {thSort('avg_ev', '实际单均EV', 'right')}
-                      <th className="py-1 px-2 text-right text-ink-40" title="理论单均EV">理论EV</th>
-                      {thSort('cum_ev', '实际累计EV', 'right')}
-                      <th className="py-1 px-2 text-right text-ink-40" title="理论累计EV">理论累计</th>
+                      {thSort('avg_ev', '反算单均EV', 'right', '护栏反算子集、行情快照价口径')}
+                      <th className="py-1 px-2 text-right text-ink-40" title="理论单均EV（行情快照价）">理论EV</th>
+                      {thSort('cum_ev', '反算累计EV', 'right')}
+                      <th className="py-1 px-2 text-right text-ink-40" title="理论累计EV（行情快照价）">理论累计</th>
+                      <th className="py-1 px-2 text-right text-brand" title={EXEC_QUOTE_HINT}>可执行n / 前向n</th>
+                      <th className="py-1 px-2 text-right text-brand" title={EXEC_QUOTE_HINT}>可执行单均EV</th>
                     </>
                   ) : guardMode === 'GUARDED' ? (
                     <>
-                      {thSort('n', '实际n', 'right')}
-                      {thSort('fill_rate', '成交率', 'right', '带护栏实际成交信号占理论信号的比例')}
-                      {thSort('win_rate', '实际胜率', 'right')}
-                      {thSort('breakeven', '实际保本率', 'right', '带护栏成交信号前向真实入场报价对应的平均保本胜率')}
+                      {thSort('n', '反算n', 'right')}
+                      {thSort('fill_rate', '通过率', 'right', '护栏反算通过信号占理论信号的比例（用当前护栏回算历史）')}
+                      {thSort('win_rate', '反算胜率', 'right', '护栏反算子集的胜率（价格取行情快照）')}
+                      {thSort('breakeven', '实际保本率', 'right', '护栏反算子集前向真实入场报价对应的平均保本胜率')}
                       <th className="py-1 px-2 text-right" title="冻结回测胜率×0.98：费后理论允许的最高入场价">回测保本价</th>
                       {thSort('bench', '回测胜率', 'right')}
                       {thSort('dev', '偏离', 'right')}
-                      {thSort('avg_ev', '实际单均EV', 'right')}
-                      {thSort('cum_ev', '实际累计EV', 'right')}
+                      {thSort('avg_ev', '反算单均EV', 'right', '护栏反算子集、行情快照价口径')}
+                      {thSort('cum_ev', '反算累计EV', 'right')}
+                      <th className="py-1 px-2 text-right text-brand" title={EXEC_QUOTE_HINT}>可执行n / 前向n</th>
+                      <th className="py-1 px-2 text-right text-brand" title={EXEC_QUOTE_HINT}>可执行单均EV</th>
                     </>
                   ) : (
                     <>
@@ -9054,6 +9210,13 @@ function ShadowSignalCard({
                             {EXECUTION_BADGE[s.execution_mode ?? 'SHADOW_ONLY']?.label ?? '仅影子'}
                           </span>
                           {signalDescFor('shadow', k) && <HelpHint text={`${k}：${signalDescFor('shadow', k)}`} />}
+                          {/* 观察价来源告警（2026-10-15）：非「触发时快照价」时显式标出，
+                              避免把历史/回落口径的价格当可成交价读 */}
+                          {s.quote_caliber && s.quote_caliber !== 'market_snapshot' && (
+                            <span className="ds-badge ds-badge-warn" title={quoteCaliberHint(s.quote_caliber)}>
+                              {QUOTE_CALIBER_LABEL[s.quote_caliber]?.label ?? s.quote_caliber}
+                            </span>
+                          )}
                         </span>
                       </td>
                       <td className="py-1 px-2 text-center">
@@ -9150,13 +9313,14 @@ function ShadowSignalCard({
                           <td className={`py-1 px-2 text-right font-mono text-[11px] ${s.avg_ev == null ? 'text-ink-40' : s.avg_ev >= 0 ? 'text-positive/70' : 'text-negative/70'}`}>{evFmt(s.avg_ev)}</td>
                           <td className={`py-1 px-2 text-right font-mono font-bold ${s.guarded_cum_ev == null ? 'text-ink-55' : s.guarded_cum_ev >= 0 ? 'text-positive' : 'text-negative'}`}>{evFmt(s.guarded_cum_ev)}</td>
                           <td className={`py-1 px-2 text-right font-mono text-[11px] ${s.cum_ev == null ? 'text-ink-40' : s.cum_ev >= 0 ? 'text-positive/70' : 'text-negative/70'}`}>{evFmt(s.cum_ev)}</td>
+                          <ExecutionQuoteCells quote={s.execution_quote} />
                         </>
                       ) : guardMode === 'GUARDED' ? (
                         <>
                           <td className="py-1 px-2 text-right font-mono font-bold">{s.guarded_n ?? 0}</td>
                           <td className="py-1 px-2 text-right font-mono font-medium">{pct1(s.guarded_fill_rate)}</td>
                           <td className="py-1 px-2 text-right font-mono font-bold text-brand">{pct1(s.guarded_win_rate)}</td>
-                          <td className="py-1 px-2 text-right font-mono text-ink-55" title={s.guarded_avg_breakeven == null ? '暂无前向真实报价样本' : '带护栏成交信号前向真实入场报价对应的平均保本胜率'}>{pct1(s.guarded_avg_breakeven)}</td>
+                          <td className="py-1 px-2 text-right font-mono text-ink-55" title={s.guarded_avg_breakeven == null ? '暂无前向真实报价样本' : '护栏反算子集前向真实入场报价对应的平均保本胜率'}>{pct1(s.guarded_avg_breakeven)}</td>
                           <td className="py-1 px-2 text-right font-mono text-ink-55">{pct1(s.bench_max_entry_price)}</td>
                           <td className="py-1 px-2 text-right font-mono text-ink-55">{pct1(s.bench_winrate)}</td>
                           <td className={`py-1 px-2 text-right font-mono ${dev == null ? 'text-ink-55' : dev >= 0 ? 'text-positive' : 'text-negative'}`}>
@@ -9164,6 +9328,7 @@ function ShadowSignalCard({
                           </td>
                           <td className={`py-1 px-2 text-right font-mono ${s.guarded_avg_ev == null ? 'text-ink-55' : s.guarded_avg_ev >= 0 ? 'text-positive' : 'text-negative'}`}>{evFmt(s.guarded_avg_ev)}</td>
                           <td className={`py-1 px-2 text-right font-mono ${s.guarded_cum_ev == null ? 'text-ink-55' : s.guarded_cum_ev >= 0 ? 'text-positive' : 'text-negative'}`}>{evFmt(s.guarded_cum_ev)}</td>
+                          <ExecutionQuoteCells quote={s.execution_quote} />
                         </>
                       ) : (
                         <>
@@ -9716,6 +9881,10 @@ function RegimeByVersionTable({
               实线=线上累计胜率；同色虚线=回测冻结胜率；同色点线=前向真实报价对应的平均保本率（没有前向报价样本时不绘制）。
               第 11 条起复用前十色相并降为淡色细线（克制色板做不出 22 个可区分色相），表格中的版本名同步淡化以保持对应。
               本区版本仍在采集，曲线末端=最新前向进展；「回测保本价」=冻结胜率×0.98，与前向保本率不是同一指标。
+              <br />
+              ⚠ 价格口径（2026-10-15 起标注）：本区所有 EV/胜率用的入场价都是<b>行情快照价</b>（触发当刻市场报价），
+              「护栏反算」是用<b>当前</b>护栏回算历史的反事实——两者都不是可成交价；触发当刻按 1/5/10U 询得的
+              <b>可执行报价</b>单列显示，无样本时显示「—」而不是 0。历史行（未标来源者）可能含非目标市场的窗口首采样价，仅供方向参考。
             </>
           }
         />

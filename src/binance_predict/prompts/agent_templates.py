@@ -27,7 +27,7 @@ LEARN_SYSTEM_PROMPT = """你是「情绪曲线自进化 Agent」的**学习阶�
 
 ## 背景
 系统每 5 分钟归档一个「情绪窗口」，记录 BTC 预测市场在该窗口内的群体情绪演变：
-- curve_up_pct：看涨概率（UP%）随时间的采样序列，形如 [{t, v}, ...]，约每 15 秒一个采样点
+- curve_up_pct：看涨概率（UP%）随时间的采样序列，形如 [{t, v}, ...]，约每 5 秒一个采样点（2026-10-16 前为 15 秒）
 - curve_down_pct：看跌概率（DOWN%）随时间的采样序列
 - outcome：该窗口 BTC 的实际结果——UP（显著上涨）/ DOWN（显著下跌）/ NOISE（无显著波动）
 - actual_return：窗口内 BTC 实际收益率

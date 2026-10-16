@@ -154,13 +154,15 @@ def _gap_crowd_row(**over) -> SimpleNamespace:
 
 
 def _make_db(shadow_rows, scene_rows, krev_rows=(), pattern_rows=(),
-             absorption_rows=(), firsthit_rows=(), gap_crowd_rows=()) -> AsyncMock:
+             absorption_rows=(), firsthit_rows=(), gap_crowd_rows=(),
+             forward_rows=()) -> AsyncMock:
     db = AsyncMock()
-    r1, r2, r3, r4, r5, r6, r7, r8 = (MagicMock() for _ in range(8))
+    r1, r2, r3, r4, r5, r6, r7, r8, r9 = (MagicMock() for _ in range(9))
     # 端点用指定列 SELECT，结果直接 .all()（不再 .scalars()）；
-    # 8 次查询顺序（2026-09-07 新增 firsthit；2026-10-10 新增 gap_crowd）：
+    # 9 次查询顺序（2026-09-07 新增 firsthit；2026-10-10 新增 gap_crowd；
+    # 2026-10-15 新增统一账本前向行——刻意置于末尾以保持既有顺序稳定）：
     #   影子行 → KREV 行 → pattern 行 → absorption 行 → firsthit 行 → gap_crowd 行 →
-    #   SceneParamVersion SHADOW 版本名（默认空）→ 场景行
+    #   SceneParamVersion SHADOW 版本名（默认空）→ 场景行 → 前向可执行报价行
     r1.all.return_value = shadow_rows
     r2.all.return_value = krev_rows
     r3.all.return_value = pattern_rows
@@ -169,7 +171,8 @@ def _make_db(shadow_rows, scene_rows, krev_rows=(), pattern_rows=(),
     r6.all.return_value = gap_crowd_rows
     r7.all.return_value = []
     r8.all.return_value = scene_rows
-    db.execute = AsyncMock(side_effect=[r1, r2, r3, r4, r5, r6, r7, r8])
+    r9.scalars.return_value.all.return_value = list(forward_rows)
+    db.execute = AsyncMock(side_effect=[r1, r2, r3, r4, r5, r6, r7, r8, r9])
     return db
 
 
@@ -1110,6 +1113,55 @@ async def test_analytics_shadow_guarded_metrics_and_curves() -> None:
 
 
 @pytest.mark.asyncio
+async def test_analytics_execution_quote_and_caliber_metadata() -> None:
+    """口径元数据：quote_caliber 标注入场观察价来源；execution_quote 只读统一账本
+    前向可执行报价（get_quote 估计），与行情快照 EV 并列且不相加。"""
+    import binance_predict.main as m
+    from binance_predict.services.live_execution_policy import config_fingerprint
+    from binance_predict.services.shadow_forward_evidence import PROFILE
+
+    version = "candle_hm_bull_15m_ma10_component_shadow_v1"
+    shadow = _krev_row(
+        version=version, win=True, entry_down_price=0.50, direction="DOWN",
+        feature_snapshot={"entry_quote_kind": "market_snapshot"},
+    )
+    profile = {**PROFILE, "amount_usdt": 1.0, "runtime_rules": {
+        "order_type": "MARKET", "max_exec_price": 0.55,
+        "entry_band_whitelist": None, "runtime_guard_resolved": True}}
+    forward = SimpleNamespace(
+        signal_version=version, target_window_start=1_000_000_000_000, direction="DOWN",
+        theoretical_outcome="DOWN", theoretical_win=True, strategy_eligible=True,
+        trigger_ts=1_000_000_000_000,
+        config_snapshot={"profile": profile, "hash": config_fingerprint(profile)},
+        input_snapshot={"capture_mode": "LIVE"},
+        decision_snapshot={"shadow_capacity": {"accepted": True}},
+        quote_snapshot={"ladder": {"1": {
+            "available": True, "average_price": 0.50, "amount_usdt": 1.0,
+            "received_at": 1_000_000_000_500, "amount_out": "2000000000000000000"}}},
+    )
+    out = await m.get_signals_analytics(_make_db([], [], krev_rows=[shadow], forward_rows=[forward]))
+
+    summary = out["shadow"][version]["summary"]
+    assert summary["quote_caliber"] == "market_snapshot"
+    assert summary["guard_caliber"] == "current_config_recomputed"
+    quote = summary["execution_quote"]
+    assert quote["caliber"] == "trigger_time_get_quote_not_fill"
+    assert (quote["n"], quote["live_n"], quote["quote_n"], quote["coverage"]) == (1, 1, 1, 1.0)
+    assert quote["amount"] == "1" and quote["avg_price"] == 0.50
+    assert quote["win_rate"] == 1.0 and quote["avg_ev"] == pytest.approx(0.98 / 0.50 - 1)
+    assert quote["guard_price_frozen"] == 0.55
+    assert quote["legacy_guard_n"] == 0
+    assert quote["amounts"]["1"]["cum_ev"] == pytest.approx(0.98 / 0.50 - 1)
+
+    # 无前向样本的版本：execution_quote 为 None（不得用 0 冒充），观察价来源照实标注
+    legacy = await m.get_signals_analytics(_make_db([], [], krev_rows=[
+        _krev_row(version="krev_a_v1", win=True, entry_down_price=0.5, direction="UP")]))
+    legacy_summary = legacy["shadow"]["krev_a_v1"]["summary"]
+    assert legacy_summary["execution_quote"] is None
+    assert legacy_summary["quote_caliber"] == "legacy_unknown"
+
+
+@pytest.mark.asyncio
 async def test_shadow_signal_detail_api() -> None:
     """测试单影子信号详情端点：逐笔对齐、执行漏斗、实盘订单关联、分桶与曲线。"""
     import binance_predict.main as m
@@ -1207,3 +1259,5 @@ async def test_shadow_signal_detail_api() -> None:
     # 检查 curves
     assert len(res["curves"]) == 3
     assert res["curves"][0]["cum_ev_theoretical"] == pytest.approx(0.98/0.07 - 1)
+
+

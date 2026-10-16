@@ -1,5 +1,5 @@
 """
-BTC 5min LLM 预测系统 V2 - SQLAlchemy ORM 模型
+BTC 预测市场系统 - SQLAlchemy ORM 模型
 
 对应 V2 PRD §16 数据库设计。
 所有表结构与 Pydantic schemas（models/schemas.py）严格对齐，
@@ -170,7 +170,7 @@ class TradeOrderModel(Base):
 # ============================================================
 
 class PredictionMarketSample(Base):
-    """预测市场情绪采样：每 15s 记录 UP/DOWN token 价格（5m/15m 双市场）"""
+    """预测市场情绪采样：UP/DOWN token 价格（5m/15m 双市场）；2026-10-16 前每 15s、之后每 5s 一行"""
     __tablename__ = "prediction_market_samples"
     __table_args__ = (
         Index("ix_pm_samples_timestamp", "timestamp"),

@@ -1,5 +1,5 @@
 """
-BTC 5min LLM 预测系统 V2 - 全局配置模块
+BTC 预测市场系统 - 全局配置模块
 
 从 .env 文件和环境变量加载配置，使用 pydantic-settings 进行类型安全校验。
 所有配置项集中管理，确保前后端数据一致性（对应用户规则 8）。
@@ -57,8 +57,9 @@ class Settings(BaseSettings):
     noise_threshold: float = 0.0005
 
     # --- 原始采样保留策略 ---
-    # prediction_market_samples（15s 级原始数据）的保留时长（小时）。
-    # <=0 表示永不删除（默认）：TimescaleDB 下约 5760 行/天、~300MB/年，成本可忽略；
+    # prediction_market_samples（报价原始数据；2026-10-16 前为 15s 级、之后 5s 级，
+    # 新旧行混存按 timestamp 区分）的保留时长（小时）。
+    # <=0 表示永不删除（默认）：TimescaleDB 下 15s 段约 1.2 万行/天、5s 段约 3.5 万行/天，成本可忽略；
     # 而归档表只保存"当时想到要存的"字段——历史价格曲线因旧的 1 小时清理策略
     # 永久丢失（3510/3522 窗口无价格数据）即为教训。需要旧行为可设为 1。
     sample_retention_hours: float = 0.0
@@ -317,8 +318,9 @@ class Settings(BaseSettings):
     agent_evolve_min_new_samples: int = 24
     # Learn 窗口数：Learn 阶段选取最近 N 个 outcome 非空的情绪窗口（Req 2.2）
     agent_learn_window_count: int = 50
-    # Predict 触发采样点：当前窗口累计有效采样点达到 N 个时触发 Predict（Req 3.1）
-    agent_predict_trigger_samples: int = 10
+    # Predict 触发采样点：当前窗口累计有效采样点达到 N 个时触发 Predict（Req 3.1）。
+    # 30 × 5s ≈ 150s（半窗），与旧口径 10 × 15s 的触发时点一致（2026-10-16 采样 15s→5s）
+    agent_predict_trigger_samples: int = 30
     # ACTIVE 模式数上限：超过则 Evolve 强制淘汰超额部分（Req 5.8）
     agent_active_pattern_cap: int = 30
     # 淘汰保护最小样本数：sample_count <= 此值的模式不因上限被淘汰（Req 5.8）
@@ -491,10 +493,7 @@ class Settings(BaseSettings):
     candlestick_shadow_enabled: bool = True
 
     # --- 多通道实盘（MultiLiveTrader，2026-08-24，取代旧单版本 quote_edge 实盘字段）---
-    # 13 通道（quote_edge 族 1：contrarian_v2；x4 × 2：x4_v2/x4_v3；
-    # 场景 5：S1/S2/S4/S5 + s5_deep；2026-09-06 影子 promote 5：
-    # s2_cond_t4/t5d、nb_smaslope_5m、absorption_follow_td120/150）
-    # 可同时开启；每通道独立金额/日限/护栏，通道静态描述见 services/live_channels.py。
+    # 通道全集见 services/live_channels.LIVE_CHANNELS，可同时开启；每通道独立金额/日限/护栏，通道静态描述见 services/live_channels.py。
     # 2026-09-04 退役 8 通道（momentum v1/v2/v3、contrarian v1/v3a/v3b/v4、x4_v1），
     # 退役名单 live_channels.RETIRED_CHANNELS：不再装配也不可 toggle 上线，
     # 但配置（env JSON / DB 覆盖行）里残留退役名只告警跳过、不拒启。
