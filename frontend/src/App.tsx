@@ -2422,6 +2422,19 @@ ${names}
 // 2026-08-29：加「目标周期」列——window_start + market_period 展示真正下注的窗口时段；
 // 2026-09-08：失败单从主列表剥离，改双 Tab（最近订单 / 失败订单）——
 // 失败单 amount_in=0、token_id=""、均价是报价不是成交价，混在主列表里会污染盈亏阅读）
+//
+// 复利链每链一个 signal_version（manual_chain_<链号>，后端 (版本,窗口) 唯一键与重启认领靠它），
+// 若按原样进筛选器，每下一条链就多一个选项（2026-10-16 实测 35 条）；
+// 订单表统一按「族」收敛：筛选器只出一条「复利链」，行内保留链号便于追溯。
+const MANUAL_CHAIN_PREFIX = 'manual_chain_'
+const channelFilterKey = (ver: string) => (ver.startsWith(MANUAL_CHAIN_PREFIX) ? MANUAL_CHAIN_PREFIX : ver)
+const channelFilterLabel = (key: string) => key === MANUAL_CHAIN_PREFIX
+  ? '复利链（手动）'
+  : (SIGNAL_INFO[key]?.name ?? key)
+const channelRowLabel = (ver: string) => ver.startsWith(MANUAL_CHAIN_PREFIX)
+  ? `复利链 #${ver.slice(MANUAL_CHAIN_PREFIX.length)}`
+  : (SIGNAL_INFO[ver]?.name ?? ver)
+
 const DEFAULT_ORDERS_PAGE_SIZE = 20
 
 function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
@@ -2446,19 +2459,20 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
   const base = orderTab === 'active' ? activeOrders : failedOrders
 
   const channels = Array.from(new Set(
-    base.map(o => String(o.signal_version ?? '')).filter(v => v && v !== '--'))).sort()
+    base.map(o => channelFilterKey(String(o.signal_version ?? ''))).filter(v => v && v !== '--'))).sort()
   const kw = fKeyword.trim().toLowerCase()
   const filtered = base.filter(o => {
     if (orderTab === 'active' && fStatus !== 'ALL' && String(o.status ?? '') !== fStatus) return false
-    if (fChannel !== 'ALL' && String(o.signal_version ?? '') !== fChannel) return false
+    if (fChannel !== 'ALL' && channelFilterKey(String(o.signal_version ?? '')) !== fChannel) return false
     if (fDirection !== 'ALL' && String(o.direction ?? '') !== fDirection) return false
     if (kw) {
       const idStr = String(o.id ?? '').toLowerCase()
       const ver = String(o.signal_version ?? '').toLowerCase()
       const verName = (SIGNAL_INFO[o.signal_version as string]?.name ?? '').toLowerCase()
+      const verLabel = channelRowLabel(String(o.signal_version ?? '')).toLowerCase()
       const msg = String(o.error_message ?? '').toLowerCase()
       const dir = String(o.direction ?? '').toLowerCase()
-      if (!idStr.includes(kw) && !ver.includes(kw) && !verName.includes(kw) && !msg.includes(kw) && !dir.includes(kw)) {
+      if (!idStr.includes(kw) && !ver.includes(kw) && !verName.includes(kw) && !verLabel.includes(kw) && !msg.includes(kw) && !dir.includes(kw)) {
         return false
       }
     }
@@ -2538,6 +2552,16 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
   const cellChannel = (o: Record<string, unknown>) => {
     const ver = String(o.signal_version ?? '')
     const info = SIGNAL_INFO[ver]
+    if (ver.startsWith(MANUAL_CHAIN_PREFIX)) {
+      return (
+        <td className="py-1.5 pr-2">
+          <span className="inline-flex items-center gap-1">
+            <span className="text-ink-95">{channelRowLabel(ver)}</span>
+            <HelpHint text={`${ver}（复利链手动单）：同一链各腿共用一个版本号，链内依次下注 5m 窗口，赢则本金+利润滚入下一腿，输即终止。链进度见下单弹窗的复利链面板。`} />
+          </span>
+        </td>
+      )
+    }
     return (
       <td className="py-1.5 pr-2">
         {info ? (
@@ -2662,7 +2686,7 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
           <select value={fChannel} onChange={e => setFChannel(e.target.value)} className={selectCls} title="按信号通道筛选">
             <option value="ALL">全部通道</option>
             {channels.map(v => (
-              <option key={v} value={v}>{SIGNAL_INFO[v]?.name ?? v}</option>
+              <option key={v} value={v}>{channelFilterLabel(v)}</option>
             ))}
           </select>
           <select value={fDirection} onChange={e => setFDirection(e.target.value)} className={selectCls} title="按押注方向筛选">
@@ -3752,7 +3776,7 @@ function LiveTradeTab() {
                     <tbody className="divide-y divide-line-soft font-mono">
                       {redeemDetails.map(d => {
                         const info = d.signal_version ? SIGNAL_INFO[d.signal_version] : null
-                        const name = info?.name ?? d.signal_version ?? '人工/未知'
+                        const name = info?.name ?? (d.signal_version ? channelRowLabel(d.signal_version) : '人工/未知')
                         const isClaimable = d.can_claim
                         return (
                           <tr key={d.order_id} className="hover:bg-card/50 transition-colors">
