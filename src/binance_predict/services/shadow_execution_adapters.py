@@ -134,8 +134,17 @@ class ShadowSourceAdapter:
             theoretical_settled_at=self.settled_at(row),
             source_payload={
                 "source_table": self.model.__tablename__,
+                # 蜡烛族按 timeframe 只落一行物理事件，逻辑标签存在 feature_snapshot：
+                # matched=gate 启用的标签、all=全部命中标签（前向行按 all 建行，故
+                # 投影器结算标签行必须读 all，否则会漏结算被手动下线的标签）。
                 "matched_signal_ids": (
                     list((getattr(row, "feature_snapshot", None) or {}).get("matched_signal_ids", []))
+                    if self.source_type is SourceType.KLINE else []
+                ),
+                "all_matched_signal_ids": (
+                    list((getattr(row, "feature_snapshot", None) or {}).get(
+                        "all_matched_signal_ids",
+                        (getattr(row, "feature_snapshot", None) or {}).get("matched_signal_ids", [])))
                     if self.source_type is SourceType.KLINE else []
                 ),
             },

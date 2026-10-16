@@ -43,15 +43,40 @@ class QuoteBudget:
 QUOTE_QUEUE = QuoteBudget()
 
 
+def _effective_runtime_rules(ch_spec, config) -> dict:
+    """触发瞬间的生效执行规则（护栏取热调值，缺省回落 spec.auto_max_exec）。
+
+    2026-10-15 修正：原实现只读运行时 ChannelConfig——未热调时 max_exec_price=None
+    会让 quote_returns 回落到 PROFILE 的统一 0.50（而非该通道自己的 auto_max_exec，
+    如蜡烛族 0.6842/0.6533），order_type 更因该字段不在 ChannelConfig 上而恒为 None，
+    入场白名单则完全没冻结。此处按实盘同源口径（热调值优先 → spec.auto_max_exec、
+    spec.order_type、spec.entry_band_whitelist）解析后冻结，使前向「可执行报价」
+    估计与当时真钱规则一致。
+    """
+    override = getattr(config, "max_exec_price", None)
+    auto = getattr(ch_spec, "auto_max_exec", None)
+    bands = getattr(ch_spec, "entry_band_whitelist", None)
+    return {
+        "order_type": getattr(ch_spec, "order_type", None) or "MARKET",
+        "max_exec_price": override if override is not None else auto,
+        "entry_band_whitelist": [list(band) for band in bands] if bands else None,
+        "max_daily_orders": getattr(config, "max_daily_orders", None),
+        "guard_source": ("runtime_override" if override is not None
+                         else ("spec_auto_max_exec" if auto is not None else None)),
+        "runtime_guard_resolved": True,
+    }
+
+
 def capture_event(snapshot, version):
     """Synchronous trigger-time copy, before persistence or quote awaits."""
     from copy import deepcopy
+    from .live_channels import LIVE_CHANNELS
     from .shadow_execution_registry import SHADOW_VERSION_SPECS
     spec = SHADOW_VERSION_SPECS.get(version)
-    config = (_runtime_configs() if _runtime_configs else {}).get(spec.live_channel if spec else version)
+    channel = spec.live_channel if spec else version
+    config = (_runtime_configs() if _runtime_configs else {}).get(channel)
     profile = {**PROFILE, "signal_version": version, "amount_usdt": current_amount(version),
-               "runtime_rules": {name: getattr(config, name, None) for name in
-                                 ("order_type", "max_exec_price", "max_daily_orders")}}
+               "runtime_rules": _effective_runtime_rules(LIVE_CHANNELS.get(channel), config)}
     fingerprint = config_fingerprint(profile)
     return {**deepcopy(snapshot), "_frozen": {"profile": profile, "hash": fingerprint,
         "cohort": "forward-v2-"+fingerprint[:16],
@@ -368,6 +393,14 @@ def quote_returns(row):
     if outcome not in {"UP", "DOWN"} or snapshot.get("strategy_eligible") is not True:
         return {}
     trigger = snapshot.get("trigger_ts")
+    # 冻结执行规则（2026-10-15）：order_type / 护栏 / 入场白名单一律读触发时冻结值；
+    # 旧画像（无 runtime_rules 这些键）回落 MARKET + PROFILE 护栏 + 无白名单，行为不变。
+    rules = profile.get("runtime_rules") or {}
+    order_type = rules.get("order_type") or profile.get("order_type") or "MARKET"
+    max_exec = rules.get("max_exec_price")
+    if max_exec is None:
+        max_exec = profile.get("max_exec_price")
+    bands = rules.get("entry_band_whitelist")
     results = {}
     for amount, quote in ((snapshot.get("quote_snapshot") or {}).get("ladder") or {}).items():
         price = quote.get("average_price")
@@ -378,8 +411,9 @@ def quote_returns(row):
                 math.isfinite(stake) and stake > 0 and trigger and received and
                 0 <= received-trigger <= profile["quote_max_age_ms"]):
             continue
-        gate = evaluate_quote_execution_policy(order_type="MARKET", avg_price=price,
-                                                max_exec_price=profile.get("runtime_rules", {}).get("max_exec_price") or profile["max_exec_price"])
+        gate = evaluate_quote_execution_policy(
+            order_type=order_type, avg_price=price, max_exec_price=max_exec,
+            entry_bands=tuple((float(lo), float(hi)) for lo, hi in bands) if bands else None)
         if not gate.eligible:
             continue
         won = outcome == snapshot.get("direction")
@@ -388,11 +422,27 @@ def quote_returns(row):
             return stake*((1-profile["fee_assumption"])/stressed-1) if won else -stake
         results[amount] = {"stake": stake, "pnl": pnl(0), "stress_1pct": pnl(.01),
                            "stress_3pct": pnl(.03), "fill": False,
+                           "price": price, "amount_usdt": stake,
                            "capacity_passed_for_amount": stake == profile.get("amount_usdt"),
                            "counterfactual_amount": stake != profile.get("amount_usdt"),
                            "amount_out_valid": valid_amount_out(quote.get("amount_out")),
-                           "admission": False, "fees_verified": False}
+                           "admission": False, "fees_verified": False,
+                           # 该笔所用冻结执行规则（审计：历史行可能是旧画像，护栏口径不同）
+                           "guard_price": max_exec, "order_type": order_type}
     return results
+
+
+def apply_settlement(row, outcome: str) -> None:
+    """把结算结果写进单行前向评估（含该行报价阶梯的结算估计）；调用方负责提交。
+
+    幂等：同一 outcome 重复写入结果一致。与 settle_firsthit 共用，避免两条路径口径分叉。
+    """
+    row.theoretical_outcome = outcome
+    row.theoretical_win = row.direction == outcome
+    row.theoretical_settled_at = datetime.now(timezone.utc)
+    decision = dict(row.decision_snapshot or {})
+    decision["settlement_quote_estimates"] = quote_returns(row)
+    row.decision_snapshot = decision
 
 
 async def settle_firsthit(session, window_start, outcome, market_period="5m", signal_version=None):
@@ -405,9 +455,4 @@ async def settle_firsthit(session, window_start, outcome, market_period="5m", si
         *([ShadowExecutionAssessment.signal_version == signal_version] if signal_version else [])
     ))).scalars().all()
     for row in rows:
-        row.theoretical_outcome = outcome
-        row.theoretical_win = row.direction == outcome
-        row.theoretical_settled_at = datetime.now(timezone.utc)
-        decision = dict(row.decision_snapshot or {})
-        decision["settlement_quote_estimates"] = quote_returns(row)
-        row.decision_snapshot = decision
+        apply_settlement(row, outcome)

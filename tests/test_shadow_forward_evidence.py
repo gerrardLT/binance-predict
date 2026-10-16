@@ -109,6 +109,72 @@ def test_capture_runtime_profile_changes_cohort(monkeypatch):
     assert first["_frozen"]["profile"]["amount_usdt"] == 3
 
 
+def test_capture_event_freezes_effective_execution_rules(monkeypatch):
+    """护栏必须冻结「生效值」：未热调时回落 spec.auto_max_exec，而非 None（旧实现
+    会让结算估计统一回落到 0.50）；order_type 与入场白名单同样随画像冻结。"""
+    from binance_predict.services import shadow_forward_evidence as module
+    from binance_predict.services.live_channels import LIVE_CHANNELS
+
+    version = "candle_hm_bull_15m_ma10_component_shadow_v1"
+    spec = LIVE_CHANNELS[version]
+    config = SimpleNamespace(amount_usdt=2.0, max_exec_price=None, max_daily_orders=100)
+    monkeypatch.setattr(module, "_runtime_configs", lambda: {version: config})
+    event = {"window_start": 1000, "trigger_ts": 1100}
+
+    rules = module.capture_event(event, version)["_frozen"]["profile"]["runtime_rules"]
+    assert rules["max_exec_price"] == spec.auto_max_exec
+    assert rules["guard_source"] == "spec_auto_max_exec"
+    assert rules["order_type"] == "MARKET"
+    assert rules["runtime_guard_resolved"] is True
+
+    config.max_exec_price = 0.55
+    rules = module.capture_event(event, version)["_frozen"]["profile"]["runtime_rules"]
+    assert rules["max_exec_price"] == 0.55 and rules["guard_source"] == "runtime_override"
+
+    # 白名单通道：冻结值须与 spec 一致（旧实现完全没冻结白名单）
+    band_version = "absorption_follow_td120_v1"
+    monkeypatch.setattr(module, "_runtime_configs", lambda: {
+        band_version: SimpleNamespace(amount_usdt=1.0, max_exec_price=None, max_daily_orders=100)})
+    rules = module.capture_event(event, band_version)["_frozen"]["profile"]["runtime_rules"]
+    assert rules["entry_band_whitelist"] == [list(LIVE_CHANNELS[band_version].entry_band_whitelist[0])]
+
+
+def test_quote_returns_honours_frozen_execution_rules():
+    """结算估计读触发时冻结的护栏/白名单；旧画像（无 runtime_rules）行为不变。"""
+    from binance_predict.services.live_execution_policy import config_fingerprint
+    from binance_predict.services.shadow_forward_evidence import PROFILE, PROFILE_HASH, quote_returns
+
+    def _row(profile):
+        return {
+            "config_snapshot": {"profile": profile, "hash": config_fingerprint(profile)},
+            "decision_snapshot": {"shadow_capacity": {"accepted": True}},
+            "input_snapshot": {"capture_mode": "LIVE"}, "strategy_eligible": True,
+            "direction": "DOWN", "theoretical_outcome": "DOWN", "trigger_ts": 1000,
+            "quote_snapshot": {"ladder": {"1": {
+                "available": True, "average_price": .35, "amount_usdt": 1.0,
+                "received_at": 1100, "amount_out": "1"}}},
+        }
+
+    # 冻结护栏 0.30 → 0.35 贴线以上被拒（与实盘同口径：含贴线弃单）
+    assert quote_returns(_row({**PROFILE, "runtime_rules": {
+        "order_type": "MARKET", "max_exec_price": .30}})) == {}
+    # 冻结白名单不含 0.35 → 拒
+    assert quote_returns(_row({**PROFILE, "runtime_rules": {
+        "order_type": "MARKET", "max_exec_price": .50,
+        "entry_band_whitelist": [[.60, .70]]}})) == {}
+    # 护栏与白名单都放行 → 出估计，且回带所用规则供审计
+    out = quote_returns(_row({**PROFILE, "runtime_rules": {
+        "order_type": "MARKET", "max_exec_price": .50,
+        "entry_band_whitelist": [[.30, .40]]}}))["1"]
+    assert out["price"] == .35 and out["guard_price"] == .50 and out["order_type"] == "MARKET"
+    # 旧画像（无 runtime_rules）：回落 PROFILE 护栏 0.50、无白名单，行为与改动前一致
+    legacy = {**PROFILE}
+    legacy.pop("runtime_rules", None)
+    assert "1" in quote_returns(_row(legacy))
+    assert quote_returns(_row({"runtime_rules": None, **legacy}))["1"]["guard_price"] == .50
+    assert PROFILE_HASH
+
+
 def test_overflow_and_capture_exception_never_escape(monkeypatch):
     from binance_predict.services import shadow_forward_evidence as module
     monkeypatch.setattr(module, "OVERFLOW_COUNTS", {})

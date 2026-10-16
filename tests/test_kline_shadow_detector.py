@@ -357,6 +357,106 @@ async def test_fresh_krev_hit_dispatches_live_payload(monkeypatch) -> None:
     assert {p["version"] for p in fired} <= {"krev_a_v1", "krev_b_v1"}
     assert all(p["market_start"] == target and p["direction"] == "UP" for p in fired)
 
+
+# ============================================================
+# 续发跳过（2026-10-09）：相邻信号根连续命中只保留首发实盘派单
+# ============================================================
+
+def _hit_at(d: KlineShadowDetector, idx: int):
+    """构造 evaluate_conditions 替身：指定信号根命中 krev_a_v1（口径正确性另测）。"""
+    return lambda _fm, _specs, _n_tail: [{"spec": d._specs[0], "idx": idx, "bar_offset": 0}]
+
+
+async def _eval_hit(monkeypatch, d, rows, sub, session, idx: int) -> None:
+    """以「idx 命中、时刻新鲜」执行一次 _evaluate_new_bars。"""
+    monkeypatch.setattr(ksd, "evaluate_conditions", _hit_at(d, idx))
+    target = int(rows[idx]["open_time"]) + ksd.BAR_MS_15M
+    monkeypatch.setattr(ksd.time, "time", lambda: (target + 30_000) / 1000)
+    await d._evaluate_new_bars(rows, sub)
+
+
+@pytest.mark.asyncio
+async def test_refire_adjacent_second_hit_skips_live_dispatch(monkeypatch) -> None:
+    """相邻根连续命中：首发派单，第二根跳过实盘但影子照常落表。"""
+    rows = _flat_then_drop_rows(n_flat=44, n_drop=0)
+    sub = _sub_rows_for_last_cycle(rows)
+    session = _FakeSession(scalar=None)
+    d = KlineShadowDetector(collector=None, pm_15m_latest={})
+    fired: list[dict] = []
+    d._on_live_fire = fired.append
+    monkeypatch.setattr(ksd, "async_session_factory", lambda: _FakeSessionCtx(session))
+    monkeypatch.setattr(ksd.shadow_gate, "is_enabled", lambda _version: True)
+
+    i_first, i_second, i_third = len(rows) - 3, len(rows) - 2, len(rows) - 1
+    d._last_evaluated_bar = int(rows[i_first - 1]["open_time"])
+    await _eval_hit(monkeypatch, d, rows, sub, session, i_first)
+    assert len(fired) == 1 and fired[0]["market_start"] == int(rows[i_first]["open_time"]) + 900_000
+
+    d._last_evaluated_bar = int(rows[i_first]["open_time"])
+    await _eval_hit(monkeypatch, d, rows, sub, session, i_second)
+    assert len(fired) == 1, "相邻续发不得二次派单"
+    assert d._refire_skip_count == 1
+    assert len(session.added) == 2, "续发影子信号仍须落表（口径保真）"
+
+    # 连续第三根仍判为续发（被跳过的第二根属正式命中）
+    d._last_evaluated_bar = int(rows[i_second]["open_time"])
+    await _eval_hit(monkeypatch, d, rows, sub, session, i_third)
+    assert len(fired) == 1 and d._refire_skip_count == 2
+    assert len(session.added) == 3
+
+
+@pytest.mark.asyncio
+async def test_refire_gap_bar_allows_dispatch(monkeypatch) -> None:
+    """中间隔一根（非相邻）再命中 → 不属续发，正常派单。"""
+    rows = _flat_then_drop_rows(n_flat=44, n_drop=0)
+    sub = _sub_rows_for_last_cycle(rows)
+    session = _FakeSession(scalar=None)
+    d = KlineShadowDetector(collector=None, pm_15m_latest={})
+    fired: list[dict] = []
+    d._on_live_fire = fired.append
+    monkeypatch.setattr(ksd, "async_session_factory", lambda: _FakeSessionCtx(session))
+    monkeypatch.setattr(ksd.shadow_gate, "is_enabled", lambda _version: True)
+
+    i_first, i_gap, i_far = len(rows) - 3, len(rows) - 2, len(rows) - 1
+    d._last_evaluated_bar = int(rows[i_first - 1]["open_time"])
+    await _eval_hit(monkeypatch, d, rows, sub, session, i_first)
+    # i_gap 不命中：推进已评估游标即可
+    d._last_evaluated_bar = int(rows[i_gap]["open_time"])
+    await _eval_hit(monkeypatch, d, rows, sub, session, i_far)
+    assert len(fired) == 2, "间隔根再命中不属续发，应正常派单"
+    assert d._refire_skip_count == 0
+
+
+@pytest.mark.asyncio
+async def test_refire_versions_tracked_independently(monkeypatch) -> None:
+    """续发状态按 version 独立：A 的上一根命中不影响 B 同根首发。"""
+    rows = _flat_then_drop_rows(n_flat=44, n_drop=0)
+    sub = _sub_rows_for_last_cycle(rows)
+    session = _FakeSession(scalar=None)
+    d = KlineShadowDetector(collector=None, pm_15m_latest={})
+    fired: list[dict] = []
+    d._on_live_fire = fired.append
+    monkeypatch.setattr(ksd, "async_session_factory", lambda: _FakeSessionCtx(session))
+    monkeypatch.setattr(ksd.shadow_gate, "is_enabled", lambda _version: True)
+
+    i_prev, i_now = len(rows) - 2, len(rows) - 1
+    d._last_hit_bar["krev_a_v1"] = int(rows[i_prev]["open_time"])  # A 上一根刚命中
+    d._last_evaluated_bar = int(rows[i_prev]["open_time"])
+    monkeypatch.setattr(
+        ksd, "evaluate_conditions",
+        lambda _fm, _specs, _n_tail: [{"spec": d._specs[1], "idx": i_now, "bar_offset": 0}],
+    )
+    target = int(rows[i_now]["open_time"]) + ksd.BAR_MS_15M
+    monkeypatch.setattr(ksd.time, "time", lambda: (target + 30_000) / 1000)
+    await d._evaluate_new_bars(rows, sub)
+    assert len(fired) == 1 and fired[0]["version"] == "krev_b_v1", "B 的首发不受 A 续发状态影响"
+
+
+@pytest.mark.asyncio
+async def test_refire_skip_counter_in_status() -> None:
+    d = KlineShadowDetector(collector=None, pm_15m_latest={})
+    assert d.status()["refire_skip_count"] == 0
+
 # ============================================================
 # 实盘注册：不进 X4 专用白名单，通道默认由统一配置关闭
 # ============================================================

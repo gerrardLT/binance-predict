@@ -19,6 +19,8 @@
 
 采集与执行解耦：影子信号照常落表；同名实盘通道默认关闭。仅正常轮询中新收盘根、
 且目标根开盘后 90 秒内的新鲜命中才通过钩子交给 MultiLiveTrader；冷启动回补不追单。
+2026-10-09 起实盘派单叠加续发跳过：同一 version 相邻信号根连续命中只保留首发
+（影子证据：相邻续发 1 胜 5 负 vs 首发 67%；10-05 相邻双窗 4×5U 全输）。
 结算口径与回测 reversal_1 一致：次根收阳（close>open）即赢；平盘 → NOISE/EXPIRED。
 
 数据流：
@@ -138,6 +140,12 @@ class KlineShadowDetector:
         self._last_evaluated_bar: int | None = None  # 已评估过的最大 15m open_time
         self._trigger_count = 0
         self._settle_count = 0
+        # 续发跳过（2026-10-09 实盘归因）：同一 version 相邻信号根连续命中冻结条件时，
+        # 只保留首发实盘派单。影子 33 事件中相邻续发 6 事件 1 胜 5 负（17%，首发同期
+        # 67%）；实盘 10-05 12:15→12:30 相邻双窗 4×5U 全输 -19.9U。影子落表不受影响。
+        # 进程内存态：冷启动回补会把末段命中重新打底；重启瞬间最多漏判一次续发。
+        self._last_hit_bar: dict[str, int] = {}  # version → 最近正式命中的信号根 open_time
+        self._refire_skip_count: int = 0
         # 条件预解析（注册表原文 → 原子片段），启动时一次性暴露格式错误
         self._specs = [{**s, "parts": parse_condition(s["condition"])} for s in SHADOW_CONDITIONS]
         self._on_live_fire = None
@@ -234,7 +242,18 @@ class KlineShadowDetector:
             added = 0
             for hit in hits:
                 bar = closed_15m[hit["idx"]]
-                payloads = live_payloads if collect_live else None
+                version = hit["spec"]["version"]
+                start_ms = int(bar["open_time"])
+                refire = self._last_hit_bar.get(version) == start_ms - BAR_MS_15M
+                # 被跳过的续发仍属正式命中：连续第三、四根继续判为续发
+                self._last_hit_bar[version] = start_ms
+                if refire and collect_live:
+                    self._refire_skip_count += 1
+                    logger.info(
+                        "KREV 续发跳过实盘派单 | {} | 信号根 {}（上一相邻根也命中冻结条件）",
+                        version, start_ms,
+                    )
+                payloads = live_payloads if (collect_live and not refire) else None
                 if await self._record_signal(session, hit["spec"], bar, fm, hit["idx"], payloads):
                     added += 1
             if added:
@@ -393,6 +412,7 @@ class KlineShadowDetector:
             "last_evaluated_bar": self._last_evaluated_bar,
             "trigger_count": self._trigger_count,
             "settle_count": self._settle_count,
+            "refire_skip_count": self._refire_skip_count,
             "versions": [s["version"] for s in self._specs],
             "live_channels_registered": True,
         }

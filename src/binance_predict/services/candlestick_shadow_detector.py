@@ -410,11 +410,16 @@ class CandlestickShadowDetector:
                 "signal_bar_start": start,
             } for version in live_labels)
         labels = _enabled_labels(live_labels)
+        has_trigger_quote = up_q is not None and down_q is not None
         snapshot = {
             **hit["snapshot"],
             "matched_signal_ids": labels,
             "all_matched_signal_ids": live_labels,
             "quote_snapshots": {},
+            # 入场观察价来源（2026-10-15）：触发时市场报价快照=market_snapshot（权威，
+            # 结算不再覆盖）；缺失时结算回落目标窗首个 15s 采样=window_open_sample。
+            "entry_quote_kind": "market_snapshot" if has_trigger_quote else None,
+            "window_open_quote": None,
         }
         session.add(KlineShadowSignal(
             version=event_version,
@@ -479,17 +484,39 @@ class CandlestickShadowDetector:
                 snapshots = quote_snapshots(await self._load_quote_points(tf, target_start), target_start)
                 feature_snapshot = dict(signal.feature_snapshot or {})
                 first = snapshots["first"]
+                # 入场观察价口径（2026-10-15 修正）：触发时市场报价快照是唯一权威来源，
+                # 结算不再覆盖它。旧实现用「目标窗内首个 15s 采样」覆盖 entry_*，而
+                # prediction_market_samples 无市场身份列（start/end_date），边界首个采样
+                # 可能是刚结束市场的报价 → 记下目标市场并不存在的价格（实测 ma10 一笔
+                # 影子 0.27 / 实盘成交 0.50）。该采样降级为审计字段 window_open_quote，
+                # 仅在触发时快照缺失（冷启动回补等）时回落为入场价并标注来源。
+                trigger_entry_down = (float(signal.entry_down_price)
+                                      if signal.entry_down_price is not None else None)
+                if trigger_entry_down is not None:
+                    entry_kind, entry_down = "market_snapshot", trigger_entry_down
+                elif first is not None:
+                    entry_kind, entry_down = "window_open_sample", float(first["down_price"])
+                else:
+                    entry_kind, entry_down = None, None
                 labels = list(feature_snapshot.get("matched_signal_ids", []))
                 all_labels = list(feature_snapshot.get("all_matched_signal_ids", labels))
-                enriched = apply_quote_labels(tf, all_labels, first["down_price"] if first else None)
+                # 报价标签与入场观察价同源派生：避免「入场价用 A 源、报价标签用 B 源」的
+                # 口径不自洽（历史教训：触发子集报价对必须自洽）。
+                enriched = apply_quote_labels(tf, all_labels, entry_down)
                 newly_derived = [label for label in enriched if label not in all_labels]
                 feature_snapshot["all_matched_signal_ids"] = enriched
                 feature_snapshot["matched_signal_ids"] = list(dict.fromkeys(
                     labels + [label for label in newly_derived if shadow_gate.is_enabled(label)]
                 ))
                 feature_snapshot["quote_snapshots"] = snapshots
+                feature_snapshot["entry_quote_kind"] = entry_kind
+                feature_snapshot["window_open_quote"] = (
+                    {"timestamp": first["timestamp"], "offset_sec": first["offset_sec"],
+                     "up_price": first["up_price"], "down_price": first["down_price"]}
+                    if first is not None else None
+                )
                 signal.feature_snapshot = feature_snapshot
-                if first:
+                if entry_kind == "window_open_sample" and first is not None:
                     signal.entry_up_price = first["up_price"]
                     signal.entry_down_price = first["down_price"]
                     signal.entry_quote_ts = first["timestamp"]

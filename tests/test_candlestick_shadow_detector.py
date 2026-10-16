@@ -226,7 +226,82 @@ async def test_settlement_updates_labels_quotes_and_down_result(monkeypatch) -> 
     assert signal.status == "SETTLED" and signal.win is True
     assert signal.entry_down_price == 0.54 and signal.entry_quote_ts == target + 5_000
     assert q_id in signal.feature_snapshot["matched_signal_ids"]
+    # 触发时快照缺失 → 回落目标窗首个采样，且必须显式标注来源（不得冒充触发时快照）
+    assert signal.feature_snapshot["entry_quote_kind"] == "window_open_sample"
+    assert signal.feature_snapshot["window_open_quote"]["down_price"] == 0.54
     assert session.committed
+
+
+@pytest.mark.asyncio
+async def test_settlement_never_overwrites_trigger_time_quote(monkeypatch) -> None:
+    """结算不得用目标窗首个采样覆盖触发时观察价（旧实现会记下非目标市场的价）。"""
+    target = 1_700_000_100_000
+    signal = SimpleNamespace(
+        version=EVENT_VERSION_BY_TF["15m"], timeframe="15m",
+        signal_bar_start=target - BAR_MS["15m"], target_bar_start=target,
+        direction="DOWN", status="PENDING", settle_outcome=None, win=None,
+        settle_open=None, settle_close=None, settled_at=None,
+        # 触发时市场报价快照（权威）
+        entry_up_price=0.50, entry_down_price=0.50, entry_quote_ts=target + 30_000,
+        feature_snapshot={
+            "matched_signal_ids": ["candle_hm_bull_15m_union_shadow_v1"],
+            "all_matched_signal_ids": ["candle_hm_bull_15m_union_shadow_v1"],
+            "quote_snapshots": {},
+            "entry_quote_kind": "market_snapshot",
+        },
+    )
+    session = _FakeSession(rows=[signal])
+    monkeypatch.setattr(csd, "async_session_factory", lambda: _SessionCtx(session))
+    detector = CandlestickShadowDetector(None, {}, {})
+    detector._load_quote_points = AsyncMock(return_value=[
+        SimpleNamespace(timestamp=target + 1_000, up_price=0.73, down_price=0.27)
+    ])
+
+    await detector._settle_pending("15m", [{
+        "open_time": target, "open": 100.0, "high": 101.0,
+        "low": 98.0, "close": 99.0, "volume": 1.0,
+    }])
+
+    assert signal.entry_down_price == 0.50 and signal.entry_up_price == 0.50
+    assert signal.entry_quote_ts == target + 30_000
+    assert signal.feature_snapshot["entry_quote_kind"] == "market_snapshot"
+    # 首个采样降级为审计字段，供事后比对，不再当入场价
+    assert signal.feature_snapshot["window_open_quote"]["down_price"] == 0.27
+
+
+@pytest.mark.asyncio
+async def test_settlement_quote_label_uses_same_source_as_entry_price(monkeypatch) -> None:
+    """报价标签（0.45~0.55）必须与入场观察价同源派生，否则标签与价格不自洽。"""
+    target = 1_700_000_100_000
+    q_id = "candle_hm_bull_15m_q45_55_shadow_hyp_v1"
+    signal = SimpleNamespace(
+        version=EVENT_VERSION_BY_TF["15m"], timeframe="15m",
+        signal_bar_start=target - BAR_MS["15m"], target_bar_start=target,
+        direction="DOWN", status="PENDING", settle_outcome=None, win=None,
+        settle_open=None, settle_close=None, settled_at=None,
+        entry_up_price=0.50, entry_down_price=0.50, entry_quote_ts=target + 20_000,
+        feature_snapshot={
+            "matched_signal_ids": ["candle_hm_bull_15m_union_shadow_v1"],
+            "all_matched_signal_ids": ["candle_hm_bull_15m_union_shadow_v1"],
+            "quote_snapshots": {},
+            "entry_quote_kind": "market_snapshot",
+        },
+    )
+    session = _FakeSession(rows=[signal])
+    monkeypatch.setattr(csd, "async_session_factory", lambda: _SessionCtx(session))
+    monkeypatch.setattr(csd.shadow_gate, "is_enabled", lambda _version: True)
+    detector = CandlestickShadowDetector(None, {}, {})
+    # 首个采样 0.60 落在报价带外：若按采样派生会漏掉标签，按入场价（0.50）派生才会命中
+    detector._load_quote_points = AsyncMock(return_value=[
+        SimpleNamespace(timestamp=target + 1_000, up_price=0.40, down_price=0.60)
+    ])
+
+    await detector._settle_pending("15m", [{
+        "open_time": target, "open": 100.0, "high": 101.0,
+        "low": 98.0, "close": 99.0, "volume": 1.0,
+    }])
+
+    assert q_id in signal.feature_snapshot["matched_signal_ids"]
 
 
 def test_all_18_logical_versions_are_record_only_and_physically_isolated() -> None:
