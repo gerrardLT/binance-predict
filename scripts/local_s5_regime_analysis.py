@@ -15,7 +15,7 @@ regime 定义（同 local_cycle_regime_check.py，无未来函数，仅用截至
   波动档：低 RV<q33 / 中 / 高 RV≥q67
 
 事件 = output/klines_5m_cache_720d.json 720d 锁定口径（同 local_s5_real_quote_ev.py）
-报价 = prediction_market_samples_online_20260819.json → q̂(t=5, 回落态, 深度)
+报价 = prediction_market_samples.json → q̂(t=5, 回落态, 深度)
 线上对照 = output/online_signals_now_20260824_1641.json 的 S5 结算行
 EV 口径：赢 0.98/q̂−1 / 输 −1（无溢价快照口径，与 s5_real_quote_ev 一致）
 纪律声明：exploratory 事后细分——用于理解周期依赖与仓位分配，不筛选新场景。
@@ -35,7 +35,7 @@ FEE = 0.02
 EPS = 0.0005
 LOOKBACK = 48
 KL5 = "output/klines_5m_cache_720d.json"
-SAMPLES = "prediction_market_samples_online_20260819.json"
+SAMPLES = "prediction_market_samples.json"
 LIVE = "output/online_signals_now_20260824_1641.json"
 LOG = "output/s5_regime_analysis.log"
 DEPTH_EDGES = (0.0005, 0.0015)

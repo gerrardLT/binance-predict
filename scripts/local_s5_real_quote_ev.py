@@ -11,7 +11,7 @@
   b) 15m 市场新样本双态报价表 q̂(t, 状态, 深度) 与 S7 旧表对照；
   c) S1 直入场（开盘桶 b=0/1）真实报价 EV。
 
-数据：output/klines_5m_cache_720d.json + prediction_market_samples_online_20260819.json
+数据：output/klines_5m_cache_720d.json + prediction_market_samples.json
 口径：S1/S5 事件 = 720d 锁定口径；EV = 赢 0.98/q−1 / 输 −1；费 2%。
 """
 from __future__ import annotations
@@ -28,7 +28,7 @@ FEE = 0.02
 EPS = 0.0005
 LOOKBACK = 48
 KL5 = "output/klines_5m_cache_720d.json"
-SAMPLES = "prediction_market_samples_online_20260819.json"
+SAMPLES = "prediction_market_samples.json"
 LOG = "output/s5_real_quote_ev.log"
 DEPTH_EDGES = (0.0005, 0.0015)
 

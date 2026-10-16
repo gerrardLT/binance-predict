@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 import numpy as np
 
 KL5 = "output/klines_5m_cache_720d.json"
-SAMPLES = "prediction_market_samples_online_20260819.json"
+SAMPLES = "prediction_market_samples.json"
 LOG = "output/quote_bin_winrate_fine.log"
 BINS = [(0.05, 0.15), (0.15, 0.25), (0.25, 0.35), (0.35, 0.45), (0.45, 0.55),
         (0.55, 0.65), (0.65, 0.75), (0.75, 0.85), (0.85, 0.95)]

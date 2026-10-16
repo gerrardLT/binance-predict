@@ -10,7 +10,7 @@
 
 数据
 ----
-  output/pull_samples_5m_20260907.json / pull_samples_15m_20260907.json（线上全量采样）
+  prediction_market_samples.json（线上全量采样，按 market_period 过滤 5m/15m）
   output/klines_5m_cache_720d.json + klines_5m_tail_20260907.json（结算真值）
 
 事件定义
@@ -50,8 +50,8 @@ FEE = 0.02
 Q_HI = 0.1
 WIN_MS = {"5m": 300_000, "15m": 900_000}
 SAMPLES = {
-    "5m": "output/pull_samples_5m_20260907.json",
-    "15m": "output/pull_samples_15m_20260907.json",
+    "5m": "prediction_market_samples.json",
+    "15m": "prediction_market_samples.json",
 }
 KLINE_FILES = ["output/klines_5m_cache_720d.json", "output/klines_5m_tail_20260907.json"]
 LOG = "output/firsthit_qdepth_grid.log"
@@ -161,7 +161,7 @@ def collect_first_hits(period: str, k5: dict[int, tuple[float, float]]) -> list[
     """每窗口每侧取报价首次进入 (0,0.1] 的采样作为事件。"""
     L = WIN_MS[period]
     with open(SAMPLES[period], encoding="utf-8") as f:
-        raw = json.load(f)
+        raw = [s for s in json.load(f) if s.get("market_period") == period]
     by_win: dict[int, list[dict]] = defaultdict(list)
     for s in raw:
         ts = int(s["timestamp"])

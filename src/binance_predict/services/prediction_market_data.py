@@ -1,5 +1,5 @@
 """
-BTC 5min LLM 预测系统 V2 - Prediction 只读市场数据服务
+BTC 预测市场系统 - Prediction 只读市场数据服务
 
 只读地从 Binance Prediction Markets API 获取 5 分钟 BTC 预测市场的报价数据，
 供情绪曲线 tracker 采样使用。

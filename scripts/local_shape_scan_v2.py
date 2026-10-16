@@ -52,7 +52,7 @@ import numpy as np
 
 FEE = 0.02
 Q_LO, Q_HI = 0.005, 0.1
-SAMPLES_5M = "output/pull_samples_5m_20260907.json"
+SAMPLES_5M = "prediction_market_samples.json"
 KL5_FILES = ["output/klines_5m_cache_720d.json", "output/klines_5m_tail_20260907.json"]
 LOG = "output/shape_scan_v2.log"
 OUT = "output/shape_scan_v2.json"
@@ -135,7 +135,7 @@ def load_k5():
 
 def collect(k5):
     """首触事件 + 修正后的特征。就近补缺 btc（±2 样本内）。"""
-    raw = json.load(open(SAMPLES_5M, encoding="utf-8"))
+    raw = [s for s in json.load(open("prediction_market_samples.json", encoding="utf-8")) if s.get("market_period") == "5m"]
     L = 300_000
     by = defaultdict(list)
     for s in raw:

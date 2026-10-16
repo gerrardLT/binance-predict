@@ -7,14 +7,13 @@ BTC 预测市场（Binance Prediction Markets，5m / 15m 二元方向市场）�
 
 ```text
 ① 离线科学发现          ② 影子前向验证            ③ 小金额实盘
-discovery/ + scripts/    6 个 shadow detector      MultiLiveTrader
-720d K线 / 报价分箱      只记录不下注               15 通道，默认全 OFF
+discovery/ + scripts/    多个 shadow detector      MultiLiveTrader
+720d K线 / 报价分箱      只记录不下注               61 通道，默认全 OFF
 BH-FDR 多重检验校正  ->  攒 2~3 周线上样本     ->   人工 promote 才开火
 holdout 只触碰一次       与下单路径物理隔离         每通道独立金额/日限/护栏
 ```
 
-> **命名遗留说明**：仓库名 `binance-predict`、`pyproject.toml` 描述「LLM 全自动预测系统 V2」、
-> `main.py` 文档串「V3」、以及下文提到的「情绪 Agent / 系统 B」，指的都是**已退役的旧架构**。
+> **命名遗留说明**：仓库名 `binance-predict` 与下文提到的「情绪 Agent / 系统 B」「路径 A」，指的都是**已退役的旧架构**。
 > 详见文末[已退役组件](#已退役组件)。当前唯一的自动决策引擎是 `MultiLiveTrader`。
 
 ---
@@ -26,7 +25,7 @@ holdout 只触碰一次       与下单路径物理隔离         每通道独�
 | 闸门 | 默认值 | 说明 |
 | --- | --- | --- |
 | `AGENT_AUTO_TRADE` | `false` | 旧 Agent Loop 的自动交易开关；该 Loop 本身已退役，此开关当前不生效 |
-| `LIVE_CHANNELS_JSON` | 空 | **实盘真正的总闸**。空 = 15 通道全部 `enabled=False` |
+| `LIVE_CHANNELS_JSON` | 空 | **实盘真正的总闸**。空 = 全部通道 `enabled=False` |
 | `live_channel_overrides` 表 | 空 | 前端 toggle 的持久化层，优先级**高于** env；删表行才回落 env |
 
 **开启实盘的前提**：`BINANCE_API_KEY` / `BINANCE_API_SECRET`（需币安后台开通 Prediction Trading 权限）
@@ -97,41 +96,28 @@ Binance Prediction REST     -> 15 秒采样 -> prediction_market_samples
 
 ---
 
-## 实盘通道注册表（15 通道）
+## 实盘通道注册表（61 通道，默认全 OFF）
 
-**口径源是 `services/live_channels.py`**（前端 `SIGNAL_INFO` 常量须与之同步）。
-三族触发机制：
+**口径源是 `services/live_channels.py`**（`LIVE_CHANNELS` 61 个、`RETIRED_CHANNEL_SPECS` 20 个已退役；
+前端 `SIGNAL_INFO` 常量须与之同步）。逐通道的方向 / 周期 / 护栏 / 中文名以 `ChannelSpec` 为准，
+README 不再抄表（抄过，三周就过期）。
 
-- **quote_edge 族**（5m）：采样循环喂价 → 窗内报价区间命中
-- **x4 族**（5m）：轮询 `misalignment_signals` PENDING → 次窗 +150s 决策点下单
-- **scene 族**（15m）：`fake_breakout_detector` fire 钩子 → 次周期开盘下单（S5 为 +5min 确认入场）
+| 族 | 通道数 | 触发机制 |
+| --- | --- | --- |
+| `candlestick_reversal` | 18 | 蜡烛形态检测器 `_on_live_fire` → `on_candlestick_signal` |
+| `kline_reversal` | 12 | KREV / 反转 / CRV / BRK 检测器 → `on_kline_reversal_signal` |
+| `scene` | 10 | `fake_breakout_detector` fire 钩子 → 次周期开盘下单（S5 为 +5min 确认入场） |
+| `firsthit` / `firsthit_early` | 6 / 2 | 首触检测器（含 D/E 分桶组合） |
+| `nextbar` | 5 | nextbar / rev2 inside 检测器 → `on_nextbar_signal` |
+| `quote_edge` / `x4` | 2 / 2 | 采样循环喂价命中 / 轮询 `misalignment_signals` PENDING → 次窗 +150s 下单 |
+| `s2_cond` / `absorption` | 2 / 2 | S2 条件单变体 / 吸收跟随 |
 
-| 通道 | 族 | 周期 | 方向 | 护栏 | 说明 |
-| --- | --- | --- | --- | --- | --- |
-| `quote_momentum_v1` | quote_edge | 5m | DOWN | 0.78 | 报价动量（A 格顺势），t∈[90,120)s × q∈[0.69,0.75) |
-| `quote_momentum_v2` | quote_edge | 5m | DOWN | 0.78 | v1 + BTC 门禁 `chg ≤ −0.10%` |
-| `quote_momentum_v3` | quote_edge | 5m | DOWN | 0.78 | v1 + 末收 15m 非连涨门禁（K 线异步核验） |
-| `quote_contrarian_v1` | quote_edge | 5m | DOWN | 0.28 | 报价反向（B 格逆势），t∈[45,60)s × q∈[0.15,0.25) |
-| `quote_contrarian_v2` | quote_edge | 5m | DOWN | 0.28 | v1 + BTC 门禁 `chg < +0.10%` |
-| `quote_contrarian_v3a` | quote_edge | 5m | DOWN | 0.28 | v1 + v2 门禁 + 前窗 DOWN（异步 DB 核验） |
-| `quote_contrarian_v3b` | quote_edge | 5m | DOWN | 0.28 | v1 + v2 门禁 + 距日高回落 ≥0.30% |
-| `quote_contrarian_v4` | quote_edge | 5m | DOWN | 0.28 | v1 + `ret24 ≤ −1.0%` regime 门禁 |
-| `x4_v1` | x4 | 5m | DOWN | 0.45 | 情绪错位（收阳押次窗 DOWN） |
-| `x4_v2` | x4 | 5m | DOWN | 0.50 | 情绪错位 · 平静市门禁版 |
-| `scene_bull_exhaust` | scene | 15m | DOWN | 0.70 | 场景 S1 多头耗尽 |
-| `scene_bull_exhaust_confirm` | scene | 15m | DOWN | 0.75 | 场景 S5 +5min 确认入场 |
-| `s5_deep_z20_v1` | scene | 15m | DOWN | 0.88 | S5 深档（`z5 ≤ −20bp` 子集） |
-| `scene_bear_exhaust` | scene | 15m | UP | 0.65 | 场景 S2 空头耗尽 |
-| `scene_momentum_fade` | scene | 15m | DOWN | 0.55 | 场景 S4 动量衰竭 |
+**同窗互斥组**：`SAME_WINDOW_EXCLUSIVE`（`live_channels.py`），组内每市场窗口至多一个通道成交，
+防同源通道叠加敞口。按 `exclusive_group(channel)` 查询，不要在文档里抄组成员。
 
-**同窗互斥组**（组内每市场窗口至多一个通道成交，防同源通道叠加敞口）：
-
-- `{quote_momentum_v1, quote_momentum_v2, quote_momentum_v3}`
-- `{scene_bull_exhaust_confirm, s5_deep_z20_v1}`
-
-护栏数值依据是盈亏平衡入场价 `entry* = wr × (1 − FEE)`（干净口径历史胜率），设在平衡价附近或略下方。
-**部分护栏的样本量偏小**（如 S1 的 0.70 依据 41 个信号中 8 个的胜率），属探索性设定，
-配合 2 USDT 小金额前向验证。全部护栏可被 `LIVE_CHANNELS_JSON` 或 DB 覆盖层按通道改写。
+护栏数值依据是盈亏平衡入场价 `entry* = wr × (1 − FEE)`，设在平衡价附近或略下方。
+护栏有两套口径（面板 GUARDED 用 `auto_max_exec` / 覆盖值，firsthit 实盘下单用动态护栏），
+改动前先读 `live_channels.py` 与 `multi_live_trader.py`。全部护栏可被 `LIVE_CHANNELS_JSON` 或 DB 覆盖层按通道改写。
 
 ### 配置分层
 
@@ -143,34 +129,20 @@ Binance Prediction REST     -> 15 秒采样 -> prediction_market_samples
 
 ---
 
-## 信号检测器（7 个：6 影子 + 1 场景）
+## 信号检测器
 
-lifespan 共启动 7 个检测器。其中 **6 个是影子**（只记录不下注），与下单路径**物理隔离**：
-其信号表不进 `X4_VERSIONS` / `LIVE_CHANNELS` 白名单，从代码结构上保证影子不可能触发实盘。
-新研究线要上线必须显式改注册表。
+`main.py` lifespan 装配约 19 个检测器（`services/*_detector.py`、`*_shadow_detector.py`、
+`firsthit_forward_recorder.py`），各自一个 `*_ENABLED` 开关（`config/settings.py`，**代码默认多为 `true`**，
+作紧急停用制动力；未全部收录进 `.env.example`，排查行为以 `settings.py` 为准）。
 
-第 7 个是 `FakeBreakoutDetector`（场景检测器），**它是实盘 scene 族的触发源**，详见表后说明。
+**影子 ≠ 与下单物理隔离**：影子检测器只记录不下注，但多数已挂 `_on_live_fire` 钩子到
+`MultiLiveTrader.on_*_signal`。信号对应的通道**在 `LIVE_CHANNELS` 注册且 enabled** 时才会真实下单；
+未注册或 OFF 的影子永远只落表。场景检测器关闭时钩子为 `None`，场景通道即使开启也无触发源（fail-safe）。
 
-| 检测器 | 落表 | version | 开关 |
-| --- | --- | --- | --- |
-| `QuoteEdgeDetector` | `pattern_shadow_signals` | `quote_momentum_v1/v2/v3`、`quote_contrarian_v1/v2/v3a/v3b/v4`、`late_night_contrarian_v1/v2` | `QUOTE_EDGE_ENABLED` |
-| `MisalignmentDetector` | `misalignment_signals` | `x4_v1`、`x4_v2` | `MISALIGNMENT_ENABLED` |
-| `KlineShadowDetector` | `kline_shadow_signals` | `krev_a_v1`、`krev_b_v1` | `KLINE_SHADOW_ENABLED` |
-| `ReversalShadowDetector` | `kline_shadow_signals` | `rev_p1_v1`、`rev_p2_v1` | `REVERSAL_SHADOW_ENABLED` |
-| `NextbarShadowDetector` | `kline_shadow_signals` | `nb_zschamp_15m_v1`、`nb_smaslope_5m_v1` | `NEXTBAR_SHADOW_ENABLED` |
-| `HmShadowDetector` | `pattern_shadow_signals` | `hm_touch_down_v1`、`hm_touch_down_v2` | `HM_SHADOW_ENABLED` |
-| ⚠️ `FakeBreakoutDetector`（场景，**非影子**） | `fake_breakout_signals` | S1/S2/S4/S5 + `s5_deep_z20_v1` | `FAKE_BREAKOUT_ENABLED` |
-
-`kline_shadow_signals` 被 KREV / 反转 / nextbar 三族共用，靠 `version`（+ nextbar 另加 `timeframe`）
-隔离，各检测器只认自己的 version 结算——防止 5m 次根错结 15m 信号。
-
-上表开关全部**代码默认 `true`**（部署即生效，仅作紧急停用制动力），可经同名 env 覆盖为 `false`。
-注意这 7 个开关**未收录进 `.env.example`**——线上 `.env` 缺行时走代码默认值，排查行为时以
-`config/settings.py` 为准。唯一例外是 `KLINE_SHADOW_EMAIL_ENABLED`（默认 `false`，影子期静默防轰炸）。
-
-**注意**：`FakeBreakoutDetector` 是例外。它本身「信号模式不下注」，但其 fire 钩子
-（`_on_signal_fired` / `_on_s5_deep_fired`）接的是 `MultiLiveTrader.on_scene_signal`，
-**scene 族通道开启后它会触发真实下单**。场景检测器关闭时钩子为 `None`，场景通道即使开启也无触发源（fail-safe）。
+信号落表：`fake_breakout_signals`（场景）、`misalignment_signals`（X4）、`pattern_shadow_signals`（报价 edge / HM）、
+`kline_shadow_signals`（KREV / 反转 / nextbar / CRV / BRK 等，靠 `version` + `timeframe` 隔离，
+各检测器只认自己的 version 结算）、`absorption_shadow_signals`、`gap_crowd_shadow_signals`、`firsthit_*`。
+在线影子状态查 `GET /api/signals/analytics`。
 
 ### 研究纪律
 
@@ -242,13 +214,15 @@ uv run alembic upgrade head      # 部署前先备份数据库
 > `rule_versions`、`prompt_versions`、`review_memories`。
 > 没有确认备份前不要执行 `upgrade head`。
 
-### 16 张表
+### 27 张表（口径源 `db/models.py`）
 
 | 分类 | 表 |
 | --- | --- |
-| 行情/窗口 | `prediction_market_samples`（15s 原始采样，默认永不删除）、`sentiment_windows`（5m 归档 + 曲线） |
-| 交易 | `trade_orders`（订单 + 结算字段）、`live_channel_overrides`（通道配置 DB 覆盖层） |
-| 信号 | `fake_breakout_signals`（场景）、`misalignment_signals`（X4）、`pattern_shadow_signals`（报价 edge / HM）、`kline_shadow_signals`（KREV / 反转 / nextbar） |
+| 行情/窗口 | `prediction_market_samples`（15s 原始采样，永不删除）、`sentiment_windows`（5m 归档 + 曲线） |
+| 交易 | `trade_orders`（订单 + 结算字段）、`live_channel_overrides`（通道配置 DB 覆盖层）、`compound_chains`（复利下单链） |
+| 信号 | `fake_breakout_signals`、`misalignment_signals`、`pattern_shadow_signals`、`kline_shadow_signals`、`absorption_shadow_signals`、`gap_crowd_shadow_signals` |
+| 首触研究账本 | `firsthit_shadow_signals`、`firsthit_forward_events`、`firsthit_window_audit`、`firsthit_mother_event` |
+| 影子评估/体检 | `shadow_execution_assessments`、`signal_health_snapshots`、`shadow_version_overrides`、`notification_channel_overrides` |
 | Agent Loop（退役，只读存档） | `pattern_memory`、`agent_predictions`、`pattern_change_log`、`pattern_backtest_runs`、`binning_snapshots` |
 | 研究/运维 | `scene_param_versions`、`llm_traces`、`health_snapshots` |
 
@@ -256,7 +230,7 @@ uv run alembic upgrade head      # 部署前先备份数据库
 
 ## API
 
-55 个端点。`[auth]` = 额外受 `_require_auth`（`API_AUTH_TOKEN`）保护；全部端点都受登录中间件保护。
+约 77 个端点（以 `main.py` 路由装饰器为准）。`[auth]` = 额外受 `_require_auth`（`API_AUTH_TOKEN`）保护；全部端点都受登录中间件保护。
 
 ### 认证与运维
 
@@ -274,7 +248,7 @@ uv run alembic upgrade head      # 部署前先备份数据库
 | `POST /api/live/toggle` | **通道开关 / 金额 / 日限 / 护栏热调**，持久化到 DB `[auth]` |
 | `POST /api/trade/test` | 手动测试下单 `[auth]` |
 | `GET /api/live/pnl-curve` | 实盘盈亏曲线 `[auth]` |
-| `GET /api/trades/latest` · `/recent` · `/fund-flow` | 订单查询（`recent` limit ≤ 100）`[auth]` |
+| `GET /api/trades/latest` · `/recent` · `/fund-flow` | 订单查询（`recent` limit ≤ 5000）`[auth]` |
 | `GET /api/trades/binance-history` | 币安侧订单历史 `[auth]` |
 | `POST /api/trades/sync-binance` · `/sync-status` · `/settle-scan` | 对账 / 状态同步 / 结算扫描 `[auth]` |
 | `GET /api/prediction-wallet` | 预测钱包信息 `[auth]` |
@@ -326,19 +300,19 @@ uv run alembic upgrade head      # 部署前先备份数据库
 
 ```text
 src/binance_predict/
-├── main.py                 # FastAPI 装配 + lifespan + 55 个端点（~4100 行单文件）
-├── config/settings.py      # Pydantic Settings，全部开关与阈值（~450 行，注释含决策依据）
+├── main.py                 # FastAPI 装配 + lifespan + ~77 个端点（~6500 行单文件）
+├── config/settings.py      # Pydantic Settings，全部开关与阈值（~580 行，注释含决策依据）
 ├── db/
 │   ├── engine.py           # async engine + session factory
-│   └── models.py           # 16 张表 ORM（~1250 行）
+│   └── models.py           # 27 张表 ORM（~1900 行）
 ├── models/schemas.py       # Pydantic 契约
-├── services/               # 业务核心（42 个模块）
-│   ├── live_channels.py    # ★ 15 通道注册表 + 配置解析（口径源）
+├── services/               # 业务核心（73 个模块）
+│   ├── live_channels.py    # ★ 61 通道注册表 + 配置解析（口径源）
 │   ├── multi_live_trader.py# ★ 实盘调度：三族触发 / 日限 / 互斥组 / 门禁核验
-│   ├── prediction_trading.py# ★ 下单链路：占位→报价→护栏→币安下单→落库（~1750 行）
+│   ├── prediction_trading.py# ★ 下单链路：占位→报价→护栏→币安下单→落库（~2850 行）
 │   ├── trade_settler.py    # 结算：5m/15m 口径分流
 │   ├── quote_edge_detector.py   # 报价 edge 影子 + 冻结区间/门禁注册表
-│   ├── fake_breakout_detector.py# 场景检测器（S1/S2/S4/S5，~1650 行）
+│   ├── fake_breakout_detector.py# 场景检测器（S1/S2/S4/S5，~2150 行）
 │   ├── misalignment_detector.py # X4 影子
 │   ├── kline_shadow_detector.py # KREV 影子
 │   ├── reversal_shadow_detector.py / nextbar_shadow_detector.py / hm_shadow_detector.py
@@ -356,11 +330,11 @@ src/binance_predict/
 ├── backtest/               # 回测内核（data / events / stats / surface）
 └── prompts/                # 退役 Agent Loop 的提示词模板
 
-frontend/src/App.tsx        # 前端唯一源文件（~4700 行，React 19 + Tailwind 4 + recharts）
-alembic/versions/           # 32 个迁移
-scripts/                    # 99 个一次性研究/评估脚本（.py，另有 .sh/.ps1；非运行时依赖）
-tests/                      # pytest + pytest-asyncio + hypothesis（50 文件 / 793 用例）
-docs/prd/ docs/research/    # PRD v1~v3 与研究线文档
+frontend/src/App.tsx        # 前端唯一源文件（~9600 行，React 19 + Tailwind 4 + recharts）
+alembic/versions/           # 45 个迁移
+scripts/                    # 49 个研究/运维脚本（非运行时依赖；已删的旧一次性脚本见冷归档与 git 历史）
+tests/                      # pytest + pytest-asyncio + hypothesis（84 文件 / 1581 用例）
+docs/prd/ docs/research/    # PRD v3（历史快照）与研究线文档
 output/ logs/ .pytest_tmp/  # 运行产物与工作草稿区（gitignored，不清理不提交）
 ```
 
@@ -378,7 +352,7 @@ output/ logs/ .pytest_tmp/  # 运行产物与工作草稿区（gitignored，不�
 
 ```powershell
 # 后端：必须用 venv 的 python（系统 Python 没装本包，会 ModuleNotFoundError）
-.venv\Scripts\python.exe -m pytest tests/ -q          # 793 用例，约 75s
+.venv\Scripts\python.exe -m pytest tests/ -q          # 1581 用例
 .venv\Scripts\python.exe -m pytest tests/test_multi_live_trader.py -q   # 实盘链路
 
 # 前端：build 含 tsc 类型检查
@@ -451,9 +425,10 @@ Test Gate（uv sync --frozen + pytest tests/ 全量）
 ## 相关文档
 
 - `AGENTS.md` — AI 协作约定：命令、架构、交易语义、边界（禁止事项）、Git 交付规范
-- `docs/prd/v1.md` `v2.md` `v3.md` — 三代 PRD
+- `docs/prd/v3.md` — 历史 PRD 快照（V1/V2 已删，架构已被多通道实盘取代）
 - `docs/research/` — 各研究线文档（按研究族分子目录，随研究线增删；`agents-md-spec.md` 为协作规范）
-- `docs/runbook-decision-bench.md` — 决策台架 runbook
+- `docs/runbook-decision-bench.md` — 决策台架 runbook（2026-07 口径）
+- `docs/RESEARCH_ISOLATION.md` — 新研究隔离规范
 - `.env.example` — 全部配置项模板（含逐项注释）
 
 <!-- 2026-08-15 deploy note: VPS .env 补 AGENT_ALERT_* 邮件段，触发镜像变更以重建容器加载新 env -->

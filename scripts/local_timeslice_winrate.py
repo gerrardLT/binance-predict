@@ -50,7 +50,7 @@ from binance_predict.backtest.stats import (  # noqa: E402
 # 服务层常量延迟到函数内 import（模块顶层保持轻依赖，测试可安全 import）
 
 KLINES_CSV = os.path.join(ROOT, "output", "klines_5m_720d.csv")
-SENTIMENT_JSON = os.path.join(ROOT, "output", "sentiment_windows_online_fixed.json")
+SENTIMENT_JSON = os.path.join(ROOT, "sentiment_windows.json")
 EXPORT_GLOB = os.path.join(ROOT, "output", "timeslice_export_*")
 SNAPSHOT_GLOB = os.path.join(ROOT, "output", "timeslice_snapshot_*.json")
 
@@ -458,7 +458,7 @@ def replay_scene_events(c5: list[tuple]) -> tuple[list[Record], dict]:
 # ----------------------------------------------------------------------
 
 def replay_shadow_signals(path: str = SENTIMENT_JSON) -> tuple[list[Record], dict]:
-    """在 sentiment_windows_online_fixed.json（07-13~08-19）上重放 10 个影子版本。
+    """在 sentiment_windows.json 前段（07-13~08-19）上重放 10 个影子版本。
 
     门禁链（与线上检测器逐字段一致）：
       base 4 版 = QUOTE_EDGE_RULES 区间首命中（含 late_night 两版）

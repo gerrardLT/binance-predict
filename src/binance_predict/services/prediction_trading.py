@@ -1,5 +1,5 @@
 """
-BTC 5min LLM 预测系统 V2 - Binance Prediction Trading 服务
+BTC 预测市场系统 - Binance Prediction Trading 服务
 
 通过 Binance Prediction Markets API 实现预测结果的自动交易。
 

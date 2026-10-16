@@ -9,9 +9,9 @@
 
 数据
 ----
-  output/pull_samples_5m_20260907.json    线上 prediction_market_samples，period=5m
+  prediction_market_samples.json    线上 prediction_market_samples，period=5m
                                           2026-07-26 ~ 09-07，243,657 条，~15s/条
-  output/pull_samples_15m_20260907.json   period=15m，2026-08-13 ~ 09-07，134,418 条
+  prediction_market_samples.json   period=15m，2026-08-13 ~ 09-07，134,418 条
   output/klines_5m_cache_720d.json        5m K 线主缓存（~09-04）
   output/klines_5m_tail_20260907.json     5m K 线增量（09-04 ~ 09-07）
 
@@ -52,8 +52,8 @@ import numpy as np
 KLINE_CACHE = "output/klines_5m_cache_720d.json"
 KLINE_TAIL = "output/klines_5m_tail_20260907.json"
 SAMPLES = {
-    "5m": "output/pull_samples_5m_20260907.json",
-    "15m": "output/pull_samples_15m_20260907.json",
+    "5m": "prediction_market_samples.json",
+    "15m": "prediction_market_samples.json",
 }
 LOG_FILE = "output/quote_reversal_by_bucket.log"
 OUT_JSON = "output/quote_reversal_by_bucket.json"
@@ -166,7 +166,7 @@ def build(period: str, k5: dict[int, tuple[float, float]]) -> dict:
     L = WIN_MS[period]
     nb = L // BUCKET_MS
     with open(SAMPLES[period], encoding="utf-8") as f:
-        raw = json.load(f)
+        raw = [s for s in json.load(f) if s.get("market_period") == period]
 
     # 窗口归组（同时记录首/末 btc_price 供自检②）
     by_win: dict[int, list[dict]] = defaultdict(list)

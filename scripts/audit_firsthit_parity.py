@@ -12,7 +12,7 @@
 
 用法：
     .venv\\Scripts\\python.exe scripts/audit_firsthit_parity.py
-输入：output/pull_samples_5m_20260907.json + output/klines_5m_cache_720d.json
+输入：prediction_market_samples.json + output/klines_5m_cache_720d.json
       + output/klines_5m_tail_20260907.json
 输出：output/firsthit_parity_audit_20260908.json（+ 控制台漏斗）
 """
@@ -32,7 +32,7 @@ from binance_predict.services.firsthit_shadow_detector import (  # noqa: E402
     FEE_RET, FIRSTHIT_SPECS, _gate_of, extract_firsthit_features,
 )
 
-SAMPLES = "output/pull_samples_5m_20260907.json"
+SAMPLES = "prediction_market_samples.json"
 KLINES = ["output/klines_5m_cache_720d.json", "output/klines_5m_tail_20260907.json"]
 L = 300_000
 SPLIT = "2026-08-24"          # 冻结切分（历史探索内部再分前后段看稳定性）
@@ -115,7 +115,7 @@ def streak_up_of(k5: dict, window_start: int) -> int | None:
 
 def replay_events(k5) -> tuple[list[dict], dict]:
     """生产同源重放：extract_firsthit_features + _gate_of（含 streak）。"""
-    raw = json.load(open(SAMPLES, encoding="utf-8"))
+    raw = [s for s in json.load(open("prediction_market_samples.json", encoding="utf-8")) if s.get("market_period") == "5m"]
     by: dict[int, list[dict]] = defaultdict(list)
     for s in raw:
         by[int(s["timestamp"]) // L * L].append(s)

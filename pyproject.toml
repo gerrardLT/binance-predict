@@ -1,7 +1,7 @@
 [project]
 name = "binance-predict"
 version = "0.1.0"
-description = "BTC 5min LLM 全自动预测系统 V2"
+description = "BTC 预测市场多通道实盘 + 影子信号系统"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

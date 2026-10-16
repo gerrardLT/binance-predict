@@ -1,5 +1,5 @@
 """
-BTC 5min LLM 预测系统 V2 - 异步数据库引擎
+BTC 预测市场系统 - 异步数据库引擎
 
 使用 SQLAlchemy 2.0 异步引擎 + asyncpg 驱动。
 支持 PostgreSQL + TimescaleDB 扩展。

@@ -69,7 +69,7 @@ OUT_DIR = os.path.join(ROOT, "output")
 KL5_JSON = os.path.join(ROOT, "output", "klines_5m_cache_720d.json")
 CSV_15M = os.path.join(ROOT, "output", "klines_15m_720d.csv")
 CSV_5M = os.path.join(ROOT, "output", "klines_5m_720d.csv")
-SENTIMENT_JSON = os.path.join(ROOT, "output", "sentiment_windows_online_fixed.json")
+SENTIMENT_JSON = os.path.join(ROOT, "sentiment_windows.json")
 
 # ---- 冻结常量（出处注明，勿改动）----
 W = 672                                    # 7d × 96 根 15m（local_s5_regime_analysis.py L42）

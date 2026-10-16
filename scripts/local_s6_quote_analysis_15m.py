@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """S6 定价行为实证（15m 市场版）：线上 5 天 15s 报价 × 720d 5m K 缓存（2026-08-18）。
 
-数据：output/online_15m_samples_full.json（线上 prediction_market_samples，15m 市场，
+数据：prediction_market_samples.json（线上 prediction_market_samples，15m 市场，
      08-13 08:43 ~ 08-18 06:36 UTC，26,098 条，btc_price 100% 覆盖）
      + output/klines_5m_cache_720d.json（聚合 15m 判结算：close vs open）
 
@@ -21,7 +21,7 @@ import time
 
 import numpy as np
 
-SAMPLES = "output/online_15m_samples_full.json"
+SAMPLES = "prediction_market_samples.json"
 KLINES = "output/klines_5m_cache_720d.json"
 LOG = "output/s6_quote_analysis_15m.log"
 
@@ -53,7 +53,7 @@ def main() -> int:
     sys.stdout = Tee()
 
     with open(SAMPLES, encoding="utf-8") as f:
-        raw = json.load(f)
+        raw = [s for s in json.load(f) if s.get("market_period") == "15m"]
     with open(KLINES, encoding="utf-8") as f:
         kl5 = json.load(f)
     # 5m K 聚合 15m：cyc → (open, close)

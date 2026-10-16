@@ -16,12 +16,12 @@ BTC 预测市场（Binance Prediction）自动化交易系统。**真金实盘�
 
 ## 架构
 
-- `src/binance_predict/main.py` — FastAPI 路由与启动装配（超大单文件 ~4150 行；新增端点按既有分块注释风格就近插入）
+- `src/binance_predict/main.py` — FastAPI 路由与启动装配（超大单文件 ~6500 行；新增端点按既有分块注释风格就近插入）
 - `src/binance_predict/services/` — 业务核心：
   - `prediction_trading.py` — 下单链路：占位→报价→护栏→币安下单→落库
   - `multi_live_trader.py` — 多通道实盘调度；**通道注册表的口径源是 `live_channels.py`**
   - `quote_edge_detector.py` — 5m 窗口报价边缘检测
-- `frontend/src/App.tsx` — 前端唯一源文件（~4700 行，React 19 + Tailwind + recharts）；新组件进此文件，沿用「分块注释 + 就近放置」格局
+- `frontend/src/App.tsx` — 前端唯一源文件（~9600 行，React 19 + Tailwind + recharts）；新组件进此文件，沿用「分块注释 + 就近放置」格局
 - `tests/` — pytest + pytest-asyncio；实盘链路测试模式参照 `tests/test_multi_live_trader.py` 的 `_make_real_trader(monkeypatch)` 替身
 - `alembic/versions/` — DB 迁移；`scripts/` — 一次性/评估脚本（非运行时依赖）
 - `output/`、`logs/`、`.pytest_tmp/` — 运行产物与工作草稿区，不清理、不提交
@@ -34,6 +34,19 @@ BTC 预测市场（Binance Prediction）自动化交易系统。**真金实盘�
 - 每轮研究写入独立的 `output/research_runs/<run_id>/`；成功与失败试验都必须登记，不得只保留赢家
 - 最终盲测报告和哈希冻结后，只有用户明确同意进入 `COMPARISON`，才可解封旧研究做对照
 - 旧研究冷归档位于项目外 `D:/project-archives/binance-predict/legacy-research-2026-09/`；生产代码、数据库历史与交易安全规则不因研究隔离而删除
+
+## 回测数据源（验证信号/门禁前必读）
+
+不要只拿实盘订单或生产采样表下结论——它们只有几十单 / 几周，样本内挑出的阈值几乎必然虚高。按问题选数据源：
+
+- **只问胜率/方向**（如「某条件下次根收阳率是否更低」）：直接用币安公开 K 线回测多年历史，不需要报价。`https://data-api.binance.vision/api/v3/klines`（无需 key，可拉 2021 年至今）。先用 K 线复现信号触发，与线上信号表对账吻合后再用
+- **问入场价/EV/价格门**（如护栏、入场价白名单）：用 PREDEXON 历史订单簿，**不要只依赖** `prediction_market_samples`（生产只回溯到 2026-07-26/08-13）。脚本 `scripts/predexon_backfill.py`，端点 `/v2/predictfun/orderbooks`＝币安预测市场（订单 `vendor=PREDICT_FUN`）的历史盘口；`.env` 的 `PREDEXON_API_KEY` 多 key 逗号分隔、每 key 1 rps、须 `curl.exe`+浏览器 UA（urllib 被 Cloudflare 拦）
+  - 找市场：`/v2/predictfun/markets?search=<标题>`，BTC 15m 标题形如 `Bitcoin Up or Down - October 12, 8:45AM-9AM ET`（美东时间、整点省略 `:00`）。**标题不含年份**，须用 `created_time` 在开盘前 3 天内去重，否则会命中别年同日期的市场
+  - 取盘口：`/v2/predictfun/orderbooks?market_id=&start_time=&end_time=`（毫秒）；Yes=UP token，UP 入场价取 `best_ask`，DOWN 取 `1 − best_bid`；结算看 `winning_outcome`（0=UP，1=DOWN）。BTC 15m 虽从 2026-04-29 起能查到，但 **2026-04-29→06-30 是不完整段，禁止用于策略裁决、护栏优化、累计 EV 或跨段合并统计**：5 月缺失 31%~39%，6 月 S2/S4 仍缺 17%~27%，且缺失与胜负相关。PREDEXON 主分析段固定从 **2026-07-01** 起；每次必须先按通道×月份报告覆盖率，任一桶缺失 >10% 则该桶只作数据质量备注，不参与结论
+  - **快照时点必须对齐实盘报价时刻**（场景开盘单约开盘 +3.5s，S5 约 +310s；以订单 `quote_json.timestamp − window_start` 为准）。开盘 +1s 的盘口很薄、常见 0.97 残单，用它模拟会把大量实盘成交误判为弃单（2026-10-13 踩过：S1 74 笔实盘成交里 46 笔被误判）。对齐后实盘成交价 − 一档价中位 0.000
+  - 模拟线上护栏要用「按实盘金额吃 5 档的 VWAP」判，不能用一档价判护栏再按 VWAP 成交
+- ⚠️ `.pytest_tmp/predexon_curve_research/` 是 **Polymarket** 数据（manifest `source=PREDEXON Polymarket market-price`），不是币安平台，不能当币安报价用
+- 实盘订单的正确用途：样本外检验通过之后，核对真实成交价/滑点是否吃掉边
 
 ## 交易语义（改下单/结算代码前必读）
 
