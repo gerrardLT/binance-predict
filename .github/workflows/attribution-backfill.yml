@@ -1,0 +1,76 @@
+# ============================================================
+# 运维工作流：LLM 归因系统——历史订单证据包回填（一次性/可重跑）
+#
+# 功能：
+#   在生产 backend 容器内运行 scripts/order_context_backfill.py：
+#   为已结算 FILLED 且尚无 pack 的实盘订单组装 order_context_packs。
+#   幂等（已有 pack 默认跳过，rebuild=true 强制重建）；只写新表，
+#   不触碰交易/结算数据。K 线经币安公共 API 回放。
+#
+# 前提：部署流水线已把含本脚本的镜像发上 VPS（backend.Dockerfile COPY）。
+# ============================================================
+
+name: Attribution Backfill
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "最多回填最近 N 笔已结算订单"
+        required: true
+        default: "800"
+      channel:
+        description: "只回填该通道（留空=全部通道）"
+        required: false
+        default: ""
+      rebuild:
+        description: "已有 pack 也强制重建 (true/false)"
+        required: true
+        default: "false"
+
+concurrency:
+  group: attribution-backfill
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    name: Backfill order context packs on VPS
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Execute backfill via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
+          command_timeout: 120m
+          script: |
+            set -euo pipefail
+            cd /www/wwwroot/binance-predict
+            if [ ! -f docker-compose.prod.yml ]; then
+              echo "ERROR: docker-compose.prod.yml not found"
+              exit 1
+            fi
+
+            echo "=== 回填前：packs 现状 ==="
+            docker compose -f docker-compose.prod.yml exec -T db \
+              sh -c "psql -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -t -c 'SELECT channel, status, count(*) FROM order_context_packs GROUP BY 1,2 ORDER BY 3 DESC;'"
+
+            ARGS="--limit ${{ github.event.inputs.limit }}"
+            if [ -n "${{ github.event.inputs.channel }}" ]; then
+              ARGS="$ARGS --channel ${{ github.event.inputs.channel }}"
+            fi
+            if [ "${{ github.event.inputs.rebuild }}" = "true" ]; then
+              ARGS="$ARGS --rebuild"
+            fi
+
+            echo "=== 运行回填：python scripts/order_context_backfill.py $ARGS ==="
+            docker compose -f docker-compose.prod.yml exec -T backend \
+              python scripts/order_context_backfill.py $ARGS
+
+            echo "=== 回填后：packs 现状 ==="
+            docker compose -f docker-compose.prod.yml exec -T db \
+              sh -c "psql -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -t -c 'SELECT channel, status, count(*) FROM order_context_packs GROUP BY 1,2 ORDER BY 3 DESC;'"

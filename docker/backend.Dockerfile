@@ -43,6 +43,8 @@ COPY --from=builder /app/src /app/src
 COPY --from=builder /app/main.py /app/
 COPY --from=builder /app/alembic.ini /app/
 COPY --from=builder /app/alembic /app/alembic
+# 一次性运维脚本（仅归因证据包回填，经 GH Actions SSH exec 运行；不带其余研究脚本）
+COPY scripts/order_context_backfill.py /app/scripts/order_context_backfill.py
 
 # 将虚拟环境 bin 加入 PATH
 ENV PATH="/app/.venv/bin:$PATH"
