@@ -55,6 +55,10 @@ jobs:
               exit 1
             fi
 
+            echo "=== 建表：alembic current → upgrade head（幂等）==="
+            docker compose -f docker-compose.prod.yml exec -T backend \
+              sh -c "alembic current && alembic upgrade head && alembic current"
+
             echo "=== 回填前：packs 现状 ==="
             docker compose -f docker-compose.prod.yml exec -T db \
               sh -c "psql -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -t -c 'SELECT channel, status, count(*) FROM order_context_packs GROUP BY 1,2 ORDER BY 3 DESC;'"
