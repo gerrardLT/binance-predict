@@ -1883,3 +1883,142 @@ class CompoundChain(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+# ============================================================
+# LLM 归因系统（order context + attribution，2026-10-19）
+# 科学骨架：确定性统计先行裁决，LLM 只做假设生成器，随机性是一等假设。
+# 绝不进入下单/结算决策路径；全部异步事后组装。
+# ============================================================
+
+class OrderContextPack(Base):
+    """实盘订单全场景证据包：下单前/中/后三维上下文 + 确定性事实卡。
+
+    pack 三段式（schema_version 版本化，前端按版本渲染）：
+      pre  — 决策时刻市场状态（K线冻结、报价轨迹、体制、通道滚动状态）
+      exec — 执行过程（信号快照、护栏配置、报价→成交滑点、时间戳链）
+      post — 结果与反事实（窗口内路径、结算前后报价、同窗兄弟通道）
+    facts — 确定性分解结果（TCA 式），是 LLM 归因的唯一数字来源。
+    status: BUILT=全维度齐 | PARTIAL=缺部分维度（missing 列出）| FAILED=组装失败。
+    """
+
+    __tablename__ = "order_context_packs"
+    __table_args__ = (
+        UniqueConstraint("order_id", name="uq_order_context_packs_order"),
+        Index("ix_order_context_packs_channel_window", "channel", "window_start"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    order_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("trade_orders.id", ondelete="CASCADE"), nullable=False)
+    channel: Mapped[str] = mapped_column(String(80), nullable=False, comment="=trade_orders.signal_version")
+    market_period: Mapped[str] = mapped_column(String(8), nullable=False)
+    window_start: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    direction: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    schema_version: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(String(8), nullable=False, comment="BUILT|PARTIAL|FAILED")
+    missing: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    pack: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    facts: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class AttributionRun(Base):
+    """归因运行：一次事件（连败/红灯/周报/手动）触发的完整归因流程记录。
+
+    verdict（统计先行裁决，LLM 之前决定）：
+      RANDOM_CONSISTENT — 与随机波动一致，无归因证据（禁止 LLM 深归因编故事）
+      ANOMALOUS         — 统计异常，值得深归因（LLM 面板 + 假设检验）
+      INSUFFICIENT_DATA — 样本不足
+    """
+
+    __tablename__ = "attribution_runs"
+    __table_args__ = (
+        Index("ix_attribution_runs_channel_created", "channel", "created_at"),
+        Index("ix_attribution_runs_trigger", "trigger_type"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    trigger_type: Mapped[str] = mapped_column(String(16), nullable=False,
+                                              comment="STREAK|RED_LIGHT|WEEKLY|MANUAL")
+    channel: Mapped[str] = mapped_column(String(80), nullable=False)
+    scope: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"),
+                                        comment="归因范围：order_ids/from_ms/to_ms/n")
+    facts: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"),
+                                        comment="确定性事实卡（含随机性检验）")
+    verdict: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(10), nullable=False, default="PENDING",
+                                        comment="PENDING|RUNNING|DONE|FAILED")
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AttributionAnalysis(Base):
+    """单模型归因输出（一次 run × 每个模型一行）：跨家族双 LLM 独立分析。
+
+    hypotheses — 通过 claim 校验闸的结构化假设列表；
+    rejected_claims — 未过闸（证据ID不存在/数值不匹配/方向符号错）被剔除的断言，
+    保留供审计（用户永远只看到 verified 部分，但系统不隐藏剔除记录）。
+    """
+
+    __tablename__ = "attribution_analyses"
+    __table_args__ = (
+        Index("ix_attribution_analyses_run", "run_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("attribution_runs.id", ondelete="CASCADE"), nullable=False)
+    model: Mapped[str] = mapped_column(String(64), nullable=False, comment="provider:model")
+    family: Mapped[str] = mapped_column(String(24), nullable=False, comment="厂商家族（防同源伪独立）")
+    raw_output: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    hypotheses: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    rejected_claims: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class Hypothesis(Base):
+    """归因假设台账（知识库 + 错误记忆）。
+
+    状态机：CANDIDATE → (统计检验) → SUPPORTED | REJECTED；SUPPORTED 可被后续
+    检验 SUPERSEDED。REJECTED 进 error memory（in_error_memory=True），注入后续
+    prompt 防止 LLM 重复讲已证伪的故事。行动建议仅进队列，人工执行（权限边界）。
+    """
+
+    __tablename__ = "hypotheses"
+    __table_args__ = (
+        Index("ix_hypotheses_channel_status", "channel", "status"),
+        Index("ix_hypotheses_status", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    channel: Mapped[str | None] = mapped_column(String(80), nullable=True, comment="空=全通道")
+    category: Mapped[str] = mapped_column(String(24), nullable=False,
+        comment="RANDOM|EXPOSURE|EDGE_DECAY|EXECUTION|COMPOSITION|CROWD|OTHER")
+    statement: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(12), nullable=False, default="CANDIDATE")
+    test_spec: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"),
+                                            comment="{name, params} 检验菜单绑定")
+    last_test: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    first_run_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    support_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    reject_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    in_error_memory: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    action_suggestion: Mapped[str | None] = mapped_column(Text, nullable=True)
+    action_status: Mapped[str | None] = mapped_column(String(10), nullable=True,
+                                                      comment="PENDING|APPLIED|DISMISSED")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())

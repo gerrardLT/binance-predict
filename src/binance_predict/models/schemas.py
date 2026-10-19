@@ -498,3 +498,18 @@ class HealthReport(BaseModel):
         description="LLM：call_count / total_cost / phase_success_rates / consecutive_failures（内存态）",
     )
     summary: str = Field(default="", description="自然语言诊断，供人/LLM 一眼读懂")
+
+
+class TriggerAttributionRequest(BaseModel):
+    """POST /api/attribution/trigger：手动触发一次归因运行。"""
+
+    channel: str = Field(description="通道 ID（LIVE_CHANNELS 白名单内）")
+    trigger_type: str = Field(
+        default="MANUAL", description="MANUAL | STREAK | RED_LIGHT | WEEKLY（手动触发不受日预算限制）"
+    )
+
+
+class HypothesisActionRequest(BaseModel):
+    """POST /api/attribution/hypotheses/{id}/action：人工处置行动建议。"""
+
+    action_status: str = Field(description="APPLIED（已人工执行）| DISMISSED（否决建议）")

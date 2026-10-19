@@ -46,6 +46,7 @@ IS NULL，启动首次 poll_once 即全量回补历史未结算行，无需水�
 from __future__ import annotations
 
 import asyncio
+from typing import Callable
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -72,10 +73,22 @@ class TradeSettler:
     只读窗口 + 回填结算字段，零资金风险（lifespan 无开关常开）。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, on_settled: "Callable[[int, str | None], None] | None" = None) -> None:
         self._running = False
         self._task: asyncio.Task | None = None
         self._settled_count = 0
+        # 结算成功回调（order_id, channel）：LLM 归因钩子（2026-10-19）。
+        # 调用方负责 fire-and-forget；此处 try/except 双保险——回调故障
+        # 绝不影响结算事务本身。
+        self._on_settled = on_settled
+
+    def _fire_on_settled(self, row: TradeOrderModel) -> None:
+        if self._on_settled is None:
+            return
+        try:
+            self._on_settled(int(row.id), row.signal_version)
+        except Exception as exc:
+            logger.warning("结算回调异常（不影响结算）: %s", exc)
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -264,6 +277,7 @@ class TradeSettler:
             return False  # 已被并发结算（幂等守卫生效）
         await self._patch_settlement_assessment(row, str(outcome))
         self._settled_count += 1
+        self._fire_on_settled(row)
         logger.info(
             "订单结算 | id=%s | window=%s | direction=%s → %s | win=%s | pnl=%s | settle_price=%s",
             row.id, row.window_start, row.direction, outcome, win,
@@ -364,6 +378,7 @@ class TradeSettler:
             return False  # 已被并发结算（幂等守卫生效）
         await self._patch_settlement_assessment(row, str(outcome))
         self._settled_count += 1
+        self._fire_on_settled(row)
         logger.info(
             "订单结算 | id=%s | scene_signal=%s | window=%s | direction=%s → %s"
             " | win=%s | pnl=%s | settle_price=%s",
@@ -490,6 +505,7 @@ class TradeSettler:
             return False  # 已被并发结算（幂等守卫生效）
         await self._patch_settlement_assessment(row, str(outcome))
         self._settled_count += 1
+        self._fire_on_settled(row)
         logger.info(
             "订单结算 | id=%s | kline_shadow | signal=%s | window=%s | direction=%s → %s"
             " | win=%s | pnl=%s | settle_price=%s",
@@ -648,6 +664,7 @@ class TradeSettler:
             return False
         await self._patch_settlement_assessment(row, str(outcome))
         self._settled_count += 1
+        self._fire_on_settled(row)
         logger.info(
             "订单结算 | id=%s | 手动 15m（窗口拼接口径）| window=%s | direction=%s → %s | win=%s | pnl=%s",
             row.id, row.window_start, row.direction, outcome, win,

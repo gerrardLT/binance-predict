@@ -29,37 +29,24 @@ def test_retirement_switches_default_off() -> None:
 
 
 def test_main_instantiation_gated_by_switch() -> None:
-    """SentimentAgent/AgentScheduler 实例化必须位于 agent_loop_enabled 分支内。"""
-    src = (ROOT / "src/binance_predict/main.py").read_text(encoding="utf-8")
-    tree = ast.parse(src)
-    lines = src.splitlines()
+    """2026-10-19 更新：系统B 代码已整体移除——main.py 不得再引用任何系统B 模块。
 
-    gate_line: int | None = None
-    inst_lines: list[int] = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.If):
-            cond = node.test
-            if (
-                isinstance(cond, ast.Attribute)
-                and cond.attr == "agent_loop_enabled"
-                and isinstance(cond.value, ast.Name)
-                and cond.value.id == "settings"
-            ):
-                gate_indent = len(lines[node.lineno - 1]) - len(lines[node.lineno - 1].lstrip())
-                # 分支体内任何 SentimentAgent(...) / AgentScheduler(...) 调用都算 gated
-                calls = [
-                    sub.lineno for sub in ast.walk(node)
-                    if isinstance(sub, ast.Call)
-                    and isinstance(sub.func, ast.Name)
-                    and sub.func.id in ("SentimentAgent", "AgentScheduler")
-                ]
-                if not calls:
-                    continue  # 非 lifespan 的开关分支（如后续模块），跳过
-                for ln in calls:
-                    indent = len(lines[ln - 1]) - len(lines[ln - 1].lstrip())
-                    assert indent > gate_indent, f"L{ln} 实例化不在开关分支内"
-                return
-    raise AssertionError("main.py 未找到含实例化的 `if settings.agent_loop_enabled:` 分支")
+    （旧口径「实例化须在 agent_loop_enabled 分支内」随分支一起删除；
+    新口径：imports/调用点零残留，sentiment_windows 归档与 momentum 不受影响。）
+    """
+    src = (ROOT / "src/binance_predict/main.py").read_text(encoding="utf-8")
+    ast.parse(src)
+    for forbidden in (
+        "from .services.sentiment_agent import",
+        "from .services.agent_scheduler import",
+        "from .services.pattern_reevaluator import",
+        "SentimentAgent(",
+        "AgentScheduler(",
+    ):
+        assert forbidden not in src, f"main.py 残留系统B 引用: {forbidden}"
+    # 保留项仍在：情绪窗口归档（场景信号位势源）与动量预测端点
+    assert "_sentiment_window_archiver" in src
+    assert '"/api/sentiment/momentum-predict"' in src
 
 
 def test_retirement_migration_syntax() -> None:

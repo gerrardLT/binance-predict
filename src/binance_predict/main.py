@@ -44,7 +44,6 @@ from .db.engine import async_session_factory, get_db
 from .db.models import (
     Base,
     FakeBreakoutSignal,
-    PatternBacktestRun,
     PredictionMarketSample,
     SceneParamVersion,
     SentimentWindow,
@@ -60,12 +59,13 @@ from .models.schemas import (
     TransferOutboundRequest,
     ToggleLiveRequest,
     ToggleShadowRequest,
+    TriggerAttributionRequest,
+    HypothesisActionRequest,
     NotifyConfigPutRequest,
     NotifyConfigResetRequest,
 )
 from .services.absorption_shadow_detector import AbsorptionShadowDetector
 from .services.gap_crowd_shadow_detector import GapCrowdShadowDetector
-from .services.agent_scheduler import AgentScheduler
 from .services.brk_reversion_detector import BrkReversionDetector
 from .services.combo_shadow_detector import ComboShadowDetector
 from .services.candlestick_shadow_detector import CandlestickShadowDetector
@@ -93,13 +93,13 @@ from .services.wechat_notifier import wechat_notifier
 from .services.trade_settler import TradeSettler
 from .services.compound_chain import CompoundChainRunner, validate_plan
 from .services.llm_service import LLMService
-from .services.pattern_reevaluator import pattern_reevaluator
 from .services.prediction_trading import BinancePredictionTrader
 from .services.prediction_market_data import PredictionMarketDataService, MarketQuoteData
-from .services.sentiment_agent import SentimentAgent
 from .services.signal_notify import set_live_enabled_resolver
-from .services.metrics import metrics_collector
 from .services.live_channel_benchmarks import CHANNEL_BENCHMARKS, benchmark_dict
+from .services.order_context_recorder import recorder as order_context_recorder
+from .services.attribution_engine import engine as attribution_engine
+from .services.attribution_engine import AttributionEngine
 from .services.live_performance import (
     LiveOrder,
     actual_cost,
@@ -148,12 +148,6 @@ _last_closed_window_entry_price: float | None = None
 _last_closed_window_exit_price: float | None = None
 _last_archived_window_end: int | None = None  # 去重：避免同一已关闭窗口重复归档
 
-# AgentScheduler 全局实例（lifespan 中初始化，tracker/archiver 引用发布事件）
-agent_scheduler: AgentScheduler | None = None
-
-# SentimentAgent 全局实例（lifespan 中初始化，供 deep-learn API 调用）
-sentiment_agent: SentimentAgent | None = None
-
 # 15m 市场最新报价缓存（tracker 15s 对齐采样 + 边界加速协程（边界后 40s 内 2s 粒度）
 # 刷新，假突破检测器读取信号时刻的 15m DOWN 报价与到期时刻；只读共享，无需加锁——
 # 单写者事件循环 + 读者可容忍毫秒级旧值，逐 key 赋值段无 await 不交错）
@@ -175,7 +169,6 @@ _pm_5m_cycle_open_price: float | None = None
 _pm_5m_cycle_open_end: int | None = None
 
 # PREDICT 事件触发标志：同一窗口仅触发一次（Req 3.1），窗口切换时重置
-_predict_triggered_for_window: bool = False
 
 # 假突破检测器全局实例（lifespan 中初始化；秒级检测日线阻力破位，暂不下注）
 fake_breakout_detector: FakeBreakoutDetector | None = None
@@ -270,7 +263,7 @@ EDGE_ACCEL_INTERVAL_S = 2      # 加密刷新间隔
 EDGE_ACCEL_WINDOW_MS = 40_000  # 15m 边界后的加速窗口
 
 # tracker 主采样间隔（秒）：2026-10-16 起 5s 全量采样（此前 15s），对齐到该间隔的
-# 整数边界（:00/:05/…）。PREDICT 触发阈值（settings.agent_predict_trigger_samples=30，
+# 整数边界（:00/:05/…）。
 # 30×5s≈150s 半窗）与 _pm_history 容量（6000，约 8.3h）均按此间隔换算，改动须同步。
 PM_POLL_INTERVAL_S = 5
 
@@ -384,7 +377,7 @@ async def _prediction_market_tracker() -> None:
     读写分离设计：本函数不再调用 prediction_trader.list_markets()，
     避免修改交易模块状态（Bug 1.1 修复）。
     """
-    global _current_window_end, _window_entry_price, _predict_triggered_for_window
+    global _current_window_end, _window_entry_price
     global _last_closed_window_end, _last_closed_window_entry_price, _last_closed_window_exit_price
     global _pm_5m_cycle_open_price, _pm_5m_cycle_open_end
 
@@ -500,8 +493,6 @@ async def _prediction_market_tracker() -> None:
                             _window_entry_price if _window_entry_price and _window_entry_price > 0 else None
                         )
                     _pm_5m_cycle_open_end = int(new_window_end)
-                    # 窗口切换时重置 PREDICT 触发标志（Req 3.1，同一窗口仅触发一次）
-                    _predict_triggered_for_window = False
 
                 # 首次进入窗口（含启动/重载）：从 DB 恢复当前窗口的采样数据
                 if not _restored_current_window:
@@ -577,40 +568,8 @@ async def _prediction_market_tracker() -> None:
                 except Exception as e:
                     logger.warning("预测市场采样入库失败: {}", e)
 
-                # 检查是否达到 PREDICT 触发条件（Req 3.1）：
-                # 当前窗口累计有效采样点达到 agent_predict_trigger_samples 时，
-                # 向 AgentScheduler 发布 PREDICT 事件（同一窗口仅触发一次）。
-                # 注意：len(_pm_history) 即为当前窗口内采样数，因为窗口切换时
-                # 执行了 _pm_history.clear()，所以 deque 长度等于窗口内累积计数。
-                if (
-                    not _predict_triggered_for_window
-                    and agent_scheduler is not None
-                    and len(_pm_history) >= settings.agent_predict_trigger_samples
-                ):
-                    _predict_triggered_for_window = True
-                    # 构建 current_curve：当前窗口三通道时序切片（宪法第八条规则 3：
-                    # sentiment/price/volume 实时采样齐备，L2 跨通道谓词在线可执行；
-                    # btc_price/trade_volume 为 None 的点被符号化层跳过，不阻塞）
-                    current_curve = [
-                        {
-                            "t": p["timestamp"],
-                            "up_pct": p["up_pct"],
-                            "down_pct": p["down_pct"],
-                            "btc_price": p.get("btc_price"),
-                            "trade_volume": p.get("trade_volume"),
-                        }
-                        for p in _pm_history
-                    ]
-                    agent_scheduler.publish("PREDICT", {
-                        "window_end_ms": _current_window_end,
-                        "current_curve": current_curve,
-                    })
-                    logger.info(
-                        "PREDICT 事件发布 | 窗口={} | 采样点={} | 阈值={}",
-                        _current_window_end,
-                        len(_pm_history),
-                        settings.agent_predict_trigger_samples,
-                    )
+                # （系统B PREDICT 事件发布点已随 AgentScheduler 移除，2026-10-19；
+                # 采样循环本身不受影响）
 
                 # 多通道实盘（quote_edge 族）：DOWN 报价首次进所绑版本规则区间 → 真单。
                 # None 守卫：未装配时跳过；check 内纯内存比较，不阻塞采样循环。
@@ -874,14 +833,8 @@ async def _sentiment_window_archiver() -> None:
                             start_ms, end_ms, len(samples), outcome, actual_return or 0,
                         )
 
-                        # 向 AgentScheduler 发布 WINDOW_ARCHIVED 事件（Req 6.1/6.2）：
-                        # 驱动 Validate→Learn 闭环，替换原 _auto_run_backtest 直调（已退役）
-                        if agent_scheduler is not None:
-                            agent_scheduler.publish("WINDOW_ARCHIVED", {"window_id": window.id})
-                            logger.debug(
-                                "WINDOW_ARCHIVED 事件发布 | window_id={} | {}~{}",
-                                window.id, start_ms, end_ms,
-                            )
+                        # （系统B WINDOW_ARCHIVED 事件发布点已随 AgentScheduler 移除，
+                        # 2026-10-19；情绪窗口归档本身继续运行）
 
                         _last_archived_window_end = end_ms  # 标记已归档，避免重复
 
@@ -937,93 +890,6 @@ async def _binance_reconcile_loop() -> None:
         except Exception as exc:
             logger.warning("币安定时对账异常（下轮重试）| {}", exc)
         await asyncio.sleep(1800)
-
-
-async def _health_monitor_loop() -> None:
-    """Agent 运行健康后台监控循环。
-
-    按 settings.agent_health_monitor_interval 周期构建健康报告：
-    - 非 OK 状态（WARN/CRITICAL）写日志，并经 alert_notifier 按 code 去重后
-      主动推送（邮件 + 可选 webhook；同 code 在抑制窗口内不重发）
-    - 每 settings.agent_health_snapshot_interval 落一条 HealthSnapshot 供趋势回看，
-      并清理早于保留窗口的旧快照
-
-    只读聚合 + 可选落库，异常仅告警不影响主决策流程。
-    """
-    from .db.models import HealthSnapshot
-    from .services.health import health_service
-    from .services.alerting import alert_notifier
-
-    if not settings.agent_health_monitor_enabled:
-        logger.info("Agent 健康监控已禁用（agent_health_monitor_enabled=False）")
-        return
-
-    await asyncio.sleep(30)  # 等待调度器/采集器预热，避免冷启动误报
-    last_snapshot_at = 0.0
-    logger.info(
-        "Agent 健康监控已启动 | 轮询={}s | 落库={}s | 抑制窗口={}s",
-        settings.agent_health_monitor_interval,
-        settings.agent_health_snapshot_interval,
-        settings.agent_alert_suppress_seconds,
-    )
-
-    while True:
-        try:
-            snapshot, consecutive_failures, queue_depth = _collect_memory_state()
-            async with async_session_factory() as db:
-                report = await health_service.build_report(
-                    db,
-                    metrics_snapshot=snapshot,
-                    consecutive_failures=consecutive_failures,
-                    queue_depth=queue_depth,
-                )
-
-                # 非 OK 状态写日志；新告警经邮件/webhook 主动推送（同 code 抑制窗口内不重发）
-                if report.overall_status == "CRITICAL":
-                    logger.warning("[HEALTH] CRITICAL | {}", report.summary)
-                elif report.overall_status == "WARN":
-                    logger.info("[HEALTH] WARN | {}", report.summary)
-                await alert_notifier.notify(report)
-
-                # 周期性落库 + 清理旧快照
-                now = time.time()
-                if now - last_snapshot_at >= settings.agent_health_snapshot_interval:
-                    db.add(HealthSnapshot(
-                        overall_status=report.overall_status,
-                        alert_count=len(report.alerts),
-                        report=report.model_dump(mode="json"),
-                    ))
-                    await db.commit()
-                    last_snapshot_at = now
-                    await _cleanup_old_health_snapshots(db)
-
-            await asyncio.sleep(settings.agent_health_monitor_interval)
-
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.warning("Agent 健康监控异常: {}", e)
-            await asyncio.sleep(settings.agent_health_monitor_interval)
-
-
-async def _cleanup_old_health_snapshots(db: AsyncSession) -> None:
-    """删除早于保留窗口的 health_snapshots 记录，防止表无限增长。失败仅告警。"""
-    from sqlalchemy import delete as sa_delete
-    from .db.models import HealthSnapshot
-
-    cutoff = datetime.now(timezone.utc) - timedelta(
-        days=settings.agent_health_snapshot_retention_days
-    )
-    try:
-        result = await db.execute(
-            sa_delete(HealthSnapshot).where(HealthSnapshot.created_at < cutoff)
-        )
-        if result.rowcount and result.rowcount > 0:
-            await db.commit()
-            logger.debug("清理旧健康快照 | 删除 {} 条（早于 {}）", result.rowcount, cutoff.isoformat())
-    except Exception as e:
-        await db.rollback()
-        logger.warning("清理旧健康快照失败: {}", e)
 
 
 # ============================================================
@@ -1203,37 +1069,17 @@ async def lifespan(app: FastAPI):
     # 3. 启动高频 asyncio 任务（现货 WS 连接 + SSE 心跳 + 预测市场追踪）
     await collector.start()
 
-    # 4. 实例化并启动 AgentScheduler（Req 2.1/6.1/11.2）
-    # 2026-08-16 系统B退役：agent_loop_enabled=False 时不实例化（预测循环停用），
-    # 全局 agent_scheduler/sentiment_agent 保持 None——tracker/archiver 的
-    # publish 调用已有 None 守卫，事件静默跳过；情绪窗口归档器不受影响。
-    global agent_scheduler, sentiment_agent
-    if settings.agent_loop_enabled:
-        _sentiment_agent = SentimentAgent(llm=llm_service, trader=prediction_trader)
-        sentiment_agent = _sentiment_agent
-        agent_scheduler = AgentScheduler(agent=_sentiment_agent, trader=prediction_trader)
-        await agent_scheduler.start()  # 含冷启动检查（Req 11.2）
-        logger.info("SentimentAgent + AgentScheduler 已就绪（冷启动检查完成）")
-
-        # P1-1：启动对账——回填进程重启后遗漏的未验证预测（孤儿预测）。
-        # 调度队列非持久，重启后 is_correct IS NULL 的预测无人回填；
-        # 在 scheduler 启动后、正常事件流开始前一次性扫描并回填。
-        try:
-            reconciled = await _sentiment_agent.reconcile_pending_predictions()
-            logger.info("启动对账完成 | 回填未验证预测 {} 条", reconciled)
-        except Exception as exc:
-            logger.error("启动对账失败（不阻断启动）| {}", exc)
-    else:
-        logger.info("系统B预测循环已退役（agent_loop_enabled=False）| 情绪窗口归档继续运行（场景信号位势源）")
+    # 4. （系统B AgentScheduler/SentimentAgent 已于 2026-10-19 整体移除；
+    #     情绪窗口归档器不受影响，继续运行——它是场景信号的位势源）
 
     tasks = [
         asyncio.create_task(collector.connect_spot_ws(), name="spot_ws"),
         asyncio.create_task(_prediction_market_tracker(), name="pm_tracker"),
         asyncio.create_task(_pm_15m_edge_accelerator(), name="pm_15m_edge_accel"),
         asyncio.create_task(_sentiment_window_archiver(), name="sw_archiver"),
-        asyncio.create_task(_health_monitor_loop(), name="health_monitor"),
         asyncio.create_task(_binance_reconcile_loop(), name="binance_reconcile"),
         asyncio.create_task(_signal_health_loop(), name="signal_health"),
+        asyncio.create_task(_attribution_weekly_loop(), name="attribution_weekly"),
     ]
     logger.info("现货 WS + 预测市场追踪 + 15m边界加速 + 情绪窗口归档 + 健康监控已启动")
 
@@ -1265,6 +1111,10 @@ async def lifespan(app: FastAPI):
         # v3 通道保守不开火，与影子「collector 缺失不落 v3」同口径）
         multi_live_trader.kline_fetcher = collector.fetch_recent_klines
         multi_live_trader.kline_ending_at_fetcher = collector.fetch_klines_ending_at
+
+    # LLM 归因系统：证据包 K 线源（与影子检测器同 collector，只读回放）；
+    # 结算钩子在 trade_settler 装配处注入。
+    order_context_recorder.kline_fetcher = collector.fetch_klines_ending_at
 
     # 影子版本开关 gate（前端手动下线能力）：先于所有影子检测器启动，保证首轮
     # 落库判定可用；DB 故障保守全在线（fail-safe，不停采集）。
@@ -1562,8 +1412,10 @@ async def lifespan(app: FastAPI):
 
     # 交易结算器（P0-2）：回读 SentimentWindow 结算 FILLED 订单输赢/盈亏。
     # 无开关常开：行为只读窗口 + 回填结算字段，零资金风险。
+    # 2026-10-19：结算回调挂归因钩子（建证据包 + 连败检测；fire-and-forget，
+    # 内部全捕获，绝不阻塞/影响结算事务）。
     global trade_settler
-    trade_settler = TradeSettler()
+    trade_settler = TradeSettler(on_settled=_attribution_on_settled)
     await trade_settler.start()
     logger.info("交易结算器已启动（60s 扫描 FILLED 未结算订单，settled_at 锚点）")
 
@@ -1678,17 +1530,10 @@ async def lifespan(app: FastAPI):
         )
         await research_scheduler.start()
 
-    # 模式池分级与定期重回测（无限进化引擎：新数据累积阈值触发，只发现不下注）
-    if settings.pattern_reeval_enabled:
-        await pattern_reevaluator.start()
-        logger.info("模式重回测调度器已启动（模式池 S/A/B/C 分级）")
-
     yield  # 应用运行中
 
     # 4. 清理
     logger.info("系统关闭中...")
-    # 停止模式重回测调度器
-    await pattern_reevaluator.stop()
     # 停止场景研究调度器
     if research_scheduler is not None:
         await research_scheduler.stop()
@@ -1766,9 +1611,6 @@ async def lifespan(app: FastAPI):
         await multi_live_trader.stop()
     # 复位邮件闸 resolver（防同进程二次 lifespan 残留指向旧 trader 的闭包）
     set_live_enabled_resolver(None)
-    # 停止 AgentScheduler（优雅关闭，等待当前阶段执行完毕）
-    if agent_scheduler is not None:
-        await agent_scheduler.stop()
     await collector.stop()
     try:
         await shadow_execution_projector.stop()
@@ -2302,105 +2144,6 @@ async def get_fake_breakout_stats(db: AsyncSession = Depends(get_db)):
         "research_win_rates": dict(RESEARCH_WIN_RATES),
         "pricing": {"fee": FEE, "premium": PREMIUM, "odds": round(ODDS, 4), "breakeven": round(BREAKEVEN, 4)},
     }
-
-
-# ============================================================
-# 模式池分级与回测快照 API（无限进化引擎，只发现不下注）
-# ============================================================
-
-@app.post("/api/agent/patterns/reevaluate")
-async def trigger_pattern_reevaluate(_: None = Depends(_require_auth)):
-    """手动触发一轮全量模式重回测（与后台调度同一入口）。"""
-    summary = await pattern_reevaluator.run_all(trigger="MANUAL")
-    return {"ok": True, "summary": summary}
-
-
-@app.get("/api/agent/patterns/backtest-runs")
-async def list_pattern_backtest_runs(
-    pattern_id: int | None = None,
-    limit: int = 50,
-    db: AsyncSession = Depends(get_db),
-):
-    """模式回测快照列表（纵向对比数据源：同一模式随时间的回测漂移）。"""
-    from sqlalchemy import desc as sa_desc, select as sa_select
-
-    limit = max(1, min(limit, 200))
-    stmt = sa_select(PatternBacktestRun).order_by(sa_desc(PatternBacktestRun.created_at))
-    if pattern_id is not None:
-        stmt = stmt.where(PatternBacktestRun.pattern_id == pattern_id)
-    stmt = stmt.limit(limit)
-    rows = (await db.execute(stmt)).scalars().all()
-    return {
-        "runs": [
-            {
-                "id": r.id,
-                "pattern_id": r.pattern_id,
-                "data_start": r.data_start,
-                "data_end": r.data_end,
-                "sample_count": r.sample_count,
-                "correct_count": r.correct_count,
-                "win_rate": r.win_rate,
-                "wilson_lower": r.wilson_lower,
-                "wilson_upper": r.wilson_upper,
-                "ev_after_fee": r.ev_after_fee,
-                "segment_stats": r.segment_stats,
-                "delta_vs_prev": r.delta_vs_prev,
-                "trigger_reason": r.trigger_reason,
-                "created_at": r.created_at.isoformat() if r.created_at else None,
-            }
-            for r in rows
-        ],
-        "total": len(rows),
-    }
-
-
-@app.get("/api/agent/patterns/compare")
-async def compare_patterns_latest(db: AsyncSession = Depends(get_db)):
-    """横向对比：每个模式最新一次回测快照 + 当前 tier（模式间对比）。"""
-    from sqlalchemy import desc as sa_desc, select as sa_select
-    from .db.models import PatternMemory
-
-    patterns = (await db.execute(
-        sa_select(PatternMemory).order_by(sa_desc(PatternMemory.updated_at))
-    )).scalars().all()
-
-    # 每个模式的最新一次回测
-    latest_runs: dict[int, PatternBacktestRun] = {}
-    run_rows = (await db.execute(
-        sa_select(PatternBacktestRun).order_by(sa_desc(PatternBacktestRun.created_at))
-    )).scalars().all()
-    for r in run_rows:
-        if r.pattern_id not in latest_runs:
-            latest_runs[r.pattern_id] = r
-
-    items = []
-    for p in patterns:
-        run = latest_runs.get(p.id)
-        items.append({
-            "pattern_id": p.id,
-            "pattern_name": p.pattern_name,
-            "status": p.status,
-            "tier": p.tier,
-            "predicted_direction": p.predicted_direction,
-            "discovery_method": p.discovery_method,
-            "live_win_rate": p.win_rate,
-            "live_sample_count": p.sample_count,
-            "latest_run": (
-                {
-                    "id": run.id,
-                    "data_end": run.data_end,
-                    "sample_count": run.sample_count,
-                    "win_rate": run.win_rate,
-                    "wilson_lower": run.wilson_lower,
-                    "wilson_upper": run.wilson_upper,
-                    "ev_after_fee": run.ev_after_fee,
-                    "delta_vs_prev": run.delta_vs_prev,
-                    "created_at": run.created_at.isoformat() if run.created_at else None,
-                }
-                if run else None
-            ),
-        })
-    return {"patterns": items, "total": len(items)}
 
 
 @app.get("/api/health")
@@ -5897,6 +5640,12 @@ async def _signal_health_loop() -> None:
                 name = LIVE_CHANNELS[r["key"]].display_name if r["scope"] == "live" and r["key"] in LIVE_CHANNELS else r["key"]
                 wechat_notifier.push_markdown(sh.format_red_alert(r, name))
                 logger.warning("信号体检转红 | {} {} | {}", r["scope"], r["key"], r["reasons"])
+                # 红灯→LLM 深归因触发（引擎内自带并发/日预算护栏；随机性前置门
+                # 仍生效：与随机一致时只落事实卡不调模型）
+                if r["scope"] == "live" and settings.attribution_enabled:
+                    asyncio.create_task(
+                        attribution_engine.on_red_light(r["key"]),
+                        name=f"attr_red_{r['key']}")
             for r in sh.new_red_transitions(prev, cal_snap):
                 wechat_notifier.push_markdown(sh.format_calibration_red_alert(r))
                 logger.warning("买贵校准转红 | {} | {}", r["key"], r["reasons"])
@@ -5906,6 +5655,47 @@ async def _signal_health_loop() -> None:
         except Exception as exc:
             logger.warning("信号体检循环异常 | {}", exc)
         await asyncio.sleep(3600)
+
+
+def _attribution_on_settled(order_id: int, channel: str | None) -> None:
+    """结算回调（同步、fire-and-forget）：建证据包 + 连败事件检测。
+
+    recorder/engine 内部全捕获异常；本函数只做 dispatch，任何归因侧故障
+    都不可能传播回结算事务（安全边界铁律）。
+    """
+    if not settings.attribution_enabled:
+        return
+    try:
+        order_context_recorder.enqueue(order_id)
+        if channel:
+            asyncio.create_task(
+                attribution_engine.on_order_settled(channel),
+                name=f"attr_streak_{channel}")
+    except Exception as exc:  # pragma: no cover - 双保险
+        logger.warning("归因结算钩子 dispatch 失败 | order={} | {}", order_id, exc)
+
+
+async def _attribution_weekly_loop() -> None:
+    """归因周报：每周一 00:30 UTC 对全部已启用实盘通道跑一次归因（随机性门同样生效）。"""
+    from .services.live_channels import parse_channel_config
+
+    await asyncio.sleep(300)
+    last_week = None
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            iso_week = f"{now.isocalendar().year}-W{now.isocalendar().week}"
+            if now.weekday() == 0 and now.hour == 0 and last_week != iso_week and settings.attribution_enabled:
+                last_week = iso_week
+                configs = parse_channel_config()
+                channels = [ch for ch, c in configs.items() if c.enabled]
+                n = await attribution_engine.weekly_review(channels)
+                logger.info("归因周报完成 | 通道 {} 个 | 运行 {} 次", len(channels), n)
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.warning("归因周报循环异常 | {}", exc)
+        await asyncio.sleep(1200)
 
 
 @app.get("/api/signals/execution-comparison")
@@ -6072,40 +5862,6 @@ async def get_sentiment_windows(
     ]
 
 
-@app.post("/api/sentiment/backtest")
-async def run_sentiment_backtest(
-    window_count: int = 24,
-    force: bool = False,
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    [DEPRECATED] 情绪曲线回测分析 — 已退役
-
-    该端点依赖的 llm_service.sentiment_backtest 已被 SentimentAgent Learn 阶段取代。
-    保留端点返回退役提示，避免前端调用报 404。
-    """
-    return {
-        "status": "deprecated",
-        "message": "回测功能已退役，已被 SentimentAgent 的 Learn 阶段取代。请使用 /api/sentiment/agent/patterns 查看模式库。",
-    }
-
-
-@app.post("/api/sentiment/predict")
-async def run_sentiment_prediction(
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    [DEPRECATED] 基于当前情绪曲线的实时预测 — 已退役
-
-    该端点依赖的 llm_service.sentiment_predict 已被 SentimentAgent Predict 阶段取代。
-    保留端点返回退役提示，避免前端调用报 404。
-    """
-    return {
-        "status": "deprecated",
-        "message": "情绪预测功能已退役，已被 SentimentAgent 的 Predict 阶段取代。请使用 /api/sentiment/agent/predictions 查看预测历史。",
-    }
-
-
 # ============================================================
 # 概率动量预测 API（方案 C：纯算法，不依赖 LLM）
 # ============================================================
@@ -6157,577 +5913,188 @@ async def run_momentum_predict(
 
 
 # ============================================================
-# Sentiment Agent 查询 API（Req 6.5, 8.3, 8.4, 8.5）
-# 端点内导入以避免循环依赖与全局命名空间冲突（sa_select 别名区分于模块级 select）
-# ============================================================
-
-@app.get("/api/sentiment/agent/predictions")
-async def get_agent_predictions(
-    start: datetime | None = None,
-    end: datetime | None = None,
-    direction: str | None = None,
-    _: None = Depends(_require_auth),
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    查询 Agent 预测历史（Req 8.3）
-
-    支持按时间范围和方向筛选，按 prediction_time 降序返回，最多 100 条。
-    """
-    from sqlalchemy import select as sa_select
-    from .db.models import AgentPrediction
-    from .models.schemas import AgentPredictionRecord
-
-    stmt = sa_select(AgentPrediction).order_by(AgentPrediction.prediction_time.desc())
-
-    # 时间范围筛选
-    if start is not None:
-        stmt = stmt.where(AgentPrediction.prediction_time >= start)
-    if end is not None:
-        stmt = stmt.where(AgentPrediction.prediction_time <= end)
-    # 方向筛选
-    if direction is not None:
-        stmt = stmt.where(AgentPrediction.predicted_direction == direction)
-
-    stmt = stmt.limit(100)
-    result = await db.execute(stmt)
-    rows = result.scalars().all()
-
-    return [
-        AgentPredictionRecord(
-            id=r.id,
-            prediction_time=r.prediction_time,
-            sentiment_window_id=r.sentiment_window_id,
-            predicted_direction=r.predicted_direction,
-            matched_pattern_id=r.matched_pattern_id,
-            matched_pattern_name=r.matched_pattern_name,
-            confidence=r.confidence,
-            entry_timing=r.entry_timing,
-            reasoning=r.reasoning,
-            is_correct=r.is_correct,
-            actual_outcome=r.actual_outcome,
-            actual_return=r.actual_return,
-            validated_at=r.validated_at,
-            trade_order_id=r.trade_order_id,
-            skip_trade_reason=r.skip_trade_reason,
-            created_at=r.created_at,
-        ).model_dump()
-        for r in rows
-    ]
-
-
-@app.get("/api/sentiment/agent/patterns")
-async def get_agent_patterns(
-    _: None = Depends(_require_auth),
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    查询 Pattern_Memory 当前状态（Req 8.4）
-
-    返回所有模式（ACTIVE + RETIRED + 统计），按 status(ACTIVE 优先) 和 win_rate 降序排序。
-    """
-    from sqlalchemy import select as sa_select, case
-    from .db.models import PatternMemory
-    from .models.schemas import PatternMemoryRecord
-
-    # 按 status 排序：ACTIVE=0, EVOLVING=1, RETIRED=2；同 status 内按 win_rate 降序
-    status_order = case(
-        (PatternMemory.status == "ACTIVE", 0),
-        (PatternMemory.status == "EVOLVING", 1),
-        else_=2,
-    )
-    stmt = (
-        sa_select(PatternMemory)
-        .order_by(status_order.asc(), PatternMemory.win_rate.desc())
-    )
-    result = await db.execute(stmt)
-    rows = result.scalars().all()
-
-    return [
-        PatternMemoryRecord(
-            id=r.id,
-            pattern_name=r.pattern_name,
-            description=r.description,
-            curve_features=r.curve_features,
-            conditions=r.conditions,
-            predicted_direction=r.predicted_direction,
-            win_rate=r.win_rate,
-            sample_count=r.sample_count,
-            correct_count=r.correct_count,
-            confidence_score=r.confidence_score,
-            status=r.status,
-            discovery_method=r.discovery_method,
-            holdout_win_rate=r.holdout_win_rate,
-            holdout_sample_count=r.holdout_sample_count,
-            holdout_ci_lower=r.holdout_ci_lower,
-            created_at=r.created_at,
-            updated_at=r.updated_at,
-        ).model_dump()
-        for r in rows
-    ]
-
-
-@app.get("/api/sentiment/agent/patterns/{pattern_id}/history")
-async def get_pattern_history(
-    pattern_id: int,
-    limit: int = 200,
-    _: None = Depends(_require_auth),
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    查询某模式的进化轨迹（Req 8.5）
-
-    返回该模式的所有 Pattern_Change_Log 记录，按 created_at 正序排列。
-    支持 limit 分页参数（默认 200 条）。
-    """
-    from sqlalchemy import select as sa_select
-    from .db.models import PatternChangeLog
-    from .models.schemas import PatternChangeLogRecord
-
-    stmt = (
-        sa_select(PatternChangeLog)
-        .where(PatternChangeLog.pattern_id == pattern_id)
-        .order_by(PatternChangeLog.created_at.asc())
-        .limit(limit)
-    )
-    result = await db.execute(stmt)
-    rows = result.scalars().all()
-
-    return [
-        PatternChangeLogRecord(
-            id=r.id,
-            pattern_id=r.pattern_id,
-            change_type=r.change_type,
-            phase=r.phase,
-            before_snapshot=r.before_snapshot,
-            after_snapshot=r.after_snapshot,
-            change_reason=r.change_reason,
-            evolve_phase_id=r.evolve_phase_id,
-            created_at=r.created_at,
-        ).model_dump()
-        for r in rows
-    ]
-
-
-@app.get("/api/sentiment/agent/status")
-async def get_agent_status(
-    _: None = Depends(_require_auth),
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    查询 Agent 运行状态（Req 6.5）
-
-    返回当前验证计数、ACTIVE 模式数量、调度器运行状态。
-    """
-    from sqlalchemy import select as sa_select, func as sa_func
-    from .db.models import PatternMemory
-
-    # 查询 ACTIVE 模式数量
-    count_stmt = (
-        sa_select(sa_func.count())
-        .select_from(PatternMemory)
-        .where(PatternMemory.status == "ACTIVE")
-    )
-    count_result = await db.execute(count_stmt)
-    active_pattern_count = count_result.scalar() or 0
-
-    # 从 AgentScheduler 获取验证计数和运行状态
-    validate_counter = 0
-    scheduler_running = False
-    if agent_scheduler is not None:
-        validate_counter = agent_scheduler.validate_counter
-        scheduler_running = True
-
-    return {
-        "validate_counter": validate_counter,
-        "active_pattern_count": active_pattern_count,
-        "scheduler_running": scheduler_running,
-        "queue_depth": agent_scheduler.queue_depth if agent_scheduler is not None else -1,
-        "evolve_trigger_mode": settings.agent_evolve_trigger_mode,
-        "new_validated_since_evolve": (
-            agent_scheduler.new_validated_since_evolve if agent_scheduler is not None else 0
-        ),
-        "evolve_min_new_samples": settings.agent_evolve_min_new_samples,
-        "metrics_summary": {
-            "llm_total_cost": metrics_collector.get_snapshot().get("llm", {}).get("total_cost", 0.0),
-            "llm_call_count": metrics_collector.get_snapshot().get("llm", {}).get("call_count", 0),
-        },
-    }
-
-
-@app.get("/api/sentiment/agent/metrics")
-async def get_agent_metrics(
-    _: None = Depends(_require_auth),
-):
-    """
-    查询 Agent 运行时详细指标（Req 17 可观测性）
-
-    返回各阶段执行统计、LLM token 用量与估算成本、交易决策统计、队列深度。
-    """
-    return metrics_collector.get_snapshot()
-
-
-@app.get("/api/sentiment/agent/evolution")
-async def get_agent_evolution(
-    days: int = 30,
-    _: None = Depends(_require_auth),
-    db: AsyncSession = Depends(get_db),
-):
-    """进化有效性看板（Item 1）。
-
-    把「Agent 是否真的在进化」量化为可证伪的数字：总体决策胜率与是否
-    跑赢随机基线（Wilson 95% 下界>0.5）、按天的样本外胜率趋势、前半程 vs
-    近半程代际对比（change≠improvement 的判据）、以及按发现方法拆分的胜率
-    （LLM_DEEP / PY_CLUSTER / LEGACY / UNMATCHED）。days 夹在 [1, 90]。
-    """
-    from .services.evolution_metrics import build_evolution_report
-
-    days = max(1, min(days, 90))
-    return await build_evolution_report(db, days=days)
-
-
-def _collect_memory_state() -> tuple[dict, dict, int | None]:
-    """采集进程内内存态指标，供 HealthService 融合。
-
-    Returns:
-        (metrics_snapshot, consecutive_failures, queue_depth)
-        - metrics_snapshot: metrics_collector.get_snapshot()
-        - consecutive_failures: {phase: 连续失败数}
-        - queue_depth: 调度器当前队列深度；scheduler 未就绪时为 None
-    """
-    snapshot = metrics_collector.get_snapshot()
-    consecutive_failures = {
-        phase: metrics_collector.get_consecutive_failures(phase)
-        for phase in ("PREDICT", "VALIDATE", "LEARN", "EVOLVE")
-    }
-    queue_depth = agent_scheduler.queue_depth if agent_scheduler is not None else None
-    return snapshot, consecutive_failures, queue_depth
-
-
-@app.get("/api/agent/health")
-async def get_agent_health(
-    _: None = Depends(_require_auth),
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    Agent 运行健康报告（监控系统主端点）
-
-    聚合 5 类关键指标（窗口连续性 / predict 匹配率 / 置信度校准 / 调度器心跳 /
-    LLM 错误率），派生告警与总体状态，并附自然语言诊断 summary，供人与 LLM
-    直接读取做运行诊断。返回结构见 models.schemas.HealthReport。
-    """
-    from .services.health import health_service
-
-    snapshot, consecutive_failures, queue_depth = _collect_memory_state()
-    report = await health_service.build_report(
-        db,
-        metrics_snapshot=snapshot,
-        consecutive_failures=consecutive_failures,
-        queue_depth=queue_depth,
-    )
-    return report.model_dump()
-
-
-# ============================================================
-# 深度模式发现 API（双模式架构）
+# LLM 归因系统 API（order context + attribution；2026-10-19）
+# 确定性统计先行裁决，LLM 只做假设生成器；一切行动建议人工执行。
 # ============================================================
 
 
-@app.post("/api/sentiment/agent/deep-learn")
-async def trigger_deep_learn(
-    max_windows: int = 100,
-    _: None = Depends(_require_auth),
-):
-    """
-    触发手动深度模式发现（预览模式）。
-
-    分析全量历史窗口，返回发现结果供用户审核。
-    不写入 DB，需通过 /commit 端点确认写入。
-    """
-    if sentiment_agent is None:
-        return {"status": "deprecated", "message": "系统B预测循环已退役（2026-08-16 拍板），deep-learn 系列端点随之退役"}
-
-    # P1-2: 端点入参 clamp 上限，防止外部传入超大 max_windows 拖垮采样
-    max_windows = max(1, min(max_windows, settings.agent_deep_learn_max_windows_cap))
-    try:
-        result = await sentiment_agent.deep_learn(max_windows=max_windows)
-        return {
-            "status": "ok",
-            "reasoning": result.get("reasoning", ""),
-            "discoveries": result.get("discoveries", []),
-            "count": len(result.get("discoveries", [])),
-            "message": "预览模式，数据尚未写入 DB。确认后请调用 POST /api/sentiment/agent/deep-learn/commit",
-        }
-    except RuntimeError as e:
-        # 并发冲突
-        return {"status": "busy", "message": str(e)}
-    except Exception as e:
-        logger.error("深度分析失败: {}", e)
-        return {"status": "error", "message": "深度分析失败，请查看服务端日志"}
-
-
-@app.post("/api/sentiment/agent/deep-learn/stream")
-async def stream_deep_learn(
-    max_windows: int = 100,
-    _: None = Depends(_require_auth),
-):
-    """流式深度模式发现（SSE）：逐 token 推送 LLM 输出，供前端实时打字机展示。
-
-    与 POST /deep-learn 的一次性返回不同，本端点以 text/event-stream 逐帧推送：
-    每帧一行 `data: <json>\\n\\n`，json.type ∈ {step, reasoning, progress, done, error}。
-    done 帧携带最终 reasoning 与 discoveries（供前端勾选后走 /commit 写入）。
-    不写 DB；成功后会落一条 DEEP_LEARN 轨迹。
-    """
-    # P1-2: 端点入参 clamp 上限
-    max_windows = max(1, min(max_windows, settings.agent_deep_learn_max_windows_cap))
-
-    async def event_gen():
-        if sentiment_agent is None:
-            yield f"data: {json.dumps({'type': 'error', 'message': '系统B预测循环已退役（2026-08-16 拍板），deep-learn 系列端点随之退役'}, ensure_ascii=False)}\n\n"
-            return
-        try:
-            async for ev in sentiment_agent.deep_learn_stream(max_windows=max_windows):
-                yield f"data: {json.dumps(ev, ensure_ascii=False, default=str)}\n\n"
-        except Exception as e:
-            logger.error("流式深度分析异常: {} | {}", type(e).__name__, e)
-            payload = {"type": "error", "message": f"{type(e).__name__}: {e}"}
-            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-    return StreamingResponse(
-        event_gen(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",  # 显式关闭代理缓冲，确保逐帧下发
-        },
-    )
-
-
-@app.post("/api/sentiment/agent/deep-learn/commit")
-async def commit_deep_learn(
-    request: CommitDeepLearnRequest,
-    _: None = Depends(_require_auth),
-):
-    """
-    将用户确认的模式发现写入 pattern_memory。
-
-    discoveries 来自 POST /api/sentiment/agent/deep-learn 的返回值。
-    请求体使用 Pydantic Schema 校验，确保数据完整性。
-    """
-    if sentiment_agent is None:
-        return {"status": "deprecated", "message": "系统B预测循环已退役（2026-08-16 拍板），deep-learn 系列端点随之退役"}
-
-    if not request.discoveries:
-        return {"status": "error", "message": "discoveries 为空，无内容可写入"}
-
-    # 将 Pydantic 模型转换为 dict 列表
-    discoveries_dicts = [d.model_dump() for d in request.discoveries]
-
-    # P2-2: 记录预览时的 snapshot_token 供审计；commit 侧不信任预览声明，
-    # 而是用每条 discovery 携带的当次 holdout 统计独立重跑准入闸门（兜底一致性）。
-    logger.info(
-        "Commit Deep Learn: snapshot_token={} | discoveries={}",
-        request.snapshot_token, len(discoveries_dicts),
-    )
-    try:
-        # commit_deep_learn 返回 {status, written, rejected, failed}（P0-3 准入 / P1-4 失败收集）
-        result = await sentiment_agent.commit_deep_learn(discoveries_dicts)
-        return {
-            "status": "ok",
-            "written": result.get("written", 0),
-            "rejected": result.get("rejected", []),
-            "failed": result.get("failed", []),
-        }
-    except RuntimeError as e:
-        # 并发冲突
-        return {"status": "busy", "message": str(e)}
-    except Exception as e:
-        logger.error("深度分析写入失败: {}", e)
-        return {"status": "error", "message": "写入失败，请查看服务端日志"}
-
-
-def _summarize_discovery_group(result: dict) -> dict:
-    """把一次 deep-learn 结果压成多维对比摘要（双轨：holdout 维度 + Q6 初筛维度）。
-
-    旧轨（PY_CLUSTER/LEGACY）维度保持不变：发现数、平均 holdout 胜率 / Wilson
-    下界、holdout 样本量、平均 confidence、通过 P0-3 准入闸门的比例、方向分布。
-    谓词轨（LLM_DEEP 新轨，predicate 非空）追加：假设条数、screen 三档裁决计数、
-    过闸（ACTIVE+OBSERVE 可写库）比例、平均 screen lift、分箱版本。
-    """
-    discoveries = result.get("discoveries", [])
-    n = len(discoveries)
-    win_rates = [d["holdout_win_rate"] for d in discoveries if d.get("holdout_win_rate") is not None]
-    ci_lowers = [d["holdout_ci_lower"] for d in discoveries if d.get("holdout_ci_lower") is not None]
-    confidences = [d["confidence_score"] for d in discoveries if d.get("confidence_score") is not None]
-    total_samples = sum(int(d.get("holdout_sample_count") or 0) for d in discoveries)
-    min_samples = settings.agent_deep_learn_min_holdout_samples
-    passed = [
-        d for d in discoveries
-        if (d.get("holdout_ci_lower") or 0.0) > 0.5
-        and (d.get("holdout_sample_count") or 0) >= min_samples
-    ]
-    up = sum(1 for d in discoveries if (d.get("predicted_direction") or "").upper() == "UP")
-    down = sum(1 for d in discoveries if (d.get("predicted_direction") or "").upper() == "DOWN")
-
-    # --- 谓词轨（Q6 初筛）维度 ---
-    pred_track = [d for d in discoveries if d.get("predicate")]
-    pn = len(pred_track)
-    screen_lifts = [
-        d["screen_lift"] for d in pred_track if d.get("screen_lift") is not None
-    ]
-    active_n = sum(1 for d in pred_track if d.get("screen_verdict") == "ACTIVE")
-    observe_n = sum(1 for d in pred_track if d.get("screen_verdict") == "OBSERVE")
-    reject_n = sum(1 for d in pred_track if d.get("screen_verdict") == "REJECT")
-
-    def _avg(xs: list[float]) -> float:
-        return round(sum(xs) / len(xs), 4) if xs else 0.0
+@app.get("/api/attribution/status")
+async def get_attribution_status(_: None = Depends(_require_auth)):
+    """归因系统状态：开关 / 模型阵容 / 引擎版本。"""
+    from .services.llm_panel import PROMPT_VERSION, default_panel
 
     return {
-        "method": result.get("method"),
-        "discovery_count": n,
-        "avg_holdout_win_rate": _avg(win_rates),
-        "avg_holdout_ci_lower": _avg(ci_lowers),
-        "total_holdout_samples": total_samples,
-        "avg_confidence": _avg(confidences),
-        "passed_gate_count": len(passed),
-        "passed_gate_ratio": round(len(passed) / n, 4) if n else 0.0,
-        "direction_up": up,
-        "direction_down": down,
-        "snapshot_token": result.get("snapshot_token"),
-        "train_count": result.get("train_count", 0),
-        "holdout_count": result.get("holdout_count", 0),
-        # 谓词轨扩展（旧轨结果这些字段为 0/None，不影响旧面板）
-        "binning_version": result.get("binning_version"),
-        "predicate_count": pn,
-        "screen_active_count": active_n,
-        "screen_observe_count": observe_n,
-        "screen_reject_count": reject_n,
-        "screen_admitted_count": active_n + observe_n,
-        "screen_admitted_ratio": round((active_n + observe_n) / pn, 4) if pn else 0.0,
-        "avg_screen_lift": _avg(screen_lifts),
+        "enabled": settings.attribution_enabled,
+        "llm_enabled": settings.attribution_llm_enabled,
+        "panel": [{"provider": p["provider"], "model": p["model"], "family": p["family"]}
+                  for p in default_panel()],
+        "prompt_version": PROMPT_VERSION,
+        "streak_p": settings.attribution_streak_p,
+        "streak_window_n": settings.attribution_streak_window_n,
+        "max_daily_runs": settings.attribution_max_daily_runs,
     }
 
 
-@app.post("/api/sentiment/agent/deep-learn/pycluster")
-async def trigger_deep_learn_pycluster(
-    max_windows: int = 100,
-    _: None = Depends(_require_auth),
-):
-    """触发 Python 聚类版深度发现（全程无 LLM，确定性对照组，预览不写库）。
-
-    与纯 LLM 版 /deep-learn 对称：返回 discoveries（每条含 discovery_method=PY_CLUSTER
-    与 holdout 统计）+ snapshot_token + train/holdout 计数，供前端预览后走 /commit 写入。
-    """
-    if sentiment_agent is None:
-        return {"status": "deprecated", "message": "系统B预测循环已退役（2026-08-16 拍板），deep-learn 系列端点随之退役"}
-
-    # P1-2: 端点入参 clamp 上限
-    max_windows = max(1, min(max_windows, settings.agent_deep_learn_max_windows_cap))
-    try:
-        result = await sentiment_agent.deep_learn_pycluster(max_windows=max_windows)
-        return {
-            "status": "ok",
-            "reasoning": result.get("reasoning", ""),
-            "discoveries": result.get("discoveries", []),
-            "count": len(result.get("discoveries", [])),
-            "method": result.get("method", "PY_CLUSTER"),
-            "snapshot_token": result.get("snapshot_token"),
-            "train_count": result.get("train_count", 0),
-            "holdout_count": result.get("holdout_count", 0),
-            "message": "预览模式，数据尚未写入 DB。确认后请调用 POST /api/sentiment/agent/deep-learn/commit",
-        }
-    except RuntimeError as e:
-        return {"status": "busy", "message": str(e)}
-    except Exception as e:
-        logger.error("聚类深度分析失败: {}", e)
-        return {"status": "error", "message": "聚类深度分析失败，请查看服务端日志"}
-
-
-@app.post("/api/sentiment/agent/deep-learn/compare")
-async def compare_deep_learn(
-    max_windows: int = 100,
-    _: None = Depends(_require_auth),
-):
-    """同一采样窗口上依次跑 LLM 版与 Python 聚类版，返回对齐的多维对比（预览不写库）。
-
-    两版均调用同一确定性采样，snapshot_token 应一致；不一致时 snapshot_consistent=False，
-    前端需提示两次采样窗口不同（对比失真）。comparison 为 [LLM 摘要, PY 摘要]。
-    """
-    if sentiment_agent is None:
-        return {"status": "deprecated", "message": "系统B预测循环已退役（2026-08-16 拍板），deep-learn 系列端点随之退役"}
-
-    # P1-2: 端点入参 clamp 上限
-    max_windows = max(1, min(max_windows, settings.agent_deep_learn_max_windows_cap))
-    try:
-        llm_result = await sentiment_agent.deep_learn(max_windows=max_windows)
-        py_result = await sentiment_agent.deep_learn_pycluster(max_windows=max_windows)
-    except RuntimeError as e:
-        return {"status": "busy", "message": str(e)}
-    except Exception as e:
-        logger.error("对比深度分析失败: {}", e)
-        return {"status": "error", "message": "对比深度分析失败，请查看服务端日志"}
-
-    return {
-        "status": "ok",
-        "snapshot_consistent": (
-            llm_result.get("snapshot_token") == py_result.get("snapshot_token")
-        ),
-        "comparison": [
-            _summarize_discovery_group(llm_result),
-            _summarize_discovery_group(py_result),
-        ],
-        "llm": {
-            "reasoning": llm_result.get("reasoning", ""),
-            "discoveries": llm_result.get("discoveries", []),
-        },
-        "pycluster": {
-            "reasoning": py_result.get("reasoning", ""),
-            "discoveries": py_result.get("discoveries", []),
-        },
-    }
-
-
-@app.get("/api/sentiment/agent/deep-learn/compare/live")
-async def compare_deep_learn_live(
-    _: None = Depends(_require_auth),
+@app.get("/api/attribution/runs")
+async def list_attribution_runs(
+    channel: str | None = None,
+    limit: int = 50,
     db: AsyncSession = Depends(get_db),
 ):
-    """按 discovery_method 聚合 pattern_memory 的上线真实指标（LLM_DEEP vs PY_CLUSTER vs LEGACY）。
+    """归因运行列表（新→旧）。"""
+    from sqlalchemy import desc as sa_desc
+    from .db.models import AttributionRun
 
-    live 维度用 Harness 维护的 win_rate/sample_count/correct_count（与发现时 holdout 分开存），
-    反映模式上线后的真实表现。仅统计 ACTIVE 模式。
-    """
-    from sqlalchemy import func as sa_func, select as sa_select
-    from .db.models import PatternMemory
+    limit = max(1, min(limit, 200))
+    stmt = sa_select(AttributionRun).order_by(
+        AttributionRun.created_at.desc()).limit(limit)
+    if channel:
+        stmt = stmt.where(AttributionRun.channel == channel)
+    rows = (await db.execute(stmt)).scalars().all()
+    return {"runs": [{
+        "id": r.id, "trigger_type": r.trigger_type, "channel": r.channel,
+        "status": r.status, "verdict": r.verdict,
+        "scope": r.scope, "summary": r.summary, "error": r.error,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+        "finished_at": r.finished_at.isoformat() if r.finished_at else None,
+    } for r in rows]}
 
-    stmt = (
-        sa_select(
-            PatternMemory.discovery_method,
-            sa_func.count(PatternMemory.id),
-            sa_func.sum(PatternMemory.sample_count),
-            sa_func.sum(PatternMemory.correct_count),
-            sa_func.avg(PatternMemory.confidence_score),
-            sa_func.avg(PatternMemory.holdout_ci_lower),
-        )
-        .where(PatternMemory.status == "ACTIVE")
-        .group_by(PatternMemory.discovery_method)
-    )
+
+@app.get("/api/attribution/runs/{run_id}")
+async def get_attribution_run(run_id: int, db: AsyncSession = Depends(get_db)):
+    """单次归因运行详情：事实卡 + 各模型分析（含被剔除 claims 审计）。"""
+    from .db.models import AttributionAnalysis, AttributionRun
+
+    r = await db.get(AttributionRun, run_id)
+    if r is None:
+        raise HTTPException(status_code=404, detail="run 不存在")
+    analyses = (await db.execute(sa_select(AttributionAnalysis).where(
+        AttributionAnalysis.run_id == run_id).order_by(AttributionAnalysis.id))).scalars().all()
+    return {
+        "id": r.id, "trigger_type": r.trigger_type, "channel": r.channel,
+        "status": r.status, "verdict": r.verdict, "scope": r.scope,
+        "facts": r.facts, "summary": r.summary, "error": r.error,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+        "finished_at": r.finished_at.isoformat() if r.finished_at else None,
+        "analyses": [{
+            "id": a.id, "model": a.model, "family": a.family,
+            "hypotheses": a.hypotheses, "rejected_claims": a.rejected_claims,
+            "raw_output": a.raw_output,
+            "prompt_tokens": a.prompt_tokens, "output_tokens": a.output_tokens,
+            "error": a.error,
+        } for a in analyses],
+    }
+
+
+@app.post("/api/attribution/trigger")
+async def trigger_attribution(req: TriggerAttributionRequest):
+    """手动触发归因（MANUAL 不受日预算限制；通道白名单校验）。"""
+    from .services.live_channels import LIVE_CHANNELS
+
+    if req.channel not in LIVE_CHANNELS:
+        raise HTTPException(status_code=422, detail=f"未知通道: {req.channel}")
+    if req.trigger_type not in ("MANUAL", "STREAK", "RED_LIGHT", "WEEKLY"):
+        raise HTTPException(status_code=422, detail=f"非法触发类型: {req.trigger_type}")
+    if req.trigger_type != "MANUAL":
+        return {"error": "非 MANUAL 触发类型由系统自动触发（红灯/连败/周报）"}
+
+    run = await attribution_engine.run_attribution("MANUAL", req.channel)
+    if run is None:
+        return {"error": "归因运行失败（详见后端日志）"}
+    return {"ok": True, "run_id": run.id, "verdict": run.verdict, "summary": run.summary}
+
+
+@app.get("/api/attribution/hypotheses")
+async def list_hypotheses(
+    channel: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+    db: AsyncSession = Depends(get_db),
+):
+    """假设台账（知识库 + 错误记忆）。"""
+    from sqlalchemy import desc as sa_desc
+    from .db.models import Hypothesis
+
+    limit = max(1, min(limit, 500))
+    stmt = sa_select(Hypothesis).order_by(Hypothesis.updated_at.desc()).limit(limit)
+    if channel:
+        stmt = stmt.where(Hypothesis.channel == channel)
+    if status:
+        stmt = stmt.where(Hypothesis.status == status)
+    rows = (await db.execute(stmt)).scalars().all()
+    return {"hypotheses": [{
+        "id": h.id, "channel": h.channel, "category": h.category,
+        "statement": h.statement, "status": h.status,
+        "test_spec": h.test_spec, "last_test": h.last_test,
+        "support_count": h.support_count, "reject_count": h.reject_count,
+        "in_error_memory": h.in_error_memory,
+        "action_suggestion": h.action_suggestion, "action_status": h.action_status,
+        "created_at": h.created_at.isoformat() if h.created_at else None,
+        "updated_at": h.updated_at.isoformat() if h.updated_at else None,
+    } for h in rows]}
+
+
+@app.post("/api/attribution/hypotheses/{hyp_id}/action")
+async def set_hypothesis_action(hyp_id: int, req: HypothesisActionRequest,
+                                db: AsyncSession = Depends(get_db)):
+    """人工处置行动建议（APPLIED=已人工执行 / DISMISSED=否决）。"""
+    from .db.models import Hypothesis
+
+    if req.action_status not in ("APPLIED", "DISMISSED"):
+        raise HTTPException(status_code=422, detail="action_status 只允许 APPLIED|DISMISSED")
+    h = await db.get(Hypothesis, hyp_id)
+    if h is None:
+        raise HTTPException(status_code=404, detail="假设不存在")
+    h.action_status = req.action_status
+    await db.commit()
+    return {"ok": True, "id": hyp_id, "action_status": h.action_status}
+
+
+@app.get("/api/attribution/packs")
+async def list_order_context_packs(
+    channel: str | None = None,
+    limit: int = 50,
+    db: AsyncSession = Depends(get_db),
+):
+    """证据包列表（轻量，不含 pack 本体）。"""
+    from sqlalchemy import desc as sa_desc
+    from .db.models import OrderContextPack
+
+    limit = max(1, min(limit, 200))
+    stmt = sa_select(
+        OrderContextPack.id, OrderContextPack.order_id, OrderContextPack.channel,
+        OrderContextPack.window_start, OrderContextPack.direction,
+        OrderContextPack.status, OrderContextPack.missing,
+        OrderContextPack.facts, OrderContextPack.created_at,
+    ).order_by(OrderContextPack.window_start.desc()).limit(limit)
+    if channel:
+        stmt = stmt.where(OrderContextPack.channel == channel)
     rows = (await db.execute(stmt)).all()
-    groups = []
-    for method, cnt, samples, correct, avg_conf, avg_ci in rows:
-        samples = int(samples or 0)
-        correct = int(correct or 0)
-        groups.append({
-            "method": method,
-            "pattern_count": int(cnt or 0),
-            "live_sample_count": samples,
-            "live_correct_count": correct,
-            "live_win_rate": round(correct / samples, 4) if samples else 0.0,
-            "avg_confidence": round(float(avg_conf), 4) if avg_conf is not None else 0.0,
-            "avg_holdout_ci_lower": round(float(avg_ci), 4) if avg_ci is not None else 0.0,
-        })
-    return {"status": "ok", "groups": groups}
+    return {"packs": [{
+        "id": r.id, "order_id": r.order_id, "channel": r.channel,
+        "window_start": r.window_start, "direction": r.direction,
+        "status": r.status, "missing": r.missing, "facts": r.facts,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+    } for r in rows]}
+
+
+@app.get("/api/attribution/packs/{order_id}")
+async def get_order_context_pack(order_id: int, db: AsyncSession = Depends(get_db)):
+    """单个证据包详情（前/中/后全量，供回放视图）。"""
+    from .db.models import OrderContextPack
+
+    row = (await db.execute(sa_select(OrderContextPack).where(
+        OrderContextPack.order_id == order_id))).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="证据包不存在")
+    return {
+        "order_id": row.order_id, "channel": row.channel,
+        "market_period": row.market_period, "window_start": row.window_start,
+        "direction": row.direction, "schema_version": row.schema_version,
+        "status": row.status, "missing": row.missing, "pack": row.pack,
+        "facts": row.facts, "error": row.error,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
 
 
 # ============================================================

@@ -137,6 +137,27 @@ class Settings(BaseSettings):
     llm_input_price_per_1m: float = 1.0    # DeepSeek-V4-Flash 输入价格（缓存未命中）
     llm_output_price_per_1m: float = 2.0   # DeepSeek-V4-Flash 输出价格
 
+    # --- LLM 归因系统（2026-10-19；确定性统计先行裁决，LLM 只做假设生成器）---
+    # 总开关：关=结算后不建证据包、不触发任何归因（已落库数据不受影响）。
+    attribution_enabled: bool = True
+    # 深归因 LLM 面板开关：关=事件仍跑确定性事实卡与随机性检验，但不调用任何模型。
+    attribution_llm_enabled: bool = True
+    # 双家族默认阵容（provider:model,provider:model）。空=用已配置的
+    # DeepSeek(decision_model) + Qwen(review_model)。覆盖示例：
+    # "deepseek:deepseek-v4-flash,dashscope:qwen3.7-max"
+    attribution_panel_models: str = ""
+    # 单模型调用超时（秒）；两模型并行，超时记录 error 不阻塞 run。
+    attribution_llm_timeout_s: float = 90.0
+    # 连败/连胜事件触发深归因的二项检验显著性阈值（p < 该值才算统计异常）。
+    attribution_streak_p: float = 0.05
+    # 连败事件检测窗口：最近 N 笔已结算订单（对通道基准胜率做二项检验）。
+    attribution_streak_window_n: int = 20
+    # 每通道每日最大自动深归因次数（防红灯反复触发刷成本；手动触发不受限）。
+    attribution_max_daily_runs: int = 6
+    # 结算后只读报价梯度探针（1/5/10 USDT）：默认关——结算后市场多已关闭，
+    # 探针大概率 unavailable；仅在需要执行环境维度时开。
+    attribution_ladder_probe: bool = False
+
     # --- 告警配置 ---
     agent_alert_enabled: bool = True
     agent_alert_consecutive_failures: int = 3
