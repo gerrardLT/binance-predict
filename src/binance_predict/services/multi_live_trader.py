@@ -156,6 +156,15 @@ G3_LIVE_TD_BANDS_S = ((105.0, 120.0), (210.0, 240.0))  # 触发时刻双波峰�
 G3_LIVE_Q_MIN = 0.07                                   # 浅价下界（触发报价，过滤深水归零单）
 G3_LIVE_MIN_REMAIN_S = 60.0                            # 下单时刻距窗末剩余硬门（60s，防>240s末段追单）
 
+# 2026-10-19 实盘 0 单修复：G3v2 / 分桶 D/E 的触发语义是「DOWN 首触 ≤0.10」，天然发生在
+# BTC 创新高、上影≈0 的时刻。旧 firsthit 盘前过滤器（上影<0.5bp / 连阳>1）与动态护栏的
+# −0.01 收紧会把它们结构性拦光（线上 17 笔影子：14 笔上影 0.00bp，实盘 0 单）。
+# 该族只保留版本门（双波峰/分桶 + q + chg）与剩余时间门；护栏改用 q×1.3 封顶 0.12
+# （2026-10-08 前向 259 笔实测成交价≈触发价×1.10，q×1.03 只能成交 43% 且被拦部分胜率更高）。
+G3_LIVE_GUARD_RATIO = 1.30
+G3_LIVE_GUARD_CAP = 0.12
+G3_LEGACY_VETO_EXEMPT = frozenset({G3_LIVE_CHANNEL, *CHG35_VERSIONS})
+
 # 蜡烛 5m 长下影家族低波门禁（2026-10-09 方案A，用户拍板）：1h 实现波动率 7 日
 # 分位 ≤ 阈值不开仓（死水市反转无燃料）。阈值挂在 ChannelSpec.min_rv_pct
 # （live_channels.CANDLE_5M_MIN_RV_PCT），此处只管口径与判定；与审计
@@ -273,7 +282,8 @@ def _resolve_firsthit_dynamic_guard(spec, cfg, ext: dict,
     
     核心逻辑：
     - 护拦 = q × FIRSTHIT_SLIPPAGE_TOL_RATIO (3% 容忍度)，允许反转金单成交
-    - 盘前 veto 已过滤连阳>1/|chg|>50bp/上影过小，此处仅做微调收紧
+    - 旧 firsthit 版本：盘前 veto 已过滤连阳>1/|chg|>50bp/上影过小，此处仅做微调收紧
+    - G3v2 / 分桶 D/E：豁免旧 veto，护栏 = q×1.3 封顶 0.12（首触价天然贴 0.10）
     - 对比旧逻辑（绝对阈值 base=0.10~0.12）：会错误拦截 avgPrice=0.36+ 的反转金单，
       却放行 avgPrice=0.01~0.05 的崩盘毒单 → 逆向选择机制
     
@@ -287,6 +297,15 @@ def _resolve_firsthit_dynamic_guard(spec, cfg, ext: dict,
     # K10策略门已完全冻结；成交层只保留统一3%滑点保护，不再叠加旧先验过滤。
     if spec.channel in K10_VERSIONS:
         return round(max(FIRSTHIT_DYNAMIC_GUARD_CLAMP_LO, base), 4)
+
+    # G3v2 / 分桶 D/E：首触价天然贴 Q_HI=0.10，真实成交价≈触发价×1.10；旧 −0.01
+    # 调整会把护栏压到触发价以下 → 结构性弃单。改用 q×1.3 封顶 0.12（见常量区）。
+    if spec.channel in G3_LEGACY_VETO_EXEMPT:
+        return round(
+            min(G3_LIVE_GUARD_CAP,
+                max(FIRSTHIT_DYNAMIC_GUARD_CLAMP_LO, q * G3_LIVE_GUARD_RATIO)),
+            4,
+        )
 
     # 旧 firsthit 版本保持原微调，避免本次接入改变既有生产行为。
     adj = 0.0
@@ -780,7 +799,9 @@ class MultiLiveTrader:
                     cfg = self._configs[ch]
                     if not cfg.enabled or window_start_ms in cfg.fired:
                         continue
-                    if quick_veto is not None and ch not in K10_VERSIONS | FIRSTHIT_EARLY_VERSIONS:
+                    if (quick_veto is not None
+                            and ch not in K10_VERSIONS | FIRSTHIT_EARLY_VERSIONS
+                            and ch not in G3_LEGACY_VETO_EXEMPT):
                         logger.info(
                             "多通道实盘：{} 盘前快速否决 | 窗口 {} | {}",
                             ch, _fmt_win(window_start_ms), quick_veto)
@@ -1961,13 +1982,16 @@ class MultiLiveTrader:
 
         chg/upper_wick 维度已在 check() 同步层快速否决；此处只需复核 streak 维度
         （_firsthit_pre_market_veto 对 chg/upper_wick 的复检幂等无害）。
+        G3v2 / 分桶 D/E 豁免旧盘前先验（见 G3_LEGACY_VETO_EXEMPT 常量注释），
+        同时跳过 streak DB 查询以降低下单延迟。
         DB 查询失败 → 异常上抛到外层 except，仅告警不开火（保守口径：门禁数据
         缺失不下注，与影子「门禁数据缺失不落表」一致）。
         """
         win_label = _fmt_win(window_start)
         try:
             streak_up = None
-            if channel not in K10_VERSIONS | FIRSTHIT_EARLY_VERSIONS:
+            if (channel not in K10_VERSIONS | FIRSTHIT_EARLY_VERSIONS
+                    and channel not in G3_LEGACY_VETO_EXEMPT):
                 streak_up = 0
                 L_ms = 300_000
                 async with async_session_factory() as session:
@@ -1984,7 +2008,11 @@ class MultiLiveTrader:
                             streak_up += 1
                         else:
                             break
-            veto = None if channel in K10_VERSIONS | FIRSTHIT_EARLY_VERSIONS else _firsthit_pre_market_veto(ext, streak_up)
+            veto = (
+                None
+                if channel in K10_VERSIONS | FIRSTHIT_EARLY_VERSIONS | G3_LEGACY_VETO_EXEMPT
+                else _firsthit_pre_market_veto(ext, streak_up)
+            )
             if veto is not None:
                 logger.info("多通道实盘：{} 盘前过滤拦截 | 窗口 {} | {}",
                             channel, win_label, veto)

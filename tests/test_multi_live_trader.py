@@ -2709,7 +2709,7 @@ async def test_chg35_buckets_live_default_off_and_gates(monkeypatch) -> None:
 
     - 2.82<chg≤3.5 是 G3v2 拒而 D/E 放行的区间（chg=3.0bp）
     - 桶：D=[105,195)∪[210,240)；E=[105,150)∪[180,195)∪[210,240)；195-210 谷底两者都不下单
-    - 下单时刻距窗末剩余 <60s 弃单；护栏为动态 q×1.03
+    - 下单时刻距窗末剩余 <60s 弃单；护栏为动态 q×1.3 封顶 0.12（2026-10-19 修复）
     """
     from binance_predict.services.live_channels import LIVE_CHANNELS, parse_channel_config
     d, e, g = "firsthit_down_chg35_d_v1", "firsthit_down_chg35_e_v1", "firsthit_down_chg_v2"
@@ -2743,7 +2743,7 @@ async def test_chg35_buckets_live_default_off_and_gates(monkeypatch) -> None:
     f = await run(225, 3.0)
     assert {c["signal_version"] for c in f.calls} == {d, e}
     assert all(c["prediction"] == "DOWN" and c["market_period"] == "5m" for c in f.calls)
-    assert abs(f.calls[0]["max_exec_price"] - 0.08 * 1.03) < 1e-4   # 动态护栏 q×1.03，不用 0.101
+    assert abs(f.calls[0]["max_exec_price"] - 0.08 * 1.3) < 1e-4   # G3 族动态护栏 q×1.3，不用 0.101
     # chg=3.49 内、3.6 越界（3.5 贴线含边界由 test_gate_of_chg35_price_and_chg_boundaries 直测；
     # 曲线构造的浮点误差会让 3.5 算成 3.5000000000007，故实盘链路用例避开恰好边界）
     assert {c["signal_version"] for c in (await run(225, 3.49)).calls} == {d, e}
@@ -2762,6 +2762,129 @@ async def test_chg35_buckets_live_default_off_and_gates(monkeypatch) -> None:
     assert (await run(240, 3.0, channels=(d, e))).calls == []
     # 下单时刻剩余 <60s（墙钟 245s）：带内触发也弃单
     assert (await run(225, 3.0, wall_s=245, channels=(d, e))).calls == []
+
+
+def _btc_curve_new_high(trigger_idx: int, chg_bps: float = 2.0) -> list[dict]:
+    """单调上升到触发点（触发时即窗口新高，upper_wick=0），之后走平。
+
+    复现线上 G3v2 的真实触发形态：DOWN 首触 ≤0.10 几乎总发生在 BTC 创新高、
+    上影=0 的时刻（旧盘前 veto 会结构性拦光）。
+    """
+    trig = 100.0 * (1.0 + chg_bps / 1e4)
+    pts = [{"t": WINDOW_START, "v": 100.0}]
+    for i in range(1, 20):
+        ts = WINDOW_START + i * 15_000
+        v = 100.0 + (trig - 100.0) * (i / trigger_idx) if i <= trigger_idx else trig
+        pts.append({"t": ts, "v": v})
+    return pts
+
+
+@pytest.mark.asyncio
+async def test_g3v2_zero_upper_wick_fires_with_g3_guard(monkeypatch) -> None:
+    """2026-10-19 回归：G3v2 触发时上影=0（BTC 新高）也必须开火。
+
+    线上 17 笔影子中 14 笔上影 0.00bp，被旧 `_firsthit_pre_market_veto`
+    （upper_wick<0.5bp）在进入版本门前拦光 → 实盘 0 单。修复后该族豁免旧 veto，
+    护栏用 q×1.3 封顶 0.12。
+    """
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["firsthit_down_chg_v2"])
+    dn = _firsthit_down_curve(trigger_q=0.10, npts=20, trigger_idx=7)  # t=105s 早峰下界
+    btc = _btc_curve_new_high(trigger_idx=7, chg_bps=2.0)              # chg=+2bp, 上影=0
+    monkeypatch.setattr(milt.time, "time", lambda: (WINDOW_START + 106_000) / 1000)
+    fired = t.check(
+        WINDOW_START, WINDOW_END, WINDOW_START + 105_000,
+        down_price=0.10, btc_price=100.02, window_entry_price=100.0,
+        window_btc_curve=btc, window_down_curve=dn,
+    )
+    await _drain(t)
+    assert fired == ["firsthit_down_chg_v2"]
+    assert len(fake.calls) == 1
+    assert fake.calls[0]["signal_version"] == "firsthit_down_chg_v2"
+    # q=0.10 × 1.3 = 0.13，封顶 0.12；不再是 q×1.03−0.01=0.093
+    assert fake.calls[0]["max_exec_price"] == pytest.approx(0.12)
+
+
+@pytest.mark.asyncio
+async def test_chg35_zero_upper_wick_fires_with_g3_guard(monkeypatch) -> None:
+    """分桶 D/E 与 G3v2 同批豁免旧 veto：上影=0、chg=3.0bp 仍开火，护栏 q×1.3。"""
+    for ch in ("firsthit_down_chg35_d_v1", "firsthit_down_chg35_e_v1"):
+        fake = _FakeTrader()
+        t = _make_trader(monkeypatch, fake, channels=[ch])
+        dn = _firsthit_down_curve(trigger_q=0.08, npts=20, trigger_idx=15)  # 225s 主峰带
+        btc = _btc_curve_new_high(trigger_idx=15, chg_bps=3.0)              # 上影=0, chg=3bp
+        monkeypatch.setattr(milt.time, "time", lambda: (WINDOW_START + 226_000) / 1000)
+        fired = t.check(
+            WINDOW_START, WINDOW_END, WINDOW_START + 225_000,
+            down_price=0.08, btc_price=100.03, window_entry_price=100.0,
+            window_btc_curve=btc, window_down_curve=dn,
+        )
+        await _drain(t)
+        assert fired == [ch]
+        assert len(fake.calls) == 1
+        assert fake.calls[0]["max_exec_price"] == pytest.approx(0.08 * 1.3)
+
+
+@pytest.mark.asyncio
+async def test_g3v2_zero_upper_wick_still_rejects_high_chg(monkeypatch) -> None:
+    """豁免旧 veto 不等于豁免版本门：上影=0 但 chg>+2.82bp 仍不得开火。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["firsthit_down_chg_v2"])
+    dn = _firsthit_down_curve(trigger_q=0.10, npts=20, trigger_idx=7)
+    btc = _btc_curve_new_high(trigger_idx=7, chg_bps=3.0)              # 越 chg 门
+    monkeypatch.setattr(milt.time, "time", lambda: (WINDOW_START + 106_000) / 1000)
+    fired = t.check(
+        WINDOW_START, WINDOW_END, WINDOW_START + 105_000,
+        down_price=0.10, btc_price=100.03, window_entry_price=100.0,
+        window_btc_curve=btc, window_down_curve=dn,
+    )
+    await _drain(t)
+    assert fired == []
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_firsthit_still_vetoed_by_zero_upper_wick(monkeypatch) -> None:
+    """豁免范围仅限 G3v2/分桶 D/E：G0 旧通道上影=0 仍被盘前 veto 拦截。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["firsthit_down_v1"])
+    dn = _firsthit_down_curve(trigger_q=0.07, npts=20, trigger_idx=7)
+    btc = _btc_curve_new_high(trigger_idx=7, chg_bps=2.0)
+    fired = t.check(
+        WINDOW_START, WINDOW_END, WINDOW_START + 105_000,
+        down_price=0.07, btc_price=100.02, window_entry_price=100.0,
+        window_btc_curve=btc, window_down_curve=dn,
+    )
+    await _drain(t)
+    assert fired == []
+    assert fake.calls == []
+
+
+def test_g3_guard_ratio_and_cap() -> None:
+    """G3v2 / 分桶 D/E 的实盘护栏：q×1.3，封顶 0.12，下限 clamp 0.05。"""
+    from binance_predict.services.live_channels import LIVE_CHANNELS, ChannelConfig
+    from binance_predict.services.multi_live_trader import _resolve_firsthit_dynamic_guard
+
+    cfg = ChannelConfig(amount_usdt=1.0, max_daily_orders=100,
+                        max_exec_price=None, enabled=True)
+    for ch in ("firsthit_down_chg_v2", "firsthit_down_chg35_d_v1",
+               "firsthit_down_chg35_e_v1"):
+        spec = LIVE_CHANNELS[ch]
+        # upper_wick=0 / streak=1 都不再收紧（旧逻辑会 −0.01/−0.02）
+        assert _resolve_firsthit_dynamic_guard(
+            spec, cfg, {"q": 0.10, "upper_wick_bps": 0.0}, streak_up=1
+        ) == pytest.approx(0.12)
+        assert _resolve_firsthit_dynamic_guard(
+            spec, cfg, {"q": 0.09, "upper_wick_bps": 0.0}, streak_up=1
+        ) == pytest.approx(0.117)
+        assert _resolve_firsthit_dynamic_guard(
+            spec, cfg, {"q": 0.07, "upper_wick_bps": 0.0}, streak_up=0
+        ) == pytest.approx(0.091)
+        # 极深折价触发仍受 CLAMP_LO=0.05 保护
+        assert _resolve_firsthit_dynamic_guard(
+            spec, cfg, {"q": 0.02, "upper_wick_bps": 0.0}, streak_up=0
+        ) == pytest.approx(0.05)
+
 
 @pytest.mark.asyncio
 async def test_g3_pin_btc_to_first_touch_eliminates_timing_drift(monkeypatch) -> None:

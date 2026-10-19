@@ -322,7 +322,9 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     # 2026-10-13：通道护栏 auto_max_exec 0.09→0.101（用户拍板）。首触价天然贴 Q_HI=0.1
     # 上限（实测入场价只有 0.09/0.10 两档），0.09 护栏会把全部 v2 信号判为超价弃单，
     # 面板「带护栏实际」长期 0 笔；0.101 放行 q∈[0.07,0.1] 全区间。
-    # ⚠ 实盘 firsthit 下单走动态护栏 q×1.03，本值只作用于影子「带护栏」口径与通道预设。
+    # 2026-10-19：实盘 0 单根因修复——该族豁免旧 firsthit 盘前否决（上影<0.5bp/连阳>1），
+    # 且实盘动态护栏改为 q×1.3 封顶 0.12（见 multi_live_trader.G3_LIVE_GUARD_*）。
+    # ⚠ 本值只作用于影子「带护栏」口径与通道预设，实盘 firsthit 下单走动态护栏，不用本值。
     "firsthit_down_chg_v2": ChannelSpec(
         "firsthit_down_chg_v2", "firsthit", "5m", "DOWN", 0.101,
         "首触G3偏离v2·双波峰版 触发105-120s/210-240s∧q≥0.07（押DOWN）",
@@ -330,7 +332,8 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
     # 2026-10-13 分桶组合 D/E（q≥0.07 ∩ chg≤+3.5bp ∩ 首触 15s 分桶；75D 线上采样回测，
     # 样本内择优，默认 OFF，影子+小额实盘前向裁决）。门由 firsthit_shadow_detector._gate_of
     # 单点定义，影子与实盘同源；首触 <240s 保证下单剩余 ≥60s。
-    # 护栏 0.101 仅作用于面板「带护栏」口径；实盘下单走动态护栏 q×1.03（同 G3v2）。
+    # 护栏 0.101 仅作用于面板「带护栏」口径；实盘下单走动态护栏 q×1.3 封顶 0.12
+    # （2026-10-19 与 G3v2 同批修复，豁免旧盘前否决）。
     # ⚠ E ⊂ D 且与 G3v2 事件重叠：firsthit 全族不设同窗互斥，同开会对同一事件重复下注。
     "firsthit_down_chg35_d_v1": ChannelSpec(
         "firsthit_down_chg35_d_v1", "firsthit", "5m", "DOWN", 0.101,
