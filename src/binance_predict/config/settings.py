@@ -137,6 +137,11 @@ class Settings(BaseSettings):
     llm_input_price_per_1m: float = 1.0    # DeepSeek-V4-Flash 输入价格（缓存未命中）
     llm_output_price_per_1m: float = 2.0   # DeepSeek-V4-Flash 输出价格
 
+    # --- Gemini（OpenAI 兼容中转；归因面板第三家族，2026-10-20）---
+    gemini_api_key: str = ""
+    gemini_base_url: str = "https://solostudio.one/v1"
+    gemini_model: str = "ag/gemini-3.8-flash-high"
+
     # --- LLM 归因系统（2026-10-19；确定性统计先行裁决，LLM 只做假设生成器）---
     # 总开关：关=结算后不建证据包、不触发任何归因（已落库数据不受影响）。
     attribution_enabled: bool = True

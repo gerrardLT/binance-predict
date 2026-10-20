@@ -94,6 +94,11 @@ def _provider_entry(provider: str, model: str) -> dict | None:
             return None
         return {"provider": provider, "model": model, "family": "qwen",
                 "api_key": settings.dashscope_api_key, "base_url": settings.dashscope_base_url}
+    if provider == "gemini":
+        if not settings.gemini_api_key:
+            return None
+        return {"provider": provider, "model": model, "family": "gemini",
+                "api_key": settings.gemini_api_key, "base_url": settings.gemini_base_url}
     logger.warning("归因面板：未知 provider {}（忽略）", provider)
     return None
 

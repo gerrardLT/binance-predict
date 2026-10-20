@@ -357,3 +357,34 @@ def test_attribution_endpoints_have_local_sa_select_import():
                 f"{m.group(1)} 使用 sa_select 但缺局部导入（生产 NameError→500 同型）"
             checked += 1
     assert checked >= 4  # 五个 DB 端点里至少四个用 sa_select
+
+
+# ======================================================================
+# 三家族面板（2026-10-20：deepseek 官方 + gemini 中转 + qwen 百炼）
+# ======================================================================
+
+def test_provider_entry_gemini(monkeypatch):
+    from binance_predict.config.settings import settings
+    from binance_predict.services.llm_panel import _provider_entry
+    monkeypatch.setattr(settings, "gemini_api_key", "sk-test")
+    monkeypatch.setattr(settings, "gemini_base_url", "https://relay.example/v1")
+    entry = _provider_entry("gemini", "ag/gemini-3.8-flash-high")
+    assert entry == {"provider": "gemini", "model": "ag/gemini-3.8-flash-high",
+                     "family": "gemini", "api_key": "sk-test",
+                     "base_url": "https://relay.example/v1"}
+    monkeypatch.setattr(settings, "gemini_api_key", "")
+    assert _provider_entry("gemini", "x") is None  # 无 key → 不进面板
+
+
+def test_default_panel_respects_override(monkeypatch):
+    from binance_predict.config.settings import settings
+    from binance_predict.services.llm_panel import default_panel
+    monkeypatch.setattr(settings, "attribution_panel_models",
+                        "gemini:ag/gemini-3.8-flash-high,deepseek:deepseek-v4-flash")
+    monkeypatch.setattr(settings, "gemini_api_key", "sk-g")
+    monkeypatch.setattr(settings, "deepseek_api_key", "sk-d")
+    panel = default_panel()
+    assert [(p["provider"], p["model"], p["family"]) for p in panel] == [
+        ("gemini", "ag/gemini-3.8-flash-high", "gemini"),
+        ("deepseek", "deepseek-v4-flash", "deepseek"),
+    ]
