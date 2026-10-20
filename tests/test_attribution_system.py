@@ -332,3 +332,28 @@ class TestSettlementHook:
                             lambda oid: fired.append(oid))
         m._attribution_on_settled(1, "ch")
         assert not fired  # 总开关关闭时完全不 dispatch
+
+
+# ======================================================================
+# 回归：归因 DB 端点的 sa_select 局部导入（生产 500 事故 2026-10-20）
+# main.py 惯例是端点内 `from sqlalchemy import select as sa_select`，
+# 模块级不存在该名字——漏 import 只在运行时 NameError（500）。
+# ======================================================================
+
+def test_attribution_endpoints_have_local_sa_select_import():
+    import re
+    from pathlib import Path
+    src = Path("src/binance_predict/main.py").read_text(encoding="utf-8")
+    # 找到每个 attribution 端点函数体，检查用了 sa_select 的都有局部导入
+    fn_pattern = re.compile(
+        r'async def (list_attribution_runs|get_attribution_run|list_hypotheses|'
+        r'list_order_context_packs|get_order_context_pack)\(.*?\n(?=@app|\Z)',
+        re.S)
+    checked = 0
+    for m in fn_pattern.finditer(src):
+        body = m.group(0)
+        if "sa_select(" in body:
+            assert "select as sa_select" in body, \
+                f"{m.group(1)} 使用 sa_select 但缺局部导入（生产 NameError→500 同型）"
+            checked += 1
+    assert checked >= 4  # 五个 DB 端点里至少四个用 sa_select

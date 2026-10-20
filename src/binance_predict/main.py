@@ -5942,7 +5942,7 @@ async def list_attribution_runs(
     db: AsyncSession = Depends(get_db),
 ):
     """归因运行列表（新→旧）。"""
-    from sqlalchemy import desc as sa_desc
+    from sqlalchemy import desc as sa_desc, select as sa_select
     from .db.models import AttributionRun
 
     limit = max(1, min(limit, 200))
@@ -5963,6 +5963,7 @@ async def list_attribution_runs(
 @app.get("/api/attribution/runs/{run_id}")
 async def get_attribution_run(run_id: int, db: AsyncSession = Depends(get_db)):
     """单次归因运行详情：事实卡 + 各模型分析（含被剔除 claims 审计）。"""
+    from sqlalchemy import select as sa_select
     from .db.models import AttributionAnalysis, AttributionRun
 
     r = await db.get(AttributionRun, run_id)
@@ -6012,7 +6013,7 @@ async def list_hypotheses(
     db: AsyncSession = Depends(get_db),
 ):
     """假设台账（知识库 + 错误记忆）。"""
-    from sqlalchemy import desc as sa_desc
+    from sqlalchemy import desc as sa_desc, select as sa_select
     from .db.models import Hypothesis
 
     limit = max(1, min(limit, 500))
@@ -6057,7 +6058,7 @@ async def list_order_context_packs(
     db: AsyncSession = Depends(get_db),
 ):
     """证据包列表（轻量，不含 pack 本体）。"""
-    from sqlalchemy import desc as sa_desc
+    from sqlalchemy import desc as sa_desc, select as sa_select
     from .db.models import OrderContextPack
 
     limit = max(1, min(limit, 200))
@@ -6081,6 +6082,7 @@ async def list_order_context_packs(
 @app.get("/api/attribution/packs/{order_id}")
 async def get_order_context_pack(order_id: int, db: AsyncSession = Depends(get_db)):
     """单个证据包详情（前/中/后全量，供回放视图）。"""
+    from sqlalchemy import select as sa_select
     from .db.models import OrderContextPack
 
     row = (await db.execute(sa_select(OrderContextPack).where(
