@@ -285,7 +285,9 @@ class LLMPanel:
                             {"role": "user", "content": user_prompt},
                         ],
                         temperature=0.2,
-                        max_tokens=4000,
+                        # 思考模型（deepseek-flash/qwen3.8 等）思考消耗输出预算：
+                        # 16000 保证思考 + JSON 正文都放得下（不禁思考，2026-10-20 拍板）
+                        max_tokens=16000,
                     ),
                     timeout=settings.attribution_llm_timeout_s,
                 )
