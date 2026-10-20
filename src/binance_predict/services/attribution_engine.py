@@ -439,7 +439,11 @@ class AttributionEngine:
                     rejected_claims=a["rejected_claims"], error=a["error"]))
             await db.flush()
 
-            existing = [dict(h) for h in (await db.execute(sa_select(Hypothesis))).scalars()]
+            # 显式取列构造 dict（SQLAlchemy 2.0 ORM 对象不可 dict()/迭代展开）
+            _rows = (await db.execute(sa_select(Hypothesis))).scalars().all()
+            existing = [{"id": h.id, "channel": h.channel, "statement": h.statement,
+                         "status": h.status, "support_count": h.support_count,
+                         "reject_count": h.reject_count} for h in _rows]
             for mi, hyps in enumerate(per_model):
                 for h in hyps:
                     hyp_row = None

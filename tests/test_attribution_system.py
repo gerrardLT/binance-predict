@@ -388,3 +388,13 @@ def test_default_panel_respects_override(monkeypatch):
         ("gemini", "ag/gemini-3.8-flash-high", "gemini"),
         ("deepseek", "deepseek-v4-flash", "deepseek"),
     ]
+
+
+def test_engine_no_orm_dict_expansion():
+    """回归：'Hypothesis' object is not iterable（生产 run#4 FAILED 根因）。
+
+    SQLAlchemy 2.0 ORM 对象不可 dict()/迭代展开；台账去重必须显式取列。
+    """
+    from pathlib import Path
+    src = Path("src/binance_predict/services/attribution_engine.py").read_text(encoding="utf-8")
+    assert "dict(h) for h in" not in src
