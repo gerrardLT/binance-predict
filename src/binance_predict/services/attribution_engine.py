@@ -550,7 +550,7 @@ class AttributionEngine:
         async with async_session_factory() as db:
             rows = (await db.execute(sa_select(
                 Hypothesis.statement, Hypothesis.status, Hypothesis.in_error_memory,
-            ).where(Hypothesis.channel.in_([channel]))).limit(50)).all()
+            ).where(Hypothesis.channel.in_([channel])).limit(50))).all()
             return [{"statement": s, "status": st, "in_error_memory": em}
                     for s, st, em in rows]
 
