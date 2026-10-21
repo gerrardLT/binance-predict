@@ -163,6 +163,23 @@ class Settings(BaseSettings):
     # 探针大概率 unavailable；仅在需要执行环境维度时开。
     attribution_ladder_probe: bool = False
 
+    # --- LLM 策略顾问与趋势预警（2026-10-22）---
+    # 总开关：关=不产出策略建议、不发 L2 趋势预警（体检面板 trend 段仍保留）。
+    strategy_advice_enabled: bool = True
+    # 策略建议模型（provider:model 逗号分隔）。空=默认面板首个模型（单模型控成本）。
+    strategy_advice_models: str = ""
+    # 每通道每日自动策略建议次数上限（TREND/RED_LIGHT/STREAK 触发；手动不受限）。
+    strategy_advice_max_daily: int = 2
+    # 应用建议后的效果追踪窗口（结算单数）。
+    strategy_advice_tracking_n: int = 30
+    # 一键应用冷冻期：同通道 N 天内最多 M 次参数变更（仅停火不受限）。
+    strategy_advice_apply_freeze_days: int = 7
+    strategy_advice_apply_freeze_max: int = 2
+    # EV 趋势 CUSUM 报警参数（σ 倍数）与最低样本（已结算单）。
+    trend_cusum_k: float = 0.5
+    trend_cusum_h: float = 5.0
+    trend_min_n: int = 40
+
     # --- 告警配置 ---
     agent_alert_enabled: bool = True
     agent_alert_consecutive_failures: int = 3

@@ -61,6 +61,8 @@ from .models.schemas import (
     ToggleShadowRequest,
     TriggerAttributionRequest,
     HypothesisActionRequest,
+    AdviceTriggerRequest,
+    AdviceApplyRequest,
     NotifyConfigPutRequest,
     NotifyConfigResetRequest,
 )
@@ -5609,6 +5611,39 @@ async def diagnose_signal_health(
     return await shs.run_llm_diagnosis(detail["diagnosis_payload"])
 
 
+async def _on_trend_alert(channel: str, payload: dict) -> None:
+    """L2 趋势预警：微信推送（72h 冷却）+ 自动策略建议（引擎内自带日预算）。
+
+    结算钩子实时触发与每小时体检兜底共用本函数；冷却键 `health_trend:{channel}`
+    保证同通道 72h 最多一条。推送失败不影响策略建议生成。
+    """
+    from .services import channel_trend as ctrend
+    from .services.live_channels import LIVE_CHANNELS
+
+    name = (LIVE_CHANNELS[channel].display_name
+            if channel in LIVE_CHANNELS else channel)
+    try:
+        wechat_notifier.push_with_cooldown(
+            f"health_trend:{channel}",
+            ctrend.format_trend_alert(payload, name),
+            cooldown_ms=72 * 3600_000,
+        )
+    except Exception as exc:
+        logger.warning("趋势预警推送失败 | {} | {}", channel, exc)
+    if settings.strategy_advice_enabled:
+        # 运行时参数快照必须随触发一起传入：否则事实卡 current_params 为空，
+        # LLM 的 action.from_value 无法匹配，一切调整建议都会被硬闸降为 HOLD。
+        params = await _channel_runtime_params(channel)
+        asyncio.create_task(
+            attribution_engine.run_strategy_advice(
+                "TREND", channel, current_params=params),
+            name=f"advice_trend_{channel}")
+
+
+# 引擎层不 import notifier：趋势预警的推送与建议触发由这里注入。
+attribution_engine.on_trend_alert = _on_trend_alert
+
+
 async def _signal_health_loop() -> None:
     """每小时体检：落日快照、情绪日留存、新转红通道微信推送（仅建议，不自动关通道）。"""
     from .services import signal_health as sh
@@ -5636,6 +5671,11 @@ async def _signal_health_loop() -> None:
                 if cal_snap:
                     await shs.persist_snapshots(db, cal_snap, now_ms)
             active = [r for r in report["rows"] if r["active"]]
+            # 趋势兜底扫描（2026-10-22）：实时检测在结算钩子，这里每小时补扫；
+            # 与实时路径共用 72h 冷却键，不会重复轰炸。
+            for _ch, _t in (report.get("trend") or {}).items():
+                if _t.get("level") == "L2":
+                    await _on_trend_alert(_ch, _t)
             for r in sh.new_red_transitions(prev, active):
                 name = LIVE_CHANNELS[r["key"]].display_name if r["scope"] == "live" and r["key"] in LIVE_CHANNELS else r["key"]
                 wechat_notifier.push_markdown(sh.format_red_alert(r, name))
@@ -5646,6 +5686,14 @@ async def _signal_health_loop() -> None:
                     asyncio.create_task(
                         attribution_engine.on_red_light(r["key"]),
                         name=f"attr_red_{r['key']}")
+                # L3 红灯同时生成策略建议（L3 只标注不新增推送；此处只调 LLM，
+                # 日预算/防重入由引擎内部保证）
+                if r["scope"] == "live" and settings.strategy_advice_enabled:
+                    _red_params = await _channel_runtime_params(r["key"])
+                    asyncio.create_task(
+                        attribution_engine.run_strategy_advice(
+                            "RED_LIGHT", r["key"], current_params=_red_params),
+                        name=f"advice_red_{r['key']}")
             for r in sh.new_red_transitions(prev, cal_snap):
                 wechat_notifier.push_markdown(sh.format_calibration_red_alert(r))
                 logger.warning("买贵校准转红 | {} | {}", r["key"], r["reasons"])
@@ -5671,6 +5719,10 @@ def _attribution_on_settled(order_id: int, channel: str | None) -> None:
             asyncio.create_task(
                 attribution_engine.on_order_settled(channel),
                 name=f"attr_streak_{channel}")
+            # 已应用策略建议的 30 单效果追踪（仅分析层，异常不回流结算事务）
+            asyncio.create_task(
+                attribution_engine.update_advice_tracking(channel),
+                name=f"advice_track_{channel}")
     except Exception as exc:  # pragma: no cover - 双保险
         logger.warning("归因结算钩子 dispatch 失败 | order={} | {}", order_id, exc)
 
@@ -5920,18 +5972,33 @@ async def run_momentum_predict(
 
 @app.get("/api/attribution/status")
 async def get_attribution_status(_: None = Depends(_require_auth)):
-    """归因系统状态：开关 / 模型阵容 / 引擎版本。"""
-    from .services.llm_panel import PROMPT_VERSION, default_panel
+    """归因系统状态：开关 / 模型阵容 / 引擎版本 / 策略顾问。"""
+    from .services.llm_panel import (
+        PROMPT_VERSION, STRATEGY_PROMPT_VERSION, default_panel,
+    )
 
+    panel = [{"provider": p["provider"], "model": p["model"], "family": p["family"]}
+             for p in default_panel()]
     return {
         "enabled": settings.attribution_enabled,
         "llm_enabled": settings.attribution_llm_enabled,
-        "panel": [{"provider": p["provider"], "model": p["model"], "family": p["family"]}
-                  for p in default_panel()],
+        "panel": panel,
         "prompt_version": PROMPT_VERSION,
         "streak_p": settings.attribution_streak_p,
         "streak_window_n": settings.attribution_streak_window_n,
         "max_daily_runs": settings.attribution_max_daily_runs,
+        "strategy_advice": {
+            "enabled": settings.strategy_advice_enabled,
+            # 默认单模型（面板首项）；覆盖时返回覆盖列表
+            "models": ([m.strip() for m in settings.strategy_advice_models.split(",") if m.strip()]
+                       or [f"{p['provider']}:{p['model']}" for p in panel[:1]]),
+            "max_daily": settings.strategy_advice_max_daily,
+            "tracking_n": settings.strategy_advice_tracking_n,
+            "prompt_version": STRATEGY_PROMPT_VERSION,
+            "trend_cusum_k": settings.trend_cusum_k,
+            "trend_cusum_h": settings.trend_cusum_h,
+            "trend_min_n": settings.trend_min_n,
+        },
     }
 
 
@@ -6097,6 +6164,262 @@ async def get_order_context_pack(order_id: int, db: AsyncSession = Depends(get_d
         "facts": row.facts, "error": row.error,
         "created_at": row.created_at.isoformat() if row.created_at else None,
     }
+
+
+# ============================================================
+# 信号趋势 AI 顾问 API（2026-10-22）
+# L1 进面板 / L2 微信+LLM / L3 走既有红灯；LLM 永无执行权。
+# ============================================================
+
+
+async def _channel_runtime_params(channel: str) -> dict:
+    """运行时通道参数快照（toggle 热调后的真实值；未装配回落注册表默认）。"""
+    from .services.live_channels import LIVE_CHANNELS, parse_channel_config, resolve_max_exec
+
+    if multi_live_trader is not None:
+        try:
+            status = await multi_live_trader.status_async()
+            row = next((c for c in status.get("channels", [])
+                        if c.get("channel") == channel), None)
+            if row is not None:
+                return {"amount_usdt": float(row.get("amount_usdt")),
+                        "max_daily_orders": int(row.get("max_daily_orders")),
+                        "max_exec_price": float(row.get("max_exec_price")),
+                        "enabled": bool(row.get("enabled"))}
+        except Exception as exc:
+            logger.warning("advisor 通道状态查询失败，回落注册表默认 | {}", exc)
+    spec = LIVE_CHANNELS.get(channel)
+    cfg = parse_channel_config().get(channel)
+    if spec is None or cfg is None:
+        return {}
+    return {"amount_usdt": float(cfg.amount_usdt),
+            "max_daily_orders": int(cfg.max_daily_orders),
+            "max_exec_price": float(resolve_max_exec(spec, cfg)),
+            "enabled": bool(cfg.enabled)}
+
+
+@app.get("/api/live/advisor")
+async def live_advisor(_: None = Depends(_require_auth),
+                       db: AsyncSession = Depends(get_db)):
+    """「信号实盘通道」AI 顾问轻量汇总（前端 60s 轮询）。
+
+    - exposure：已开启通道的单窗/日敏口（纯配置算术，零 DB）
+    - channels：每通道趋势分级（L1/L2/L3）+ 最新一条建议摘要
+    - top_advice：待处理建议中 L3→L2→L1 排序的 top1（只给一条，防待办清单化）
+    趋势数据只读 _signal_health_cache（每小时体检循环负责刷新）；缓存为空时
+    才惰性构建一次——60s 前端轮询绝不触发全量体检重建。建议详情懒加载。
+    """
+    from sqlalchemy import select as sa_select
+    from .db.models import StrategyAdvice
+    from .services.live_channels import LIVE_CHANNELS
+
+    global _signal_health_cache
+    if _signal_health_cache is not None:
+        report = _signal_health_cache[1]
+    else:
+        report = await _signal_health_report(db)
+    trend = report.get("trend") or {}
+    status = (await multi_live_trader.status_async()) if multi_live_trader else None
+    ch_rows = (status or {}).get("channels", [])
+    enabled = [c for c in ch_rows if c.get("enabled")]
+    exposure = {
+        "enabled_channels": len(enabled),
+        "window_exposure": round(sum(float(c.get("amount_usdt") or 0)
+                                     for c in enabled), 2),
+        "daily_exposure": round(sum(
+            float(c.get("amount_usdt") or 0) * int(c.get("max_daily_orders") or 0)
+            for c in enabled), 2),
+    }
+    rows = (await db.execute(sa_select(StrategyAdvice).order_by(
+        StrategyAdvice.created_at.desc()).limit(200))).scalars().all()
+    latest_by_ch: dict[str, dict] = {}
+    for r in rows:
+        if r.channel in latest_by_ch:
+            continue
+        spec = r.advice_spec or {}
+        latest_by_ch[r.channel] = {
+            "id": r.id, "verdict": spec.get("verdict"), "status": r.status,
+            "applyable": bool(spec.get("applyable")),
+            "to_value": (spec.get("action") or {}).get("to_value"),
+            "confidence": spec.get("confidence"),
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+    channels_out: dict[str, dict] = {}
+    for ch in LIVE_CHANNELS:
+        t = trend.get(ch)
+        if t is None:
+            continue
+        channels_out[ch] = {
+            "level": t.get("level"), "reasons": t.get("reasons"),
+            "n": t.get("n"), "win_rate": t.get("win_rate"),
+            "rolling20_win_rate": t.get("rolling20_win_rate"),
+            "p_edge_negative": t.get("p_edge_negative"),
+            "edge": t.get("edge"), "cusum": t.get("cusum"),
+            "since_alarm_n": t.get("since_alarm_n"),
+            "coverage_ratio": t.get("coverage_ratio"),
+            "advice": latest_by_ch.get(ch),
+        }
+    rank = {"L3": 3, "L2": 2, "L1": 1, "L0": 0}
+    candidates = [
+        {"channel": ch, "level": info.get("level"), "advice": info["advice"]}
+        for ch, info in channels_out.items()
+        if info.get("advice")
+        and info["advice"].get("status") == "PENDING"
+        and info["advice"].get("verdict") in (
+            "TIGHTEN_GUARD", "CUT_AMOUNT", "CUT_DAILY_LIMIT", "PAUSE")
+    ]
+    candidates.sort(key=lambda c: rank.get(c["level"] or "L0", 0), reverse=True)
+    return {"as_of": int(time.time() * 1000), "exposure": exposure,
+            "channels": channels_out,
+            "top_advice": candidates[0] if candidates else None}
+
+
+@app.get("/api/attribution/advices")
+async def list_strategy_advices(
+    channel: str | None = None, status: str | None = None, limit: int = 50,
+    _: None = Depends(_require_auth), db: AsyncSession = Depends(get_db),
+):
+    """策略建议列表（新→旧；含完整 advice_spec 与被剔除项审计）。"""
+    from sqlalchemy import select as sa_select
+    from .db.models import StrategyAdvice
+
+    limit = max(1, min(limit, 200))
+    stmt = sa_select(StrategyAdvice).order_by(
+        StrategyAdvice.created_at.desc()).limit(limit)
+    if channel:
+        stmt = stmt.where(StrategyAdvice.channel == channel)
+    if status:
+        stmt = stmt.where(StrategyAdvice.status == status)
+    rows = (await db.execute(stmt)).scalars().all()
+    return {"advices": [attribution_engine._advice_dict(r) for r in rows]}
+
+
+@app.post("/api/attribution/advices/trigger")
+async def trigger_strategy_advice(req: AdviceTriggerRequest,
+                                  _: None = Depends(_require_auth)):
+    """手动生成一条策略建议（MANUAL 不受日预算限制，但同样过随机性前置门）。"""
+    from .services.live_channels import LIVE_CHANNELS
+
+    if req.channel not in LIVE_CHANNELS:
+        raise HTTPException(status_code=422, detail=f"未知通道: {req.channel}")
+    params = await _channel_runtime_params(req.channel)
+    advice = await attribution_engine.run_strategy_advice(
+        "MANUAL", req.channel, manual=True, current_params=params)
+    if advice is None:
+        return {"error": "策略建议运行失败（无已结算订单 / LLM 不可用 / 详见后端日志）"}
+    return advice
+
+
+@app.post("/api/attribution/advices/{advice_id}/apply")
+async def apply_strategy_advice(advice_id: int, req: AdviceApplyRequest,
+                                _: None = Depends(_require_auth),
+                                db: AsyncSession = Depends(get_db)):
+    """一键应用策略建议（服务端二次校验；只允许四类更保守动作）。
+
+    ⚠️ 前端不得把 LLM 输出直接拼成 /api/live/toggle 请求——所有校验在此，
+    保证任何前端 bug 都不能放大真金敏口。同通道已有 PENDING 建议会被
+    SUPERSEDED（参数已变，旧建议作废）。
+    """
+    from sqlalchemy import select as sa_select
+    from .db.models import StrategyAdvice
+    from .services.live_channels import LIVE_CHANNELS
+
+    if multi_live_trader is None:
+        return {"error": "执行器未装配（装配阶段异常？详见后端日志）"}
+    row = await db.get(StrategyAdvice, advice_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="建议不存在")
+    if row.channel not in LIVE_CHANNELS:
+        raise HTTPException(status_code=422, detail=f"通道已不在注册表: {row.channel}")
+    if row.status != "PENDING":
+        return {"error": f"建议状态为 {row.status}，不可应用"}
+    spec = row.advice_spec or {}
+    verdict = spec.get("verdict")
+    if not spec.get("applyable") or verdict not in (
+            "TIGHTEN_GUARD", "CUT_AMOUNT", "CUT_DAILY_LIMIT", "PAUSE"):
+        return {"error": f"该建议不可一键应用（verdict={verdict}）"}
+    action = spec.get("action") or {}
+    if req.param != action.get("param"):
+        raise HTTPException(
+            status_code=422,
+            detail=f"param 不匹配：建议 {action.get('param')}，请求 {req.param}")
+    to_value = action.get("to_value")
+    if req.to_value is not None and abs(float(req.to_value) - float(to_value)) > 1e-9:
+        raise HTTPException(status_code=422,
+                            detail="to_value 与建议不一致（建议已固化，不可自行改价）")
+    if verdict == "PAUSE" and not req.confirm:
+        raise HTTPException(status_code=422,
+                            detail="停火需 confirm=true 强确认（请先确认在途任务与互斥组兄弟通道）")
+    # 冷冻期：同通道 N 天内最多 M 次参数变更（停火不受限）
+    if verdict != "PAUSE":
+        since = datetime.now(timezone.utc) - timedelta(
+            days=settings.strategy_advice_apply_freeze_days)
+        applied_rows = (await db.execute(sa_select(StrategyAdvice).where(
+            StrategyAdvice.channel == row.channel,
+            StrategyAdvice.status == "APPLIED",
+            StrategyAdvice.updated_at >= since,
+        ))).scalars().all()
+        if len(applied_rows) >= settings.strategy_advice_apply_freeze_max:
+            raise HTTPException(
+                status_code=429,
+                detail=(f"通道近 {settings.strategy_advice_apply_freeze_days} 天已应用 "
+                        f"{len(applied_rows)} 次（上限 {settings.strategy_advice_apply_freeze_max}），"
+                        "冷冻期内仅允许停火"))
+    # 执行（沿用 toggle 的原子语义：先全量校验再统一生效）
+    kwargs: dict = {}
+    if verdict == "PAUSE":
+        kwargs["enabled"] = False
+    elif action.get("param") == "amount_usdt":
+        kwargs["amount_usdt"] = float(to_value)
+    elif action.get("param") == "max_daily_orders":
+        kwargs["max_daily_orders"] = int(round(float(to_value)))
+    elif action.get("param") == "max_exec_price":
+        kwargs["max_exec_price"] = float(to_value)
+    try:
+        multi_live_trader.set_channel(row.channel, **kwargs)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    try:
+        await multi_live_trader.persist_channel(row.channel)
+    except Exception as exc:
+        logger.warning("建议应用持久化失败（运行时已生效）| {} | {}", row.channel, exc)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    logs = list(row.application_log or [])
+    logs.append({"applied_at": now_iso, "param": action.get("param"),
+                 "from_value": action.get("from_value"), "to_value": to_value,
+                 "advice_id": row.id, "verdict": verdict})
+    row.application_log = logs
+    row.status = "APPLIED"
+    # 同通道其他 PENDING 建议作废（参数已变，旧建议失效）
+    others = (await db.execute(sa_select(StrategyAdvice).where(
+        StrategyAdvice.channel == row.channel,
+        StrategyAdvice.status == "PENDING",
+        StrategyAdvice.id != row.id,
+    ))).scalars().all()
+    for o in others:
+        o.status = "SUPERSEDED"
+    await db.commit()
+    _status = await multi_live_trader.status_async()
+    ch_state = next((c for c in _status["channels"] if c["channel"] == row.channel), None)
+    return {"ok": True, "advice_id": row.id, "status": row.status,
+            "applied": {action.get("param"): to_value}, "channel_state": ch_state}
+
+
+@app.post("/api/attribution/advices/{advice_id}/dismiss")
+async def dismiss_strategy_advice(advice_id: int,
+                                  _: None = Depends(_require_auth),
+                                  db: AsyncSession = Depends(get_db)):
+    """否决策略建议（仅 PENDING 可操作；记录保留供审计）。"""
+    from .db.models import StrategyAdvice
+
+    row = await db.get(StrategyAdvice, advice_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="建议不存在")
+    if row.status != "PENDING":
+        return {"error": f"建议状态为 {row.status}，不可否决"}
+    row.status = "DISMISSED"
+    await db.commit()
+    return {"ok": True, "id": advice_id, "status": row.status}
 
 
 # ============================================================

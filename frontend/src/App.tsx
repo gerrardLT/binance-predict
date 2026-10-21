@@ -547,6 +547,24 @@ const api = {
   getAttributionPacks: (channel?: string, limit = 50) =>
     authFetch(`/api/attribution/packs?limit=${limit}` + (channel ? `&channel=${encodeURIComponent(channel)}` : '')).then(r => r.json()),
   getAttributionPack: (orderId: number) => authFetch(`/api/attribution/packs/${orderId}`).then(r => r.json()),
+  // AI 策略顾问（2026-10-22）：趋势分级 + 结构化建议；LLM 无执行权，应用必须人工确认
+  getAdvisor: () => authFetch('/api/live/advisor').then(r => r.json()),
+  getAdvices: (channel?: string, limit = 10) =>
+    authFetch(`/api/attribution/advices?limit=${limit}` + (channel ? `&channel=${encodeURIComponent(channel)}` : '')).then(r => r.json()),
+  triggerAdvice: (channel: string) =>
+    authFetch('/api/attribution/advices/trigger', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ channel }),
+    }).then(r => r.json()),
+  applyAdvice: (id: number, body: { param: string; to_value: number | boolean; confirm?: boolean }) =>
+    authFetch(`/api/attribution/advices/${id}/apply`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(r => r.json()),
+  dismissAdvice: (id: number) =>
+    authFetch(`/api/attribution/advices/${id}/dismiss`, { method: 'POST' }).then(r => r.json()),
   // 实盘面板（2026-08-22）：钱包/实盘状态/下单/订单历史
   getPredictionWallet: () => authFetch('/api/prediction-wallet').then(r => r.json()),
   getLiveStatus: () => authFetch('/api/misalignment/signals').then(r => r.json()),
@@ -867,6 +885,110 @@ interface PackDetail {
   }
   facts: Record<string, unknown>
   error: string | null
+}
+
+// ============================================================
+// AI 策略顾问（2026-10-22）：趋势分级 + 结构化建议 + 一键应用
+// ============================================================
+
+type TrendLevel = 'L0' | 'L1' | 'L2' | 'L3'
+type AdviceVerdict = 'HOLD' | 'TIGHTEN_GUARD' | 'CUT_AMOUNT' | 'CUT_DAILY_LIMIT' | 'PAUSE' | 'ESCALATE_HUMAN'
+interface AdvisorAdviceSummary {
+  id: number
+  verdict: AdviceVerdict | null
+  status: string
+  applyable: boolean
+  to_value: number | null
+  confidence: number | null
+  created_at: string | null
+}
+interface AdvisorChannelTrend {
+  level: TrendLevel
+  reasons: string[]
+  n: number
+  win_rate: number | null
+  rolling20_win_rate: number | null
+  p_edge_negative: number | null
+  edge: number | null
+  cusum: number | null
+  since_alarm_n: number | null
+  coverage_ratio: number | null
+  advice: AdvisorAdviceSummary | null
+}
+interface AdvisorPayload {
+  as_of: number
+  exposure: { enabled_channels: number; window_exposure: number; daily_exposure: number }
+  channels: Record<string, AdvisorChannelTrend>
+  top_advice: { channel: string; level: TrendLevel; advice: AdvisorAdviceSummary } | null
+}
+interface AdviceEvidence { claim?: string; evidence_ids?: string[]; numbers?: { name: string; value: number }[] }
+interface StrategyAdviceSpec {
+  schema: string
+  channel: string
+  verdict: AdviceVerdict
+  diagnosis: {
+    primary_cause: string
+    evidence: AdviceEvidence[]
+    supporting_test: { name?: string; verdict?: string; significant?: boolean }
+    randomness_check: { verdict?: string | null }
+  }
+  action: {
+    param: string
+    from_value: number | boolean
+    to_value: number | boolean
+    duration_orders: number
+    expiry_condition: string
+  } | null
+  confidence: number | null
+  counter_hypothesis: string
+  kill_criteria: string
+  expected_effect: Record<string, unknown>
+  requires_human_review: boolean
+  clamped: boolean
+  applyable: boolean
+  system_skipped_llm?: boolean
+}
+interface StrategyAdviceRow {
+  id: number
+  channel: string
+  trigger_type: string
+  prompt_version: string
+  advice_spec: StrategyAdviceSpec
+  rejected: Record<string, unknown>[]
+  pre_metrics: Record<string, unknown>
+  status: string
+  application_log: Record<string, unknown>[]
+  tracking: { target_n?: number; observed_n?: number; verdict?: string | null; note?: string }
+  created_at: string | null
+  updated_at: string | null
+}
+
+const ADVICE_VERDICT_META: Record<string, { label: string; cls: string }> = {
+  HOLD: { label: '保持不动', cls: 'bg-sunken text-ink-70 border-line' },
+  TIGHTEN_GUARD: { label: '收紧护栏', cls: 'bg-warning-soft text-warning border-warning/30' },
+  CUT_AMOUNT: { label: '下调金额', cls: 'bg-warning-soft text-warning border-warning/30' },
+  CUT_DAILY_LIMIT: { label: '下调日限', cls: 'bg-warning-soft text-warning border-warning/30' },
+  PAUSE: { label: '停火观察', cls: 'bg-negative-soft text-negative border-negative/30' },
+  ESCALATE_HUMAN: { label: '转人工', cls: 'bg-sunken text-ink-70 border-line' },
+}
+const ADVICE_CAUSE_META: Record<string, string> = {
+  RANDOM: '随机波动（无归因证据）',
+  EDGE_DECAY: '优势衰减',
+  BUY_EXPENSIVE: '买贵（入场价高于保本线）',
+  EXECUTION: '执行问题（滑点/护栏）',
+  EXPOSURE: '敏口集中',
+  COMPOSITION: '触发构成漂移',
+  CROWD: '人群/报价结构',
+  UNKNOWN: '原因未知',
+  OTHER: '其他',
+}
+const ADVICE_PARAM_LABEL: Record<string, string> = {
+  amount_usdt: '单笔金额', max_daily_orders: '日限', max_exec_price: '执行价护栏', enabled: '通道开关',
+}
+const TREND_LEVEL_META: Record<string, { label: string; cls: string }> = {
+  L1: { label: '观察', cls: 'bg-warning-soft text-warning border-warning/40' },
+  L2: { label: '预警', cls: 'bg-negative-soft text-negative border-negative/40' },
+  L3: { label: '红灯', cls: 'bg-negative text-white border-negative' },
 }
 
 const SIGNAL_INFO: Record<string, { name: string; desc: string; retired?: boolean }> = {
@@ -3216,6 +3338,13 @@ function LiveTradeTab() {
   const [expandedLiveChannel, setExpandedLiveChannel] = useState<string | null>(null)
   // 通道盈亏与 ROI 数据（2026-09-09：在实盘通道卡片中直观映射实盘战绩与盈利率）
   const [pnlData, setPnlData] = useState<PnlCurveData | null>(null)
+  // AI 策略顾问（2026-10-22）：趋势分级 + 建议摘要（60s 轮询，后端 300s 缓存）
+  const [advisor, setAdvisor] = useState<AdvisorPayload | null>(null)
+  const [adviceBusy, setAdviceBusy] = useState<string | null>(null)
+  const [adviceMsg, setAdviceMsg] = useState<Record<string, string>>({})
+  // 每通道历史建议（行内展开懒加载，最多 10 条）
+  const [channelAdvices, setChannelAdvices] = useState<Record<string, StrategyAdviceRow[]>>({})
+  const [showAdviceHistory, setShowAdviceHistory] = useState<string | null>(null)
 
   const refresh = useCallback(() => {
     api.getPredictionWallet().then(setWallet).catch(() => {})
@@ -3236,6 +3365,16 @@ function LiveTradeTab() {
     const timer = setInterval(refresh, 15000)
     return () => clearInterval(timer)
   }, [refresh])
+
+  // AI 顾问轮询：60s（趋势分级来自体检报告 300s 缓存，无需更高频）
+  const refreshAdvisor = useCallback(() => {
+    api.getAdvisor().then(setAdvisor).catch(() => {})
+  }, [])
+  useEffect(() => {
+    refreshAdvisor()
+    const timer = setInterval(refreshAdvisor, 60000)
+    return () => clearInterval(timer)
+  }, [refreshAdvisor])
 
   // 本地 1s tick：用 window_end - server_now_ms 偏移算剩余秒（不新增网络轮询）
   useEffect(() => {
@@ -3263,6 +3402,25 @@ function LiveTradeTab() {
     }
     return { pnlByChan: byChannel, liveSortMetrics: metrics }
   }, [pnlData])
+
+  // 滚动 20 单胜率序列（sparkline）：直接用 pnl-curve 已有逐单 win，零新后端
+  const winRateSpark = useMemo(() => {
+    const out: Record<string, { i: number; wr: number }[]> = {}
+    for (const channel of pnlData?.channels ?? []) {
+      const pts = channel.points
+      if (pts.length < 20) continue
+      const seq: { i: number; wr: number }[] = []
+      let wins = 0
+      for (let i = 0; i < pts.length; i++) {
+        wins += pts[i].win ? 1 : 0
+        if (i >= 20 && pts[i - 20].win) wins -= 1
+        if (i >= 19) seq.push({ i: i + 1, wr: wins / 20 })
+      }
+      out[channel.channel] = seq.slice(-60)
+    }
+    return out
+  }, [pnlData])
+
   const byLivePerformance = (a: LiveChannelStatus, b: LiveChannelStatus) => {
     const am = liveSortMetrics[a.channel]
     const bm = liveSortMetrics[b.channel]
@@ -3275,24 +3433,210 @@ function LiveTradeTab() {
   const stoppedLiveChannels = liveChannels.filter(c => !c.enabled).sort(byLivePerformance)
   const enabledCount = activeLiveChannels.length
   const toggleLiveDetails = (channel: string) => setExpandedLiveChannel(current => current === channel ? null : channel)
+
+  // ---- AI 顾问交互（2026-10-22）：建议懒加载 / 手动分析 / 一键应用 ----
+  const loadChannelAdvices = useCallback(async (channel: string) => {
+    const r = await api.getAdvices(channel, 10).catch(() => null)
+    if (r?.advices) setChannelAdvices(prev => ({ ...prev, [channel]: r.advices }))
+  }, [])
+
+  useEffect(() => {
+    if (expandedLiveChannel && !channelAdvices[expandedLiveChannel]) {
+      loadChannelAdvices(expandedLiveChannel)
+    }
+  }, [expandedLiveChannel, channelAdvices, loadChannelAdvices])
+
+  const runAdvice = async (channel: string) => {
+    if (adviceBusy) return
+    setAdviceBusy(channel)
+    setAdviceMsg(prev => ({ ...prev, [channel]: '模型分析中（最长 90s）…' }))
+    try {
+      const r = await api.triggerAdvice(channel).catch(e => ({ error: String(e) }))
+      if (r?.error) {
+        setAdviceMsg(prev => ({ ...prev, [channel]: `分析失败：${r.error}` }))
+        return
+      }
+      setAdviceMsg(prev => ({ ...prev, [channel]: '' }))
+      await loadChannelAdvices(channel)
+      refreshAdvisor()
+    } finally {
+      setAdviceBusy(null)
+    }
+  }
+
+  const applyAdvice = async (adv: StrategyAdviceRow) => {
+    const action = adv.advice_spec.action
+    if (!action) return
+    const isPause = adv.advice_spec.verdict === 'PAUSE'
+    const paramLabel = ADVICE_PARAM_LABEL[action.param] ?? action.param
+    const text = isPause
+      ? `确认停火 ${SIGNAL_INFO[adv.channel]?.name ?? adv.channel}？\n\n注意：在途任务不受影响；同窗互斥组内其他通道会获得更多成交机会。`
+      : `确认应用：${paramLabel} ${String(action.from_value)} → ${String(action.to_value)}？\n\n应用后 ${action.duration_orders || 30} 单内进入效果追踪，冷冻期内不可再次应用。`
+    if (!window.confirm(text)) return
+    const r = await api.applyAdvice(adv.id, {
+      param: action.param, to_value: action.to_value, confirm: isPause,
+    }).catch(e => ({ error: String(e) }))
+    if (r?.error) {
+      setAdviceMsg(prev => ({ ...prev, [adv.channel]: `应用失败：${r.error}` }))
+      return
+    }
+    setAdviceMsg(prev => ({ ...prev, [adv.channel]: '已应用，30 单后自动评估效果' }))
+    await loadChannelAdvices(adv.channel)
+    refresh()
+    refreshAdvisor()
+  }
+
+  const dismissAdvice = async (adv: StrategyAdviceRow) => {
+    await api.dismissAdvice(adv.id).catch(() => {})
+    await loadChannelAdvices(adv.channel)
+    refreshAdvisor()
+  }
+
+  // 行内 AI 建议块（展开时显示；历史懒加载）
+  const renderAdviceBlock = (ch: LiveChannelStatus) => {
+    const trend = advisor?.channels?.[ch.channel]
+    const advs = channelAdvices[ch.channel] ?? []
+    const latest = advs[0]
+    // 空 spec（LLM 不可用/全部被闸拦截）与无记录同等处理
+    const rawSpec = latest?.advice_spec
+    const spec = rawSpec && rawSpec.verdict ? rawSpec : null
+    const busy = adviceBusy === ch.channel
+    const levelMeta = trend?.level && trend.level !== 'L0' ? TREND_LEVEL_META[trend.level] : null
+    return (
+      <div className="px-3 py-2 text-[11px] border-t border-line-soft bg-card space-y-1.5" onClick={event => event.stopPropagation()}>
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="font-semibold text-ink-90">AI 策略建议</span>
+          {levelMeta && (
+            <span className={`px-1.5 py-0.5 rounded-pill border text-[9px] font-bold ${levelMeta.cls}`}
+              title={(trend?.reasons ?? []).join('；')}>趋势{levelMeta.label}</span>
+          )}
+          {trend?.reasons?.length ? (
+            <span className="text-ink-55 truncate max-w-[340px]" title={trend.reasons.join('；')}>{trend.reasons[0]}</span>
+          ) : null}
+          <button
+            onClick={() => runAdvice(ch.channel)}
+            disabled={busy || !!adviceBusy}
+            className="ml-auto px-2 py-0.5 rounded-pill bg-brand text-white text-[10px] font-semibold disabled:opacity-50"
+          >{busy ? '分析中…' : 'AI 分析'}</button>
+          {advs.length > 1 && (
+            <button onClick={() => setShowAdviceHistory(cur => cur === ch.channel ? null : ch.channel)}
+              className="px-2 py-0.5 rounded-pill border border-line text-[10px] text-ink-55">
+              历史 {advs.length}
+            </button>
+          )}
+        </div>
+        {adviceMsg[ch.channel] && <div className="text-warning">{adviceMsg[ch.channel]}</div>}
+        {!spec && (
+          <div className="text-ink-55">暂无建议——「AI 分析」会基于全部已结算订单（含证据包与行情背景）给出诊断与动作；LLM 只给建议，执行需你确认。</div>
+        )}
+        {spec && latest && (
+          <div className="space-y-1">
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className={`px-1.5 py-0.5 rounded-pill border text-[10px] font-semibold ${ADVICE_VERDICT_META[spec.verdict]?.cls ?? ''}`}>
+                {ADVICE_VERDICT_META[spec.verdict]?.label ?? spec.verdict}
+              </span>
+              <span className="text-ink-55 font-mono">{latest.trigger_type} · {fmtMs(latest.created_at ? Date.parse(latest.created_at) : null)}</span>
+              {spec.clamped && <span className="text-warning">幅度已截断</span>}
+              {latest.status !== 'PENDING' && <span className="text-ink-55">（{latest.status}）</span>}
+              {latest.status === 'PENDING' && spec.applyable && (
+                <>
+                  <button onClick={() => applyAdvice(latest)} className="px-2 py-0.5 rounded-pill bg-warning text-white text-[10px] font-semibold">一键应用</button>
+                  <button onClick={() => dismissAdvice(latest)} className="px-2 py-0.5 rounded-pill border border-line text-[10px] text-ink-55">忽略</button>
+                </>
+              )}
+            </div>
+            <div className="text-ink-90">
+              诊断：{ADVICE_CAUSE_META[spec.diagnosis?.primary_cause] ?? spec.diagnosis?.primary_cause}
+              {spec.diagnosis?.supporting_test?.name ? `（检验 ${spec.diagnosis.supporting_test.name} → ${spec.diagnosis.supporting_test.verdict ?? '--'}）` : ''}
+            </div>
+            {spec.action && (
+              <div className="font-mono text-ink-80">
+                {ADVICE_PARAM_LABEL[spec.action.param] ?? spec.action.param}：
+                {String(spec.action.from_value)} → <b>{String(spec.action.to_value)}</b>
+                {spec.action.duration_orders ? `（追踪 ${spec.action.duration_orders} 单）` : ''}
+              </div>
+            )}
+            {spec.action?.expiry_condition && <div className="text-ink-55">恢复条件：{spec.action.expiry_condition}</div>}
+            {spec.diagnosis?.evidence?.length ? (
+              <ul className="text-ink-55 space-y-0.5">
+                {spec.diagnosis.evidence.slice(0, 4).map((e, i) => <li key={i}>· {e.claim ?? '（断言）'}</li>)}
+              </ul>
+            ) : null}
+            <div className="text-ink-55">反方解释：{spec.counter_hypothesis}</div>
+            <div className="text-ink-55">撤回条件：{spec.kill_criteria}</div>
+            {latest.status === 'APPLIED' && latest.tracking?.observed_n != null && (
+              <div className="text-ink-55 font-mono">
+                效果追踪：{latest.tracking.observed_n}/{latest.tracking.target_n ?? 30} 单
+                {latest.tracking.verdict ? ` · ${latest.tracking.verdict}` : ''}
+                {latest.tracking.note ? `（${latest.tracking.note}）` : ''}
+              </div>
+            )}
+          </div>
+        )}
+        {showAdviceHistory === ch.channel && advs.length > 1 && (
+          <div className="space-y-1 border-t border-line-soft pt-1">
+            {advs.slice(1, 8).map(a => (
+              <div key={a.id} className="flex items-center gap-2 text-ink-55 font-mono">
+                <span>{fmtMs(a.created_at ? Date.parse(a.created_at) : null)}</span>
+                <span className="font-sans">{ADVICE_VERDICT_META[a.advice_spec.verdict]?.label ?? a.advice_spec.verdict}</span>
+                <span>{a.status}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  // 滚动胜率 sparkline + 趋势徽标（行内紧凑显示；数据来自 pnl-curve 与 advisor）。
+  // 用原生 SVG 而非 recharts：每行一张迷你图，50 通道会拖慢主面板。
+  const renderTrendCell = (channel: string) => {
+    const spark = winRateSpark[channel]
+    const trend = advisor?.channels?.[channel]
+    const levelMeta = trend?.level && trend.level !== 'L0' ? TREND_LEVEL_META[trend.level] : null
+    if (!spark?.length && !levelMeta) return null
+    return (
+      <span className="shrink-0 flex items-center gap-1"
+        title={trend ? (trend.reasons?.join('；') || '滚动20单胜率趋势') : '滚动20单胜率趋势（最近60单）'}>
+        {spark?.length ? (
+          <svg width={56} height={16} viewBox="0 0 56 16" className="shrink-0">
+            <polyline
+              fill="none"
+              stroke={trend?.level === 'L2' || trend?.level === 'L3' ? 'var(--negative)' : 'var(--brand)'}
+              strokeWidth={1.4}
+              points={spark.map((p, i) => `${(i / Math.max(1, spark.length - 1)) * 54 + 1},${(15 - p.wr * 14).toFixed(1)}`).join(' ')}
+            />
+          </svg>
+        ) : null}
+        {levelMeta && (
+          <span className={`px-1 py-0.5 rounded-pill border text-[9px] font-bold ${levelMeta.cls}`}>{
+            levelMeta.label}</span>
+        )}
+      </span>
+    )
+  }
+
   const liveDetails = (ch: LiveChannelStatus) => {
     const p = pnlByChan[ch.channel]
     const metrics = liveSortMetrics[ch.channel]
     const detail = (label: string, value: string, tone = '') => <div><span className="text-ink-55">{label}</span><b className={`ml-1 font-mono ${tone}`}>{value}</b></div>
-    return <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-4 gap-y-1 px-3 py-2 text-[11px] border-t border-line-soft bg-card" onClick={event => event.stopPropagation()}>
-      {detail('真实胜率', metrics?.winRate == null ? '--' : `${(metrics.winRate * 100).toFixed(1)}%`)}
-      {detail('信号EV', metrics?.signalEv == null ? '--' : `${metrics.signalEv >= 0 ? '+' : ''}${(metrics.signalEv * 100).toFixed(1)}%`, metrics?.signalEv == null ? '' : metrics.signalEv >= 0 ? 'text-positive' : 'text-negative')}
-      {detail('已结算', `${p?.settled_count ?? 0} 单`)}
-      {detail('胜 / 负', `${p?.win_count ?? 0} / ${Math.max(0, (p?.settled_count ?? 0) - (p?.win_count ?? 0))}`)}
-      {detail('累计投入', p ? `${p.total_cost.toFixed(2)} U` : '--')}
-      {detail('真实PnL', p ? `${p.total_pnl >= 0 ? '+' : ''}${p.total_pnl.toFixed(2)} U` : '--', p ? p.total_pnl >= 0 ? 'text-positive' : 'text-negative' : '')}
-      {detail('资金ROI', p?.roi == null ? '--' : `${p.roi >= 0 ? '+' : ''}${(p.roi * 100).toFixed(1)}%`, p?.roi == null ? '' : p.roi >= 0 ? 'text-positive' : 'text-negative')}
-      {detail('今日 / 日限', `${ch.filled_today ?? 0} / ${ch.max_daily_orders}`)}
-      {detail('累计开火', `${ch.fire_total} 次`)}
-      {detail('周期', ch.market_period || '--')}
-      {detail('方向', ch.direction || '--')}
-      {detail('执行价护栏', ch.max_exec_price.toFixed(2))}
-    </div>
+    return <>
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-4 gap-y-1 px-3 py-2 text-[11px] border-t border-line-soft bg-card" onClick={event => event.stopPropagation()}>
+        {detail('真实胜率', metrics?.winRate == null ? '--' : `${(metrics.winRate * 100).toFixed(1)}%`)}
+        {detail('信号EV', metrics?.signalEv == null ? '--' : `${metrics.signalEv >= 0 ? '+' : ''}${(metrics.signalEv * 100).toFixed(1)}%`, metrics?.signalEv == null ? '' : metrics.signalEv >= 0 ? 'text-positive' : 'text-negative')}
+        {detail('已结算', `${p?.settled_count ?? 0} 单`)}
+        {detail('胜 / 负', `${p?.win_count ?? 0} / ${Math.max(0, (p?.settled_count ?? 0) - (p?.win_count ?? 0))}`)}
+        {detail('累计投入', p ? `${p.total_cost.toFixed(2)} U` : '--')}
+        {detail('真实PnL', p ? `${p.total_pnl >= 0 ? '+' : ''}${p.total_pnl.toFixed(2)} U` : '--', p ? p.total_pnl >= 0 ? 'text-positive' : 'text-negative' : '')}
+        {detail('资金ROI', p?.roi == null ? '--' : `${p.roi >= 0 ? '+' : ''}${(p.roi * 100).toFixed(1)}%`, p?.roi == null ? '' : p.roi >= 0 ? 'text-positive' : 'text-negative')}
+        {detail('今日 / 日限', `${ch.filled_today ?? 0} / ${ch.max_daily_orders}`)}
+        {detail('累计开火', `${ch.fire_total} 次`)}
+        {detail('周期', ch.market_period || '--')}
+        {detail('方向', ch.direction || '--')}
+        {detail('执行价护栏', ch.max_exec_price.toFixed(2))}
+      </div>
+      {renderAdviceBlock(ch)}
+    </>
   }
 
   // 倒计时：服务端时钟修正后的剩余毫秒；<60s 红色警示
@@ -3786,6 +4130,48 @@ function LiveTradeTab() {
                 </span>
               : <span className="text-ink-55">未装配（启动异常，详见后端日志）</span>}
           </div>
+          {/* AI 策略顾问汇总卡（2026-10-22）：只答两件事——最坏单窗敏口、若只能改一个改哪个。 */}
+          {liveChannels.length > 0 && (
+            <div className="bg-card border border-line rounded-sm px-2.5 py-2 space-y-1.5">
+              <div className="flex items-center gap-2 text-[11px]">
+                <span className="font-semibold text-ink-95">AI 策略顾问</span>
+                <HelpHint text="趋势分级 L1 观察 / L2 预警 / L3 红灯（与体检红灯同口径）。汇总卡只答两个问题：当前最坏单窗敏口是多少；若只能改一个通道改哪个。LLM 只给建议，一键应用需你确认，应用后 30 单自动评估。" />
+                <span className="ml-auto text-[10px] text-ink-55 font-mono">
+                  数据截止 {advisor ? fmtMs(advisor.as_of) : '--'} · 口径：已结算单
+                </span>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-[11px]">
+                <div className="bg-sunken rounded-sm px-2 py-1.5 space-y-0.5">
+                  <div className="text-ink-55">组合敏口（最坏同时亏）</div>
+                  <div className="font-mono text-ink-95">
+                    单窗 <b>{advisor?.exposure.window_exposure?.toFixed(1) ?? '--'}</b> U
+                    <span className="text-ink-55">（{advisor?.exposure.enabled_channels ?? 0} 通道在实盘）</span>
+                    · 日累计 <b>{advisor?.exposure.daily_exposure?.toFixed(0) ?? '--'}</b> U
+                  </div>
+                </div>
+                <div className="bg-sunken rounded-sm px-2 py-1.5 space-y-0.5">
+                  <div className="text-ink-55">若只能改一个</div>
+                  {advisor?.top_advice ? (
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <span className="font-semibold text-ink-95">
+                        {SIGNAL_INFO[advisor.top_advice.channel]?.name ?? advisor.top_advice.channel}
+                      </span>
+                      <span className="text-warning font-semibold">
+                        {ADVICE_VERDICT_META[advisor.top_advice.advice.verdict ?? '']?.label ?? advisor.top_advice.advice.verdict}
+                      </span>
+                      {advisor.top_advice.advice.to_value != null && (
+                        <span className="font-mono text-ink-70">→ {String(advisor.top_advice.advice.to_value)}</span>
+                      )}
+                      <button className="text-brand underline"
+                        onClick={() => setExpandedLiveChannel(advisor.top_advice!.channel)}>查看并确认</button>
+                    </div>
+                  ) : (
+                    <span className="text-ink-55">暂无可执行的 AI 建议（保持不动也是一等输出）</span>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
           {/* 主区只展示实际 enabled 通道；关闭项折叠到管理区，避免停火通道被误读为正在实盘。 */}
           {liveChannels.length > 0 && (
             <div className="bg-sunken border border-line rounded-sm p-2 space-y-1">
@@ -3814,6 +4200,7 @@ function LiveTradeTab() {
                       <span>胜率 <b>{metrics?.winRate == null ? '--' : `${(metrics.winRate * 100).toFixed(1)}%`}</b></span>
                       <span className={metrics?.signalEv == null ? 'text-ink-55' : metrics.signalEv >= 0 ? 'text-positive' : 'text-negative'}>信号EV <b>{metrics?.signalEv == null ? '--' : `${metrics.signalEv >= 0 ? '+' : ''}${(metrics.signalEv * 100).toFixed(1)}%`}</b></span>
                     </span>
+                    {renderTrendCell(ch.channel)}
                     <span className="shrink-0 flex items-center gap-1" onClick={event => event.stopPropagation()}>
                       <span className="text-[10px] text-ink-55">护栏</span>
                       <input
@@ -3931,6 +4318,7 @@ function LiveTradeTab() {
                               <span>胜率 <b>{metrics?.winRate == null ? '--' : `${(metrics.winRate * 100).toFixed(1)}%`}</b></span>
                               <span className={metrics?.signalEv == null ? 'text-ink-55' : metrics.signalEv >= 0 ? 'text-positive' : 'text-negative'}>信号EV <b>{metrics?.signalEv == null ? '--' : `${metrics.signalEv >= 0 ? '+' : ''}${(metrics.signalEv * 100).toFixed(1)}%`}</b></span>
                             </span>
+                            {renderTrendCell(ch.channel)}
                             <span className="shrink-0 flex items-center gap-1" onClick={event => event.stopPropagation()}>
                               <span className="text-[10px] text-ink-55">护栏</span>
                               <input

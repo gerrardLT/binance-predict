@@ -513,3 +513,24 @@ class HypothesisActionRequest(BaseModel):
     """POST /api/attribution/hypotheses/{id}/action：人工处置行动建议。"""
 
     action_status: str = Field(description="APPLIED（已人工执行）| DISMISSED（否决建议）")
+
+
+class AdviceTriggerRequest(BaseModel):
+    """POST /api/attribution/advices/trigger：手动生成一条策略建议。"""
+
+    channel: str = Field(description="通道 ID（LIVE_CHANNELS 白名单内）")
+
+
+class AdviceApplyRequest(BaseModel):
+    """POST /api/attribution/advices/{id}/apply：一键应用（服务端二次校验）。
+
+    只接受建议固化的 param/to_value：前端不得自行改价，否则 422。
+    """
+
+    param: str = Field(description="amount_usdt | max_daily_orders | max_exec_price | enabled")
+    to_value: float | None = Field(
+        default=None, description="目标值；缺省取建议固化值（与建议不一致则 422）"
+    )
+    confirm: bool = Field(
+        default=False, description="停火需强确认（建议卡显示在途任务数后仍需 confirm=true）"
+    )

@@ -9,6 +9,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Iterable, Mapping
 
+from binance_predict.services import channel_trend as ct
 from binance_predict.services import signal_health as sh
 
 # LLM 诊断留口：接入时把 async (payload) -> dict 赋给它；未赋值 = 未实现（P1 不接模型）。
@@ -192,6 +193,7 @@ def assemble_report(
     rows: list[dict[str, Any]] = []
     events: dict[tuple[str, str], list[sh.Event]] = {}
     active_events_by_key: dict[str, list[sh.Event]] = {}
+    trend_map: dict[str, dict[str, Any]] = {}
 
     for scope, evmap, meta in (("live", live_ev, live_meta), ("shadow", shadow_ev, shadow_meta)):
         for key in sorted(set(evmap) | set(meta)):
@@ -205,6 +207,12 @@ def assemble_report(
             # P3: 死因诊断与变化点检测
             death_status, death_reason = sh.diagnose_death_status(evs, b_win)
             change_point = sh.detect_change_point(evs)
+
+            # 趋势分级（2026-10-22）：只对实盘通道出结论，复用本次 metrics 零额外查询。
+            # 保本线覆盖率不足 → L0（trend_payload 内部注明原因）。
+            if scope == "live" and evs:
+                coverage = (m.get("be_n") or 0) / m["n"] if m["n"] else 0.0
+                trend_map[key] = ct.trend_payload(key, evs, coverage, metrics=m)
 
             rows.append({
                 "scope": scope, "key": key, "light": light, "reasons": reasons, "metrics": m,
@@ -228,6 +236,7 @@ def assemble_report(
         "thresholds": {"min_n": sh.MIN_N, "red_p_neg": sh.RED_P_NEG, "yellow_p_neg": sh.YELLOW_P_NEG,
                        "yellow_p_bench": sh.YELLOW_P_BENCH, "tail_share": sh.TAIL_SHARE},
         "rows": rows, "correlations": correlations[:20], "_events": events,
+        "trend": trend_map,
     }
 
 
@@ -349,6 +358,12 @@ def detail_for(scope: str, key: str, row: Mapping[str, Any], evs: list[sh.Event]
         trend_4h=t4, trend_24h=t24, volatility=vol,
     )
 
+    # 趋势下钻（2026-10-22）：实盘通道带 CUSUM 曲线；影子版本不出趋势结论。
+    if scope == "live" and evs:
+        m = row["metrics"]
+        coverage = (m.get("be_n") or 0) / m["n"] if m.get("n") else 0.0
+        diag_payload["trend"] = ct.trend_payload(key, evs, coverage, metrics=m)
+
     return {
         "scope": scope, "key": key, "light": row["light"], "reasons": row["reasons"], "metrics": row["metrics"],
         "series": sh.series(evs),
@@ -359,6 +374,8 @@ def detail_for(scope: str, key: str, row: Mapping[str, Any], evs: list[sh.Event]
         "change_point": change_point,
         "history": history,
         "diagnosis_payload": diag_payload,
+        "trend": diag_payload.get("trend"),
+        "cusum_series": ct.cusum_series(evs) if scope == "live" else [],
     }
 
 

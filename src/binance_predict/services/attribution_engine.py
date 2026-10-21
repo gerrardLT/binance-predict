@@ -16,7 +16,7 @@ import asyncio
 import datetime as dt
 import difflib
 import math
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from loguru import logger
 from sqlalchemy import select as sa_select
@@ -27,14 +27,20 @@ from binance_predict.db.models import (
     AttributionAnalysis,
     AttributionRun,
     Hypothesis,
+    StrategyAdvice,
     TradeOrderModel,
 )
 from binance_predict.services import attribution_stats as astats
+from binance_predict.services import channel_trend as ctrend
 from binance_predict.services.llm_panel import (
     LLMPanel,
-    TEST_MENU,
+    STRATEGY_PROMPT_VERSION,
+    _provider_entry,
+    build_strategy_prompt,
     build_user_prompt,
+    default_panel,
     verify_analysis,
+    verify_strategy_advice,
 )
 
 STREAK_LOOKBACK = 50          # 触发检测回看的已结算订单数上限
@@ -59,6 +65,34 @@ def _ev_per_order(o: dict) -> float | None:
         return None
 
 
+def _orders_to_events(orders: list[dict]) -> list[dict]:
+    """归因订单 dict → signal_health/channel_trend 事件（升序）。
+
+    EV=pnl/本金；保本线=均价/0.98（与 live_performance.break_even 估算口径同源）。
+    """
+    events: list[dict] = []
+    for o in orders:
+        ev = _ev_per_order(o)
+        if ev is None:
+            continue
+        avg = o.get("avg_price")
+        events.append({
+            "ts": o.get("created_ts") or 0, "win": o.get("win"), "ev": ev,
+            "be": (avg / 0.98) if avg else None, "q": avg,
+        })
+    return events
+
+
+def _iso_to_ms(value: str | None) -> int:
+    """ISO 时间串 → 毫秒；解析失败返回 0（追踪时按全量窗口回退）。"""
+    if not value:
+        return 0
+    try:
+        return int(dt.datetime.fromisoformat(value).timestamp() * 1000)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _entry_band(p: float | None) -> str:
     if p is None:
         return "unknown"
@@ -66,11 +100,14 @@ def _entry_band(p: float | None) -> str:
     return f"[{lo:.1f},{lo + 0.1:.1f})"
 
 
-def compute_channel_facts(orders: list[dict], window_n: int | None = None) -> tuple[dict, set[str]]:
+def compute_channel_facts(orders: list[dict], window_n: int | None = None,
+                          current_params: dict | None = None) -> tuple[dict, set[str]]:
     """确定性事实卡（LLM 的唯一数字来源）。
 
     orders: 按时间升序的通道订单 dict 列表，字段：
       win, pnl, amount_usdt, direction, created_ts(ms), avg_price, quoted_avg_price
+    current_params: 运行时通道参数快照（金额/日限/护栏/开关）——策略建议的
+      action.from_value 必须与之精确匹配；归因主流程可不传（空字典）。
     base_rate 取窗口前全部历史胜率（无前视）；window_n = 检验窗口大小（默认 settings）。
     """
     n_win = settings.attribution_streak_window_n if window_n is None else window_n
@@ -137,6 +174,39 @@ def compute_channel_facts(orders: list[dict], window_n: int | None = None) -> tu
         hour_groups[g]["values"].append(e)
         hour_groups[g]["timestamps_ms"].append(o.get("created_ts") or 0)
 
+    # Q5 买贵 vs 信号失效分解（前后半窗口）：Δedge = Δ胜率 − Δ保本线。
+    # 同一现象两种处置完全相反（调护栏 vs 停火），LLM 不准靠猜。
+    def _wr_be(seq: list[dict]) -> tuple[float | None, float | None]:
+        w = [o["win"] for o in seq if o.get("win") is not None]
+        b = [o["avg_price"] / 0.98 for o in seq if o.get("avg_price")]
+        return (round(sum(w) / len(w), 4) if w else None,
+                round(sum(b) / len(b), 4) if b else None)
+
+    _half = len(orders) // 2
+    wr1, be1 = _wr_be(orders[:_half])
+    wr2, be2 = _wr_be(orders[_half:])
+
+    def _delta(a: float | None, b: float | None) -> float | None:
+        return round(b - a, 4) if (a is not None and b is not None) else None
+
+    _edge1 = (wr1 - be1) if (wr1 is not None and be1 is not None) else None
+    _edge2 = (wr2 - be2) if (wr2 is not None and be2 is not None) else None
+    edge_decomp = {
+        "win_rate_delta": _delta(wr1, wr2),
+        "mean_breakeven_delta": _delta(be1, be2),
+        "edge_delta": _delta(_edge1, _edge2),
+    }
+
+    # 趋势分级（与体检/预警同源口径；覆盖不足时 L0 + 原因）
+    _events = _orders_to_events(orders)
+    if _events:
+        _be_n = sum(1 for e in _events if e["be"] is not None)
+        trend_payload = ctrend.trend_payload(
+            orders[-1].get("channel") if orders else None,
+            _events, _be_n / len(_events))
+    else:
+        trend_payload = {"level": "L0", "reasons": ["无已结算订单"], "coverage_ratio": 0.0}
+
     facts: dict[str, Any] = {
         "engine_version": ENGINE_VERSION,
         "channel": orders[-1].get("channel") if orders else None,
@@ -148,6 +218,9 @@ def compute_channel_facts(orders: list[dict], window_n: int | None = None) -> tu
             "verdict": sa.get("verdict"),
             "note": "RANDOM_CONSISTENT=与随机波动一致，无归因证据；此项为一等假设",
         },
+        "current_params": dict(current_params or {}),
+        "edge_decomp": edge_decomp,
+        "trend": trend_payload,
         "q1_exposure": {
             "n_losses": len(losses),
             "top_loss_days": [{"day": d, "losses": c} for d, c in top_days],
@@ -176,6 +249,13 @@ def compute_channel_facts(orders: list[dict], window_n: int | None = None) -> tu
         "q2_edge_decay.win_rate_first_half", "q2_edge_decay.win_rate_second_half",
         "q2_edge_decay.ev_block_bootstrap_all.p_le_zero", "q4_execution.slippage_bp_mean",
         "q4_execution.slippage_bp_max", "entry_band_ev", "hour_bucket_ev",
+        # 策略建议（2026-10-22）：当前参数原值 / 买贵-失效分解 / 趋势分级
+        "current_params.amount_usdt", "current_params.max_daily_orders",
+        "current_params.max_exec_price", "current_params.enabled",
+        "edge_decomp.win_rate_delta", "edge_decomp.mean_breakeven_delta",
+        "edge_decomp.edge_delta",
+        "trend.level", "trend.cusum", "trend.reasons", "trend.coverage_ratio",
+        "trend.n", "trend.win_rate", "trend.p_edge_negative", "trend.mean_breakeven",
     }
     return facts, evidence_ids
 
@@ -202,6 +282,7 @@ def execute_test(name: str, params: dict, orders: list[dict]) -> dict:
         return out
     if name == "ev_block_bootstrap":
         subset = params.get("filter")
+        direction = str(params.get("direction") or "positive")
         seq = list(orders)
         if subset == "recent_n":
             seq = orders[-int(params.get("n") or settings.attribution_streak_window_n):]
@@ -209,7 +290,16 @@ def execute_test(name: str, params: dict, orders: list[dict]) -> dict:
         vals = [e for _, e in rows if e is not None]
         tss = [o.get("created_ts") or 0 for o, e in rows if e is not None]
         res = astats.block_bootstrap_mean_p(vals, tss)
-        out.update({"result": res,
+        p_le = res.get("p_le_zero")
+        if direction == "negative":
+            # p_le_zero = P(mean≤0)；显著为负 ⇔ P(mean≥0) 很小 ⇔ p_le_zero 接近 1
+            significant = p_le is not None and p_le > 0.95
+            out.update({"result": res, "direction": "negative",
+                        "p_ge_zero": round(1.0 - p_le, 4) if p_le is not None else None,
+                        "significant": significant,
+                        "verdict": "SIGNIFICANT_NEGATIVE" if significant else "NOT_SIGNIFICANT"})
+            return out
+        out.update({"result": res, "direction": "positive",
                     "significant": bool(res.get("significant_positive")),
                     "verdict": "SIGNIFICANT_POSITIVE" if res.get("significant_positive") else "NOT_SIGNIFICANT"})
         return out
@@ -302,6 +392,9 @@ class AttributionEngine:
     def __init__(self, panel: LLMPanel | None = None) -> None:
         self.panel = panel or LLMPanel()
         self._running: set[str] = set()   # 防同通道并发 run
+        # L2 趋势预警回调（main.py 注入微信推送 + 策略建议触发）。
+        # 引擎不直接 import notifier，保持分析层与通知层解耦；异常只记日志。
+        self.on_trend_alert: Callable[[str, dict], Awaitable[None]] | None = None
 
     # ---------------- 触发入口 ----------------
 
@@ -322,6 +415,9 @@ class AttributionEngine:
 
     async def _maybe_trigger_streak(self, channel: str) -> None:
         orders = await self._load_channel_orders(channel, limit=STREAK_LOOKBACK)
+        # 趋势检测（2026-10-22）：与连败检测共用同一订单加载，零额外查询；
+        # 放在连败窗口门之前，避免 streak_window_n 调大时趋势检测被跳过。
+        await self._maybe_emit_trend(channel, orders)
         if len(orders) < settings.attribution_streak_window_n:
             return
         facts, _ = compute_channel_facts(orders)
@@ -333,6 +429,35 @@ class AttributionEngine:
         await self._run_guarded("STREAK", channel)
 
     # ---------------- 主流程 ----------------
+
+    async def _maybe_emit_trend(self, channel: str, orders: list[dict]) -> None:
+        """L2 趋势预警回调（L1 只进体检面板，L3 走既有红灯链路）。
+
+        orders 口径与 compute_channel_facts 一致（升序）；EV=pnl/本金，
+        保本线用 avg_price/0.98（与 live_performance.break_even 估算口径同源）。
+        """
+        if self.on_trend_alert is None or not settings.strategy_advice_enabled:
+            return
+        events: list[dict] = []
+        for o in orders:
+            ev = _ev_per_order(o)
+            if ev is None:
+                continue
+            avg = o.get("avg_price")
+            events.append({
+                "ts": o.get("created_ts") or 0, "win": o.get("win"), "ev": ev,
+                "be": (avg / 0.98) if avg else None, "q": avg,
+            })
+        if len(events) < ctrend.TREND_MIN_N:
+            return
+        be_n = sum(1 for e in events if e["be"] is not None)
+        payload = ctrend.trend_payload(channel, events, be_n / len(events))
+        if payload.get("level") != "L2":
+            return
+        try:
+            await self.on_trend_alert(channel, payload)
+        except Exception as exc:
+            logger.warning("归因引擎：趋势预警回调失败 | {} | {}", channel, exc)
 
     async def _run_guarded(self, trigger: str, channel: str) -> None:
         key = f"{trigger}:{channel}"
@@ -580,6 +705,213 @@ class AttributionEngine:
             except Exception as exc:
                 logger.warning("周报归因失败 | {} | {}", ch, exc)
         return n
+
+    # ---------------- 策略顾问（2026-10-22） ----------------
+
+    def _strategy_panel(self) -> LLMPanel:
+        """策略建议模型：默认单模型控成本（settings 可覆盖为多模型）。"""
+        override = settings.strategy_advice_models.strip()
+        if override:
+            out = []
+            for item in override.split(","):
+                if ":" not in item:
+                    continue
+                provider, model = item.split(":", 1)
+                entry = _provider_entry(provider.strip(), model.strip())
+                if entry:
+                    out.append(entry)
+            if out:
+                return LLMPanel(out)
+        full = default_panel()
+        return LLMPanel(full[:1] if full else [])
+
+    async def _advice_budget_ok(self, channel: str) -> bool:
+        """每通道每日自动建议次数限制（手动触发不查此函数）。"""
+        today = dt.datetime.now(dt.timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        async with async_session_factory() as db:
+            n = (await db.execute(sa_select(StrategyAdvice.id).where(
+                StrategyAdvice.channel == channel,
+                StrategyAdvice.created_at >= today,
+                StrategyAdvice.trigger_type != "MANUAL",
+            ))).scalars()
+            return len(list(n)) < settings.strategy_advice_max_daily
+
+    async def run_strategy_advice(self, trigger: str, channel: str, *,
+                                  manual: bool = False,
+                                  current_params: dict | None = None) -> dict | None:
+        """完整策略建议流程（L2 趋势 / 红灯 / 手动共用；与 run_attribution 并列）。
+
+        随机性前置门对 MANUAL 同样生效：与随机一致时不调模型、直接落 HOLD，
+        防止用户在纯噪声上反复点出「看起来有道理」的建议（也省 token）。
+        LLM 永无执行权：advice_spec.applyable 只表示允许前端展示一键应用按钮。
+        """
+        if not settings.strategy_advice_enabled:
+            return None
+        key = f"advice:{channel}"
+        if key in self._running:
+            return None
+        self._running.add(key)
+        try:
+            if not manual and not await self._advice_budget_ok(channel):
+                return None
+            orders = await self._load_channel_orders(channel, limit=200)
+            if not orders:
+                return None
+            facts, evidence_ids = compute_channel_facts(
+                orders, current_params=current_params)
+            # 预置检验：给 LLM 可引用的显著证据，也作为 verify 核对 supporting_test 的依据
+            pre_tests: list[dict] = []
+            for tname, tparams in (("streak_binomial", {}),
+                                   ("ev_block_bootstrap", {"direction": "negative"}),
+                                   ("cusum_changepoint", {})):
+                pre_tests.append(execute_test(tname, tparams, orders))
+            facts["pre_tests"] = pre_tests
+            streak_verdict = (facts.get("streak") or {}).get("verdict")
+
+            rejected: list[dict] = []
+            if streak_verdict in ("RANDOM_CONSISTENT", "INSUFFICIENT_DATA"):
+                # 随机性前置门：与随机一致 → 不调模型，直接 HOLD（一等输出）
+                advice_spec = {
+                    "schema": "strategy_advice_v1",
+                    "channel": channel,
+                    "verdict": "HOLD",
+                    "diagnosis": {
+                        "primary_cause": "RANDOM",
+                        "evidence": [],
+                        "supporting_test": {"name": "streak_binomial",
+                                            "verdict": streak_verdict,
+                                            "significant": False},
+                        "randomness_check": {"verdict": streak_verdict},
+                    },
+                    "action": None,
+                    "confidence": None,
+                    "counter_hypothesis": "观察到的波动可能只是通道基准胜率下的正常抽样噪声",
+                    "kill_criteria": "若后续检验出现显著负 EV（direction=negative）"
+                                     "或 CUSUM 越界则重新评估",
+                    "expected_effect": {},
+                    "requires_human_review": True,
+                    "clamped": False,
+                    "applyable": False,
+                    "system_skipped_llm": True,
+                }
+                rejected.append({"reason": "random_gate_skipped_llm",
+                                 "verdict": streak_verdict})
+            else:
+                ledger = await self._load_ledger(channel)
+                error_memory = [h["statement"] for h in ledger if h.get("in_error_memory")]
+                prompt = build_strategy_prompt(
+                    facts, channel, ledger, error_memory, current_params=current_params)
+                outputs = await self._strategy_panel().analyze(prompt)
+                advice_spec = None
+                llm_errors: list[dict] = []
+                for mo in outputs:
+                    if mo.get("error") or not mo.get("parsed"):
+                        llm_errors.append({
+                            "model": f"{mo.get('provider')}:{mo.get('model')}",
+                            "error": mo.get("error")})
+                        continue
+                    advice_spec, rejected = verify_strategy_advice(
+                        mo["parsed"], facts, evidence_ids)
+                    if advice_spec is not None:
+                        break
+                if advice_spec is None:
+                    rejected = llm_errors + rejected
+
+            trend = facts.get("trend") or {}
+            pre_metrics = {
+                "n": trend.get("n"), "win_rate": trend.get("win_rate"),
+                "mean_breakeven": trend.get("mean_breakeven"),
+                "edge": trend.get("edge"),
+                "p_edge_negative": trend.get("p_edge_negative"),
+                "rolling20_win_rate": trend.get("rolling20_win_rate"),
+                "cusum": trend.get("cusum"), "level": trend.get("level"),
+            }
+            async with async_session_factory() as db:
+                row = StrategyAdvice(
+                    channel=channel, trigger_type=trigger,
+                    prompt_version=STRATEGY_PROMPT_VERSION,
+                    advice_spec=advice_spec or {},
+                    rejected=rejected,
+                    pre_metrics=pre_metrics,
+                    status="PENDING",
+                    application_log=[],
+                    tracking={"target_n": settings.strategy_advice_tracking_n,
+                              "observed_n": 0, "verdict": None},
+                )
+                db.add(row)
+                await db.commit()
+                await db.refresh(row)
+                return self._advice_dict(row)
+        except Exception as exc:
+            logger.warning("策略建议运行失败 | {} | {}", channel, exc)
+            return None
+        finally:
+            self._running.discard(key)
+
+    async def update_advice_tracking(self, channel: str) -> None:
+        """结算钩子：已应用建议的 30 单效果追踪（fire-and-forget 安全壳）。
+
+        判据：p_edge_negative 从 ≥0.90 降至 <0.75 → IMPROVED；满窗仍 ≥0.90 →
+        WORSE；其余 NO_CHANGE。⚠️ 30 单胜率 95% CI 约 ±18pp——只能排除「更糟」，
+        不能证明「变好」；严禁把均值回归当成「调参有效」。
+        """
+        if not settings.strategy_advice_enabled:
+            return
+        try:
+            async with async_session_factory() as db:
+                row = (await db.execute(sa_select(StrategyAdvice).where(
+                    StrategyAdvice.channel == channel,
+                    StrategyAdvice.status == "APPLIED",
+                ).order_by(StrategyAdvice.updated_at.desc()).limit(1))).scalar_one_or_none()
+                if row is None:
+                    return
+                tr = dict(row.tracking or {})
+                target = int(tr.get("target_n") or settings.strategy_advice_tracking_n)
+                if int(tr.get("observed_n") or 0) >= target:
+                    return
+                applied_ms = 0
+                for entry in reversed(row.application_log or []):
+                    applied_ms = _iso_to_ms(entry.get("applied_at"))
+                    if applied_ms:
+                        break
+                orders = await self._load_channel_orders(channel, limit=200)
+                events = _orders_to_events(orders)
+                if applied_ms:
+                    events = [e for e in events if int(e.get("ts") or 0) >= applied_ms]
+                tr["observed_n"] = len(events)
+                if len(events) >= target:
+                    window = events[-target:]
+                    be_n = sum(1 for e in window if e["be"] is not None)
+                    tp = ctrend.trend_payload(channel, window, be_n / target)
+                    p_neg = tp.get("p_edge_negative")
+                    baseline = (row.pre_metrics or {}).get("p_edge_negative")
+                    if (p_neg is not None and p_neg < 0.75
+                            and baseline is not None and baseline >= 0.90):
+                        tr["verdict"] = "IMPROVED"
+                    elif p_neg is not None and p_neg >= 0.90:
+                        tr["verdict"] = "WORSE"
+                    else:
+                        tr["verdict"] = "NO_CHANGE"
+                    tr["eval"] = {k: tp.get(k) for k in (
+                        "n", "win_rate", "edge", "p_edge_negative", "rolling20_win_rate")}
+                    tr["note"] = "30 单胜率 CI≈±18pp：只能排除更糟，不能证明变好。"
+                row.tracking = tr
+                await db.commit()
+        except Exception as exc:
+            logger.warning("策略建议效果追踪失败 | {} | {}", channel, exc)
+
+    @staticmethod
+    def _advice_dict(row: StrategyAdvice) -> dict:
+        return {
+            "id": row.id, "channel": row.channel,
+            "trigger_type": row.trigger_type, "prompt_version": row.prompt_version,
+            "advice_spec": row.advice_spec, "rejected": row.rejected,
+            "pre_metrics": row.pre_metrics, "status": row.status,
+            "application_log": row.application_log, "tracking": row.tracking,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        }
 
 
 engine = AttributionEngine()

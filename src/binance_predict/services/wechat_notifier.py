@@ -228,6 +228,21 @@ class WeChatNotifier:
 
         loop.create_task(_run(), name="wechat_push_markdown")
 
+    def push_with_cooldown(self, dedupe_key: str, content: str,
+                           cooldown_ms: int) -> bool:
+        """带进程内冷却的推送（趋势预警等低频告警用）。
+
+        同 key 在冷却窗口内只发一次，返回是否真正派发；重启后冷却丢失，
+        最多重复一次（与体检快照基线恢复同理）。
+        """
+        now_ms = int(time.time() * 1000)
+        last = self._sent_warnings.get(dedupe_key)
+        if last is not None and now_ms - last < cooldown_ms:
+            return False
+        self._sent_warnings[dedupe_key] = now_ms
+        self.push_markdown(content)
+        return True
+
     # ------------------------------------------------------------------
     # 核心业务场景：提前预警雷达 (Pre-Trade Radar)
     # ------------------------------------------------------------------

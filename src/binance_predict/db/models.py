@@ -2022,3 +2022,40 @@ class Hypothesis(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class StrategyAdvice(Base):
+    """LLM 策略建议（2026-10-22）：结构化动作 + 应用闭环 + 效果追踪。
+
+    与 Hypothesis（归因假设台账）分离：假设回答「为什么」，本表回答「要不要改、
+    改成多少、改完有没有用」。LLM 永无执行权——applyable 只表示允许前端展示
+    一键应用按钮，实际执行须用户点击并经服务端二次校验。
+
+    status: PENDING | APPLIED | DISMISSED | EXPIRED | SUPERSEDED
+    advice_spec: verify_strategy_advice 产出的结构化建议（含 clamped/applyable）
+    application_log: [{applied_at, param, from_value, to_value, note}]
+    tracking: {target_n, observed_n, baseline, verdict(IMPROVED|NO_CHANGE|WORSE)}
+    """
+
+    __tablename__ = "strategy_advices"
+    __table_args__ = (
+        Index("ix_strategy_advices_channel_created", "channel", "created_at"),
+        Index("ix_strategy_advices_status", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    channel: Mapped[str] = mapped_column(String(80), nullable=False)
+    trigger_type: Mapped[str] = mapped_column(String(16), nullable=False,
+                                              comment="TREND|RED_LIGHT|STREAK|MANUAL")
+    prompt_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    advice_spec: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    rejected: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"),
+                                           comment="被确定性闸剔除的建议/断言审计")
+    pre_metrics: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    status: Mapped[str] = mapped_column(String(12), nullable=False, default="PENDING")
+    application_log: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    tracking: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())

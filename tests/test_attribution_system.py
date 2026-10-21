@@ -8,6 +8,7 @@ from binance_predict.services.llm_panel import (
     _extract_json,
     build_user_prompt,
     verify_analysis,
+    verify_strategy_advice,
 )
 from binance_predict.services.order_context_recorder import (
     assemble_pack,
@@ -398,3 +399,168 @@ def test_engine_no_orm_dict_expansion():
     from pathlib import Path
     src = Path("src/binance_predict/services/attribution_engine.py").read_text(encoding="utf-8")
     assert "dict(h) for h in" not in src
+
+
+# ======================================================================
+# 策略建议确定性闸（2026-10-22）：单调收紧 + 幅度上限 + 随机性门
+# ======================================================================
+
+STRATEGY_FACTS = {
+    "channel": "ch_a",
+    "randomness_first": {"verdict": "ANOMALOUS_LOSING"},
+    "current_params": {"amount_usdt": 2.0, "max_daily_orders": 100,
+                       "max_exec_price": 0.5, "enabled": True},
+    "pre_tests": [
+        {"name": "streak_binomial", "significant": True, "verdict": "ANOMALOUS_LOSING"},
+        {"name": "ev_block_bootstrap", "significant": True, "verdict": "SIGNIFICANT_NEGATIVE"},
+        {"name": "cusum_changepoint", "significant": True, "verdict": "BREAK_DETECTED"},
+    ],
+    "trend": {"level": "L2", "cusum": 9.3, "n": 60},
+}
+STRATEGY_EVID = {"channel", "randomness_first.verdict", "current_params.amount_usdt",
+                 "current_params.max_daily_orders", "current_params.max_exec_price",
+                 "current_params.enabled", "trend.level", "trend.cusum"}
+
+
+def _advice_parsed(verdict="CUT_AMOUNT", param="amount_usdt", from_v=2.0, to_v=1.0,
+                   evidence=None, counter="反方", kill="撤回",
+                   st_name="streak_binomial", st_sig=True, rnd="ANOMALOUS_LOSING",
+                   to_value_override=None):
+    to_value = to_value_override if to_value_override is not None else to_v
+    return {
+        "schema": "strategy_advice_v1",
+        "channel": "ch_a",
+        "verdict": verdict,
+        "diagnosis": {
+            "primary_cause": "EDGE_DECAY",
+            "evidence": evidence or [],
+            "supporting_test": {"name": st_name, "verdict": "ANOMALOUS_LOSING",
+                                "significant": st_sig},
+            "randomness_check": {"verdict": rnd},
+        },
+        "action": {"param": param, "from_value": from_v, "to_value": to_value,
+                   "duration_orders": 30, "expiry_condition": ""},
+        "confidence": 0.7,
+        "counter_hypothesis": counter,
+        "kill_criteria": kill,
+        "expected_effect": {},
+        "requires_human_review": True,
+    }
+
+
+class TestVerifyStrategyAdvice:
+    def test_valid_cut_amount(self):
+        spec, rejected = verify_strategy_advice(_advice_parsed(), STRATEGY_FACTS, STRATEGY_EVID)
+        assert spec is not None
+        assert spec["verdict"] == "CUT_AMOUNT"
+        assert spec["action"]["to_value"] == 1.0
+        assert spec["applyable"] is True
+        assert rejected == []
+
+    def test_widen_forbidden_voids_whole_advice(self):
+        spec, rejected = verify_strategy_advice(
+            _advice_parsed(to_v=3.0), STRATEGY_FACTS, STRATEGY_EVID)
+        assert spec is None
+        assert any(r["reason"] == "widen_forbidden" for r in rejected)
+
+    def test_ratio_clamped_to_fifty_percent(self):
+        # 2.0 → 0.5（降 75%）应截断到 1.0 并标 clamped
+        spec, _ = verify_strategy_advice(
+            _advice_parsed(to_v=0.5), STRATEGY_FACTS, STRATEGY_EVID)
+        assert spec is not None
+        assert spec["action"]["to_value"] == 1.0
+        assert spec["clamped"] is True
+
+    def test_guard_step_clamped(self):
+        spec, _ = verify_strategy_advice(
+            _advice_parsed(verdict="TIGHTEN_GUARD", param="max_exec_price",
+                           from_v=0.5, to_v=0.05),
+            STRATEGY_FACTS, STRATEGY_EVID)
+        assert spec is not None
+        assert spec["action"]["to_value"] == 0.4  # max(0.05, 0.5-0.10)
+        assert spec["clamped"] is True
+
+    def test_from_value_must_match_facts(self):
+        spec, rejected = verify_strategy_advice(
+            _advice_parsed(from_v=1.5), STRATEGY_FACTS, STRATEGY_EVID)
+        assert spec is None
+        assert any(r["reason"] == "from_value_mismatch" for r in rejected)
+
+    def test_param_must_match_verdict(self):
+        spec, rejected = verify_strategy_advice(
+            _advice_parsed(param="max_exec_price"), STRATEGY_FACTS, STRATEGY_EVID)
+        assert spec is None
+        assert any("param_mismatch" in r["reason"] for r in rejected)
+
+    def test_missing_counter_or_kill_voids(self):
+        spec, rejected = verify_strategy_advice(
+            _advice_parsed(counter=""), STRATEGY_FACTS, STRATEGY_EVID)
+        assert spec is None
+        assert rejected[0]["reason"] == "missing_counter_or_kill"
+
+    def test_random_consistent_forces_hold(self):
+        facts = dict(STRATEGY_FACTS, randomness_first={"verdict": "RANDOM_CONSISTENT"})
+        spec, rejected = verify_strategy_advice(
+            _advice_parsed(rnd="RANDOM_CONSISTENT"), facts, STRATEGY_EVID)
+        assert spec is not None
+        assert spec["verdict"] == "HOLD"
+        assert spec["action"] is None
+        assert spec["applyable"] is False
+        assert any(r["reason"] == "random_consistent_forced_hold" for r in rejected)
+
+    def test_supporting_test_must_be_significant(self):
+        # LLM 引用 ev_block_bootstrap 降仓，但事实卡 pre_tests 显示该检验不显著
+        facts = dict(STRATEGY_FACTS, pre_tests=[
+            {"name": "streak_binomial", "significant": True,
+             "verdict": "ANOMALOUS_LOSING"},
+            {"name": "ev_block_bootstrap", "significant": False,
+             "verdict": "NOT_SIGNIFICANT"},
+        ])
+        spec, rejected = verify_strategy_advice(
+            _advice_parsed(st_name="ev_block_bootstrap"), facts, STRATEGY_EVID)
+        assert spec is not None
+        assert spec["verdict"] == "HOLD"
+        assert any("supporting_test_not_significant" in r["reason"] for r in rejected)
+
+    def test_enabled_widening_forbidden(self):
+        parsed = _advice_parsed(verdict="PAUSE", param="enabled",
+                                from_v=1.0, to_value_override=True)
+        spec, rejected = verify_strategy_advice(parsed, STRATEGY_FACTS, STRATEGY_EVID)
+        assert spec is None
+        assert any(r["reason"] == "enable_widening_forbidden" for r in rejected)
+
+    def test_pause_without_recovery_condition_not_applyable(self):
+        parsed = _advice_parsed(verdict="PAUSE", param="enabled",
+                                from_v=1.0, to_value_override=False)
+        spec, _ = verify_strategy_advice(parsed, STRATEGY_FACTS, STRATEGY_EVID)
+        assert spec is not None
+        assert spec["verdict"] == "PAUSE"
+        assert spec["applyable"] is False  # 缺恢复条件 → 不给一键按钮
+
+    def test_evidence_number_gate(self):
+        evidence = [{"claim": "金额是 2.0", "evidence_ids": ["current_params.amount_usdt"],
+                     "numbers": [{"name": "current_params.amount_usdt", "value": 2.0}]}]
+        spec, _ = verify_strategy_advice(
+            _advice_parsed(evidence=evidence), STRATEGY_FACTS, STRATEGY_EVID)
+        assert spec is not None
+        assert len(spec["diagnosis"]["evidence"]) == 1
+        # 编造数字 → claim 被剔除，但建议本体保留（只展示过闸部分）
+        bad = [{"claim": "编造", "evidence_ids": ["current_params.amount_usdt"],
+                "numbers": [{"name": "current_params.amount_usdt", "value": 9.9}]}]
+        spec2, rejected2 = verify_strategy_advice(
+            _advice_parsed(evidence=bad), STRATEGY_FACTS, STRATEGY_EVID)
+        assert spec2 is not None
+        assert spec2["diagnosis"]["evidence"] == []
+        assert any(r["reason"] == "number_mismatch" for r in rejected2)
+
+
+def test_ev_block_bootstrap_negative_direction():
+    """负向 EV 检验：全亏损单应判 SIGNIFICANT_NEGATIVE（降仓的合法依据）。"""
+    orders = [{"win": False, "pnl": -10.0, "amount_usdt": 10.0,
+               "created_ts": i * 86_400_000} for i in range(30)]
+    res = execute_test("ev_block_bootstrap", {"direction": "negative"}, orders)
+    assert res["verdict"] == "SIGNIFICANT_NEGATIVE"
+    assert res["significant"] is True
+    # 正向对照：同一批单不构成「显著为正」
+    res_pos = execute_test("ev_block_bootstrap", {}, orders)
+    assert res_pos["significant"] is False
