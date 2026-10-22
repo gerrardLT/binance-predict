@@ -66,6 +66,40 @@ REV2_5M_SPECS: list[dict] = [
             "AND body_r <= 0.45 AND upper_r <= 0.10"
         ),
     },
+    # 2026-10-23 用户拍板注册（PREDEXON 5m 真实盘口：n=4，3 胜，费后 EV +43.3%）：
+    # 严格质量版，720d n=28 / 胜率 78.6%。A 为近 10 根内最显著收顶阳线，
+    # T 为长下影、实体 20-35% 的确认阴线；T 收盘后在次根 5m 开盘押 DOWN。
+    {
+        "version": "hm_quality_5m_v1",
+        "discovery_id": "hm_quality_5m",
+        "timeframe": "5m",
+        "direction": "DOWN",
+        "evaluator": "hm_quality",
+        "condition_text": (
+            "A: green, body_r>=0.767, upper_r<=0.10, body>=max3*0.60, body>=max10*0.60, "
+            "range>=median12*0.70, close==max(last4 closes), close>close[-2], upper_r in [0.03,0.10]; "
+            "T: red, body_r>=0.10, lower_r>=0.40, upper_r<=0.12, range>=A.range*0.40, "
+            "body_r in [0.20,0.35), lower_r in [0.60,0.75), "
+            "(harami&inside)|(harami&body<=0.25)|(inside&body<=0.67)"
+        ),
+    },
+    # 2026-10-23 用户拍板注册（PREDEXON 5m 真实盘口：n=23，17 胜，费后 EV +43.2%）：
+    # 中等冲刺版，720d n=184 / 胜率 64.1%，三段 62.8/65.0/67.7。
+    # A 相对前 5 根收盘 +20~50bp，T 上影<=5% 且整根落在 A 区间内。
+    {
+        "version": "hm_moderate_5m_v1",
+        "discovery_id": "hm_moderate_5m",
+        "timeframe": "5m",
+        "direction": "DOWN",
+        "evaluator": "hm_moderate",
+        "condition_text": (
+            "A: green, body_r>=0.70, upper_r<=0.15, body>=max3*0.30, body>=max10*0.20, "
+            "range>=median12*0.70, close==max(last4 closes), close>close[-2], "
+            "close/close[5 bars ago]-1 in [20bp,50bp); "
+            "T: red, body_r>=0.10, lower_r>=0.30, upper_r<=0.05, range>=A.range*0.40, "
+            "T fully inside A (low>=A.low and high<=A.high)"
+        ),
+    },
 ]
 
 REV2_SHADOW_SPECS: list[dict] = REV2_15M_SPECS + REV2_5M_SPECS
@@ -100,6 +134,83 @@ def _to_klines(rows: list[dict], bar_ms: int) -> Klines:
     return kl
 
 
+def _evaluate_custom_5m(kind: str, o, h, l, c, i: int) -> dict | None:
+    """5m 自定义形态（hm_quality / hm_moderate）：A=i-1，T=i，次根 i+1 押 DOWN。
+
+    与 720d 回测逐条同口径；仅在 i>=14 时调用（保证前 12 根与 5 根回看可用）。
+    """
+    a = i - 1
+    if a < 13:
+        return None
+    body = np.abs(c - o)
+    rng = h - l
+    body_a = float(body[a])
+    range_a = float(rng[a])
+    if range_a <= 0:
+        return None
+    body_r_a = body_a / range_a
+    upper_r_a = (float(h[a]) - float(c[a])) / range_a
+    max3 = float(np.max(body[a - 3:a]))
+    max10 = float(np.max(body[a - 10:a]))
+    med12 = float(np.median(rng[a - 12:a]))
+    close4 = float(np.max(c[a - 3:a + 1]))
+    two_bar_up = float(c[a]) > float(c[a - 2])
+    green_a = float(c[a]) > float(o[a])
+    red_t = float(c[i]) < float(o[i])
+    if not (green_a and red_t):
+        return None
+    body_t = float(o[i]) - float(c[i])
+    lower_t = float(c[i]) - float(l[i])
+    upper_t = float(h[i]) - float(o[i])
+    range_t = float(rng[i])
+    if range_t <= 0:
+        return None
+    body_r_t = body_t / range_t
+    lower_r_t = lower_t / range_t
+    upper_r_t = upper_t / range_t
+    # 实体孕线 / 整根 Inside Bar（严格，无容差）
+    harami = (min(float(o[i]), float(c[i])) >= min(float(o[a]), float(c[a]))
+              and max(float(o[i]), float(c[i])) <= max(float(o[a]), float(c[a])))
+    inside = float(l[i]) >= float(l[a]) and float(h[i]) <= float(h[a])
+
+    snapshot = {
+        "a_body_r": round(body_r_a, 4), "a_upper_r": round(upper_r_a, 4),
+        "a_body_to_max3": round(body_a / max(max3, 1e-12), 3),
+        "a_body_to_max10": round(body_a / max(max10, 1e-12), 3),
+        "a_range_to_med12": round(range_a / max(med12, 1e-12), 3),
+        "t_body_r": round(body_r_t, 4), "t_lower_r": round(lower_r_t, 4),
+        "t_upper_r": round(upper_r_t, 4), "t_range_to_a": round(range_t / range_a, 3),
+        "harami": bool(harami), "inside": bool(inside),
+    }
+    if kind == "hm_quality":
+        ret = (
+            body_r_a >= 0.767 and upper_r_a <= 0.10
+            and body_a >= max3 * 0.60 and body_a >= max10 * 0.60
+            and range_a >= med12 * 0.70
+            and float(c[a]) >= close4 and two_bar_up
+            and 0.03 <= upper_r_a <= 0.10
+            and body_r_t >= 0.10 and lower_r_t >= 0.40 and upper_r_t <= 0.12
+            and range_t >= range_a * 0.40
+            and 0.20 <= body_r_t < 0.35 and 0.60 <= lower_r_t < 0.75
+            and ((harami and inside) or (harami and body_r_t <= 0.25) or (inside and body_r_t <= 0.67))
+        )
+    elif kind == "hm_moderate":
+        ret6 = float(c[a]) / float(c[a - 5]) - 1
+        ret = (
+            body_r_a >= 0.70 and upper_r_a <= 0.15
+            and body_a >= max3 * 0.30 and body_a >= max10 * 0.20
+            and range_a >= med12 * 0.70
+            and float(c[a]) >= close4 and two_bar_up
+            and 0.0020 <= ret6 < 0.0050
+            and body_r_t >= 0.10 and lower_r_t >= 0.30 and upper_r_t <= 0.05
+            and range_t >= range_a * 0.40
+            and inside
+        )
+    else:
+        return None
+    return snapshot if ret else None
+
+
 def evaluate_rev2_patterns(
     kl: Klines, n_tail: int, specs: list[dict] | None = None
 ) -> list[dict]:
@@ -108,6 +219,7 @@ def evaluate_rev2_patterns(
     specs_by_version = {spec["version"]: spec for spec in specs}
     hm_spec = next((spec for version, spec in specs_by_version.items() if version.startswith("hm_inside_")), None)
     ih_spec = next((spec for version, spec in specs_by_version.items() if version.startswith("ih_inside_")), None)
+    custom_specs = [spec for spec in specs if spec.get("evaluator")]
     o, h, l, c = kl.o, kl.h, kl.l, kl.c
     n = len(c)
     if n < 5:
@@ -127,6 +239,13 @@ def evaluate_rev2_patterns(
     start_eval = max(4, n - n_tail)
 
     for i in range(start_eval, n):
+        if custom_specs and i >= 14:
+            for spec in custom_specs:
+                snap = _evaluate_custom_5m(spec["evaluator"], o, h, l, c, i)
+                if snap is not None:
+                    hits.append({"spec": spec, "idx": i, "snapshot": snap})
+        if hm_spec is None and ih_spec is None:
+            continue
         prev_is_green = is_green[i - 1]
         prev_body = body[i - 1]
         prev_body_r = body_r[i - 1]

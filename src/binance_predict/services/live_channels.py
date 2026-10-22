@@ -97,6 +97,10 @@ class ChannelSpec:
     # +0.103/+0.042（高波砍半）。tier unknown（数据不足）→ 不减仓（保守=维持基准
     # 行为）。None = 不启用。影子行记录 vol_tier/atr_pct，前向可按层复核。
     highvol_amount_factor: float | None = None
+    # 新通道默认启用标记（2026-10-23）：True 时 parse_channel_config 初始 enabled=True，
+    # 仍可被 LIVE_CHANNELS_JSON / DB live_channel_overrides 覆盖关闭。仅用于用户明确
+    # 要求"注册即开启"的通道；既有通道保持 False，行为零变化。
+    default_enabled: bool = False
 
 
 def _qe_guard(version: str) -> float:
@@ -387,6 +391,19 @@ LIVE_CHANNELS: dict[str, ChannelSpec] = {
         "ih_inside_15m_v2", "nextbar", "15m", "UP", 0.30,
         "15m孕线倒垂线反转（押UP）",
     ),
+    # 2026-10-23 用户拍板注册（PREDEXON 5m 真实盘口验 EV 后）：
+    # hm_quality_5m_v1 720d n=28 胜率 78.6%；盘口 n=4 3胜 EV +43.3%（样本小）。
+    # hm_moderate_5m_v1 720d n=184 胜率 64.1%（三段 62.8/65.0/67.7）；
+    # 盘口 n=23 17胜 EV +43.2%。两者 T 收盘后在次根 5m 开盘押 DOWN。
+    # 护栏 0.55：盘口证据 ≤0.55 EV +50.8%（moderate）/ +36.6%（quality）。
+    "hm_quality_5m_v1": ChannelSpec(
+        "hm_quality_5m_v1", "nextbar", "5m", "DOWN", 0.55,
+        "5m收顶阳线+长下影阴线·质量版（押DOWN）", default_enabled=True,
+    ),
+    "hm_moderate_5m_v1": ChannelSpec(
+        "hm_moderate_5m_v1", "nextbar", "5m", "DOWN", 0.55,
+        "5m收顶阳线+长下影阴线·中等冲刺版（押DOWN）", default_enabled=True,
+    ),
     # --- CRV 情绪反转族（2026-10-04 研究 run 20261004T083106Z-candle-reversal-certainty
     # 影子 promote + 用户拍板注册实盘，默认全部 OFF）：
     # 「高位/突破阳线 → 次根收阴」的反转族。护栏 = 盲测胜率 × 0.98（费后保本入场价，
@@ -645,6 +662,7 @@ KEPT_CHANNELS_20261022: frozenset[str] = frozenset({
     "scene_bull_exhaust", "scene_bear_exhaust", "scene_momentum_fade",
     # nextbar / kline_reversal（实盘 ON）
     "krev_b_v1", "hm_inside_15m_v2",
+    "hm_quality_5m_v1", "hm_moderate_5m_v1",
     # firsthit D/E（实盘 ON，观察期）
     "firsthit_down_chg35_d_v1", "firsthit_down_chg35_e_v1",
     # CRV 全族
@@ -698,6 +716,9 @@ SAME_WINDOW_EXCLUSIVE: tuple[frozenset[str], ...] = (
     # 吸收跟随双变体同窗同假设（TD120/TD150 只是判定时点不同，欠反应状态连续），
     # 防同窗双成交（2026-09-06 promote）。
     frozenset({"absorption_follow_td120_v1", "absorption_follow_td150_v1"}),
+    # 2026-10-23 新增两版同源同向（同一根 A/T 可同时满足 quality 与 moderate 分支），
+    # 默认均开启实盘 → 必须互斥，防同窗双倍 DOWN 敞口。
+    frozenset({"hm_quality_5m_v1", "hm_moderate_5m_v1"}),
     # CRV 15m 高位/突破族三通道同源（同一根突破阳线物理事件、同押 DOWN、同目标窗：
     # hi_brk20 ⊇ brk20 的事件子集、brk50_hi 高度重叠）→ 同窗至多一单成交。
     # BRK 8h 突破回归事件集是 crv_brk20 的子集（前窗更长 ⇒ 更难突破），同押 DOWN
@@ -761,15 +782,16 @@ def resolve_max_exec(spec: ChannelSpec, cfg: ChannelConfig) -> float:
 def parse_channel_config() -> dict[str, ChannelConfig]:
     """默认配置 + LIVE_CHANNELS_JSON 覆盖 + 校验（非法值 ValueError 拒启）。
 
-    默认全部 OFF（enabled=False），金额/日限取全局默认；JSON 里逐通道覆盖。
+    默认按 ChannelSpec.default_enabled（既有通道 False，2026-10-23 新增两通道 True）；
+    金额/日限取全局默认；JSON / DB 覆盖优先。
     """
     configs: dict[str, ChannelConfig] = {
         ch: ChannelConfig(
-            enabled=False,
+            enabled=spec.default_enabled,
             amount_usdt=settings.live_default_amount_usdt,
             max_daily_orders=settings.live_default_max_daily_orders,
         )
-        for ch in LIVE_CHANNELS
+        for ch, spec in LIVE_CHANNELS.items()
     }
 
     raw = (settings.live_channels_json or "").strip()

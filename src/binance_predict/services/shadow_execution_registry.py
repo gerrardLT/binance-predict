@@ -89,6 +89,9 @@ _VERSION_ROWS: tuple[tuple[str, SourceType, str, str, str], ...] = (
     ("hm_inside_15m_v2", SourceType.KLINE, "15m", "target_bar", "row"),
     ("ih_inside_15m_v2", SourceType.KLINE, "15m", "target_bar", "row"),
     ("hm_inside_5m_v2", SourceType.KLINE, "5m", "target_bar", "row"),
+    # 2026-10-23 用户拍板注册（盘口 EV 验证后）：5m 收顶阳线+长下影阴线两版。
+    ("hm_quality_5m_v1", SourceType.KLINE, "5m", "target_bar", "row"),
+    ("hm_moderate_5m_v1", SourceType.KLINE, "5m", "target_bar", "row"),
     # CRV 情绪反转族（2026-10-04 研究 run 20261004T083106Z）：15m/5m 突破族押次根
     # 收阴 DOWN + 三个三因子探索/观察级（dnex/os_st4/hi_z3，仅影子）；direction 按行（row）。
     ("crv_hi_brk20_15m_v1", SourceType.KLINE, "15m", "target_bar", "row"),
@@ -187,7 +190,7 @@ def _family_of(version: str, source: SourceType) -> str:
         return "scene"
     if version.startswith("combo_"):
         return "combo"
-    if version.startswith(("nb_", "hm_inside_", "ih_inside_")):
+    if version.startswith(("nb_", "hm_inside_", "ih_inside_", "hm_quality_", "hm_moderate_")):
         return "nextbar"
     if version.startswith(("krev_", "rev_", "crv_", "brkrv_", "kdc_")):
         return "kline_reversal"

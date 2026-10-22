@@ -260,3 +260,59 @@ async def test_5m_record_signal_uses_matching_quote_and_live_window(monkeypatch)
         "direction": "DOWN",
         "signal_bar_start": signal_start,
     }]
+
+
+def _build_5m_custom(prev_tail: dict, a: dict, t: dict) -> Klines:
+    """构造 14 根平盘前导 + A + T 的 5m K 线，用于 2026-10-23 新形态测试。"""
+    t0 = 1700000000000
+    rows = []
+    for k in range(14):
+        rows.append({"open_time": t0 + k * BAR_MS["5m"], "open": 100.0, "high": 100.2,
+                     "low": 99.8, "close": 100.0, "volume": 10})
+    rows.append({"open_time": t0 + 14 * BAR_MS["5m"], **a})
+    rows.append({"open_time": t0 + 15 * BAR_MS["5m"], **t})
+    return _to_klines(rows, BAR_MS["5m"])
+
+
+def test_evaluate_hm_quality_5m_positive() -> None:
+    """质量版正例：A 收顶大阳（实体 90.9%、上影 6.1%），T 实体 30%、下影 70%、上影 0。"""
+    a = {"open": 100.0, "high": 103.2, "low": 99.9, "close": 103.0, "volume": 20}
+    t = {"open": 103.0, "high": 103.0, "low": 101.0, "close": 102.4, "volume": 10}
+    kl = _build_5m_custom({}, a, t)
+    hits = evaluate_rev2_patterns(kl, n_tail=1, specs=REV2_5M_SPECS)
+    versions = {h["spec"]["version"] for h in hits}
+    assert "hm_quality_5m_v1" in versions
+    hit = next(h for h in hits if h["spec"]["version"] == "hm_quality_5m_v1")
+    assert hit["spec"]["direction"] == "DOWN"
+    assert hit["snapshot"]["t_body_r"] == pytest.approx(0.30, abs=1e-6)
+    assert hit["snapshot"]["t_lower_r"] == pytest.approx(0.70, abs=1e-6)
+    assert "hm_moderate_5m_v1" not in versions  # 该例涨幅 300bp，不属中等冲刺
+
+
+def test_evaluate_hm_moderate_5m_positive() -> None:
+    """中等冲刺版正例：A 相对前 5 根 +30bp、实体 75%、上影 12.5%；T 整根 Inside、下影 33%。"""
+    a = {"open": 100.0, "high": 100.35, "low": 99.95, "close": 100.3, "volume": 20}
+    t = {"open": 100.3, "high": 100.3, "low": 100.0, "close": 100.1, "volume": 10}
+    kl = _build_5m_custom({}, a, t)
+    hits = evaluate_rev2_patterns(kl, n_tail=1, specs=REV2_5M_SPECS)
+    versions = {h["spec"]["version"] for h in hits}
+    assert "hm_moderate_5m_v1" in versions
+    assert "hm_quality_5m_v1" not in versions  # A 实体 75% 低于质量版 76.7%
+
+
+def test_evaluate_hm_quality_5m_rejects_flat_top() -> None:
+    """边界反例：A 完全无上影（upper_r=0）不满足质量版 [3%,10%] 区间。"""
+    a = {"open": 100.0, "high": 103.0, "low": 99.9, "close": 103.0, "volume": 20}
+    t = {"open": 103.0, "high": 103.0, "low": 101.0, "close": 102.4, "volume": 10}
+    kl = _build_5m_custom({}, a, t)
+    hits = evaluate_rev2_patterns(kl, n_tail=1, specs=REV2_5M_SPECS)
+    assert all(h["spec"]["version"] != "hm_quality_5m_v1" for h in hits)
+
+
+def test_evaluate_hm_moderate_5m_rejects_outside_t() -> None:
+    """边界反例：T 下影刺破 A 低点（非整根 Inside）不满足中等冲刺版。"""
+    a = {"open": 100.0, "high": 100.35, "low": 100.05, "close": 100.3, "volume": 20}
+    t = {"open": 100.3, "high": 100.3, "low": 100.0, "close": 100.1, "volume": 10}
+    kl = _build_5m_custom({}, a, t)
+    hits = evaluate_rev2_patterns(kl, n_tail=1, specs=REV2_5M_SPECS)
+    assert all(h["spec"]["version"] != "hm_moderate_5m_v1" for h in hits)

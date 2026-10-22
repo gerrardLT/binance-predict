@@ -233,7 +233,9 @@ def test_parse_defaults_all_off(monkeypatch) -> None:
     # 2026-10-22 通道治理：配置表 = 在线白名单（26），归档通道不进配置表
     assert len(cfgs) == len(LIVE_CHANNELS)
     assert set(cfgs) == set(LIVE_CHANNELS)
-    assert all(not c.enabled for c in cfgs.values())
+    # 2026-10-23：两个新通道 default_enabled=True（用户拍板注册即开启），其余全 OFF。
+    default_on = {"hm_quality_5m_v1", "hm_moderate_5m_v1"}
+    assert all(c.enabled == (ch in default_on) for ch, c in cfgs.items())
     assert all(c.amount_usdt == 2.0 for c in cfgs.values())
     assert all(c.max_daily_orders == 100 for c in cfgs.values())
     assert all(c.max_exec_price is None for c in cfgs.values())  # 缺省回落 auto
@@ -406,7 +408,7 @@ def test_parse_non_int_daily_rejected(monkeypatch) -> None:
 
 
 def test_channels_registry_shape(monkeypatch) -> None:
-    """注册表形状：2026-10-22 治理后在线 26 个白名单；归档 spec 全部仍在台账。"""
+    """注册表形状：2026-10-22 治理后在线 26 个，2026-10-23 新增 2 个（共 28）；归档 spec 全部仍在台账。"""
     from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
     from binance_predict.services.live_channels import KEPT_CHANNELS_20261022
 
@@ -440,6 +442,8 @@ def test_channels_registry_shape(monkeypatch) -> None:
         "firsthit_down_g4_v1",
         # 2026-09-09 15m 经典孕线反转双通道 + 2026-09-13 5m HM 精选通道（默认全 OFF）
         "hm_inside_5m_v2", "hm_inside_15m_v2", "ih_inside_15m_v2",
+        # 2026-10-23 用户拍板新增两通道（默认开启实盘，护栏 0.55）
+        "hm_quality_5m_v1", "hm_moderate_5m_v1",
         # 2026-10-04 CRV 情绪反转四通道（默认全 OFF；两个三因子探索级仅影子不注册实盘）
         "crv_hi_brk20_15m_v1", "crv_brk20_15m_v1",
         "crv_brk50_hi_15m_v1", "crv_brk20_5m_v1",
@@ -459,7 +463,7 @@ def test_channels_registry_shape(monkeypatch) -> None:
     assert {"quote_momentum_v1", "quote_contrarian_v1", "x4_v1",
             "firsthit_down_g7_v1", "g7_t270_v1",
             "gap_crowd_5m_v1", "gap_crowd_15m_v1"} <= set(RETIRED_CHANNELS)
-    assert len(LIVE_CHANNELS) + len(RETIRED_CHANNELS) == 26 + 61
+    assert len(LIVE_CHANNELS) + len(RETIRED_CHANNELS) == 28 + 61
     assert not (set(LIVE_CHANNELS) & set(RETIRED_CHANNELS))
     by = {**RETIRED_CHANNEL_SPECS, **LIVE_CHANNELS}
     # 在线通道：市场周期/方向/护栏逐项对齐
@@ -3381,7 +3385,8 @@ def test_status_shape(monkeypatch) -> None:
     from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
     # 状态列表 = LIVE_CHANNELS + 退役 spec（_with_retired 合并）→ gap_crowd 两版退役后
     # 仍在合并表内；2026-10-12 加 crv_dnbrk24_15m/5m_v1 两通道后基数 59→61。
-    assert len(s["channels"]) == 69 + len(CANDLESTICK_SIGNAL_IDS)  # 2026-10-16 +KDC 四通道
+    # 2026-10-23：新增 hm_quality/hm_moderate 两通道 → 69→71
+    assert len(s["channels"]) == 71 + len(CANDLESTICK_SIGNAL_IDS)
     by = {c["channel"]: c for c in s["channels"]}
     c = by["quote_contrarian_v1"]
     assert c["enabled"] is True and c["enabled_at_startup"] is True
@@ -7273,3 +7278,12 @@ async def test_bodybrk20_hook_fires_down_and_exclusive_with_brk20_5m(monkeypatch
     t.on_kline_reversal_signal({**base, "version": "crv_brk20_5m_v1"})
     await _drain(t)
     assert [c["signal_version"] for c in fake.calls] == ["crv_bodybrk20_5m_v1"]
+
+
+def test_new_5m_channels_same_window_exclusive() -> None:
+    """2026-10-23：quality/moderate 同源同向，默认均开启，必须同窗互斥。"""
+    from binance_predict.services.live_channels import exclusive_group
+
+    grp = exclusive_group("hm_quality_5m_v1")
+    assert grp == frozenset({"hm_quality_5m_v1", "hm_moderate_5m_v1"})
+    assert exclusive_group("hm_moderate_5m_v1") == grp

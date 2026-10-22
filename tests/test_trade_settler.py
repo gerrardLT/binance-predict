@@ -587,3 +587,40 @@ async def test_15m_with_scene_signal_id_uses_fake_breakout(monkeypatch) -> None:
     assert p["pnl"] == pytest.approx(1.0 / 0.5 - 1.0)
     assert p["settle_price"] == pytest.approx(79000.0)
     db.get.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_hm_quality_5m_uses_kline_shadow_settlement(monkeypatch) -> None:
+    """2026-10-23 新增 5m nextbar 通道：优先按 K 线影子行结算（不读 SentimentWindow）。
+
+    影子行 DOWN、窗口桩给 UP——若路由错误走窗口会得 win=False；正确应 win=True。
+    """
+    shadow = _shadow("DOWN", win=True, settle_close=79104.0)
+    db = _Db([_row(signal_version="hm_quality_5m_v1", market_period="5m",
+                   direction="DOWN", amount_in=str(2 * 10**18),
+                   quote_json={"averagePrice": 0.50, "filledShareQty": 4.0})],
+             _window("UP", exit_price=99999.0), shadow=shadow)
+    _stub_db(monkeypatch, db)
+
+    assert await TradeSettler().poll_once() == 1
+
+    p = _params(db.updates[0])
+    assert p["settle_outcome"] == "DOWN"
+    assert p["win"] is True
+    assert p["settle_price"] == pytest.approx(79104.0)
+
+
+@pytest.mark.asyncio
+async def test_hm_moderate_5m_missing_shadow_falls_back_to_window(monkeypatch) -> None:
+    """影子行缺失（gate 关闭/未回补）→ 回退 5m SentimentWindow，避免真单被 EXPIRED。"""
+    db = _Db([_row(signal_version="hm_moderate_5m_v1", market_period="5m",
+                   direction="DOWN")],
+             _window("DOWN", exit_price=43250.0), shadow=None)
+    _stub_db(monkeypatch, db)
+
+    assert await TradeSettler().poll_once() == 1
+
+    p = _params(db.updates[0])
+    assert p["settle_outcome"] == "DOWN"
+    assert p["win"] is True
+    assert p["settle_price"] == pytest.approx(43250.0)

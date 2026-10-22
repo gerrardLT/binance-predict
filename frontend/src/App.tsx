@@ -1298,6 +1298,14 @@ const SIGNAL_INFO: Record<string, { name: string; desc: string; retired?: boolea
     name: '15m孕线倒垂线反转（押UP）',
     desc: '15m Ver2 经典反转：前置 4 根低点最长实体阴线 + 信号柱完全被包裹（Inside Bar）+ 底部长上影倒垂线、短下影≤10% → 押次根 15m 收阳 UP（720d 胜率 52.5%，30d 胜率 62.5%）。MARKET 市价单，护栏 0.30（成交均价 ≥0.30 弃单），可通过实盘通道热配置调整。',
   },
+  hm_quality_5m_v1: {
+    name: '5m收顶阳线+长下影阴线·质量版（押DOWN）',
+    desc: 'A 为近 10 根内最显著收顶阳线（实体≥76.7%、上影 3%~10%、实体≥前3/前10根最大实体的 60%），T 为收阴且实体 20%~35%、下影 60%~75%、上影≤12% → T 收盘后在次根 5m 开盘押 DOWN。720d n=28 胜率 78.6%；PREDEXON 5m 真实盘口 n=4 3胜，费后 EV +43.3%（样本小）。MARKET 市价单，护栏 0.55。',
+  },
+  hm_moderate_5m_v1: {
+    name: '5m收顶阳线+长下影阴线·中等冲刺版（押DOWN）',
+    desc: 'A 相对前 5 根收盘上涨 20~50bp、实体≥70%、上影≤15%，T 收阴且整根落在 A 区间内、下影≥30%、上影≤5% → T 收盘后在次根 5m 开盘押 DOWN。720d n=184 胜率 64.1%（三段 62.8/65.0/67.7）；PREDEXON 5m 真实盘口 n=23 17胜，费后 EV +43.2%。MARKET 市价单，护栏 0.55。',
+  },
   // --- 蜡烛反转族 18 逻辑版本（中文名与后端 candlestick_shadow_detector.CANDLESTICK_DISPLAY_NAMES 对齐）---
   // 共享 5m/15m 物理事件，各逻辑版本独立注册实盘；不收录会让订单表/通道面板退回裸英文 ID。
   candle_hm_bull_5m_consensus2_shadow_v1: {
@@ -6556,6 +6564,8 @@ const SHADOW_META: Record<string, { label: string; color: string }> = {
   hm_inside_15m_v2: { label: '15m 孕线上吊线 Inside Bar→DOWN', color: 'var(--chart-2)' },
   ih_inside_15m_v2: { label: '15m 孕线倒垂线 Inside Bar→UP', color: 'var(--chart-3)' },
   hm_inside_5m_v2: { label: '5m 孕线上吊线精选 Inside Bar→DOWN', color: 'var(--chart-4)' },
+  hm_quality_5m_v1: { label: '5m 收顶阳线+长下影阴线·质量版→DOWN', color: 'var(--chart-5)' },
+  hm_moderate_5m_v1: { label: '5m 收顶阳线+长下影阴线·中等冲刺版→DOWN', color: 'var(--chart-1)' },
   // 2026-10-10 报价-人群错位族（gap_crowd_shadow_signals 表）——注册后同日证伪退役：
   // 标签保留供审计（曲线不再新增），实盘通道与影子采集均已停用。
   gap_crowd_5m_v1: { label: '报价落后人群 5m后半窗→UP（已证伪退役）', color: 'var(--chart-9)' },
@@ -6638,6 +6648,8 @@ const ANALYTICS_EXTRA_DESC: Record<string, string> = {
   hm_inside_15m_v2: '15m 经典孕线上吊线反转：前置 4 根高点最长实体阳线 + 信号柱完全包裹(Inside Bar) + 顶部长下影上吊线(lower_r≥45%)、短上影 upper_r≤10% → 押次根 15m 收阴 DOWN。落表 kline_shadow_signals。720d 全样本回测 n=237 胜率 55.7%，30d 胜率 60.0%。MARKET 市价单护栏 0.30（成交均价 ≥0.30 弃单）。EV 按目标窗真实报价前向现算。',
   ih_inside_15m_v2: '15m 经典孕线倒垂线反转：前置 4 根低点最长实体阴线 + 信号柱完全包裹(Inside Bar) + 底部长上影倒垂线(upper_r≥45%)、短下影 lower_r≤10% → 押次根 15m 收阳 UP。落表 kline_shadow_signals。720d 全样本回测 n=183 胜率 54.6%，30d 胜率 77.8%。MARKET 市价单护栏 0.30（成交均价 ≥0.30 弃单）。EV 按目标窗真实报价前向现算。',
   hm_inside_5m_v2: '5m 孕线上吊线精选反转：前置 4 根高点最长实体阳线 + 信号柱完全包裹(Inside Bar) + 下影占比 [75%,90%)、短上影 upper_r≤10% → 押次根 5m 收阴 DOWN。落表 kline_shadow_signals。720d 全样本回测 n=371 胜率 58.5%，30d 胜率 71.4%。MARKET 市价单护栏 0.30（成交均价 ≥0.30 弃单）。EV 按目标窗真实报价前向现算。',
+  hm_quality_5m_v1: '5m 收顶阳线+长下影阴线·质量版：A 实体≥76.7%、上影 3%~10%、为前 3/前 10 根最大实体的 60% 以上且收在最近 4 根最高收盘；T 收阴、实体 20%~35%、下影 60%~75%、上影≤12% → 次根 5m 开盘押 DOWN。落表 kline_shadow_signals。720d n=28 胜率 78.6%；PREDEXON 真实盘口 n=4 3胜，费后 EV +43.3%。MARKET 护栏 0.55。',
+  hm_moderate_5m_v1: '5m 收顶阳线+长下影阴线·中等冲刺版：A 相对前 5 根收盘 +20~50bp、实体≥70%、上影≤15%；T 收阴、整根 Inside Bar、下影≥30%、上影≤5% → 次根 5m 开盘押 DOWN。落表 kline_shadow_signals。720d n=184 胜率 64.1%（三段 62.8/65.0/67.7）；PREDEXON 真实盘口 n=23 17胜，费后 EV +43.2%。MARKET 护栏 0.55。',
   candle_hm_bull_5m_consensus2_shadow_v1: '5m 主影子：阳线、下影≥50%、实体≤50%、上影≤10%，且 ret3/ret5_majority/ma10 至少两种上涨，预测次根 DOWN。只记录不下注。',
   candle_hm_bull_5m_consensus3_shadow_v1: '5m 严格对照：主影子的三趋势全同意子集。与主版本共用一个物理事件，不代表第二笔独立暴露。',
   candle_hm_bull_15m_union_shadow_v1: '15m 主影子：同一长下影阳线形态，三趋势任一种上涨即记录，预测次根 DOWN。只记录不下注。',

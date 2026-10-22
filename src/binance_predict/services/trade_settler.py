@@ -59,6 +59,11 @@ from binance_predict.services.shadow_execution_store import patch_assessment
 from binance_predict.services.shadow_execution_types import AssessmentPatch, ReasonCode, TerminalStage
 from binance_predict.services.wechat_notifier import wechat_notifier
 
+# 2026-10-23：5m nextbar 管道（hm_quality/hm_moderate）也落 kline_shadow_signals，
+# 结算优先按影子行（version + target_bar_start）对齐；影子行缺失（gate 关闭 /
+# 检测器未回补）时回退既有 5m SentimentWindow 路径，避免真单被记 EXPIRED/pnl=0。
+_KLINE_SHADOW_5M_VERSIONS = frozenset({"hm_quality_5m_v1", "hm_moderate_5m_v1"})
+
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL = 60.0                    # 轮询间隔（秒）
@@ -178,6 +183,11 @@ class TradeSettler:
         # 按「有无 scene_signal_id」分流而非硬编码通道名：新增 15m 影子族通道无需改此处。
         if getattr(row, "signal_version", None) in CANDLESTICK_SIGNAL_IDS:
             return await self._settle_kline_shadow_row(row)
+        # 5m nextbar 管道：影子行与订单同表对齐，优先按 K 线影子行结算；
+        # 影子行缺失时回退 5m SentimentWindow（见 _has_kline_shadow_row）。
+        if getattr(row, "signal_version", None) in _KLINE_SHADOW_5M_VERSIONS:
+            if await self._has_kline_shadow_row(row):
+                return await self._settle_kline_shadow_row(row)
         # 手动 15m 单（manual_test_*）：无影子信号行，回读 KlineShadowSignal 必落空
         # → 24h 后被错记 EXPIRED/pnl=0（CodeReview R2 Critical#1，与 id=466 同型）。
         # 分流到独立路径：用 15m 窗内首尾两个 5m SentimentWindow 拼出周期开盘/收盘价。
@@ -400,11 +410,23 @@ class TradeSettler:
             logger.warning("企微场景结算通知异常: %s", exc)
         return True
 
+    async def _has_kline_shadow_row(self, row: TradeOrderModel) -> bool:
+        """5m nextbar 通道：影子行是否存在（决定走 K 线影子还是 SentimentWindow）。"""
+        async with async_session_factory() as session:
+            found = (await session.execute(
+                sa_select(KlineShadowSignal.id).where(
+                    KlineShadowSignal.version == row.signal_version,
+                    KlineShadowSignal.target_bar_start == row.window_start,
+                ).limit(1)
+            )).scalar_one_or_none()
+        return found is not None
+
     async def _settle_kline_shadow_row(self, row: TradeOrderModel) -> bool:
         """K 线影子族订单结算：回读 KlineShadowSignal（version + target_bar_start 对齐）。
 
         适用范围：15m 且无 scene_signal_id 的通道——s2_cond 条件单族（t4/t5d）与
-        nextbar 15m 族（hm_inside_15m_v2/ih_inside_15m_v2）。这些通道的信号行落
+        nextbar 15m 族（hm_inside_15m_v2/ih_inside_15m_v2）；以及 2026-10-23 注册的
+        5m nextbar 管道（hm_quality_5m_v1/hm_moderate_5m_v1，显式路由）。这些通道的信号行落
         kline_shadow_signals（检测器在次根收盘时用 15m K 线 open/close 判向），
         下单路径无 signal_id 关联列，故按 (version=signal_version,
         target_bar_start=window_start) 回查。
