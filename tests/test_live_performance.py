@@ -156,20 +156,22 @@ def test_g7_duplicate_exposure_and_overlap_cost():
 
 
 def test_explicit_exclusive_group_conflict_and_benchmark_registry():
+    # 2026-10-22 治理：原 s2_cond_t4/t5d 已归档（运行时求交后无互斥），
+    # 改用在线同组通道 absorption TD120/TD150 验证同窗冲突。
     rows = [
-        order(channel="s2_cond_t4_v1", market_period="15m", amount_in=str(2 * 10**18)),
-        order(channel="s2_cond_t5d_v1", market_period="15m", amount_in=str(2 * 10**18)),
+        order(channel="absorption_follow_td120_v1", market_period="5m", amount_in=str(2 * 10**18)),
+        order(channel="absorption_follow_td150_v1", market_period="5m", amount_in=str(2 * 10**18)),
     ]
     assert duplicate_risk(rows)["explicit_exclusive_conflict_count"] == 1
     assert get_channel_benchmark("scene_bull_exhaust").win_rate == 0.644
-    assert get_channel_benchmark("s1_dyn_sq_v1").win_rate == 0.6493
-    assert get_channel_benchmark("s1_dyn_sq_v1").sample_size == 1782
+    # 2026-10-22 治理：归档通道不再提供基准（实盘/前端也不展示）
+    assert get_channel_benchmark("s1_dyn_sq_v1") is None
     assert get_channel_benchmark("x4_v2").win_rate == 0.553
-    assert get_channel_benchmark("firsthit_down_body_v1").win_rate == 0.153
-    assert get_channel_benchmark("krev_a_v1").win_rate == 0.642
+    assert get_channel_benchmark("firsthit_down_body_v1") is None
+    assert get_channel_benchmark("krev_a_v1") is None
     assert get_channel_benchmark("krev_b_v1").sample_size == 134
-    assert get_channel_benchmark("rev_p1_v1").win_rate == 0.620
-    assert get_channel_benchmark("rev_p2_v1").win_rate == 0.624
+    assert get_channel_benchmark("rev_p1_v1") is None
+    assert get_channel_benchmark("rev_p2_v1") is None
     assert get_channel_benchmark("unknown") is None
 
 

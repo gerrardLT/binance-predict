@@ -462,14 +462,15 @@ async def test_refire_skip_counter_in_status() -> None:
 # ============================================================
 
 def test_versions_registered_as_live_channels() -> None:
-    from binance_predict.services.live_channels import LIVE_CHANNELS
+    from binance_predict.services.live_channels import LIVE_CHANNELS, RETIRED_CHANNEL_SPECS
+    all_specs = {**RETIRED_CHANNEL_SPECS, **LIVE_CHANNELS}  # 2026-10-22 治理：归档 spec 仍可查
     from binance_predict.services.multi_live_trader import X4_VERSIONS
     versions = [s["version"] for s in SHADOW_CONDITIONS]
     for v in versions:
         assert v not in X4_VERSIONS
-        assert LIVE_CHANNELS[v].family == "kline_reversal"
-        assert LIVE_CHANNELS[v].market_period == "15m"
-        assert LIVE_CHANNELS[v].direction == "UP"
+        assert all_specs[v].family == "kline_reversal"
+        assert all_specs[v].market_period == "15m"
+        assert all_specs[v].direction == "UP"
 
 
 def test_settings_default_on() -> None:

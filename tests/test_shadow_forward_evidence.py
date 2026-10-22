@@ -113,10 +113,14 @@ def test_capture_event_freezes_effective_execution_rules(monkeypatch):
     """护栏必须冻结「生效值」：未热调时回落 spec.auto_max_exec，而非 None（旧实现
     会让结算估计统一回落到 0.50）；order_type 与入场白名单同样随画像冻结。"""
     from binance_predict.services import shadow_forward_evidence as module
-    from binance_predict.services.live_channels import LIVE_CHANNELS
+    from binance_predict.services.live_channels import LIVE_CHANNELS, RETIRED_CHANNEL_SPECS
+    all_specs = {**RETIRED_CHANNEL_SPECS, **LIVE_CHANNELS}  # 2026-10-22 治理：归档 spec 仍可查
 
+    # 2026-10-22 治理回归保护：归档通道也必须冻结生效护栏（不能因不在
+    # LIVE_CHANNELS 而丢成 None，否则可执行报价口径偏乐观）。
     version = "candle_hm_bull_15m_ma10_component_shadow_v1"
-    spec = LIVE_CHANNELS[version]
+    spec = all_specs[version]
+    assert version not in LIVE_CHANNELS and version in RETIRED_CHANNEL_SPECS
     config = SimpleNamespace(amount_usdt=2.0, max_exec_price=None, max_daily_orders=100)
     monkeypatch.setattr(module, "_runtime_configs", lambda: {version: config})
     event = {"window_start": 1000, "trigger_ts": 1100}

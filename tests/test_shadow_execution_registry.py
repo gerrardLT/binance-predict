@@ -115,7 +115,7 @@ def test_s4_variants_split_between_live_and_record_only() -> None:
     assert delay.source_type is SourceType.KLINE
     assert delay.market_period == "15m"
     assert delay.family == "scene"
-    assert delay.live_channel == "s4_delay60_v1" and delay.live_retired is False
+    assert delay.live_channel == "s4_delay60_v1" and delay.live_retired is True  # 2026-10-22 归档
     hiconf = SHADOW_VERSION_SPECS["s4_hiconf_v1"]
     assert hiconf.source_type is SourceType.KLINE
     assert hiconf.market_period == "15m"
@@ -130,7 +130,7 @@ def test_s1_entry_variants_have_same_name_live_channels() -> None:
         assert spec.source_type is SourceType.KLINE
         assert spec.market_period == "15m"
         assert spec.family == "scene"
-        assert spec.live_channel == version and spec.live_retired is False
+        assert spec.live_channel == version and spec.live_retired is True  # 2026-10-22 归档
 
 
 def test_s1_dynamic_shadow_has_registered_live_channel() -> None:

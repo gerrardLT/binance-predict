@@ -70,13 +70,17 @@ def _effective_runtime_rules(ch_spec, config) -> dict:
 def capture_event(snapshot, version):
     """Synchronous trigger-time copy, before persistence or quote awaits."""
     from copy import deepcopy
-    from .live_channels import LIVE_CHANNELS
+    from .live_channels import LIVE_CHANNELS, RETIRED_CHANNEL_SPECS
     from .shadow_execution_registry import SHADOW_VERSION_SPECS
     spec = SHADOW_VERSION_SPECS.get(version)
     channel = spec.live_channel if spec else version
     config = (_runtime_configs() if _runtime_configs else {}).get(channel)
+    # 2026-10-22 通道治理：归档通道从退休台账回溯 spec。若只认 LIVE_CHANNELS，
+    # 归档后 spec=None → 冻结的 max_exec_price/白名单全丢，超价成交不再判
+    # REJECT，归档版本的 forward-v2「可执行报价」口径会系统性偏乐观。
+    ch_spec = LIVE_CHANNELS.get(channel) or RETIRED_CHANNEL_SPECS.get(channel)
     profile = {**PROFILE, "signal_version": version, "amount_usdt": current_amount(version),
-               "runtime_rules": _effective_runtime_rules(LIVE_CHANNELS.get(channel), config)}
+               "runtime_rules": _effective_runtime_rules(ch_spec, config)}
     fingerprint = config_fingerprint(profile)
     return {**deepcopy(snapshot), "_frozen": {"profile": profile, "hash": fingerprint,
         "cohort": "forward-v2-"+fingerprint[:16],

@@ -47,6 +47,10 @@ from .candlestick_shadow_detector import (
     CANDLESTICK_SIGNAL_IDS,
 )
 from .quote_edge_detector import QUOTE_EDGE_RULES
+# 2026-10-22 通道治理：归档名单的单一事实源在 shadow_version_gate.ARCHIVED_VERSIONS
+# （实盘/影子双端共用一个名单，避免两处硬编码不同步）。candlestick 已先导入
+# shadow_version_gate，此处为缓存命中，无循环导入。
+from .shadow_version_gate import ARCHIVED_VERSIONS as _ARCHIVED_VERSIONS
 
 MAX_ORDER_AMOUNT_USDT = 50.0    # 单笔金额硬上限（配置误写拒绝启动，不靠自律）
 MAX_DAILY_ORDERS_CAP = 500      # 日限硬上限（防配置误写 ×100 敞口失控）
@@ -628,6 +632,45 @@ RETIRED_CHANNEL_SPECS: dict[str, ChannelSpec] = {
     ),
 }
 
+# ---------------------------------------------------------------------------
+# 2026-10-22 通道治理（用户拍板）：除保留清单外全部归档。
+# 保留 = 当时实盘 ON 的 15 个 + kdc 四版 + crv 全族 + 复核观察 5 个
+# （x4_v2 / S5 确认 / 吸收 TD120+TD150 / candle 15m union）。
+# 归档名单单一事实源：shadow_version_gate.ARCHIVED_VERSIONS（与影子隐藏共用）；
+# 显式名单而非「不在白名单就归档」——防未来新注册通道被默归归档而静默不交易。
+# 归档 spec 本体保留在 RETIRED_CHANNEL_SPECS（审计/回滚），注释见上。
+# ---------------------------------------------------------------------------
+KEPT_CHANNELS_20261022: frozenset[str] = frozenset({
+    # scene 族（实盘主力）
+    "scene_bull_exhaust", "scene_bear_exhaust", "scene_momentum_fade",
+    # nextbar / kline_reversal（实盘 ON）
+    "krev_b_v1", "hm_inside_15m_v2",
+    # firsthit D/E（实盘 ON，观察期）
+    "firsthit_down_chg35_d_v1", "firsthit_down_chg35_e_v1",
+    # CRV 全族
+    "crv_hi_brk20_15m_v1", "crv_brk20_15m_v1", "crv_brk50_hi_15m_v1",
+    "crv_brk20_5m_v1", "crv_dnbrk24_15m_v1", "crv_dnbrk24_5m_v1",
+    "crv_dnvol20_15m_v1", "crv_bodybrk20_5m_v1",
+    # KDC 四版
+    "kdc_s1_96hi_15m_v1", "kdc_s2_ext_15m_v1", "kdc_s3_3up_15m_v1",
+    "kdc_s4_3dn_15m_v1",
+    # BRK 假突破回归 5m（实盘 ON）
+    "brkrv_brk8h_5m_v1",
+    # 蜡烛族：仅保留实盘 ON 版与 15m union
+    "candle_hm_bull_5m_trend4h_up_shadow_hyp_v1",
+    "candle_hm_bull_15m_union_shadow_v1",
+    # 复核观察（不归档）
+    "x4_v2", "scene_bull_exhaust_confirm",
+    "absorption_follow_td120_v1", "absorption_follow_td150_v1",
+})
+ARCHIVED_CHANNELS_20261022: frozenset[str] = frozenset(_ARCHIVED_VERSIONS)
+_unknown_archived = ARCHIVED_CHANNELS_20261022 - set(LIVE_CHANNELS)
+if _unknown_archived:
+    # 拼写错误/已移除版本不应静默：告警供启动日志审计（不阻断装配）
+    logger.warning("通道治理：归档名单中的未知通道已忽略 | {}", sorted(_unknown_archived))
+for _archived_ch in ARCHIVED_CHANNELS_20261022 & set(LIVE_CHANNELS):
+    RETIRED_CHANNEL_SPECS[_archived_ch] = LIVE_CHANNELS.pop(_archived_ch)
+
 RETIRED_CHANNELS: frozenset[str] = frozenset(RETIRED_CHANNEL_SPECS)
 
 
@@ -637,6 +680,8 @@ RETIRED_CHANNELS: frozenset[str] = frozenset(RETIRED_CHANNEL_SPECS)
 #   自拦深档高报价窗），互斥防未来护栏调高后叠加。
 # momentum 族 v1/v2/v3 互斥组已随三成员全退役而移除（见
 # RETIRED_SAME_WINDOW_EXCLUSIVE，仅留作机制测试 fixture）。
+# 2026-10-22 通道治理：组常量保留完整语义（含已归档成员，兼作测试 fixture 源），
+# 归档后是否生效由 exclusive_group() 在运行时与 LIVE_CHANNELS 求交决定。
 _CANDLE_5M_CHANNELS = frozenset(v for v in CANDLESTICK_SIGNAL_IDS if "_5m_" in v)
 _CANDLE_15M_CHANNELS = frozenset(v for v in CANDLESTICK_SIGNAL_IDS if "_15m_" in v)
 
@@ -681,10 +726,18 @@ RETIRED_SAME_WINDOW_EXCLUSIVE: tuple[frozenset[str], ...] = (
 
 
 def exclusive_group(channel: str) -> frozenset[str] | None:
-    """通道所属同窗互斥组（None = 不与他通道同窗成交限制）。"""
+    """通道所属同窗互斥组（None = 不与他通道同窗成交限制）。
+
+    2026-10-22 通道治理：SAME_WINDOW_EXCLUSIVE 常量保留完整语义（含已归档
+    成员，兼作机制测试 fixture），运行时只与当前 LIVE_CHANNELS 求交——
+    归档通道不参与生产判定，交集不足 2 个成员时互斥语义消失，返回 None。
+    """
+    if channel not in LIVE_CHANNELS:
+        return None  # 归档/未注册通道不参与生产互斥判定
     for grp in SAME_WINDOW_EXCLUSIVE:
         if channel in grp:
-            return grp
+            active = frozenset(grp & set(LIVE_CHANNELS))
+            return active if len(active) >= 2 else None
     return None
 
 

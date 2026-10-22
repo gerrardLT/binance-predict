@@ -94,6 +94,7 @@ from .live_channels import (
     LIVE_CHANNELS,
     MAX_DAILY_ORDERS_CAP,
     MAX_ORDER_AMOUNT_USDT,
+    RETIRED_CHANNELS,
     exclusive_group,
     parse_channel_config,
     resolve_max_exec,
@@ -113,9 +114,10 @@ from .quote_edge_detector import (
     _prev_window_outcome,
 )
 
-# x4 轮询只拉在线通道的版本（x4_v1 已于 2026-09-04 退役，不在 _specs 里；
-# 若仍拉它的 PENDING 行，_fire_x4 会因找不到 spec 而白跑一趟）。
-X4_VERSIONS = ("x4_v2", "x4_v3")  # x4_v3：v2 并行对比版（双趋势门禁+入场价白名单，2026-09-06）
+# x4 轮询只拉在线通道的版本（已归档/退役版本不在 _specs 里；若仍拉它们的
+# PENDING 行，_fire_x4 会因找不到 spec 而白跑 + 打 warning）。
+# 2026-10-22 治理：x4_v3 已归档 → 按 LIVE_CHANNELS 收敛。
+X4_VERSIONS = tuple(v for v in ("x4_v2", "x4_v3") if v in LIVE_CHANNELS)
 SIGNAL_BACKFILL_DELAY_MS = 180_000  # 窗口结束后 180s 回读影子信号（归档+结算已就绪）
 HEAL_INTERVAL_S = 300.0             # signal_id 自愈扫描间隔（重启/延迟不丢对账）
 X4_POLL_INTERVAL_S = 30.0           # x4 PENDING 信号轮询间隔
@@ -1554,7 +1556,9 @@ class MultiLiveTrader:
         try:
             if self._stopped:
                 return  # stop 后拒绝派生新下单任务（与 check/scene 同契约）
-            cfg = self._configs[S5_DEEP_CHANNEL]
+            cfg = self._configs.get(S5_DEEP_CHANNEL)
+            if cfg is None:
+                return  # 2026-10-22 治理：通道已归档（未装配）→ 静默跳过，不污染告警
             if not cfg.enabled:
                 return
             market_start = int(sig["market_start_15m"])
@@ -1575,7 +1579,9 @@ class MultiLiveTrader:
         try:
             if self._stopped:
                 return
-            cfg = self._configs[S1_DYNAMIC_CHANNEL]
+            cfg = self._configs.get(S1_DYNAMIC_CHANNEL)
+            if cfg is None:
+                return  # 2026-10-22 治理：通道已归档（未装配）→ 静默跳过，不污染告警
             if not cfg.enabled:
                 return
             market_start = int(sig["market_start_15m"])
@@ -2349,7 +2355,14 @@ class MultiLiveTrader:
                 sa_select(LiveChannelOverride)
             )).scalars().all())
         applied: list[str] = []
+        retired_skipped: list[str] = []
         for row in rows:
+            if row.channel in RETIRED_CHANNELS:
+                # 2026-10-22 治理：归档通道的旧覆盖行一律忽略（绝不自动开仓）。
+                # 即使以后把它加回白名单，也要重新显式 toggle 才生效——
+                # 避免「恢复白名单 = 直接接入真钱交易」的隐式状态。
+                retired_skipped.append(row.channel)
+                continue
             try:
                 self.set_channel(
                     row.channel, enabled=row.enabled,
@@ -2360,6 +2373,9 @@ class MultiLiveTrader:
                 logger.warning("多通道实盘：DB 覆盖行非法已跳过 | {}", exc)
                 continue
             applied.append(row.channel)
+        if retired_skipped:
+            logger.info("多通道实盘：{} 条归档通道覆盖行已忽略（不自动开仓）| {}",
+                        len(retired_skipped), sorted(retired_skipped))
         if applied:
             self._enabled_at_startup = {
                 ch: cfg.enabled for ch, cfg in self._configs.items()

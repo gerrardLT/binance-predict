@@ -20,7 +20,7 @@ from binance_predict.services import fake_breakout_detector as fbd_mod
 from binance_predict.services.fake_breakout_detector import FakeBreakoutDetector
 
 PASSWORD = "s3cret-login"
-CHANNEL = "quote_contrarian_v2"
+CHANNEL = "scene_momentum_fade"  # 2026-10-22：原 quote_contrarian_v2 已归档，改用在线通道
 OTHER = "x4_v2"
 
 

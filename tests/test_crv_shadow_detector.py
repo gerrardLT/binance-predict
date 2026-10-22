@@ -561,8 +561,9 @@ def test_crv_live_channels_registered_default_off() -> None:
     # 15m 三通道同窗互斥（2026-10-05 起并入 BRK 同源突破回归通道：同一根突破
     # 阳线事件子集、同押 DOWN 同目标窗 → 同窗至多一单成交）
     grp = exclusive_group("crv_hi_brk20_15m_v1")
+    # 2026-10-22 治理：brkrv_brk8h_15m_v1 已归档 → 运行时求交后不再出现在组内
     assert grp == {"crv_hi_brk20_15m_v1", "crv_brk20_15m_v1", "crv_brk50_hi_15m_v1",
-                   "brkrv_brk8h_15m_v1", "kdc_s1_96hi_15m_v1", "kdc_s2_ext_15m_v1",
+                   "kdc_s1_96hi_15m_v1", "kdc_s2_ext_15m_v1",
                    "kdc_s3_3up_15m_v1"}
     assert exclusive_group("crv_brk20_5m_v1") == {"crv_brk20_5m_v1", "brkrv_brk8h_5m_v1",
                                                   "crv_bodybrk20_5m_v1"}

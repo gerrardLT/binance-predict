@@ -302,26 +302,28 @@ async def test_stale_and_backscan_hits_never_dispatch(monkeypatch) -> None:
 # ============================================================
 
 def test_brkrv_live_channels_registered_default_off() -> None:
-    from binance_predict.services.live_channels import LIVE_CHANNELS, exclusive_group, parse_channel_config
+    from binance_predict.services.live_channels import (
+        LIVE_CHANNELS, RETIRED_CHANNEL_SPECS, exclusive_group, parse_channel_config)
 
     expected = {
         "brkrv_brk8h_15m_v1": ("15m", "DOWN", 0.54),
         "brkrv_brk8h_5m_v1": ("5m", "DOWN", 0.55),
     }
     for version, (period, direction, guard) in expected.items():
-        spec = LIVE_CHANNELS[version]
+        # 2026-10-22 治理：15m 版已归档（spec 保留在台账）
+        spec = {**RETIRED_CHANNEL_SPECS, **LIVE_CHANNELS}[version]
         assert spec.family == "kline_reversal"
         assert spec.market_period == period and spec.direction == direction
         assert spec.auto_max_exec == guard
-    # 默认全部 OFF（parse_channel_config 无覆盖时）
+    # 默认全部 OFF（parse_channel_config 无覆盖时）；2026-10-22 治理：15m 版归档
     configs = parse_channel_config()
-    for version in expected:
-        assert configs[version].enabled is False
-    # 15m：并入 CRV 15m 突破族互斥组（同一根突破阳线事件子集、同押 DOWN）
-    grp15 = exclusive_group("brkrv_brk8h_15m_v1")
-    assert grp15 == {"crv_hi_brk20_15m_v1", "crv_brk20_15m_v1",
-                     "crv_brk50_hi_15m_v1", "brkrv_brk8h_15m_v1",
-                     "kdc_s1_96hi_15m_v1", "kdc_s2_ext_15m_v1", "kdc_s3_3up_15m_v1"}
+    assert configs["brkrv_brk8h_5m_v1"].enabled is False
+    assert "brkrv_brk8h_15m_v1" not in configs
+    # 15m 版归档 → 运行时求交后无互斥组（原 CRV 15m 族仍保留）
+    assert exclusive_group("brkrv_brk8h_15m_v1") is None
+    assert exclusive_group("crv_hi_brk20_15m_v1") == {
+        "crv_hi_brk20_15m_v1", "crv_brk20_15m_v1", "crv_brk50_hi_15m_v1",
+        "kdc_s1_96hi_15m_v1", "kdc_s2_ext_15m_v1", "kdc_s3_3up_15m_v1"}
     # 5m：与 crv_brk20_5m 同窗互斥（brk8h ⊂ brk20 事件集）
     grp5 = exclusive_group("brkrv_brk8h_5m_v1")
     assert grp5 == {"crv_brk20_5m_v1", "brkrv_brk8h_5m_v1", "crv_bodybrk20_5m_v1"}

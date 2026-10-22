@@ -14,7 +14,11 @@ import numpy as np
 import pytest
 
 from binance_predict.discovery.data import Klines
-from binance_predict.services.live_channels import LIVE_CHANNELS
+from binance_predict.services.live_channels import LIVE_CHANNELS, RETIRED_CHANNEL_SPECS
+
+# 2026-10-22 通道治理：hm_inside_5m / ih_inside_15m 已归档（spec 保留在台账）——
+# 本模块的注册断言改用合并台账；在线 spec 仍来自 LIVE_CHANNELS。
+ALL_CHANNEL_SPECS = {**RETIRED_CHANNEL_SPECS, **LIVE_CHANNELS}
 import binance_predict.services.rev2_inside_shadow_detector as rev2_mod
 from binance_predict.services.rev2_inside_shadow_detector import (
     BAR_MS,
@@ -30,21 +34,21 @@ from binance_predict.services.rev2_inside_shadow_detector import (
 
 def test_live_channels_registered() -> None:
     """验证 Rev2 三个通道的周期、方向与默认热调护栏（2026-09-20 LIMIT→MARKET）。"""
-    spec_5m = LIVE_CHANNELS["hm_inside_5m_v2"]
+    spec_5m = ALL_CHANNEL_SPECS["hm_inside_5m_v2"]
     assert spec_5m.family == "nextbar"
     assert spec_5m.market_period == "5m"
     assert spec_5m.direction == "DOWN"
     assert spec_5m.auto_max_exec == 0.30
     assert spec_5m.order_type == "MARKET"
 
-    spec_hm = LIVE_CHANNELS["hm_inside_15m_v2"]
+    spec_hm = ALL_CHANNEL_SPECS["hm_inside_15m_v2"]
     assert spec_hm.family == "nextbar"
     assert spec_hm.market_period == "15m"
     assert spec_hm.direction == "DOWN"
     assert spec_hm.auto_max_exec == 0.30
     assert spec_hm.order_type == "MARKET"
 
-    spec_ih = LIVE_CHANNELS["ih_inside_15m_v2"]
+    spec_ih = ALL_CHANNEL_SPECS["ih_inside_15m_v2"]
     assert spec_ih.family == "nextbar"
     assert spec_ih.market_period == "15m"
     assert spec_ih.direction == "UP"

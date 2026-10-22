@@ -468,11 +468,12 @@ def test_versions_isolated_from_trading_path() -> None:
     """影子纪律红线：不进 X4 下单白名单（旁路下单禁止）；实盘化只走显式
     ChannelSpec 注册——2026-09-06 t4/t5d 双变体已 promote 进 LIVE_CHANNELS，
     影子落表与实盘下单并存（影子下线≠实盘下线）。"""
-    from binance_predict.services.live_channels import LIVE_CHANNELS
+    from binance_predict.services.live_channels import LIVE_CHANNELS, RETIRED_CHANNEL_SPECS
     from binance_predict.services.multi_live_trader import X4_VERSIONS
     for v in S2_COND_VERSIONS:
         assert v not in X4_VERSIONS, f"{v} 不得进入 X4 下单白名单"
-        assert v in LIVE_CHANNELS, f"{v} 应已 promote 注册实盘通道"
+        # 2026-10-22 治理：t4/t5d 已归档（spec 保留在台账，不再实盘）
+        assert v in RETIRED_CHANNEL_SPECS, f"{v} 应已归档（spec 保留）"
 
 
 def test_versions_disjoint_from_other_shadow_families() -> None:

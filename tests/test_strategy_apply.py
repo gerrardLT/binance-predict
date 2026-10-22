@@ -19,7 +19,7 @@ from binance_predict.db.models import StrategyAdvice
 from binance_predict.main import app
 
 PASSWORD = "s3cret-advice"
-CH = "quote_contrarian_v2"
+CH = "scene_momentum_fade"  # 2026-10-22：原 quote_contrarian_v2 已归档，改用在线通道
 PATH = "/api/attribution/advices"
 
 

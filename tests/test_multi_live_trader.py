@@ -230,8 +230,9 @@ def test_parse_defaults_all_off(monkeypatch) -> None:
     monkeypatch.setattr(settings, "live_default_max_daily_orders", 100)
     monkeypatch.setattr(settings, "live_channels_json", "")
     cfgs = parse_channel_config()
-    assert len(cfgs) == 49 + len(CANDLESTICK_SIGNAL_IDS)  # 2026-10-16 +KDC 四通道
-    assert set(CANDLESTICK_SIGNAL_IDS) <= set(cfgs)
+    # 2026-10-22 通道治理：配置表 = 在线白名单（26），归档通道不进配置表
+    assert len(cfgs) == len(LIVE_CHANNELS)
+    assert set(cfgs) == set(LIVE_CHANNELS)
     assert all(not c.enabled for c in cfgs.values())
     assert all(c.amount_usdt == 2.0 for c in cfgs.values())
     assert all(c.max_daily_orders == 100 for c in cfgs.values())
@@ -292,13 +293,13 @@ def test_parse_overrides_applied(monkeypatch) -> None:
     monkeypatch.setattr(settings, "live_channels_json", json.dumps({
         "x4_v2": {"enabled": True, "amount_usdt": 1.0,
                   "max_daily_orders": 50, "max_exec_price": 0.48},
-        "quote_contrarian_v2": {"enabled": True},
+        "scene_momentum_fade": {"enabled": True},
     }))
     cfgs = parse_channel_config()
     x4 = cfgs["x4_v2"]
     assert x4.enabled and x4.amount_usdt == 1.0
     assert x4.max_daily_orders == 50 and x4.max_exec_price == 0.48
-    assert cfgs["quote_contrarian_v2"].enabled is True
+    assert cfgs["scene_momentum_fade"].enabled is True
     assert cfgs["scene_bull_exhaust"].enabled is False   # 未提及通道不受影响
 
 
@@ -325,6 +326,38 @@ def test_parse_retired_channel_skipped_not_raise(monkeypatch) -> None:
     assert set(cfgs) == set(LIVE_CHANNELS)          # 退役通道不入配置表
     assert "x4_v1" not in cfgs and "quote_momentum_v3" not in cfgs
     assert cfgs["x4_v2"].enabled is True and cfgs["x4_v2"].amount_usdt == 3.0
+
+
+@pytest.mark.asyncio
+async def test_apply_db_overrides_ignores_archived_channels(monkeypatch) -> None:
+    """2026-10-22 治理：归档通道的 DB 覆盖行一律忽略，绝不自动开仓。
+
+    防止「以后恢复白名单 = 直接接入真钱」：即便历史覆盖行 enabled=True，
+    也必须重新显式 toggle 才会生效。
+    """
+    trader = _make_trader(monkeypatch, _FakeTrader())
+    calls: list[str] = []
+    monkeypatch.setattr(type(trader), "set_channel",
+                        lambda self, ch, **kw: calls.append(ch))
+    rows = [
+        SimpleNamespace(channel="quote_contrarian_v2", enabled=True, amount_usdt=5.0,
+                        max_daily_orders=100, max_exec_price=0.3),
+        SimpleNamespace(channel="x4_v2", enabled=False, amount_usdt=1.0,
+                        max_daily_orders=10, max_exec_price=None),
+    ]
+
+    class _RowsSession:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def execute(self, stmt):
+            res = MagicMock()
+            res.scalars.return_value.all.return_value = rows
+            return res
+
+    monkeypatch.setattr(milt, "async_session_factory", lambda: _RowsSession())
+    applied = await trader.apply_db_overrides()
+    assert applied == ["x4_v2"]            # 归档行被跳过
+    assert calls == ["x4_v2"]              # 在线行照常应用
 
 
 def test_parse_amount_over_cap_rejected(monkeypatch) -> None:
@@ -372,9 +405,12 @@ def test_parse_non_int_daily_rejected(monkeypatch) -> None:
         parse_channel_config()
 
 
-def test_channels_registry_shape() -> None:
-    """注册表形状：既有通道 + 18 个蜡烛逻辑通道，退役通道不混入。"""
+def test_channels_registry_shape(monkeypatch) -> None:
+    """注册表形状：2026-10-22 治理后在线 26 个白名单；归档 spec 全部仍在台账。"""
     from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
+    from binance_predict.services.live_channels import KEPT_CHANNELS_20261022
+
+    assert set(LIVE_CHANNELS) == KEPT_CHANNELS_20261022
 
     expected_existing = {
         "quote_contrarian_v2",
@@ -417,24 +453,13 @@ def test_channels_registry_shape() -> None:
         "kdc_s1_96hi_15m_v1", "kdc_s2_ext_15m_v1",
         "kdc_s3_3up_15m_v1", "kdc_s4_3dn_15m_v1",
     }
-    assert set(LIVE_CHANNELS) == expected_existing | set(CANDLESTICK_SIGNAL_IDS)
-    assert set(RETIRED_CHANNELS) == {
-        "quote_momentum_v1", "quote_contrarian_v1",
-        "quote_momentum_v2",
-        "quote_contrarian_v3a", "quote_contrarian_v3b",
-        "quote_contrarian_v4", "quote_momentum_v3",
-        "x4_v1",
-        # 2026-10-05：firsthit 前向深析退役（G7 全系/K10 两版/过程恢复）。
-        # late_night_v1 / hm_touch×2 是纯影子版本，本就无实盘通道（只在
-        # shadow_version_gate.RETIRED_VERSIONS 退役）。
-        "firsthit_down_g7_v1", "g7_streak_v1", "g7_wick20_v1",
-        "g7_strict_v1", "g7_q05_v1", "g7_t270_v1",
-        "firsthit_down_k10_v1", "firsthit_down_k10_profit_v1",
-        "process_recovery_down_v1",
-        "firsthit_down_chg_v1",
-        # 2026-10-10 证伪退役：gap_crowd 两版（触发条件只在报价对不一致快照成立）
-        "gap_crowd_5m_v1", "gap_crowd_15m_v1",
-    }
+    # 归档后：原 67 个 = 在线 26 + 归档 41（spec 全部保留，不丢历史语义）
+    assert expected_existing <= set(RETIRED_CHANNEL_SPECS) | set(LIVE_CHANNELS)
+    assert set(CANDLESTICK_SIGNAL_IDS) <= set(RETIRED_CHANNEL_SPECS) | set(LIVE_CHANNELS)
+    assert {"quote_momentum_v1", "quote_contrarian_v1", "x4_v1",
+            "firsthit_down_g7_v1", "g7_t270_v1",
+            "gap_crowd_5m_v1", "gap_crowd_15m_v1"} <= set(RETIRED_CHANNELS)
+    assert len(LIVE_CHANNELS) + len(RETIRED_CHANNELS) == 26 + 61
     assert not (set(LIVE_CHANNELS) & set(RETIRED_CHANNELS))
     by = {**RETIRED_CHANNEL_SPECS, **LIVE_CHANNELS}
     # 在线通道：市场周期/方向/护栏逐项对齐
@@ -509,12 +534,17 @@ def test_channels_registry_shape() -> None:
     assert all(s.v2_guard in (None, "max_rise") for s in LIVE_CHANNELS.values())
     from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_BACKTEST
     for version in CANDLESTICK_SIGNAL_IDS:
-        spec = LIVE_CHANNELS[version]
+        spec = by[version]
         assert spec.family == "candlestick_reversal"
         assert spec.market_period in {"5m", "15m"}
         assert spec.order_type == "MARKET"
         assert spec.auto_max_exec == pytest.approx(CANDLESTICK_BACKTEST[version][0] * 0.98, abs=5e-5)
     # 同窗互斥组：S5、S2 condition 与 absorption（firsthit 全族已于 2026-09-12 解除互斥以支持独立实盘测试）
+    # 2026-10-22 治理：exclusive_group 运行时与 LIVE_CHANNELS 求交——仅注入
+    # 归档 spec（不注入退役互斥组，保持“退役组不参与生产判定”语义可验）。
+    _merged = {**RETIRED_CHANNEL_SPECS, **LIVE_CHANNELS}
+    monkeypatch.setattr(lc, "LIVE_CHANNELS", _merged)
+    monkeypatch.setattr(milt, "LIVE_CHANNELS", _merged)
     from binance_predict.services.live_channels import exclusive_group
     assert exclusive_group("s1_dyn_sq_v1") == frozenset(
         {"scene_bull_exhaust", "s1_dyn_sq_v1"})
@@ -551,9 +581,10 @@ def test_retired_channel_specs_match_retired_versions() -> None:
     反向不要求包含：late_night_contrarian_v1 / hm_touch_down_v1/v2 是纯影子
     版本，本就无实盘通道。
     """
-    from binance_predict.services.shadow_version_gate import RETIRED_VERSIONS
-    assert RETIRED_CHANNELS <= RETIRED_VERSIONS
-    assert RETIRED_VERSIONS - RETIRED_CHANNELS == {
+    from binance_predict.services.shadow_version_gate import ARCHIVED_VERSIONS, RETIRED_VERSIONS
+    # 2026-10-22 治理：归档（影子仍采集，前端隐藏）与永久退役合并覆盖全部实盘退役 spec
+    assert RETIRED_CHANNELS <= RETIRED_VERSIONS | ARCHIVED_VERSIONS
+    assert (RETIRED_VERSIONS | ARCHIVED_VERSIONS) - RETIRED_CHANNELS == {
         "late_night_contrarian_v1", "hm_touch_down_v1", "hm_touch_down_v2"}
 
 
@@ -1505,11 +1536,12 @@ def test_scene_s2_entry_whitelist_registered() -> None:
     """注册表口径源：S2 挂入场价白名单 [0.50,0.65)，同族其他场景通道零影响。"""
     from binance_predict.services.live_channels import LIVE_CHANNELS
 
-    assert LIVE_CHANNELS["scene_bear_exhaust"].entry_band_whitelist == ((0.50, 0.65),)
-    assert not hasattr(LIVE_CHANNELS["scene_bear_exhaust"], "max_low24_gap_pct")
+    by = {**RETIRED_CHANNEL_SPECS, **LIVE_CHANNELS}  # 归档 spec 仍在台账内
+    assert by["scene_bear_exhaust"].entry_band_whitelist == ((0.50, 0.65),)
+    assert not hasattr(by["scene_bear_exhaust"], "max_low24_gap_pct")
     for other in ("scene_bull_exhaust", "scene_bear_exhaust_opt_v1",
                   "scene_bull_exhaust_confirm", "scene_momentum_fade"):
-        assert LIVE_CHANNELS[other].entry_band_whitelist is None
+        assert by[other].entry_band_whitelist is None
 
 
 @pytest.mark.asyncio
@@ -2144,7 +2176,8 @@ async def test_candlestick_5m_low_rv_gate_boundary_threshold(monkeypatch) -> Non
 async def test_candlestick_low_rv_gate_scope_only_5m_wick_family(monkeypatch) -> None:
     """门禁范围：15m 蜡烛版与 candidate_* 观察版不加门（fetcher 缺失仍放行）。"""
     # 正向口径：7 个 candle_hm_bull_5m_* 长下影版本全部挂 0.30（live_channels 冻结值）
-    wick_5m = {v: s for v, s in LIVE_CHANNELS.items() if v.startswith("candle_hm_bull_5m_")}
+    wick_5m = {v: s for v, s in {**RETIRED_CHANNEL_SPECS, **LIVE_CHANNELS}.items()
+               if v.startswith("candle_hm_bull_5m_")}
     assert len(wick_5m) == 7
     assert all(s.min_rv_pct == 0.30 for s in wick_5m.values())
     for version in ("candle_hm_bull_15m_consensus3_shadow_v1",
@@ -2446,6 +2479,7 @@ async def test_process_recovery_default_off_and_live_confirmation(monkeypatch):
 @pytest.mark.asyncio
 async def test_firsthit_early_channels_default_off_and_time_boundaries(monkeypatch):
     channels = ["firsthit_down_chg_early180_v1", "firsthit_down_k10_early180_v1"]
+    _with_retired(monkeypatch)  # 归档通道需先注入注册表，parse 才可见
     assert all(parse_channel_config()[ch].enabled is False for ch in channels)
     fake = _FakeTrader()
     t = _make_trader(monkeypatch, fake, channels=channels)
@@ -2504,18 +2538,21 @@ def _firsthit_btc_curve(btc_open: float = 100.0, btc_trig: float = 100.3, npts: 
 
 @pytest.mark.asyncio
 async def test_firsthit_enabled_channels_registered(monkeypatch) -> None:
-    """firsthit G0/G1/G3 三个通道已注册，默认关闭，护栏按约定值。"""
-    from binance_predict.services.live_channels import LIVE_CHANNELS
-    assert all(ch in LIVE_CHANNELS for ch in ["firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v2"])
+    """firsthit G0/G1/G3 三个通道已归档（2026-10-22 治理），spec 保留；
+    在线 firsthit 仅 D/E 两版，默认关闭，护栏按约定值。
+    """
+    by = {**RETIRED_CHANNEL_SPECS, **LIVE_CHANNELS}
+    assert all(ch in RETIRED_CHANNEL_SPECS for ch in
+               ["firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v2"])
     cfgs = parse_channel_config()
-    assert not cfgs["firsthit_down_v1"].enabled and not cfgs["firsthit_down_body_v1"].enabled and not cfgs["firsthit_down_chg_v2"].enabled
-    assert cfgs["firsthit_down_v1"].amount_usdt == 2.0
-    assert cfgs["firsthit_down_v1"].max_daily_orders == 100
-    assert cfgs["firsthit_down_v1"].max_exec_price is None       # 缺省回落 spec.auto_max_exec
-    assert cfgs["firsthit_down_body_v1"].max_exec_price is None
-    assert cfgs["firsthit_down_chg_v2"].max_exec_price is None
+    assert {"firsthit_down_chg35_d_v1", "firsthit_down_chg35_e_v1"} <= set(cfgs)
+    assert not cfgs["firsthit_down_chg35_d_v1"].enabled
+    assert cfgs["firsthit_down_chg35_d_v1"].amount_usdt == 2.0
+    assert cfgs["firsthit_down_chg35_d_v1"].max_daily_orders == 100
+    assert cfgs["firsthit_down_chg35_d_v1"].max_exec_price is None
+    assert cfgs["firsthit_down_chg35_e_v1"].max_exec_price is None
     # 2026-10-13：v2 通道护栏 0.09→0.101（首触价贴 Q_HI=0.1，0.09 会把全部信号判超价弃单）
-    assert LIVE_CHANNELS["firsthit_down_chg_v2"].auto_max_exec == 0.101
+    assert by["firsthit_down_chg_v2"].auto_max_exec == 0.101
 
 
 @pytest.mark.asyncio
@@ -2869,7 +2906,7 @@ def test_g3_guard_ratio_and_cap() -> None:
                         max_exec_price=None, enabled=True)
     for ch in ("firsthit_down_chg_v2", "firsthit_down_chg35_d_v1",
                "firsthit_down_chg35_e_v1"):
-        spec = LIVE_CHANNELS[ch]
+        spec = {**RETIRED_CHANNEL_SPECS, **LIVE_CHANNELS}[ch]
         # upper_wick=0 / streak=1 都不再收紧（旧逻辑会 −0.01/−0.02）
         assert _resolve_firsthit_dynamic_guard(
             spec, cfg, {"q": 0.10, "upper_wick_bps": 0.0}, streak_up=1
@@ -3456,29 +3493,34 @@ def _stub_override_db(monkeypatch, rows: list) -> _OverrideSession:
 @pytest.mark.asyncio
 async def test_apply_db_overrides_applies_and_skips_bad(monkeypatch) -> None:
     """DB 覆盖层：合法行覆盖 env 设定；未知通道行跳过不崩启动；
-    enabled_at_startup 重快照反映覆盖后的最终启动态。"""
+    enabled_at_startup 重快照反映覆盖后的最终启动态。
+
+    2026-10-22 治理：原用例用 x4_v1/quote_contrarian_v1（已永久退役）作合法行，
+    归档/退役行现在一律忽略 → 改用在线通道。退役行忽略见
+    test_apply_db_overrides_ignores_archived_channels。
+    """
     t = _make_trader(monkeypatch, _FakeTrader(),
-                     channels=["quote_contrarian_v1"])
+                     channels=["scene_bull_exhaust"])
     rows = [
-        SimpleNamespace(channel="x4_v1", enabled=True,
+        SimpleNamespace(channel="x4_v2", enabled=True,
                         amount_usdt=1.5, max_daily_orders=50,
                         max_exec_price=0.55),
         SimpleNamespace(channel="ghost_channel", enabled=True,
                         amount_usdt=2.0, max_daily_orders=10),
-        SimpleNamespace(channel="quote_contrarian_v1", enabled=False,
+        SimpleNamespace(channel="scene_bull_exhaust", enabled=False,
                         amount_usdt=2.0, max_daily_orders=100),
     ]
     _stub_override_db(monkeypatch, rows)
 
     applied = await t.apply_db_overrides()
 
-    assert applied == ["x4_v1", "quote_contrarian_v1"]   # ghost 被跳过
-    assert t._configs["x4_v1"].enabled is True
-    assert t._configs["x4_v1"].amount_usdt == 1.5
-    assert t._configs["x4_v1"].max_daily_orders == 50
-    assert t._configs["x4_v1"].max_exec_price == 0.55    # 护栏自定义覆盖（DB 层）
-    assert t._configs["quote_contrarian_v1"].enabled is False   # DB 胜过 env 层
-    assert t._enabled_at_startup["quote_contrarian_v1"] is False
+    assert applied == ["x4_v2", "scene_bull_exhaust"]   # ghost 被跳过
+    assert t._configs["x4_v2"].enabled is True
+    assert t._configs["x4_v2"].amount_usdt == 1.5
+    assert t._configs["x4_v2"].max_daily_orders == 50
+    assert t._configs["x4_v2"].max_exec_price == 0.55    # 护栏自定义覆盖（DB 层）
+    assert t._configs["scene_bull_exhaust"].enabled is False   # DB 胜过 env 层
+    assert t._enabled_at_startup["scene_bull_exhaust"] is False
 
 
 @pytest.mark.asyncio
@@ -3655,15 +3697,17 @@ async def test_live_performance_summary_duplicate_window_and_period_keys(monkeyp
     import binance_predict.main as m
     from binance_predict.services.live_performance import LiveOrder
 
+    _with_retired(monkeypatch)  # 归档通道（spec 仍在台账）参与本用例的重复敷口统计
+
     rows = [
-        LiveOrder(id=1, channel="firsthit_down_body_v1", market_period="5m",
+        LiveOrder(id=1, channel="crv_bodybrk20_5m_v1", market_period="5m",
                   window_start=1000, direction="DOWN", settle_outcome="DOWN", win=True,
                   pnl=3, amount_in=str(2 * 10**18), assessment_id=11,
                   quote_json={"amountIn": str(2 * 10**18), "filledShareQty": 4}),
-        LiveOrder(id=2, channel="firsthit_down_v1", market_period="5m",
+        LiveOrder(id=2, channel="crv_brk20_5m_v1", market_period="5m",
                   window_start=1000, direction="DOWN", settle_outcome="DOWN", win=False,
                   pnl=-3, amount_in=str(3 * 10**18)),
-        LiveOrder(id=3, channel="s2_cond_t4_v1", market_period="15m",
+        LiveOrder(id=3, channel="krev_b_v1", market_period="15m",
                   window_start=1000, direction="UP", settle_outcome="UP", win=True,
                   pnl=1, amount_in=str(10**18)),
     ]
@@ -3686,8 +3730,9 @@ async def test_live_performance_summary_duplicate_window_and_period_keys(monkeyp
         "realized_outcome_minus_break_even_probability"
     )
     by_channel = {row["channel"]: row for row in out["channels"]}
-    assert by_channel["firsthit_down_body_v1"]["latest"]["rolling20"]["n"] == 1
-    assert by_channel["firsthit_down_body_v1"]["benchmark"]["win_rate"] == 0.153
+    assert by_channel["crv_bodybrk20_5m_v1"]["latest"]["rolling20"]["n"] == 1
+    # 2026-10-22 治理：归档通道在实盘面板不再返回；在线通道的基准必须可查
+    assert by_channel["krev_b_v1"]["benchmark"]["win_rate"] == 0.634
 
 
 @pytest.mark.asyncio
@@ -6009,9 +6054,11 @@ def test_limit_order_channels_marked_in_registry() -> None:
         "s2_cond_t4_v1",
     ]
     for ch in expected_limit_channels:
-        spec = LIVE_CHANNELS.get(ch)
+        spec = {**RETIRED_CHANNEL_SPECS, **LIVE_CHANNELS}.get(ch)
         assert spec is not None, f"通道 {ch} 未注册"
         assert spec.order_type == "LIMIT", f"通道 {ch} 的 order_type 应为 LIMIT，实为 {spec.order_type}"
+    # 2026-10-22 治理：在线通道已全部 MARKET；LIMIT 语义保留在归档 spec 中
+    assert all(s.order_type == "MARKET" for s in LIVE_CHANNELS.values())
 
     # 市价通道保持 MARKET
     expected_market_channels = [
@@ -6034,7 +6081,7 @@ def test_limit_order_channels_marked_in_registry() -> None:
         "firsthit_down_chg_v2",
     ]
     for ch in expected_market_channels:
-        spec = LIVE_CHANNELS.get(ch)
+        spec = {**RETIRED_CHANNEL_SPECS, **LIVE_CHANNELS}.get(ch)
         assert spec is not None, f"通道 {ch} 未注册"
         assert spec.order_type == "MARKET", f"通道 {ch} 的 order_type 应为 MARKET，实为 {spec.order_type}"
 
@@ -6324,7 +6371,7 @@ def test_ln_fixture_lands_in_hour_guard() -> None:
 
 def test_ln_guard_would_not_block_fill() -> None:
     """护栏 0.33 高于触发区间上界 0.30 → 护栏不是 0 单的原因（排除竞争假设）。"""
-    assert lc.LIVE_CHANNELS[LN_CH].auto_max_exec == 0.33
+    assert lc.RETIRED_CHANNEL_SPECS[LN_CH].auto_max_exec == 0.33
     assert QUOTE_EDGE_RULES[LN_CH][3] == 0.30
 
 
@@ -6332,7 +6379,7 @@ def test_ln_guard_would_not_block_fill() -> None:
 
 def test_ln_spec_v2_guard_removed() -> None:
     """A 方案：v2_guard 声明已移除（撤销 A → 本用例红）。"""
-    assert lc.LIVE_CHANNELS[LN_CH].v2_guard is None
+    assert lc.RETIRED_CHANNEL_SPECS[LN_CH].v2_guard is None
 
 
 def test_ln_other_gate_registries_intact() -> None:

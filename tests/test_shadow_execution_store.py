@@ -58,9 +58,10 @@ async def test_source_projector_does_not_query_orders_and_uses_explicit_policy()
     assert values["signal_version"] == "quote_contrarian_v2"
     assert values["policy_version"] == EXECUTION_POLICY_VERSION
     assert values["channel_mapped"] is True
-    assert values["retired"] is False
+    # 2026-10-22 通道治理：quote_contrarian_v2 已归档（spec 仍在台账）→ retired=True
+    assert values["retired"] is True
     assert values["terminal_stage"] == TerminalStage.UNKNOWN.value
-    assert values["reason_code"] == ReasonCode.LEGACY_UNKNOWN.value
+    assert values["reason_code"] == ReasonCode.RETIRED_CHANNEL.value
     assert values["strategy_eligible"] is None
     assert values["operational_eligible"] is None
     assert values["execution_eligible"] is None

@@ -305,12 +305,17 @@ async def test_settlement_quote_label_uses_same_source_as_entry_price(monkeypatc
 
 
 def test_all_18_logical_versions_are_record_only_and_physically_isolated() -> None:
-    from binance_predict.services.live_channels import LIVE_CHANNELS
+    from binance_predict.services.live_channels import LIVE_CHANNELS, RETIRED_CHANNEL_SPECS
     from binance_predict.services.multi_live_trader import X4_VERSIONS
 
     assert len(CANDLESTICK_SIGNAL_IDS) == 18
     assert len(CANDLESTICK_LOGICAL_SPECS) == 18
-    assert set(CANDLESTICK_SIGNAL_IDS) <= set(LIVE_CHANNELS)
+    # 2026-10-22 治理：精确切分在线/归档（仅 2 个在线，其余 16 个归档保留 spec）
+    assert set(CANDLESTICK_SIGNAL_IDS) & set(LIVE_CHANNELS) == {
+        "candle_hm_bull_5m_trend4h_up_shadow_hyp_v1",
+        "candle_hm_bull_15m_union_shadow_v1",
+    }
+    assert len(set(CANDLESTICK_SIGNAL_IDS) & set(RETIRED_CHANNEL_SPECS)) == 16
     assert not (set(CANDLESTICK_SIGNAL_IDS) & set(X4_VERSIONS))
     assert not (set(EVENT_VERSION_BY_TF.values()) & set(LIVE_CHANNELS))
     detector = CandlestickShadowDetector(None, {}, {})

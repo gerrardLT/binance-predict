@@ -71,7 +71,7 @@ def test_default_enabled_without_override() -> None:
     用例版本必须避开 RETIRED_VERSIONS（退役版本恒 False，见文末专项组）。
     """
     g = ShadowVersionGate()
-    assert g.is_enabled("nb_zschamp_15m_v1") is True
+    assert g.is_enabled("crv_dnvol20_15m_v1") is True
     assert g.is_enabled("combo_p1_v1") is True
     assert g.is_enabled("any_unknown_version") is True
     assert g.all_overrides() == {}
@@ -83,11 +83,11 @@ async def test_set_enabled_offline_then_online(monkeypatch) -> None:
     session = _FakeSession(scalar=None)  # 无既有行 → insert
     monkeypatch.setattr(svg, "async_session_factory", lambda: _FakeSessionCtx(session))
     g = ShadowVersionGate()
-    await g.set_enabled("nb_zschamp_15m_v1", False)
-    assert g.is_enabled("nb_zschamp_15m_v1") is False
+    await g.set_enabled("crv_dnvol20_15m_v1", False)
+    assert g.is_enabled("crv_dnvol20_15m_v1") is False
     assert len(session.added) == 1
     row = session.added[0]
-    assert row.version == "nb_zschamp_15m_v1" and row.enabled is False
+    assert row.version == "crv_dnvol20_15m_v1" and row.enabled is False
     assert session.committed
     # 其它版本不受影响（下线是 version 级隔离）
     assert g.is_enabled("combo_p1_v1") is True
@@ -95,19 +95,19 @@ async def test_set_enabled_offline_then_online(monkeypatch) -> None:
     # 再上线：已有行 → update 路径
     session2 = _FakeSession(scalar=row)
     monkeypatch.setattr(svg, "async_session_factory", lambda: _FakeSessionCtx(session2))
-    await g.set_enabled("nb_zschamp_15m_v1", True)
-    assert g.is_enabled("nb_zschamp_15m_v1") is True
+    await g.set_enabled("crv_dnvol20_15m_v1", True)
+    assert g.is_enabled("crv_dnvol20_15m_v1") is True
     assert row.enabled is True and session2.added == []  # update 不新增行
 
 
 @pytest.mark.asyncio
 async def test_refresh_loads_overrides(monkeypatch) -> None:
     """refresh 全量加载覆盖表：False 行生效下线，无覆盖行仍默认在线。"""
-    session = _FakeSession(rows=[("nb_zschamp_15m_v1", False), ("x4_v2", True)])
+    session = _FakeSession(rows=[("crv_dnvol20_15m_v1", False), ("x4_v2", True)])
     monkeypatch.setattr(svg, "async_session_factory", lambda: _FakeSessionCtx(session))
     g = ShadowVersionGate()
     await g.refresh()
-    assert g.is_enabled("nb_zschamp_15m_v1") is False
+    assert g.is_enabled("crv_dnvol20_15m_v1") is False
     assert g.is_enabled("x4_v2") is True
     assert g.is_enabled("combo_p1_v1") is True
 
@@ -122,9 +122,9 @@ async def test_refresh_db_failure_conservative(monkeypatch) -> None:
     await g.refresh()  # 不应抛异常
     assert g.is_enabled("anything") is True  # 首次加载失败 → 全默认在线
     # 已有缓存时故障不清空（维持最后一次成功加载的状态）
-    g._overrides = {"nb_zschamp_15m_v1": False}
+    g._overrides = {"krev_b_v1": False}
     await g.refresh()
-    assert g.is_enabled("nb_zschamp_15m_v1") is False
+    assert g.is_enabled("krev_b_v1") is False
 
 
 # ============================================================
@@ -157,6 +157,8 @@ async def test_nextbar_record_signal_blocked_when_offline(monkeypatch) -> None:
 
     session = _FakeSession(scalar=None)
     monkeypatch.setattr(nsd, "async_session_factory", lambda: _FakeSessionCtx(session))
+    # 2026-10-22 通道治理：nb_zschamp_15m_v1 已归档但影子仍采集；
+    # 本用例验证「手动下线（覆盖行 False）→ 检测器不落库」仍然生效。
     monkeypatch.setattr(nsd.shadow_gate, "_overrides", {"nb_zschamp_15m_v1": False})
     d = nsd.NextbarShadowDetector(collector=None, pm_15m_latest={}, pm_5m_info={})
     t0 = 1_700_000_000_000 // 900_000 * 900_000
@@ -197,10 +199,10 @@ async def test_shadow_toggle_api_writes_gate(monkeypatch) -> None:
         calls.append((version, enabled))
 
     monkeypatch.setattr(m.shadow_gate, "set_enabled", _fake_set)
-    req = ToggleShadowRequest(version="nb_zschamp_15m_v1", enabled=False)
+    req = ToggleShadowRequest(version="crv_dnvol20_15m_v1", enabled=False)
     out = await m.shadow_toggle(req, None)
-    assert calls == [("nb_zschamp_15m_v1", False)]
-    assert out["version"] == "nb_zschamp_15m_v1" and out["enabled"] is False
+    assert calls == [("crv_dnvol20_15m_v1", False)]
+    assert out["version"] == "crv_dnvol20_15m_v1" and out["enabled"] is False
     assert "下线" in out["message"]
 
     req2 = ToggleShadowRequest(version="combo_p1_v1", enabled=True)
@@ -273,6 +275,36 @@ async def test_shadow_toggle_api_rejects_retired_version() -> None:
         monkeypatch.undo()
 
 
+@pytest.mark.asyncio
+async def test_shadow_toggle_api_rejects_archived_version() -> None:
+    """2026-10-22 通道治理：归档版本继续采集，但不接受手动切换（API 闭环）。
+
+    否则可绕过前端隐藏把对照资产停采，或给半个退役态留口子。
+    """
+    import binance_predict.main as m
+    from fastapi import HTTPException
+
+    from binance_predict.models.schemas import ToggleShadowRequest
+
+    v = "quote_contrarian_v2"
+    assert v in svg.ARCHIVED_VERSIONS and v in m.SHADOW_BENCH
+    calls: list[tuple[str, bool]] = []
+
+    async def _fake_set(version: str, enabled: bool) -> None:
+        calls.append((version, enabled))
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(m.shadow_gate, "set_enabled", _fake_set)
+    try:
+        with pytest.raises(HTTPException) as ei:
+            await m.shadow_toggle(ToggleShadowRequest(version=v, enabled=False), None)
+        assert ei.value.status_code == 422
+        assert "已归档" in str(ei.value.detail)
+        assert calls == []          # gate 写入未被触达
+    finally:
+        monkeypatch.undo()
+
+
 def test_retired_versions_cover_all_retired_channels() -> None:
     """两处退役名单必须一致（live_channels.RETIRED_CHANNELS ⊆
     shadow_version_gate.RETIRED_VERSIONS）：通道退役了影子版本也必须退役，
@@ -281,7 +313,9 @@ def test_retired_versions_cover_all_retired_channels() -> None:
     版本，本就无实盘通道。
     """
     from binance_predict.services.live_channels import RETIRED_CHANNELS
-    assert RETIRED_CHANNELS <= svg.RETIRED_VERSIONS
+    # 精确对应：实盘退役集 = 永久退役 ∪ 归档（归档影子仍采集，仅前端隐藏）
+    assert RETIRED_CHANNELS - svg.RETIRED_VERSIONS == svg.ARCHIVED_VERSIONS
+    assert not (svg.ARCHIVED_VERSIONS & svg.RETIRED_VERSIONS)
     assert svg.RETIRED_VERSIONS - RETIRED_CHANNELS == {
         "late_night_contrarian_v1", "hm_touch_down_v1", "hm_touch_down_v2"}
 
@@ -299,5 +333,9 @@ async def test_retired_detector_record_blocked_without_override(monkeypatch) -> 
     monkeypatch.setattr(qed, "async_session_factory", lambda: _FakeSessionCtx(session))
     monkeypatch.setattr(qed.shadow_gate, "_overrides", {})   # 模拟覆盖行被删
     assert qed.shadow_gate.is_enabled("quote_contrarian_v1") is False
+    # 2026-10-22 通道治理：quote_contrarian_v2 归档但影子仍采集（区别于永久退役），
+    # 前端由 is_hidden 隐藏。
     assert qed.shadow_gate.is_enabled("quote_contrarian_v2") is True
+    assert qed.shadow_gate.is_hidden("quote_contrarian_v2") is True
+    assert qed.shadow_gate.is_enabled("crv_dnvol20_15m_v1") is True  # 在线对照
 

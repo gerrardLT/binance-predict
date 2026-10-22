@@ -399,11 +399,12 @@ def test_timeframe_version_partition() -> None:
 
 def test_versions_isolated_from_x4_and_registered_live() -> None:
     """nextbar 双版本只走显式 nextbar 钩子，不得混入 X4 轮询下单路径。"""
-    from binance_predict.services.live_channels import LIVE_CHANNELS
+    from binance_predict.services.live_channels import LIVE_CHANNELS, RETIRED_CHANNEL_SPECS
     from binance_predict.services.multi_live_trader import X4_VERSIONS
     for v in NEXTBAR_VERSIONS:
         assert v not in X4_VERSIONS, f"{v} 不得进入 X4 下单白名单"
-        assert v in LIVE_CHANNELS, f"{v} 应注册为默认关闭的实盘通道"
+        # 2026-10-22 治理：nb_* 两版已归档（spec 保留在台账，不再实盘）
+        assert v in RETIRED_CHANNEL_SPECS, f"{v} 应已归档（spec 保留）"
 
 
 def test_settings_default_on() -> None:

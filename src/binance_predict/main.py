@@ -2834,6 +2834,13 @@ async def shadow_toggle(
         raise HTTPException(
             status_code=422,
             detail=f"影子版本 {req.version} 已永久退役，不可再上线（历史数据仍可在面板查看）")
+    if shadow_gate.is_hidden(req.version):
+        # 2026-10-22 通道治理：归档版本仍继续采集（保留对照资产），不接受手动
+        # 切换；否则 API 可绕过前端隐藏把对照资产停掉。恢复归档需改白名单。
+        raise HTTPException(
+            status_code=422,
+            detail=(f"影子版本 {req.version} 已归档（仅继续采集，不可手动切换；"
+                    "如需恢复实盘请改 KEPT 白名单）"))
     await shadow_gate.set_enabled(req.version, req.enabled)
     return {
         "message": (
@@ -4852,10 +4859,12 @@ async def get_signals_analytics(
 
     event_versions = {"candle_hm_bull_5m_event_v1", "candle_hm_bull_15m_event_v1"}
     live_by_ch = _current_live_channels()
+    from .services.live_channels import RETIRED_CHANNEL_SPECS
+    _retired_live_channels = frozenset(RETIRED_CHANNEL_SPECS)
     registered_versions = (set(SHADOW_VERSIONS) - event_versions) | set(CANDLESTICK_SIGNAL_IDS)
     visible_versions = {
         version for version in registered_versions
-        if not shadow_gate.is_retired(version)
+        if not shadow_gate.is_hidden(version)
         and (shadow_gate.is_enabled(version) or live_by_ch.get(version, {}).get("enabled"))
     } if active_only else None
 
@@ -4966,8 +4975,10 @@ async def get_signals_analytics(
                 "enabled": shadow_gate.is_enabled(v),
                 "retired": shadow_gate.is_retired(v),
                 "collection_mode": "RECORD_ONLY",
+                # 2026-10-22 通道治理：实盘已归档（RETIRED_CHANNELS）也算 LIVE_RETIRED，
+                # 与「影子仅记录」区分开（归档影子仍采集，仅前端隐藏）。
                 "execution_mode": (
-                    "LIVE_RETIRED" if shadow_gate.is_retired(v) else
+                    "LIVE_RETIRED" if (shadow_gate.is_retired(v) or v in _retired_live_channels) else
                     "LIVE_ACTIVE" if live_by_ch.get(v, {}).get("enabled") else
                     "LIVE_AVAILABLE" if v in live_by_ch else "SHADOW_ONLY"
                 ),
@@ -5775,7 +5786,7 @@ async def get_signals_execution_comparison(
         live_by_ch = _current_live_channels()
         active_versions = {
             version for version in SHADOW_BENCH
-            if not shadow_gate.is_retired(version)
+            if not shadow_gate.is_hidden(version)
             and (shadow_gate.is_enabled(version) or live_by_ch.get(version, {}).get("enabled"))
         }
         from .services.candlestick_shadow_detector import (

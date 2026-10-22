@@ -66,6 +66,39 @@ RETIRED_VERSIONS: frozenset[str] = frozenset({
     "gap_crowd_5m_v1", "gap_crowd_15m_v1",
 })
 
+# 2026-10-22 通道治理（用户拍板）：与 live_channels.KEPT_CHANNELS_20261022 对齐。
+# 归档 ≠ 退役：影子检测器照常采集/落表（保留对照资产与研究审计），
+# 但前端 active_only 过滤（is_hidden）在影子/实盘双端不再展示。
+# 实盘侧已从 LIVE_CHANNELS 移入 RETIRED_CHANNEL_SPECS，不可再 toggle。
+ARCHIVED_VERSIONS: frozenset[str] = frozenset({
+    "quote_contrarian_v2", "late_night_contrarian_v2", "x4_v3",
+    "s5_deep_z20_v1", "s1_early2_v1", "s1_dyn_sq_v1",
+    "scene_bear_exhaust_opt_v1", "s4_delay60_v1", "s1_dip45_v1",
+    "s2_cond_t4_v1", "s2_cond_t5d_v1",
+    "nb_zschamp_15m_v1", "nb_smaslope_5m_v1",
+    "hm_inside_5m_v2", "ih_inside_15m_v2",
+    "krev_a_v1", "rev_p1_v1", "rev_p2_v1", "brkrv_brk8h_15m_v1",
+    "firsthit_down_chg_early180_v1", "firsthit_down_k10_early180_v1",
+    "firsthit_down_v1", "firsthit_down_body_v1", "firsthit_down_chg_v2",
+    "firsthit_down_g4_v1",
+    "candle_hm_bull_5m_consensus2_shadow_v1",
+    "candle_hm_bull_5m_consensus3_shadow_v1",
+    "candle_hm_bull_15m_consensus3_shadow_v1",
+    "candle_hm_bull_5m_ret5_majority_component_shadow_v1",
+    "candle_hm_bull_5m_ret3_component_shadow_v1",
+    "candle_hm_bull_15m_ret3_component_shadow_v1",
+    "candle_hm_bull_15m_ma10_component_shadow_v1",
+    "candle_hm_bull_5m_volume_mid_high_shadow_hyp_v1",
+    "candle_hm_bull_5m_asia_shadow_hyp_v1",
+    "candle_hm_bull_15m_q45_55_shadow_hyp_v1",
+    "candle_hm_bull_15m_trend1h_up_shadow_hyp_v1",
+    "candle_hm_bull_15m_asia_shadow_hyp_v1",
+    "candidate_5m_ret5_majority_up_upper_bull_l70b30m10_shadow_hyp_v1",
+    "candidate_5m_ret3_up_lower_bear_l50b50m0_shadow_hyp_v1",
+    "candidate_15m_ret5_majority_up_lower_bull_l50b40m10_shadow_hyp_v1",
+    "candidate_15m_ret3_down_upper_bull_l50b40m10_shadow_hyp_v1",
+})
+
 
 class ShadowVersionGate:
     """影子版本开关闸门：内存缓存 {version: enabled}，只存覆盖行（默认 True 不占内存）。"""
@@ -94,6 +127,11 @@ class ShadowVersionGate:
     def is_retired(version: str) -> bool:
         """是否永久退役版本（toggle API 拒绝上线 / 面板标注用）。"""
         return version in RETIRED_VERSIONS
+
+    @staticmethod
+    def is_hidden(version: str) -> bool:
+        """前端是否隐藏：永久退役 + 2026-10-22 治理归档（归档影子仍照常采集）。"""
+        return version in RETIRED_VERSIONS or version in ARCHIVED_VERSIONS
 
     def all_overrides(self) -> dict[str, bool]:
         """当前覆盖表快照（审计/状态端点用）。"""

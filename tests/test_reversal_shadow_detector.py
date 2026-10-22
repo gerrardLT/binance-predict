@@ -482,14 +482,15 @@ async def test_fresh_reversal_hit_dispatches_frozen_direction(
 # ============================================================
 
 def test_versions_registered_as_live_channels() -> None:
-    from binance_predict.services.live_channels import LIVE_CHANNELS
+    from binance_predict.services.live_channels import LIVE_CHANNELS, RETIRED_CHANNEL_SPECS
+    all_specs = {**RETIRED_CHANNEL_SPECS, **LIVE_CHANNELS}  # 2026-10-22 治理：P1/P2 已归档
     from binance_predict.services.multi_live_trader import X4_VERSIONS
     expected = {spec["version"]: spec["direction"] for spec in REVERSAL_SHADOW_SPECS}
     for version, direction in expected.items():
         assert version not in X4_VERSIONS
-        assert LIVE_CHANNELS[version].family == "kline_reversal"
-        assert LIVE_CHANNELS[version].market_period == "15m"
-        assert LIVE_CHANNELS[version].direction == direction
+        assert all_specs[version].family == "kline_reversal"
+        assert all_specs[version].market_period == "15m"
+        assert all_specs[version].direction == direction
 
 
 def test_settings_default_on() -> None:

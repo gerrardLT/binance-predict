@@ -452,7 +452,8 @@ async def test_s2_optimized_shadow_appears_in_analytics() -> None:
     assert summary["n"] == 1
     assert summary["win_rate"] == 1.0
     assert summary["avg_ev"] == pytest.approx(0.96)
-    assert summary["execution_mode"] == "SHADOW_ONLY"  # 测试未装配 MultiLiveTrader
+    # 2026-10-22 通道治理：该版本已归档 → 面板显式标 LIVE_RETIRED（数据仍可查）
+    assert summary["execution_mode"] == "LIVE_RETIRED"
     from binance_predict.services.shadow_execution_registry import SHADOW_VERSION_SPECS
     assert SHADOW_VERSION_SPECS["scene_bear_exhaust_opt_v1"].live_channel == (
         "scene_bear_exhaust_opt_v1"
@@ -464,25 +465,25 @@ async def test_analytics_active_only_hides_offline_and_retired_versions(monkeypa
     """分析页只返回仍在线采集或仍在实盘执行的信号，历史下线版本不传给前端。"""
     import binance_predict.main as m
 
-    monkeypatch.setattr(m.shadow_gate, "is_retired", lambda version: version == "x4_v1")
+    monkeypatch.setattr(m.shadow_gate, "is_hidden", lambda version: version == "x4_v1")
     monkeypatch.setattr(
         m.shadow_gate, "is_enabled",
-        lambda version: version not in {"x4_v1", "x4_v2", "krev_a_v1"},
+        lambda version: version not in {"x4_v1", "x4_v2", "crv_dnvol20_15m_v1"},
     )
     monkeypatch.setattr(m, "multi_live_trader", SimpleNamespace(status=MagicMock(return_value={
         "channels": [{
-            "channel": "krev_a_v1", "enabled": True,
-            "amount_usdt": 2.0, "max_daily_orders": 100, "max_exec_price": 0.629,
+            "channel": "crv_dnvol20_15m_v1", "enabled": True,
+            "amount_usdt": 2.0, "max_daily_orders": 100, "max_exec_price": 0.57,
         }],
     })))
     out = await m.get_signals_analytics(_make_db([], []), active_only=True)
 
     assert "x4_v1" not in out["shadow"]
     assert "x4_v2" not in out["shadow"]
-    assert "krev_a_v1" in out["shadow"]  # 影子虽关闭，但实盘仍开，不能从分析页消失
-    assert out["shadow"]["krev_a_v1"]["summary"]["execution_mode"] == "LIVE_ACTIVE"
+    assert "crv_dnvol20_15m_v1" in out["shadow"]  # 影子虽关闭，但实盘仍开，不能从分析页消失
+    assert out["shadow"]["crv_dnvol20_15m_v1"]["summary"]["execution_mode"] == "LIVE_ACTIVE"
     assert all(block["summary"]["enabled"] for version, block in out["shadow"].items()
-               if version != "krev_a_v1")
+               if version != "crv_dnvol20_15m_v1")
     assert out["scene"] == {}  # 测试替身未提供已开启的正式场景通道
 
 @pytest.mark.asyncio
@@ -541,12 +542,17 @@ async def test_analytics_empty_db() -> None:
             "scene_bear_exhaust", "scene_momentum_fade",
         }
     from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
+    from binance_predict.services.live_channels import RETIRED_CHANNELS
     assert set(out["shadow"].keys()) == expected | set(CANDLESTICK_SIGNAL_IDS)
     assert "candle_hm_bull_5m_event_v1" not in out["shadow"]
     for version in CANDLESTICK_SIGNAL_IDS:
         summary = out["shadow"][version]["summary"]
         assert summary["collection_mode"] == "RECORD_ONLY"
-        assert summary["execution_mode"] == "SHADOW_ONLY"
+        # 2026-10-22 治理：已归档 candle 版本显式标 LIVE_RETIRED，在线版本为 SHADOW_ONLY
+        if version in RETIRED_CHANNELS:
+            assert summary["execution_mode"] == "LIVE_RETIRED"
+        else:
+            assert summary["execution_mode"] == "SHADOW_ONLY"
         assert summary["family"] == "candlestick_reversal"
         assert summary["bench_winrate"] is not None
         assert summary["bench_max_entry_price"] == pytest.approx(
@@ -605,7 +611,7 @@ async def test_analytics_empty_db() -> None:
     # 30d q90 动态门的720d基准64.93%。
     s1d = out["shadow"]["s1_dyn_sq_v1"]["summary"]
     assert s1d["bench_winrate"] == 0.6493 and s1d["bench_ev"] is None
-    assert s1d["execution_mode"] == "SHADOW_ONLY"
+    assert s1d["execution_mode"] == "LIVE_RETIRED"  # 2026-10-22 归档
     assert s1d["desc"].startswith("S1动态轧空路由")
     from binance_predict.services.shadow_execution_registry import SHADOW_VERSION_SPECS
     assert SHADOW_VERSION_SPECS["s1_dyn_sq_v1"].live_channel == "s1_dyn_sq_v1"
@@ -1001,44 +1007,38 @@ async def test_analytics_live_channel_field(monkeypatch) -> None:
     assert all(b["summary"]["live_channel"] is None
                for b in out["shadow"].values())
 
-    # 装配替身：nextbar + KREV 通道在册（状态直通下发，不查 DB）
+    # 装配替身：在线通道在册（状态直通下发，不查 DB；归档通道不再出现于执行器）
     fake = SimpleNamespace(status=MagicMock(return_value={
         "channels": [{
-            "channel": "nb_zschamp_15m_v1", "enabled": False,
+            "channel": "crv_dnvol20_15m_v1", "enabled": False,
             "amount_usdt": 2.0, "max_daily_orders": 100, "max_exec_price": 0.57,
         }, {
-            "channel": "nb_smaslope_5m_v1", "enabled": False,
-            "amount_usdt": 2.0, "max_daily_orders": 100, "max_exec_price": 0.46,
+            "channel": "krev_b_v1", "enabled": False,
+            "amount_usdt": 2.0, "max_daily_orders": 100, "max_exec_price": 0.621,
         }, {
-            "channel": "s1_dyn_sq_v1", "enabled": False,
-            "amount_usdt": 2.0, "max_daily_orders": 100, "max_exec_price": 0.63,
-        }, {
-            "channel": "krev_a_v1", "enabled": False,
-            "amount_usdt": 2.0, "max_daily_orders": 100, "max_exec_price": 0.629,
+            "channel": "hm_inside_15m_v2", "enabled": False,
+            "amount_usdt": 2.0, "max_daily_orders": 100, "max_exec_price": 0.30,
         }],
     }))
     monkeypatch.setattr(m, "multi_live_trader", fake)
     out2 = await m.get_signals_analytics(_make_db([], []))
-    assert out2["shadow"]["nb_zschamp_15m_v1"]["summary"]["live_channel"] == {
+    assert out2["shadow"]["crv_dnvol20_15m_v1"]["summary"]["live_channel"] == {
         "enabled": False, "amount_usdt": 2.0,
         "max_daily_orders": 100, "max_exec_price": 0.57,
     }
-    assert out2["shadow"]["nb_zschamp_15m_v1"]["summary"]["guard_price"] == 0.57
-    assert out2["shadow"]["nb_smaslope_5m_v1"]["summary"]["live_channel"] == {
+    assert out2["shadow"]["crv_dnvol20_15m_v1"]["summary"]["guard_price"] == 0.57
+    assert out2["shadow"]["krev_b_v1"]["summary"]["live_channel"] == {
         "enabled": False, "amount_usdt": 2.0,
-        "max_daily_orders": 100, "max_exec_price": 0.46,
+        "max_daily_orders": 100, "max_exec_price": 0.621,
     }
-    assert out2["shadow"]["s1_dyn_sq_v1"]["summary"]["live_channel"] == {
+    assert out2["shadow"]["hm_inside_15m_v2"]["summary"]["live_channel"] == {
         "enabled": False, "amount_usdt": 2.0,
-        "max_daily_orders": 100, "max_exec_price": 0.63,
+        "max_daily_orders": 100, "max_exec_price": 0.30,
     }
-    assert out2["shadow"]["s1_dyn_sq_v1"]["summary"]["execution_mode"] == "LIVE_AVAILABLE"
-    assert out2["shadow"]["s1_dyn_sq_v1"]["summary"]["guard_price"] == 0.63
-    assert out2["shadow"]["krev_a_v1"]["summary"]["live_channel"] == {
-        "enabled": False, "amount_usdt": 2.0,
-        "max_daily_orders": 100, "max_exec_price": 0.629,
-    }
-    assert out2["shadow"]["krev_a_v1"]["summary"]["execution_mode"] == "LIVE_AVAILABLE"
+    assert out2["shadow"]["hm_inside_15m_v2"]["summary"]["execution_mode"] == "LIVE_AVAILABLE"
+    assert out2["shadow"]["hm_inside_15m_v2"]["summary"]["guard_price"] == 0.30
+    # 2026-10-22 治理：归档通道会被标记退役，不再 LIVE_AVAILABLE
+    assert out2["shadow"]["krev_a_v1"]["summary"]["execution_mode"] == "LIVE_RETIRED"
     # 未出现在执行器状态中的版本仍为 None；状态只拉一次，非逐版本查询。
     assert out2["shadow"]["combo_p1_v1"]["summary"]["live_channel"] is None
     assert fake.status.call_count == 1
