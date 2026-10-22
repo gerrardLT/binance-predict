@@ -2524,6 +2524,10 @@ async def manual_trade_test(
         return {"error": "max_exec_price 仅允许 0~1 开区间"}
     if req.price_limit is not None and not (0.0 < req.price_limit < 1.0):
         return {"error": "price_limit 仅允许 0~1 开区间"}
+    # LIMIT 必须给限价：缺失时 effective_guard=None，会向币安下发一张没有
+    # priceLimit 的限价单（语义退化为「按报价成交」），属于静默错单（S#1 同类）。
+    if req.order_type == "LIMIT" and req.price_limit is None:
+        return {"error": "LIMIT 必须提供 price_limit（0~1 开区间，作为挂单价与护栏）"}
     # LIMIT 的限价值与护栏共用 max_exec_price（execute_signal_trade line: limit_price=max_exec_price）；
     # MARKET 则仅用 max_exec_price 作护栏
     effective_guard = (

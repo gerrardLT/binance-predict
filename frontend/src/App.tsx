@@ -1917,6 +1917,10 @@ function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }
   const lastReloadRef = useRef(0)
   const [amount, setAmount] = useState('1')
   const [side, setSide] = useState<'UP' | 'DOWN'>('UP')
+  // 下单方式（2026-10-22）：市价 FOK 立即成交 / 限价 GTC 挂单。
+  // LIMIT 的挂单价即 price_limit（后端 effective_guard → limit_price），无自由定价之外的护栏。
+  const [orderType, setOrderType] = useState<'MARKET' | 'LIMIT'>('MARKET')
+  const [limitPrice, setLimitPrice] = useState('0.50')
   const [busy, setBusy] = useState(false)
   const [results, setResults] = useState<Record<string, unknown>[]>([])
   const [currentWin, setCurrentWin] = useState<Record<string, unknown> | null>(null)
@@ -1963,7 +1967,10 @@ function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }
   // 可连选的未来窗（可用且距开盘 ≥5s）；连选钮数量随实际窗口数自适应，不再设上限
   const nextAvailWins = future.filter(w =>
     w.available && w.window_start - nowMs >= 5_000)
+  const limitNum = parseFloat(limitPrice)
+  const limitOk = Number.isFinite(limitNum) && limitNum > 0 && limitNum < 1
   const canSubmit = amtOk && !busy && targets.length > 0
+    && (orderType === 'MARKET' || limitOk)
     && (!bigAmount || confirmed)
 
   // 踩线自动移出 + 大额时要求确认
@@ -2023,9 +2030,15 @@ function TestTradeFab({ quote, remainSec, wallet, refresh, orders, clockOffset }
         const res = await api.postTradeTest(amtNum, side, {
           market_period: period,
           window_start: ws,
+          ...(orderType === 'LIMIT'
+            ? { order_type: 'LIMIT', price_limit: limitNum }
+            : { order_type: 'MARKET' }),
         })
         out.push({ ...res, window_start: ws,
-          window_end: ws + step })
+          window_end: ws + step,
+          // 附带本次提交的下单方式，供结果区区分「成交价」与「挂单价」
+          order_type: orderType,
+          limit_price: orderType === 'LIMIT' ? limitNum : null })
         // 逐窗独立尝试（每窗一单占位互不影响）；余额不足等硬错误会逐窗复现于结果
       }
       setResults(out)
@@ -2284,6 +2297,37 @@ ${names}
               )}
             </div>
 
+            {/* 下单方式：市价 FOK 立即成交 / 限价 GTC 挂单（挂单价=price_limit） */}
+            <div className="space-y-1.5">
+              <div className="flex items-center gap-1.5 flex-wrap text-xs">
+                <span className="text-ink-55 shrink-0">下单方式</span>
+                {(['MARKET', 'LIMIT'] as const).map(t => (
+                  <button key={t} onClick={() => setOrderType(t)}
+                    className={`px-2.5 py-0.5 rounded-pill border ${orderType === t
+                      ? 'bg-brand text-white border-brand font-semibold'
+                      : 'border-line bg-card text-ink-80 hover:border-brand'}`}
+                  >{t === 'MARKET' ? '市价（立即成交）' : '限价（挂单等成交）'}</button>
+                ))}
+                {orderType === 'LIMIT' && (
+                  <>
+                    <label className="ml-2 text-ink-55 shrink-0">挂单价</label>
+                    <input type="number" min={0.01} max={0.99} step={0.01} value={limitPrice}
+                      onChange={e => setLimitPrice(e.target.value)}
+                      className="ds-input ds-input-numeric w-20" />
+                    <span className={`text-[11px] ${limitOk ? 'text-ink-55' : 'text-negative'}`}>
+                      {limitOk ? '0~1 开区间' : '限价须在 0~1 开区间'}
+                    </span>
+                  </>
+                )}
+              </div>
+              {orderType === 'LIMIT' && (
+                <div className="text-[11px] text-ink-55 leading-4">
+                  限价单挂入撮合簿等待被动成交，可能不成交；窗口结束仍未成交会自动撤单，不会留到下一窗。
+                  限价同时充当护栏，报价超过挂单价时不会被吃掉。
+                </div>
+              )}
+            </div>
+
             {/* 大额确认（仅 >10U 出现） */}
             {bigAmount && (
               <label className="flex items-center gap-2 p-2 rounded-sm border border-warning bg-warning/10 text-xs text-ink-80">
@@ -2297,7 +2341,7 @@ ${names}
               className={`ds-btn-primary w-full py-3 text-base font-bold disabled:opacity-40 ${busy ? 'cursor-wait' : ''}`}
             >
               {busy ? '下单中…'
-                : `一键下单（${side === 'UP' ? '涨' : '跌'} ${amount}U${targets.length > 1 ? ` × ${targets.length} 窗` : ''}）`}
+                : `一键下单（${side === 'UP' ? '涨' : '跌'} ${amount}U${targets.length > 1 ? ` × ${targets.length} 窗` : ''} · ${orderType === 'LIMIT' ? `限价 ${limitPrice}` : '市价'}）`}
             </button>
 
             {/* 结果 */}
@@ -2305,13 +2349,18 @@ ${names}
               <div className="space-y-1">
                 {results.map((r, i) => {
                   const ok = r.status === 'FILLED'
+                  // 限价挂单返回 PENDING（已提交撮合簿、尚未成交），不能当失败展示
+                  const pending = r.status === 'PENDING'
                   return (
-                    <div key={i} className={`p-2 rounded-sm text-xs ${ok ? 'bg-positive-soft text-positive' : 'bg-negative-soft text-negative'}`}>
-                      <span className="font-bold">{ok ? '✓ 成交' : '✗ 失败'}</span>
+                    <div key={i} className={`p-2 rounded-sm text-xs ${ok
+                      ? 'bg-positive-soft text-positive'
+                      : pending ? 'bg-warning/10 text-warning' : 'bg-negative-soft text-negative'}`}>
+                      <span className="font-bold">{ok ? '✓ 成交' : pending ? '⏳ 已挂单' : '✗ 失败'}</span>
                       {r.window_start != null && (
                         <span className="ml-1.5 font-mono">{fmtHHMM(Number(r.window_start))}–{r.window_end != null ? fmtHHMM(Number(r.window_end)) : '--'}</span>
                       )}
-                      {r.average_price != null && <span className="ml-1.5">@{String(r.average_price)}</span>}
+                      {r.average_price != null && !pending && <span className="ml-1.5">@{String(r.average_price)}</span>}
+                      {pending && r.limit_price != null && <span className="ml-1.5 font-mono">挂单 @{String(r.limit_price)}，等被动成交</span>}
                       {r.filled_shares != null && <span className="ml-1.5">{String(r.filled_shares)}股</span>}
                       {(r.error || r.error_message) != null && <span className="ml-1.5">{String(r.error ?? r.error_message)}</span>}
                     </div>

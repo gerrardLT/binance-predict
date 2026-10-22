@@ -129,6 +129,26 @@ async def test_trade_test_limit_order_passthrough(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_trade_test_limit_requires_price_limit(monkeypatch) -> None:
+    """LIMIT 缺 price_limit → 拒绝且不调 trader（否则下发无限价限价单）。"""
+    import binance_predict.main as m
+
+    called = []
+
+    async def _exec(**kw):  # pragma: no cover - 不应被调用
+        called.append(kw)
+        return _order()
+
+    monkeypatch.setattr(m.prediction_trader, "execute_signal_trade", _exec)
+    out = await m.manual_trade_test(
+        ManualTradeTestRequest(amount_usdt=0.5, prediction="DOWN", order_type="LIMIT"),
+        _=None,
+    )
+    assert "price_limit" in out["error"]
+    assert called == []
+
+
+@pytest.mark.asyncio
 async def test_trade_test_order_none_returns_error(monkeypatch) -> None:
     """trader 返回 None（key 未配/钱包失败/同窗占位）→ error + window_start。"""
     import binance_predict.main as m
