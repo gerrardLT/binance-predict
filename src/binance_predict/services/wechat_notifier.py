@@ -436,6 +436,38 @@ class WeChatNotifier:
         self.push_markdown("\n".join(lines))
 
     # ------------------------------------------------------------------
+    # 结算对账：本地结果 vs 币安官方 winning_outcome
+    # ------------------------------------------------------------------
+
+    def notify_settlement_mismatch(self, mismatches: list[dict]) -> None:
+        """结算对账不一致告警（汇总一条；同一批订单只推一次）。
+
+        只告警不改库：财务数据更正走人工确认 + 一次性修复 workflow。
+        """
+        if not mismatches:
+            return
+        dedup_key = "settle_mismatch_" + ",".join(
+            str(m.get("id")) for m in mismatches[:20])
+        if dedup_key in self._sent_warnings:
+            return
+        self._sent_warnings[dedup_key] = time.time()
+
+        lines = [f"### ⚠️【结算对账不一致】{len(mismatches)} 笔与币安官方结果不符"]
+        for m in mismatches[:10]:
+            pnl = m.get("local_pnl")
+            pnl_str = f"{pnl:+.2f}" if isinstance(pnl, (int, float)) else "N/A"
+            lines.append(
+                f"> **#{m.get('id')} {format_channel_title(str(m.get('channel') or 'unknown'))}**"
+                f" {m.get('period')} | 下注 `{m.get('direction')}`"
+                f" | 本地 `{m.get('local_outcome')}`/`{m.get('local_win')}`/{pnl_str}U"
+                f" | 官方 `{m.get('official_outcome')}`"
+            )
+        if len(mismatches) > 10:
+            lines.append(f"> …另有 {len(mismatches) - 10} 笔，详见日志 CRITICAL")
+        lines.append("> 数据未自动更正；确认后用一次性修复 workflow 处理。")
+        self.push_markdown("\n".join(lines))
+
+    # ------------------------------------------------------------------
     # 系统状态：预测钱包低余额预警
     # ------------------------------------------------------------------
 

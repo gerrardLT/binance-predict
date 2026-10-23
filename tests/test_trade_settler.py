@@ -624,3 +624,169 @@ async def test_hm_moderate_5m_missing_shadow_falls_back_to_window(monkeypatch) -
     assert p["settle_outcome"] == "DOWN"
     assert p["win"] is True
     assert p["settle_price"] == pytest.approx(43250.0)
+
+
+# ------------------------------------------------------------------
+# 官方结算优先（2026-10-23）：winning_outcome > K 线归档/影子行
+# ------------------------------------------------------------------
+
+class _FakeOfficial:
+    """OfficialSettlementClient 替身：返回固定结局并记录调用。"""
+
+    def __init__(self, outcome: str | None) -> None:
+        self.outcome = outcome
+        self.calls: list[tuple[str, int]] = []
+
+    async def fetch_outcome(self, period: str, window_start: int):
+        self.calls.append((period, window_start))
+        return self.outcome
+
+
+@pytest.mark.asyncio
+async def test_official_overrides_kline_window(monkeypatch) -> None:
+    """官方 DOWN 覆盖窗口 UP：DOWN 单判赢，settle_price 留空（官方无价）。"""
+    db = _Db([_row(direction="DOWN")], _window("UP", exit_price=99999.0))
+    _stub_db(monkeypatch, db)
+    fake = _FakeOfficial("DOWN")
+
+    assert await TradeSettler(official_client=fake).poll_once() == 1
+
+    p = _params(db.updates[0])
+    assert p["settle_outcome"] == "DOWN"
+    assert p["win"] is True
+    assert p["settle_price"] is None
+    assert fake.calls == [("5m", WS)]
+
+
+@pytest.mark.asyncio
+async def test_official_pending_retries_within_30min(monkeypatch) -> None:
+    """官方 PENDING（市场未出结果）且订单未超 30min → 不结算，下轮重试。"""
+    recent = datetime.now(timezone.utc) - timedelta(minutes=10)
+    db = _Db([_row(created_at=recent)], _window("DOWN"))
+    _stub_db(monkeypatch, db)
+
+    assert await TradeSettler(official_client=_FakeOfficial("PENDING")).poll_once() == 0
+    assert db.updates == []
+
+
+@pytest.mark.asyncio
+async def test_official_pending_stale_falls_back_to_kline(monkeypatch) -> None:
+    """PENDING 超 30min → 回退 K 线归档，避免订单永久卡在途。"""
+    old = datetime.now(timezone.utc) - timedelta(hours=2)
+    db = _Db([_row(created_at=old)], _window("DOWN"))
+    _stub_db(monkeypatch, db)
+
+    assert await TradeSettler(official_client=_FakeOfficial("PENDING")).poll_once() == 1
+
+    p = _params(db.updates[0])
+    assert p["settle_outcome"] == "DOWN"
+    assert p["settle_price"] == pytest.approx(43250.0)
+
+
+@pytest.mark.asyncio
+async def test_official_none_falls_back_to_kline(monkeypatch) -> None:
+    """官方查询失败/未找到 → 回退 K 线归档（原行为不变）。"""
+    db = _Db([_row()], _window("DOWN"))
+    _stub_db(monkeypatch, db)
+
+    assert await TradeSettler(official_client=_FakeOfficial(None)).poll_once() == 1
+
+    p = _params(db.updates[0])
+    assert p["settle_outcome"] == "DOWN"
+    assert p["settle_price"] == pytest.approx(43250.0)
+
+
+@pytest.mark.asyncio
+async def test_official_overrides_scene_signal(monkeypatch) -> None:
+    """15m scene 订单：官方 DOWN 覆盖信号行 UP，且不再回读信号行。"""
+    scene_sig = SimpleNamespace(
+        id=42, settle_outcome="UP", settle_btc_price=79000.0,
+        settle_deadline=int((datetime.now(timezone.utc)
+                             + timedelta(hours=1)).timestamp() * 1000),
+    )
+    db = _Db(
+        [_row(market_period="15m", scene_signal_id=42, direction="DOWN",
+              signal_version="scene_bear_exhaust")],
+        None, scene_signal=scene_sig)
+    _stub_db(monkeypatch, db)
+
+    assert await TradeSettler(official_client=_FakeOfficial("DOWN")).poll_once() == 1
+
+    p = _params(db.updates[0])
+    assert p["settle_outcome"] == "DOWN"
+    assert p["win"] is True
+    assert p["settle_price"] is None
+    db.get.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_official_overrides_kline_shadow(monkeypatch) -> None:
+    """15m K 线影子订单：官方 UP 覆盖影子行 DOWN。"""
+    shadow = _shadow("DOWN", win=False, settle_close=79000.0)
+    db = _Db([_row15(direction="UP")], None, shadow=shadow)
+    _stub_db(monkeypatch, db)
+
+    assert await TradeSettler(official_client=_FakeOfficial("UP")).poll_once() == 1
+
+    p = _params(db.updates[0])
+    assert p["settle_outcome"] == "UP"
+    assert p["win"] is True
+    assert p["settle_price"] is None
+
+
+@pytest.mark.asyncio
+async def test_reconcile_reports_mismatch_and_alerts(monkeypatch) -> None:
+    """对账：本地 win 与官方不符 → 返回 mismatch 并推企微告警（不改库）。"""
+    settled = _row(
+        settled_at=datetime.now(timezone.utc), direction="DOWN",
+        settle_outcome="UP", win=True, pnl=-1.0,
+    )
+    db = _Db([settled], None)
+    _stub_db(monkeypatch, db)
+    alerts: list[list[dict]] = []
+    monkeypatch.setattr(
+        ts_mod.wechat_notifier, "notify_settlement_mismatch",
+        lambda mismatches: alerts.append(mismatches),
+    )
+
+    result = await TradeSettler(
+        official_client=_FakeOfficial("UP")).reconcile_official(days=2)
+
+    assert result["checked"] == 1
+    assert len(result["mismatches"]) == 1
+    assert result["mismatches"][0]["official_outcome"] == "UP"
+    assert alerts and alerts[0][0]["id"] == 11
+    assert db.updates == []  # 只告警，不改财务数据
+
+
+@pytest.mark.asyncio
+async def test_reconcile_without_client_returns_error(monkeypatch) -> None:
+    """未配置官方源 → 明确返回 error（不误报 0 不一致）。"""
+    result = await TradeSettler(official_client=None).reconcile_official(days=2)
+    assert "error" in result
+    assert result["checked"] == 0
+
+
+@pytest.mark.asyncio
+async def test_reconcile_includes_expired_orders(monkeypatch) -> None:
+    """EXPIRED（归档缺失、pnl=0）也纳入对账：官方有结果时告警。"""
+    expired = _row(
+        settled_at=datetime.now(timezone.utc), direction="DOWN",
+        settle_outcome="EXPIRED", win=None, pnl=0.0,
+    )
+    db = _Db([expired], None)
+    _stub_db(monkeypatch, db)
+    alerts: list[list[dict]] = []
+    monkeypatch.setattr(
+        ts_mod.wechat_notifier, "notify_settlement_mismatch",
+        lambda mismatches: alerts.append(mismatches),
+    )
+
+    result = await TradeSettler(
+        official_client=_FakeOfficial("DOWN")).reconcile_official(days=1)
+
+    assert result["checked"] == 1
+    assert len(result["mismatches"]) == 1
+    assert result["mismatches"][0]["local_outcome"] == "EXPIRED"
+    assert alerts
+

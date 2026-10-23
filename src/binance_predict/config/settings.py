@@ -77,9 +77,11 @@ class Settings(BaseSettings):
     log_rotation: str = "00:00"  # 每天零点切割
     log_retention: str = "14 days"  # 保留 14 天
 
-    # --- Predexon 历史数据源（仅供离线回填脚本读取，运行时不用）---
-    # scripts/predexon_backfill.py 直接从 .env 读此键（多 key 逗号分隔）；
-    # 显式声明收录，避免 pydantic-settings extra=forbid 拒绝整个配置加载。
+    # --- Predexon（多 key 逗号分隔）---
+    # 两处使用：① scripts/predexon_backfill.py 离线回填直接从 .env 读；
+    # ② 运行时 official_settlement 用它查询币安市场官方 winning_outcome（结算优先源，
+    # 未配置时自动回退币安 K 线口径）。显式声明收录，避免 pydantic-settings
+    # extra=forbid 拒绝整个配置加载。
     predexon_api_key: str = ""
 
     # --- 生产环境 HTTP API（本地只读运维/研究导出用，运行时不用）---

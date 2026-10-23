@@ -34,6 +34,17 @@ def suppress_real_wechat_push(monkeypatch):
     monkeypatch.setattr(wechat_notifier, "_send_markdown_raw", AsyncMock(return_value=True))
 
 
+@pytest.fixture(autouse=True)
+def disable_official_settlement_network(monkeypatch):
+    """单测默认禁用官方结算源（.env 可能配了 PREDEXON_API_KEY，防真实网络请求）。
+
+    需要验证官方优先分支时，构造 TradeSettler(official_client=<替身>) 显式注入，
+    或直接测试 OfficialSettlementClient 并 mock 其 _request。
+    """
+    import binance_predict.services.trade_settler as ts_mod
+    monkeypatch.setattr(ts_mod, "get_official_settlement_client", lambda: None)
+
+
 @pytest.fixture
 def mock_prediction_trader():
     """Mock BinancePredictionTrader instance with default state."""

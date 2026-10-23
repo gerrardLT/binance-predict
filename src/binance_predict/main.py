@@ -3933,6 +3933,25 @@ async def settle_scan(_: None = Depends(_require_auth)):
     return {"settled": settled}
 
 
+@app.post("/api/trades/reconcile-official")
+async def reconcile_official(
+    days: int = 2,
+    _: None = Depends(_require_auth),
+):
+    """手动触发「已结算订单 vs 币安官方 winning_outcome」对账（只告警不改数据）。
+
+    每日 UTC 03:00 由 TradeSettler 自动跑一次；本端点用于部署后验证、
+    人工排查历史窗口。官方源未配置（PREDEXON_API_KEY）时返回 error。
+    """
+    if trade_settler is None:
+        return {"error": "结算器未装配（启动异常？详见后端日志）",
+                "checked": 0, "mismatches": []}
+    try:
+        return await trade_settler.reconcile_official(days=days)
+    except Exception as e:
+        return {"error": f"对账失败: {e}", "checked": 0, "mismatches": []}
+
+
 @app.get("/api/logs/tail")
 async def tail_logs(
     lines: int = 200,
