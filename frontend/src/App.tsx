@@ -879,7 +879,14 @@ interface PackDetail {
   status: string
   missing: string[]
   pack: {
-    pre?: { klines_1m?: number[][]; klines_5m?: number[][]; quotes?: PackQuotePoint[]; regime?: Record<string, number | null>; channel_state?: Record<string, unknown> }
+    pre?: {
+      klines_1m?: number[][]; klines_5m?: number[][]
+      /** v2：按真实决策时刻切的已收盘 K 线（场景卡专用） */
+      klines_1m_decision?: number[][]; klines_5m_decision?: number[][]
+      decision_ts?: number | null; decision_source?: string | null; decision_slice?: string
+      ref_price?: number | null
+      quotes?: PackQuotePoint[]; regime?: Record<string, number | null>; channel_state?: Record<string, unknown>
+    }
     exec?: { order?: Record<string, unknown>; assessment?: Record<string, unknown> | null; quote?: Record<string, unknown>; timeline?: Record<string, unknown> }
     post?: { window_klines_1m?: number[][]; quotes_around_settle?: PackQuotePoint[]; settle?: Record<string, unknown>; siblings?: Record<string, unknown>[] }
   }
@@ -5310,6 +5317,104 @@ function RunDetailBody({ detail }: { detail: AttributionRunDetail }) {
   )
 }
 
+// ============================================================
+// 订单场景卡（证据包 v2）：决策前 24×5m + 15×1m 蜡烛 + 决策竖线 + 结果窗
+// 数据：pack.pre.klines_5m_decision / klines_1m_decision（已收盘根，锚点=真实报价时刻）
+// y 轴归一到「相对决策参考价 %」，跨单可比；结果窗只展示、不入特征。
+// ============================================================
+
+function CandlePane({ bars, ref, postPct, width, height, title }: {
+  bars: number[][]; ref: number; postPct: number[]; width: number; height: number; title: string
+}) {
+  if (!bars.length) return null
+  const padL = 38, padR = 8, padT = 14, padB = 16
+  const postW = postPct.length > 1 ? Math.min(88, width * 0.16) : 0
+  const plotW = width - padL - padR - postW
+  const bw = plotW / bars.length
+  const pct = (p: number) => (p / ref - 1) * 100
+  const vals: number[] = []
+  bars.forEach(k => { vals.push(pct(k[2]), pct(k[3])) })
+  postPct.forEach(v => vals.push(v))
+  let lo = Math.min(...vals), hi = Math.max(...vals)
+  if (!Number.isFinite(lo) || !Number.isFinite(hi)) return null
+  if (hi - lo < 0.02) { hi += 0.01; lo -= 0.01 }
+  const pad = (hi - lo) * 0.12
+  lo -= pad; hi += pad
+  const y = (v: number) => padT + ((hi - v) / (hi - lo)) * (height - padT - padB)
+  const xa = (i: number) => padL + (i + 0.5) * bw
+  const ticks = [hi, (hi + lo) / 2, lo]
+  return (
+    <svg width={width} height={height} className="block">
+      <text x={padL} y={10} fontSize={10} fill="var(--ink-55)">{title}</text>
+      {ticks.map((t, i) => (
+        <g key={`t${i}`}>
+          <line x1={padL} x2={width - padR} y1={y(t)} y2={y(t)} stroke="var(--line)" strokeDasharray="2 4" />
+          <text x={padL - 4} y={y(t) + 3} fontSize={9} textAnchor="end" fill="var(--ink-35)">{t.toFixed(2)}%</text>
+        </g>
+      ))}
+      <line x1={padL} x2={width - padR} y1={y(0)} y2={y(0)} stroke="var(--ink-35)" strokeDasharray="3 3" />
+      {bars.map((k, i) => {
+        const o = k[1], h = k[2], l = k[3], c = k[4]
+        const color = c >= o ? '#26a69a' : '#ef5350'
+        const top = y(Math.max(o, c))
+        const hgt = Math.max(1, y(Math.min(o, c)) - top)
+        const w = Math.max(2.5, bw * 0.62)
+        return (
+          <g key={`b${i}`}>
+            <line x1={xa(i)} x2={xa(i)} y1={y(h)} y2={y(l)} stroke={color} strokeWidth={1} />
+            <rect x={xa(i) - w / 2} y={top} width={w} height={hgt} fill={color} />
+          </g>
+        )
+      })}
+      <line x1={padL + plotW} x2={padL + plotW} y1={padT - 4} y2={height - padB}
+        stroke="var(--ink-35)" strokeDasharray="3 3" />
+      {postPct.length > 1 && (
+        <>
+          <rect x={padL + plotW} y={padT - 4} width={postW} height={height - padT - padB + 4}
+            fill="var(--sunken)" opacity={0.7} />
+          <polyline fill="none" stroke="var(--ink-55)" strokeWidth={1.2}
+            points={postPct.map((v, i) =>
+              `${padL + plotW + ((i + 0.5) / postPct.length) * postW},${y(v)}`).join(' ')} />
+          <text x={padL + plotW + 3} y={height - 4} fontSize={8} fill="var(--ink-35)">结果窗</text>
+        </>
+      )}
+    </svg>
+  )
+}
+
+function SceneCard({ pre, post, win }: {
+  pre: NonNullable<PackDetail['pack']['pre']>
+  post: NonNullable<PackDetail['pack']['post']>
+  win: boolean | null
+}) {
+  const ref = pre.ref_price
+  const bars5 = (pre.klines_5m_decision ?? []).slice(-24)
+  const bars1 = (pre.klines_1m_decision ?? []).slice(-15)
+  if (!ref || (!bars5.length && !bars1.length)) return null
+  const postPct = (post.window_klines_1m ?? []).map(k => (k[4] / ref - 1) * 100)
+  const tone = win === true ? 'border-positive/50' : win === false ? 'border-negative/50' : 'border-line'
+  return (
+    <div className={`rounded-sm border ${tone} px-2 py-1.5 space-y-1 bg-sunken/40`}>
+      <div className="flex items-center gap-3 flex-wrap text-[11px]">
+        <span className={`font-semibold ${win === true ? 'text-positive' : win === false ? 'text-negative' : 'text-ink-55'}`}>
+          {win === true ? 'WIN' : win === false ? 'LOSS' : '结果未知'} 场景卡
+        </span>
+        <span className="text-ink-55">锚点 {fmtMs(pre.decision_ts ?? 0)}（{pre.decision_source ?? '—'}）</span>
+        <span className="text-ink-55">参考价 {ref.toFixed(2)}</span>
+        <span className="text-ink-35">结果窗仅展示，不入特征</span>
+      </div>
+      <div className="overflow-x-auto">
+        <div className="flex gap-2 min-w-max">
+          <CandlePane bars={bars5} ref={ref} postPct={postPct} width={560} height={150}
+            title="决策前 24 根 5m（已收盘）" />
+          <CandlePane bars={bars1} ref={ref} postPct={[]} width={280} height={150}
+            title="决策前 15 根 1m（已收盘）" />
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function PackDetailModal({ orderId, detail, onClose }: { orderId: number; detail: PackDetail | null; onClose: () => void }) {
   if (!detail) {
     return createPortal(
@@ -5340,6 +5445,15 @@ function PackDetailModal({ orderId, detail, onClose }: { orderId: number; detail
           {detail.missing?.length > 0 && <span className="text-[10px] text-warning" title={detail.missing.join(', ')}>缺 {detail.missing.length} 维</span>}
           <button className="ml-auto px-2 py-0.5 border border-line rounded-pill text-[11px]" onClick={onClose}>关闭</button>
         </div>
+
+        {/* 场景卡（v2）：按真实决策时刻切片；v1 包降级为下方折线 */}
+        {pre.klines_5m_decision?.length ? (
+          <SceneCard pre={pre} post={post} win={(settle.win as boolean | undefined) ?? null} />
+        ) : (
+          <div className="text-[11px] text-ink-35">
+            该证据包为 v1（无决策时刻切片），下方用窗口前收盘折线代替；回填后自动升级为场景卡。
+          </div>
+        )}
 
         {/* 前：报价轨迹 + K线 */}
         <div className="space-y-2">

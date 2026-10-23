@@ -11,6 +11,8 @@ from binance_predict.services.llm_panel import (
     verify_strategy_advice,
 )
 from binance_predict.services.order_context_recorder import (
+    PACK_SCHEMA_VERSION,
+    _resolve_decision_ts,
     assemble_pack,
     compute_order_facts,
 )
@@ -57,13 +59,54 @@ class TestAssemblePack:
             {"n_prior": 20, "rolling20_win_rate": 0.62, "rolling20_pnl": -5.0},
         )
         assert not missing
-        assert pack["schema_version"] == "v1"
+        assert pack["schema_version"] == PACK_SCHEMA_VERSION == "v2"
         assert len(pack["pre"]["klines_1m"]) == 60
         assert pack["pre"]["channel_state"]["rolling20_win_rate"] == 0.62
         assert pack["exec"]["quote"]["averagePrice"] == "0.55"
         assert pack["post"]["settle"]["win"] is False
         assert pack["post"]["siblings"][0]["channel"] == "ch_b"
         assert pack["pre"]["regime"]["ret_1h"] is not None
+
+    def test_decision_slice_v2(self):
+        """v2：决策时刻切片入包，ref_price 取决策 1m 末收盘；缺切片不拉低 status。"""
+        bars_1m = [_bar(i * 60_000, o=200.0 + i) for i in range(30)]
+        bars_5m = [_bar(i * 300_000, o=200.0 + i) for i in range(50)]
+        pack, missing = assemble_pack(
+            _order(), None, [{"ts": 1}], [],
+            [_bar(i * 60_000) for i in range(60)],
+            [_bar(i * 300_000) for i in range(50)],
+            [_bar(i * 60_000) for i in range(10)],
+            [], {"n_prior": 0},
+            klines_1m_decision=bars_1m, klines_5m_decision=bars_5m,
+            decision_ts=1_700_000_150_000, decision_source="quote",
+        )
+        pre = pack["pre"]
+        assert pre["decision_slice"] == "ok"
+        assert pre["decision_ts"] == 1_700_000_150_000
+        assert pre["decision_source"] == "quote"
+        assert len(pre["klines_5m_decision"]) == 50
+        assert pre["ref_price"] == bars_1m[-1]["close"]
+        # 切片缺失不进 missing（避免历史包/断网时整体降级）
+        assert "klines_1m_decision" not in missing
+
+    def test_decision_slice_missing_marks_pre(self):
+        pack, _missing = assemble_pack(
+            _order(), None, [], [], None, None, None, [], {"n_prior": 0},
+        )
+        assert pack["pre"]["decision_slice"] == "missing"
+        assert pack["pre"]["klines_5m_decision"] == []
+
+    def test_resolve_decision_ts_priority(self):
+        o = _order(quote_json={"timestamp": 1_700_000_123_000,
+                               "averagePrice": "0.55"})
+        ts, src = _resolve_decision_ts(o, {"quote_ts": 1_700_000_999_000}, 1_700_000_000_000)
+        assert (ts, src) == (1_700_000_123_000, "quote")
+        ts, src = _resolve_decision_ts(_order(quote_json={}), {"quote_ts": 1_700_000_321_000},
+                                       1_700_000_000_000)
+        assert (ts, src) == (1_700_000_321_000, "assessment_quote")
+        # 全部缺失 → 回退 created_at（2026-10-19T00:00:00Z）
+        ts, src = _resolve_decision_ts(_order(quote_json={}), None, 1_700_000_000_000)
+        assert src == "created_at" and ts == 1_792_368_000_000
 
     def test_missing_dims_partial(self):
         pack, missing = assemble_pack(

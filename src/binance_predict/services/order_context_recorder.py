@@ -26,11 +26,16 @@ from binance_predict.db.engine import async_session_factory
 from binance_predict.db.models import OrderContextPack, TradeOrderModel
 from binance_predict.services import attribution_stats as astats
 
-PACK_SCHEMA_VERSION = "v1"
+PACK_SCHEMA_VERSION = "v2"
 PRE_WINDOW_MS = 30 * 60_000          # 前段报价轨迹长度：窗口前 30 分钟
 POST_WINDOW_MS = 5 * 60_000          # 后段：结算（窗口结束）后 5 分钟
 KLINE_1M_BEFORE = 60                 # 决策时刻前的 1m K线根数
 KLINE_5M_BEFORE = 50                 # 5m 根数（够算 ret_4h 与 ATR）
+# v2：按「决策时刻」再切一组 K 线，供前端场景卡（24×5m + 15×1m）使用。
+# 窗内下单的通道（吸收跟随 +310s、情绪错位 +150s、首触窗内触发）必须用这组，
+# 否则画面会比真实决策时刻早 2~5 分钟。
+KLINE_1M_DECISION = 30
+KLINE_5M_DECISION = 50
 MAX_QUOTE_POINTS = 480               # 单段报价轨迹最大点数（超出等距抽稀）
 
 KlineFetcher = Callable[[str, int, int], Awaitable[list[dict] | None]]
@@ -90,6 +95,37 @@ def _compute_regime(klines_1m: list[dict], klines_5m: list[dict]) -> dict:
     return regime
 
 
+def _resolve_decision_ts(
+    order: dict, assessment: dict | None, window_start: int,
+) -> tuple[int, str]:
+    """解析决策时刻（ms）与来源。
+
+    优先级：报价响应时间 > assessment 报价/触发时刻 > 订单落库时间 > 窗口开始。
+    窗内下单的通道（吸收跟随/情绪错位/首触）必须用决策时刻而不是 window_start，
+    否则场景卡会整体左移 2~5 分钟。
+    """
+    quote = order.get("quote_json") or {}
+    candidates = (
+        (quote.get("timestamp"), "quote"),
+        ((assessment or {}).get("quote_ts"), "assessment_quote"),
+        ((assessment or {}).get("trigger_ts"), "assessment_trigger"),
+    )
+    for value, source in candidates:
+        try:
+            ts = int(value)
+        except (TypeError, ValueError):
+            continue
+        if ts > 0:
+            return ts, source
+    created = order.get("created_at")
+    if created:
+        try:
+            return int(datetime.fromisoformat(created).timestamp() * 1000), "created_at"
+        except (TypeError, ValueError):
+            pass
+    return int(window_start or 0), "window_start"
+
+
 def assemble_pack(
     order: dict,
     assessment: dict | None,
@@ -100,22 +136,42 @@ def assemble_pack(
     klines_1m_window: list[dict] | None,
     siblings: list[dict],
     channel_prior: dict,
+    *,
+    klines_1m_decision: list[dict] | None = None,
+    klines_5m_decision: list[dict] | None = None,
+    decision_ts: int | None = None,
+    decision_source: str | None = None,
 ) -> tuple[dict, list[str]]:
-    """纯函数组装证据包（无 IO，测试直接喂 dict）。返回 (pack, missing)。"""
+    """纯函数组装证据包（无 IO，测试直接喂 dict）。返回 (pack, missing)。
+
+    v2 新增：`pre.klines_1m_decision / klines_5m_decision`——按真实决策时刻切的
+    K 线（已收盘根），供前端场景卡使用；缺失不影响 status（不写入 missing）。
+    """
     missing: list[str] = []
     pack: dict[str, Any] = {"schema_version": PACK_SCHEMA_VERSION}
 
     # ---- 前：决策时刻市场状态 ----
+    k1d = _kline_brief(klines_1m_decision)
+    k5d = _kline_brief(klines_5m_decision)
+    k1b = _kline_brief(klines_1m_before)
+    k5b = _kline_brief(klines_5m_before)
+    ref_price = k1d[-1][4] if k1d else (k1b[-1][4] if k1b else None)
     pack["pre"] = {
-        "klines_1m": _kline_brief(klines_1m_before),
-        "klines_5m": _kline_brief(klines_5m_before),
+        "klines_1m": k1b,
+        "klines_5m": k5b,
+        "klines_1m_decision": k1d,
+        "klines_5m_decision": k5d,
+        "decision_ts": decision_ts,
+        "decision_source": decision_source,
+        "decision_slice": "ok" if (k1d and k5d) else "missing",
+        "ref_price": ref_price,
         "quotes": quotes_pre,
         "regime": _compute_regime(klines_1m_before or [], klines_5m_before or []),
         "channel_state": channel_prior,
     }
-    if not pack["pre"]["klines_1m"]:
+    if not k1b:
         missing.append("klines_1m_before")
-    if not pack["pre"]["klines_5m"]:
+    if not k5b:
         missing.append("klines_5m_before")
     if not quotes_pre:
         missing.append("quotes_pre")
@@ -291,6 +347,21 @@ class OrderContextRecorder:
                     "btc": r.btc_price, "vol": r.trade_volume, "parts": r.participants,
                 } for r in rows])
 
+            # v2：按真实决策时刻再切一组 K 线（场景卡专用）
+            decision_ts, decision_source = _resolve_decision_ts(o, assessment_dict, ws)
+            klines_1m_decision = klines_5m_decision = None
+            if self.kline_fetcher is not None and decision_ts > 0:
+                try:
+                    klines_1m_decision = await self.kline_fetcher(
+                        "1m", KLINE_1M_DECISION, decision_ts)
+                except Exception as exc:
+                    logger.debug("证据包 1m 决策 K 线获取失败 | order={} | {}", order_id, exc)
+                try:
+                    klines_5m_decision = await self.kline_fetcher(
+                        "5m", KLINE_5M_DECISION, decision_ts)
+                except Exception as exc:
+                    logger.debug("证据包 5m 决策 K 线获取失败 | order={} | {}", order_id, exc)
+
             klines_1m_before = klines_5m_before = klines_1m_window = None
             if self.kline_fetcher is not None:
                 try:
@@ -345,6 +416,10 @@ class OrderContextRecorder:
                 o, assessment_dict, _q(pre_rows), _q(post_rows),
                 klines_1m_before, klines_5m_before, klines_1m_window,
                 siblings, channel_prior,
+                klines_1m_decision=klines_1m_decision,
+                klines_5m_decision=klines_5m_decision,
+                decision_ts=decision_ts,
+                decision_source=decision_source,
             )
             if ladder is not None:
                 pack["post"]["ladder"] = ladder
