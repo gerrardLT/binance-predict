@@ -1,0 +1,128 @@
+# ============================================================
+# 批量数据更正：9 笔实盘订单结算方向与币安官方 winning_outcome 不符
+#
+# 核对方式：PREDEXON /v2/predictfun/markets?search=<ET 标题> 的 winning_outcome
+# （0=UP，1=DOWN，链上 resolution）。范围 2026-08-25 → 10-23，1173 笔中 9 笔不一致。
+#
+# 根因：币安官方结算源是 Chainlink BTC/USDT top-of-book mid price，本地归档
+# 用币安现货 K 线 open/close；8/9 笔价差在 0.001~1.73bp 级尘埃反向，另 1 笔
+# （1527）为 15m 场景 FakeBreakoutSignal 周期锚点口径偏差。
+#
+# 更正范围（订单与执行评估全改；归档窗口只改 5m）：
+#   - trade_orders：9 笔，settle_outcome/win/pnl 按官方重算，settle_price 置 NULL
+#   - shadow_execution_assessments：同 9 笔，theoretical_outcome/win/return
+#   - sentiment_windows：5 个 5m 窗口 outcome，actual_return 置 NULL
+#   - kline_shadow_signals：仅 ih_inside_15m_v2 通道专属行
+# 不修改：蜡烛物理事件行（candle_hm_bull_5m_event_v1，多逻辑版本共用，
+#   其 settle_* 是 K 线口径研究事实）；fake_breakout_signals（场景信号口径）。
+#
+# 安全设计：目标与修正值全部硬编码；默认 dry-run；事务包裹；前后快照。
+# ============================================================
+
+name: Fix Live Settlement Mismatch Batch
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry-run（只 SELECT 不写库）；改 false 才执行 UPDATE"
+        required: false
+        default: "true"
+        type: string
+
+concurrency:
+  group: fix-live-settlement-mismatch-batch
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    name: Correct 9 mismatched live orders against official outcome
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Execute via SSH
+        uses: appleboy/ssh-action@v1
+        env:
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
+          envs: DRY_RUN
+          script: |
+            set -euo pipefail
+            cd /www/wwwroot/binance-predict
+            if [ ! -f docker-compose.prod.yml ]; then
+              echo "ERROR: docker-compose.prod.yml not found"
+              exit 1
+            fi
+            echo "dry_run=${DRY_RUN:-true}"
+
+            psql_exec() {
+              docker compose -f docker-compose.prod.yml exec -T db \
+                sh -c "psql -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -v ON_ERROR_STOP=1 -c \"$1\""
+            }
+
+            echo "=== 执行前：9 笔订单 ==="
+            psql_exec "SELECT id, signal_version, window_start, market_period, direction, settle_outcome, win, pnl, settle_price FROM trade_orders WHERE id IN (2724, 1527, 1682, 2464, 2174, 2164, 1889, 775, 527) ORDER BY id;"
+
+            echo "=== 执行前：5 个 5m 归档窗口 ==="
+            psql_exec "SELECT id, start_time, entry_price, exit_price, actual_return, outcome FROM sentiment_windows WHERE start_time IN (1791955200000, 1791479100000, 1791475200000, 1791025500000, 1790512200000) ORDER BY start_time;"
+
+            echo "=== 执行前：ih_inside_15m_v2 影子行 ==="
+            psql_exec "SELECT id, version, target_bar_start, direction, settle_outcome, win, status FROM kline_shadow_signals WHERE version = 'ih_inside_15m_v2' AND target_bar_start = 1789077600000;"
+
+            echo "=== 执行前：9 笔执行评估账本 ==="
+            psql_exec "SELECT id, signal_version, target_window_start, market_period, policy_version, theoretical_outcome, theoretical_win FROM shadow_execution_assessments WHERE (signal_version, target_window_start) IN (('scene_bear_exhaust', 1792332900000), ('scene_bull_exhaust', 1790085600000), ('candle_hm_bull_5m_consensus2_shadow_v1', 1790512200000), ('manual_chain_16', 1791955200000), ('absorption_follow_td120_v1', 1791479100000), ('absorption_follow_td150_v1', 1791475200000), ('candle_hm_bull_5m_trend4h_up_shadow_hyp_v1', 1791025500000), ('ih_inside_15m_v2', 1789077600000), ('scene_bull_exhaust', 1788860700000)) ORDER BY target_window_start;"
+
+            if [ "${DRY_RUN:-true}" != "false" ]; then
+              echo "=== DRY-RUN：跳过 UPDATE。确认上方快照后，以 dry_run=false 重跑。 ==="
+              exit 0
+            fi
+
+            echo "=== 执行事务更正 ==="
+            psql_exec "BEGIN;
+              UPDATE trade_orders SET settle_outcome = 'DOWN', win = FALSE, pnl = -20.0, settle_price = NULL WHERE id = 2724 AND direction = 'UP';
+              UPDATE trade_orders SET settle_outcome = 'UP',   win = FALSE, pnl = -2.0,  settle_price = NULL WHERE id = 1527 AND direction = 'DOWN';
+              UPDATE trade_orders SET settle_outcome = 'UP',   win = FALSE, pnl = -5.0,  settle_price = NULL WHERE id = 1682 AND direction = 'DOWN';
+              UPDATE trade_orders SET settle_outcome = 'UP',   win = FALSE, pnl = -1.0,  settle_price = NULL WHERE id = 2464 AND direction = 'DOWN';
+              UPDATE trade_orders SET settle_outcome = 'UP',   win = FALSE, pnl = -1.0,  settle_price = NULL WHERE id = 2174 AND direction = 'DOWN';
+              UPDATE trade_orders SET settle_outcome = 'DOWN', win = TRUE,  pnl = 0.96,  settle_price = NULL WHERE id = 2164 AND direction = 'DOWN';
+              UPDATE trade_orders SET settle_outcome = 'UP',   win = FALSE, pnl = -5.0,  settle_price = NULL WHERE id = 1889 AND direction = 'DOWN';
+              UPDATE trade_orders SET settle_outcome = 'UP',   win = TRUE,  pnl = 2.33,  settle_price = NULL WHERE id = 775  AND direction = 'UP';
+              UPDATE trade_orders SET settle_outcome = 'UP',   win = FALSE, pnl = -2.98, settle_price = NULL WHERE id = 527  AND direction = 'DOWN';
+
+              UPDATE sentiment_windows SET outcome = 'UP',   actual_return = NULL WHERE start_time = 1791955200000;
+              UPDATE sentiment_windows SET outcome = 'UP',   actual_return = NULL WHERE start_time = 1791479100000;
+              UPDATE sentiment_windows SET outcome = 'DOWN', actual_return = NULL WHERE start_time = 1791475200000;
+              UPDATE sentiment_windows SET outcome = 'UP',   actual_return = NULL WHERE start_time = 1791025500000;
+              UPDATE sentiment_windows SET outcome = 'UP',   actual_return = NULL WHERE start_time = 1790512200000;
+
+              UPDATE kline_shadow_signals SET settle_outcome = 'UP', win = TRUE, status = 'SETTLED' WHERE version = 'ih_inside_15m_v2' AND target_bar_start = 1789077600000;
+
+              UPDATE shadow_execution_assessments SET theoretical_outcome = 'DOWN', theoretical_win = FALSE, theoretical_realized_return = NULL, updated_at = NOW() WHERE signal_version = 'scene_bear_exhaust' AND target_window_start = 1792332900000;
+              UPDATE shadow_execution_assessments SET theoretical_outcome = 'UP',   theoretical_win = FALSE, theoretical_realized_return = NULL, updated_at = NOW() WHERE signal_version = 'scene_bull_exhaust' AND target_window_start = 1790085600000;
+              UPDATE shadow_execution_assessments SET theoretical_outcome = 'UP',   theoretical_win = FALSE, theoretical_realized_return = NULL, updated_at = NOW() WHERE signal_version = 'candle_hm_bull_5m_consensus2_shadow_v1' AND target_window_start = 1790512200000;
+              UPDATE shadow_execution_assessments SET theoretical_outcome = 'UP',   theoretical_win = FALSE, theoretical_realized_return = NULL, updated_at = NOW() WHERE signal_version = 'manual_chain_16' AND target_window_start = 1791955200000;
+              UPDATE shadow_execution_assessments SET theoretical_outcome = 'UP',   theoretical_win = FALSE, theoretical_realized_return = NULL, updated_at = NOW() WHERE signal_version = 'absorption_follow_td120_v1' AND target_window_start = 1791479100000;
+              UPDATE shadow_execution_assessments SET theoretical_outcome = 'DOWN', theoretical_win = TRUE,  theoretical_realized_return = NULL, updated_at = NOW() WHERE signal_version = 'absorption_follow_td150_v1' AND target_window_start = 1791475200000;
+              UPDATE shadow_execution_assessments SET theoretical_outcome = 'UP',   theoretical_win = FALSE, theoretical_realized_return = NULL, updated_at = NOW() WHERE signal_version = 'candle_hm_bull_5m_trend4h_up_shadow_hyp_v1' AND target_window_start = 1791025500000;
+              UPDATE shadow_execution_assessments SET theoretical_outcome = 'UP',   theoretical_win = TRUE,  theoretical_realized_return = NULL, updated_at = NOW() WHERE signal_version = 'ih_inside_15m_v2' AND target_window_start = 1789077600000;
+              UPDATE shadow_execution_assessments SET theoretical_outcome = 'UP',   theoretical_win = FALSE, theoretical_realized_return = NULL, updated_at = NOW() WHERE signal_version = 'scene_bull_exhaust' AND target_window_start = 1788860700000;
+              COMMIT;"
+
+            echo "=== 执行后：9 笔订单 ==="
+            psql_exec "SELECT id, signal_version, window_start, direction, settle_outcome, win, pnl, settle_price FROM trade_orders WHERE id IN (2724, 1527, 1682, 2464, 2174, 2164, 1889, 775, 527) ORDER BY id;"
+
+            echo "=== 执行后：5 个 5m 归档窗口 ==="
+            psql_exec "SELECT id, start_time, entry_price, exit_price, actual_return, outcome FROM sentiment_windows WHERE start_time IN (1791955200000, 1791479100000, 1791475200000, 1791025500000, 1790512200000) ORDER BY start_time;"
+
+            echo "=== 执行后：ih_inside_15m_v2 影子行 ==="
+            psql_exec "SELECT id, version, target_bar_start, direction, settle_outcome, win, status FROM kline_shadow_signals WHERE version = 'ih_inside_15m_v2' AND target_bar_start = 1789077600000;"
+
+            echo "=== 执行后：9 笔执行评估账本 ==="
+            psql_exec "SELECT id, signal_version, target_window_start, market_period, policy_version, theoretical_outcome, theoretical_win FROM shadow_execution_assessments WHERE (signal_version, target_window_start) IN (('scene_bear_exhaust', 1792332900000), ('scene_bull_exhaust', 1790085600000), ('candle_hm_bull_5m_consensus2_shadow_v1', 1790512200000), ('manual_chain_16', 1791955200000), ('absorption_follow_td120_v1', 1791479100000), ('absorption_follow_td150_v1', 1791475200000), ('candle_hm_bull_5m_trend4h_up_shadow_hyp_v1', 1791025500000), ('ih_inside_15m_v2', 1789077600000), ('scene_bull_exhaust', 1788860700000)) ORDER BY target_window_start;"
+
+            echo "=== 完成。赢单奖金需在币安侧领取；redeemed_at 不变。 ==="
