@@ -1,0 +1,138 @@
+# ============================================================
+# 数据更正：订单 2865（brkrv_brk8h_5m_v1，窗口 1792722900000）结算方向判反
+#
+# 事实依据：
+#   1. 币安订单 26102300001987034349 / 市场 btc-updown-5m-1792722900
+#   2. PREDEXON /v2/predictfun/markets 返回该市场 winning_outcome=1（DOWN），
+#      链上 resolution_tx=0x89e8d148...，payout_numerators=[0,1]。
+#   3. 本地归档用币安现货 5m K 线 open/close（81895.80→81898.17，+0.0029%）
+#      判成 UP；币安官方结算源是 Chainlink BTC/USDT top-of-book mid price，
+#      该窗口微跌 → DOWN。尘埃级反向导致单笔方向判反。
+#
+# 更正内容（四处保持同一口径）：
+#   - trade_orders 2865：outcome DOWN / win TRUE / pnl 9.89（19.6 shares − 9.71 成本）
+#     settle_price 置 NULL：本地 K 线价与官方结算源不同，保留会与 outcome 矛盾。
+#   - sentiment_windows[1792722900000]：outcome DOWN、actual_return NULL
+#     （entry/exit 保留为币安现货参考价）。
+#   - kline_shadow_signals[brkrv_brk8h_5m_v1, 1792722900000]：outcome DOWN / win TRUE。
+#   - shadow_execution_assessments 同版本同窗口：theoretical_outcome DOWN / win TRUE。
+#
+# 安全设计（对齐 fix-s2-settlement-data-repair.yml 既有模式）：
+#   1. 目标硬编码，不接受任意 ID/价格输入。
+#   2. 默认 dry-run：只 SELECT，不写库。
+#   3. 幂等守卫：只在当前值仍为错误值（outcome='UP'）时 UPDATE。
+#   4. 事务包裹；执行前后各打快照。
+#   5. 凭据全部来自 GitHub Secrets。
+# ============================================================
+
+name: Fix BRKRV Order 2865 Settlement
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry-run（只 SELECT 不写库）；改 false 才执行 UPDATE"
+        required: false
+        default: "true"
+        type: string
+
+concurrency:
+  group: fix-brkrv-order-2865
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    name: Correct settlement of order 2865 / window 1792722900000
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Execute via SSH
+        uses: appleboy/ssh-action@v1
+        env:
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
+          envs: DRY_RUN
+          script: |
+            set -euo pipefail
+            cd /www/wwwroot/binance-predict
+            if [ ! -f docker-compose.prod.yml ]; then
+              echo "ERROR: docker-compose.prod.yml not found"
+              exit 1
+            fi
+            echo "dry_run=${DRY_RUN:-true}"
+
+            psql_exec() {
+              docker compose -f docker-compose.prod.yml exec -T db \
+                sh -c "psql -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -v ON_ERROR_STOP=1 -c \"$1\""
+            }
+
+            echo "=== 执行前：订单 2865 ==="
+            psql_exec "SELECT id, signal_version, window_start, market_period, direction, status, settle_outcome, win, pnl, settle_price, settled_at, redeemed_at FROM trade_orders WHERE id = 2865;"
+
+            echo "=== 执行前：归档窗口 1792722900000 ==="
+            psql_exec "SELECT id, start_time, entry_price, exit_price, actual_return, outcome, sample_count FROM sentiment_windows WHERE start_time = 1792722900000;"
+
+            echo "=== 执行前：影子行 brkrv_brk8h_5m_v1 ==="
+            psql_exec "SELECT id, version, target_bar_start, direction, settle_open, settle_close, settle_outcome, win, status, settled_at FROM kline_shadow_signals WHERE version = 'brkrv_brk8h_5m_v1' AND target_bar_start = 1792722900000;"
+
+            echo "=== 执行前：执行评估账本 ==="
+            psql_exec "SELECT id, signal_version, target_window_start, theoretical_outcome, theoretical_win, theoretical_realized_return FROM shadow_execution_assessments WHERE signal_version = 'brkrv_brk8h_5m_v1' AND target_window_start = 1792722900000;"
+
+            if [ "${DRY_RUN:-true}" != "false" ]; then
+              echo "=== DRY-RUN：跳过 UPDATE。确认上方四行快照后，以 dry_run=false 重跑。 ==="
+              exit 0
+            fi
+
+            echo "=== 执行事务更正 ==="
+            psql_exec "BEGIN;
+              UPDATE trade_orders
+                 SET settle_outcome = 'DOWN',
+                     win = TRUE,
+                     pnl = 9.89,
+                     settle_price = NULL
+               WHERE id = 2865
+                 AND settle_outcome = 'UP'
+                 AND win = FALSE;
+
+              UPDATE sentiment_windows
+                 SET outcome = 'DOWN',
+                     actual_return = NULL
+               WHERE start_time = 1792722900000
+                 AND outcome = 'UP';
+
+              UPDATE kline_shadow_signals
+                 SET settle_outcome = 'DOWN',
+                     win = TRUE,
+                     status = 'SETTLED'
+               WHERE version = 'brkrv_brk8h_5m_v1'
+                 AND target_bar_start = 1792722900000
+                 AND settle_outcome = 'UP';
+
+              UPDATE shadow_execution_assessments
+                 SET theoretical_outcome = 'DOWN',
+                     theoretical_win = TRUE,
+                     theoretical_realized_return = NULL,
+                     updated_at = NOW()
+               WHERE signal_version = 'brkrv_brk8h_5m_v1'
+                 AND target_window_start = 1792722900000
+                 AND theoretical_outcome = 'UP';
+              COMMIT;"
+
+            echo "=== 执行后：订单 2865 ==="
+            psql_exec "SELECT id, signal_version, window_start, direction, status, settle_outcome, win, pnl, settle_price, settled_at, redeemed_at FROM trade_orders WHERE id = 2865;"
+
+            echo "=== 执行后：归档窗口 1792722900000 ==="
+            psql_exec "SELECT id, start_time, entry_price, exit_price, actual_return, outcome FROM sentiment_windows WHERE start_time = 1792722900000;"
+
+            echo "=== 执行后：影子行 brkrv_brk8h_5m_v1 ==="
+            psql_exec "SELECT id, version, target_bar_start, direction, settle_open, settle_close, settle_outcome, win, status FROM kline_shadow_signals WHERE version = 'brkrv_brk8h_5m_v1' AND target_bar_start = 1792722900000;"
+
+            echo "=== 执行后：执行评估账本 ==="
+            psql_exec "SELECT id, signal_version, target_window_start, theoretical_outcome, theoretical_win, theoretical_realized_return FROM shadow_execution_assessments WHERE signal_version = 'brkrv_brk8h_5m_v1' AND target_window_start = 1792722900000;"
+
+            echo "=== 完成。注意：redeemed_at 仍为空，赢单奖金需在币安侧领取。 ==="
