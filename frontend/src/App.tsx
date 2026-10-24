@@ -6906,6 +6906,46 @@ function ShadowExecutionComparisonCard({
 
   return (
     <Card title="影子信号·理论到实盘执行对比">
+      {/* 结论带：一眼看到准入判断与三个关键数字 */}
+      {(() => {
+        const fwdEv = filteredReturns.executable_fixed_1u.avg
+        const fwdN = filteredReturns.executable_fixed_1u.n
+        const blocked = (data.forward_evidence?.blocking_reasons?.length ?? 0) > 0
+        const fillRate = filteredFunnel.submitted > 0
+          ? filteredFunnel.filled / filteredFunnel.submitted : null
+        return (
+          <div className={`mb-4 grid gap-3 rounded-sm border p-3 sm:grid-cols-4 ${
+            blocked ? 'border-warning/40 bg-warning/5' : 'border-positive/40 bg-positive/5'}`}>
+            <div>
+              <div className="text-[10px] uppercase tracking-wide text-ink-55">准入判断</div>
+              <div className={`mt-0.5 text-lg font-bold ${blocked ? 'text-warning' : 'text-positive'}`}>
+                {blocked ? '阻塞准入' : '可进入评审'}
+              </div>
+              <div className="text-[10px] text-ink-40">{filteredFunnel.theoretical} 理论样本</div>
+            </div>
+            <div>
+              <div className="text-[10px] text-ink-55">前向可执行 EV</div>
+              <div className={`font-mono text-2xl font-bold leading-tight ${
+                fwdEv == null ? 'text-ink-40' : fwdEv >= 0 ? 'text-positive' : 'text-negative'}`}>
+                {fwdEv == null ? '—' : `${(fwdEv * 100).toFixed(2)}%`}
+              </div>
+              <div className="text-[10px] text-ink-40">n={fwdN} · 报价口径非成交</div>
+            </div>
+            <div>
+              <div className="text-[10px] text-ink-55">已结算</div>
+              <div className="font-mono text-2xl font-bold leading-tight text-ink-95">{filteredFunnel.settled}</div>
+              <div className="text-[10px] text-ink-40">下单 {filteredFunnel.submitted} · 成交 {filteredFunnel.filled}</div>
+            </div>
+            <div>
+              <div className="text-[10px] text-ink-55">成交 / 下单</div>
+              <div className="font-mono text-2xl font-bold leading-tight text-ink-95">
+                {fillRate == null ? '—' : `${(fillRate * 100).toFixed(0)}%`}
+              </div>
+              <div className="text-[10px] text-ink-40">限价单不保证成交</div>
+            </div>
+          </div>
+        )
+      })()}
       {data.forward_evidence && (
         <section className="mb-4 space-y-3 rounded-sm border border-line bg-sunken p-3">
           <header className="flex flex-wrap items-center gap-2">
@@ -6916,127 +6956,125 @@ function ShadowExecutionComparisonCard({
             <HelpHint text="报价不是成交；费用为假设，仅持有到结算。旧账本与归档不计实时证据。" />
           </header>
 
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
-            {([['实时样本', data.forward_evidence.live_n],
-               ['归档样本', data.forward_evidence.archive_n],
-               ['独立窗口', data.forward_evidence.independent_windows],
-               ['独立日', data.forward_evidence.independent_days],
-               ['同窗同向配对', data.forward_evidence.paired_same_window_direction],
-               ['配对缺失', data.forward_evidence.pair_missing]] as const).map(([label, value]) => (
-              <div key={label} className="rounded-sm border border-line bg-card px-2.5 py-2">
-                <div className="text-[10px] text-ink-55">{label}</div>
-                <div className="font-mono text-sm font-semibold text-ink-95">{value}</div>
-              </div>
-            ))}
-          </div>
-
-          <div className="overflow-x-auto">
-            <table className="w-full min-w-[620px] text-xs">
-              <thead>
-                <tr className="border-b border-line text-[10px] text-ink-55">
-                  <th className="py-1.5 pr-2 text-left font-medium">档位</th>
-                  <th className="px-2 py-1.5 text-right font-medium">样本</th>
-                  <th className="px-2 py-1.5 text-right font-medium">本金</th>
-                  <th className="px-2 py-1.5 text-right font-medium">净收益</th>
-                  <th className="px-2 py-1.5 text-right font-medium">压力 1%</th>
-                  <th className="px-2 py-1.5 text-right font-medium">压力 3%</th>
-                  <th className="py-1.5 pl-2 text-right font-medium">缺失</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-line-soft font-mono">
-                {Object.entries(data.forward_evidence.ladder).map(([amount, v]) => (
-                  <tr key={amount}>
-                    <td className="py-1.5 pr-2 font-semibold text-ink-95">{amount}U</td>
-                    <td className="px-2 py-1.5 text-right">{v.n}</td>
-                    <td className="px-2 py-1.5 text-right text-ink-70">{v.stake.toFixed(2)}</td>
-                    <td className={`px-2 py-1.5 text-right font-semibold ${v.pnl >= 0 ? 'text-positive' : 'text-negative'}`}>{v.pnl.toFixed(2)}</td>
-                    <td className="px-2 py-1.5 text-right text-ink-55">{v.stress_1pct.toFixed(2)}</td>
-                    <td className="px-2 py-1.5 text-right text-ink-55">{v.stress_3pct.toFixed(2)}</td>
-                    <td className="py-1.5 pl-2 text-right text-ink-55">{v.missing}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-2 text-xs text-ink-70">
-            <span>证据金额</span>
-            <select value={evidenceAmount} onChange={e => setEvidenceAmount(e.target.value)}
-              className="rounded-sm border border-line bg-card px-1.5 py-0.5 text-xs text-ink-80">
-              <option value="ALL">全部（独立展示，不合计）</option>
-              {[...new Set(data.forward_evidence.series?.map(row => row.amount))].map(amount => (
-                <option key={amount} value={amount}>{amount}U</option>
-              ))}
-            </select>
-            <span className="text-[10px] text-ink-40">
-              版本筛选「{search || '全部'}」 · 策略「{policy === 'ALL' ? '全部' : policy}」
-            </span>
-          </div>
-
-          <div className="overflow-x-auto">
-            <table className="w-full min-w-[860px] text-xs">
-              <thead>
-                <tr className="border-b border-line text-[10px] text-ink-55">
-                  <th className="py-1.5 pr-2 text-left font-medium">版本</th>
-                  <th className="px-2 py-1.5 text-right font-medium">档位</th>
-                  <th className="px-2 py-1.5 text-right font-medium">样本</th>
-                  <th className="px-2 py-1.5 text-right font-medium">报价估计收益</th>
-                  <th className="px-2 py-1.5 text-right font-medium">最大回撤</th>
-                  <th className="px-2 py-1.5 text-right font-medium">去最大赢单</th>
-                  <th className="px-2 py-1.5 text-right font-medium">最大赢单占比</th>
-                  <th className="py-1.5 pl-2 text-right font-medium">缺失</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-line-soft font-mono">
-                {data.forward_evidence.series?.filter(row => (!search || row.signal_version.toLowerCase().includes(search)) && (evidenceAmount === 'ALL' || row.amount === evidenceAmount) && (policy === 'ALL' || row.policy_version === policy)).map(row => (
-                  <tr key={`${row.signal_version}-${row.policy_version}-${row.amount}`}>
-                    <td className="py-1.5 pr-2 text-ink-95">{row.signal_version}</td>
-                    <td className="px-2 py-1.5 text-right text-ink-70">{row.amount}U</td>
-                    <td className="px-2 py-1.5 text-right">{row.n}</td>
-                    <td className={`px-2 py-1.5 text-right font-semibold ${row.pnl >= 0 ? 'text-positive' : 'text-negative'}`}>{row.pnl.toFixed(2)}</td>
-                    <td className="px-2 py-1.5 text-right text-ink-70">{row.max_drawdown.toFixed(2)}</td>
-                    <td className="px-2 py-1.5 text-right text-ink-70">{row.without_top_win_pnl.toFixed(2)}</td>
-                    <td className="px-2 py-1.5 text-right text-ink-70">{row.top_win_positive_share == null ? '未知' : `${(100 * row.top_win_positive_share).toFixed(1)}%`}</td>
-                    <td className="py-1.5 pl-2 text-right text-ink-55">{Object.values(row.missing).reduce((a, b) => a + b, 0)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-
           {data.forward_evidence.blocking_reasons.length > 0 && (
-            <ul className="space-y-1 text-[11px] text-ink-70">
+            <ul className="space-y-0.5 border-l-2 border-warning/50 pl-2 text-[11px] text-ink-70">
               {data.forward_evidence.blocking_reasons.map(reason => (
-                <li key={reason} className="flex gap-1.5"><span className="text-warning">·</span><span>{reason}</span></li>
+                <li key={reason}>{reason}</li>
               ))}
             </ul>
           )}
 
           <details className="rounded-sm border border-line-soft">
-            <summary className="cursor-pointer px-2 py-1.5 text-[11px] text-ink-70">全家族实时与归档覆盖<HelpHint text="零样本不隐去；实时冻结仍须报价、运营和结算证据，归档不可替代准入。" /></summary>
-            <div className="overflow-x-auto px-2 pb-2">
-              <table className="w-full min-w-[720px] text-xs">
-                <thead>
-                  <tr className="border-b border-line text-[10px] text-ink-55">
-                    <th className="py-1 pr-2 text-left font-medium">版本</th>
-                    <th className="px-2 py-1 text-right font-medium">实时冻结</th>
-                    <th className="px-2 py-1 text-right font-medium">归档/旧账本</th>
-                    <th className="px-2 py-1 text-left font-medium">采集能力</th>
-                    <th className="py-1 pl-2 text-left font-medium">阻塞原因</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-line-soft font-mono">
-                  {data.coverage_matrix?.map(row => (
-                    <tr key={row.signal_version}>
-                      <td className="py-1 pr-2 text-ink-95">{row.signal_version}</td>
-                      <td className="px-2 py-1 text-right">{row.live_frozen_n}</td>
-                      <td className="px-2 py-1 text-right text-ink-70">{row.archive_or_legacy_n}</td>
-                      <td className="px-2 py-1 text-left">{row.capture_capability === 'LIVE_ENTRY' ? <span className="text-positive">已接实时</span> : <span className="text-warning">仅归档</span>}</td>
-                      <td className="py-1 pl-2 text-left text-[10px] text-ink-55">{row.blocking_reasons.join('；') || '—'}</td>
+            <summary className="cursor-pointer px-2 py-1.5 text-[11px] text-ink-70">
+              明细：金额阶梯 / 逐版本前向证据 / 全家族覆盖
+              <span className="ml-2 text-[10px] text-ink-40">
+                实时 {data.forward_evidence.live_n} · 归档 {data.forward_evidence.archive_n} ·
+                独立窗 {data.forward_evidence.independent_windows} · 独立日 {data.forward_evidence.independent_days} ·
+                同窗同向配对 {data.forward_evidence.paired_same_window_direction} · 缺失 {data.forward_evidence.pair_missing}
+              </span>
+            </summary>
+            <div className="space-y-3 px-2 pb-2 pt-2">
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[620px] text-xs">
+                  <thead>
+                    <tr className="border-b border-line text-[10px] text-ink-55">
+                      <th className="py-1 pr-2 text-left font-medium">档位</th>
+                      <th className="px-2 py-1 text-right font-medium">样本</th>
+                      <th className="px-2 py-1 text-right font-medium">本金</th>
+                      <th className="px-2 py-1 text-right font-medium">净收益</th>
+                      <th className="px-2 py-1 text-right font-medium">压力 1%</th>
+                      <th className="px-2 py-1 text-right font-medium">压力 3%</th>
+                      <th className="py-1 pl-2 text-right font-medium">缺失</th>
                     </tr>
+                  </thead>
+                  <tbody className="divide-y divide-line-soft font-mono">
+                    {Object.entries(data.forward_evidence.ladder).map(([amount, v]) => (
+                      <tr key={amount}>
+                        <td className="py-1 pr-2 font-semibold text-ink-95">{amount}U</td>
+                        <td className="px-2 py-1 text-right">{v.n}</td>
+                        <td className="px-2 py-1 text-right text-ink-70">{v.stake.toFixed(2)}</td>
+                        <td className={`px-2 py-1 text-right font-semibold ${v.pnl >= 0 ? 'text-positive' : 'text-negative'}`}>{v.pnl.toFixed(2)}</td>
+                        <td className="px-2 py-1 text-right text-ink-55">{v.stress_1pct.toFixed(2)}</td>
+                        <td className="px-2 py-1 text-right text-ink-55">{v.stress_3pct.toFixed(2)}</td>
+                        <td className="py-1 pl-2 text-right text-ink-55">{v.missing}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 text-xs text-ink-70">
+                <span>证据金额</span>
+                <select value={evidenceAmount} onChange={e => setEvidenceAmount(e.target.value)}
+                  className="rounded-sm border border-line bg-card px-1.5 py-0.5 text-xs text-ink-80">
+                  <option value="ALL">全部（独立展示，不合计）</option>
+                  {[...new Set(data.forward_evidence.series?.map(row => row.amount))].map(amount => (
+                    <option key={amount} value={amount}>{amount}U</option>
                   ))}
-                </tbody>
-              </table>
+                </select>
+                <span className="text-[10px] text-ink-40">
+                  版本「{search || '全部'}」 · 策略「{policy === 'ALL' ? '全部' : policy}」
+                </span>
+              </div>
+
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[860px] text-xs">
+                  <thead>
+                    <tr className="border-b border-line text-[10px] text-ink-55">
+                      <th className="py-1 pr-2 text-left font-medium">版本</th>
+                      <th className="px-2 py-1 text-right font-medium">档位</th>
+                      <th className="px-2 py-1 text-right font-medium">样本</th>
+                      <th className="px-2 py-1 text-right font-medium">报价估计收益</th>
+                      <th className="px-2 py-1 text-right font-medium">最大回撤</th>
+                      <th className="px-2 py-1 text-right font-medium">去最大赢单</th>
+                      <th className="px-2 py-1 text-right font-medium">最大赢单占比</th>
+                      <th className="py-1 pl-2 text-right font-medium">缺失</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-line-soft font-mono">
+                    {data.forward_evidence.series?.filter(row => (!search || row.signal_version.toLowerCase().includes(search)) && (evidenceAmount === 'ALL' || row.amount === evidenceAmount) && (policy === 'ALL' || row.policy_version === policy)).map(row => (
+                      <tr key={`${row.signal_version}-${row.policy_version}-${row.amount}`}>
+                        <td className="py-1 pr-2 text-ink-95">{row.signal_version}</td>
+                        <td className="px-2 py-1 text-right text-ink-70">{row.amount}U</td>
+                        <td className="px-2 py-1 text-right">{row.n}</td>
+                        <td className={`px-2 py-1 text-right font-semibold ${row.pnl >= 0 ? 'text-positive' : 'text-negative'}`}>{row.pnl.toFixed(2)}</td>
+                        <td className="px-2 py-1 text-right text-ink-70">{row.max_drawdown.toFixed(2)}</td>
+                        <td className="px-2 py-1 text-right text-ink-70">{row.without_top_win_pnl.toFixed(2)}</td>
+                        <td className="px-2 py-1 text-right text-ink-70">{row.top_win_positive_share == null ? '未知' : `${(100 * row.top_win_positive_share).toFixed(1)}%`}</td>
+                        <td className="py-1 pl-2 text-right text-ink-55">{Object.values(row.missing).reduce((a, b) => a + b, 0)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              <details className="rounded-sm border border-line-soft">
+                <summary className="cursor-pointer px-2 py-1.5 text-[11px] text-ink-70">全家族实时与归档覆盖<HelpHint text="零样本不隐去；实时冻结仍须报价、运营和结算证据，归档不可替代准入。" /></summary>
+                <div className="overflow-x-auto px-2 pb-2">
+                  <table className="w-full min-w-[720px] text-xs">
+                    <thead>
+                      <tr className="border-b border-line text-[10px] text-ink-55">
+                        <th className="py-1 pr-2 text-left font-medium">版本</th>
+                        <th className="px-2 py-1 text-right font-medium">实时冻结</th>
+                        <th className="px-2 py-1 text-right font-medium">归档/旧账本</th>
+                        <th className="px-2 py-1 text-left font-medium">采集能力</th>
+                        <th className="py-1 pl-2 text-left font-medium">阻塞原因</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-line-soft font-mono">
+                      {data.coverage_matrix?.map(row => (
+                        <tr key={row.signal_version}>
+                          <td className="py-1 pr-2 text-ink-95">{row.signal_version}</td>
+                          <td className="px-2 py-1 text-right">{row.live_frozen_n}</td>
+                          <td className="px-2 py-1 text-right text-ink-70">{row.archive_or_legacy_n}</td>
+                          <td className="px-2 py-1 text-left">{row.capture_capability === 'LIVE_ENTRY' ? <span className="text-positive">已接实时</span> : <span className="text-warning">仅归档</span>}</td>
+                          <td className="py-1 pl-2 text-left text-[10px] text-ink-55">{row.blocking_reasons.join('；') || '—'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </details>
             </div>
           </details>
         </section>
