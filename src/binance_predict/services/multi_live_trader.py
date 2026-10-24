@@ -1736,6 +1736,27 @@ class MultiLiveTrader:
         """
         self._on_kline_signal(sig, "wbid")
 
+    def on_excur_signal(self, sig: dict) -> None:
+        """ExcurBidShadowDetector 布防接盘触发钩子（同步接口，fire-and-forget）。
+
+        payload：{version, market_start, market_end, direction, signal_bar_start,
+        touch_price, t_rel}。market = 当前 15m 窗口；触发式市价单（护栏 0.31），
+        「不晚于 T−120s 触发」等价研究撤单口径。默认 OFF。
+        """
+        try:
+            channel = str(sig.get("version") or "")
+            market_start = int(sig["market_start"])
+            if not self._hook_gate(channel, "excur", market_start):
+                return
+            task = asyncio.create_task(
+                self._fire_excur(channel, sig),
+                name=f"live_excur_{channel}_{market_start}",
+            )
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+        except Exception as exc:
+            logger.warning("多通道实盘：excur 钩子异常（不影响检测循环）| {}", exc)
+
     def on_kline_reversal_signal(self, sig: dict) -> None:
         """KREV/P1/P2 新根收盘钩子；默认 OFF，启用后按冻结方向派单。"""
         self._on_kline_signal(sig, "kline_reversal")
@@ -1789,6 +1810,55 @@ class MultiLiveTrader:
             # kline 影子信号无订单 signal_id 关联列，对账走 signal_version+window_start
         except Exception as exc:
             logger.warning("多通道实盘：S2 条件单下单任务异常 | {} | {} | {}",
+                           channel, _fmt_win(market_start), exc)
+
+    async def _fire_excur(self, channel: str, sig: dict) -> None:
+        """excur 布防接盘下单任务：当前 15m 窗口市价买 UP（护栏 0.31）。
+
+        I/O 等待后复核剩余时间硬门（>120s，研究撤单口径）：采样触发后若已进入
+        末 120s（极罕见排队/重启场景）直接弃单，防末段逆向选择成交。"""
+        spec = self._specs[channel]
+        cfg = self._configs[channel]
+        market_start = int(sig["market_start"])
+        market_end = int(sig["market_end"])
+        prediction = "UP"
+        try:
+            if time.time() * 1000 >= market_end - 120_000:
+                logger.info(
+                    "多通道实盘：{} 下单时刻剩余≤120s，弃单 | 窗口 {}",
+                    channel, _fmt_win(market_start))
+                await self._record_strategy_outcome(
+                    channel, market_start, reason="excur_late_skip",
+                    rejected=True,
+                    input_snapshot={"t_rel": sig.get("t_rel")},
+                )
+                return
+            assessment_context, proceed = await self._prepare_runtime_execution(
+                channel, market_start, prediction,
+                input_snapshot={"touch_price": sig.get("touch_price"),
+                                "t_rel": sig.get("t_rel")},
+            )
+            if not proceed:
+                return
+            logger.info(
+                "多通道实盘开火 | {} | 布防接盘押 {} | 窗口 {} | t=+{}s touch={} | "
+                "金额 {} | 护栏 {}",
+                channel, prediction, _fmt_win(market_start), sig.get("t_rel"),
+                sig.get("touch_price"), cfg.amount_usdt, resolve_max_exec(spec, cfg))
+            order = await self._exec_with_exclusive(
+                channel,
+                prediction=prediction,
+                amount_usdt=cfg.amount_usdt,
+                signal_version=channel,
+                window_start=market_start,
+                max_exec_price=resolve_max_exec(spec, cfg),
+                market_period="15m",
+                order_type=spec.order_type,
+                assessment_context=assessment_context,
+            )
+            await self._after_fill(order, channel, cfg)
+        except Exception as exc:
+            logger.warning("多通道实盘：excur 下单任务异常 | {} | {} | {}",
                            channel, _fmt_win(market_start), exc)
 
     async def _rv_pct_at(self, window_start_ms: int) -> float | None:

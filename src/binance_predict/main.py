@@ -82,6 +82,7 @@ from .services.misalignment_detector import MisalignmentDetector
 from .services.multi_live_trader import MultiLiveTrader
 from .services.nextbar_shadow_detector import NextbarShadowDetector
 from .services.wbid_shadow_detector import WbidShadowDetector
+from .services.excur_shadow_detector import ExcurBidShadowDetector
 from .services.quote_edge_detector import QuoteEdgeDetector
 from .services.reversal_shadow_detector import ReversalShadowDetector
 from .services.rev2_inside_shadow_detector import Rev2InsideShadowDetector
@@ -204,6 +205,8 @@ nextbar_shadow_detector: NextbarShadowDetector | None = None
 
 # 窗口内深价接盘影子检测器全局实例（wbid 族：5m 位面触及，影子落表 + 实盘默认 OFF）
 wbid_shadow_detector: WbidShadowDetector | None = None
+# 布防接盘影子检测器全局实例（excur 族：15m 布防+报价触发，影子落表 + 实盘默认 OFF）
+excur_shadow_detector: ExcurBidShadowDetector | None = None
 
 # 组合条件影子检测器全局实例（combo 族：45 维大搜索存活 5 组合，只记录不下注）
 combo_shadow_detector: ComboShadowDetector | None = None
@@ -346,6 +349,18 @@ async def _handle_15m_quote(quote_15m, ts_ms: int, *, persist: bool) -> None:
                 )
     except Exception as e:
         logger.warning("gap_crowd 15m 判定异常: {}", e)
+    # excur 布防接盘（15m 布防窗口内 UP ≤0.30 触发重放；仅 tracker 对齐采样路径
+    # 判定，与研究 5s 采样口径一致；边界加速路径 persist=False 不参与）。
+    # 独立守卫：不依赖 down_chance（gap_crowd 才需要），价格字段齐即判定——
+    # chance 缺失的采样点不能漏判首触。
+    if (excur_shadow_detector is not None
+            and quote_15m.start_date and quote_15m.end_date):
+        try:
+            await excur_shadow_detector.observe_sample(
+                int(quote_15m.start_date), int(quote_15m.end_date), ts_ms,
+                quote_15m.up_price, quote_15m.down_price)
+        except Exception as e:
+            logger.warning("excur 布防接盘判定异常: {}", e)
 
 
 async def _pm_15m_edge_accelerator() -> None:
@@ -1274,6 +1289,17 @@ async def lifespan(app: FastAPI):
         await wbid_shadow_detector.start()
         logger.info("wbid 窗口内接盘检测器已启动（5m 位面触及；影子落表 + 实盘默认 OFF）")
 
+    # excur 布防接盘（2026-10-24）：15m 布防窗口（前6根深跌+贴24h低）内 UP 报价首次
+    # ≤0.30 且剩余 >120s → 触发重放，影子落表 + 实盘钩子（通道 default_enabled=False，
+    # 需人工开闸）。钩子在 start() 前注入，避免部署边界漏单（同 candlestick 契约）。
+    global excur_shadow_detector
+    if settings.excur_shadow_enabled:
+        excur_shadow_detector = ExcurBidShadowDetector(collector=collector)
+        if multi_live_trader is not None:
+            excur_shadow_detector._on_live_fire = multi_live_trader.on_excur_signal
+        await excur_shadow_detector.start()
+        logger.info("excur 布防接盘检测器已启动（15m 布防+0.30 触发；影子落表 + 实盘默认 OFF）")
+
     global nextbar_shadow_detector
     if settings.nextbar_shadow_enabled:
         nextbar_shadow_detector = NextbarShadowDetector(
@@ -1591,6 +1617,8 @@ async def lifespan(app: FastAPI):
     # 停止窗口内深价接盘影子检测器
     if wbid_shadow_detector is not None:
         await wbid_shadow_detector.stop()
+    if excur_shadow_detector is not None:
+        await excur_shadow_detector.stop()
     # 停止组合条件影子检测器
     if combo_shadow_detector is not None:
         await combo_shadow_detector.stop()

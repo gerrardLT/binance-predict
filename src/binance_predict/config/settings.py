@@ -451,6 +451,12 @@ class Settings(BaseSettings):
     # 真实 ask 未验证 → 默认仅开影子落表攒真实报价；实盘通道 default_enabled=False。
     wbid_shadow_enabled: bool = True
 
+    # --- excur 布防接盘影子信号（excur 族，2026-10-24）---
+    # 15m 开盘前布防（前6根深跌+贴24h低，TRAIN Q20 冻结阈值）→ 窗口内 UP 报价首次
+    # ≤0.30 且剩余 >120s → 押当窗收涨 UP。PREDEXON 真实盘口校准 EV +0.0215/窗
+    # CI[+0.013,+0.081]（探索性），默认仅开影子落表；实盘通道 default_enabled=False。
+    excur_shadow_enabled: bool = True
+
     # --- CRV 情绪反转影子信号（crv 族，2026-10-04）---
     # 研究 run 20261004T083106Z-candle-reversal-certainty 冻结候选实时重放：
     # 15m 高位∧突破20高（盲测 63.7%）、15m 突破20高（58.5%）、15m 突破50高∧pos100>0.75

@@ -458,13 +458,13 @@ def test_channels_registry_shape(monkeypatch) -> None:
         "kdc_s3_3up_15m_v1", "kdc_s4_3dn_15m_v1",
     }
     # 归档后：原 67 个 = 在线 26 + 归档 41（spec 全部保留，不丢历史语义）
-    # 2026-10-23 +2（hm 族）→ 28；2026-10-24 +4（wbid 族）→ 32
+    # 2026-10-23 +2（hm 族）→ 28；2026-10-24 +4（wbid 族）+1（excur）→ 33
     assert expected_existing <= set(RETIRED_CHANNEL_SPECS) | set(LIVE_CHANNELS)
     assert set(CANDLESTICK_SIGNAL_IDS) <= set(RETIRED_CHANNEL_SPECS) | set(LIVE_CHANNELS)
     assert {"quote_momentum_v1", "quote_contrarian_v1", "x4_v1",
             "firsthit_down_g7_v1", "g7_t270_v1",
             "gap_crowd_5m_v1", "gap_crowd_15m_v1"} <= set(RETIRED_CHANNELS)
-    assert len(LIVE_CHANNELS) + len(RETIRED_CHANNELS) == 32 + 61
+    assert len(LIVE_CHANNELS) + len(RETIRED_CHANNELS) == 33 + 61
     assert not (set(LIVE_CHANNELS) & set(RETIRED_CHANNELS))
     by = {**RETIRED_CHANNEL_SPECS, **LIVE_CHANNELS}
     # 在线通道：市场周期/方向/护栏逐项对齐
@@ -567,8 +567,10 @@ def test_channels_registry_shape(monkeypatch) -> None:
     assert exclusive_group("firsthit_down_g7_v1") is None
     assert exclusive_group("scene_bull_exhaust") == frozenset(
         {"scene_bull_exhaust", "s1_dyn_sq_v1"})
+    # 2026-10-24 并入 excur 布防接盘（同窗同向 UP、布防条件与 S2 空头耗尽重叠）
     assert exclusive_group("scene_bear_exhaust") == frozenset(
-        {"scene_bear_exhaust", "scene_bear_exhaust_opt_v1"})
+        {"scene_bear_exhaust", "scene_bear_exhaust_opt_v1",
+         "excur_bid30_15m_v1"})
     assert exclusive_group("quote_contrarian_v2") is None
     assert exclusive_group("quote_momentum_v3") is None   # 退役组不参与生产判定
     assert RETIRED_SAME_WINDOW_EXCLUSIVE == (
@@ -3387,8 +3389,9 @@ def test_status_shape(monkeypatch) -> None:
     # 状态列表 = LIVE_CHANNELS + 退役 spec（_with_retired 合并）→ gap_crowd 两版退役后
     # 仍在合并表内；2026-10-12 加 crv_dnbrk24_15m/5m_v1 两通道后基数 59→61。
     # 2026-10-23：新增 hm_quality/hm_moderate 两通道 → 69→71
-    # 2026-10-24：新增 wbid 窗口内接盘四通道（默认 OFF）→ 71→75
-    assert len(s["channels"]) == 75 + len(CANDLESTICK_SIGNAL_IDS)
+    # 2026-10-24：新增 wbid 窗口内接盘四通道（默认 OFF）→ 71→75；
+    # 2026-10-24：再增 excur 布防接盘一通道（默认 OFF）→ 75→76
+    assert len(s["channels"]) == 76 + len(CANDLESTICK_SIGNAL_IDS)
     by = {c["channel"]: c for c in s["channels"]}
     c = by["quote_contrarian_v1"]
     assert c["enabled"] is True and c["enabled_at_startup"] is True
@@ -7296,3 +7299,577 @@ def test_new_5m_channels_same_window_exclusive() -> None:
     grp = exclusive_group("hm_quality_5m_v1")
     assert grp == frozenset({"hm_quality_5m_v1", "hm_moderate_5m_v1"})
     assert exclusive_group("hm_moderate_5m_v1") == grp
+
+
+
+
+# ============================================================
+# 组 12：excur 布防接盘（15m 布防 + UP≤0.30 触发，2026-10-24）
+# ============================================================
+
+def test_excur_registry_defaults() -> None:
+    """excur 通道注册口径：family/市场/方向/护栏/市价单/默认 OFF/S2 互斥组。"""
+    from binance_predict.services.live_channels import (
+        LIVE_CHANNELS, RETIRED_CHANNELS, KEPT_CHANNELS_20261022,
+        exclusive_group, ARCHIVED_CHANNELS_20261022)
+    ch = "excur_bid30_15m_v1"
+    spec = LIVE_CHANNELS.get(ch)
+    assert spec is not None, "excur 通道未注册"
+    assert spec.family == "excur" and spec.market_period == "15m"
+    assert spec.direction == "UP" and spec.order_type == "MARKET"
+    assert spec.auto_max_exec == 0.31          # 触发档 0.30 + 滑点余量
+    assert spec.default_enabled is False       # 实盘默认关闭
+    assert ch not in RETIRED_CHANNELS and ch not in ARCHIVED_CHANNELS_20261022
+    assert ch in KEPT_CHANNELS_20261022
+    grp = exclusive_group(ch)
+    assert grp is not None and {"scene_bear_exhaust", ch} <= grp
+
+
+def test_excur_arm_15m_pure() -> None:
+    """布防纯函数：双条件严格小于、样本不足保守不布防、窗口内根不参与。"""
+    from binance_predict.services.excur_shadow_detector import (
+        arm_15m, RET6_Q20_BP, DIST24L_Q20_BP, BAR_15M_MS)
+
+    def make_bars(ws: int, *, ret6_bp: float, dist24l_bp: float, n: int = 100,
+                  intra: dict | None = None) -> list[dict]:
+        bars = []
+        close_prev = 100.0
+        close6 = close_prev * (1.0 - ret6_bp / 1e4)
+        for i in range(n):
+            t = ws - (n - i) * BAR_15M_MS
+            c = close6 if i == n - 7 else close_prev
+            low = (close_prev * (1 - dist24l_bp / 1e4)) if i == n - 1 else c - 1e-9
+            bars.append({"open_time": t, "open": c, "high": c + 0.01,
+                         "low": low, "close": c})
+        if intra is not None:
+            bars.append({"open_time": ws, **intra})
+        return bars
+
+    WS = 1_790_000_000_000
+    arm = arm_15m(make_bars(WS, ret6_bp=-40.0, dist24l_bp=40.0), WS)
+    assert arm is not None and arm["armed"] is True
+    assert arm["ret6_bp"] < RET6_Q20_BP and arm["dist24l_bp"] < DIST24L_Q20_BP
+    arm2 = arm_15m(make_bars(WS, ret6_bp=-20.0, dist24l_bp=40.0), WS)
+    assert arm2 is not None and arm2["armed"] is False
+    arm3 = arm_15m(make_bars(WS, ret6_bp=-40.0, dist24l_bp=80.0), WS)
+    assert arm3 is not None and arm3["armed"] is False
+    # 贴线上方（比阈值少跌 0.001bp）不布防；恰好等于阈值的严格小于语义经价格
+    # 反推会引入 ~1e-13 浮点误差，无法稳定构造，改测「略高于阈值」的边界侧。
+    arm4 = arm_15m(make_bars(WS, ret6_bp=RET6_Q20_BP + 0.001, dist24l_bp=40.0), WS)
+    assert arm4 is not None and arm4["armed"] is False
+    # 样本不足 → None（保守不布防）
+    assert arm_15m(make_bars(WS, ret6_bp=-40.0, dist24l_bp=40.0, n=90), WS) is None
+    # 窗口内根（open_time=ws）不参与：即使窗口内暴跌也不改变布防判定
+    arm5 = arm_15m(make_bars(WS, ret6_bp=-40.0, dist24l_bp=40.0,
+                             intra={"open": 99.0, "high": 99.0, "low": 80.0,
+                                    "close": 80.0}), WS)
+    assert arm5 is not None and arm5["armed"] is True
+
+
+@pytest.mark.asyncio
+async def test_excur_observe_sample_flow(monkeypatch) -> None:
+    """触发流：布防落行一次 → 触发回填+钩子一次 → 同窗去重 → 撤单线不触发。"""
+    import binance_predict.services.excur_shadow_detector as excur_mod
+    from binance_predict.services.excur_shadow_detector import (
+        ExcurBidShadowDetector, EXCUR_VERSION, CANCEL_BEFORE_END_S, BAR_15M_MS)
+
+    WS = 1_790_000_000_000 // BAR_15M_MS * BAR_15M_MS
+    WE = WS + BAR_15M_MS
+
+    def make_bars(ret6_bp: float = -40.0, dist24l_bp: float = 40.0) -> list[dict]:
+        n, close_prev = 100, 100.0
+        close6 = close_prev * (1.0 - ret6_bp / 1e4)
+        bars = []
+        for i in range(n):
+            t = WS - (n - i) * BAR_15M_MS
+            c = close6 if i == n - 7 else close_prev
+            low = (close_prev * (1 - dist24l_bp / 1e4)) if i == n - 1 else c - 1e-9
+            bars.append({"open_time": t, "open": c, "high": c + 0.01,
+                         "low": low, "close": c})
+        return bars
+
+    class _Collector:
+        async def fetch_recent_klines(self, interval: str, n: int):
+            assert interval == "15m"
+            return make_bars()[-n:]
+
+    store: dict = {"rows": [], "next_id": 1}
+
+    class _Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def first(self):
+            for r in self._rows:
+                return (r.id,)
+            return None
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return [r for r in self._rows if r.status == "PENDING"]
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def execute(self, stmt):
+            return _Result(store["rows"])
+
+        async def get(self, model, rid: int):
+            for r in store["rows"]:
+                if r.id == rid:
+                    return r
+            return None
+
+        def add(self, row):
+            row.id = store["next_id"]
+            store["next_id"] += 1
+            store["rows"].append(row)
+
+        async def commit(self):
+            return None
+
+    monkeypatch.setattr(excur_mod, "async_session_factory", lambda: _Session())
+    det = ExcurBidShadowDetector(collector=_Collector())
+    fires: list[dict] = []
+    det._on_live_fire = fires.append
+
+    # ① 首采样（up=0.5 未达触发档）→ 只落布防行
+    await det.observe_sample(WS, WE, WS + 30_000, 0.50, 0.50)
+    assert len(store["rows"]) == 1
+    row = store["rows"][0]
+    assert row.version == EXCUR_VERSION and row.status == "PENDING"
+    assert row.feature_snapshot["armed"] is True
+    assert row.entry_up_price is None and fires == []
+
+    # ② 触发采样（up=0.28，剩余 > 120s）→ 回填 + 钩子一次
+    ts_touch = WS + 60_000
+    await det.observe_sample(WS, WE, ts_touch, 0.28, 0.72)
+    assert len(fires) == 1
+    assert fires[0]["version"] == EXCUR_VERSION
+    assert fires[0]["market_start"] == WS and fires[0]["market_end"] == WE
+    assert fires[0]["direction"] == "UP"
+    assert row.feature_snapshot["touched"] is True
+    assert row.entry_up_price == 0.28 and row.entry_quote_ts == ts_touch
+
+    # ③ 同窗第二次触及 → 不再触发（去重）
+    await det.observe_sample(WS, WE, WS + 90_000, 0.20, 0.80)
+    assert len(fires) == 1
+
+    # ④ 布防缓存清空后重放同窗：exists 行命中 → 不重复落行
+    n_rows = len(store["rows"])
+    det._arm_cache.clear()
+    det._row_ids.clear()
+    await det.observe_sample(WS, WE, WS + 45_000, 0.10, 0.90)
+    assert len(store["rows"]) == n_rows
+    assert len(fires) == 1        # 已 touched，不重复触发
+
+    # ⑤ 撤单线：剩余 ≤120s 的触及不触发（研究 T−120s 口径，含线不触发）。
+    # 用独立存储：主存储的 exists 行（别的窗口）会让伪对象误判去重。
+    store3: dict = {"rows": [], "next_id": 1}
+
+    class _Session3(_Session):
+        def __init__(self):
+            pass
+
+        async def execute(self, stmt):
+            return _Result(store3["rows"])
+
+        async def get(self, model, rid: int):
+            for r in store3["rows"]:
+                if r.id == rid:
+                    return r
+            return None
+
+        def add(self, row):
+            row.id = store3["next_id"]
+            store3["next_id"] += 1
+            store3["rows"].append(row)
+
+    monkeypatch.setattr(excur_mod, "async_session_factory", lambda: _Session3())
+    det3 = ExcurBidShadowDetector(collector=_Collector())
+    det3._arm_cache[WS] = {"ret6_bp": -40.0, "dist24l_bp": 40.0, "armed": True}
+    det3_fires: list[dict] = []
+    det3._on_live_fire = det3_fires.append
+    late_ts = WE - CANCEL_BEFORE_END_S * 1000
+    await det3.observe_sample(WS, WE, late_ts, 0.10, 0.90)
+    assert det3_fires == []
+    await det3.observe_sample(WS, WE, late_ts - 1_000, 0.10, 0.90)
+    assert len(det3_fires) == 1
+
+
+@pytest.mark.asyncio
+async def test_excur_live_fire_passes_market_and_guard(monkeypatch) -> None:
+    """实盘开火：透传 UP/15m/MARKET/护栏 0.31，signal_version=通道名。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["excur_bid30_15m_v1"])
+    now_ms = int(time.time() * 1000)
+    # 用「从当下起整 15m」的未来窗：剩余时间恒 900s，稳定通过剩余时间门
+    sig = {"version": "excur_bid30_15m_v1", "market_start": now_ms,
+           "market_end": now_ms + 900_000, "direction": "UP",
+           "signal_bar_start": now_ms, "touch_price": 0.29, "t_rel": 60.0}
+    t.on_excur_signal(sig)
+    await _drain(t)
+    assert len(fake.calls) == 1
+    call = fake.calls[0]
+    assert call["signal_version"] == "excur_bid30_15m_v1"
+    assert call["window_start"] == now_ms
+    assert call["prediction"] == "UP" and call["market_period"] == "15m"
+    assert call["order_type"] == "MARKET" and call["max_exec_price"] == 0.31
+
+
+@pytest.mark.asyncio
+async def test_excur_live_late_veto(monkeypatch) -> None:
+    """末段否决：下单任务启动时剩余 ≤120s → 不下单并记 outcome。"""
+    from unittest.mock import AsyncMock
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["excur_bid30_15m_v1"])
+    outcomes = AsyncMock()
+    monkeypatch.setattr(t, "_record_strategy_outcome", outcomes)
+    now_ms = int(time.time() * 1000)
+    WS = now_ms // 900_000 * 900_000
+    sig = {"version": "excur_bid30_15m_v1", "market_start": WS,
+           "market_end": now_ms + 60_000, "direction": "UP",
+           "signal_bar_start": WS, "touch_price": 0.29, "t_rel": 800.0}
+    t.on_excur_signal(sig)
+    await _drain(t)
+    assert fake.calls == []
+    assert outcomes.await_count == 1
+    assert outcomes.await_args.kwargs["reason"] == "excur_late_skip"
+
+
+@pytest.mark.asyncio
+async def test_excur_disabled_channel_never_fires(monkeypatch) -> None:
+    """默认 OFF：钩子到达但通道未启用 → 不下单（影子照常落表）。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=[])
+    WS = 1_790_000_000_000
+    t.on_excur_signal({"version": "excur_bid30_15m_v1", "market_start": WS,
+                       "market_end": WS + 900_000, "direction": "UP",
+                       "signal_bar_start": WS, "touch_price": 0.29, "t_rel": 60.0})
+    await _drain(t)
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_excur_restart_dedup_from_db_state(monkeypatch) -> None:
+    """重启反例：清空全部内存状态（_arm_cache/_row_ids/_touched）后重放同窗——
+    以 DB 行的 touched 状态为准，不重复触发、不覆写首次成交数据。"""
+    import binance_predict.services.excur_shadow_detector as excur_mod
+    from binance_predict.services.excur_shadow_detector import (
+        ExcurBidShadowDetector, BAR_15M_MS)
+
+    WS = 1_790_000_000_000 // BAR_15M_MS * BAR_15M_MS
+    WE = WS + BAR_15M_MS
+    n, close_prev = 100, 100.0
+    close6 = close_prev * (1.0 + 0.004)
+    bars = []
+    for i in range(n):
+        t = WS - (n - i) * BAR_15M_MS
+        c = close6 if i == n - 7 else close_prev
+        low = 99.60 if i == n - 1 else c - 1e-9
+        bars.append({"open_time": t, "open": c, "high": c + 0.01,
+                     "low": low, "close": c})
+
+    class _Collector:
+        async def fetch_recent_klines(self, interval: str, k: int):
+            return bars[-k:]
+
+    store: dict = {"rows": [], "next_id": 1}
+
+    class _Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def first(self):
+            for r in self._rows:
+                return (r.id,)
+            return None
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return [r for r in self._rows if r.status == "PENDING"]
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def execute(self, stmt):
+            return _Result(store["rows"])
+
+        async def get(self, model, rid: int):
+            for r in store["rows"]:
+                if r.id == rid:
+                    return r
+            return None
+
+        def add(self, row):
+            row.id = store["next_id"]
+            store["next_id"] += 1
+            store["rows"].append(row)
+
+        async def commit(self):
+            return None
+
+    monkeypatch.setattr(excur_mod, "async_session_factory", lambda: _Session())
+    det = ExcurBidShadowDetector(collector=_Collector())
+    fires: list[dict] = []
+    det._on_live_fire = fires.append
+    await det.observe_sample(WS, WE, WS + 60_000, 0.28, 0.72)
+    assert len(fires) == 1 and store["rows"][0].entry_up_price == 0.28
+    first_ts = store["rows"][0].entry_quote_ts
+    # 模拟重启：全部内存态清空，且来了一次更深的触及（0.20）
+    det._arm_cache.clear()
+    det._row_ids.clear()
+    det._touched.clear()
+    await det.observe_sample(WS, WE, WS + 90_000, 0.20, 0.80)
+    assert len(fires) == 1                          # 不重复触发
+    assert store["rows"][0].entry_up_price == 0.28  # 首次数据不被覆写
+    assert store["rows"][0].entry_quote_ts == first_ts
+
+
+@pytest.mark.asyncio
+async def test_excur_transient_fetch_failure_no_cache(monkeypatch) -> None:
+    """瞬态K线拉取失败不毒化布防缓存：空返回不落缓存，下轮采样重试成功。"""
+    import binance_predict.services.excur_shadow_detector as excur_mod
+    from binance_predict.services.excur_shadow_detector import (
+        ExcurBidShadowDetector, BAR_15M_MS)
+
+    WS = 1_790_000_000_000 // BAR_15M_MS * BAR_15M_MS
+    WE = WS + BAR_15M_MS
+    n, close_prev = 100, 100.0
+    close6 = close_prev * (1.0 + 0.004)
+    bars = []
+    for i in range(n):
+        t = WS - (n - i) * BAR_15M_MS
+        c = close6 if i == n - 7 else close_prev
+        low = 99.60 if i == n - 1 else c - 1e-9
+        bars.append({"open_time": t, "open": c, "high": c + 0.01,
+                     "low": low, "close": c})
+
+    state = {"fail": True}
+
+    class _Collector:
+        async def fetch_recent_klines(self, interval: str, k: int):
+            if state["fail"]:
+                return []            # 模拟 REST 瞬态失败（返回空列表）
+            return bars[-k:]
+
+    store: dict = {"rows": [], "next_id": 1}
+
+    class _Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def first(self):
+            for r in self._rows:
+                return (r.id,)
+            return None
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return [r for r in self._rows if r.status == "PENDING"]
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def execute(self, stmt):
+            return _Result(store["rows"])
+
+        async def get(self, model, rid: int):
+            for r in store["rows"]:
+                if r.id == rid:
+                    return r
+            return None
+
+        def add(self, row):
+            row.id = store["next_id"]
+            store["next_id"] += 1
+            store["rows"].append(row)
+
+        async def commit(self):
+            return None
+
+    monkeypatch.setattr(excur_mod, "async_session_factory", lambda: _Session())
+    det = ExcurBidShadowDetector(collector=_Collector())
+    # 首轮拉取失败：不落行、不写缓存
+    await det.observe_sample(WS, WE, WS + 30_000, 0.10, 0.90)
+    assert store["rows"] == [] and WS not in det._arm_cache
+    # 下轮恢复：布防判定照常完成并落行
+    state["fail"] = False
+    await det.observe_sample(WS, WE, WS + 35_000, 0.50, 0.50)
+    assert len(store["rows"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_excur_price_boundary_inclusive(monkeypatch) -> None:
+    """价格边界：up_price == 0.30 恰好等于触发档 → 触发（≤ 含线，与研究口径一致）。"""
+    import binance_predict.services.excur_shadow_detector as excur_mod
+    from binance_predict.services.excur_shadow_detector import (
+        ExcurBidShadowDetector, BID_LEVEL, BAR_15M_MS)
+
+    WS = 1_790_000_000_000 // BAR_15M_MS * BAR_15M_MS
+    WE = WS + BAR_15M_MS
+    store: dict = {"rows": [], "next_id": 1}
+
+    class _Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def first(self):
+            for r in self._rows:
+                return (r.id,)
+            return None
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return [r for r in self._rows if r.status == "PENDING"]
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def execute(self, stmt):
+            return _Result(store["rows"])
+
+        async def get(self, model, rid: int):
+            for r in store["rows"]:
+                if r.id == rid:
+                    return r
+            return None
+
+        def add(self, row):
+            row.id = store["next_id"]
+            store["next_id"] += 1
+            store["rows"].append(row)
+
+        async def commit(self):
+            return None
+
+    monkeypatch.setattr(excur_mod, "async_session_factory", lambda: _Session())
+    det = ExcurBidShadowDetector(collector=_CollectorNone())
+    det._arm_cache[WS] = {"ret6_bp": -40.0, "dist24l_bp": 40.0, "armed": True}
+    fires: list[dict] = []
+    det._on_live_fire = fires.append
+    await det.observe_sample(WS, WE, WS + 60_000, BID_LEVEL, 0.70)
+    assert len(fires) == 1 and store["rows"][0].entry_up_price == BID_LEVEL
+
+
+class _CollectorNone:
+    async def fetch_recent_klines(self, interval: str, k: int):
+        return []
+
+
+@pytest.mark.asyncio
+async def test_excur_settle_pending(monkeypatch) -> None:
+    """结算：close>open → win/UP；close==open → NOISE/win=None；远古窗 → EXPIRED。"""
+    import binance_predict.services.excur_shadow_detector as excur_mod
+    from binance_predict.services.excur_shadow_detector import (
+        ExcurBidShadowDetector, BAR_15M_MS)
+
+    WS = 1_790_000_000_000 // BAR_15M_MS * BAR_15M_MS
+    now_ms = WS + 2 * BAR_15M_MS
+    bars = [
+        {"open_time": WS, "open": 100.0, "high": 100.5, "low": 99.0,
+         "close": 100.4, "close_time": WS + BAR_15M_MS - 1},          # 收涨
+        {"open_time": WS + BAR_15M_MS, "open": 100.0, "high": 100.5, "low": 99.0,
+         "close": 100.0, "close_time": WS + 2 * BAR_15M_MS - 1},      # 平盘
+    ]
+
+    class _Collector:
+        async def fetch_recent_klines(self, interval: str, k: int):
+            return bars[-k:]
+
+    rows = []
+
+    class _FakeRow:
+        def __init__(self, target, touched):
+            self.id = len(rows) + 1
+            self.version = "excur_bid30_15m_v1"
+            self.status = "PENDING"
+            self.target_bar_start = target
+            self.feature_snapshot = {"touched": touched}
+            self.entry_up_price = 0.29 if touched else None
+            self.settle_open = self.settle_close = None
+            self.settle_outcome = None
+            self.win = None
+
+    rows.append(_FakeRow(WS, True))
+    rows.append(_FakeRow(WS + BAR_15M_MS, False))          # 未触发行也要结算
+    rows.append(_FakeRow(WS - 20 * BAR_15M_MS, False))     # 远古窗 → EXPIRED
+    store = {"rows": rows, "next_id": 99}
+
+    class _Result:
+        def __init__(self, rws):
+            self._rows = rws
+
+        def first(self):
+            for r in self._rows:
+                return (r.id,)
+            return None
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return [r for r in self._rows if r.status == "PENDING"]
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def execute(self, stmt):
+            return _Result(store["rows"])
+
+        async def get(self, model, rid: int):
+            for r in store["rows"]:
+                if r.id == rid:
+                    return r
+            return None
+
+        def add(self, row):
+            row.id = store["next_id"]
+            store["next_id"] += 1
+            store["rows"].append(row)
+
+        async def commit(self):
+            return None
+
+    monkeypatch.setattr(excur_mod, "async_session_factory", lambda: _Session())
+    import time as _time
+    monkeypatch.setattr(excur_mod.time, "time", lambda: now_ms / 1000.0)
+    det = ExcurBidShadowDetector(collector=_Collector())
+    await det._settle_pending()
+    by_target = {r.target_bar_start: r for r in rows}
+    win_row = by_target[WS]
+    assert win_row.status == "SETTLED" and win_row.win is True
+    assert win_row.settle_outcome == "UP"
+    tie_row = by_target[WS + BAR_15M_MS]
+    assert tie_row.status == "SETTLED" and tie_row.win is None
+    assert tie_row.settle_outcome == "NOISE"
+    old_row = by_target[WS - 20 * BAR_15M_MS]
+    assert old_row.status == "EXPIRED"

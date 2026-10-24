@@ -17,6 +17,9 @@
 - gap_crowd：采样循环喂价内联判定（5m 与 15m 市场各自调用）——窗后半段预测市场报价
   比人群投票倾向便宜 ≥5pp → 买便宜侧 UP；判定函数与影子同源
   （gap_crowd_shadow_detector.evaluate_gap_crowd 纯函数）。
+- excur：15m 采样喂价（excur_shadow_detector.observe_sample）——开盘前布防
+  （前6根15m深跌+贴24h低，TRAIN Q20 冻结阈值）→ 窗口内 UP 报价首次 ≤0.30 且
+  剩余 >120s → 触发式市价买 UP（2026-10-24 注册，默认 OFF）。
 
 护栏数值依据：盈亏平衡入场价 entry* = wr×(1−FEE)（干净口径历史胜率）：
 S1 wr64.4%→0.63 / S5 78.5%→0.77 / S2 53.6%→0.525 / S4 55.4%→0.54 /
@@ -576,6 +579,25 @@ LIVE_CHANNELS["wbid_d03_k2_fast_5m_v1"] = ChannelSpec(
     "窗口接盘·浅位急跌2分钟", order_type="LIMIT",
 )
 
+# ---------------------------------------------------------------------------
+# excur 族（2026-10-24 注册，研究 run 20261024T092511Z-window-excursion-occurrence
+# 「砸坑收回」出现概率轮）：「布防接盘」——开盘前布防（前 6 根 15m 深跌 + 贴 24h 低，
+# TRAIN Q20 冻结阈值见 excur_shadow_detector）→ 窗口内 UP 报价首次 ≤0.30 且剩余
+# >120s → 触发式市价买 UP（护栏 0.31 = 触发档 + 滑点余量）。「不晚于 T−120s 触发」
+# 等价研究「挂单 T−120s 撤销」口径。EV 依据（PREDEXON 2026-07→10 真实盘口，722
+# 布防窗）：EV +0.0215/窗 CI[+0.013,+0.081]、成交率 65.5%、成交后胜率 33.9%
+# （保本线 30.6%）——20 格校准中唯一 CI 下界>0 的探索性结论，先影子前向验证；
+# 未成交窗 99% 收涨（逆向选择全在成交侧）。检测器 excur_shadow_detector 落
+# kline_shadow_signals（每布防窗一行，触发回填 entry 价），实盘钩子
+# MultiLiveTrader.on_excur_signal。default_enabled=False。
+# ⚠ 与 S2 族（scene_bear_exhaust）同窗同向且布防条件高度重叠（空头耗尽族）
+#   → 并入 S2 互斥组：同窗至多一单 UP 成交（默认 OFF，开启时须知互斥关系）。
+# ---------------------------------------------------------------------------
+LIVE_CHANNELS["excur_bid30_15m_v1"] = ChannelSpec(
+    "excur_bid30_15m_v1", "excur", "15m", "UP", 0.31,
+    "布防接盘·前跌贴低买UP（0.30档）",
+)
+
 
 # ---------------------------------------------------------------------------
 # 已退役通道（2026-09-04 用户拍板「信号直接不要了」）：不在 LIVE_CHANNELS
@@ -695,6 +717,8 @@ KEPT_CHANNELS_20261022: frozenset[str] = frozenset({
     # wbid 窗口内深价接盘（2026-10-24 注册，default_enabled=False）
     "wbid_d03_k2_5m_v1", "wbid_d03_k3_5m_v1", "wbid_d05_k2_5m_v1",
     "wbid_d03_k2_fast_5m_v1",
+    # excur 布防接盘（2026-10-24 注册，default_enabled=False）
+    "excur_bid30_15m_v1",
     # firsthit D/E（实盘 ON，观察期）
     "firsthit_down_chg35_d_v1", "firsthit_down_chg35_e_v1",
     # CRV 全族
@@ -741,7 +765,10 @@ SAME_WINDOW_EXCLUSIVE: tuple[frozenset[str], ...] = (
     frozenset({"scene_bull_exhaust", "s1_dyn_sq_v1"}),
     frozenset({"scene_bull_exhaust_confirm", "s5_deep_z20_v1"}),
     # 原 S2 与优化版是同一父事件、同方向、同目标窗；若同时启用只允许一单成交。
-    frozenset({"scene_bear_exhaust", "scene_bear_exhaust_opt_v1"}),
+    # 2026-10-24 并入 excur 布防接盘：同为「空头耗尽族→同窗押 UP」，布防条件
+    # （前6根深跌+贴24h低）与 S2 父事件高度重叠，防同窗双倍 UP 敞口。
+    frozenset({"scene_bear_exhaust", "scene_bear_exhaust_opt_v1",
+               "excur_bid30_15m_v1"}),
     # S2 条件单双变体同源（同一实盘 S2 事件、同一目标周期；t=4/t=5 判价高度重叠），
     # 防同事件双成交叠加敞口（2026-09-06 promote）。
     frozenset({"s2_cond_t4_v1", "s2_cond_t5d_v1"}),
