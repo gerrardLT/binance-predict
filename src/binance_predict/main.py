@@ -81,6 +81,7 @@ from .services.kline_shadow_detector import KlineShadowDetector
 from .services.misalignment_detector import MisalignmentDetector
 from .services.multi_live_trader import MultiLiveTrader
 from .services.nextbar_shadow_detector import NextbarShadowDetector
+from .services.wbid_shadow_detector import WbidShadowDetector
 from .services.quote_edge_detector import QuoteEdgeDetector
 from .services.reversal_shadow_detector import ReversalShadowDetector
 from .services.rev2_inside_shadow_detector import Rev2InsideShadowDetector
@@ -200,6 +201,9 @@ brk_reversion_detector: BrkReversionDetector | None = None
 
 # 下一根 K 线方向影子检测器全局实例（nextbar 族：15m 冠军 + 5m sma_slope 误定价候选，只记录不下注）
 nextbar_shadow_detector: NextbarShadowDetector | None = None
+
+# 窗口内深价接盘影子检测器全局实例（wbid 族：5m 位面触及，影子落表 + 实盘默认 OFF）
+wbid_shadow_detector: WbidShadowDetector | None = None
 
 # 组合条件影子检测器全局实例（combo 族：45 维大搜索存活 5 组合，只记录不下注）
 combo_shadow_detector: ComboShadowDetector | None = None
@@ -1258,6 +1262,18 @@ async def lifespan(app: FastAPI):
     # LIVE_CHANNELS，目标根开盘 ≤90s 的新鲜命中经 _on_live_fire 钩子驱动真单（冷启动
     # 回补天然排除；与 KREV/反转共表 kline_shadow_signals，version+timeframe 双隔离，
     # 各用自己 tf 的 K 线结算）。默认开关开启，与其他影子一致。
+    # wbid 窗口内深价接盘（2026-10-24）：5m 窗口内位面触及实时重放，影子落表 +
+    # 实盘钩子（通道 default_enabled=False，需人工开闸）。钩子在 start() 前注入，
+    # 避免部署边界漏单（同 candlestick 契约）。
+    global wbid_shadow_detector
+    if settings.wbid_shadow_enabled:
+        wbid_shadow_detector = WbidShadowDetector(
+            collector=collector, pm_5m_info=_pm_market_info)
+        if multi_live_trader is not None:
+            wbid_shadow_detector._on_live_fire = multi_live_trader.on_wbid_signal
+        await wbid_shadow_detector.start()
+        logger.info("wbid 窗口内接盘检测器已启动（5m 位面触及；影子落表 + 实盘默认 OFF）")
+
     global nextbar_shadow_detector
     if settings.nextbar_shadow_enabled:
         nextbar_shadow_detector = NextbarShadowDetector(
@@ -1572,6 +1588,9 @@ async def lifespan(app: FastAPI):
     # 停止下一根 K 线方向影子检测器
     if nextbar_shadow_detector is not None:
         await nextbar_shadow_detector.stop()
+    # 停止窗口内深价接盘影子检测器
+    if wbid_shadow_detector is not None:
+        await wbid_shadow_detector.stop()
     # 停止组合条件影子检测器
     if combo_shadow_detector is not None:
         await combo_shadow_detector.stop()

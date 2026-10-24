@@ -62,7 +62,7 @@ class ChannelSpec:
     """通道静态描述（冻结，运行时不可变）。"""
 
     channel: str
-    family: str                   # quote_edge | x4 | scene | s2_cond | nextbar | absorption | firsthit
+    family: str                   # quote_edge | x4 | scene | s2_cond | nextbar | absorption | firsthit | wbid
     market_period: str            # 5m | 15m
     direction: str                # 典型下单方向（scene/s2_cond 族由信号 side 决定；
                                   # absorption 族由 BTC 位移符号动态决定，此处为基准方向）
@@ -549,6 +549,35 @@ for _candle_spec in CANDLESTICK_LOGICAL_SPECS:
 
 
 # ---------------------------------------------------------------------------
+# wbid 族（窗口内深价接盘，2026-10-24 注册）：5m 窗口内价格下探到
+# open − d×ATR5 位面、且首次触及在第 k 根 1m bar 时挂 UP 限价买单。
+# ⚠ order_type=LIMIT 时 auto_max_exec 即**挂单价**（execute_signal_trade 内部
+# limit_price = max_exec_price）：实际成交在 min(ask, 挂价)，报价均价≥挂价则
+# 贴线弃单。挂价冻结自研究 EXEC_SPEC §4 建议价 = p_max − 0.02。
+# 回测（2024-09→2026-09，723d）：胜率 17–25%、样本外 EV +3.1~+4.1¢/股；
+# ⚠ 回测为「假设按建议价成交」的乐观上界，真实 ask 未验证（+5¢ 滑点即归零），
+# 故 default_enabled=False，先跑影子攒真实报价再评审开闸。
+# d03_k2_fast 的触发集合是 d03_k2 的子集 → 同窗互斥组（见 SAME_WINDOW_EXCLUSIVE）。
+# ---------------------------------------------------------------------------
+LIVE_CHANNELS["wbid_d03_k2_5m_v1"] = ChannelSpec(
+    "wbid_d03_k2_5m_v1", "wbid", "5m", "UP", 0.21,
+    "窗口接盘·浅位2分钟", order_type="LIMIT",
+)
+LIVE_CHANNELS["wbid_d03_k3_5m_v1"] = ChannelSpec(
+    "wbid_d03_k3_5m_v1", "wbid", "5m", "UP", 0.16,
+    "窗口接盘·浅位3分钟", order_type="LIMIT",
+)
+LIVE_CHANNELS["wbid_d05_k2_5m_v1"] = ChannelSpec(
+    "wbid_d05_k2_5m_v1", "wbid", "5m", "UP", 0.14,
+    "窗口接盘·深位2分钟", order_type="LIMIT",
+)
+LIVE_CHANNELS["wbid_d03_k2_fast_5m_v1"] = ChannelSpec(
+    "wbid_d03_k2_fast_5m_v1", "wbid", "5m", "UP", 0.21,
+    "窗口接盘·浅位急跌2分钟", order_type="LIMIT",
+)
+
+
+# ---------------------------------------------------------------------------
 # 已退役通道（2026-09-04 用户拍板「信号直接不要了」）：不在 LIVE_CHANNELS
 # → 执行器不装配、不可 toggle 上线、status 不列出。spec 本体保留在此处，
 # 两个用途：① parse_channel_config 对 LIVE_CHANNELS_JSON / live_channel_overrides
@@ -663,6 +692,9 @@ KEPT_CHANNELS_20261022: frozenset[str] = frozenset({
     # nextbar / kline_reversal（实盘 ON）
     "krev_b_v1", "hm_inside_15m_v2",
     "hm_quality_5m_v1", "hm_moderate_5m_v1",
+    # wbid 窗口内深价接盘（2026-10-24 注册，default_enabled=False）
+    "wbid_d03_k2_5m_v1", "wbid_d03_k3_5m_v1", "wbid_d05_k2_5m_v1",
+    "wbid_d03_k2_fast_5m_v1",
     # firsthit D/E（实盘 ON，观察期）
     "firsthit_down_chg35_d_v1", "firsthit_down_chg35_e_v1",
     # CRV 全族
@@ -737,6 +769,8 @@ SAME_WINDOW_EXCLUSIVE: tuple[frozenset[str], ...] = (
     # 同周期蜡烛逻辑版本共享物理事件，避免主版/对照/组件/潜力标签重复暴露。
     _CANDLE_5M_CHANNELS,
     _CANDLE_15M_CHANNELS,
+    # wbid 浅位2分钟与其急跌子集同源（急跌 ⊂ 全部），同窗至多一单（2026-10-24）。
+    frozenset({"wbid_d03_k2_5m_v1", "wbid_d03_k2_fast_5m_v1"}),
     # 2026-09-12：解除 firsthit 全族同窗互斥，允许各 G 系列及 G7 变体按门禁独立下单对比实盘效果
 )
 

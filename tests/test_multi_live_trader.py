@@ -458,12 +458,13 @@ def test_channels_registry_shape(monkeypatch) -> None:
         "kdc_s3_3up_15m_v1", "kdc_s4_3dn_15m_v1",
     }
     # 归档后：原 67 个 = 在线 26 + 归档 41（spec 全部保留，不丢历史语义）
+    # 2026-10-23 +2（hm 族）→ 28；2026-10-24 +4（wbid 族）→ 32
     assert expected_existing <= set(RETIRED_CHANNEL_SPECS) | set(LIVE_CHANNELS)
     assert set(CANDLESTICK_SIGNAL_IDS) <= set(RETIRED_CHANNEL_SPECS) | set(LIVE_CHANNELS)
     assert {"quote_momentum_v1", "quote_contrarian_v1", "x4_v1",
             "firsthit_down_g7_v1", "g7_t270_v1",
             "gap_crowd_5m_v1", "gap_crowd_15m_v1"} <= set(RETIRED_CHANNELS)
-    assert len(LIVE_CHANNELS) + len(RETIRED_CHANNELS) == 28 + 61
+    assert len(LIVE_CHANNELS) + len(RETIRED_CHANNELS) == 32 + 61
     assert not (set(LIVE_CHANNELS) & set(RETIRED_CHANNELS))
     by = {**RETIRED_CHANNEL_SPECS, **LIVE_CHANNELS}
     # 在线通道：市场周期/方向/护栏逐项对齐
@@ -3386,7 +3387,8 @@ def test_status_shape(monkeypatch) -> None:
     # 状态列表 = LIVE_CHANNELS + 退役 spec（_with_retired 合并）→ gap_crowd 两版退役后
     # 仍在合并表内；2026-10-12 加 crv_dnbrk24_15m/5m_v1 两通道后基数 59→61。
     # 2026-10-23：新增 hm_quality/hm_moderate 两通道 → 69→71
-    assert len(s["channels"]) == 71 + len(CANDLESTICK_SIGNAL_IDS)
+    # 2026-10-24：新增 wbid 窗口内接盘四通道（默认 OFF）→ 71→75
+    assert len(s["channels"]) == 75 + len(CANDLESTICK_SIGNAL_IDS)
     by = {c["channel"]: c for c in s["channels"]}
     c = by["quote_contrarian_v1"]
     assert c["enabled"] is True and c["enabled_at_startup"] is True
@@ -6057,13 +6059,20 @@ def test_limit_order_channels_marked_in_registry() -> None:
         "quote_contrarian_v2",
         "late_night_contrarian_v2",
         "s2_cond_t4_v1",
+        # 2026-10-24 wbid 窗口内深价接盘（限价挂单接盘，默认 OFF）
+        "wbid_d03_k2_5m_v1",
+        "wbid_d03_k3_5m_v1",
+        "wbid_d05_k2_5m_v1",
+        "wbid_d03_k2_fast_5m_v1",
     ]
     for ch in expected_limit_channels:
         spec = {**RETIRED_CHANNEL_SPECS, **LIVE_CHANNELS}.get(ch)
         assert spec is not None, f"通道 {ch} 未注册"
         assert spec.order_type == "LIMIT", f"通道 {ch} 的 order_type 应为 LIMIT，实为 {spec.order_type}"
-    # 2026-10-22 治理：在线通道已全部 MARKET；LIMIT 语义保留在归档 spec 中
-    assert all(s.order_type == "MARKET" for s in LIVE_CHANNELS.values())
+    # 2026-10-22 治理：在线通道除 wbid 族（窗口内限价接盘，2026-10-24）外全部
+    # MARKET；LIMIT 语义其余保留在归档 spec 中。
+    assert all(s.order_type == "MARKET" for cid, s in LIVE_CHANNELS.items()
+               if not cid.startswith("wbid_"))
 
     # 市价通道保持 MARKET
     expected_market_channels = [

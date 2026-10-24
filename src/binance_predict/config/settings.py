@@ -445,6 +445,12 @@ class Settings(BaseSettings):
     # 部署即生效；仅作紧急停用制动力，正常情况下无需触碰。
     nextbar_shadow_enabled: bool = True
 
+    # --- wbid 窗口内深价接盘影子信号（wbid 族，2026-10-24）---
+    # 5m 窗口内价格下探到 open−d×ATR5 位面且首次触及在第 k 根 1m bar → 押 UP 收阳。
+    # 回测（723d）样本外 EV +3.1~+4.1¢/股，但为「假设按建议价成交」的乐观上界，
+    # 真实 ask 未验证 → 默认仅开影子落表攒真实报价；实盘通道 default_enabled=False。
+    wbid_shadow_enabled: bool = True
+
     # --- CRV 情绪反转影子信号（crv 族，2026-10-04）---
     # 研究 run 20261004T083106Z-candle-reversal-certainty 冻结候选实时重放：
     # 15m 高位∧突破20高（盲测 63.7%）、15m 突破20高（58.5%）、15m 突破50高∧pos100>0.75

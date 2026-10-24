@@ -1726,6 +1726,16 @@ class MultiLiveTrader:
         """
         self._on_kline_signal(sig, "nextbar")
 
+    def on_wbid_signal(self, sig: dict) -> None:
+        """WbidShadowDetector 窗口内位面触及钩子（同步接口，fire-and-forget）。
+
+        payload：{version, market_start, market_end, direction, signal_bar_start,
+        price_limit, k, speed}。market = 当前 5m 窗口（非次根）；限价挂单价由通道
+        spec.auto_max_exec 承载（execute_signal_trade 内部 limit_price =
+        max_exec_price），sig.price_limit 仅作审计。默认 OFF。
+        """
+        self._on_kline_signal(sig, "wbid")
+
     def on_kline_reversal_signal(self, sig: dict) -> None:
         """KREV/P1/P2 新根收盘钩子；默认 OFF，启用后按冻结方向派单。"""
         self._on_kline_signal(sig, "kline_reversal")
