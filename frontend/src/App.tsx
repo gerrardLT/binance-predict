@@ -6781,9 +6781,11 @@ const executionMoney = (v: number | null) => v == null ? '—' : `${v >= 0 ? '+'
 function ShadowExecutionComparisonCard({
   data,
   unavailable,
+  analytics,
 }: {
   data: ExecutionComparison | null
   unavailable: string
+  analytics?: SignalsAnalytics | null
 }) {
   const [versionText, setVersionText] = useState('')
   const [period, setPeriod] = useState('ALL')
@@ -6906,6 +6908,79 @@ function ShadowExecutionComparisonCard({
 
   return (
     <Card title="影子信号·理论到实盘执行对比">
+      {/* 逐信号影子数据：新族（wbid）置顶，其余按样本量降序 */}
+      {analytics && (() => {
+        const src = analytics.shadow ?? {}
+        const keys = new Set(Object.keys(src))
+        Object.keys(SIGNAL_INFO).filter(k => k.startsWith('wbid_')).forEach(k => keys.add(k))
+        const rows = Array.from(keys).map(k => ({ key: k, s: src[k]?.summary ?? null }))
+          .sort((a, b) => {
+            const aw = a.key.startsWith('wbid_') ? 1 : 0
+            const bw = b.key.startsWith('wbid_') ? 1 : 0
+            if (aw !== bw) return bw - aw
+            return (b.s?.n ?? 0) - (a.s?.n ?? 0)
+          })
+        const th = (label: string, right = false) => (
+          <th className={`px-2 py-1 text-[10px] font-medium text-ink-55 ${right ? 'text-right' : 'text-left'}`}>{label}</th>
+        )
+        return (
+          <section className="mb-5">
+            <div className="mb-1.5 flex flex-wrap items-baseline gap-2">
+              <h3 className="text-sm font-semibold text-ink-95">
+                影子信号 · 逐版本前向数据（{rows.length} 版）
+              </h3>
+              <span className="text-[10px] text-ink-55">
+                新注册 wbid 族置顶；样本 0 = 已注册未触发
+              </span>
+            </div>
+            <div className="overflow-x-auto rounded-sm border border-line">
+              <table className="w-full min-w-[780px] text-xs">
+                <thead className="bg-sunken">
+                  <tr className="border-b border-line">
+                    {th('信号')}{th('样本', true)}{th('胜率', true)}{th('回测基准', true)}
+                    {th('偏差', true)}{th('平均EV', true)}{th('累计EV', true)}{th('保本率', true)}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-line-soft font-mono">
+                  {rows.map(({ key, s }) => {
+                    const dev = s?.win_rate != null && s.bench_winrate != null
+                      ? s.win_rate - s.bench_winrate : null
+                    const isNew = key.startsWith('wbid_')
+                    return (
+                      <tr key={key} className={isNew ? 'bg-warning/5' : ''}>
+                        <td className="px-2 py-1">
+                          <div className="flex flex-wrap items-center gap-1">
+                            <span className={isNew ? 'font-semibold text-warning' : 'font-medium text-ink-95'}>
+                              {SIGNAL_INFO[key]?.name ?? key}
+                            </span>
+                            {isNew && <span className="ds-badge ds-badge-violet">新</span>}
+                            {SIGNAL_INFO[key] && <HelpHint text={SIGNAL_INFO[key].desc} />}
+                          </div>
+                          <div className="text-[10px] text-ink-40">{key}</div>
+                        </td>
+                        <td className="px-2 py-1 text-right">{s?.n ?? 0}</td>
+                        <td className="px-2 py-1 text-right font-bold">{pct1(s?.win_rate ?? null)}</td>
+                        <td className="px-2 py-1 text-right text-ink-55">{pct1(s?.bench_winrate ?? null)}</td>
+                        <td className={`px-2 py-1 text-right ${dev == null ? 'text-ink-55' : dev >= 0 ? 'text-positive' : 'text-negative'}`}>
+                          {dev == null ? '—' : `${dev >= 0 ? '+' : ''}${(dev * 100).toFixed(1)}pp`}
+                        </td>
+                        <td className={`px-2 py-1 text-right ${s?.avg_ev == null ? 'text-ink-55' : s.avg_ev >= 0 ? 'text-positive' : 'text-negative'}`}>
+                          {evFmt(s?.avg_ev ?? null)}
+                        </td>
+                        <td className={`px-2 py-1 text-right ${s?.cum_ev == null ? 'text-ink-55' : s.cum_ev >= 0 ? 'text-positive' : 'text-negative'}`}>
+                          {evFmt(s?.cum_ev ?? null)}
+                        </td>
+                        <td className="px-2 py-1 text-right text-ink-70">{pct1(s?.avg_breakeven ?? null)}</td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        )
+      })()}
+
       {/* 结论带：一眼看到准入判断与三个关键数字 */}
       {(() => {
         const fwdEv = filteredReturns.executable_fixed_1u.avg
@@ -7465,7 +7540,7 @@ function SceneSignalsCard({
 
 
 
-      <ShadowExecutionComparisonCard data={executionComparison} unavailable={executionUnavailable} />
+      <ShadowExecutionComparisonCard data={executionComparison} unavailable={executionUnavailable} analytics={analytics} />
     </div>
   )
 }
