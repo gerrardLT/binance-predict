@@ -158,6 +158,16 @@ _VERSION_ROWS: tuple[tuple[str, SourceType, str, str, str], ...] = (
     ("candidate_5m_ret3_up_lower_bear_l50b50m0_shadow_hyp_v1", SourceType.KLINE, "5m", "target_bar", "row"),
     ("candidate_15m_ret5_majority_up_lower_bull_l50b40m10_shadow_hyp_v1", SourceType.KLINE, "15m", "target_bar", "row"),
     ("candidate_15m_ret3_down_upper_bull_l50b40m10_shadow_hyp_v1", SourceType.KLINE, "15m", "target_bar", "row"),
+    # 2026-10-25 补登记（窗口内接盘 wbid 四版 + 布防接盘 excur）：注册时漏登
+    # _VERSION_ROWS，导致 /api/signals/analytics?active_only=true 的
+    # visible_versions 不含这些版本——即使结算完成也不返回，新信号在信号
+    # 分析页任何视图不可见（叠加结算循环 close_time KeyError，已另行修复）。
+    # 同窗结算、K 线源、按行 direction 判定。
+    ("wbid_d03_k2_5m_v1", SourceType.KLINE, "5m", "same_window", "row"),
+    ("wbid_d03_k3_5m_v1", SourceType.KLINE, "5m", "same_window", "row"),
+    ("wbid_d05_k2_5m_v1", SourceType.KLINE, "5m", "same_window", "row"),
+    ("wbid_d03_k2_fast_5m_v1", SourceType.KLINE, "5m", "same_window", "row"),
+    ("excur_bid30_15m_v1", SourceType.KLINE, "15m", "same_window", "row"),
 )
 
 

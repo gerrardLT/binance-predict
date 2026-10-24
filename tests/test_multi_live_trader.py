@@ -7790,11 +7790,14 @@ async def test_excur_settle_pending(monkeypatch) -> None:
 
     WS = 1_790_000_000_000 // BAR_15M_MS * BAR_15M_MS
     now_ms = WS + 2 * BAR_15M_MS
+    # 真实 collector 字段格式：只有 open_time/open/high/low/close/volume，
+    # 无 close_time——2026-10-25 生产事故回归（bar["close_time"] KeyError 使
+    # 结算循环每 15s 崩溃，触发行全部卡死 PENDING）
     bars = [
         {"open_time": WS, "open": 100.0, "high": 100.5, "low": 99.0,
-         "close": 100.4, "close_time": WS + BAR_15M_MS - 1},          # 收涨
+         "close": 100.4, "volume": 1.0},                              # 收涨
         {"open_time": WS + BAR_15M_MS, "open": 100.0, "high": 100.5, "low": 99.0,
-         "close": 100.0, "close_time": WS + 2 * BAR_15M_MS - 1},      # 平盘
+         "close": 100.0, "volume": 1.0},                              # 平盘
     ]
 
     class _Collector:
@@ -7815,8 +7818,12 @@ async def test_excur_settle_pending(monkeypatch) -> None:
             self.settle_outcome = None
             self.win = None
 
+    OLD15 = WS - 12 * BAR_15M_MS                            # 3 小时前积压行
+    bars.insert(0, {"open_time": OLD15, "open": 100.0, "high": 100.5,
+                    "low": 99.0, "close": 100.3, "volume": 1.0})
     rows.append(_FakeRow(WS, True))
     rows.append(_FakeRow(WS + BAR_15M_MS, False))          # 未触发行也要结算
+    rows.append(_FakeRow(OLD15, True))                     # 积压行：须补结算
     rows.append(_FakeRow(WS - 20 * BAR_15M_MS, False))     # 远古窗 → EXPIRED
     store = {"rows": rows, "next_id": 99}
 
@@ -7871,5 +7878,126 @@ async def test_excur_settle_pending(monkeypatch) -> None:
     tie_row = by_target[WS + BAR_15M_MS]
     assert tie_row.status == "SETTLED" and tie_row.win is None
     assert tie_row.settle_outcome == "NOISE"
+    backlog15 = by_target[OLD15]
+    assert backlog15.status == "SETTLED" and backlog15.win is True      # 积压补结算
     old_row = by_target[WS - 20 * BAR_15M_MS]
+    assert old_row.status == "EXPIRED"
+
+
+# ============================================================
+# 组 13：wbid/excur 结算 close_time 回归 + 影子版本注册表补登记（2026-10-25）
+# ============================================================
+
+def test_shadow_registry_contains_wbid_and_excur() -> None:
+    """2026-10-25 补登记回归：wbid 四版 + excur 必须在影子版本注册表。
+
+    注册时漏登使 /api/signals/analytics?active_only=true 的 visible_versions
+    不含这些版本——即使结算完成也不返回，新信号在信号分析页任何视图不可见。
+    """
+    from binance_predict.services.shadow_execution_registry import (
+        SHADOW_VERSIONS, SHADOW_VERSION_SPECS)
+    expected = {
+        "wbid_d03_k2_5m_v1", "wbid_d03_k3_5m_v1",
+        "wbid_d05_k2_5m_v1", "wbid_d03_k2_fast_5m_v1",
+        "excur_bid30_15m_v1",
+    }
+    assert expected <= set(SHADOW_VERSIONS)
+    for v in expected:
+        spec = SHADOW_VERSION_SPECS[v]
+        assert spec.target_semantics == "same_window", v   # 当窗结算
+        assert spec.market_period == ("15m" if v.startswith("excur") else "5m"), v
+        assert spec.live_channel == v                       # 同名实盘通道自动映射
+
+
+@pytest.mark.asyncio
+async def test_wbid_settle_pending_real_bar_fields(monkeypatch) -> None:
+    """wbid 结算回归（2026-10-25 生产事故）：collector 的 bar 无 close_time 字段，
+    结算不得抛 KeyError——否则循环每 15s 崩溃、触发行永远卡死 PENDING。"""
+    import binance_predict.services.wbid_shadow_detector as wbid_mod
+    from binance_predict.services.wbid_shadow_detector import WbidShadowDetector
+
+    WS = 1_790_000_000_000 // 300_000 * 300_000
+    now_ms = WS + 2 * 300_000
+    # 真实字段格式（无 close_time）
+    closed5 = [
+        {"open_time": WS, "open": 100.0, "high": 100.5, "low": 99.0,
+         "close": 100.4, "volume": 1.0},                            # 收涨（已收盘）
+        {"open_time": WS + 300_000, "open": 100.0, "high": 100.5,
+         "low": 99.0, "close": 99.9, "volume": 1.0},                # 收跌（已收盘）
+    ]
+
+    class _Collector:
+        async def fetch_recent_klines(self, interval: str, n: int):
+            return closed5[-n:]
+
+    class _FakeRow:
+        def __init__(self, target, version):
+            self.id = id(self)
+            self.version = version
+            self.status = "PENDING"
+            self.target_bar_start = target
+            self.settle_open = self.settle_close = None
+            self.settle_outcome = None
+            self.win = None
+
+    OLD = WS - 36 * 300_000           # 3 小时前积压行（close_time 卡死期）：须补结算
+    closed5.insert(0, {"open_time": OLD, "open": 100.0, "high": 100.5,
+                       "low": 99.0, "close": 100.2, "volume": 1.0})
+    rows = [_FakeRow(WS, "wbid_d03_k2_5m_v1"),
+            _FakeRow(WS + 300_000, "wbid_d05_k2_5m_v1"),
+            _FakeRow(OLD, "wbid_d03_k2_5m_v1"),
+            _FakeRow(WS - 20 * 300_000, "wbid_d03_k3_5m_v1")]       # 远古窗 → EXPIRED
+
+    class _Result:
+        def __init__(self, rws):
+            self._rows = rws
+
+        def first(self):
+            for r in self._rows:
+                return (r.id,)
+            return None
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return [r for r in self._rows if r.status == "PENDING"]
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def execute(self, stmt):
+            return _Result(rows)
+
+        async def get(self, model, rid: int):
+            for r in rows:
+                if r.id == rid:
+                    return r
+            return None
+
+        def add(self, row):
+            rows.append(row)
+
+        async def commit(self):
+            return None
+
+    monkeypatch.setattr(wbid_mod, "async_session_factory", lambda: _Session())
+    import time as _time
+    monkeypatch.setattr(wbid_mod.time, "time", lambda: now_ms / 1000.0)
+    det = WbidShadowDetector(collector=_Collector(), pm_5m_info={})
+    await det._settle_pending(now_ms)    # 修复前：此处 KeyError('close_time')
+    by_target = {r.target_bar_start: r for r in rows}
+    up_row = by_target[WS]
+    assert up_row.status == "SETTLED" and up_row.win is True
+    assert up_row.settle_outcome == "UP"
+    dn_row = by_target[WS + 300_000]
+    assert dn_row.status == "SETTLED" and dn_row.win is False
+    assert dn_row.settle_outcome == "DOWN"
+    old_backlog = by_target[OLD]
+    assert old_backlog.status == "SETTLED" and old_backlog.win is True   # 积压补结算
+    old_row = by_target[WS - 20 * 300_000]
     assert old_row.status == "EXPIRED"

@@ -226,17 +226,25 @@ class ExcurBidShadowDetector:
 
     async def _settle_pending(self) -> None:
         now_ms = int(time.time() * 1000)
-        closed15 = await self._collector.fetch_recent_klines("15m", 8)
-        by_start = {int(b["open_time"]): b for b in closed15} if closed15 else {}
         async with async_session_factory() as session:
             rows = (await session.execute(
                 sa_select(KlineShadowSignal).where(
                     KlineShadowSignal.version == EXCUR_VERSION,
                     KlineShadowSignal.status == "PENDING",
                 ))).scalars().all()
+            if not rows:
+                return
+            # 回读窗口按最老 PENDING 行动态扩大（同 wbid：积压行补结算而非
+            # EXPIRED 兜底；上限 3 天 = 288 根 15m）。
+            oldest = min(int(r.target_bar_start) for r in rows)
+            need = max(8, min((now_ms - oldest) // BAR_15M_MS + 2, 288))
+            closed15 = await self._collector.fetch_recent_klines("15m", need)
+            # bar 无 close_time 字段（同 wbid 2026-10-25 生产修复）：收盘时刻 =
+            # open_time + 15m 推导；close_time KeyError 会使结算循环每 15s 崩溃。
+            by_start = {int(b["open_time"]): b for b in closed15} if closed15 else {}
             for r in rows:
                 bar = by_start.get(int(r.target_bar_start))
-                if bar is None or int(bar["close_time"]) > now_ms:
+                if bar is None or int(bar["open_time"]) + BAR_15M_MS > now_ms:
                     if now_ms - int(r.target_bar_start) > 10 * BAR_15M_MS:
                         r.status = "EXPIRED"
                     continue

@@ -238,17 +238,29 @@ class WbidShadowDetector:
                 logger.warning("wbid 实盘钩子异常（不影响影子）| {}", exc)
 
     async def _settle_pending(self, now_ms: int) -> None:
-        closed5 = await self._collector.fetch_recent_klines("5m", WARMUP_5M)
-        by_start = {int(b["open_time"]): b for b in closed5}
         async with async_session_factory() as session:
             rows = (await session.execute(
                 sa_select(KlineShadowSignal).where(
                     KlineShadowSignal.version.in_(WBID_VERSIONS),
                     KlineShadowSignal.status == "PENDING",
                 ))).scalars().all()
+            if not rows:
+                return
+            # 回读窗口按最老 PENDING 行动态扩大：修复部署前积压的行（如
+            # close_time KeyError 期间卡死的 7 小时）也能补结算，而不是被
+            # EXPIRED 兜底吞掉（老行结算完 limit 自动回落 WARMUP_5M；上限
+            # 3 天防异常行无限拉取）。
+            oldest = min(int(r.target_bar_start) for r in rows)
+            need = max(WARMUP_5M, min((now_ms - oldest) // BAR_5M_MS + 2, 864))
+            closed5 = await self._collector.fetch_recent_klines("5m", need)
+            # fetch_recent_klines 的 bar 只有 open_time/open/high/low/close/volume，
+            # 无 close_time 字段——收盘时刻 = open_time + 周期长度推导（2026-10-25
+            # 生产修复：bar["close_time"] KeyError 曾使结算循环每 15s 崩溃，
+            # wbid 触发行全部卡死 PENDING，无法进入任何统计视图）。
+            by_start = {int(b["open_time"]): b for b in closed5}
             for r in rows:
                 bar = by_start.get(int(r.target_bar_start))
-                if bar is None or int(bar["close_time"]) > now_ms:
+                if bar is None or int(bar["open_time"]) + BAR_5M_MS > now_ms:
                     if now_ms - int(r.target_bar_start) > 10 * BAR_5M_MS:
                         r.status = "EXPIRED"
                     continue

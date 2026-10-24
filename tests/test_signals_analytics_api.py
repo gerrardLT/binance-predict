@@ -542,6 +542,10 @@ async def test_analytics_empty_db() -> None:
             # 2026-10-14 补齐 4 个经典场景实盘通道
             "scene_bull_exhaust", "scene_bull_exhaust_confirm",
             "scene_bear_exhaust", "scene_momentum_fade",
+            # 2026-10-25 补登记（注册时漏登曾使 active_only 视图完全不返回）
+            "wbid_d03_k2_5m_v1", "wbid_d03_k3_5m_v1",
+            "wbid_d05_k2_5m_v1", "wbid_d03_k2_fast_5m_v1",
+            "excur_bid30_15m_v1",
         }
     from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
     from binance_predict.services.live_channels import RETIRED_CHANNELS
