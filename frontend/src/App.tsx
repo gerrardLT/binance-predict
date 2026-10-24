@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom'
 import {
   XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, Area, AreaChart, ReferenceLine,
-  Bar, Legend, LineChart, Line,
+  Bar, BarChart, Legend, LineChart, Line,
   ReferenceArea, ReferenceDot, Cell, ComposedChart,
 } from 'recharts'
 
@@ -1420,6 +1420,15 @@ const FAMILY_LABELS: Record<string, string> = {
   absorption: '吸收跟随', firsthit: '首触反转', gap_crowd: '报价-人群错位',
   scene: '场景突破', quote_edge: '报价边缘', x4: '情绪错位',
   s2_cond: 'S2条件', nextbar: '次根方向', legacy: '其他',
+}
+const ROLE_LABELS: Record<string, string> = {
+  PRIMARY: '主版本', CONTROL: '严格对照', COMPONENT: '归因组件',
+  HYPOTHESIS: '预注册潜力', STRATEGY: '策略',
+}
+const FAMILY_ORDER = ['candlestick_reversal', 'scene', 'quote_edge', 'x4', 'gap_crowd', 's2_cond', 'nextbar', 'absorption', 'firsthit', 'combo', 'kline_reversal', 'pattern', 'misalignment', 'kline', 'legacy']
+const familyRank = (family: string) => {
+  const rank = FAMILY_ORDER.indexOf(family)
+  return rank < 0 ? FAMILY_ORDER.length : rank
 }
 const signalFamilyLabel = (family: string | undefined) => FAMILY_LABELS[family ?? 'legacy'] ?? family ?? '其他'
 
@@ -6594,6 +6603,106 @@ const TOOLTIP_STYLE = {
 const TOOLTIP_LABEL_STYLE = { color: 'var(--on-ink)' } as const
 const TOOLTIP_ITEM_STYLE = { color: 'var(--on-ink)' } as const
 
+/* 22 条影子曲线 → chart-1..10 循环取色。
+   第 11 条起与第 1..10 条同色，靠渲染层的「淡色 + 细线」区分（见 shadowEntries.map）。
+   label 是 recharts 的 dataKey 本身，改 label 会同时改曲线与图例，故一字未动。 */
+const SHADOW_META: Record<string, { label: string; color: string }> = {
+  // 长影短实体反转：主事件只落一次，下列逻辑版本由标签还原。
+  candle_hm_bull_5m_consensus2_shadow_v1: { label: '5m 长下影·至少2趋势→DOWN', color: 'var(--chart-1)' },
+  candle_hm_bull_5m_consensus3_shadow_v1: { label: '5m 长下影·三趋势对照→DOWN', color: 'var(--chart-2)' },
+  candle_hm_bull_15m_union_shadow_v1: { label: '15m 长下影·任一趋势→DOWN', color: 'var(--chart-3)' },
+  candle_hm_bull_15m_consensus3_shadow_v1: { label: '15m 长下影·三趋势对照→DOWN', color: 'var(--chart-4)' },
+  candle_hm_bull_5m_ret5_majority_component_shadow_v1: { label: '5m ret5归因组件', color: 'var(--chart-5)' },
+  candle_hm_bull_5m_ret3_component_shadow_v1: { label: '5m ret3归因组件', color: 'var(--chart-6)' },
+  candle_hm_bull_15m_ret3_component_shadow_v1: { label: '15m ret3归因组件', color: 'var(--chart-7)' },
+  candle_hm_bull_15m_ma10_component_shadow_v1: { label: '15m ma10归因组件', color: 'var(--chart-8)' },
+  candle_hm_bull_5m_volume_mid_high_shadow_hyp_v1: { label: '5m 长下影+中高量能', color: 'var(--chart-9)' },
+  candle_hm_bull_5m_trend4h_up_shadow_hyp_v1: { label: '5m 长下影+4h上涨', color: 'var(--chart-10)' },
+  candle_hm_bull_5m_asia_shadow_hyp_v1: { label: '5m 长下影+亚洲时段', color: 'var(--chart-1)' },
+  candle_hm_bull_15m_q45_55_shadow_hyp_v1: { label: '15m 长下影+DOWN报价0.45~0.55', color: 'var(--chart-2)' },
+  candle_hm_bull_15m_trend1h_up_shadow_hyp_v1: { label: '15m 长下影+1h上涨', color: 'var(--chart-3)' },
+  candle_hm_bull_15m_asia_shadow_hyp_v1: { label: '15m 长下影+亚洲时段', color: 'var(--chart-4)' },
+  candidate_5m_ret5_majority_up_upper_bull_l70b30m10_shadow_hyp_v1: { label: '5m 上涨阳线长上影潜力', color: 'var(--chart-5)' },
+  candidate_5m_ret3_up_lower_bear_l50b50m0_shadow_hyp_v1: { label: '5m 严格0上影阴线长下影', color: 'var(--chart-6)' },
+  candidate_15m_ret5_majority_up_lower_bull_l50b40m10_shadow_hyp_v1: { label: '15m ret5阳线长下影潜力', color: 'var(--chart-7)' },
+  candidate_15m_ret3_down_upper_bull_l50b40m10_shadow_hyp_v1: { label: '15m 下跌阳线长上影→UP', color: 'var(--chart-8)' },
+  x4_v1: { label: 'X4 情绪错位→DOWN', color: 'var(--chart-1)' },
+  quote_momentum_v1: { label: 'A 报价动量→DOWN', color: 'var(--chart-2)' },
+  quote_contrarian_v1: { label: 'B 报价反向→DOWN', color: 'var(--chart-3)' },
+  krev_a_v1: { label: 'KREV-A 反转→UP', color: 'var(--chart-4)' },
+  krev_b_v1: { label: 'KREV-B 反转→UP', color: 'var(--chart-5)' },
+  hm_touch_down_v1: { label: 'HM 上吊线反弹→DOWN', color: 'var(--chart-6)' },
+  hm_touch_down_v2: { label: 'HM 上吊线反弹v2→DOWN', color: 'var(--chart-7)' },
+  rev_p1_v1: { label: 'P1 连跌弱阴反转→UP', color: 'var(--chart-8)' },
+  rev_p2_v1: { label: 'P2 连涨弱阳反转→DOWN', color: 'var(--chart-9)' },
+  crv_hi_brk20_15m_v1: { label: 'CRV高位突破20高→DOWN', color: 'var(--chart-10)' },
+  crv_brk20_15m_v1: { label: 'CRV突破20高→DOWN', color: 'var(--chart-1)' },
+  crv_brk50_hi_15m_v1: { label: 'CRV突破50高∧高位→DOWN', color: 'var(--chart-5)' },
+  crv_dnex_15m_v1: { label: 'CRV跌破出清三因子→UP', color: 'var(--chart-7)' },
+  crv_brk20_5m_v1: { label: 'CRV 5m突破20高→DOWN', color: 'var(--chart-3)' },
+  crv_os_st4_5m_v1: { label: 'CRV 5m超卖连阴三因子→UP', color: 'var(--chart-6)' },
+  crv_hi_z3_15m_v1: { label: 'CRV高位z离群连3阳→DOWN', color: 'var(--chart-2)' },
+  brkrv_brk8h_15m_v1: { label: 'BRK 15m突破8h高→DOWN', color: 'var(--chart-9)' },
+  brkrv_brk8h_5m_v1: { label: 'BRK 5m突破8h高→DOWN', color: 'var(--chart-10)' },
+  crv_dnbrk24_15m_v1: { label: 'CRV下破吞没24低→UP', color: 'var(--chart-4)' },
+  crv_dnbrk24_5m_v1: { label: 'CRV 5m下破吞没24低→UP', color: 'var(--chart-8)' },
+  crv_dnvol20_15m_v1: { label: 'CRV 5m放量下破→15m UP', color: 'var(--chart-3)' },
+  crv_bodybrk20_5m_v1: { label: 'CRV 5m大实体突破20高→DOWN', color: 'var(--chart-6)' },
+  kdc_s1_96hi_15m_v1: { label: 'KDC破96高收顶→DOWN', color: 'var(--chart-5)' },
+  kdc_s2_ext_15m_v1: { label: 'KDC超24高冲顶→DOWN', color: 'var(--chart-7)' },
+  kdc_s3_3up_15m_v1: { label: 'KDC收顶3连阳破20高→DOWN', color: 'var(--chart-9)' },
+  kdc_s4_3dn_15m_v1: { label: 'KDC破20低3连阴大阴→UP', color: 'var(--chart-2)' },
+  s5_deep_z20_v1: { label: 'S5深档 z5≤-20bp→DOWN', color: 'var(--chart-10)' },
+  s1_dyn_sq_v1: { label: 'S1动态轧空路由→DOWN', color: 'var(--chart-1)' },
+  quote_momentum_v3: { label: 'A 报价动量v3(非连涨)→DOWN', color: 'var(--chart-1)' },
+  nb_zschamp_15m_v1: { label: 'nextbar 15m冠军 深超卖→UP', color: 'var(--chart-2)' },
+  nb_smaslope_5m_v1: { label: 'nextbar 5m动量误定价→UP', color: 'var(--chart-3)' },
+  combo_p1_v1: { label: 'combo P1 周末连阳过热→DOWN', color: 'var(--chart-4)' },
+  combo_p2_v1: { label: 'combo P2 周末大阳→DOWN', color: 'var(--chart-5)' },
+  combo_p3_v1: { label: 'combo P3 贴高美盘→DOWN', color: 'var(--chart-6)' },
+  combo_p4_v1: { label: 'combo P4 周末超卖→UP', color: 'var(--chart-7)' },
+  combo_p5_v1: { label: 'combo P5 光脚超卖→UP', color: 'var(--chart-8)' },
+  absorption_follow_td120_v1: { label: '吸收跟随 TD120 欠反应→顺势', color: 'var(--chart-9)' },
+  absorption_follow_td150_v1: { label: '吸收跟随 TD150 欠反应→顺势', color: 'var(--chart-10)' },
+  s2_cond_t4_v1: { label: 'S2条件 t=4价<开→UP', color: 'var(--chart-1)' },
+  s2_cond_t5d_v1: { label: 'S2条件 t=5剔深→UP', color: 'var(--chart-2)' },
+  scene_bear_exhaust_opt_v1: { label: 'S2优化 温和放量非低位→UP', color: 'var(--chart-3)' },
+  s4_delay60_v1: { label: 'S4延迟入场 首分钟回落→DOWN', color: 'var(--chart-4)' },
+  s4_hiconf_v1: { label: 'S4高信心 连阳≥5→DOWN', color: 'var(--chart-5)' },
+  s1_early2_v1: { label: 'S1早确认 +2min回落→DOWN', color: 'var(--chart-6)' },
+  s1_dip45_v1: { label: 'S1低吸 DOWN≤0.45→DOWN', color: 'var(--chart-7)' },
+  // 2026-09-07/08 首触反转族（专用表 firsthit_shadow_signals，影子+实盘通道）
+  firsthit_down_v1: { label: '首触G0 基底 q∈(0.005,0.1]→DOWN', color: 'var(--chart-3)' },
+  firsthit_down_body_v1: { label: '首触G1 body_r≤0.35→DOWN', color: 'var(--chart-4)' },
+  firsthit_down_chg_v1: { label: '首触G3 v1 (已退役)', color: 'var(--chart-5)' },
+  firsthit_down_chg_v2: { label: '首触G3v2 双波峰版 105-120s/210-240s→DOWN', color: 'var(--chart-5)' },
+  firsthit_down_chg35_d_v1: { label: '首触分桶D chg≤3.5 去195-210谷→DOWN', color: 'var(--chart-6)' },
+  firsthit_down_chg35_e_v1: { label: '首触分桶E chg≤3.5 精选桶→DOWN', color: 'var(--chart-7)' },
+  firsthit_down_chg_early180_v1: { label: '首触G3前3分钟→DOWN', color: 'var(--chart-3)' },
+  firsthit_down_k10_early180_v1: { label: '首触K10前3分钟→DOWN', color: 'var(--chart-5)' },
+  process_recovery_down_v1: { label: '过程恢复双确认→DOWN', color: 'var(--chart-4)' },
+  firsthit_down_k10_v1: { label: '首触K10标准化距离→DOWN', color: 'var(--chart-2)' },
+  firsthit_down_k10_profit_v1: { label: '首触K10盈利过滤→DOWN', color: 'var(--chart-4)' },
+  firsthit_down_g4_v1: { label: '首触G4 交互 chg≤2.82∧body≤0.35→DOWN', color: 'var(--chart-2)' },
+  firsthit_down_g7_v1: { label: '首触G7 基底 body≤0.35∧wick=1→DOWN', color: 'var(--chart-6)' },
+  g7_streak_v1: { label: '首触G7 非强连阳 streak≤1→DOWN', color: 'var(--chart-7)' },
+  g7_wick20_v1: { label: '首触G7 长上影 wick≥2bp→DOWN', color: 'var(--chart-8)' },
+  g7_strict_v1: { label: '首触G7 严格版 streak≤1∧wick≥1.5bp→DOWN', color: 'var(--chart-9)' },
+  g7_q05_v1: { label: '首触G7 深折价 q≤0.05→DOWN', color: 'var(--chart-10)' },
+  g7_t270_v1: { label: '首触G7 非极晚 t≤270s→DOWN', color: 'var(--chart-1)' },
+  firsthit_down_btcsoft_v1: { label: '首触报价错杀 浅价∧BTC未上行→DOWN', color: 'var(--chart-2)' },
+  // 2026-09-09 / 2026-09-13 Rev2 经典孕线反转族（共表 kline_shadow_signals，影子+实盘通道）
+  hm_inside_15m_v2: { label: '15m 孕线上吊线 Inside Bar→DOWN', color: 'var(--chart-2)' },
+  ih_inside_15m_v2: { label: '15m 孕线倒垂线 Inside Bar→UP', color: 'var(--chart-3)' },
+  hm_inside_5m_v2: { label: '5m 孕线上吊线精选 Inside Bar→DOWN', color: 'var(--chart-4)' },
+  hm_quality_5m_v1: { label: '5m 收顶阳线+长下影阴线·质量版→DOWN', color: 'var(--chart-5)' },
+  hm_moderate_5m_v1: { label: '5m 收顶阳线+长下影阴线·中等冲刺版→DOWN', color: 'var(--chart-1)' },
+  // 2026-10-10 报价-人群错位族（gap_crowd_shadow_signals 表）——注册后同日证伪退役：
+  // 标签保留供审计（曲线不再新增），实盘通道与影子采集均已停用。
+  gap_crowd_5m_v1: { label: '报价落后人群 5m后半窗→UP（已证伪退役）', color: 'var(--chart-9)' },
+  gap_crowd_15m_v1: { label: '报价落后人群 15m后半窗→UP（已证伪退役）', color: 'var(--chart-10)' },
+}
+
 /* 场景曲线色 = chart-1..5。
    注意：label 是 recharts 的 dataKey 本身，改 label 会同时改曲线与图例（AGENTS.md 明示），
    因此这里只改 color，label 一字未动。 */
@@ -6781,11 +6890,9 @@ const executionMoney = (v: number | null) => v == null ? '—' : `${v >= 0 ? '+'
 function ShadowExecutionComparisonCard({
   data,
   unavailable,
-  analytics,
 }: {
   data: ExecutionComparison | null
   unavailable: string
-  analytics?: SignalsAnalytics | null
 }) {
   const [versionText, setVersionText] = useState('')
   const [period, setPeriod] = useState('ALL')
@@ -6908,78 +7015,6 @@ function ShadowExecutionComparisonCard({
 
   return (
     <Card title="影子信号·理论到实盘执行对比">
-      {/* 逐信号影子数据：新族（wbid）置顶，其余按样本量降序 */}
-      {analytics && (() => {
-        const src = analytics.shadow ?? {}
-        const keys = new Set(Object.keys(src))
-        Object.keys(SIGNAL_INFO).filter(k => k.startsWith('wbid_')).forEach(k => keys.add(k))
-        const rows = Array.from(keys).map(k => ({ key: k, s: src[k]?.summary ?? null }))
-          .sort((a, b) => {
-            const aw = a.key.startsWith('wbid_') ? 1 : 0
-            const bw = b.key.startsWith('wbid_') ? 1 : 0
-            if (aw !== bw) return bw - aw
-            return (b.s?.n ?? 0) - (a.s?.n ?? 0)
-          })
-        const th = (label: string, right = false) => (
-          <th className={`px-2 py-1 text-[10px] font-medium text-ink-55 ${right ? 'text-right' : 'text-left'}`}>{label}</th>
-        )
-        return (
-          <section className="mb-5">
-            <div className="mb-1.5 flex flex-wrap items-baseline gap-2">
-              <h3 className="text-sm font-semibold text-ink-95">
-                影子信号 · 逐版本前向数据（{rows.length} 版）
-              </h3>
-              <span className="text-[10px] text-ink-55">
-                新注册 wbid 族置顶；样本 0 = 已注册未触发
-              </span>
-            </div>
-            <div className="overflow-x-auto rounded-sm border border-line">
-              <table className="w-full min-w-[780px] text-xs">
-                <thead className="bg-sunken">
-                  <tr className="border-b border-line">
-                    {th('信号')}{th('样本', true)}{th('胜率', true)}{th('回测基准', true)}
-                    {th('偏差', true)}{th('平均EV', true)}{th('累计EV', true)}{th('保本率', true)}
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-line-soft font-mono">
-                  {rows.map(({ key, s }) => {
-                    const dev = s?.win_rate != null && s.bench_winrate != null
-                      ? s.win_rate - s.bench_winrate : null
-                    const isNew = key.startsWith('wbid_')
-                    return (
-                      <tr key={key} className={isNew ? 'bg-warning/5' : ''}>
-                        <td className="px-2 py-1">
-                          <div className="flex flex-wrap items-center gap-1">
-                            <span className={isNew ? 'font-semibold text-warning' : 'font-medium text-ink-95'}>
-                              {SIGNAL_INFO[key]?.name ?? key}
-                            </span>
-                            {isNew && <span className="ds-badge ds-badge-violet">新</span>}
-                            {SIGNAL_INFO[key] && <HelpHint text={SIGNAL_INFO[key].desc} />}
-                          </div>
-                          <div className="text-[10px] text-ink-40">{key}</div>
-                        </td>
-                        <td className="px-2 py-1 text-right">{s?.n ?? 0}</td>
-                        <td className="px-2 py-1 text-right font-bold">{pct1(s?.win_rate ?? null)}</td>
-                        <td className="px-2 py-1 text-right text-ink-55">{pct1(s?.bench_winrate ?? null)}</td>
-                        <td className={`px-2 py-1 text-right ${dev == null ? 'text-ink-55' : dev >= 0 ? 'text-positive' : 'text-negative'}`}>
-                          {dev == null ? '—' : `${dev >= 0 ? '+' : ''}${(dev * 100).toFixed(1)}pp`}
-                        </td>
-                        <td className={`px-2 py-1 text-right ${s?.avg_ev == null ? 'text-ink-55' : s.avg_ev >= 0 ? 'text-positive' : 'text-negative'}`}>
-                          {evFmt(s?.avg_ev ?? null)}
-                        </td>
-                        <td className={`px-2 py-1 text-right ${s?.cum_ev == null ? 'text-ink-55' : s.cum_ev >= 0 ? 'text-positive' : 'text-negative'}`}>
-                          {evFmt(s?.cum_ev ?? null)}
-                        </td>
-                        <td className="px-2 py-1 text-right text-ink-70">{pct1(s?.avg_breakeven ?? null)}</td>
-                      </tr>
-                    )
-                  })}
-                </tbody>
-              </table>
-            </div>
-          </section>
-        )
-      })()}
 
       {/* 结论带：一眼看到准入判断与三个关键数字 */}
       {(() => {
@@ -7312,6 +7347,1631 @@ function SignalAnalyticsTab() {
   const sceneEntries: [string, { label: string; color: string }][] = analytics
     ? Object.keys(analytics.scene).map((k, i) => [k, metaFor(SCENE_META)(k, i)])
     : []
+  // wbid 新族置顶；label 用 SIGNAL_INFO 中文名（曲线 dataKey 与图例同步）
+  const shadowEntries: [string, { label: string; color: string }][] = analytics
+    ? Object.keys(analytics.shadow)
+        .sort((a, b) => Number(b.startsWith('wbid_')) - Number(a.startsWith('wbid_')))
+        .map((k, i) => {
+          const meta = metaFor(SHADOW_META)(k, i)
+          const label = k.startsWith('wbid_') ? (SIGNAL_INFO[k]?.name ?? k) : meta.label
+          return [k, { ...meta, label }]
+        })
+    : []
+  const activeShadowEntries = shadowEntries
+  const activeShadowRows = analytics
+    ? mergeCurves(analytics.shadow, Object.fromEntries(shadowEntries)) : []
+  const featuredShadowKeys = ['s1_dyn_sq_v1'].filter(k => activeShadowEntries.some(([key]) => key === k))
+
+// 观察价来源口径（后端 summary.quote_caliber）：面板上任何「EV」都必须标清价格来源，
+// 否则会把行情快照价误读成可成交价（2026-10-15 修正）。
+const QUOTE_CALIBER_LABEL: Record<string, { label: string; hint: string }> = {
+  market_snapshot: {
+    label: '触发时快照价',
+    hint: '入场观察价取自信号触发当刻的市场报价快照（market/list）。是行情价，不是按金额询得的可成交价。',
+  },
+  window_open_sample: {
+    label: '窗口首采样价',
+    hint: '触发时快照缺失，回落为目标窗内首个采样价（10/16 前 15s 粒度、之后 5s 粒度）；采样表不含市场身份，边界采样可能并非目标市场，仅作参考。',
+  },
+  legacy_unknown: {
+    label: '历史口径未知',
+    hint: '2026-10-15 之前落库的行：当时结算会用目标窗首个采样覆盖触发时快照，逐行无法还原来源，不得当可成交价使用。',
+  },
+  mixed: {
+    label: '新旧口径混合',
+    hint: '同一版本同时含改动前的历史行与改动后的新行，观察价来源不一致，曲线两端口径不同。',
+  },
+}
+const quoteCaliberHint = (caliber: string | null | undefined): string => {
+  if (!caliber) return '未标注观察价来源。'
+  const meta = QUOTE_CALIBER_LABEL[caliber]
+  return meta ? `${meta.label}：${meta.hint}` : caliber
+}
+// 「可执行报价」列（1/5/10U get_quote，触发当刻）：与行情快照 EV 并列展示、不相加。
+const EXEC_QUOTE_HINT = '触发当刻按 1/5/10U 分别调用 get_quote 询得的可成交价（含深度），' +
+  '按触发时冻结的护栏过滤后现算的估计收益。是报价不是成交；无样本显示「—」，绝不以 0 冒充；' +
+  '统计窗口为近 45 天。'
+const ExecutionQuoteCells = ({ quote }: { quote?: ExecutionQuoteSummary | null }) => {
+  if (!quote) {
+    return (
+      <>
+        <td className="py-1 px-2 text-right font-mono text-ink-40" title={`${EXEC_QUOTE_HINT}（当前无样本）`}>—</td>
+        <td className="py-1 px-2 text-right font-mono text-ink-40">—</td>
+      </>
+    )
+  }
+  const detail = Object.entries(quote.amounts)
+    .map(([amount, a]) => `${amount}U: n=${a.n} 均价${a.avg_price?.toFixed(3) ?? '—'} 单均EV${a.avg_ev?.toFixed(3) ?? '—'}`)
+    .join(' · ')
+  const legacyGuard = quote.legacy_guard_n ?? 0
+  return (
+    <>
+      <td className="py-1 px-2 text-right font-mono"
+        title={`${EXEC_QUOTE_HINT}\n头条档位 ${quote.amount}U（覆盖率 ${pct1(quote.coverage)}）\n${detail}` +
+          (legacyGuard > 0 ? `\n⚠ ${legacyGuard} 笔为修复前冻结画像，护栏可能非当时生效值` : '')}>
+        <span className="font-bold text-ink-95">{quote.quote_n}</span>
+        <span className="text-ink-40 text-[10px]"> / {quote.live_n}</span>
+        {legacyGuard > 0 && <span className="text-warning text-[10px] ml-1" title="含修复前冻结画像行">⚠</span>}
+      </td>
+      <td className={`py-1 px-2 text-right font-mono font-bold ${
+        quote.avg_ev == null ? 'text-ink-40' : quote.avg_ev >= 0 ? 'text-positive' : 'text-negative'
+      }`} title={`档位 ${quote.amount}U · 均价 ${quote.avg_price?.toFixed(3) ?? '—'} · 冻结护栏 ${quote.guard_price_frozen ?? '—'}`}>
+        {evFmt(quote.avg_ev)}
+      </td>
+    </>
+  )
+}
+function ShadowSignalDetailModal({
+  version,
+  onClose,
+}: {
+  version: string
+  onClose: () => void
+}) {
+  const [data, setData] = useState<ShadowSignalDetailResponse | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [activeTab, setActiveTab] = useState<'chart' | 'funnel' | 'buckets' | 'orders'>('orders')
+
+  // 复合筛选器
+  const [orderFilter, setOrderFilter] = useState<'ALL' | 'GUARDED' | 'REJECTED' | 'LIVE' | 'WIN' | 'LOSS'>('ALL')
+  const [dirFilter, setDirFilter] = useState<'ALL' | 'UP' | 'DOWN'>('ALL')
+  const [liveStatusFilter, setLiveStatusFilter] = useState<'ALL' | 'FILLED' | 'FAILED' | 'NONE'>('ALL')
+  const [searchKw, setSearchKw] = useState('')
+  const [sortField, setSortField] = useState<'time' | 'price' | 'ev' | 'pnl'>('time')
+  const [sortAsc, setSortAsc] = useState<boolean>(false)
+
+  // 分页
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(25)
+
+  const loadDetail = useCallback(() => {
+    setLoading(true)
+    setError('')
+    api.getShadowSignalDetail(version, 1000)
+      .then(res => {
+        setData(res)
+        setLoading(false)
+      })
+      .catch(err => {
+        setError(`加载失败: ${(err as Error).message}`)
+        setLoading(false)
+      })
+  }, [version])
+
+  useEffect(() => {
+    loadDetail()
+  }, [loadDetail])
+
+  const s = data?.summary
+  const allOrders = data?.orders ?? []
+
+  // 排序与多重筛选
+  const filteredOrders = useMemo(() => {
+    const rawOrders = data?.orders ?? []
+    const kw = searchKw.trim().toLowerCase()
+    return rawOrders.filter(o => {
+      // 主状态过滤
+      if (orderFilter === 'GUARDED' && !o.guarded_pass) return false
+      if (orderFilter === 'REJECTED' && o.guarded_pass) return false
+      if (orderFilter === 'LIVE' && !o.live_order) return false
+      if (orderFilter === 'WIN' && o.win !== true) return false
+      if (orderFilter === 'LOSS' && o.win !== false) return false
+
+      // 方向过滤
+      if (dirFilter !== 'ALL' && o.direction !== dirFilter) return false
+
+      // 实盘状态过滤
+      if (liveStatusFilter === 'FILLED' && o.live_order?.status !== 'FILLED') return false
+      if (liveStatusFilter === 'FAILED' && o.live_order?.status !== 'FAILED') return false
+      if (liveStatusFilter === 'NONE' && o.live_order != null) return false
+
+      // 关键词搜索
+      if (kw) {
+        const timeStr = performanceTime(o.window_start).toLowerCase()
+        const dirStr = o.direction.toLowerCase()
+        const rejectStr = (o.reject_reason ?? '').toLowerCase()
+        const orderIdStr = (o.live_order?.order_id ?? '').toLowerCase()
+        const errMsg = (o.live_order?.error_message ?? '').toLowerCase()
+        if (!timeStr.includes(kw) && !dirStr.includes(kw) && !rejectStr.includes(kw) && !orderIdStr.includes(kw) && !errMsg.includes(kw)) {
+          return false
+        }
+      }
+
+      return true
+    }).sort((a, b) => {
+      let diff = 0
+      if (sortField === 'time') {
+        diff = a.window_start - b.window_start
+      } else if (sortField === 'price') {
+        diff = (a.entry_price ?? -1) - (b.entry_price ?? -1)
+      } else if (sortField === 'ev') {
+        diff = (a.ev ?? -999) - (b.ev ?? -999)
+      } else if (sortField === 'pnl') {
+        diff = (a.live_order?.pnl ?? -9999) - (b.live_order?.pnl ?? -9999)
+      }
+      return sortAsc ? diff : -diff
+    })
+  }, [data?.orders, orderFilter, dirFilter, liveStatusFilter, searchKw, sortField, sortAsc])
+
+  // 当前筛选下的聚合统计
+  const filteredStats = useMemo(() => {
+    const total = filteredOrders.length
+    if (total === 0) return null
+    const wins = filteredOrders.filter(o => o.win === true).length
+    const guarded = filteredOrders.filter(o => o.guarded_pass).length
+    const guardedWins = filteredOrders.filter(o => o.guarded_pass && o.win === true).length
+    const liveFilled = filteredOrders.filter(o => o.live_order?.status === 'FILLED')
+    const liveWins = liveFilled.filter(o => o.live_order?.win === true).length
+    const livePnlSum = liveFilled.reduce((acc, o) => acc + (o.live_order?.pnl ?? 0), 0)
+    const evValid = filteredOrders.filter(o => o.ev != null)
+    const evSum = evValid.reduce((acc, o) => acc + (o.ev ?? 0), 0)
+
+    return {
+      total,
+      winRate: total > 0 ? wins / total : 0,
+      guardedPassRate: total > 0 ? guarded / total : 0,
+      guardedWinRate: guarded > 0 ? guardedWins / guarded : null,
+      avgEv: evValid.length > 0 ? evSum / evValid.length : 0,
+      liveFilledCount: liveFilled.length,
+      liveWinRate: liveFilled.length > 0 ? liveWins / liveFilled.length : null,
+      liveTotalPnl: livePnlSum,
+    }
+  }, [filteredOrders])
+
+  // 分页计算
+  const totalPages = Math.max(1, Math.ceil(filteredOrders.length / pageSize))
+  const safePage = Math.min(page, totalPages)
+  const pageOrders = filteredOrders.slice((safePage - 1) * pageSize, safePage * pageSize)
+
+  // 常用功能：导出当前筛选结果为 CSV
+  const exportCsv = () => {
+    if (filteredOrders.length === 0) return
+    const headers = [
+      '窗口开始时间', '格式化时间', '押注方向', '观察入场价', '观察价来源', '可执行报价', '可执行档位',
+      '理论胜负', '理论实现EV',
+      '护栏判定', '弃单原因', '实盘状态', '实盘订单ID', '实盘成交均价', '均价类型',
+      '实盘金额USDT', '实盘盈亏USDT', '实盘胜负'
+    ]
+    const csvRows = [headers.join(',')]
+    for (const o of filteredOrders) {
+      const lo = o.live_order
+      const row = [
+        o.window_start,
+        `"${performanceTime(o.window_start)}"`,
+        o.direction,
+        o.entry_price ?? '',
+        o.entry_quote_kind ?? 'legacy_unknown',
+        o.executable_quote?.price ?? '',
+        o.executable_quote?.amount ?? '',
+        o.win == null ? '' : o.win ? 'WIN' : 'LOSS',
+        o.ev ?? '',
+        o.guarded_pass ? 'PASS' : 'REJECT',
+        `"${o.reject_reason ?? ''}"`,
+        lo?.status ?? 'NONE',
+        lo?.order_id ?? '',
+        lo?.average_price ?? '',
+        lo?.price_kind ?? '',
+        lo?.amount_usdt ?? '',
+        lo?.pnl ?? '',
+        lo?.win == null ? '' : lo.win ? 'WIN' : 'LOSS',
+      ]
+      csvRows.push(row.join(','))
+    }
+    const blob = new Blob(['\ufeff' + csvRows.join('\n')], { type: 'text/csv;charset=utf-8;' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `shadow_detail_${version}_${new Date().toISOString().slice(0, 10)}.csv`
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  // 走势与回撤曲线增强数据（Watermark & Drawdown）
+  const chartEnhancedData = useMemo(() => {
+    if (!data?.curves) return []
+    let peakEv = -Infinity
+    return data.curves.map(p => {
+      const ev = p.cum_ev_guarded
+      if (ev > peakEv) peakEv = ev
+      const dd = peakEv > -Infinity ? ev - peakEv : 0
+      return {
+        ...p,
+        peak_ev: peakEv,
+        drawdown_ev: +dd.toFixed(4),
+      }
+    })
+  }, [data?.curves])
+
+  // 执行漏斗阶段柱状图数据
+  const funnelData = useMemo(() => {
+    if (!s) return []
+    return [
+      { stage: '1.理论信号', count: s.total_signals, rate: '100%', fill: 'var(--chart-1)' },
+      { stage: '2.护栏反算通过', count: s.guarded_signals, rate: pct1(s.guarded_pass_rate), fill: 'var(--chart-2)' },
+      { stage: '3.实盘派单', count: s.live_orders_count, rate: s.guarded_signals > 0 ? pct1(s.live_orders_count / s.guarded_signals) : '0%', fill: 'var(--chart-3)' },
+      { stage: '4.实际成交', count: s.live_filled_count, rate: s.live_orders_count > 0 ? pct1(s.live_filled_count / s.live_orders_count) : '0%', fill: 'var(--positive)' },
+      { stage: '5.实盘胜单', count: s.live_wins, rate: s.live_filled_count > 0 ? pct1(s.live_wins / s.live_filled_count) : '0%', fill: 'var(--brand)' },
+    ]
+  }, [s])
+
+  const info = SIGNAL_INFO[version]
+  const displayName = info?.name ?? version
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-overlay p-3 md:p-6" onClick={onClose}>
+      <div
+        className="bg-card rounded-panel border border-line w-full max-w-6xl max-h-[92vh] flex flex-col shadow-2xl"
+        onClick={e => e.stopPropagation()}
+      >
+        {/* 头部导航 */}
+        <div className="px-5 py-3 border-b border-line flex items-center justify-between shrink-0 bg-sunken rounded-t-panel">
+          <div>
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="font-bold text-sm text-ink-95">{displayName}</span>
+              <span className="font-mono text-xs text-ink-55">{version}</span>
+              {data && (
+                <>
+                  <span className="ds-badge ds-badge-neutral">{signalFamilyLabel(data.family)}</span>
+                  {data.guard_price != null && (
+                    <span className="ds-badge ds-badge-indigo"
+                      title="用于「护栏反算」的**当前**护栏：它是反事实（用今天的规则回算历史），不是当时生效的真钱护栏。">
+                      反算护栏 ≤ {data.guard_price}
+                    </span>
+                  )}
+                  {data.summary.quote_caliber && (
+                    <span className={data.summary.quote_caliber === 'market_snapshot' ? 'ds-badge ds-badge-neutral' : 'ds-badge ds-badge-warn'}
+                      title={quoteCaliberHint(data.summary.quote_caliber)}>
+                      {QUOTE_CALIBER_LABEL[data.summary.quote_caliber]?.label ?? data.summary.quote_caliber}
+                    </span>
+                  )}
+                  {data.bench_winrate != null && (
+                    <span className="ds-badge ds-badge-violet">回测基准 {pct1(data.bench_winrate)}</span>
+                  )}
+                </>
+              )}
+            </div>
+            <p className="text-[11px] text-ink-55 mt-1 line-clamp-1">{data?.desc || info?.desc || '暂无说明'}</p>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={exportCsv}
+              disabled={filteredOrders.length === 0}
+              className="px-2.5 py-1 text-xs rounded-sm border border-line bg-card hover:bg-sunken text-ink-80 transition disabled:opacity-40 font-medium"
+              title="导出当前筛选的订单列表为 CSV"
+            >
+              📥 导出 CSV
+            </button>
+            <button
+              onClick={loadDetail}
+              disabled={loading}
+              className="px-2.5 py-1 text-xs rounded-sm border border-line bg-card hover:bg-sunken text-ink-80 transition disabled:opacity-40"
+              title="重新获取最新数据"
+            >
+              {loading ? '刷新中…' : '🔄 刷新'}
+            </button>
+            <button
+              onClick={onClose}
+              className="text-ink-55 hover:text-ink-95 text-xl leading-none px-2 py-0.5 rounded-sm hover:bg-sunken"
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+
+        {/* 核心 KPI 矩阵 */}
+        {s && (
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 px-5 py-2.5 border-b border-line-soft bg-card shrink-0">
+            <div className="p-2 rounded-sm bg-sunken border border-line-soft">
+              <div className="text-[10px] text-ink-55">信号与通过率</div>
+              <div className="font-mono font-bold text-sm text-ink-95">
+                {s.guarded_signals} <span className="text-[11px] font-normal text-ink-40">/ {s.total_signals}</span>
+              </div>
+              <div className="text-[10px] text-ink-55 mt-0.5">
+                护栏反算通过率 <span className="font-mono font-medium text-brand">{pct1(s.guarded_pass_rate)}</span>
+              </div>
+            </div>
+
+            <div className="p-2 rounded-sm bg-sunken border border-line-soft">
+              <div className="text-[10px] text-ink-55">胜率对比（反算 vs 理论）</div>
+              <div className="font-mono font-bold text-sm text-brand">
+                {pct1(s.guarded_win_rate)} <span className="text-[11px] font-normal text-ink-40">({s.guarded_wins}胜)</span>
+              </div>
+              <div className="text-[10px] text-ink-55 mt-0.5">
+                全量理论 <span className="font-mono text-ink-80">{pct1(s.theoretical_win_rate)}</span> · 基准 <span className="font-mono">{pct1(data.bench_winrate)}</span>
+              </div>
+            </div>
+
+            <div className="p-2 rounded-sm bg-sunken border border-line-soft">
+              <div className="text-[10px] text-ink-55">护栏反算收益（累计 / 单均）</div>
+              <div className={`font-mono font-bold text-sm ${s.guarded_cum_ev >= 0 ? 'text-positive' : 'text-negative'}`}>
+                {evFmt(s.guarded_cum_ev)} EV
+              </div>
+              <div className="text-[10px] text-ink-55 mt-0.5">
+                反算单均 <span className="font-mono">{evFmt(s.guarded_avg_ev)}</span> · 理论 <span className="font-mono">{evFmt(s.theoretical_avg_ev)}</span>
+              </div>
+            </div>
+
+            {/* 可执行报价（触发当刻按金额 get_quote）：与上面的行情快照口径并列、不相加 */}
+            <div className="p-2 rounded-sm bg-sunken border border-line-soft">
+              <div className="text-[10px] text-ink-55" title={EXEC_QUOTE_HINT}>可执行报价（get_quote）</div>
+              {s.execution_quote ? (
+                <>
+                  <div className={`font-mono font-bold text-sm ${(s.execution_quote.avg_ev ?? 0) >= 0 ? 'text-positive' : 'text-negative'}`}>
+                    {evFmt(s.execution_quote.avg_ev)} EV
+                  </div>
+                  <div className="text-[10px] text-ink-55 mt-0.5">
+                    {s.execution_quote.amount}U 档 · 样本 <span className="font-mono">{s.execution_quote.quote_n}</span>/{s.execution_quote.live_n}
+                    · 均价 <span className="font-mono">{s.execution_quote.avg_price?.toFixed(3) ?? '—'}</span>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="font-mono font-bold text-sm text-ink-40">样本不足</div>
+                  <div className="text-[10px] text-ink-55 mt-0.5">尚无触发当刻 1/5/10U 报价样本</div>
+                </>
+              )}
+            </div>
+
+            <div className="p-2 rounded-sm bg-sunken border border-line-soft">
+              <div className="text-[10px] text-ink-55">实盘订单与盈亏</div>
+              <div className={`font-mono font-bold text-sm ${s.live_total_pnl >= 0 ? 'text-positive' : 'text-negative'}`}>
+                {s.live_total_pnl >= 0 ? '+' : ''}{s.live_total_pnl.toFixed(2)} USDT
+              </div>
+              <div className="text-[10px] text-ink-55 mt-0.5">
+                成交 <span className="font-mono">{s.live_filled_count}</span> 单 · 实盘胜率 <span className="font-mono">{pct1(s.live_win_rate)}</span>
+              </div>
+            </div>
+
+            <div className="p-2 rounded-sm bg-sunken border border-line-soft">
+              <div className="text-[10px] text-ink-55">护栏避损与执行价</div>
+              <div className="font-mono font-bold text-sm text-ink-95">
+                拦截 {s.rejected_signals} 笔
+                <span className={`text-[11px] font-normal ml-1 ${s.avoided_loss_ev >= 0 ? 'text-positive' : 'text-negative'}`}>
+                  ({s.avoided_loss_ev >= 0 ? '+' : ''}{s.avoided_loss_ev.toFixed(2)} EV)
+                </span>
+              </div>
+              <div className="text-[10px] text-ink-55 mt-0.5">
+                快照均价 <span className="font-mono">{s.avg_quote_price?.toFixed(3) ?? '--'}</span>
+                {s.avg_live_fill_price != null && (
+                  <> · 实盘 <span className="font-mono">{s.avg_live_fill_price.toFixed(3)}</span></>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* 标签栏 */}
+        <div className="flex items-center gap-2 px-5 py-2 border-b border-line-soft bg-sunken text-xs shrink-0 flex-wrap">
+          <button
+            onClick={() => setActiveTab('orders')}
+            className={`px-3 py-1 font-semibold rounded-sm transition ${
+              activeTab === 'orders' ? 'bg-brand text-white shadow-xs' : 'text-ink-80 hover:text-ink-95 bg-card border border-line-soft'
+            }`}
+          >
+            📋 逐笔订单与实盘对齐 ({allOrders.length})
+          </button>
+          <button
+            onClick={() => setActiveTab('chart')}
+            className={`px-3 py-1 font-semibold rounded-sm transition ${
+              activeTab === 'chart' ? 'bg-brand text-white shadow-xs' : 'text-ink-80 hover:text-ink-95 bg-card border border-line-soft'
+            }`}
+          >
+            📈 累计收益 & 胜率演进
+          </button>
+          <button
+            onClick={() => setActiveTab('funnel')}
+            className={`px-3 py-1 font-semibold rounded-sm transition ${
+              activeTab === 'funnel' ? 'bg-brand text-white shadow-xs' : 'text-ink-80 hover:text-ink-95 bg-card border border-line-soft'
+            }`}
+          >
+            🔽 执行漏斗 & 逐笔回报
+          </button>
+          <button
+            onClick={() => setActiveTab('buckets')}
+            className={`px-3 py-1 font-semibold rounded-sm transition ${
+              activeTab === 'buckets' ? 'bg-brand text-white shadow-xs' : 'text-ink-80 hover:text-ink-95 bg-card border border-line-soft'
+            }`}
+          >
+            📊 报价分档 & 时段归因
+          </button>
+        </div>
+
+        {/* 主内容区 */}
+        <div className="flex-1 min-h-0 overflow-auto p-4">
+          {loading && <div className="text-center text-ink-55 py-16 text-xs">加载订单与分析数据中…</div>}
+          {error && <div className="text-center text-negative py-16 text-xs">{error}</div>}
+
+          {!loading && !error && data && (
+            <>
+              {/* Tab 1: 逐笔订单表格（强化筛选+排序+动态统计） */}
+              {activeTab === 'orders' && (
+                <div className="space-y-3">
+                  {/* 复合筛选栏 */}
+                  <div className="p-2.5 bg-sunken rounded-sm border border-line-soft flex items-center justify-between gap-2.5 flex-wrap text-xs">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <input
+                        type="text"
+                        placeholder="搜索时间 / 单号 / 状态 / 拒单原因..."
+                        value={searchKw}
+                        onChange={e => { setSearchKw(e.target.value); setPage(1) }}
+                        className="px-2 py-0.5 border border-line rounded-sm text-xs text-ink-80 bg-card w-52"
+                      />
+
+                      <select
+                        value={orderFilter}
+                        onChange={e => { setOrderFilter(e.target.value as typeof orderFilter); setPage(1) }}
+                        className="px-2 py-0.5 border border-line rounded-sm text-xs text-ink-80 bg-card"
+                      >
+                        <option value="ALL">全部信号状态</option>
+                        <option value="GUARDED">仅护栏通过</option>
+                        <option value="REJECTED">仅护栏拦截/弃单</option>
+                        <option value="LIVE">仅有实盘记录</option>
+                        <option value="WIN">仅理论胜单</option>
+                        <option value="LOSS">仅理论负单</option>
+                      </select>
+
+                      <select
+                        value={dirFilter}
+                        onChange={e => { setDirFilter(e.target.value as typeof dirFilter); setPage(1) }}
+                        className="px-2 py-0.5 border border-line rounded-sm text-xs text-ink-80 bg-card"
+                      >
+                        <option value="ALL">全部方向</option>
+                        <option value="DOWN">仅押 DOWN</option>
+                        <option value="UP">仅押 UP</option>
+                      </select>
+
+                      <select
+                        value={liveStatusFilter}
+                        onChange={e => { setLiveStatusFilter(e.target.value as typeof liveStatusFilter); setPage(1) }}
+                        className="px-2 py-0.5 border border-line rounded-sm text-xs text-ink-80 bg-card"
+                      >
+                        <option value="ALL">全部实盘状态</option>
+                        <option value="FILLED">仅实盘已成交</option>
+                        <option value="FAILED">仅实盘失败/被拒</option>
+                        <option value="NONE">仅未下实盘单</option>
+                      </select>
+
+                      <div className="flex items-center gap-1 border-l border-line-soft pl-2">
+                        <span className="text-ink-55">排序:</span>
+                        <select
+                          value={sortField}
+                          onChange={e => setSortField(e.target.value as typeof sortField)}
+                          className="px-2 py-0.5 border border-line rounded-sm text-xs text-ink-80 bg-card"
+                        >
+                          <option value="time">按时间</option>
+                          <option value="price">按入场价</option>
+                          <option value="ev">按理论EV</option>
+                          <option value="pnl">按实盘盈亏</option>
+                        </select>
+                        <button
+                          onClick={() => setSortAsc(!sortAsc)}
+                          className="px-1.5 py-0.5 rounded-sm border border-line bg-card text-ink-80 hover:text-brand"
+                        >
+                          {sortAsc ? '▲ 升序' : '▼ 降序'}
+                        </button>
+                      </div>
+
+                      {(searchKw || orderFilter !== 'ALL' || dirFilter !== 'ALL' || liveStatusFilter !== 'ALL') && (
+                        <button
+                          onClick={() => {
+                            setSearchKw('')
+                            setOrderFilter('ALL')
+                            setDirFilter('ALL')
+                            setLiveStatusFilter('ALL')
+                            setPage(1)
+                          }}
+                          className="text-brand hover:underline px-1"
+                        >
+                          重置筛选
+                        </button>
+                      )}
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <span className="text-ink-55">每页</span>
+                      <select
+                        value={pageSize}
+                        onChange={e => { setPageSize(Number(e.target.value)); setPage(1) }}
+                        className="px-2 py-0.5 border border-line rounded-sm text-xs text-ink-80 bg-card"
+                      >
+                        <option value={15}>15 笔</option>
+                        <option value={25}>25 笔</option>
+                        <option value={50}>50 笔</option>
+                        <option value={100}>100 笔</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  {/* 动态筛选汇总条 */}
+                  {filteredStats && (
+                    <div className="px-3 py-1.5 bg-brand-soft/40 border border-brand/20 rounded-sm text-[11px] text-ink-80 flex items-center gap-4 flex-wrap">
+                      <span>当前视图: <strong className="font-mono text-ink-95">{filteredStats.total}</strong> 笔</span>
+                      <span>理论胜率: <strong className="font-mono text-brand">{pct1(filteredStats.winRate)}</strong></span>
+                      <span>单均 EV: <strong className="font-mono">{evFmt(filteredStats.avgEv)}</strong></span>
+                      <span>护栏通过率: <strong className="font-mono">{pct1(filteredStats.guardedPassRate)}</strong></span>
+                      <span>实盘成交: <strong className="font-mono">{filteredStats.liveFilledCount}</strong> 笔</span>
+                      <span>实盘胜率: <strong className="font-mono">{pct1(filteredStats.liveWinRate)}</strong></span>
+                      <span>实盘盈亏: <strong className={`font-mono font-bold ${filteredStats.liveTotalPnl >= 0 ? 'text-positive' : 'text-negative'}`}>{filteredStats.liveTotalPnl >= 0 ? '+' : ''}{filteredStats.liveTotalPnl.toFixed(2)}U</strong></span>
+                    </div>
+                  )}
+
+                  {/* 逐笔明细对齐表 */}
+                  <div className="overflow-x-auto border border-line rounded-sm">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="border-b border-line bg-sunken text-ink-55">
+                          <th className="py-1.5 px-2 text-left">时间 (UTC / 本地)</th>
+                          <th className="py-1.5 px-2 text-center">方向</th>
+                          <th className="py-1.5 px-2 text-right" title="观察价：信号触发当刻的市场报价快照（行情价，非可成交价）">观察入场价</th>
+                          <th className="py-1.5 px-2 text-right" title={EXEC_QUOTE_HINT}>可执行报价</th>
+                          <th className="py-1.5 px-2 text-center">理论胜负</th>
+                          <th className="py-1.5 px-2 text-right">理论单笔EV</th>
+                          <th className="py-1.5 px-2 text-center">护栏判定</th>
+                          <th className="py-1.5 px-2 text-center">实盘订单</th>
+                          <th className="py-1.5 px-2 text-right">实盘成交价</th>
+                          <th className="py-1.5 px-2 text-right">实盘投入</th>
+                          <th className="py-1.5 px-2 text-right">实盘盈亏</th>
+                          <th className="py-1.5 px-2 text-center">实盘胜负</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {pageOrders.length === 0 ? (
+                          <tr>
+                            <td colSpan={12} className="py-8 text-center text-ink-55">
+                              当前筛选条件下无匹配订单
+                            </td>
+                          </tr>
+                        ) : (
+                          pageOrders.map((o, idx) => {
+                            const won = o.win === true
+                            const lo = o.live_order
+                            const liveWon = lo?.win === true
+                            const liveLost = lo?.win === false
+                            return (
+                              <tr key={idx} className="border-b border-line-soft hover:bg-sunken transition-colors">
+                                <td className="py-1.5 px-2 font-mono text-ink-80 whitespace-nowrap">
+                                  {performanceTime(o.window_start)}
+                                </td>
+                                <td className="py-1.5 px-2 text-center">
+                                  <span className={`px-1.5 py-0.2 rounded-xs font-bold text-[10px] ${
+                                    o.direction === 'UP' ? 'bg-positive-soft text-positive' : 'bg-negative-soft text-negative'
+                                  }`}>
+                                    {o.direction}
+                                  </span>
+                                </td>
+                                <td className="py-1.5 px-2 text-right font-mono text-ink-95">
+                                  {o.entry_price != null ? o.entry_price.toFixed(3) : '--'}
+                                  {o.entry_quote_kind === 'window_open_sample' && (
+                                    <span className="text-[9px] px-0.5 py-0.2 ml-1 rounded-xs bg-warning-soft text-warning"
+                                      title="触发时快照缺失，回落目标窗首个采样价（采样表无市场身份，可能非目标市场）">
+                                      首采样
+                                    </span>
+                                  )}
+                                </td>
+                                <td className="py-1.5 px-2 text-right font-mono"
+                                  title={o.executable_quote
+                                    ? `${EXEC_QUOTE_HINT}\n档位 ${o.executable_quote.amount}U · 冻结护栏 ${o.executable_quote.guard_price ?? '—'}`
+                                    : `${EXEC_QUOTE_HINT}（本窗无样本）`}>
+                                  {o.executable_quote?.price != null
+                                    ? o.executable_quote.price.toFixed(3)
+                                    : <span className="text-ink-40">—</span>}
+                                </td>
+                                <td className="py-1.5 px-2 text-center">
+                                  {o.win == null ? (
+                                    <span className="text-ink-40">未结算</span>
+                                  ) : won ? (
+                                    <span className="text-positive font-bold">胜</span>
+                                  ) : (
+                                    <span className="text-negative font-bold">负</span>
+                                  )}
+                                </td>
+                                <td className={`py-1.5 px-2 text-right font-mono font-medium ${
+                                  o.ev == null ? 'text-ink-40' : o.ev >= 0 ? 'text-positive' : 'text-negative'
+                                }`}>
+                                  {evFmt(o.ev)}
+                                </td>
+                                <td className="py-1.5 px-2 text-center">
+                                  {o.guarded_pass ? (
+                                    <span className="px-1.5 py-0.2 text-[10px] font-medium text-brand bg-brand-soft rounded-pill" title="通过护栏与进场白名单">
+                                      通过
+                                    </span>
+                                  ) : (
+                                    <span className="px-1.5 py-0.2 text-[10px] font-medium text-negative bg-negative-soft rounded-pill" title={o.reject_reason ?? '弃单'}>
+                                      {o.reject_reason ?? '弃单'}
+                                    </span>
+                                  )}
+                                </td>
+                                <td className="py-1.5 px-2 text-center whitespace-nowrap">
+                                  {lo ? (
+                                    <span className={`px-1.5 py-0.2 text-[10px] font-medium rounded-pill ${
+                                      lo.status === 'FILLED'
+                                        ? 'bg-positive-soft text-positive border border-positive/30'
+                                        : lo.status === 'FAILED'
+                                        ? 'bg-negative-soft text-negative border border-negative/30'
+                                        : 'bg-warning-soft text-warning'
+                                    }`} title={lo.error_message ? `错误: ${lo.error_message}` : `订单: ${lo.order_id ?? lo.id}`}>
+                                      {lo.status === 'FILLED' ? '已成交' : lo.status === 'FAILED' ? '失败/拒单' : lo.status}
+                                    </span>
+                                  ) : (
+                                    <span className="text-ink-40 text-[10px]">未下单</span>
+                                  )}
+                                </td>
+                                <td className="py-1.5 px-2 text-right font-mono">
+                                  {lo?.average_price != null ? (
+                                    <span className="inline-flex items-center gap-0.5 justify-end">
+                                      {lo.average_price.toFixed(3)}
+                                      {lo.price_kind === 'quote' && (
+                                        <span className="text-[9px] px-0.5 py-0.2 rounded-xs bg-warning-soft text-warning" title="报价/委托价">
+                                          报
+                                        </span>
+                                      )}
+                                    </span>
+                                  ) : '--'}
+                                </td>
+                                <td className="py-1.5 px-2 text-right font-mono text-ink-80">
+                                  {lo ? `${lo.amount_usdt.toFixed(1)}U` : '--'}
+                                </td>
+                                <td className={`py-1.5 px-2 text-right font-mono font-bold ${
+                                  lo?.pnl == null ? 'text-ink-40' : lo.pnl >= 0 ? 'text-positive' : 'text-negative'
+                                }`}>
+                                  {lo?.pnl != null ? `${lo.pnl >= 0 ? '+' : ''}${lo.pnl.toFixed(2)}U` : '--'}
+                                </td>
+                                <td className="py-1.5 px-2 text-center">
+                                  {lo == null ? (
+                                    <span className="text-ink-40">--</span>
+                                  ) : liveWon ? (
+                                    <span className="text-positive font-bold">胜</span>
+                                  ) : liveLost ? (
+                                    <span className="text-negative font-bold">负</span>
+                                  ) : (
+                                    <span className="text-ink-40">{lo.status === 'FAILED' ? '拒' : '--'}</span>
+                                  )}
+                                </td>
+                              </tr>
+                            )
+                          })
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  {/* 分页控制 */}
+                  {totalPages > 1 && (
+                    <div className="flex items-center justify-between gap-2 mt-2 text-xs">
+                      <span className="text-ink-55">
+                        共 {filteredOrders.length} 笔 · 第 {safePage} / {totalPages} 页
+                      </span>
+                      <div className="flex items-center gap-1">
+                        <button
+                          disabled={safePage <= 1}
+                          onClick={() => setPage(1)}
+                          className="px-2 py-0.5 border border-line rounded-sm disabled:opacity-40 hover:border-brand"
+                        >
+                          首页
+                        </button>
+                        <button
+                          disabled={safePage <= 1}
+                          onClick={() => setPage(safePage - 1)}
+                          className="px-2 py-0.5 border border-line rounded-sm disabled:opacity-40 hover:border-brand"
+                        >
+                          上一页
+                        </button>
+                        <span className="px-2 font-mono">
+                          {safePage} / {totalPages}
+                        </span>
+                        <button
+                          disabled={safePage >= totalPages}
+                          onClick={() => setPage(safePage + 1)}
+                          className="px-2 py-0.5 border border-line rounded-sm disabled:opacity-40 hover:border-brand"
+                        >
+                          下一页
+                        </button>
+                        <button
+                          disabled={safePage >= totalPages}
+                          onClick={() => setPage(totalPages)}
+                          className="px-2 py-0.5 border border-line rounded-sm disabled:opacity-40 hover:border-brand"
+                        >
+                          末页
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Tab 2: 走势曲线与回撤走势（增强版图表） */}
+              {activeTab === 'chart' && (
+                <div className="space-y-4">
+                  <div className="border border-line rounded-sm p-3 bg-card">
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-xs font-bold text-ink-95">累计收益与实盘盈亏走势 (Cumulative EV vs Real PnL)</span>
+                      <span className="text-[11px] text-ink-55">左轴=EV（理论/护栏反算，均为行情快照价） · 右轴=USDT（实盘真实净盈亏）</span>
+                    </div>
+                    <ResponsiveContainer width="100%" height={260}>
+                      <ComposedChart data={chartEnhancedData}>
+                        <CartesianGrid stroke="var(--line-soft)" />
+                        <XAxis
+                          dataKey="ts"
+                          type="number"
+                          domain={['dataMin', 'dataMax']}
+                          scale="time"
+                          tickFormatter={performanceTime}
+                          tick={{ fontSize: 10, fill: 'var(--ink-55)' }}
+                        />
+                        <YAxis yAxisId="ev" tick={{ fontSize: 10, fill: 'var(--ink-55)' }} />
+                        <YAxis yAxisId="pnl" orientation="right" tick={{ fontSize: 10, fill: 'var(--ink-55)' }} tickFormatter={v => `${v}U`} />
+                        <Tooltip
+                          contentStyle={TOOLTIP_STYLE}
+                          labelStyle={TOOLTIP_LABEL_STYLE}
+                          itemStyle={TOOLTIP_ITEM_STYLE}
+                          labelFormatter={v => performanceTime(Number(v))}
+                        />
+                        <Legend />
+                        <ReferenceLine yAxisId="ev" y={0} stroke="var(--line)" strokeDasharray="3 3" />
+                        <Line
+                          yAxisId="ev"
+                          name="护栏反算累计EV（快照价）"
+                          dataKey="cum_ev_guarded"
+                          stroke="var(--brand)"
+                          strokeWidth={2}
+                          dot={false}
+                          connectNulls
+                        />
+                        <Line
+                          yAxisId="ev"
+                          name="全量理论累计EV（快照价）"
+                          dataKey="cum_ev_theoretical"
+                          stroke="var(--chart-1)"
+                          strokeWidth={1.5}
+                          strokeDasharray="4 2"
+                          dot={false}
+                          connectNulls
+                        />
+                        {s && s.live_orders_count > 0 && (
+                          <Line
+                            yAxisId="pnl"
+                            name="实盘累计盈亏(USDT)"
+                            dataKey="cum_pnl_live"
+                            stroke="var(--positive)"
+                            strokeWidth={2}
+                            dot={false}
+                            connectNulls
+                          />
+                        )}
+                      </ComposedChart>
+                    </ResponsiveContainer>
+                  </div>
+
+                  {/* 胜率演进折线图 */}
+                  <div className="border border-line rounded-sm p-3 bg-card">
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-xs font-bold text-ink-95">前向胜率演进 (Rolling Win Rate)</span>
+                      <span className="text-[11px] text-ink-55">橙色虚线=冻结回测基准胜率</span>
+                    </div>
+                    <ResponsiveContainer width="100%" height={200}>
+                      <LineChart data={chartEnhancedData}>
+                        <CartesianGrid stroke="var(--line-soft)" />
+                        <XAxis
+                          dataKey="ts"
+                          type="number"
+                          domain={['dataMin', 'dataMax']}
+                          scale="time"
+                          tickFormatter={performanceTime}
+                          tick={{ fontSize: 10, fill: 'var(--ink-55)' }}
+                        />
+                        <YAxis domain={[0, 1]} tick={{ fontSize: 10, fill: 'var(--ink-55)' }} tickFormatter={v => `${(v * 100).toFixed(0)}%`} />
+                        <Tooltip
+                          contentStyle={TOOLTIP_STYLE}
+                          labelStyle={TOOLTIP_LABEL_STYLE}
+                          itemStyle={TOOLTIP_ITEM_STYLE}
+                          labelFormatter={v => performanceTime(Number(v))}
+                          formatter={v => [typeof v === 'number' ? `${(v * 100).toFixed(1)}%` : '--', '']}
+                        />
+                        <Legend />
+                        {data.bench_winrate != null && (
+                          <ReferenceLine y={data.bench_winrate} stroke="var(--warning)" strokeDasharray="5 3" label="基准胜率" />
+                        )}
+                        <Line
+                          name="护栏反算胜率"
+                          dataKey="win_rate_guarded"
+                          stroke="var(--brand)"
+                          strokeWidth={2}
+                          dot={false}
+                          connectNulls
+                        />
+                        <Line
+                          name="全量理论胜率"
+                          dataKey="win_rate_theoretical"
+                          stroke="var(--ink-40)"
+                          strokeWidth={1.5}
+                          dot={false}
+                          connectNulls
+                        />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </div>
+
+                  {/* 回撤深度面积图 */}
+                  <div className="border border-line rounded-sm p-3 bg-card">
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-xs font-bold text-ink-95">累计 EV 回撤深度 (Drawdown Under Water)</span>
+                      <span className="text-[11px] text-ink-55">展示该信号历史回撤幅度与持续时间</span>
+                    </div>
+                    <ResponsiveContainer width="100%" height={180}>
+                      <AreaChart data={chartEnhancedData}>
+                        <CartesianGrid stroke="var(--line-soft)" />
+                        <XAxis
+                          dataKey="ts"
+                          type="number"
+                          domain={['dataMin', 'dataMax']}
+                          scale="time"
+                          tickFormatter={performanceTime}
+                          tick={{ fontSize: 10, fill: 'var(--ink-55)' }}
+                        />
+                        <YAxis tick={{ fontSize: 10, fill: 'var(--ink-55)' }} />
+                        <Tooltip
+                          contentStyle={TOOLTIP_STYLE}
+                          labelStyle={TOOLTIP_LABEL_STYLE}
+                          itemStyle={TOOLTIP_ITEM_STYLE}
+                          labelFormatter={v => performanceTime(Number(v))}
+                          formatter={v => [`${v} EV`, '回撤深度']}
+                        />
+                        <Area
+                          type="monotone"
+                          dataKey="drawdown_ev"
+                          name="EV回撤"
+                          stroke="var(--negative)"
+                          fill="var(--negative-soft)"
+                          fillOpacity={0.6}
+                          isAnimationActive={false}
+                        />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+              )}
+
+              {/* Tab 3: 执行漏斗与逐笔回报分布 */}
+              {activeTab === 'funnel' && (
+                <div className="space-y-4">
+                  {/* 执行转化漏斗 */}
+                  <div className="border border-line rounded-sm p-4 bg-card">
+                    <div className="text-xs font-bold text-ink-95 mb-1">
+                      执行转化漏斗 (Execution Conversion Funnel)
+                    </div>
+                    <p className="text-[11px] text-ink-55 mb-3">
+                      量化从理论信号触发到最终实盘成交与获利的每一层损耗率，定位执行瓶颈。
+                    </p>
+                    <ResponsiveContainer width="100%" height={220}>
+                      <BarChart data={funnelData} layout="vertical" margin={{ left: 20, right: 30, top: 10, bottom: 10 }}>
+                        <CartesianGrid stroke="var(--line-soft)" horizontal={false} />
+                        <XAxis type="number" tick={{ fontSize: 10, fill: 'var(--ink-55)' }} />
+                        <YAxis dataKey="stage" type="category" tick={{ fontSize: 11, fill: 'var(--ink-95)' }} width={80} />
+                        <Tooltip
+                          contentStyle={TOOLTIP_STYLE}
+                          labelStyle={TOOLTIP_LABEL_STYLE}
+                          itemStyle={TOOLTIP_ITEM_STYLE}
+                          formatter={(v, _, item) => [`${v} 笔 (转化率: ${(item?.payload as { rate?: string })?.rate ?? '--'})`, '数量']}
+                        />
+                        <Bar dataKey="count" radius={[0, 4, 4, 0]}>
+                          {funnelData.map((entry, index) => (
+                            <Cell key={`cell-${index}`} fill={entry.fill} />
+                          ))}
+                        </Bar>
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+
+                  {/* 逐笔理论回报与实盘盈亏柱图 */}
+                  <div className="border border-line rounded-sm p-3 bg-card">
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-xs font-bold text-ink-95">逐笔收益柱状图 (Per-Trade Return Sequence)</span>
+                      <span className="text-[11px] text-ink-55">近 60 笔信号理论 EV 与实盘盈亏 (USDT)</span>
+                    </div>
+                    <ResponsiveContainer width="100%" height={200}>
+                      <BarChart
+                        data={allOrders.slice(-60).map((o: ShadowDetailOrderItem, idx: number) => ({
+                          idx: idx + 1,
+                          time: performanceTime(o.window_start),
+                          ev: o.ev ?? 0,
+                          pnl: o.live_order?.pnl ?? 0,
+                        }))}
+                        margin={{ top: 10, right: 10, left: 0, bottom: 0 }}
+                      >
+                        <CartesianGrid stroke="var(--line-soft)" />
+                        <XAxis dataKey="idx" tick={{ fontSize: 10, fill: 'var(--ink-55)' }} />
+                        <YAxis tick={{ fontSize: 10, fill: 'var(--ink-55)' }} />
+                        <Tooltip
+                          contentStyle={TOOLTIP_STYLE}
+                          labelStyle={TOOLTIP_LABEL_STYLE}
+                          itemStyle={TOOLTIP_ITEM_STYLE}
+                          labelFormatter={(idx, list) => {
+                            const row = list[0]?.payload as { time?: string } | undefined
+                            return `第 ${idx} 笔 · ${row?.time ?? ''}`
+                          }}
+                          formatter={(v, n) => [typeof v === 'number' ? `${v.toFixed(3)} ${n === 'ev' ? 'EV' : 'U'}` : '--', n === 'ev' ? '理论EV' : '实盘PnL']}
+                        />
+                        <ReferenceLine y={0} stroke="var(--line)" />
+                        <Bar dataKey="ev" name="理论EV" fill="var(--chart-1)" radius={[2, 2, 0, 0]}>
+                          {allOrders.slice(-60).map((entry: ShadowDetailOrderItem, index: number) => (
+                            <Cell key={`cell-${index}`} fill={(entry.ev ?? 0) >= 0 ? 'var(--positive)' : 'var(--negative)'} />
+                          ))}
+                        </Bar>
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+              )}
+
+              {/* Tab 4: 报价分桶与时段归因 */}
+              {activeTab === 'buckets' && (
+                <div className="space-y-4">
+                  {/* 报价区间柱状图对比 */}
+                  <div className="border border-line rounded-sm p-3 bg-card">
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-xs font-bold text-ink-95">报价分档信号量与胜率分布 (Quote Buckets)</span>
+                      <span className="text-[11px] text-ink-55">柱高=信号数 · 折线=胜率</span>
+                    </div>
+                    <ResponsiveContainer width="100%" height={220}>
+                      <ComposedChart data={data.quote_buckets}>
+                        <CartesianGrid stroke="var(--line-soft)" />
+                        <XAxis dataKey="range" tick={{ fontSize: 10, fill: 'var(--ink-80)' }} />
+                        <YAxis yAxisId="n" tick={{ fontSize: 10, fill: 'var(--ink-55)' }} />
+                        <YAxis yAxisId="wr" orientation="right" domain={[0, 1]} tick={{ fontSize: 10, fill: 'var(--ink-55)' }} tickFormatter={v => `${(v * 100).toFixed(0)}%`} />
+                        <Tooltip contentStyle={TOOLTIP_STYLE} labelStyle={TOOLTIP_LABEL_STYLE} itemStyle={TOOLTIP_ITEM_STYLE} />
+                        <Legend />
+                        <Bar yAxisId="n" name="信号数" dataKey="signals" fill="var(--chart-1)" radius={[3, 3, 0, 0]} />
+                        <Bar yAxisId="n" name="实盘单" dataKey="live_orders" fill="var(--positive)" radius={[3, 3, 0, 0]} />
+                        <Line yAxisId="wr" name="理论胜率" dataKey="win_rate" stroke="var(--brand)" strokeWidth={2} dot={{ r: 3 }} />
+                        <Line yAxisId="wr" name="实盘胜率" dataKey="live_win_rate" stroke="var(--warning)" strokeWidth={2} dot={{ r: 3 }} />
+                      </ComposedChart>
+                    </ResponsiveContainer>
+
+                    <div className="overflow-x-auto mt-3">
+                      <table className="w-full text-xs">
+                        <thead>
+                          <tr className="border-b border-line text-ink-55 bg-sunken">
+                            <th className="py-1 px-1.5 text-left">报价档位</th>
+                            <th className="py-1 px-1.5 text-right">信号数</th>
+                            <th className="py-1 px-1.5 text-right">理论胜率</th>
+                            <th className="py-1 px-1.5 text-right">单均EV</th>
+                            <th className="py-1 px-1.5 text-right">实盘单数</th>
+                            <th className="py-1 px-1.5 text-right">实盘胜率</th>
+                            <th className="py-1 px-1.5 text-right">实盘盈亏</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {data.quote_buckets.map((b, i) => (
+                            <tr key={i} className="border-b border-line-soft hover:bg-sunken">
+                              <td className="py-1 px-1.5 font-mono text-ink-95 font-medium">{b.range}</td>
+                              <td className="py-1 px-1.5 text-right font-mono text-ink-80">{b.signals}</td>
+                              <td className="py-1 px-1.5 text-right font-mono font-medium text-brand">
+                                {pct1(b.win_rate)}
+                              </td>
+                              <td className={`py-1 px-1.5 text-right font-mono ${
+                                b.avg_ev == null ? 'text-ink-40' : b.avg_ev >= 0 ? 'text-positive' : 'text-negative'
+                              }`}>
+                                {evFmt(b.avg_ev)}
+                              </td>
+                              <td className="py-1 px-1.5 text-right font-mono text-ink-80">{b.live_orders || '--'}</td>
+                              <td className="py-1 px-1.5 text-right font-mono font-medium text-brand">{pct1(b.live_win_rate)}</td>
+                              <td className={`py-1 px-1.5 text-right font-mono font-bold ${
+                                b.live_pnl == null ? 'text-ink-40' : b.live_pnl >= 0 ? 'text-positive' : 'text-negative'
+                              }`}>
+                                {b.live_pnl != null ? `${b.live_pnl >= 0 ? '+' : ''}${b.live_pnl.toFixed(1)}U` : '--'}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  {/* 时段分布图表对比 */}
+                  <div className="border border-line rounded-sm p-3 bg-card">
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-xs font-bold text-ink-95">UTC 时段信号分布与胜率 (Hour Buckets)</span>
+                      <span className="text-[11px] text-ink-55">柱高=信号数 · 折线=胜率</span>
+                    </div>
+                    <ResponsiveContainer width="100%" height={220}>
+                      <ComposedChart data={data.hour_buckets}>
+                        <CartesianGrid stroke="var(--line-soft)" />
+                        <XAxis dataKey="hour_range" tick={{ fontSize: 10, fill: 'var(--ink-80)' }} />
+                        <YAxis yAxisId="n" tick={{ fontSize: 10, fill: 'var(--ink-55)' }} />
+                        <YAxis yAxisId="wr" orientation="right" domain={[0, 1]} tick={{ fontSize: 10, fill: 'var(--ink-55)' }} tickFormatter={v => `${(v * 100).toFixed(0)}%`} />
+                        <Tooltip contentStyle={TOOLTIP_STYLE} labelStyle={TOOLTIP_LABEL_STYLE} itemStyle={TOOLTIP_ITEM_STYLE} />
+                        <Legend />
+                        <Bar yAxisId="n" name="信号数" dataKey="signals" fill="var(--chart-2)" radius={[3, 3, 0, 0]} />
+                        <Bar yAxisId="n" name="实盘单" dataKey="live_orders" fill="var(--positive)" radius={[3, 3, 0, 0]} />
+                        <Line yAxisId="wr" name="理论胜率" dataKey="win_rate" stroke="var(--brand)" strokeWidth={2} dot={{ r: 3 }} />
+                        <Line yAxisId="wr" name="实盘胜率" dataKey="live_win_rate" stroke="var(--warning)" strokeWidth={2} dot={{ r: 3 }} />
+                      </ComposedChart>
+                    </ResponsiveContainer>
+
+                    <div className="overflow-x-auto mt-3">
+                      <table className="w-full text-xs">
+                        <thead>
+                          <tr className="border-b border-line text-ink-55 bg-sunken">
+                            <th className="py-1 px-1.5 text-left">UTC 时段</th>
+                            <th className="py-1 px-1.5 text-right">信号数</th>
+                            <th className="py-1 px-1.5 text-right">理论胜率</th>
+                            <th className="py-1 px-1.5 text-right">单均EV</th>
+                            <th className="py-1 px-1.5 text-right">实盘单数</th>
+                            <th className="py-1 px-1.5 text-right">实盘胜率</th>
+                            <th className="py-1 px-1.5 text-right">实盘盈亏</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {data.hour_buckets.map((b, i) => (
+                            <tr key={i} className="border-b border-line-soft hover:bg-sunken">
+                              <td className="py-1 px-1.5 font-mono text-ink-95 font-medium">{b.hour_range}</td>
+                              <td className="py-1 px-1.5 text-right font-mono text-ink-80">{b.signals}</td>
+                              <td className="py-1 px-1.5 text-right font-mono font-medium text-brand">
+                                {pct1(b.win_rate)}
+                              </td>
+                              <td className={`py-1 px-1.5 text-right font-mono ${
+                                b.avg_ev == null ? 'text-ink-40' : b.avg_ev >= 0 ? 'text-positive' : 'text-negative'
+                              }`}>
+                                {evFmt(b.avg_ev)}
+                              </td>
+                              <td className="py-1 px-1.5 text-right font-mono text-ink-80">{b.live_orders || '--'}</td>
+                              <td className="py-1 px-1.5 text-right font-mono font-medium text-brand">{pct1(b.live_win_rate)}</td>
+                              <td className={`py-1 px-1.5 text-right font-mono font-bold ${
+                                b.live_pnl == null ? 'text-ink-40' : b.live_pnl >= 0 ? 'text-positive' : 'text-negative'
+                              }`}>
+                                {b.live_pnl != null ? `${b.live_pnl >= 0 ? '+' : ''}${b.live_pnl.toFixed(1)}U` : '--'}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function ShadowSignalCard({
+  title,
+  entries,
+  rows,
+  footnote,
+  emptyHint,
+  analytics,
+  load,
+  pumpTs,
+  isRetired,
+}: {
+  title: string
+  entries: [string, { label: string; color: string }][]
+  rows: Record<string, number>[]
+  footnote: React.ReactNode
+  emptyHint?: string
+  analytics: SignalsAnalytics
+  load: () => void
+  pumpTs: number | null
+  isRetired?: boolean
+}) {
+  const [kw, setKw] = useState('')
+  const [statusFilter, setStatusFilter] = useState<'ALL' | 'ONLINE' | 'OFFLINE' | 'LIVE'>('ALL')
+  const [familyFilter, setFamilyFilter] = useState('ALL')
+  const [roleFilter, setRoleFilter] = useState('ALL')
+  const [guardMode, setGuardMode] = useState<'GUARDED' | 'THEORETICAL' | 'BOTH'>('GUARDED')
+  const [sortCol, setSortCol] = useState<string>('default')
+  const [sortAsc, setSortAsc] = useState<boolean>(false)
+  const [detailVersion, setDetailVersion] = useState<string | null>(null)
+
+  if (entries.length === 0) {
+    return (
+      <Card title={title}>
+        <div className="text-center text-ink-55 py-6 text-xs">{emptyHint ?? '无数据'}</div>
+      </Card>
+    )
+  }
+
+  const toggleSort = (col: string) => {
+    if (sortCol === col) {
+      setSortAsc(!sortAsc)
+    } else {
+      setSortCol(col)
+      setSortAsc(false)
+    }
+  }
+
+  const thSort = (field: string, label: string, align: 'left' | 'center' | 'right' = 'right', hint?: string) => (
+    <th
+      className={`py-1 px-2 text-${align} cursor-pointer select-none hover:text-brand transition-colors`}
+      onClick={() => toggleSort(field)}
+      title={hint}
+    >
+      <span className={`inline-flex items-center gap-0.5 ${align === 'right' ? 'justify-end' : align === 'center' ? 'justify-center' : 'justify-start'}`}>
+        {label}
+        {sortCol === field ? (
+          <span className="text-brand font-mono text-[10px]">{sortAsc ? '▲' : '▼'}</span>
+        ) : (
+          <span className="text-ink-40 font-mono text-[10px]">⇅</span>
+        )}
+      </span>
+    </th>
+  )
+
+  const search = kw.trim().toLowerCase()
+  const filtered = entries.filter(([k, m]) => {
+    const s = analytics.shadow[k]?.summary
+    if (!s) return false
+    if (search) {
+      const matchKey = k.toLowerCase().includes(search)
+      const matchLabel = m.label.toLowerCase().includes(search)
+      const matchDesc = String(s.desc ?? '').toLowerCase().includes(search)
+      const matchExtra = (signalDescFor('shadow', k) ?? '').toLowerCase().includes(search)
+      if (!matchKey && !matchLabel && !matchDesc && !matchExtra) return false
+    }
+    const online = s.enabled !== false
+    const retired = s.retired === true
+    const live = retired ? null : (s.live_channel ?? null)
+    if (familyFilter !== 'ALL' && (s.family ?? 'legacy') !== familyFilter) return false
+    if (roleFilter !== 'ALL' && (s.role ?? 'STRATEGY') !== roleFilter) return false
+    if (statusFilter === 'ONLINE') {
+      if (retired || !online) return false
+    } else if (statusFilter === 'OFFLINE') {
+      if (retired || online) return false
+    } else if (statusFilter === 'LIVE') {
+      if (retired || !live || !live.enabled) return false
+    }
+    return true
+  })
+
+  const sorted = [...filtered].sort(([ka, ma], [kb, mb]) => {
+    if (sortCol === 'default') return 0
+    const sa = analytics.shadow[ka]?.summary
+    const sb = analytics.shadow[kb]?.summary
+    if (!sa || !sb) return 0
+    let diff = 0
+    if (sortCol === 'ver') {
+      diff = ma.label.localeCompare(mb.label, 'zh-CN')
+    } else if (sortCol === 'status') {
+      const valA = sa.retired ? -1 : sa.enabled !== false ? 1 : 0
+      const valB = sb.retired ? -1 : sb.enabled !== false ? 1 : 0
+      diff = valA - valB
+    } else if (sortCol === 'live') {
+      const valA = sa.retired ? 0 : sa.live_channel?.enabled ? 2 : sa.live_channel ? 1 : 0
+      const valB = sb.retired ? 0 : sb.live_channel?.enabled ? 2 : sb.live_channel ? 1 : 0
+      diff = valA - valB
+    } else if (sortCol === 'n') {
+      const na = guardMode === 'GUARDED' ? (sa.guarded_n ?? 0) : (sa.n ?? 0)
+      const nb = guardMode === 'GUARDED' ? (sb.guarded_n ?? 0) : (sb.n ?? 0)
+      diff = na - nb
+    } else if (sortCol === 'win_rate') {
+      const wra = guardMode === 'GUARDED' ? (sa.guarded_win_rate ?? -1) : (sa.win_rate ?? -1)
+      const wrb = guardMode === 'GUARDED' ? (sb.guarded_win_rate ?? -1) : (sb.win_rate ?? -1)
+      diff = wra - wrb
+    } else if (sortCol === 'breakeven') {
+      const bea = guardMode === 'GUARDED' ? (sa.guarded_avg_breakeven ?? -1) : (sa.avg_breakeven ?? -1)
+      const beb = guardMode === 'GUARDED' ? (sb.guarded_avg_breakeven ?? -1) : (sb.avg_breakeven ?? -1)
+      diff = bea - beb
+    } else if (sortCol === 'bench') {
+      diff = (sa.bench_winrate ?? -1) - (sb.bench_winrate ?? -1)
+    } else if (sortCol === 'dev') {
+      const activeWra = guardMode === 'GUARDED' ? sa.guarded_win_rate : sa.win_rate
+      const activeWrb = guardMode === 'GUARDED' ? sb.guarded_win_rate : sb.win_rate
+      const devA = activeWra != null && sa.bench_winrate != null ? activeWra - sa.bench_winrate : -999
+      const devB = activeWrb != null && sb.bench_winrate != null ? activeWrb - sb.bench_winrate : -999
+      diff = devA - devB
+    } else if (sortCol === 'avg_ev') {
+      const eva = guardMode === 'GUARDED' ? (sa.guarded_avg_ev ?? -999) : (sa.avg_ev ?? -999)
+      const evb = guardMode === 'GUARDED' ? (sb.guarded_avg_ev ?? -999) : (sb.avg_ev ?? -999)
+      diff = eva - evb
+    } else if (sortCol === 'cum_ev') {
+      const ceva = guardMode === 'GUARDED' ? (sa.guarded_cum_ev ?? -999) : (sa.cum_ev ?? -999)
+      const cevb = guardMode === 'GUARDED' ? (sb.guarded_cum_ev ?? -999) : (sb.cum_ev ?? -999)
+      diff = ceva - cevb
+    } else if (sortCol === 'fill_rate') {
+      diff = (sa.guarded_fill_rate ?? -1) - (sb.guarded_fill_rate ?? -1)
+    }
+    return sortAsc ? diff : -diff
+  })
+
+  const familyOptions = Array.from(new Set(entries.map(([k]) => analytics.shadow[k]?.summary.family ?? 'legacy')))
+    .sort((a, b) => familyRank(a) - familyRank(b))
+  const filterActive = search !== '' || statusFilter !== 'ALL' || familyFilter !== 'ALL' || roleFilter !== 'ALL'
+  const selectCls = 'px-1.5 py-0.5 border border-line rounded-sm text-xs text-ink-80 bg-card'
+
+  return (
+    <Card title={title}>
+      {/* 筛选与搜索栏 */}
+      <div className="flex items-center justify-between mb-3 gap-2 flex-wrap text-xs">
+        <div className="flex items-center gap-2 flex-wrap">
+          <input
+            type="text"
+            placeholder="搜索版本/说明/代号..."
+            value={kw}
+            onChange={e => setKw(e.target.value)}
+            className={`${selectCls} w-44`}
+          />
+          <select value={familyFilter} onChange={e => setFamilyFilter(e.target.value)} className={selectCls}>
+            <option value="ALL">全部策略族</option>
+            {familyOptions.map(family => <option key={family} value={family}>{signalFamilyLabel(family)}</option>)}
+          </select>
+          <select value={roleFilter} onChange={e => setRoleFilter(e.target.value)} className={selectCls}>
+            <option value="ALL">全部角色</option>
+            {Object.entries(ROLE_LABELS).map(([role, label]) => <option key={role} value={role}>{label}</option>)}
+          </select>
+          {!isRetired && (
+            <select
+              value={statusFilter}
+              onChange={e => setStatusFilter(e.target.value as 'ALL' | 'ONLINE' | 'OFFLINE' | 'LIVE')}
+              className={selectCls}
+            >
+              <option value="ALL">全部在线信号</option>
+              <option value="ONLINE">仅在线采集</option>
+              <option value="LIVE">仅实盘中</option>
+            </select>
+          )}
+          <div className="inline-flex items-center rounded-sm border border-line bg-sunken p-0.5 text-xs">
+            <button
+              onClick={() => setGuardMode('GUARDED')}
+              className={`px-2 py-0.5 rounded-xs transition-colors font-medium ${
+                guardMode === 'GUARDED' ? 'bg-card text-brand shadow-xs' : 'text-ink-55 hover:text-ink-80'
+              }`}
+              title="护栏反算：用**当前**护栏/白名单回算历史，价格取行情快照（market/list）。是反事实，不是当时真钱规则、也不是可成交价。"
+            >
+              护栏反算（快照价）
+            </button>
+            <button
+              onClick={() => setGuardMode('THEORETICAL')}
+              className={`px-2 py-0.5 rounded-xs transition-colors font-medium ${
+                guardMode === 'THEORETICAL' ? 'bg-card text-brand shadow-xs' : 'text-ink-55 hover:text-ink-80'
+              }`}
+              title="原始全量影子信号（未做任何护栏拦截，价格同样取行情快照）"
+            >
+              全量理论
+            </button>
+            <button
+              onClick={() => setGuardMode('BOTH')}
+              className={`px-2 py-0.5 rounded-xs transition-colors font-medium ${
+                guardMode === 'BOTH' ? 'bg-card text-brand shadow-xs' : 'text-ink-55 hover:text-ink-80'
+              }`}
+              title="同时对比理论、护栏反算与可执行报价（get_quote）三个口径"
+            >
+              三口径对比
+            </button>
+          </div>
+          {filterActive && (
+            <button
+              onClick={() => { setKw(''); setStatusFilter('ALL'); setFamilyFilter('ALL'); setRoleFilter('ALL') }}
+              className="px-1.5 py-0.5 text-xs text-brand hover:underline"
+            >清除筛选</button>
+          )}
+          {sortCol !== 'default' && (
+            <button
+              onClick={() => { setSortCol('default'); setSortAsc(false) }}
+              className="px-1.5 py-0.5 text-xs text-ink-55 hover:underline"
+            >重置排序</button>
+          )}
+        </div>
+        <span className="text-xs text-ink-55">
+          显示 {sorted.length} / 共 {entries.length} 个版本
+        </span>
+      </div>
+
+      {sorted.length === 0 ? (
+        <div className="text-center text-ink-55 py-6 text-xs">当前筛选条件下无匹配版本</div>
+      ) : (
+        <>
+          <div className="space-y-4 mb-3">
+          {Array.from(new Set(sorted.map(([k]) => analytics.shadow[k].summary.family ?? 'legacy')))
+            .sort((a, b) => familyRank(a) - familyRank(b))
+            .map(family => {
+              const familyRows = sorted.filter(([k]) => (analytics.shadow[k].summary.family ?? 'legacy') === family)
+              return <div key={family} className="overflow-x-auto border border-line rounded-sm">
+                <div className="px-3 py-2 bg-sunken text-xs font-bold text-ink-95 flex items-center justify-between">
+                  <span>{signalFamilyLabel(family)}</span><span className="font-mono text-ink-55">{familyRows.length} 版</span>
+                </div>
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="border-b border-line text-ink-55">
+                  {thSort('ver', '版本 / 分类', 'left')}
+                  {thSort('status', '影子采集', 'center')}
+                  {thSort('live', '实盘', 'center')}
+                  <th className="py-1 px-2 text-center" title="查看单信号逐笔订单与实盘对齐对比分析">订单/对比</th>
+                  <th className="py-1 px-2 text-right" title="实盘执行价护栏（超价或贴线弃单）">护栏/弃单</th>
+                  {guardMode === 'BOTH' ? (
+                    <>
+                      {thSort('n', '实际n / 理论n', 'right')}
+                      {thSort('fill_rate', '通过率', 'right', '护栏反算通过信号占理论信号的比例（用当前护栏回算历史）')}
+                      {thSort('win_rate', '反算胜率', 'right', '护栏反算子集的胜率（价格取行情快照）')}
+                      <th className="py-1 px-2 text-right text-ink-40" title="未做护栏过滤的全量影子理论胜率">理论胜率</th>
+                      {thSort('breakeven', '实际保本率', 'right', '护栏反算子集前向真实入场报价对应的平均保本胜率')}
+                      <th className="py-1 px-2 text-right" title="冻结回测胜率×0.98：费后理论允许的最高入场价">回测保本价</th>
+                      {thSort('bench', '回测胜率', 'right')}
+                      {thSort('dev', '偏离(实-基)', 'right')}
+                      {thSort('avg_ev', '反算单均EV', 'right', '护栏反算子集、行情快照价口径')}
+                      <th className="py-1 px-2 text-right text-ink-40" title="理论单均EV（行情快照价）">理论EV</th>
+                      {thSort('cum_ev', '反算累计EV', 'right')}
+                      <th className="py-1 px-2 text-right text-ink-40" title="理论累计EV（行情快照价）">理论累计</th>
+                      <th className="py-1 px-2 text-right text-brand" title={EXEC_QUOTE_HINT}>可执行n / 前向n</th>
+                      <th className="py-1 px-2 text-right text-brand" title={EXEC_QUOTE_HINT}>可执行单均EV</th>
+                    </>
+                  ) : guardMode === 'GUARDED' ? (
+                    <>
+                      {thSort('n', '反算n', 'right')}
+                      {thSort('fill_rate', '通过率', 'right', '护栏反算通过信号占理论信号的比例（用当前护栏回算历史）')}
+                      {thSort('win_rate', '反算胜率', 'right', '护栏反算子集的胜率（价格取行情快照）')}
+                      {thSort('breakeven', '实际保本率', 'right', '护栏反算子集前向真实入场报价对应的平均保本胜率')}
+                      <th className="py-1 px-2 text-right" title="冻结回测胜率×0.98：费后理论允许的最高入场价">回测保本价</th>
+                      {thSort('bench', '回测胜率', 'right')}
+                      {thSort('dev', '偏离', 'right')}
+                      {thSort('avg_ev', '反算单均EV', 'right', '护栏反算子集、行情快照价口径')}
+                      {thSort('cum_ev', '反算累计EV', 'right')}
+                      <th className="py-1 px-2 text-right text-brand" title={EXEC_QUOTE_HINT}>可执行n / 前向n</th>
+                      <th className="py-1 px-2 text-right text-brand" title={EXEC_QUOTE_HINT}>可执行单均EV</th>
+                    </>
+                  ) : (
+                    <>
+                      {thSort('n', '理论n', 'right')}
+                      {thSort('win_rate', '理论胜率', 'right')}
+                      {thSort('breakeven', '理论保本率', 'right', '按上线后真实入场报价计算；暂无报价样本时显示—')}
+                      <th className="py-1 px-2 text-right" title="冻结回测胜率×0.98：费后理论允许的最高入场价">回测保本价</th>
+                      {thSort('bench', '回测胜率', 'right')}
+                      {thSort('dev', '偏离', 'right')}
+                      {thSort('avg_ev', '理论单均EV', 'right')}
+                      {thSort('cum_ev', '理论累计EV', 'right')}
+                    </>
+                  )}
+                </tr>
+              </thead>
+              <tbody>
+                {familyRows.map(([k, m]) => {
+                  const i = sorted.findIndex(([version]) => version === k)
+                  const s = analytics.shadow[k].summary
+                  // 与图表同序：本区第 11 条起降透明度，保证表格色块与曲线一一对应
+                  const faded = i >= 10
+                  const displayWr = guardMode === 'GUARDED' ? s.guarded_win_rate : s.win_rate
+                  const dev = displayWr != null && s.bench_winrate != null ? displayWr - s.bench_winrate : null
+                  const online = s.enabled !== false
+                  const retired = s.retired === true
+                  const live = retired ? null : (s.live_channel ?? null)
+                  return (
+                    <tr key={k} className={`border-b border-line-soft hover:bg-sunken ${online ? '' : 'opacity-45'}`}>
+                      <td className="py-1 px-2 font-medium" style={{ color: m.color, opacity: faded ? 0.6 : 1 }} title={s.desc}>
+                        <span className="inline-flex items-center gap-1 flex-wrap">
+                          {m.label}
+                          <span className="ds-badge ds-badge-neutral">{signalFamilyLabel(s.family)}</span>
+                          {s.role && s.role !== 'STRATEGY' && <span className="ds-badge ds-badge-indigo">{ROLE_LABELS[s.role] ?? s.role}</span>}
+                          <span className={`ds-badge ${EXECUTION_BADGE[s.execution_mode ?? 'SHADOW_ONLY']?.cls ?? 'ds-badge-neutral'}`}>
+                            {EXECUTION_BADGE[s.execution_mode ?? 'SHADOW_ONLY']?.label ?? '仅影子'}
+                          </span>
+                          {signalDescFor('shadow', k) && <HelpHint text={`${k}：${signalDescFor('shadow', k)}`} />}
+                          {/* 观察价来源告警（2026-10-15）：非「触发时快照价」时显式标出，
+                              避免把历史/回落口径的价格当可成交价读 */}
+                          {s.quote_caliber && s.quote_caliber !== 'market_snapshot' && (
+                            <span className="ds-badge ds-badge-warn" title={quoteCaliberHint(s.quote_caliber)}>
+                              {QUOTE_CALIBER_LABEL[s.quote_caliber]?.label ?? s.quote_caliber}
+                            </span>
+                          )}
+                        </span>
+                      </td>
+                      <td className="py-1 px-2 text-center">
+                        {retired ? (
+                          <span
+                            className="px-1.5 py-0.5 rounded-pill text-[10px] font-medium border border-line bg-sunken text-ink-55 cursor-not-allowed"
+                            title="已永久退役（2026-09-04）：代码级硬闸停发，不可重新上线；冻结 bench 基准与历史曲线仍保留供审计"
+                          >已退役</span>
+                        ) : (
+                          <button
+                            onClick={async () => { await api.toggleShadow(k, !online); load() }}
+                            className={`px-1.5 py-0.5 rounded-pill text-[10px] font-medium border transition ${
+                              online
+                                ? 'text-positive border-positive bg-positive-soft hover:bg-positive-soft-hover'
+                                : 'text-ink-55 border-line bg-card hover:bg-sunken'
+                            }`}
+                            title={online
+                              ? '点击下线：停止采集新信号（历史数据保留，曲线照常显示已有样本）'
+                              : '点击上线：恢复采集新信号'}
+                          >
+                            {online ? '在线' : '已下线'}
+                          </button>
+                        )}
+                      </td>
+                      <td className="py-1 px-2 text-center">
+                        {live ? (
+                          <button
+                            onClick={async () => {
+                              const next = !live.enabled
+                              if (next) {
+                                if (!window.confirm(
+                                  `确认开启通道实盘？\n通道: ${SIGNAL_INFO[k]?.name ?? k}（${k}）\n每单 ${String(live.amount_usdt)} USDT | 执行价护栏 ${String(live.max_exec_price)} | 日限 ${String(live.max_daily_orders)} 单\n\n命中信号将下真实订单（真金白银）；设定写入 DB 重启后保持（仅持久化失败时回落 LIVE_CHANNELS_JSON）。`)) return
+                              } else {
+                                if (!window.confirm(
+                                  `确认关闭通道实盘？\n通道: ${SIGNAL_INFO[k]?.name ?? k}（${k}）\n（不取消在途任务，只阻止该通道新单派生）`)) return
+                              }
+                              try {
+                                const res = await api.postLiveChannel(k, next)
+                                if (res?.error) alert(`切换失败: ${String(res.error)}`)
+                                load()
+                              } catch (e) {
+                                alert(`请求失败: ${(e as Error).message}`)
+                              }
+                            }}
+                            className={`px-1.5 py-0.5 rounded-pill text-[10px] font-medium border transition ${
+                              live.enabled
+                                ? 'text-positive border-positive bg-positive-soft hover:bg-positive-soft-hover'
+                                : 'text-ink-55 border-line bg-card hover:bg-sunken'
+                            }`}
+                            title={live.enabled ? '实盘下单中，点击关闭该通道（影子采集不受影响）' : '点击开启实盘下单（真金白银；影子采集不受影响）'}
+                          >
+                            {live.enabled ? '实盘中' : '加入实盘'}
+                          </button>
+                        ) : (
+                          <span className="inline-flex items-center gap-0.5 text-ink-40">
+                            —
+                            <HelpHint text="该影子族未注册实盘通道（不下注）；实盘化需在 services/live_channels.py 注册同名 ChannelSpec 并重启" />
+                          </span>
+                        )}
+                      </td>
+                      <td className="py-1 px-2 text-center">
+                        <button
+                          onClick={() => setDetailVersion(k)}
+                          className="px-2 py-0.5 rounded-pill text-[10px] font-semibold border border-brand/40 bg-brand-soft text-brand hover:bg-brand hover:text-white transition shadow-2xs"
+                          title="查看该信号逐笔详情、实盘订单对齐与分析图表"
+                        >
+                          详情 / 对比
+                        </button>
+                      </td>
+                      <td className="py-1 px-2 text-right font-mono text-ink-55" title={s.guard_price != null ? `护栏 ≤ ${s.guard_price}；已拦截弃单 ${s.guarded_rejected_n ?? 0} 笔` : '未配置护栏'}>
+                        {s.guard_price != null ? (
+                          <span>
+                            {s.guard_price}
+                            <span className="text-[10px] text-negative ml-1">(-{s.guarded_rejected_n ?? 0})</span>
+                          </span>
+                        ) : '—'}
+                      </td>
+                      {guardMode === 'BOTH' ? (
+                        <>
+                          <td className="py-1 px-2 text-right font-mono">
+                            <span className="font-bold text-ink-95">{s.guarded_n ?? 0}</span>
+                            <span className="text-ink-40 text-[10px]"> / {s.n}</span>
+                          </td>
+                          <td className="py-1 px-2 text-right font-mono font-medium">{pct1(s.guarded_fill_rate)}</td>
+                          <td className="py-1 px-2 text-right font-mono font-bold text-brand">{pct1(s.guarded_win_rate)}</td>
+                          <td className="py-1 px-2 text-right font-mono text-ink-40">{pct1(s.win_rate)}</td>
+                          <td className="py-1 px-2 text-right font-mono text-ink-55" title={s.guarded_avg_breakeven == null ? '暂无前向真实报价样本' : '带护栏成交信号前向真实入场报价对应的平均保本胜率'}>{pct1(s.guarded_avg_breakeven)}</td>
+                          <td className="py-1 px-2 text-right font-mono text-ink-55">{pct1(s.bench_max_entry_price)}</td>
+                          <td className="py-1 px-2 text-right font-mono text-ink-55">{pct1(s.bench_winrate)}</td>
+                          <td className={`py-1 px-2 text-right font-mono ${dev == null ? 'text-ink-55' : dev >= 0 ? 'text-positive' : 'text-negative'}`}>
+                            {dev == null ? '—' : `${dev >= 0 ? '+' : ''}${(dev * 100).toFixed(1)}pp`}
+                          </td>
+                          <td className={`py-1 px-2 text-right font-mono font-bold ${s.guarded_avg_ev == null ? 'text-ink-55' : s.guarded_avg_ev >= 0 ? 'text-positive' : 'text-negative'}`}>{evFmt(s.guarded_avg_ev)}</td>
+                          <td className={`py-1 px-2 text-right font-mono text-[11px] ${s.avg_ev == null ? 'text-ink-40' : s.avg_ev >= 0 ? 'text-positive/70' : 'text-negative/70'}`}>{evFmt(s.avg_ev)}</td>
+                          <td className={`py-1 px-2 text-right font-mono font-bold ${s.guarded_cum_ev == null ? 'text-ink-55' : s.guarded_cum_ev >= 0 ? 'text-positive' : 'text-negative'}`}>{evFmt(s.guarded_cum_ev)}</td>
+                          <td className={`py-1 px-2 text-right font-mono text-[11px] ${s.cum_ev == null ? 'text-ink-40' : s.cum_ev >= 0 ? 'text-positive/70' : 'text-negative/70'}`}>{evFmt(s.cum_ev)}</td>
+                          <ExecutionQuoteCells quote={s.execution_quote} />
+                        </>
+                      ) : guardMode === 'GUARDED' ? (
+                        <>
+                          <td className="py-1 px-2 text-right font-mono font-bold">{s.guarded_n ?? 0}</td>
+                          <td className="py-1 px-2 text-right font-mono font-medium">{pct1(s.guarded_fill_rate)}</td>
+                          <td className="py-1 px-2 text-right font-mono font-bold text-brand">{pct1(s.guarded_win_rate)}</td>
+                          <td className="py-1 px-2 text-right font-mono text-ink-55" title={s.guarded_avg_breakeven == null ? '暂无前向真实报价样本' : '护栏反算子集前向真实入场报价对应的平均保本胜率'}>{pct1(s.guarded_avg_breakeven)}</td>
+                          <td className="py-1 px-2 text-right font-mono text-ink-55">{pct1(s.bench_max_entry_price)}</td>
+                          <td className="py-1 px-2 text-right font-mono text-ink-55">{pct1(s.bench_winrate)}</td>
+                          <td className={`py-1 px-2 text-right font-mono ${dev == null ? 'text-ink-55' : dev >= 0 ? 'text-positive' : 'text-negative'}`}>
+                            {dev == null ? '—' : `${dev >= 0 ? '+' : ''}${(dev * 100).toFixed(1)}pp`}
+                          </td>
+                          <td className={`py-1 px-2 text-right font-mono ${s.guarded_avg_ev == null ? 'text-ink-55' : s.guarded_avg_ev >= 0 ? 'text-positive' : 'text-negative'}`}>{evFmt(s.guarded_avg_ev)}</td>
+                          <td className={`py-1 px-2 text-right font-mono ${s.guarded_cum_ev == null ? 'text-ink-55' : s.guarded_cum_ev >= 0 ? 'text-positive' : 'text-negative'}`}>{evFmt(s.guarded_cum_ev)}</td>
+                          <ExecutionQuoteCells quote={s.execution_quote} />
+                        </>
+                      ) : (
+                        <>
+                          <td className="py-1 px-2 text-right font-mono">{s.n}</td>
+                          <td className="py-1 px-2 text-right font-mono font-bold">{pct1(s.win_rate)}</td>
+                          <td className="py-1 px-2 text-right font-mono text-ink-55" title={s.avg_breakeven == null ? '暂无前向真实报价样本' : '前向真实入场报价对应的平均保本胜率'}>{pct1(s.avg_breakeven)}</td>
+                          <td className="py-1 px-2 text-right font-mono text-ink-55">{pct1(s.bench_max_entry_price)}</td>
+                          <td className="py-1 px-2 text-right font-mono text-ink-55">{pct1(s.bench_winrate)}</td>
+                          <td className={`py-1 px-2 text-right font-mono ${dev == null ? 'text-ink-55' : dev >= 0 ? 'text-positive' : 'text-negative'}`}>
+                            {dev == null ? '—' : `${dev >= 0 ? '+' : ''}${(dev * 100).toFixed(1)}pp`}
+                          </td>
+                          <td className={`py-1 px-2 text-right font-mono ${s.avg_ev == null ? 'text-ink-55' : s.avg_ev >= 0 ? 'text-positive' : 'text-negative'}`}>{evFmt(s.avg_ev)}</td>
+                          <td className={`py-1 px-2 text-right font-mono ${s.cum_ev == null ? 'text-ink-55' : s.cum_ev >= 0 ? 'text-positive' : 'text-negative'}`}>{evFmt(s.cum_ev)}</td>
+                        </>
+                      )}
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+              </div>
+            })}
+          </div>
+          <ResponsiveContainer width="100%" height={240}>
+            <LineChart
+              data={
+                guardMode === 'GUARDED'
+                  ? mergeCurves(
+                      Object.fromEntries(sorted.map(([k]) => [k, analytics.shadow[k]])),
+                      SHADOW_META,
+                      true,
+                    )
+                  : guardMode === 'THEORETICAL'
+                  ? mergeCurves(
+                      Object.fromEntries(sorted.map(([k]) => [k, analytics.shadow[k]])),
+                      SHADOW_META,
+                      false,
+                    )
+                  : rows
+              }
+              margin={{ top: 6, right: 12, left: 0, bottom: 0 }}
+            >
+              <CartesianGrid stroke="var(--line-soft)" />
+              <XAxis dataKey="ts" type="number" domain={['dataMin', 'dataMax']} scale="time"
+                tickFormatter={utcMD} tick={{ fontSize: 11, fill: 'var(--ink-55)', fontFamily: 'var(--font-stack-mono)' }} stroke="var(--ink-55)" />
+              <YAxis domain={[0, 100]} tick={{ fontSize: 11, fill: 'var(--ink-55)', fontFamily: 'var(--font-stack-mono)' }} stroke="var(--ink-55)" width={40}
+                tickFormatter={(v: number) => v + '%'} />
+              <Tooltip
+                contentStyle={TOOLTIP_STYLE} labelStyle={TOOLTIP_LABEL_STYLE} itemStyle={TOOLTIP_ITEM_STYLE}
+                labelFormatter={t => new Date(t as number).toUTCString().slice(0, 16)}
+                formatter={(v, n) => [typeof v === 'number' ? v.toFixed(1) + '%' : '--', n]}
+              />
+              {pumpTs != null && <ReferenceLine x={pumpTs} stroke="var(--warning)" strokeDasharray="4 3" />}
+              {sorted.map(([k, m], i) => {
+                const s = analytics.shadow[k].summary
+                const faded = i >= 10
+                const activeBreakeven = guardMode === 'GUARDED' ? s.guarded_avg_breakeven : s.avg_breakeven
+                return (
+                  <Fragment key={k}>
+                    <Line dataKey={m.label} stroke={m.color} strokeWidth={faded ? 1.5 : 2}
+                      strokeOpacity={faded ? 0.55 : 1} dot={false} connectNulls isAnimationActive={false} />
+                    {s.bench_winrate != null && (
+                      <ReferenceLine y={s.bench_winrate * 100} stroke={m.color} strokeDasharray="5 4" strokeOpacity={faded ? 0.3 : 0.5} />
+                    )}
+                    {activeBreakeven != null && (
+                      <ReferenceLine y={activeBreakeven * 100} stroke={m.color} strokeDasharray="1 3" strokeOpacity={faded ? 0.35 : 0.6} />
+                    )}
+                  </Fragment>
+                )
+              })}
+            </LineChart>
+          </ResponsiveContainer>
+        </>
+      )}
+      <div className="text-[10px] text-ink-55 mt-1">{footnote}</div>
+      {detailVersion && (
+        <ShadowSignalDetailModal
+          version={detailVersion}
+          onClose={() => setDetailVersion(null)}
+        />
+      )}
+    </Card>
+  )
+}
 
 function SceneSignalsCard({
   sceneEntries,
@@ -7538,9 +9198,62 @@ function SceneSignalsCard({
         />
       )}
 
+      <details className="ds-card">
+        <summary className="cursor-pointer px-4 py-3 text-sm font-semibold text-ink-95">旧版影子：在线采集与统计（展开查看）<HelpHint text="保留旧版在线采集、前向胜率、回测基准与保本线；新版前向证据及执行漏斗见页面底部。" /></summary>
+        <div className="space-y-6 px-2 pb-2">
+      {/* 旧版影子入口与完整在线采集指标一并折叠。 */}
+      {analytics && featuredShadowKeys.map(k => {
+        const s = analytics.shadow[k].summary
+        const meta = SHADOW_META[k]
+        return <div key={k} className="ds-card p-3 flex items-center justify-between gap-4 flex-wrap">
+          <div className="min-w-0">
+            <div className="flex items-center gap-1.5 flex-wrap text-sm font-semibold text-ink-95">
+              <span>{meta?.label ?? k}</span>
+              <span className="ds-badge ds-badge-violet">新上线影子</span>
+              <span className="ds-badge ds-badge-neutral">实盘默认关闭</span>
+              <HelpHint text={`${k}：${signalDescFor('shadow', k)}`} />
+            </div>
+            <div className="mt-1 text-xs text-ink-55">30 天滚动 ret1h q90 路由；普通行情开盘模拟 DOWN，轧空行情等首根 5m 收阴确认。</div>
+          </div>
+          <div className="flex items-center gap-5 text-right">
+            <div><div className="text-[10px] text-ink-55">前向样本</div><div className="font-mono font-semibold text-ink-95">{s.n}</div></div>
+            <div><div className="text-[10px] text-ink-55">回测胜率</div><div className="font-mono font-semibold text-violet">{pct1(s.bench_winrate)}</div></div>
+            <a href="#s1-dyn-shadow" className="text-xs font-medium text-brand hover:underline">查看完整指标 ↓</a>
+          </div>
+        </div>
+      })}
+
+      {/* 影子在线区（2026-09-07 与退役区分开）：只看仍在采集的版本前向进展 */}
+      {analytics && (
+        <div id="s1-dyn-shadow" className="scroll-mt-4">
+        <ShadowSignalCard
+          title={`影子信号·在线采集（${activeShadowEntries.length} 版）：前向胜率 vs 回测基准 vs 保本线`}
+          entries={activeShadowEntries}
+          rows={activeShadowRows}
+          analytics={analytics}
+          load={load}
+          pumpTs={pumpTs}
+          footnote={
+            <>
+              实线=线上累计胜率；同色虚线=回测冻结胜率；同色点线=前向真实报价对应的平均保本率（没有前向报价样本时不绘制）。
+              第 11 条起复用前十色相并降为淡色细线（克制色板做不出 22 个可区分色相），表格中的版本名同步淡化以保持对应。
+              本区版本仍在采集，曲线末端=最新前向进展；「回测保本价」=冻结胜率×0.98，与前向保本率不是同一指标。
+              <br />
+              ⚠ 价格口径（2026-10-15 起标注）：本区所有 EV/胜率用的入场价都是<b>行情快照价</b>（触发当刻市场报价），
+              「护栏反算」是用<b>当前</b>护栏回算历史的反事实——两者都不是可成交价；触发当刻按 1/5/10U 询得的
+              <b>可执行报价</b>单列显示，无样本时显示「—」而不是 0。历史行（未标来源者）可能含非目标市场的窗口首采样价，仅供方向参考。
+            </>
+          }
+        />
+        </div>
+      )}
+
+        </div>
+      </details>
 
 
-      <ShadowExecutionComparisonCard data={executionComparison} unavailable={executionUnavailable} analytics={analytics} />
+
+      <ShadowExecutionComparisonCard data={executionComparison} unavailable={executionUnavailable} />
     </div>
   )
 }
