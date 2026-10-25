@@ -98,8 +98,9 @@ class PredictionMarketDataService:
         3. 将签名添加到参数中
         """
         params.setdefault("recvWindow", 60000)  # 60s 容错时钟偏差
-        # Fix #7: 使用进程级共享时钟偏差
-        params["timestamp"] = clock_sync.now_ms()
+        # Fix #7: 使用进程级共享时钟偏差；签名时间戳含安全余量（宁可落后
+        # recvWindow 容忍区间，绝不超前触发 -1021 拒收，2026-10-25 事故加固）
+        params["timestamp"] = clock_sync.signed_timestamp_ms()
         query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
         signature = hmac.new(
             self._api_secret.encode(),
@@ -116,6 +117,39 @@ class PredictionMarketDataService:
         与交易服务保持一致，避免重复请求与偏差不一致。
         """
         await clock_sync.sync_server_time()
+
+    async def _list_page(self, limit: int, offset: int) -> dict | None:
+        """拉取一页 market/list；-1021 时间戳超前时强制重校准并重试一次。
+
+        Returns:
+            页 JSON（含 marketTopics/hasMore）；失败返回 None。
+        """
+        client = self._get_client()
+        for attempt in (1, 2):
+            params = self._sign_request({"limit": limit, "offset": offset})
+            try:
+                resp = await client.get(
+                    f"{self.BASE_URL}/sapi/v1/w3w/wallet/prediction/market/list",
+                    params=params,
+                    headers={"X-MBX-APIKEY": self._api_key},
+                )
+                resp.raise_for_status()
+                return resp.json()
+            except httpx.HTTPStatusError as e:
+                if attempt == 1 and await clock_sync.heal_after_timestamp_ahead_reject(
+                    e.response.text
+                ):
+                    continue  # 时钟已重校准：重签（新时间戳）重试一次
+                logger.error(
+                    "读取预测市场数据失败 (HTTP {}): {}",
+                    e.response.status_code,
+                    e.response.text,
+                )
+                return None
+            except Exception as e:
+                logger.error("读取预测市场数据失败: {}", e)
+                return None
+        return None
 
     async def fetch_market_data(self) -> MarketQuoteData:
         """查询 5 分钟 BTC 预测市场报价（向后兼容包装，内部走 fetch_market_data_multi）。"""
@@ -157,34 +191,17 @@ class PredictionMarketDataService:
         Returns:
             dict[str, MarketQuoteData]: key 为 '5m'/'15m'；API 失败时返回空 dict。
         """
+        # 周期校准（内部 60s 节流）：采样循环每 5s 驱动本方法，共享时钟偏差
+        # 不再依赖启动单次校准（2026-10-25 事故根因：启动偏差全天未刷新）
+        await self.sync_server_time()
+
         quotes: dict[str, MarketQuoteData] = {}
         offset = 0
         limit = 100  # 官方上限 100
 
         for _page in range(5):  # 最多翻 5 页兑底
-            params = self._sign_request({
-                "limit": limit,
-                "offset": offset,
-            })
-
-            try:
-                client = self._get_client()
-                resp = await client.get(
-                    f"{self.BASE_URL}/sapi/v1/w3w/wallet/prediction/market/list",
-                    params=params,
-                    headers={"X-MBX-APIKEY": self._api_key},
-                )
-                resp.raise_for_status()
-                data = resp.json()
-            except httpx.HTTPStatusError as e:
-                logger.error(
-                    "读取预测市场数据失败 (HTTP {}): {}",
-                    e.response.status_code,
-                    e.response.text,
-                )
-                return quotes
-            except Exception as e:
-                logger.error("读取预测市场数据失败: {}", e)
+            data = await self._list_page(limit, offset)
+            if data is None:
                 return quotes
 
             page = data.get("marketTopics", [])

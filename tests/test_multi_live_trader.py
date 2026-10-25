@@ -8064,3 +8064,152 @@ async def test_wbid_record_writes_entry_quote_kind(monkeypatch) -> None:
     assert row.feature_snapshot["entry_quote_kind"] == "market_snapshot"
     assert row.entry_up_price == 0.24
     assert (WS, ) in [(k[1],) for k in det._fired] or (spec["version"], WS) in det._fired
+
+
+# ---------------------------------------------------------------------------
+# 组 12：market/list -1021 时间戳超前自愈（2026-10-25 生产事故加固）
+# 事故：启动校准偏差 +1173ms 全天未刷新，签名时间戳超前 >1s 被币安连续拒收，
+# 所有订单「未找到 token」。要求：-1021 → 强制重校准 + 重签重试一次；其他错误不重试。
+# ---------------------------------------------------------------------------
+
+
+class _SeqListClient:
+    """按序返回预设 httpx.Response 的假 market/list 客户端。"""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = 0
+        self.seen_timestamps = []
+
+    async def get(self, _url, params=None, headers=None):
+        self.calls += 1
+        self.seen_timestamps.append(params["timestamp"])
+        return self._responses.pop(0)
+
+
+def _list_url_req() -> "httpx.Request":
+    import httpx
+
+    return httpx.Request(
+        "GET", "https://api.binance.com/sapi/v1/w3w/wallet/prediction/market/list"
+    )
+
+
+def _btc_15m_topic(start_ms: int) -> dict:
+    return {
+        "chartType": "CRYPTO_UP_DOWN",
+        "symbol": "BTCUSDT",
+        "title": "Bitcoin Up or Down 15m",
+        "slug": "btc-15m",
+        "marketTopicId": 15001,
+        "startDate": start_ms,
+        "endDate": start_ms + 900_000,
+        "status": "REGISTERED",
+        "markets": [
+            {
+                "tradingStatus": "OPEN",
+                "outcomes": [
+                    {"name": "UP", "tokenId": "T-UP", "price": 0.45, "chance": 0.45},
+                    {"name": "DOWN", "tokenId": "T-DOWN", "price": 0.55, "chance": 0.55},
+                ],
+            }
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_markets_heals_and_retries_on_1021(monkeypatch):
+    import httpx
+
+    from binance_predict.services import clock_sync
+    from binance_predict.services.prediction_trading import BinancePredictionTrader
+
+    forced = []
+
+    async def _fake_sync(*, force: bool = False, **_kw):
+        forced.append(force)
+        return 0
+
+    monkeypatch.setattr(clock_sync, "sync_server_time", _fake_sync)
+
+    req = _list_url_req()
+    rejected = httpx.Response(
+        400,
+        json={
+            "code": -1021,
+            "msg": "Timestamp for this request was 1000ms ahead of the server's time.",
+        },
+        request=req,
+    )
+    # 用当前 15m 窗口起点（list_markets 末尾会清退已结束周期，过去时间会被剔除）
+    import time as _time
+
+    ws = (int(_time.time() * 1000) // 900_000) * 900_000
+    ok = httpx.Response(
+        200,
+        json={"marketTopics": [_btc_15m_topic(ws)], "hasMore": False},
+        request=req,
+    )
+    client = _SeqListClient([rejected, ok])
+
+    trader = BinancePredictionTrader()
+    trader._api_key = "k"
+    trader._api_secret = "s"
+    monkeypatch.setattr(trader, "_get_client", lambda: client)
+
+    markets = await trader.list_markets()
+
+    assert forced == [True]  # -1021 触发了一次强制重校准
+    assert client.calls == 2  # 重签后重试一次
+    assert len(markets) == 1
+    entry = trader._15m_markets[ws]
+    assert entry["up_token"] == "T-UP" and entry["down_token"] == "T-DOWN"
+
+
+@pytest.mark.asyncio
+async def test_list_markets_no_retry_on_other_error(monkeypatch):
+    import httpx
+
+    from binance_predict.services import clock_sync
+    from binance_predict.services.prediction_trading import BinancePredictionTrader
+
+    forced = []
+
+    async def _fake_sync(*, force: bool = False, **_kw):
+        forced.append(force)
+        return 0
+
+    monkeypatch.setattr(clock_sync, "sync_server_time", _fake_sync)
+
+    req = _list_url_req()
+    rejected = httpx.Response(
+        400, json={"code": -1003, "msg": "other"}, request=req
+    )
+    client = _SeqListClient([rejected])
+
+    trader = BinancePredictionTrader()
+    trader._api_key = "k"
+    trader._api_secret = "s"
+    monkeypatch.setattr(trader, "_get_client", lambda: client)
+
+    markets = await trader.list_markets()
+
+    assert forced == []  # 非 -1021 不触发自愈
+    assert client.calls == 1  # 也不重试
+    assert markets == []
+    assert trader._15m_markets == {}
+
+
+@pytest.mark.asyncio
+async def test_sign_request_timestamp_has_safety_margin(monkeypatch):
+    from binance_predict.services import clock_sync
+    from binance_predict.services.prediction_trading import BinancePredictionTrader
+
+    monkeypatch.setattr(clock_sync.time, "time", lambda: 3000.0)
+    clock_sync._time_offset_ms = 0
+
+    trader = BinancePredictionTrader()
+    trader._api_secret = "s"
+    params = trader._sign_request({"limit": 100, "offset": 0})
+
+    assert params["timestamp"] == 3_000_000 - clock_sync._AHEAD_SAFETY_MARGIN_MS

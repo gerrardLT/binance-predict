@@ -238,8 +238,9 @@ class BinancePredictionTrader:
         POST 请求请使用 _build_signed_url() 手动构建完整 URL。
         """
         params.setdefault("recvWindow", 60000)  # 60s 容错时钟偏差
-        # Fix #7: 使用进程级共享时钟偏差
-        params["timestamp"] = clock_sync.now_ms()
+        # Fix #7: 使用进程级共享时钟偏差；签名时间戳含安全余量（宁可落后
+        # recvWindow 容忍区间，绝不超前触发 -1021 拒收，2026-10-25 事故加固）
+        params["timestamp"] = clock_sync.signed_timestamp_ms()
         query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
         signature = hmac.new(
             self._api_secret.encode(),
@@ -259,7 +260,7 @@ class BinancePredictionTrader:
         """
         params.setdefault("recvWindow", 60000)
         # Fix #7: 使用进程级共享时钟偏差
-        params["timestamp"] = clock_sync.now_ms()
+        params["timestamp"] = clock_sync.signed_timestamp_ms()
         query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
         signature = hmac.new(
             self._api_secret.encode(),
@@ -989,18 +990,11 @@ class BinancePredictionTrader:
         Returns:
             (anchor_tid, fallback_tid_for_other_period) 或 None
         """
-        client = self._get_client()
         other_period = "5m" if period == "15m" else "15m"
         anchor = fallback = None
-        try:
-            signed = self._sign_request({"limit": 100, "offset": 0})
-            resp = await client.get(
-                f"{self.BASE_URL}/sapi/v1/w3w/wallet/prediction/market/list",
-                params=signed,
-                headers={"X-MBX-APIKEY": self._api_key},
-            )
-            resp.raise_for_status()
-            for m in resp.json().get("marketTopics", []):
+        data = await self._list_page(100, 0)
+        if data is not None:
+            for m in data.get("marketTopics", []):
                 if (
                     m.get("chartType") != "CRYPTO_UP_DOWN"
                     or m.get("symbol") != "BTCUSDT"
@@ -1011,8 +1005,8 @@ class BinancePredictionTrader:
                     anchor = m.get("marketTopicId")
                 elif m_period == other_period and fallback is None:
                     fallback = m.get("marketTopicId")
-        except Exception as e:
-            logger.warning(f"锚点查询失败 | period={period} | {e}")
+        else:
+            logger.warning("锚点查询失败 | period={}", period)
         return (anchor or fallback, fallback or anchor) if anchor or fallback else None
 
     async def scan_future_markets(
@@ -1569,6 +1563,42 @@ class BinancePredictionTrader:
             await asyncio.sleep(0.2)
         return None
 
+    async def _list_page(self, limit: int, offset: int) -> dict | None:
+        """拉取一页 market/list；-1021 时间戳超前时强制重校准并重试一次。
+
+        2026-10-25 生产事故：启动校准偏差 +1173ms 全天未刷新，签名时间戳
+        超前服务器 >1s 被 -1021 连续拒收，实盘订单全部「未找到 token」。
+        重试前重签（时间戳含安全余量且时钟已重校准）。
+
+        Returns:
+            页 JSON（含 marketTopics/hasMore）；失败返回 None。
+        """
+        client = self._get_client()
+        for attempt in (1, 2):
+            params = self._sign_request({"limit": limit, "offset": offset})
+            try:
+                resp = await client.get(
+                    f"{self.BASE_URL}/sapi/v1/w3w/wallet/prediction/market/list",
+                    params=params,
+                    headers={"X-MBX-APIKEY": self._api_key},
+                )
+                resp.raise_for_status()
+                return resp.json()
+            except httpx.HTTPStatusError as e:
+                if attempt == 1 and await clock_sync.heal_after_timestamp_ahead_reject(
+                    e.response.text
+                ):
+                    continue  # 时钟已重校准：重签（新时间戳）重试一次
+                logger.error(
+                    "查询预测市场失败 (HTTP {}): {}",
+                    e.response.status_code, e.response.text,
+                )
+                return None
+            except Exception as e:
+                logger.error("查询预测市场失败: {}", e)
+                return None
+        return None
+
     async def list_markets(self) -> list[dict]:
         """
         查询活跃的 BTC 预测市场
@@ -1585,28 +1615,8 @@ class BinancePredictionTrader:
         offset = 0
         limit = 100  # 官方上限 100
         for _page in range(5):  # 最多翻 5 页兑底
-            params = self._sign_request({
-                "limit": limit,
-                "offset": offset,
-            })
-
-            try:
-                client = self._get_client()
-                resp = await client.get(
-                    f"{self.BASE_URL}/sapi/v1/w3w/wallet/prediction/market/list",
-                    params=params,
-                    headers={"X-MBX-APIKEY": self._api_key},
-                )
-                resp.raise_for_status()
-                data = resp.json()
-            except httpx.HTTPStatusError as e:
-                logger.error(
-                    "查询预测市场失败 (HTTP {}): {}",
-                    e.response.status_code, e.response.text,
-                )
-                break
-            except Exception as e:
-                logger.error("查询预测市场失败: {}", e)
+            data = await self._list_page(limit, offset)
+            if data is None:
                 break
 
             page = data.get("marketTopics", [])
