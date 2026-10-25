@@ -148,6 +148,9 @@ class ExcurBidShadowDetector:
             snap["touched"] = True
             snap["touched_t_rel_s"] = t_rel
             snap["bid_level"] = BID_LEVEL
+            # 入场观察价来源口径（_quote_caliber_of 依此判定；漏写会被误标
+            # 「历史口径未知」）——有价才写，无价行不参与口径判定
+            snap["entry_quote_kind"] = "market_snapshot"
             row.feature_snapshot = snap
             row.entry_up_price = float(up_price)
             row.entry_down_price = (float(down_price)

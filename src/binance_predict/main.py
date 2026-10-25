@@ -4420,7 +4420,7 @@ SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     "wbid_d03_k2_5m_v1": (0.244, None, "窗口接盘·浅位2分钟：5m 窗内低触 open−0.3×ATR5 且首触在第 2 根 1m → 挂 0.21 买 UP（723d 回测 n=18453 胜率 24.4%，样本外 26.0% EV +3.96¢/股为假设成交上界）"),
     "wbid_d03_k3_5m_v1": (0.188, None, "窗口接盘·浅位3分钟：首触在第 3 根 → 挂 0.16（723d 回测 n=10450 胜率 18.8%，样本外 20.1% EV +3.14¢/股）"),
     "wbid_d05_k2_5m_v1": (0.174, None, "窗口接盘·深位2分钟：位面 open−0.5×ATR5、第 2 根触及 → 挂 0.14（723d 回测 n=14434 胜率 17.4%，样本外 18.9% EV +3.93¢/股）"),
-    "wbid_d03_k2_fast_5m_v1": (0.261, None, "窗口接盘·浅位急跌2分钟：浅位第 2 根触及且跌速>0.0329 → 挂 0.21（急跌子集，样本外胜率 26.1% EV +4.06¢/股）"),
+    "wbid_d03_k2_fast_5m_v1": (0.245, None, "窗口接盘·浅位急跌2分钟：浅位第 2 根触及且跌速>0.0329 → 挂 0.21（train 急跌∩k2 交叉胜率 24.5%，EXEC_SPEC S8；validation k2 全体 25.96% 属样本外口径不混用；急跌样本外 EV +4.06¢/股）"),
 }
 for _channel, _benchmark in CHANNEL_BENCHMARKS.items():
     if _channel in SHADOW_BENCH:

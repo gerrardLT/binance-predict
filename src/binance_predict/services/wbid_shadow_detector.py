@@ -213,7 +213,11 @@ class WbidShadowDetector:
                                   "atr5": round(atr5, 4),
                                   "level": round(hit["level"], 4),
                                   "open": round(open_price, 4),
-                                  "limit_price": spec["limit"]},
+                                  "limit_price": spec["limit"],
+                                  # 入场观察价来源口径（_quote_caliber_of 依此判定；
+                                  # 漏写曾使新行被误标「历史口径未知」）
+                                  **({"entry_quote_kind": "market_snapshot"}
+                                     if up is not None else {})},
                 entry_up_price=up, entry_down_price=down, entry_quote_ts=qts,
                 status="PENDING",
             ))

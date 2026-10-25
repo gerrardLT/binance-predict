@@ -7455,6 +7455,7 @@ async def test_excur_observe_sample_flow(monkeypatch) -> None:
     assert fires[0]["market_start"] == WS and fires[0]["market_end"] == WE
     assert fires[0]["direction"] == "UP"
     assert row.feature_snapshot["touched"] is True
+    assert row.feature_snapshot["entry_quote_kind"] == "market_snapshot"
     assert row.entry_up_price == 0.28 and row.entry_quote_ts == ts_touch
 
     # ③ 同窗第二次触及 → 不再触发（去重）
@@ -8001,3 +8002,65 @@ async def test_wbid_settle_pending_real_bar_fields(monkeypatch) -> None:
     assert old_backlog.status == "SETTLED" and old_backlog.win is True   # 积压补结算
     old_row = by_target[WS - 20 * 300_000]
     assert old_row.status == "EXPIRED"
+
+
+@pytest.mark.asyncio
+async def test_wbid_record_writes_entry_quote_kind(monkeypatch) -> None:
+    """wbid 落表口径回归（2026-10-25）：feature_snapshot 必须写 entry_quote_kind，
+    否则 _quote_caliber_of 把有价无 kind 的新行误判为「历史口径未知」。"""
+    import binance_predict.services.wbid_shadow_detector as wbid_mod
+    from binance_predict.services.wbid_shadow_detector import WbidShadowDetector, BAR_5M_MS
+
+    WS = 1_790_000_000_000 // BAR_5M_MS * BAR_5M_MS
+    store: dict = {"rows": [], "next_id": 1}
+
+    class _Result:
+        def __init__(self, rws):
+            self._rows = rws
+
+        def first(self):
+            for r in self._rows:
+                return (r.id,)
+            return None
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return [r for r in self._rows if r.status == "PENDING"]
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def execute(self, stmt):
+            return _Result(store["rows"])
+
+        def add(self, row):
+            row.id = store["next_id"]
+            store["next_id"] += 1
+            store["rows"].append(row)
+
+        async def commit(self):
+            return None
+
+    async def _collector(interval: str, n: int):
+        return []
+
+    def _snap(cache, t0, max_offset_ms=0):
+        return 0.24, 0.76, t0 + 5_000        # (up, down, ts)
+
+    monkeypatch.setattr(wbid_mod, "async_session_factory", lambda: _Session())
+    monkeypatch.setattr(wbid_mod, "snapshot_entry_quote", _snap)
+    det = WbidShadowDetector(collector=_collector, pm_5m_info={"start_date": WS})
+    spec = {"version": "wbid_d03_k2_5m_v1", "d": 0.3, "k": 2, "speed": None, "limit": 0.21}
+    await det._record(WS, 80000.0, 50.0,
+                      {"spec": spec, "k": 2, "speed": 0.0, "level": 79985.0})
+    assert len(store["rows"]) == 1
+    row = store["rows"][0]
+    assert row.feature_snapshot["entry_quote_kind"] == "market_snapshot"
+    assert row.entry_up_price == 0.24
+    assert (WS, ) in [(k[1],) for k in det._fired] or (spec["version"], WS) in det._fired
