@@ -3726,6 +3726,7 @@ async def test_live_performance_summary_duplicate_window_and_period_keys(monkeyp
         return rows
 
     monkeypatch.setattr(m, "_load_live_performance_orders", load)
+    _stub_unguarded_loaders(monkeypatch, [])
     monkeypatch.setattr(m, "multi_live_trader", None)
     out = await m.live_performance_summary(db=None)
     assert out["coverage"]["order_count"] == 3
@@ -3761,6 +3762,7 @@ async def test_live_performance_summary_conflict_and_empty(monkeypatch) -> None:
         return conflict
 
     monkeypatch.setattr(m, "_load_live_performance_orders", load)
+    _stub_unguarded_loaders(monkeypatch, [])
     monkeypatch.setattr(m, "multi_live_trader", None)
     out = await m.live_performance_summary(db=None)
     assert out["coverage"]["settlement_conflict_count"] == 1
@@ -3777,6 +3779,140 @@ async def test_live_performance_summary_conflict_and_empty(monkeypatch) -> None:
     assert out["portfolio"]["total_pnl"] == 0
     assert out["portfolio"]["roi"] is None
     assert out["portfolio_series"] == [] and out["channels"] == []
+    # 不带护栏口径同步为空（不抛错、不虚增分母）
+    assert out["portfolio"]["unguarded"]["n"] == 0
+    assert out["portfolio"]["unguarded"]["win_rate"] is None
+
+
+def _stub_unguarded_loaders(monkeypatch, rejected, outcomes=None) -> None:
+    """Stub 不带护栏口径的取数/回溯（端点接线测试；解析器逻辑另有专项测试）。"""
+    import binance_predict.main as m
+
+    async def load_rejected(*_args, **_kwargs):
+        return rejected
+
+    async def resolve(_db, _rejected):
+        return dict(outcomes or {}), 0
+
+    monkeypatch.setattr(m, "_load_live_guard_rejected_orders", load_rejected)
+    monkeypatch.setattr(m, "_resolve_unguarded_window_outcomes", resolve)
+
+
+@pytest.mark.asyncio
+async def test_live_performance_summary_unguarded_merges_guard_rejections(monkeypatch) -> None:
+    """不带护栏口径：护栏/白名单弃单按窗口结果并入通道与组合层胜率。"""
+    import binance_predict.main as m
+    from binance_predict.services.live_performance import GuardRejectedOrder, LiveOrder
+
+    filled = [
+        LiveOrder(id=1, channel="x4_v2", market_period="5m", window_start=1000,
+                  direction="UP", settle_outcome="UP", win=True, pnl=2,
+                  amount_in=str(10**18)),
+        LiveOrder(id=2, channel="x4_v2", market_period="5m", window_start=2000,
+                  direction="UP", settle_outcome="DOWN", win=False, pnl=-1,
+                  amount_in=str(10**18)),
+    ]
+    rejected = [
+        GuardRejectedOrder(id=3, channel="x4_v2", market_period="5m",
+                           window_start=3000, direction="UP",
+                           error_message="执行价护栏弃单 | averagePrice=0.71 >= 0.65"),
+        GuardRejectedOrder(id=4, channel="x4_v2", market_period="15m",
+                           window_start=4000, direction="DOWN",
+                           error_message="入场价白名单弃单 | averagePrice=0.44"),
+    ]
+    outcomes = {("5m", 3000): "UP", ("15m", 4000): "DOWN"}
+
+    async def load(*_args):
+        return filled
+
+    monkeypatch.setattr(m, "_load_live_performance_orders", load)
+    _stub_unguarded_loaders(monkeypatch, rejected, outcomes)
+    monkeypatch.setattr(m, "multi_live_trader", None)
+    out = await m.live_performance_summary(db=None)
+
+    by_channel = {row["channel"]: row for row in out["channels"]}
+    un = by_channel["x4_v2"]["unguarded"]
+    # 现行口径：2 成交 1 赢
+    assert un["filled_n"] == 2 and un["filled_wins"] == 1
+    assert un["filled_win_rate"] == pytest.approx(0.5)
+    # 弃单#3（UP 窗 UP）与 #4（DOWN 窗 DOWN）都会赢 → 合计 4 单 3 赢
+    assert un["rejected_n"] == 2 and un["rejected_resolved"] == 2
+    assert un["rejected_wins"] == 2 and un["rejected_losses"] == 0
+    assert un["n"] == 4 and un["wins"] == 3
+    assert un["win_rate"] == pytest.approx(0.75)
+    assert out["portfolio"]["unguarded"]["win_rate"] == pytest.approx(0.75)
+    assert out["coverage"]["guard_rejected_count"] == 2
+    assert out["coverage"]["guard_outcome_unresolved_count"] == 0
+
+
+class _UnguardedFakeResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return list(self._rows)
+
+    def scalars(self):
+        return list(self._rows)
+
+
+class _UnguardedFakeDB:
+    """按调用顺序回放 db.execute 结果（弃单窗口回溯解析器专项测试用）。"""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.statements = []
+
+    async def execute(self, stmt):
+        self.statements.append(stmt)
+        if not self._responses:
+            raise AssertionError("意外的额外 db.execute 调用")
+        return _UnguardedFakeResult(self._responses.pop(0))
+
+
+@pytest.mark.asyncio
+async def test_resolve_unguarded_window_outcomes_vote_then_sentiment_stitch() -> None:
+    """两级回溯：同窗已结算单多数票 → SentimentWindow（5m 单窗 / 15m 首尾拼价）。"""
+    import types
+
+    import binance_predict.main as m
+    from binance_predict.services.live_performance import GuardRejectedOrder
+
+    rejected = [
+        # (5m, 1000)：同窗已结算单投票 UP×2 vs DOWN×1 → UP（计 1 个冲突窗）
+        GuardRejectedOrder(channel="x4_v2", market_period="5m", window_start=1000, direction="UP"),
+        # (5m, 2000)：无同窗成交单 → SentimentWindow.outcome=DOWN
+        GuardRejectedOrder(channel="x4_v2", market_period="5m", window_start=2000, direction="DOWN"),
+        # (15m, 3000000)：无同窗成交单 → 首窗 entry=100 / 尾窗(3600000=t0+600s) exit=101.5 → UP
+        GuardRejectedOrder(channel="scene_bear_exhaust", market_period="15m",
+                           window_start=3_000_000, direction="UP"),
+        # (5m, 5000)：无任何来源 → None（不计分母）
+        GuardRejectedOrder(channel="x4_v2", market_period="5m", window_start=5000, direction="UP"),
+    ]
+    vote_rows = [("5m", 1000, "UP"), ("5m", 1000, "UP"), ("5m", 1000, "DOWN")]
+    sw_rows = [
+        types.SimpleNamespace(start_time=2000, outcome="DOWN", entry_price=1.0, exit_price=0.9),
+        types.SimpleNamespace(start_time=3_000_000, outcome=None, entry_price=100.0, exit_price=99.0),
+        types.SimpleNamespace(start_time=3_600_000, outcome=None, entry_price=101.0, exit_price=101.5),
+    ]
+    db = _UnguardedFakeDB([vote_rows, sw_rows])
+    lookup, conflicts = await m._resolve_unguarded_window_outcomes(db, rejected)
+    assert lookup[("5m", 1000)] == "UP"
+    assert lookup[("5m", 2000)] == "DOWN"
+    assert lookup[("15m", 3_000_000)] == "UP"
+    assert lookup[("5m", 5000)] is None
+    assert conflicts == 1
+    assert len(db.statements) == 2  # 投票查询 + SentimentWindow 兜底各一次
+
+
+@pytest.mark.asyncio
+async def test_resolve_unguarded_window_outcomes_empty() -> None:
+    import binance_predict.main as m
+
+    db = _UnguardedFakeDB([])
+    lookup, conflicts = await m._resolve_unguarded_window_outcomes(db, [])
+    assert lookup == {} and conflicts == 0
+    assert db.statements == []  # 空输入不打 DB
 
 
 @pytest.mark.asyncio
@@ -3807,11 +3943,13 @@ async def test_live_channel_diagnostics_validation_and_segments(monkeypatch) -> 
         return rows
 
     monkeypatch.setattr(m, "_load_live_performance_orders", load)
+    _stub_unguarded_loaders(monkeypatch, [])
     monkeypatch.setattr(m, "multi_live_trader", None)
     quote = await m.live_channel_diagnostics(channel="x4_v2", segment_by="quote", db=None)
     assert {row["segment"] for row in quote["segments"]} == {"<0.30", "LEGACY_UNKNOWN"}
     assert quote["series"][0]["t"] == 1000
     assert quote["series"][0]["pnl"] == 1 and quote["series"][0]["cost"] == 1
+    assert quote["unguarded"]["n"] == 2 and quote["unguarded"]["rejected_n"] == 0
     exec_price = await m.live_channel_diagnostics(
         channel="x4_v2", segment_by="exec_price", db=None)
     assert {row["segment"] for row in exec_price["segments"]} == {

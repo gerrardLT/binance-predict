@@ -138,6 +138,91 @@ def normalize_order(order: LiveOrder) -> dict[str, Any]:
     return result
 
 
+# ------------------------------------------------------------------
+# Unguarded win rate（不带护栏口径，2026-10-26）
+# ------------------------------------------------------------------
+# 现行实盘胜率只统计过了护栏并成交的单（win IS NOT NULL 的 FILLED 行），
+# 与回测（无执行护栏、每个触发都计）不可比。本口径把「执行价护栏弃单 /
+# 入场价白名单弃单（含重试变体）」按窗口结果判输赢并入分母，供与回测
+# 胜率对照。余额预检/报价失败/FOK 等运营失败不是价格护栏，不计入。
+
+GUARD_REJECT_MARKERS = ("护栏弃单", "白名单弃单")
+
+
+@dataclass(frozen=True)
+class GuardRejectedOrder:
+    """Price-guard rejected firing（信号触发、有报价、被护栏拦下未提交币安）。"""
+
+    id: int | str | None = None
+    channel: str | None = None
+    market_period: str | None = None
+    window_start: int | None = None
+    direction: str | None = None
+    error_message: str | None = None
+
+
+def is_price_guard_rejection(error_message: str | None) -> bool:
+    """护栏/白名单弃单判定（含重试变体）；余额预检/报价失败等返回 False。"""
+    message = str(error_message or "")
+    return any(marker in message for marker in GUARD_REJECT_MARKERS)
+
+
+def unguarded_window_key(order: GuardRejectedOrder) -> tuple[str, int] | None:
+    period = order.market_period if order.market_period in ("5m", "15m") else "5m"
+    if order.window_start is None:
+        return None
+    return (period, int(order.window_start))
+
+
+def unguarded_summary(
+    filled_orders: Iterable[LiveOrder],
+    rejected_orders: Iterable[GuardRejectedOrder],
+    window_outcomes: Mapping[tuple[str, int], str | None],
+) -> dict[str, Any]:
+    """不带护栏胜率：成交单（现行口径）+ 弃单按窗口结果判输赢。
+
+    window_outcomes 由调用方回溯（同窗已结算单 → SentimentWindow 拼价），
+    key=unguarded_window_key。UP/DOWN 计入分母；NOISE 与未知结果不计
+    （与现行 FILLED 口径的 win IS NOT NULL 过滤对齐）。
+    """
+    filled = [order for order in filled_orders if order.win is not None]
+    filled_wins = sum(bool(order.win) for order in filled)
+    rejected = list(rejected_orders)
+    rejected_wins = rejected_losses = rejected_noise = rejected_unresolved = 0
+    for order in rejected:
+        key = unguarded_window_key(order)
+        outcome = window_outcomes.get(key) if key is not None else None
+        if outcome in ("UP", "DOWN"):
+            if order.direction == outcome:
+                rejected_wins += 1
+            else:
+                rejected_losses += 1
+        elif outcome == "NOISE":
+            rejected_noise += 1
+        else:
+            rejected_unresolved += 1
+    resolved = rejected_wins + rejected_losses
+    n = len(filled) + resolved
+    wins = filled_wins + rejected_wins
+    return {
+        # 现行带护栏口径（成交且已结算输赢）
+        "filled_n": len(filled),
+        "filled_wins": filled_wins,
+        "filled_win_rate": (filled_wins / len(filled)) if filled else None,
+        # 弃单按窗口结果回溯
+        "rejected_n": len(rejected),
+        "rejected_resolved": resolved,
+        "rejected_wins": rejected_wins,
+        "rejected_losses": rejected_losses,
+        "rejected_noise": rejected_noise,
+        "rejected_unresolved": rejected_unresolved,
+        # 合计（与回测同口径的分母）
+        "n": n,
+        "wins": wins,
+        "win_rate": (wins / n) if n else None,
+    }
+
+
 def rolling_binary_stats(values: Iterable[bool | None], windows: tuple[int, ...] = (20, 50)) -> dict[str, Any]:
     valid = [bool(value) for value in values if value is not None]
     result: dict[str, Any] = {}

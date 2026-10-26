@@ -105,14 +105,18 @@ from .services.order_context_recorder import recorder as order_context_recorder
 from .services.attribution_engine import engine as attribution_engine
 from .services.attribution_engine import AttributionEngine
 from .services.live_performance import (
+    GuardRejectedOrder,
     LiveOrder,
     actual_cost,
     analyze_live_performance,
     break_even,
     channel_series,
+    is_price_guard_rejection,
     portfolio_window_series,
     segment_orders,
     signal_truth,
+    unguarded_summary,
+    unguarded_window_key,
 )
 
 # ============================================================
@@ -3114,6 +3118,141 @@ async def _load_live_performance_orders(
     return out
 
 
+# ============================================================
+# 不带护栏口径（2026-10-26）：护栏/白名单弃单按窗口结果判输赢并入胜率
+# ============================================================
+
+async def _load_live_guard_rejected_orders(
+    db: AsyncSession, from_ms: int, to_ms: int, channels: list[str],
+) -> list[GuardRejectedOrder]:
+    """加载价格护栏/白名单弃单行（status=FAILED，未提交币安）。
+
+    余额预检/获取报价失败/FOK 未成交等运营失败不是价格护栏，
+    is_price_guard_rejection 按 error_message 判定后不计入。
+    """
+    from sqlalchemy import select as sa_select
+
+    from .db.models import TradeOrderModel
+
+    stmt = sa_select(
+        TradeOrderModel.id, TradeOrderModel.signal_version,
+        TradeOrderModel.market_period, TradeOrderModel.window_start,
+        TradeOrderModel.direction, TradeOrderModel.error_message,
+    ).where(
+        TradeOrderModel.signal_version.in_(channels),
+        TradeOrderModel.status == "FAILED",
+        TradeOrderModel.direction.isnot(None),
+        TradeOrderModel.window_start.isnot(None),
+    )
+    if from_ms:
+        stmt = stmt.where(TradeOrderModel.window_start >= from_ms)
+    if to_ms:
+        stmt = stmt.where(TradeOrderModel.window_start <= to_ms)
+    rows = (await db.execute(stmt.order_by(TradeOrderModel.window_start.asc()))).all()
+    return [
+        GuardRejectedOrder(
+            id=row[0], channel=row[1], market_period=row[2],
+            window_start=int(row[3]), direction=row[4], error_message=row[5],
+        )
+        for row in rows if is_price_guard_rejection(row[5])
+    ]
+
+
+async def _resolve_unguarded_window_outcomes(
+    db: AsyncSession, rejected: list[GuardRejectedOrder],
+) -> tuple[dict[tuple[str, int], str | None], int]:
+    """回溯弃单窗口结果：(period, window_start) → UP/DOWN/NOISE/None。
+
+    结算源两级（只读不落库，与 TradeSettler 同思路）：
+    1. 同窗任一通道已结算 FILLED 单的 settle_outcome（官方结算优先写入，
+       与现行胜率口径同源）；同窗结果冲突时取多数，平票偏向 UP/DOWN。
+    2. SentimentWindow：5m 用单窗 outcome；15m 用首（t0 entry）尾
+       （t0+600s exit）两个 5m 窗拼价（与手动 15m 单结算同口径）。
+    都查不到 → None（窗口太新归档未到/历史缺失，不计入分母）。
+    """
+    from sqlalchemy import select as sa_select
+
+    from .db.models import SentimentWindow, TradeOrderModel
+
+    def _to_float(value) -> float | None:
+        try:
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    keys = {unguarded_window_key(order) for order in rejected}
+    keys.discard(None)
+    if not keys:
+        return {}, 0
+
+    lookup: dict[tuple[str, int], str | None] = {}
+    conflicts = 0
+    # 1) 同窗已结算 FILLED 单（不限定通道：同窗任何成交单的结算结果都可用）
+    windows = sorted({ws for _, ws in keys})
+    votes: dict[tuple[str, int], dict[str, int]] = {}
+    for chunk_start in range(0, len(windows), 500):
+        chunk = windows[chunk_start:chunk_start + 500]
+        stmt = sa_select(
+            TradeOrderModel.market_period, TradeOrderModel.window_start,
+            TradeOrderModel.settle_outcome,
+        ).where(
+            TradeOrderModel.status == "FILLED",
+            TradeOrderModel.settle_outcome.in_(("UP", "DOWN", "NOISE")),
+            TradeOrderModel.window_start.in_(chunk),
+        )
+        for period, ws, outcome in (await db.execute(stmt)).all():
+            period = period if period in ("5m", "15m") else "5m"
+            key = (period, int(ws))
+            votes.setdefault(key, {})
+            votes[key][outcome] = votes[key].get(outcome, 0) + 1
+    for key, counter in votes.items():
+        if key not in keys or not counter:
+            continue
+        if len(counter) > 1:
+            conflicts += 1
+            # 多数票；平票时 UP/DOWN 优先于 NOISE（结果性结算先于平盘）
+            best = max(counter.items(), key=lambda kv: (kv[1], kv[0] in ("UP", "DOWN")))
+            lookup[key] = best[0]
+        else:
+            lookup[key] = next(iter(counter))
+
+    # 2) SentimentWindow 拼价兜底
+    pending = [key for key in keys if key not in lookup]
+    if pending:
+        starts = set()
+        for period, ws in pending:
+            starts.add(ws)
+            if period == "15m":
+                starts.add(ws + 600_000)
+        sw: dict[int, SentimentWindow] = {}
+        starts_sorted = sorted(starts)
+        for chunk_start in range(0, len(starts_sorted), 500):
+            chunk = starts_sorted[chunk_start:chunk_start + 500]
+            stmt = sa_select(SentimentWindow).where(
+                SentimentWindow.start_time.in_(chunk))
+            for row in (await db.execute(stmt)).scalars():
+                sw[int(row.start_time)] = row
+        for period, ws in pending:
+            if period == "15m":
+                first, last = sw.get(ws), sw.get(ws + 600_000)
+                entry = _to_float(first.entry_price) if first is not None else None
+                exit_ = _to_float(last.exit_price) if last is not None else None
+                if entry is None or exit_ is None:
+                    lookup[(period, ws)] = None
+                elif exit_ > entry:
+                    lookup[(period, ws)] = "UP"
+                elif exit_ < entry:
+                    lookup[(period, ws)] = "DOWN"
+                else:
+                    lookup[(period, ws)] = "NOISE"
+            else:
+                row = sw.get(ws)
+                outcome = row.outcome if row is not None else None
+                lookup[(period, ws)] = (
+                    outcome if outcome in ("UP", "DOWN", "NOISE") else None)
+    return lookup, conflicts
+
+
 @app.get("/api/live/performance-summary")
 async def live_performance_summary(
     from_ms: int = 0, to_ms: int = 0, only_enabled: bool = False,
@@ -3125,6 +3264,18 @@ async def live_performance_summary(
     selected = [channel for channel in LIVE_CHANNELS
                 if not only_enabled or bool(meta[channel].get("enabled"))]
     orders = await _load_live_performance_orders(db, from_ms, to_ms, selected)
+    # 不带护栏口径：护栏/白名单弃单按窗口结果判输赢并入（只读回溯，不改弃单行）
+    rejected_orders = await _load_live_guard_rejected_orders(db, from_ms, to_ms, selected)
+    outcome_lookup, outcome_conflicts = await _resolve_unguarded_window_outcomes(
+        db, rejected_orders)
+    unguarded_by_channel = {
+        channel: unguarded_summary(
+            [row for row in orders if row.channel == channel],
+            [row for row in rejected_orders if row.channel == channel],
+            outcome_lookup,
+        )
+        for channel in selected
+    }
     report = analyze_live_performance(orders, include_channel_series=False)
     windows = report["windows"]
     costs = [cost for row in orders if (cost := actual_cost(row)) is not None]
@@ -3168,6 +3319,7 @@ async def live_performance_summary(
                                     "ratio": len(channel_be) / len(rows)},
             "signal_truth": signal_truth(rows),
             "max_exec_price": m.get("max_exec_price"),
+            "unguarded": unguarded_by_channel[channel],
         })
     channels_out.sort(key=lambda row: row["total_pnl"], reverse=True)
     window_wins = [row["window_win"] for row in windows]
@@ -3183,6 +3335,10 @@ async def live_performance_summary(
             "break_even_available_count": len(available_be),
             "assessment_linked_count": sum(row.assessment_id is not None for row in orders),
             "is_truncated": False,
+            "guard_rejected_count": len(rejected_orders),
+            "guard_outcome_unresolved_count": sum(
+                row["rejected_unresolved"] for row in unguarded_by_channel.values()),
+            "guard_outcome_conflict_count": outcome_conflicts,
         },
         "portfolio": {
             "total_cost": total_cost, "total_pnl": total_pnl,
@@ -3196,6 +3352,7 @@ async def live_performance_summary(
             },
             "rolling_realized_ev": report["rolling_realized_ev"],
             "signal_truth": signal_truth(orders),
+            "unguarded": unguarded_summary(orders, rejected_orders, outcome_lookup),
             "quote_edge": {
                 "display_name": "样本命中减保本率",
                 "metric_semantics": "realized_outcome_minus_break_even_probability",
@@ -3210,6 +3367,8 @@ async def live_performance_summary(
         "warnings": [
             "P0 quote_edge 是 realized_outcome_minus_break_even_probability 描述指标，不是 calibration metric。",
             "部署与 regime 事实未捕获时统一返回 LEGACY_UNKNOWN。",
+            "不带护栏口径：护栏/白名单弃单按窗口结果判输赢并入（NOISE 与未回溯窗口不计分母）；"
+            "窗口结果优先复用同窗已结算单、回退 5m 窗拼价，与官方 Chainlink 结算在约 1% 微幅窗口可能不一致。",
         ],
     }
 
@@ -3227,6 +3386,8 @@ async def live_channel_diagnostics(
         raise HTTPException(status_code=422, detail=f"不支持的分桶维度: {segment_by}")
     meta = await _live_channel_meta()
     orders = await _load_live_performance_orders(db, from_ms, to_ms, [channel])
+    rejected_orders = await _load_live_guard_rejected_orders(db, from_ms, to_ms, [channel])
+    outcome_lookup, _ = await _resolve_unguarded_window_outcomes(db, rejected_orders)
     available_be = sum(break_even(row)["break_even_probability"] is not None for row in orders)
     m = meta[channel]
     return {
@@ -3241,6 +3402,7 @@ async def live_channel_diagnostics(
                     "max_exec_price": m.get("max_exec_price")},
         "benchmark": benchmark_dict(channel),
         "signal_truth": signal_truth(orders),
+        "unguarded": unguarded_summary(orders, rejected_orders, outcome_lookup),
         "coverage": {"order_count": len(orders), "break_even_available_count": available_be,
                      "assessment_linked_count": sum(row.assessment_id is not None for row in orders),
                      "is_truncated": False},

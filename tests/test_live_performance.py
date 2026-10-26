@@ -16,6 +16,8 @@ from binance_predict.services.live_performance import (
     rolling_binary_stats,
     rolling_realized_ev,
     segment_orders,
+    unguarded_summary,
+    unguarded_window_key,
 )
 
 
@@ -443,3 +445,78 @@ def test_channel_series_exposes_rolling_signal_ev():
     assert sig20["signal_ev"] == pytest.approx((0.96 * 10 - 10) / 20)
     assert last["rolling_realized_ev"]["20"]["realized_ev"] < sig20["signal_ev"]
     assert last["unit_return"] == pytest.approx(-1.0)
+
+
+# ------------------------------------------------------------------
+# 不带护栏口径（2026-10-26）：护栏/白名单弃单按窗口结果判输赢
+# ------------------------------------------------------------------
+
+def _rejected(window_start, direction="UP", market_period="5m", message=None, channel="x4_v2"):
+    from binance_predict.services.live_performance import GuardRejectedOrder
+
+    return GuardRejectedOrder(
+        id=window_start, channel=channel, market_period=market_period,
+        window_start=window_start, direction=direction,
+        error_message=message or f"执行价护栏弃单 | averagePrice=0.71 >= 0.65",
+    )
+
+
+@pytest.mark.parametrize("message,expected", [
+    ("执行价护栏弃单 | averagePrice=0.71 >= 0.65", True),
+    ("重试执行价护栏弃单 | averagePrice=0.72", True),
+    ("入场价白名单弃单 | averagePrice=0.44 不在 [[0.5, 0.65]]", True),
+    ("重试入场价白名单弃单 | averagePrice=0.44", True),
+    ("余额预检弃单 | USDT 不足", False),
+    ("获取报价失败 | timeout", False),
+    ("币安侧订单终态 FAILED（FOK 未成交）", False),
+    (None, False),
+    ("", False),
+])
+def test_is_price_guard_rejection(message, expected):
+    from binance_predict.services.live_performance import is_price_guard_rejection
+
+    assert is_price_guard_rejection(message) is expected
+
+
+def test_unguarded_window_key_normalizes_period():
+    assert unguarded_window_key(_rejected(300_000)) == ("5m", 300_000)
+    assert unguarded_window_key(_rejected(300_000, market_period="15m")) == ("15m", 300_000)
+    # 非法/缺失周期归一为 5m（与 TradeSettler 的 or "5m" 约定一致）
+    assert unguarded_window_key(_rejected(300_000, market_period=None)) == ("5m", 300_000)
+    assert unguarded_window_key(_rejected(300_000, market_period="1h")) == ("5m", 300_000)
+
+
+def test_unguarded_summary_merges_rejected_by_window_outcome():
+    filled = [order(id=1, win=True), order(id=2, win=False)]
+    rejected = [
+        _rejected(1000, direction="UP"),    # 窗口 UP → 弃单会赢
+        _rejected(2000, direction="UP"),    # 窗口 DOWN → 弃单会输
+        _rejected(3000, direction="DOWN"),  # NOISE → 不计分母
+        _rejected(4000, direction="UP"),    # 未回溯 → 不计分母
+    ]
+    outcomes = {("5m", 1000): "UP", ("5m", 2000): "DOWN", ("5m", 3000): "NOISE"}
+    stats = unguarded_summary(filled, rejected, outcomes)
+    assert stats["filled_n"] == 2 and stats["filled_wins"] == 1
+    assert stats["filled_win_rate"] == pytest.approx(0.5)
+    assert stats["rejected_n"] == 4
+    assert stats["rejected_wins"] == 1 and stats["rejected_losses"] == 1
+    assert stats["rejected_noise"] == 1 and stats["rejected_unresolved"] == 1
+    # 分母 = 成交 2 + 可判弃单 2；赢 = 1 + 1
+    assert stats["n"] == 4 and stats["wins"] == 2
+    assert stats["win_rate"] == pytest.approx(0.5)
+
+
+def test_unguarded_summary_empty_and_winless_filled():
+    from binance_predict.services.live_performance import unguarded_summary as us
+
+    # 无成交、无弃单
+    empty = us([], [], {})
+    assert empty["n"] == 0 and empty["win_rate"] is None
+    # 只有弃单：全部可判时胜率只由弃单决定
+    only_rejected = us([], [_rejected(1000, direction="DOWN")], {("5m", 1000): "DOWN"})
+    assert only_rejected["n"] == 1 and only_rejected["wins"] == 1
+    assert only_rejected["win_rate"] == pytest.approx(1.0)
+    # 成交单 win=None（EXPIRED/NOISE 行）不入分母，与现行口径一致
+    filled_unknown = [order(id=1, win=None)]
+    stats = us(filled_unknown, [], {})
+    assert stats["filled_n"] == 0 and stats["n"] == 0 and stats["win_rate"] is None
