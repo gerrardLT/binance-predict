@@ -3285,7 +3285,7 @@ function ChartDrawer({ orders }: { orders: Record<string, unknown>[] }) {
       )}
 
       <div
-        className={`fixed top-0 right-0 h-screen w-[760px] max-w-[94vw] bg-card border-l border-line z-50 flex flex-col transition-transform duration-300 ${open ? 'translate-x-0' : 'translate-x-full'}`}
+        className={`fixed top-0 right-0 h-screen w-[1040px] max-w-[96vw] bg-card border-l border-line z-50 flex flex-col transition-transform duration-300 ${open ? 'translate-x-0' : 'translate-x-full'}`}
       >
         <div className="px-4 py-2.5 border-b border-line bg-card flex items-center justify-between shrink-0 gap-2">
           <div className="flex items-center gap-2">
