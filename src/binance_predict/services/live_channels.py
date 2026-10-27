@@ -598,6 +598,27 @@ LIVE_CHANNELS["excur_bid30_15m_v1"] = ChannelSpec(
     "布防接盘·前跌贴低买UP（0.30档）",
 )
 
+# ---------------------------------------------------------------------------
+# cic 反向格（2026-10-27 注册，研究链 20261027T005754Z-5m-intra-structure →
+# 20261027T020848Z-intra-progress-direction → 20261027T023421Z-15m-book-cell-pricing
+# → 20261027T025526Z-cell-factor-buckets，含 ERRATUM 量纲修正 v1.2）：
+# 15m 窗口第 8 分钟（+483.5s 决策，每窗一次）窗口已走方向与首 5m 桶方向相反
+# （已跌+首桶阳→押UP / 已涨+首桶阴→押DOWN，方向由信号动态决定），叠加两过滤器：
+#   z1 = |cum_bps| / vol24_5m < 0.5（浅跌/浅涨；深跌格 EV −0.048 为陷阱必须剔除）
+#   eff = |P8−Popen| / path8 < 0.1878（无量纲前缀效率人口中位，震荡跌≠单边阴跌）
+# 押逆窗口惯性侧，市价单，护栏 0.45（含贴线弃单；v1.2 SIGNAL_SPEC 冻结）。
+# EV 依据（2y 人口 n=14,399 格子 + 本地 PREDEXON 盘口样本 n=130）：精筛子集人口
+# 胜率 41.4%/同期 43.5%、盘口样本胜率 53.1%、一档均价 0.436、EV +0.095/份，
+# 分月 07/08/09/10 全正（+0.086/+0.014/+0.149/+0.101）。⚠ 统计显著性未达成，
+# 影子前向验证 ≥60 天为实盘晋级必要条件。检测器 cic_shadow_detector 落
+# kline_shadow_signals（每反向格窗口一行，含被过滤器否决的格子），实盘钩子
+# MultiLiveTrader.on_cic_signal。default_enabled=False（默认不开火）。
+# ⚠ 并入 S2 互斥组：押 UP 侧与 S2/excur 同为「跌后买 UP」族，防同窗双倍 UP 敞口。
+LIVE_CHANNELS["cic_shallow_15m_v1"] = ChannelSpec(
+    "cic_shallow_15m_v1", "cic", "15m", "UP", 0.45,
+    "反向格·浅跌震荡逆转（第8分钟）",
+)
+
 
 # ---------------------------------------------------------------------------
 # 已退役通道（2026-09-04 用户拍板「信号直接不要了」）：不在 LIVE_CHANNELS
@@ -719,6 +740,8 @@ KEPT_CHANNELS_20261022: frozenset[str] = frozenset({
     "wbid_d03_k2_fast_5m_v1",
     # excur 布防接盘（2026-10-24 注册，default_enabled=False）
     "excur_bid30_15m_v1",
+    # cic 反向格（2026-10-27 注册，default_enabled=False）
+    "cic_shallow_15m_v1",
     # firsthit D/E（实盘 ON，观察期）
     "firsthit_down_chg35_d_v1", "firsthit_down_chg35_e_v1",
     # CRV 全族
@@ -768,7 +791,7 @@ SAME_WINDOW_EXCLUSIVE: tuple[frozenset[str], ...] = (
     # 2026-10-24 并入 excur 布防接盘：同为「空头耗尽族→同窗押 UP」，布防条件
     # （前6根深跌+贴24h低）与 S2 父事件高度重叠，防同窗双倍 UP 敞口。
     frozenset({"scene_bear_exhaust", "scene_bear_exhaust_opt_v1",
-               "excur_bid30_15m_v1"}),
+               "excur_bid30_15m_v1", "cic_shallow_15m_v1"}),
     # S2 条件单双变体同源（同一实盘 S2 事件、同一目标周期；t=4/t=5 判价高度重叠），
     # 防同事件双成交叠加敞口（2026-09-06 promote）。
     frozenset({"s2_cond_t4_v1", "s2_cond_t5d_v1"}),

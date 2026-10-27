@@ -457,6 +457,14 @@ class Settings(BaseSettings):
     # CI[+0.013,+0.081]（探索性），默认仅开影子落表；实盘通道 default_enabled=False。
     excur_shadow_enabled: bool = True
 
+    # --- 反向格影子信号（cic 族，2026-10-27）---
+    # 研究链 20261027T005754Z→020848Z→023421Z→025526Z（v1.2 量纲修正）冻结：
+    # 15m 窗口第 8 分钟反向格（已走方向与首 5m 桶相反）+ 浅跌（z1<0.5）+ 震荡
+    # （eff<0.1878）→ 押逆惯性侧。盘口样本 EV +0.095/份（分月全正，n=130，
+    # 一档上限口径）；统计显著性未达成，影子前向验证 ≥60 天后才可申请实盘开闸
+    # （通道 cic_shallow_15m_v1 default_enabled=False）。
+    cic_shadow_enabled: bool = True
+
     # --- CRV 情绪反转影子信号（crv 族，2026-10-04）---
     # 研究 run 20261004T083106Z-candle-reversal-certainty 冻结候选实时重放：
     # 15m 高位∧突破20高（盲测 63.7%）、15m 突破20高（58.5%）、15m 突破50高∧pos100>0.75

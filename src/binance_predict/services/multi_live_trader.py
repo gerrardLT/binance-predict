@@ -1757,6 +1757,28 @@ class MultiLiveTrader:
         except Exception as exc:
             logger.warning("多通道实盘：excur 钩子异常（不影响检测循环）| {}", exc)
 
+    def on_cic_signal(self, sig: dict) -> None:
+        """CicCounterInertiaShadowDetector 反向格触发钩子（同步，fire-and-forget）。
+
+        payload：{version, market_start, market_end, direction(UP|DOWN),
+        signal_bar_start, t_rel, z1, eff, touch_up, touch_down}。market = 当前
+        15m 窗口；第 8 分钟决策、市价押逆窗口惯性侧，护栏 0.45（含贴线弃单）。
+        默认 OFF（研究 v1.2 冻结，影子前向验证 ≥60 天后才可申请开闸）。
+        """
+        try:
+            channel = str(sig.get("version") or "")
+            market_start = int(sig["market_start"])
+            if not self._hook_gate(channel, "cic", market_start):
+                return
+            task = asyncio.create_task(
+                self._fire_cic(channel, sig),
+                name=f"live_cic_{channel}_{market_start}",
+            )
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+        except Exception as exc:
+            logger.warning("多通道实盘：cic 钩子异常（不影响检测循环）| {}", exc)
+
     def on_kline_reversal_signal(self, sig: dict) -> None:
         """KREV/P1/P2 新根收盘钩子；默认 OFF，启用后按冻结方向派单。"""
         self._on_kline_signal(sig, "kline_reversal")
@@ -1859,6 +1881,58 @@ class MultiLiveTrader:
             await self._after_fill(order, channel, cfg)
         except Exception as exc:
             logger.warning("多通道实盘：excur 下单任务异常 | {} | {} | {}",
+                           channel, _fmt_win(market_start), exc)
+
+    async def _fire_cic(self, channel: str, sig: dict) -> None:
+        """反向格下单任务：当前 15m 窗口市价押逆窗口惯性侧（护栏 0.45）。
+
+        方向由信号动态决定（场景A已跌+首桶阳→押UP；场景B镜像押DOWN）。
+        决策在第 8 分钟，剩余 ≥7 分钟，无 excur 式末段撤单线；仅保留排队
+        延迟兑底：进入末 60s 直接弃单（防极端滞后下市价单打在尾盘薄簿上）。
+        """
+        spec = self._specs[channel]
+        cfg = self._configs[channel]
+        market_start = int(sig["market_start"])
+        market_end = int(sig["market_end"])
+        prediction = str(sig["direction"])
+        try:
+            if time.time() * 1000 >= market_end - 60_000:
+                logger.info(
+                    "多通道实盘：{} 下单时刻剩余≤60s，弃单 | 窗口 {}",
+                    channel, _fmt_win(market_start))
+                await self._record_strategy_outcome(
+                    channel, market_start, reason="cic_late_skip",
+                    rejected=True,
+                    input_snapshot={"t_rel": sig.get("t_rel")},
+                )
+                return
+            assessment_context, proceed = await self._prepare_runtime_execution(
+                channel, market_start, prediction,
+                input_snapshot={"z1": sig.get("z1"), "eff": sig.get("eff"),
+                                "t_rel": sig.get("t_rel")},
+            )
+            if not proceed:
+                return
+            logger.info(
+                "多通道实盘开火 | {} | 反向格押 {} | 窗口 {} | t=+{}s z1={} eff={} | "
+                "金额 {} | 护栏 {}",
+                channel, prediction, _fmt_win(market_start), sig.get("t_rel"),
+                sig.get("z1"), sig.get("eff"), cfg.amount_usdt,
+                resolve_max_exec(spec, cfg))
+            order = await self._exec_with_exclusive(
+                channel,
+                prediction=prediction,
+                amount_usdt=cfg.amount_usdt,
+                signal_version=channel,
+                window_start=market_start,
+                max_exec_price=resolve_max_exec(spec, cfg),
+                market_period="15m",
+                order_type=spec.order_type,
+                assessment_context=assessment_context,
+            )
+            await self._after_fill(order, channel, cfg)
+        except Exception as exc:
+            logger.warning("多通道实盘：cic 下单任务异常 | {} | {} | {}",
                            channel, _fmt_win(market_start), exc)
 
     async def _rv_pct_at(self, window_start_ms: int) -> float | None:

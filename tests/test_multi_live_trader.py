@@ -458,13 +458,15 @@ def test_channels_registry_shape(monkeypatch) -> None:
         "kdc_s3_3up_15m_v1", "kdc_s4_3dn_15m_v1",
     }
     # 归档后：原 67 个 = 在线 26 + 归档 41（spec 全部保留，不丢历史语义）
-    # 2026-10-23 +2（hm 族）→ 28；2026-10-24 +4（wbid 族）+1（excur）→ 33
+    # 2026-10-23 +2（hm 族）→ 28；2026-10-24 +4（wbid 族）+1（excur）→ 33；
+    # 2026-10-27 +1（cic 反向格）→ 34
     assert expected_existing <= set(RETIRED_CHANNEL_SPECS) | set(LIVE_CHANNELS)
     assert set(CANDLESTICK_SIGNAL_IDS) <= set(RETIRED_CHANNEL_SPECS) | set(LIVE_CHANNELS)
     assert {"quote_momentum_v1", "quote_contrarian_v1", "x4_v1",
             "firsthit_down_g7_v1", "g7_t270_v1",
             "gap_crowd_5m_v1", "gap_crowd_15m_v1"} <= set(RETIRED_CHANNELS)
-    assert len(LIVE_CHANNELS) + len(RETIRED_CHANNELS) == 33 + 61
+    # 2026-10-27：+1（cic 反向格，默认 OFF）→ 34 + 61
+    assert len(LIVE_CHANNELS) + len(RETIRED_CHANNELS) == 34 + 61
     assert not (set(LIVE_CHANNELS) & set(RETIRED_CHANNELS))
     by = {**RETIRED_CHANNEL_SPECS, **LIVE_CHANNELS}
     # 在线通道：市场周期/方向/护栏逐项对齐
@@ -570,7 +572,7 @@ def test_channels_registry_shape(monkeypatch) -> None:
     # 2026-10-24 并入 excur 布防接盘（同窗同向 UP、布防条件与 S2 空头耗尽重叠）
     assert exclusive_group("scene_bear_exhaust") == frozenset(
         {"scene_bear_exhaust", "scene_bear_exhaust_opt_v1",
-         "excur_bid30_15m_v1"})
+         "excur_bid30_15m_v1", "cic_shallow_15m_v1"})
     assert exclusive_group("quote_contrarian_v2") is None
     assert exclusive_group("quote_momentum_v3") is None   # 退役组不参与生产判定
     assert RETIRED_SAME_WINDOW_EXCLUSIVE == (
@@ -3391,7 +3393,8 @@ def test_status_shape(monkeypatch) -> None:
     # 2026-10-23：新增 hm_quality/hm_moderate 两通道 → 69→71
     # 2026-10-24：新增 wbid 窗口内接盘四通道（默认 OFF）→ 71→75；
     # 2026-10-24：再增 excur 布防接盘一通道（默认 OFF）→ 75→76
-    assert len(s["channels"]) == 76 + len(CANDLESTICK_SIGNAL_IDS)
+    # 2026-10-27：再增 cic 反向格一通道（默认 OFF）→ 76→77
+    assert len(s["channels"]) == 77 + len(CANDLESTICK_SIGNAL_IDS)
     by = {c["channel"]: c for c in s["channels"]}
     c = by["quote_contrarian_v1"]
     assert c["enabled"] is True and c["enabled_at_startup"] is True
@@ -8351,3 +8354,255 @@ async def test_sign_request_timestamp_has_safety_margin(monkeypatch):
     params = trader._sign_request({"limit": 100, "offset": 0})
 
     assert params["timestamp"] == 3_000_000 - clock_sync._AHEAD_SAFETY_MARGIN_MS
+
+
+# ============================================================
+# 组 14：cic 反向格（15m 第 8 分钟反向格 + 浅跌/震荡过滤，2026-10-27）
+# ============================================================
+
+def test_cic_registry_defaults() -> None:
+    """cic 通道注册口径：family/市场/护栏 0.45/市价单/默认 OFF/S2 互斥组。"""
+    from binance_predict.services.live_channels import (
+        LIVE_CHANNELS, RETIRED_CHANNELS, KEPT_CHANNELS_20261022,
+        exclusive_group, ARCHIVED_CHANNELS_20261022, parse_channel_config)
+    ch = "cic_shallow_15m_v1"
+    spec = LIVE_CHANNELS.get(ch)
+    assert spec is not None, "cic 通道未注册"
+    assert spec.family == "cic" and spec.market_period == "15m"
+    assert spec.direction == "UP" and spec.order_type == "MARKET"
+    assert spec.auto_max_exec == 0.45          # v1.2 护栏（含贴线弃单）
+    assert spec.default_enabled is False       # 默认不开火
+    assert ch not in RETIRED_CHANNELS and ch not in ARCHIVED_CHANNELS_20261022
+    assert ch in KEPT_CHANNELS_20261022
+    cfgs = parse_channel_config()
+    assert cfgs[ch].enabled is False           # 解析默认 OFF
+    grp = exclusive_group(ch)
+    assert grp is not None and {"scene_bear_exhaust", "excur_bid30_15m_v1", ch} <= grp
+
+
+def test_cic_evaluate_pure() -> None:
+    """纯函数：反向格判定/过滤器严格小于/平盘无格/样本不足保守无信号。"""
+    from binance_predict.services.cic_shadow_detector import (
+        evaluate_cic8, Z1_MAX, EFF_MAX, BAR_1M_MS, BAR_15M_MS)
+
+    WS = 1_790_000_000_000 // 900_000 * 900_000
+
+    def m1(closes: list[float]) -> list[dict]:
+        return [{"open_time": WS + i * BAR_1M_MS, "open": 100.0,
+                 "high": max(closes) + 0.5, "low": min(closes) - 0.5, "close": c}
+                for i, c in enumerate(closes)]
+
+    def m5(bp: float = 30.0, n: int = 300) -> list[dict]:
+        # 每个 15m 窗口 |ret| = bp 个 bp → vol24（研究口径 15m×288）≈ bp
+        c = 100.0 * (1.0 + bp / 1e4)
+        return [{"open_time": WS - (n - i) * BAR_15M_MS, "open": 100.0,
+                 "high": max(100.0, c) + 0.1, "low": min(100.0, c) - 0.1,
+                 "close": c} for i in range(n)]
+
+    # 场景A：已跌 + 首桶阳 + 浅跌 + 震荡 → 触发押 UP
+    closes = [100.8, 100.5, 100.9, 100.6, 101.0, 100.5, 100.3, 99.9]
+    info = evaluate_cic8(m1(closes), m5(30.0), WS)
+    assert info is not None
+    assert info["cell"] == "A" and info["direction"] == "UP"
+    assert info["b0_bps"] > 0 and info["cum_bps"] < 0
+    assert info["z1"] < Z1_MAX and info["eff"] < EFF_MAX
+    assert info["filters_pass"] is True
+    # 深跌（z1 超线）→ 否决
+    deep = [100.4, 100.2, 100.5, 100.1, 100.6, 99.9, 99.6, 99.4]
+    info2 = evaluate_cic8(m1(deep), m5(10.0), WS)
+    assert info2 is not None and info2["cell"] == "A"
+    assert info2["z1"] >= Z1_MAX and info2["filters_pass"] is False
+    # 单边阴跌（eff 超线）→ 否决
+    oneside = [100.3, 100.1, 99.9, 99.8, 100.05, 99.85, 99.7, 99.6]
+    info3 = evaluate_cic8(m1(oneside), m5(60.0), WS)
+    assert info3 is not None and info3["cell"] == "A"
+    assert info3["eff"] >= EFF_MAX and info3["filters_pass"] is False
+    # 镜像场景B：已涨 + 首桶阴 → 押 DOWN
+    closes_b = [99.2, 99.5, 99.1, 99.4, 99.0, 99.5, 99.7, 100.1]
+    info4 = evaluate_cic8(m1(closes_b), m5(30.0), WS)
+    assert info4["cell"] == "B" and info4["direction"] == "DOWN"
+    assert info4["filters_pass"] is True
+    # 平盘（cum==0）→ 无格
+    flat = [100.8, 100.5, 100.9, 100.6, 101.0, 100.5, 100.2, 100.0]
+    info5 = evaluate_cic8(m1(flat), m5(30.0), WS)
+    assert info5["cell"] is None and info5["filters_pass"] is False
+    # 样本不足（1m 缺根 / 15m 不足 288）→ None 保守无信号
+    assert evaluate_cic8(m1(closes)[:6], m5(30.0), WS) is None
+    assert evaluate_cic8(m1(closes), m5(30.0, n=100), WS) is None
+
+
+@pytest.mark.asyncio
+async def test_cic_observe_sample_flow(monkeypatch) -> None:
+    """判定流：决策时刻前不判 → 第8分钟落行+触发+钩子 → 同窗去重 → 非格不落行。"""
+    import binance_predict.services.cic_shadow_detector as cic_mod
+    from binance_predict.services.cic_shadow_detector import (
+        CicCounterInertiaShadowDetector, CIC_VERSION, BAR_15M_MS,
+        DECIDE_T_REL_S)
+
+    WS = 1_790_000_000_000 // BAR_15M_MS * BAR_15M_MS
+    WE = WS + BAR_15M_MS
+
+    closes = [100.8, 100.5, 100.9, 100.6, 101.0, 100.5, 100.3, 99.9]
+    bars1 = [{"open_time": WS + i * 60_000, "open": 100.0,
+              "high": 101.5, "low": 99.5, "close": c}
+             for i, c in enumerate(closes)]
+    c5 = 100.0 * 1.003
+    bars15 = [{"open_time": WS - (300 - i) * 900_000, "open": 100.0,
+               "high": 100.4, "low": 99.9, "close": c5} for i in range(300)]
+
+    class _Collector:
+        async def fetch_recent_klines(self, interval: str, n: int):
+            if interval == "1m":
+                return bars1[-n:]
+            assert interval == "15m"
+            return bars15[-n:]
+
+    store: dict = {"rows": [], "next_id": 1}
+
+    class _Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def first(self):
+            for r in self._rows:
+                return (r.id,)
+            return None
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return [r for r in self._rows if r.status == "PENDING"]
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def execute(self, stmt):
+            return _Result(store["rows"])
+
+        async def get(self, model, rid: int):
+            for r in store["rows"]:
+                if r.id == rid:
+                    return r
+            return None
+
+        def add(self, row):
+            row.id = store["next_id"]
+            store["next_id"] += 1
+            store["rows"].append(row)
+
+        async def commit(self):
+            return None
+
+    monkeypatch.setattr(cic_mod, "async_session_factory", lambda: _Session())
+    det = CicCounterInertiaShadowDetector(collector=_Collector())
+    fires: list[dict] = []
+    det._on_live_fire = fires.append
+
+    # ① 决策时刻前（+100s）→ 完全不判
+    await det.observe_sample(WS, WE, WS + 100_000, 0.40, 0.60)
+    assert store["rows"] == [] and fires == [] and not det._evaluated
+
+    # ② 决策时刻（+483.5s 起）→ 落行 + 触发 + 钩子一次
+    ts_dec = WS + int(DECIDE_T_REL_S * 1000) + 500
+    await det.observe_sample(WS, WE, ts_dec, 0.42, 0.58)
+    assert len(store["rows"]) == 1
+    row = store["rows"][0]
+    assert row.version == CIC_VERSION and row.status == "PENDING"
+    assert row.direction == "UP"
+    assert row.feature_snapshot["cell"] == "A"
+    assert row.feature_snapshot["filters_pass"] is True
+    assert row.feature_snapshot["touched"] is True
+    assert row.entry_up_price == 0.42 and row.entry_down_price == 0.58
+    assert row.entry_quote_ts == ts_dec
+    assert len(fires) == 1
+    assert fires[0]["version"] == CIC_VERSION
+    assert fires[0]["market_start"] == WS and fires[0]["market_end"] == WE
+    assert fires[0]["direction"] == "UP"
+    assert fires[0]["touch_up"] == 0.42
+
+    # ③ 同窗后续采样 → 去重（已判定）
+    await det.observe_sample(WS, WE, WS + 500_000, 0.30, 0.70)
+    assert len(fires) == 1 and len(store["rows"]) == 1
+
+    # ④ 决策截止后（+700s）首采样 → 本窗不再判定
+    WS2 = WS + BAR_15M_MS
+    await det.observe_sample(WS2, WS2 + BAR_15M_MS, WS2 + 700_000, 0.42, 0.58)
+    assert WS2 not in det._evaluated
+
+    # ⑤ 非反向格窗口（cum 与首桶同向）→ 不落行
+    bars1_up = [{"open_time": WS2 + i * 60_000, "open": 100.0,
+                 "high": 101.5, "low": 99.5, "close": c}
+                for i, c in enumerate([100.5, 100.7, 100.4, 100.8, 101.0,
+                                       100.9, 101.1, 101.2])]
+
+    class _Collector2(_Collector):
+        async def fetch_recent_klines(self, interval: str, n: int):
+            if interval == "1m":
+                return bars1_up[-n:]
+            return await _Collector.fetch_recent_klines(self, interval, n)
+
+    det2 = CicCounterInertiaShadowDetector(collector=_Collector2())
+    await det2.observe_sample(WS2, WS2 + BAR_15M_MS,
+                              WS2 + int(DECIDE_T_REL_S * 1000), 0.42, 0.58)
+    assert WS2 in det2._evaluated
+    assert store["rows"] and all(r.signal_bar_start != WS2 for r in store["rows"])
+
+
+@pytest.mark.asyncio
+async def test_cic_live_fire_passes_market_and_guard(monkeypatch) -> None:
+    """实盘开火：透传动态方向 DOWN/15m/MARKET/护栏 0.45，signal_version=通道名。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["cic_shallow_15m_v1"])
+    now_ms = int(time.time() * 1000)
+    sig = {"version": "cic_shallow_15m_v1", "market_start": now_ms,
+           "market_end": now_ms + 900_000, "direction": "DOWN",
+           "signal_bar_start": now_ms, "t_rel": 483.5, "z1": 0.31, "eff": 0.12,
+           "touch_up": 0.58, "touch_down": 0.42}
+    t.on_cic_signal(sig)
+    await _drain(t)
+    assert len(fake.calls) == 1
+    call = fake.calls[0]
+    assert call["signal_version"] == "cic_shallow_15m_v1"
+    assert call["window_start"] == now_ms
+    assert call["prediction"] == "DOWN" and call["market_period"] == "15m"
+    assert call["order_type"] == "MARKET" and call["max_exec_price"] == 0.45
+
+
+@pytest.mark.asyncio
+async def test_cic_live_late_veto(monkeypatch) -> None:
+    """末段兜底：下单任务启动时剩余 ≤60s → 不下单并记 outcome。"""
+    from unittest.mock import AsyncMock
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["cic_shallow_15m_v1"])
+    outcomes = AsyncMock()
+    monkeypatch.setattr(t, "_record_strategy_outcome", outcomes)
+    now_ms = int(time.time() * 1000)
+    WS = now_ms // 900_000 * 900_000
+    sig = {"version": "cic_shallow_15m_v1", "market_start": WS,
+           "market_end": now_ms + 60_000, "direction": "UP",
+           "signal_bar_start": WS, "t_rel": 850.0, "z1": 0.3, "eff": 0.1,
+           "touch_up": 0.44, "touch_down": 0.56}
+    t.on_cic_signal(sig)
+    await _drain(t)
+    assert fake.calls == []
+    assert outcomes.await_count == 1
+    assert outcomes.await_args.kwargs["reason"] == "cic_late_skip"
+
+
+@pytest.mark.asyncio
+async def test_cic_disabled_channel_never_fires(monkeypatch) -> None:
+    """默认 OFF：钩子到达但通道未启用 → 不下单（影子照常落表）。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=[])
+    WS = 1_790_000_000_000
+    t.on_cic_signal({"version": "cic_shallow_15m_v1", "market_start": WS,
+                     "market_end": WS + 900_000, "direction": "UP",
+                     "signal_bar_start": WS, "t_rel": 483.5,
+                     "z1": 0.3, "eff": 0.1, "touch_up": 0.44, "touch_down": 0.56})
+    await _drain(t)
+    assert fake.calls == []

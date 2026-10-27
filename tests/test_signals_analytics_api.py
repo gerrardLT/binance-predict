@@ -546,6 +546,8 @@ async def test_analytics_empty_db() -> None:
             "wbid_d03_k2_5m_v1", "wbid_d03_k3_5m_v1",
             "wbid_d05_k2_5m_v1", "wbid_d03_k2_fast_5m_v1",
             "excur_bid30_15m_v1",
+            # 2026-10-27 cic 反向格（注册即登记）
+            "cic_shallow_15m_v1",
         }
     from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
     from binance_predict.services.live_channels import RETIRED_CHANNELS
