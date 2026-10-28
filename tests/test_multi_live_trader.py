@@ -236,7 +236,8 @@ def test_parse_defaults_all_off(monkeypatch) -> None:
     # 2026-10-23：两个新通道 default_enabled=True（用户拍板注册即开启），其余全 OFF。
     default_on = {"hm_quality_5m_v1", "hm_moderate_5m_v1"}
     assert all(c.enabled == (ch in default_on) for ch, c in cfgs.items())
-    assert all(c.amount_usdt == 2.0 for c in cfgs.values())
+    assert all(c.amount_usdt == (10.0 if ch == "prebar_dn_bull_bid30_15m_v1" else 2.0)
+               for ch, c in cfgs.items())
     assert all(c.max_daily_orders == 100 for c in cfgs.values())
     assert all(c.max_exec_price is None for c in cfgs.values())  # 缺省回落 auto
 
@@ -466,7 +467,7 @@ def test_channels_registry_shape(monkeypatch) -> None:
             "firsthit_down_g7_v1", "g7_t270_v1",
             "gap_crowd_5m_v1", "gap_crowd_15m_v1"} <= set(RETIRED_CHANNELS)
     # 2026-10-27：+1（cic 反向格，默认 OFF）→ 34 + 61
-    assert len(LIVE_CHANNELS) + len(RETIRED_CHANNELS) == 34 + 61
+    assert len(LIVE_CHANNELS) + len(RETIRED_CHANNELS) == 35 + 61
     assert not (set(LIVE_CHANNELS) & set(RETIRED_CHANNELS))
     by = {**RETIRED_CHANNEL_SPECS, **LIVE_CHANNELS}
     # 在线通道：市场周期/方向/护栏逐项对齐
@@ -572,7 +573,8 @@ def test_channels_registry_shape(monkeypatch) -> None:
     # 2026-10-24 并入 excur 布防接盘（同窗同向 UP、布防条件与 S2 空头耗尽重叠）
     assert exclusive_group("scene_bear_exhaust") == frozenset(
         {"scene_bear_exhaust", "scene_bear_exhaust_opt_v1",
-         "excur_bid30_15m_v1", "cic_shallow_15m_v1"})
+         "excur_bid30_15m_v1", "prebar_dn_bull_bid30_15m_v1",
+         "cic_shallow_15m_v1"})
     assert exclusive_group("quote_contrarian_v2") is None
     assert exclusive_group("quote_momentum_v3") is None   # 退役组不参与生产判定
     assert RETIRED_SAME_WINDOW_EXCLUSIVE == (
@@ -3394,7 +3396,7 @@ def test_status_shape(monkeypatch) -> None:
     # 2026-10-24：新增 wbid 窗口内接盘四通道（默认 OFF）→ 71→75；
     # 2026-10-24：再增 excur 布防接盘一通道（默认 OFF）→ 75→76
     # 2026-10-27：再增 cic 反向格一通道（默认 OFF）→ 76→77
-    assert len(s["channels"]) == 77 + len(CANDLESTICK_SIGNAL_IDS)
+    assert len(s["channels"]) == 78 + len(CANDLESTICK_SIGNAL_IDS)
     by = {c["channel"]: c for c in s["channels"]}
     c = by["quote_contrarian_v1"]
     assert c["enabled"] is True and c["enabled_at_startup"] is True
@@ -7663,6 +7665,37 @@ async def test_excur_live_fire_passes_market_and_guard(monkeypatch) -> None:
     assert call["window_start"] == now_ms
     assert call["prediction"] == "UP" and call["market_period"] == "15m"
     assert call["order_type"] == "MARKET" and call["max_exec_price"] == 0.31
+
+
+@pytest.mark.asyncio
+async def test_prebar_live_fire_passes_frozen_guard(monkeypatch) -> None:
+    """阶段5候选启用时复用统一 MARKET 链路，15m UP 且五档均价护栏严格为0.32。"""
+    fake = _FakeTrader()
+    channel = "prebar_dn_bull_bid30_15m_v1"
+    t = _make_trader(monkeypatch, fake, channels=[channel])
+    monkeypatch.setattr(milt, "PREBAR_LIVE_DELAY_S", 0.0)
+    ws = int(time.time() * 1000)
+    t.on_prebar_dn_bull_signal({"version": channel, "market_start": ws,
+        "market_end": ws + 900_000, "direction": "UP",
+        "signal_bar_start": ws - 900_000, "touch_price": 0.30,
+        "t_rel": 120.0, "score": 0.60})
+    await _drain(t)
+    assert len(fake.calls) == 1
+    call = fake.calls[0]
+    assert call["prediction"] == "UP" and call["market_period"] == "15m"
+    assert call["amount_usdt"] == 10.0
+    assert call["order_type"] == "MARKET" and call["max_exec_price"] == 0.32
+
+
+@pytest.mark.asyncio
+async def test_prebar_disabled_channel_never_fires(monkeypatch) -> None:
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=[])
+    ws = 1_800_000_000_000
+    t.on_prebar_dn_bull_signal({"version": "prebar_dn_bull_bid30_15m_v1",
+        "market_start": ws, "market_end": ws + 900_000, "direction": "UP"})
+    await _drain(t)
+    assert fake.calls == []
 
 
 @pytest.mark.asyncio

@@ -168,6 +168,7 @@ _VERSION_ROWS: tuple[tuple[str, SourceType, str, str, str], ...] = (
     ("wbid_d05_k2_5m_v1", SourceType.KLINE, "5m", "same_window", "row"),
     ("wbid_d03_k2_fast_5m_v1", SourceType.KLINE, "5m", "same_window", "row"),
     ("excur_bid30_15m_v1", SourceType.KLINE, "15m", "same_window", "row"),
+    ("prebar_dn_bull_bid30_15m_v1", SourceType.KLINE, "15m", "same_window", "row"),
     # 2026-10-27 cic 反向格（注册即登记，吸取 wbid/excur 漏登教训）：15m 同窗
     # 结算（第 8 分钟决策、当窗收盘结算）、K 线源、按行 direction 判定。
     ("cic_shallow_15m_v1", SourceType.KLINE, "15m", "same_window", "row"),

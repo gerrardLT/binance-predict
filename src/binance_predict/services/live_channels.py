@@ -104,6 +104,7 @@ class ChannelSpec:
     # 仍可被 LIVE_CHANNELS_JSON / DB live_channel_overrides 覆盖关闭。仅用于用户明确
     # 要求"注册即开启"的通道；既有通道保持 False，行为零变化。
     default_enabled: bool = False
+    default_amount_usdt: float | None = None  # None=全局默认；冻结金额候选可显式指定
 
 
 def _qe_guard(version: str) -> float:
@@ -598,6 +599,14 @@ LIVE_CHANNELS["excur_bid30_15m_v1"] = ChannelSpec(
     "布防接盘·前跌贴低买UP（0.30档）",
 )
 
+# 阶段5候选（2026-10-28）：上一根15m及更早44维HGB评分命中后，只观察
+# 目标窗前300秒；UP展示价首次≤0.30时触发MARKET单，真实五档执行均价须<0.32
+# （prediction_trading 护栏含贴线弃单）。研究月份已污染，故影子、实盘皆默认OFF。
+LIVE_CHANNELS["prebar_dn_bull_bid30_15m_v1"] = ChannelSpec(
+    "prebar_dn_bull_bid30_15m_v1", "prebar_dn_bull", "15m", "UP", 0.32,
+    "阶段5前根长下影候选·前5分钟低吸UP", default_amount_usdt=10.0,
+)
+
 # ---------------------------------------------------------------------------
 # cic 反向格（2026-10-27 注册，研究链 20261027T005754Z-5m-intra-structure →
 # 20261027T020848Z-intra-progress-direction → 20261027T023421Z-15m-book-cell-pricing
@@ -738,8 +747,8 @@ KEPT_CHANNELS_20261022: frozenset[str] = frozenset({
     # wbid 窗口内深价接盘（2026-10-24 注册，default_enabled=False）
     "wbid_d03_k2_5m_v1", "wbid_d03_k3_5m_v1", "wbid_d05_k2_5m_v1",
     "wbid_d03_k2_fast_5m_v1",
-    # excur 布防接盘（2026-10-24 注册，default_enabled=False）
-    "excur_bid30_15m_v1",
+    # excur / 阶段5深价候选（default_enabled=False）
+    "excur_bid30_15m_v1", "prebar_dn_bull_bid30_15m_v1",
     # cic 反向格（2026-10-27 注册，default_enabled=False）
     "cic_shallow_15m_v1",
     # firsthit D/E（实盘 ON，观察期）
@@ -791,7 +800,8 @@ SAME_WINDOW_EXCLUSIVE: tuple[frozenset[str], ...] = (
     # 2026-10-24 并入 excur 布防接盘：同为「空头耗尽族→同窗押 UP」，布防条件
     # （前6根深跌+贴24h低）与 S2 父事件高度重叠，防同窗双倍 UP 敞口。
     frozenset({"scene_bear_exhaust", "scene_bear_exhaust_opt_v1",
-               "excur_bid30_15m_v1", "cic_shallow_15m_v1"}),
+               "excur_bid30_15m_v1", "prebar_dn_bull_bid30_15m_v1",
+               "cic_shallow_15m_v1"}),
     # S2 条件单双变体同源（同一实盘 S2 事件、同一目标周期；t=4/t=5 判价高度重叠），
     # 防同事件双成交叠加敞口（2026-09-06 promote）。
     frozenset({"s2_cond_t4_v1", "s2_cond_t5d_v1"}),
@@ -872,7 +882,9 @@ def parse_channel_config() -> dict[str, ChannelConfig]:
     configs: dict[str, ChannelConfig] = {
         ch: ChannelConfig(
             enabled=spec.default_enabled,
-            amount_usdt=settings.live_default_amount_usdt,
+            amount_usdt=(spec.default_amount_usdt
+                         if spec.default_amount_usdt is not None
+                         else settings.live_default_amount_usdt),
             max_daily_orders=settings.live_default_max_daily_orders,
         )
         for ch, spec in LIVE_CHANNELS.items()

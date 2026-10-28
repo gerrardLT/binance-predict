@@ -126,6 +126,7 @@ X4_RECENT_WINDOW_MS = 10 * 60 * 1000  # 只看近期 PENDING（更早的已无�
 V3_PREV_RETRY_DELAY_S = 30.0        # 前窗未归档延迟重查（归档在边界+15s，相位抖动余量）
 REGIME_RETRY_DELAY_S = 30.0         # v4 ret24 K 线拉取失败延迟重查（重试后窗内仍可下单）
 STREAK_RETRY_DELAY_S = 5.0          # v3 非连涨 15m K 线拉取失败延迟重查（末收根已归档，短等即可）
+PREBAR_LIVE_DELAY_S = 1.0           # 阶段5冻结执行：触价后延迟1秒再按全深度报价
 S5_DEEP_CHANNEL = "s5_deep_z20_v1"  # 与 fake_breakout_detector.S5_DEEP_VERSION 同名（对账对齐）
 S1_DYNAMIC_CHANNEL = "s1_dyn_sq_v1"  # 与 fake_breakout_detector.S1_DYNAMIC_VERSION 同名
 # S4/S1 派生入场变体通道（与 s4_variant_shadow_detector.LIVE_VARIANT_VERSIONS 同名）：
@@ -1756,6 +1757,27 @@ class MultiLiveTrader:
             task.add_done_callback(self._tasks.discard)
         except Exception as exc:
             logger.warning("多通道实盘：excur 钩子异常（不影响检测循环）| {}", exc)
+
+    def on_prebar_dn_bull_signal(self, sig: dict) -> None:
+        """阶段5评分+前5分钟0.30触价钩子；默认OFF，延迟1秒后MARKET护栏0.32。"""
+        try:
+            channel = str(sig.get("version") or "")
+            market_start = int(sig["market_start"])
+            if not self._hook_gate(channel, "prebar_dn_bull", market_start):
+                return
+            task = asyncio.create_task(
+                self._fire_prebar_dn_bull(channel, sig),
+                name=f"live_prebar_dn_bull_{market_start}",
+            )
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+        except Exception as exc:
+            logger.warning("多通道实盘：阶段5钩子异常（不影响影子采集）| {}", exc)
+
+    async def _fire_prebar_dn_bull(self, channel: str, sig: dict) -> None:
+        """冻结执行：触价后1秒、10 USDT（spec默认）、MARKET五档VWAP严格<0.32。"""
+        await asyncio.sleep(PREBAR_LIVE_DELAY_S)
+        await self._fire_nextbar(channel, sig)
 
     def on_cic_signal(self, sig: dict) -> None:
         """CicCounterInertiaShadowDetector 反向格触发钩子（同步，fire-and-forget）。

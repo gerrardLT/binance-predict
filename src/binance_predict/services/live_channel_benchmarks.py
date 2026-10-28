@@ -62,6 +62,7 @@ _FROZEN_BENCHMARKS: dict[str, tuple[float, int | None]] = {
     # 2026-10-23：720d 纯 K 线次根反转基准（quality n=28/78.6%，moderate n=184/64.1%）。
     "hm_quality_5m_v1": (0.786, 28),
     "hm_moderate_5m_v1": (0.641, 184),
+    "prebar_dn_bull_bid30_15m_v1": (0.3537, 147),
     # gap_crowd 两版（2026-10-10 注册后同日证伪退役）：基准点估计系报价对不一致
     # 伪迹，不作为冻结基准登记（退役后本字典项也会被 LIVE_CHANNELS 过滤掉）。
     **{channel: (win_rate, sample_size)

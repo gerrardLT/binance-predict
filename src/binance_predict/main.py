@@ -83,6 +83,7 @@ from .services.multi_live_trader import MultiLiveTrader
 from .services.nextbar_shadow_detector import NextbarShadowDetector
 from .services.wbid_shadow_detector import WbidShadowDetector
 from .services.excur_shadow_detector import ExcurBidShadowDetector
+from .services.prebar_dn_bull_detector import PrebarDnBullDetector
 from .services.cic_shadow_detector import CicCounterInertiaShadowDetector
 from .services.quote_edge_detector import QuoteEdgeDetector
 from .services.reversal_shadow_detector import ReversalShadowDetector
@@ -212,6 +213,8 @@ nextbar_shadow_detector: NextbarShadowDetector | None = None
 wbid_shadow_detector: WbidShadowDetector | None = None
 # 布防接盘影子检测器全局实例（excur 族：15m 布防+报价触发，影子落表 + 实盘默认 OFF）
 excur_shadow_detector: ExcurBidShadowDetector | None = None
+# 阶段5候选：前根HGB命中 + 当前15m前5分钟UP≤0.30；影子/实盘均默认 OFF。
+prebar_dn_bull_detector: PrebarDnBullDetector | None = None
 # 反向格影子检测器全局实例（cic 族：15m 第8分钟反向格，影子落表 + 实盘默认 OFF）
 cic_shadow_detector: CicCounterInertiaShadowDetector | None = None
 
@@ -368,6 +371,15 @@ async def _handle_15m_quote(quote_15m, ts_ms: int, *, persist: bool) -> None:
                 quote_15m.up_price, quote_15m.down_price)
         except Exception as e:
             logger.warning("excur 布防接盘判定异常: {}", e)
+    # 阶段5前根评分 + 当前窗前5分钟0.30触价；shadow gate 默认关闭。
+    if (prebar_dn_bull_detector is not None
+            and quote_15m.start_date and quote_15m.end_date):
+        try:
+            await prebar_dn_bull_detector.observe_sample(
+                int(quote_15m.start_date), int(quote_15m.end_date), ts_ms,
+                quote_15m.up_price, quote_15m.down_price)
+        except Exception as e:
+            logger.warning("阶段5候选判定异常: {}", e)
     # cic 反向格（15m 窗口第 8 分钟决策，每窗一次；仅 tracker 对齐采样路径，
     # 与研究 +483.5s 快照口径一致；边界加速路径 persist=False 不参与）。
     if (cic_shadow_detector is not None
@@ -1317,6 +1329,14 @@ async def lifespan(app: FastAPI):
         await excur_shadow_detector.start()
         logger.info("excur 布防接盘检测器已启动（15m 布防+0.30 触发；影子落表 + 实盘默认 OFF）")
 
+    # 阶段5候选（2026-10-28）：冻结HGB评分命中后，当前窗前300秒UP≤0.30。
+    # detector 始终装配以支持运行时开闸；shadow_gate 无覆盖时默认关闭，实盘亦默认OFF。
+    global prebar_dn_bull_detector
+    prebar_dn_bull_detector = PrebarDnBullDetector(collector)
+    if multi_live_trader is not None:
+        prebar_dn_bull_detector._on_live_fire = multi_live_trader.on_prebar_dn_bull_signal
+    await prebar_dn_bull_detector.start()
+
     # cic 反向格（2026-10-27）：15m 窗口第 8 分钟（+483.5s）反向格 + 浅跌 + 震荡
     # 过滤 → 押逆窗口惯性侧（方向动态 UP/DOWN），影子落表 + 实盘钩子
     # （通道 default_enabled=False，默认不开火；钩子在 start() 前注入，同 excur 契约）。
@@ -1647,6 +1667,8 @@ async def lifespan(app: FastAPI):
         await wbid_shadow_detector.stop()
     if excur_shadow_detector is not None:
         await excur_shadow_detector.stop()
+    if prebar_dn_bull_detector is not None:
+        await prebar_dn_bull_detector.stop()
     if cic_shadow_detector is not None:
         await cic_shadow_detector.stop()
     # 停止组合条件影子检测器
@@ -4609,6 +4631,7 @@ SHADOW_BENCH: dict[str, tuple[float | None, float | None, str]] = {
     "wbid_d03_k3_5m_v1": (0.188, None, "窗口接盘·浅位3分钟：首触在第 3 根 → 挂 0.16（723d 回测 n=10450 胜率 18.8%，样本外 20.1% EV +3.14¢/股）"),
     "wbid_d05_k2_5m_v1": (0.174, None, "窗口接盘·深位2分钟：位面 open−0.5×ATR5、第 2 根触及 → 挂 0.14（723d 回测 n=14434 胜率 17.4%，样本外 18.9% EV +3.93¢/股）"),
     "wbid_d03_k2_fast_5m_v1": (0.245, None, "窗口接盘·浅位急跌2分钟：浅位第 2 根触及且跌速>0.0329 → 挂 0.21（train 急跌∩k2 交叉胜率 24.5%，EXEC_SPEC S8；validation k2 全体 25.96% 属样本外口径不混用；急跌样本外 EV +4.06¢/股）"),
+    "prebar_dn_bull_bid30_15m_v1": (0.3537, 0.0717, "阶段5冻结HGB触发后，当前15m前300秒UP≤0.30；10 USDT五档VWAP<0.32；历史诊断候选，仅供前向验证"),
 }
 for _channel, _benchmark in CHANNEL_BENCHMARKS.items():
     if _channel in SHADOW_BENCH:
