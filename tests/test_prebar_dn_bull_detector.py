@@ -7,7 +7,7 @@ from binance_predict.services.prebar_dn_bull_detector import VERSION, PrebarDnBu
 from binance_predict.services.shadow_version_gate import ShadowVersionGate
 
 
-def test_prebar_candidate_defaults_off(monkeypatch):
+def test_prebar_shadow_on_live_off_by_default(monkeypatch):
     from binance_predict.config.settings import settings
     monkeypatch.setattr(settings, "live_channels_json", "")
     assert LIVE_CHANNELS[VERSION].default_enabled is False
@@ -15,7 +15,7 @@ def test_prebar_candidate_defaults_off(monkeypatch):
     assert cfg.enabled is False
     assert cfg.amount_usdt == 10.0
     assert cfg.max_exec_price is None  # resolve_max_exec 回落冻结 spec 0.32
-    assert ShadowVersionGate().is_enabled(VERSION) is False
+    assert ShadowVersionGate().is_enabled(VERSION) is True
 
 
 @pytest.mark.asyncio

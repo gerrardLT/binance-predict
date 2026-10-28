@@ -25,8 +25,6 @@ from binance_predict.db.engine import async_session_factory
 from binance_predict.db.models import ShadowVersionOverride
 
 REFRESH_INTERVAL = 60.0  # 后台刷新间隔（秒）：toggle 跨进程收敛的上限
-# 新研究候选须显式开闸；仅此版本无 DB override 时默认关闭，不改变既有影子语义。
-DEFAULT_DISABLED_VERSIONS: frozenset[str] = frozenset({"prebar_dn_bull_bid30_15m_v1"})
 
 # ---------------------------------------------------------------------------
 # 永久退役版本（2026-09-04 用户拍板「信号直接不要了」）：代码级硬闸，
@@ -123,7 +121,7 @@ class ShadowVersionGate:
         """
         if version in RETIRED_VERSIONS:
             return False
-        return self._overrides.get(version, version not in DEFAULT_DISABLED_VERSIONS)
+        return self._overrides.get(version, True)
 
     @staticmethod
     def is_retired(version: str) -> bool:

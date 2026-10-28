@@ -1,4 +1,4 @@
-"""阶段5前根评分 × 当窗0.30深价候选（影子与实盘均默认关闭）。
+"""阶段5前根评分 × 当窗0.30深价候选（影子默认开启，实盘默认关闭）。
 
 冻结口径：上一根已收盘15m及更早的44维HGB评分 >= 0.54282；只在目标窗
 前300秒观察有效UP展示价，首次 <=0.30 时记录。实盘通道触价后延迟1秒，
@@ -162,7 +162,7 @@ class PrebarDnBullDetector:
             return
         self._running = True
         self._task = asyncio.create_task(self._settle_loop(), name="prebar_dn_bull_detector")
-        logger.info("阶段5检测器启动 | {} | 影子默认关闭 + 实盘默认关闭", VERSION)
+        logger.info("阶段5检测器启动 | {} | 影子默认开启 + 实盘默认关闭", VERSION)
 
     async def stop(self) -> None:
         self._running = False

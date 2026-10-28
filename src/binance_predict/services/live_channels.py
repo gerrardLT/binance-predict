@@ -601,7 +601,7 @@ LIVE_CHANNELS["excur_bid30_15m_v1"] = ChannelSpec(
 
 # 阶段5候选（2026-10-28）：上一根15m及更早44维HGB评分命中后，只观察
 # 目标窗前300秒；UP展示价首次≤0.30时触发MARKET单，真实五档执行均价须<0.32
-# （prediction_trading 护栏含贴线弃单）。研究月份已污染，故影子、实盘皆默认OFF。
+# （prediction_trading 护栏含贴线弃单）。研究月份已污染，影子默认ON，实盘默认OFF。
 LIVE_CHANNELS["prebar_dn_bull_bid30_15m_v1"] = ChannelSpec(
     "prebar_dn_bull_bid30_15m_v1", "prebar_dn_bull", "15m", "UP", 0.32,
     "阶段5前根长下影候选·前5分钟低吸UP", default_amount_usdt=10.0,

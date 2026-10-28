@@ -213,7 +213,7 @@ nextbar_shadow_detector: NextbarShadowDetector | None = None
 wbid_shadow_detector: WbidShadowDetector | None = None
 # 布防接盘影子检测器全局实例（excur 族：15m 布防+报价触发，影子落表 + 实盘默认 OFF）
 excur_shadow_detector: ExcurBidShadowDetector | None = None
-# 阶段5候选：前根HGB命中 + 当前15m前5分钟UP≤0.30；影子/实盘均默认 OFF。
+# 阶段5候选：前根HGB命中 + 当前15m前5分钟UP≤0.30；影子默认 ON，实盘默认 OFF。
 prebar_dn_bull_detector: PrebarDnBullDetector | None = None
 # 反向格影子检测器全局实例（cic 族：15m 第8分钟反向格，影子落表 + 实盘默认 OFF）
 cic_shadow_detector: CicCounterInertiaShadowDetector | None = None
@@ -371,7 +371,7 @@ async def _handle_15m_quote(quote_15m, ts_ms: int, *, persist: bool) -> None:
                 quote_15m.up_price, quote_15m.down_price)
         except Exception as e:
             logger.warning("excur 布防接盘判定异常: {}", e)
-    # 阶段5前根评分 + 当前窗前5分钟0.30触价；shadow gate 默认关闭。
+    # 阶段5前根评分 + 当前窗前5分钟0.30触价；影子默认开启。
     if (prebar_dn_bull_detector is not None
             and quote_15m.start_date and quote_15m.end_date):
         try:
@@ -1330,7 +1330,7 @@ async def lifespan(app: FastAPI):
         logger.info("excur 布防接盘检测器已启动（15m 布防+0.30 触发；影子落表 + 实盘默认 OFF）")
 
     # 阶段5候选（2026-10-28）：冻结HGB评分命中后，当前窗前300秒UP≤0.30。
-    # detector 始终装配以支持运行时开闸；shadow_gate 无覆盖时默认关闭，实盘亦默认OFF。
+    # detector 始终装配；shadow_gate 无覆盖时默认开启，实盘默认OFF。
     global prebar_dn_bull_detector
     prebar_dn_bull_detector = PrebarDnBullDetector(collector)
     if multi_live_trader is not None:

@@ -673,16 +673,13 @@ async def test_analytics_empty_db() -> None:
     # 影子开关状态（2026-09-04 前端手动下线能力）：gate 无覆盖行 → 非退役版默认全在线；
     # 退役版（RETIRED_VERSIONS）恒下线且 retired=True（代码级硬闸，不受 DB 覆盖行影响，
     # toggle API 拒改）；面板仍保留退役版历史曲线与 bench 基准（退役≠删数据）。
-    from binance_predict.services.shadow_version_gate import (
-        DEFAULT_DISABLED_VERSIONS, RETIRED_VERSIONS,
-    )
+    from binance_predict.services.shadow_version_gate import RETIRED_VERSIONS
     for ver, blk in out["shadow"].items():
         s = blk["summary"]
         if ver in RETIRED_VERSIONS:
             assert s["enabled"] is False and s["retired"] is True
         else:
-            assert s["enabled"] is (ver not in DEFAULT_DISABLED_VERSIONS)
-            assert s["retired"] is False
+            assert s["enabled"] is True and s["retired"] is False
     assert {v for v, b in out["shadow"].items()
             if b["summary"]["retired"]} == set(RETIRED_VERSIONS)
     # 退役版仍带冻结 bench 基准与说明（审计可追溯）
