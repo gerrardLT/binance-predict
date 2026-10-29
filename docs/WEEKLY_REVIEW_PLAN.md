@@ -113,7 +113,7 @@ if raw < 0.1:  flag below_floor（取 0.1，记录审计）
 | WR-09 | 落库与端点 | 列表/详情/触发/应用四端点 | `main.py`、`db/models.py` | `tests/test_weekly_review.py` | DONE | 路由注册已验；`import main` OK |
 | WR-10 | 前端 tab | `TAB_IDS` 加 `weekly`；六段式 | `frontend/src/App.tsx` | `npm run build` / `npm run lint` | DONE | `✓ built in 4.62s`；lint 仅 2 条既有 warning |
 | WR-11 | 定时任务 | 周一 00:00–00:20 UTC 先组合周报再逐通道归因 | `main.py` | 代码审阅 + 手动触发复用同一函数 | DONE | `_attribution_weekly_loop` |
-| WR-12 | 上线观察与回滚 | 文档含观察清单 + 逐步回滚；**真机手动生成一次** | 本文件 | — | DOING | 观察/回滚已写 §5；真机验证待部署后（需用户指令 push） |
+| WR-12 | 上线观察与回滚 | 文档含观察清单 + 逐步回滚；**真机手动生成一次** | 本文件 | — | DONE | 2026-10-30 部署 cf1ebd2 → 首跑 id=1 `LLM_ONLY_FAILED`（发现并修复 2 个真缺陷，见 §6）→ 部署 7076fe5 后重跑 id=2 `verdict=OK`（105 单 / +32.4U / ROI 3.87% / 15 个有成交通道 / 8 单信号 / 3 探索项 / 5 仓位建议 / 1 条断言被闸剔除） |
 
 ### 后续候选（不在本次范围）
 
@@ -131,6 +131,7 @@ if raw < 0.1:  flag below_floor（取 0.1，记录审计）
 5. 注意点 P0 数量、误报率；连续两周同一 `code` 复现则视为规则阈值需校准。
 6. 每周报 `rejected` 数量：持续偏高（>10 条）说明 prompt 与事实卡字段名对不上，需修字段命名而非放宽闸门。
 7. 同一周只应有一行 `WEEKLY`（幂等已加）；出现两行说明定位到 `find_weekly_review` 失效。
+8. **注意点 29 条（首跑实测）** 明显偏多：`NEW_CHANNEL_NO_GATE`（新通道首单 <60 天）与 `GUARD_REJECT_RATE`（15m 薄盘 55% 弃单）属预期。观察两周：若每周都是同一批 code，就是阈值需要按族拆，而不是新增规则。
 
 **回滚（每步独立）**
 1. 关仓位：通道 `amount_pct` 置 NULL（`POST /api/live/toggle` + `reset_amount_pct=true`）或 `live_amount_pct_enabled=false` → 立即回落固定金额。
@@ -145,7 +146,12 @@ if raw < 0.1:  flag below_floor（取 0.1，记录审计）
 - 2026-10-30｜口径修正｜弃单统计改由 `is_price_guard_rejection` 分类（护栏 vs 其它）；`UNSETTLED_BACKLOG` 改为「已成交 + 未结算 + 窗口结束超 30min」计数（避免把 FAILED 单误计成结算卡住）。
 - 2026-10-30｜闸门修正｜周报断言必须至少带 1 个 `evidence_id`（空证据原先会静默过闸，已修）。
 - 2026-10-30｜代码审核｜P0：周报分母改用**运行时** `base_equity`（原先读 env 默认，与 `rule_stake` 不同源）；P1：分桶改 `window_start`、`weekly_review_timeout_s` 接通、删死配置 `weekly_review_lookback_days`、触发失败不再返回 `null`；P2：乘数不再被 floor 抬升、sizing 基数缺失直接拒、应用时重算当前金额、同周 `WEEKLY` 幂等、重复应用 noop。
+- 2026-10-30｜代码审核｜P0：周报分母改用**运行时** `base_equity`（原先读 env 默认，与 `rule_stake` 不同源）；P1：分桶改 `window_start`、`weekly_review_timeout_s` 接通、删死配置 `weekly_review_lookback_days`、触发失败不再返回 `null`；P2：乘数不再被 floor 抬升、sizing 基数缺失直接拒、应用时重算当前金额、同周 `WEEKLY` 幂等、重复应用 noop。
 - 2026-10-30｜验证｜`389 passed` / 全量 `1676 passed, 15 skipped`；`npm run build` OK。
+- 2026-10-30｜**线上事故 1**｜首跑 `LLM_ONLY_FAILED`：`LLMPanel._call_one` 写死归因 `SYSTEM_PROMPT`，模型按 `hypotheses/narrative` 输出 → 周报 verify 判 `schema_mismatch`。单测直接喂 `parsed` 给 `verify_weekly_review`，漏了这层集成。修复：`analyze(system_prompt=…)`，周报显式传 `WEEKLY_SYSTEM_PROMPT`，并补了传参回归测试。
+- 2026-10-30｜**线上事故 2**｜修完 system prompt 后仍失败：输出撞 `max_tokens=16000` 被截断成非法 JSON（思考模型）。修复：`weekly_review_max_tokens=24000` 独立配置 + prompt 硬性篇幅约束（≤7000 tokens、每通道 ≤1 句诊断）。
+- 2026-10-30｜配套｜过闸失败落诊断（schema/顶层键/raw_text_head）；事实卡裁掉本周零成交通道（35→15 块，97k→48k 字符），名单进 `portfolio.idle_channels`。
+- 2026-10-30｜部署｜首次 push 的 Deploy job 因 VPS containerd `commit failed: rename … no such file` 失败（基础设施瞬时错误，非代码），`gh run rerun --failed` 后全绿。
 
 ## 7. 实施记录（代码地图 / 验证方式 / 已知边界）
 
@@ -166,9 +172,9 @@ if raw < 0.1:  flag below_floor（取 0.1，记录审计）
 ### 7.2 验证命令
 
 ```powershell
-.venv\Scripts\python.exe -m pytest tests/test_weekly_review.py tests/test_position_sizing.py -q   # 56 passed
+.venv\Scripts\python.exe -m pytest tests/test_weekly_review.py tests/test_position_sizing.py -q   # 59 passed
 .venv\Scripts\python.exe -m pytest tests/test_multi_live_trader.py -q                            # 322 passed
-.venv\Scripts\python.exe -m pytest tests/ -q                                                     # 1676 passed, 15 skipped
+.venv\Scripts\python.exe -m pytest tests/ -q                                                     # 1679 passed, 15 skipped
 cd frontend; npm run build                                                                        # tsc + vite OK
 ```
 
@@ -182,6 +188,7 @@ cd frontend; npm run build                                                      
 6. **探索性研究不执行**：只出方案（D4）；是否立项由人工另行发起，仍受现有信号研究纪律约束。
 7. **开 % 模式需改 env 并重启**：`live_amount_pct_enabled` 是 env-only（不是 DB 热调），开启要改 `.env` + 部署；关闸则可纯运行时（`reset_amount_pct=true`）。
 8. **只对下周生效**：周报事实卡与仓位建议基于上一个完整周，不会盘中重算。
+9. **输出预算是硬约束**：`WEEKLY_REVIEW_MAX_TOKENS=24000`，超了会被截断成非法 JSON；若要加通道/加段落，先看 `models[].output_tokens` 余量。首跑实测 18.1k/24k。
 
 ### 7.4 代码审核结论（2026-10-30）
 
