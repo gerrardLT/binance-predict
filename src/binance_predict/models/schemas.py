@@ -352,6 +352,47 @@ class ToggleLiveRequest(BaseModel):
         default=False,
         description="可选：True=清空自定义护栏，回落通道预设值（优先于 max_exec_price）",
     )
+    amount_pct: float | None = Field(
+        default=None,
+        description=("可选：动态仓位百分比（0.002~0.05，单笔=基准本金×pct）；"
+                     "None=不修改"),
+    )
+    amount_cap_usdt: float | None = Field(
+        default=None,
+        description="可选：% 模式下单笔金额上限（0.1~50，None=全局默认）",
+    )
+    reset_amount_pct: bool = Field(
+        default=False,
+        description="可选：True=关闭 % 模式，立即回落固定 amount_usdt（优先于 amount_pct）",
+    )
+
+
+class SizingConfigRequest(BaseModel):
+    """POST /api/live/sizing-config：仓位分母（手动固定基准本金）。
+
+    分母不随实时权益浮动（口径见 docs/WEEKLY_REVIEW_PLAN.md D1）；
+    仅用于 % 模式算术与周报的 EQUITY_DRIFT 提示，不参与其它金额。
+    """
+
+    base_equity_usdt: float = Field(description="基准本金（10~5000 USDT）")
+
+
+class WeeklyReviewTriggerRequest(BaseModel):
+    """POST /api/weekly/reviews/trigger：手动生成一份周报。"""
+
+    week_offset: int = Field(
+        default=-1, description="-1=上一完整周（默认）；0=本周至今")
+
+
+class WeeklySizingApplyRequest(BaseModel):
+    """POST /api/weekly/reviews/{id}/apply-sizing：应用周报仓位建议。
+
+    pct 必须与该报告中的建议完全一致（前端不得自行改价）；服务端还会重算
+    「折算金额 ≤ 当前金额」，任何放大敞口的请求直接拒绝。
+    """
+
+    channel: str = Field(description="通道 ID（LIVE_CHANNELS 白名单内）")
+    pct: float = Field(description="建议百分比（与周报固化值一致）")
 
 
 class ToggleShadowRequest(BaseModel):

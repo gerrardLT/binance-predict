@@ -59,12 +59,15 @@ from .models.schemas import (
     TransferOutboundRequest,
     ToggleLiveRequest,
     ToggleShadowRequest,
+    SizingConfigRequest,
     TriggerAttributionRequest,
     HypothesisActionRequest,
     AdviceTriggerRequest,
     AdviceApplyRequest,
     NotifyConfigPutRequest,
     NotifyConfigResetRequest,
+    WeeklyReviewTriggerRequest,
+    WeeklySizingApplyRequest,
 )
 from .services.absorption_shadow_detector import AbsorptionShadowDetector
 from .services.gap_crowd_shadow_detector import GapCrowdShadowDetector
@@ -2807,7 +2810,10 @@ async def live_toggle(
             amount_usdt=req.amount_usdt,
             max_daily_orders=req.max_daily_orders,
             max_exec_price=req.max_exec_price,
-            reset_max_exec=req.reset_max_exec)
+            reset_max_exec=req.reset_max_exec,
+            amount_pct=req.amount_pct,
+            amount_cap_usdt=req.amount_cap_usdt,
+            reset_amount_pct=req.reset_amount_pct)
     except ValueError as exc:
         return {"error": str(exc)}
     try:
@@ -2828,6 +2834,46 @@ async def live_toggle(
         ),
         "status": _status,
     }
+
+
+@app.get("/api/live/sizing-config")
+async def get_sizing_config(_: None = Depends(_require_auth)):
+    """动态仓位全局配置（基准本金 + 合法区间 + 当前规则金额）。"""
+    if multi_live_trader is None:
+        return {"error": "执行器未装配（装配阶段异常？详见后端日志）"}
+    status = multi_live_trader.status()
+    return {
+        "base_equity_usdt": status["base_equity_usdt"],
+        "amount_pct_enabled": status["amount_pct_enabled"],
+        "pct_range": status["amount_pct_range"],
+        "amount_cap_default": status["amount_cap_default"],
+        "amount_cap": status["amount_cap"],
+        "channels": [
+            {"channel": c["channel"], "display_name": c["display_name"],
+             "enabled": c["enabled"], "amount_usdt": c["amount_usdt"],
+             "amount_pct": c["amount_pct"], "amount_cap_usdt": c["amount_cap_usdt"],
+             "rule_amount": c["rule_amount"]}
+            for c in status["channels"]
+        ],
+    }
+
+
+@app.post("/api/live/sizing-config")
+async def set_sizing_config(req: SizingConfigRequest,
+                            _: None = Depends(_require_auth)):
+    """修改仓位分母（人工操作；越界拒改，不静默裁剪）。"""
+    if multi_live_trader is None:
+        return {"error": "执行器未装配（装配阶段异常？详见后端日志）"}
+    try:
+        value = multi_live_trader.set_base_equity(req.base_equity_usdt)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    try:
+        await multi_live_trader.persist_sizing_config()
+    except Exception as exc:
+        logger.warning("仓位分母持久化失败（运行时已生效）| {} | {}", value, exc)
+    return {"ok": True, "base_equity_usdt": value,
+            "status": multi_live_trader.status()}
 
 
 @app.get("/api/notify/config")
@@ -6031,7 +6077,11 @@ def _attribution_on_settled(order_id: int, channel: str | None) -> None:
 
 
 async def _attribution_weekly_loop() -> None:
-    """归因周报：每周一 00:30 UTC 对全部已启用实盘通道跑一次归因（随机性门同样生效）。"""
+    """周一 00:30 UTC：先出组合周报（LLM 每周复盘），再跑逐通道归因。
+
+    组合周报是「本周该做什么」的正面回答，逐通道归因是它的深挖备用；
+    两者互相独立，任一步失败不影响另一步。
+    """
     from .services.live_channels import parse_channel_config
 
     await asyncio.sleep(300)
@@ -6040,12 +6090,30 @@ async def _attribution_weekly_loop() -> None:
         try:
             now = datetime.now(timezone.utc)
             iso_week = f"{now.isocalendar().year}-W{now.isocalendar().week}"
-            if now.weekday() == 0 and now.hour == 0 and last_week != iso_week and settings.attribution_enabled:
+            if now.weekday() == 0 and now.hour == 0 and last_week != iso_week:
                 last_week = iso_week
-                configs = parse_channel_config()
-                channels = [ch for ch, c in configs.items() if c.enabled]
-                n = await attribution_engine.weekly_review(channels)
-                logger.info("归因周报完成 | 通道 {} 个 | 运行 {} 次", len(channels), n)
+                if settings.weekly_review_enabled:
+                    try:
+                        from .services.weekly_review import run_weekly_review
+
+                        meta = await _live_channel_meta()
+                        review = await run_weekly_review(
+                            "WEEKLY", week_offset=-1, channel_meta=meta,
+                            equity_provider=_weekly_equity_provider,
+                            base_equity=_runtime_base_equity())
+                        logger.info(
+                            "每周复盘完成 | {} | verdict={} | 注意点 {} 条",
+                            (review or {}).get("week_key"),
+                            (review or {}).get("verdict"),
+                            len(((review or {}).get("report") or {})
+                                .get("deterministic", {}).get("watchouts") or []))
+                    except Exception as exc:
+                        logger.warning("每周复盘生成失败（不影响归因周报）| {}", exc)
+                if settings.attribution_enabled:
+                    configs = parse_channel_config()
+                    channels = [ch for ch, c in configs.items() if c.enabled]
+                    n = await attribution_engine.weekly_review(channels)
+                    logger.info("归因周报完成 | 通道 {} 个 | 运行 {} 次", len(channels), n)
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -6724,6 +6792,179 @@ async def dismiss_strategy_advice(advice_id: int,
     await db.commit()
     return {"ok": True, "id": advice_id, "status": row.status}
 
+
+def _runtime_base_equity() -> float:
+    """仓位分母的**运行时**值（周报分母/闸门基数必须与实际下单同源）。"""
+    if multi_live_trader is None:
+        return float(settings.live_base_equity_usdt)
+    try:
+        return float(multi_live_trader.status()["base_equity_usdt"])
+    except Exception as exc:  # pragma: no cover - 双保险
+        logger.warning("基准本金读取失败（回落 env 默认）| {}", exc)
+        return float(settings.live_base_equity_usdt)
+
+
+async def _weekly_equity_provider() -> float | None:
+    """周报用余额快照（仅给 EQUITY_DRIFT 提示；失败返回 None 不阻报告）。"""
+    try:
+        bal = await prediction_trader.fetch_prediction_wallet_balance()
+    except Exception as exc:
+        logger.warning("周报余额快照失败（EQUITY_DRIFT 跳过）| {}", exc)
+        return None
+    free = (bal or {}).get("usdt_free")
+    try:
+        return float(free) if free is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+@app.get("/api/weekly/reviews")
+async def list_weekly_reviews(limit: int = 12,
+                              _: None = Depends(_require_auth),
+                              db: AsyncSession = Depends(get_db)):
+    """周报列表（新→旧；轻量，不含事实卡与报告本体）。"""
+    from sqlalchemy import select as sa_select
+    from .db.models import WeeklyReview
+
+    limit = max(1, min(limit, 52))
+    rows = (await db.execute(sa_select(WeeklyReview).order_by(
+        WeeklyReview.created_at.desc()).limit(limit))).scalars().all()
+    return {"reviews": [{
+        "id": r.id, "week_key": r.week_key, "status": r.status,
+        "verdict": r.verdict, "trigger_type": r.trigger_type,
+        "headline": ((r.report or {}).get("llm") or {}).get("headline"),
+        "watchouts": len(((r.report or {}).get("deterministic") or {})
+                         .get("watchouts") or []),
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+    } for r in rows]}
+
+
+@app.get("/api/weekly/reviews/{review_id}")
+async def get_weekly_review(review_id: int, _: None = Depends(_require_auth)):
+    """单份周报全文（事实卡 + 报告 + 被剔除断言审计）。"""
+    from .services.weekly_review import get_weekly_review as _get
+
+    row = await _get(review_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="周报不存在")
+    return row
+
+
+@app.post("/api/weekly/reviews/trigger")
+async def trigger_weekly_review(req: WeeklyReviewTriggerRequest,
+                                _: None = Depends(_require_auth)):
+    """手动生成一份周报（week_offset=-1 上一完整周，0 本周至今）。
+
+    事实卡一定会产出；LLM 段失败只降级不报错（DONE + verdict=LLM_ONLY_FAILED）。
+    """
+    from .services.weekly_review import run_weekly_review as _run
+
+    if not settings.weekly_review_enabled:
+        return {"error": "周报功能已关闭（weekly_review_enabled=false）"}
+    if req.week_offset not in (-1, 0):
+        raise HTTPException(status_code=422,
+                            detail="week_offset 仅支持 -1（上周）或 0（本周）")
+    meta = await _live_channel_meta()
+    result = await _run("MANUAL", week_offset=req.week_offset,
+                        channel_meta=meta, equity_provider=_weekly_equity_provider,
+                        base_equity=_runtime_base_equity())
+    if not result:
+        return {"error": "周报生成失败（事实卡构建异常，详见后端日志）"}
+    return result
+
+
+@app.post("/api/weekly/reviews/{review_id}/apply-sizing")
+async def apply_weekly_sizing(review_id: int, req: WeeklySizingApplyRequest,
+                              _: None = Depends(_require_auth),
+                              db: AsyncSession = Depends(get_db)):
+    """应用周报里的仓位建议（人工一键；服务端二次校验，只允许不放大敞口）。
+
+    ⚠️ 前端不得把 LLM 输出拼成 /api/live/toggle —— 这里是仓位建议的唯一入口：
+    pct 必须与该报告中的建议一致，且折算金额 ≤ 当前生效金额。
+    """
+    from sqlalchemy import select as sa_select
+    from .db.models import WeeklyReview
+    from .services.live_channels import LIVE_CHANNELS
+    from .services.position_sizing import validate_pct
+
+    if multi_live_trader is None:
+        return {"error": "执行器未装配（装配阶段异常？详见后端日志）"}
+    if not settings.live_amount_pct_enabled:
+        return {"error": "动态仓位总开关未开（live_amount_pct_enabled=false）"}
+    row = await db.get(WeeklyReview, review_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="周报不存在")
+    if req.channel not in LIVE_CHANNELS:
+        raise HTTPException(status_code=422, detail=f"未知通道: {req.channel}")
+    items = ((row.report or {}).get("llm") or {}).get("sizing") or []
+    item = next((i for i in items if i.get("channel") == req.channel), None)
+    if item is None:
+        raise HTTPException(status_code=422,
+                            detail=f"该周报没有 {req.channel} 的仓位建议")
+    try:
+        pct = validate_pct(req.pct, settings.live_amount_pct_min,
+                           settings.live_amount_pct_max)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    if abs(pct - float(item.get("pct") or 0)) > 1e-9:
+        raise HTTPException(status_code=422,
+                            detail="pct 与周报建议不一致（建议已固化，不可自行改价）")
+    # 用运行时配置重算基数：报告里的 current_amount 是生成时刻快照，
+    # 人工调过金额/基准后就不再成立（2026-10-30 审核 P2）。
+    status = multi_live_trader.status()
+    ch_state = next((c for c in status["channels"] if c["channel"] == req.channel), None)
+    if ch_state is None:
+        raise HTTPException(status_code=422, detail=f"通道 {req.channel} 不在运行时状态")
+    if ch_state.get("amount_pct") is not None and \
+            abs(float(ch_state["amount_pct"]) - pct) < 1e-9:
+        return {"ok": True, "noop": True, "review_id": row.id,
+                "message": "当前已是该仓位，无需重复应用"}
+    cur_amount = (ch_state.get("rule_amount")
+                  if ch_state.get("amount_pct") is not None else None)
+    if cur_amount is None:
+        cur_amount = ch_state.get("amount_usdt")
+    try:
+        proposed = float(status["base_equity_usdt"]) * pct
+        cur_amount = float(cur_amount)
+    except (TypeError, ValueError):
+        return {"error": "无法确定当前金额/基准本金，拒绝应用（防放大敞口）"}
+    if proposed > cur_amount + 1e-9:
+        return {"error": (f"该建议会放大敞口（{proposed:.2f}U > 当前 {cur_amount:.2f}U），"
+                           "已拒绝；如需加仓请手工改金额")}
+    # 冷冻期：同通道 N 天内最多 M 次仓位变更（与策略建议同口径）
+    since = datetime.now(timezone.utc) - timedelta(
+        days=settings.strategy_advice_apply_freeze_days)
+    recent = (await db.execute(sa_select(WeeklyReview).where(
+        WeeklyReview.created_at >= since))).scalars().all()
+    applied_n = sum(
+        1 for r in recent for e in (r.application_log or [])
+        if e.get("channel") == req.channel and e.get("param") == "amount_pct")
+    if applied_n >= settings.strategy_advice_apply_freeze_max:
+        raise HTTPException(
+            status_code=429,
+            detail=(f"通道近 {settings.strategy_advice_apply_freeze_days} 天已应用 "
+                    f"{applied_n} 次仓位变更（上限 "
+                    f"{settings.strategy_advice_apply_freeze_max}）"))
+    try:
+        multi_live_trader.set_channel(req.channel, amount_pct=pct)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    try:
+        await multi_live_trader.persist_channel(req.channel)
+    except Exception as exc:
+        logger.warning("周报仓位应用持久化失败（运行时已生效）| {} | {}",
+                       req.channel, exc)
+    logs = list(row.application_log or [])
+    logs.append({"applied_at": datetime.now(timezone.utc).isoformat(),
+                 "channel": req.channel, "param": "amount_pct",
+                 "to_value": pct, "review_id": row.id,
+                 "proposed_amount": item.get("proposed_amount")})
+    row.application_log = logs
+    await db.commit()
+    status = await multi_live_trader.status_async()
+    ch_state = next((c for c in status["channels"] if c["channel"] == req.channel), None)
+    return {"ok": True, "review_id": row.id, "applied": {"amount_pct": pct},
+            "channel_state": ch_state}
 
 # ============================================================
 # LLM 轨迹审计 API（前端「LLM 轨迹」面板 / 流程审查）

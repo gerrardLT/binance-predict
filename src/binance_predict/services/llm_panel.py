@@ -541,8 +541,11 @@ def verify_strategy_advice(parsed: dict, facts: dict,
 class LLMPanel:
     """跨家族多模型并行分析。单模型失败/超时只记 error，不影响其他模型。"""
 
-    def __init__(self, panel: list[dict] | None = None) -> None:
+    def __init__(self, panel: list[dict] | None = None,
+                 timeout_s: float | None = None) -> None:
         self.panel: list[dict] = panel if panel is not None else default_panel()
+        # 单次调用超时：None → 全局归因默认值（周报等自有节奏的场景可单独设）
+        self.timeout_s: float = float(timeout_s or settings.attribution_llm_timeout_s)
 
     async def analyze(self, user_prompt: str) -> list[dict]:
         if not self.panel:
@@ -571,7 +574,7 @@ class LLMPanel:
                         # 16000 保证思考 + JSON 正文都放得下（不禁思考，2026-10-20 拍板）
                         max_tokens=16000,
                     ),
-                    timeout=settings.attribution_llm_timeout_s,
+                    timeout=self.timeout_s,
                 )
             finally:
                 await client.close()
@@ -591,3 +594,304 @@ class LLMPanel:
         except Exception as exc:
             out["error"] = f"{type(exc).__name__}: {exc}"
         return out
+
+
+# ======================================================================
+# 每周复盘（2026-10-30）：组合级报告 + 单信号 + 注意点 + 探索性研究 + 仓位
+# ======================================================================
+
+WEEKLY_PROMPT_VERSION = "weekly_review_prompt_v1"
+WEEKLY_VERDICTS = {"KEEP", "WATCH", "TIGHTEN", "PAUSE", "ESCALATE"}
+WEEKLY_SEVERITIES = {"P0", "P1", "P2"}
+EXPLORATORY_DATA_SOURCES = {
+    "kline_720d",          # 本地 5m/15m K 线（output/klines_*_720d.csv）
+    "predexon_orderbook",  # PREDEXON 真实盘口（output/predexon_orderbooks/）
+    "live_orders",         # 生产订单（trade_orders，现有信号研究口径）
+    "shadow_signals",      # 影子前向信号（各 *_shadow_signals 表）
+}
+
+WEEKLY_SYSTEM_PROMPT = """你是量化预测市场系统的周度复盘分析师。你的读者是唯一操盘者本人：
+他每周只看一次这份报告，然后决定下周开哪些通道、给多少仓位、要不要改护栏。
+
+铁律：
+1. 你会收到一份「事实卡」（全部由确定性代码计算），它是你唯一可以引用的数字来源。
+   禁止使用事实卡之外的任何数字（包括你的记忆、常识、估算与换算）。
+2. 事实卡里的 watchouts 已由确定性规则判定（severity P0>P1>P2）。你可以补充，
+   但不允许降低规则给出的级别，也不允许把 P0 说成「可以再观察」。
+3. 每个因果/数值断言必须写成 claim：引用 evidence_ids（事实卡里的字段路径），
+   numbers 里每个 value 必须从对应字段原样复制（不得四舍五入、不得换算单位）。
+4. 结论优先级：随机性/样本量不足 > 边衰减 > 执行（买贵/护栏）> 组成漂移 > 拟合。
+   当上述现象与随机波动无法区分时，必须明写「无法区分」。
+5. 仓位（sizing）：只能给「不放大敞口」的百分比。若某通道当前是固定金额，
+   你给出的 pct 折算金额必须 ≤ 当前单笔金额，否则该条会被服务端整条作废。
+   你永远不能直接改钱，只能建议。
+
+输出必须是单个 JSON 对象，结构：
+{
+  "schema": "weekly_review_v1",
+  "headline": "一句话本周结论（≤40 字）",
+  "overall": {
+    "narrative": "组合层面 3~6 句：钱赚在哪、亏在哪、与上周的差、最大的不确定性",
+    "claims": [{"text": "断言", "evidence_ids": ["portfolio.pnl"],
+                "numbers": [{"name": "portfolio.pnl", "value": 0}]}]
+  },
+  "per_signal": [
+    {
+      "channel": "<事实卡里的通道名>",
+      "verdict": "KEEP|WATCH|TIGHTEN|PAUSE|ESCALATE",
+      "diagnosis": "一句话诊断（引用事实卡数字）",
+      "claims": [{"text": "...", "evidence_ids": ["ch.<通道>.edge"],
+                  "numbers": [{"name": "ch.<通道>.edge", "value": 0}]}],
+      "improvements": [
+        {"change": "具体改什么", "mechanism": "为什么这能改善",
+         "test": {"name": "<检验菜单键>", "params": {}},
+         "expected_effect": "预期方向与最小可检测效应",
+         "kill_criteria": "出现什么证据就撤回这条改进", "priority": "P1"}
+      ]
+    }
+  ],
+  "watchouts": [
+    {"code": "自定义代号或沿用事实卡的", "severity": "P0|P1|P2",
+     "channel": "通道名或 null", "statement": "最坏会怎样 + 建议动作",
+     "evidence_ids": ["..."], "numbers": [{"name": "...", "value": 0}]}
+  ],
+  "exploratory": [
+    {"question": "可证伪的研究问题", "mechanism": "机制假设",
+     "data_source": "kline_720d|predexon_orderbook|live_orders|shadow_signals",
+     "falsifiable_test": "怎么证伪（指标+检验）", "split": "时序切分建议",
+     "n_estimate": 0, "multiplicity": "多重检验控制方式",
+     "stop_condition": "什么情况下停止这条研究", "priority": "P1"}
+  ],
+  "sizing": [
+    {"channel": "<通道名>", "pct": 0.01, "rationale": "为什么是这个比例",
+     "claims": [{"text": "...", "evidence_ids": ["ch.<通道>.edge"],
+                 "numbers": [{"name": "ch.<通道>.edge", "value": 0}]}]}
+  ]
+}
+
+探索性研究只写方案，不写脚本、不假装跑过数据；没有 falsifiable_test 或
+stop_condition 的条目会被服务端剔除。"""
+
+
+def build_weekly_prompt(facts: dict) -> str:
+    """周报用户提示词：事实卡 + 检验菜单 + 任务约束。"""
+    slim = {k: v for k, v in facts.items() if k != "evidence_ids"}
+    parts = [
+        "## 检验菜单（improvements[].test.name 只能取以下键）\n"
+        + "\n".join(f"- {k}: {v}" for k, v in TEST_MENU.items()) + "\n",
+        "## 事实卡（唯一数字来源；evidence_ids 就是这里的字段路径）\n"
+        + json.dumps(slim, ensure_ascii=False, indent=1) + "\n",
+        "## 任务\n生成本周复盘。重点回答："
+        "① 这周赚/亏的结构原因；② 哪些通道该降级或停火；"
+        "③ 下周最值得跑的一个探索性研究；④ 仓位（只许不放大）。"
+        "事实卡 watchouts 已由规则确定，不要推翻，只补充或给出处置顺序。",
+    ]
+    return "\n".join(parts)
+
+
+def _sev_rank(severity: str | None) -> int:
+    return {"P0": 3, "P1": 2, "P2": 1}.get(str(severity or "").upper(), 0)
+
+
+def verify_weekly_review(parsed: dict, facts: dict, evidence_ids: set[str], *,
+                         channel_meta: dict | None = None,
+                         base_equity: float | None = None
+                         ) -> tuple[dict | None, list[dict]]:
+    """周报服务端硬闸。返回 (report_spec, rejected)。
+
+    逐段处置：
+    - overall/per_signal.claims：证据 ID + 数值精确匹配，不合格的单条断言剔除；
+    - per_signal.verdict 不在白名单 → 降为 WATCH（保留诊断，不整条丢弃）；
+    - improvements：test 必须在检验菜单内且有 kill_criteria，否则剔除该条；
+    - watchouts：severity 不得低于确定性规则同 code 的级别；无证据则剔除；
+    - exploratory：必须有 falsifiable_test / stop_condition / 合法 data_source；
+    - sizing：pct 在硬区间内，且折算金额 ≤ 当前生效单笔金额（永不放大敞口）。
+    """
+    if not isinstance(parsed, dict):
+        return None, [{"reason": "not_dict"}]
+    if str(parsed.get("schema") or "") != "weekly_review_v1":
+        return None, [{"reason": "schema_mismatch"}]
+
+    flat = _flatten_facts(facts)
+    ch_facts = facts.get("ch") or {}
+    deterministic = {w.get("code"): w for w in (facts.get("watchouts") or [])}
+    rejected: list[dict] = []
+
+    def _score(raw: dict) -> dict:
+        claims, rej = _verify_evidence(raw.get("claims"), flat, evidence_ids)
+        rejected.extend(rej)
+        # 空证据不算「过闸」：无 evidence_ids 的断言一律剔除（“我觉得”不是证据）
+        kept = [c for c in claims if c.get("evidence_ids")]
+        if len(kept) != len(claims):
+            rejected.append({"reason": "claim_without_evidence",
+                             "n_dropped": len(claims) - len(kept)})
+        return {"claims": kept}
+
+    headline = str(parsed.get("headline") or "").strip()[:120]
+    overall_in = parsed.get("overall") if isinstance(parsed.get("overall"), dict) else {}
+    overall = {"narrative": str(overall_in.get("narrative") or "").strip(),
+               **_score(overall_in)}
+
+    per_signal: list[dict] = []
+    for item in parsed.get("per_signal") or []:
+        if not isinstance(item, dict):
+            continue
+        channel = str(item.get("channel") or "")
+        if channel not in ch_facts:
+            rejected.append({"reason": f"unknown_channel:{channel}"})
+            continue
+        verdict = str(item.get("verdict") or "WATCH").upper()
+        if verdict not in WEEKLY_VERDICTS:
+            rejected.append({"reason": f"verdict_not_allowed:{verdict}",
+                             "channel": channel})
+            verdict = "WATCH"
+        improvements: list[dict] = []
+        for imp in item.get("improvements") or []:
+            if not isinstance(imp, dict):
+                continue
+            test = imp.get("test") if isinstance(imp.get("test"), dict) else {}
+            name = str(test.get("name") or "")
+            kill = str(imp.get("kill_criteria") or "").strip()
+            if name not in TEST_MENU or not kill:
+                rejected.append({"reason": f"improvement_invalid:{channel}:{name}",
+                                 "improvement": imp})
+                continue
+            improvements.append({
+                "change": str(imp.get("change") or "").strip(),
+                "mechanism": str(imp.get("mechanism") or "").strip(),
+                "test": {"name": name, "params": test.get("params") or {}},
+                "expected_effect": str(imp.get("expected_effect") or "").strip(),
+                "kill_criteria": kill,
+                "priority": str(imp.get("priority") or "P2").upper()[:2],
+            })
+        per_signal.append({
+            "channel": channel,
+            "display_name": ((channel_meta or {}).get(channel) or {})
+            .get("display_name", channel),
+            "verdict": verdict,
+            "diagnosis": str(item.get("diagnosis") or "").strip(),
+            **_score(item),
+            "improvements": improvements[:3],
+        })
+
+    watchouts: list[dict] = []
+    for item in parsed.get("watchouts") or []:
+        if not isinstance(item, dict):
+            continue
+        severity = str(item.get("severity") or "P2").upper()
+        code = str(item.get("code") or "LLM_OTHER").strip()[:40]
+        if severity not in WEEKLY_SEVERITIES:
+            severity = "P2"
+        det = deterministic.get(code)
+        if det is not None and _sev_rank(severity) < _sev_rank(det.get("severity")):
+            severity = str(det.get("severity"))
+            rejected.append({"reason": f"severity_downgrade_blocked:{code}"})
+        claims, rej = _verify_evidence(
+            [{"claim": item.get("statement"),
+              "evidence_ids": item.get("evidence_ids"),
+              "numbers": item.get("numbers")}], flat, evidence_ids)
+        rejected.extend(rej)
+        claims = [c for c in claims if c.get("evidence_ids")]
+        if not claims:
+            rejected.append({"reason": f"watchout_ungated:{code}"})
+            continue
+        watchouts.append({"code": code, "severity": severity,
+                          "channel": item.get("channel") or None,
+                          "statement": str(item.get("statement") or "").strip(),
+                          "claims": claims})
+
+    exploratory: list[dict] = []
+    for item in parsed.get("exploratory") or []:
+        if not isinstance(item, dict):
+            continue
+        src = str(item.get("data_source") or "")
+        test_txt = str(item.get("falsifiable_test") or "").strip()
+        stop = str(item.get("stop_condition") or "").strip()
+        question = str(item.get("question") or "").strip()
+        if src not in EXPLORATORY_DATA_SOURCES or not (test_txt and stop and question):
+            rejected.append({"reason": "exploratory_incomplete",
+                             "question": question[:60]})
+            continue
+        try:
+            n_est = int(item.get("n_estimate") or 0)
+        except (TypeError, ValueError):
+            n_est = 0
+        exploratory.append({
+            "question": question,
+            "mechanism": str(item.get("mechanism") or "").strip(),
+            "data_source": src,
+            "falsifiable_test": test_txt,
+            "split": str(item.get("split") or "").strip(),
+            "n_estimate": n_est,
+            "multiplicity": str(item.get("multiplicity") or "").strip(),
+            "stop_condition": stop,
+            "priority": str(item.get("priority") or "P2").upper()[:2],
+        })
+
+    sizing: list[dict] = []
+    lo, hi = settings.live_amount_pct_min, settings.live_amount_pct_max
+    for item in parsed.get("sizing") or []:
+        if not isinstance(item, dict):
+            continue
+        channel = str(item.get("channel") or "")
+        if channel not in ch_facts:
+            rejected.append({"reason": f"sizing_unknown_channel:{channel}"})
+            continue
+        try:
+            pct = float(item.get("pct"))
+        except (TypeError, ValueError):
+            rejected.append({"reason": f"sizing_pct_not_numeric:{channel}"})
+            continue
+        if not (lo <= pct <= hi):
+            rejected.append({"reason": f"sizing_pct_out_of_range:{channel}:{pct}"})
+            continue
+        try:
+            base_eq = float(base_equity if base_equity is not None else
+                            ((facts.get("portfolio") or {}).get("equity") or {})
+                            .get("base_equity_usdt") or 0.0)
+            cur = ch_facts[channel]
+            # 当前金额：% 模式取规则金额（缺失则回落固定金额）；固定模式取固定金额。
+            # 两者都缺 → 无法证明「不放大」→ 整条拒掉（不能因为算不出来就放行）。
+            cur_val = cur.get("rule_stake") if cur.get("amount_pct") is not None else None
+            if cur_val is None:
+                cur_val = cur.get("amount_usdt")
+            current_amount = float(cur_val)
+        except (TypeError, ValueError):
+            rejected.append({"reason": f"sizing_basis_missing:{channel}",
+                             "detail": "current_amount_not_numeric"})
+            continue
+        if not (base_eq > 0 and current_amount > 0):
+            rejected.append({"reason": f"sizing_basis_missing:{channel}",
+                             "base_equity": base_eq,
+                             "current_amount": current_amount})
+            continue
+        proposed = base_eq * pct
+        if proposed > current_amount + 1e-9:
+            rejected.append({"reason": "sizing_widen_forbidden",
+                             "channel": channel, "proposed": round(proposed, 4),
+                             "current": round(current_amount, 4)})
+            continue
+        claims, rej = _verify_evidence(item.get("claims"), flat, evidence_ids)
+        rejected.extend(rej)
+        sizing.append({"channel": channel,
+                       "display_name": ((channel_meta or {}).get(channel) or {})
+                       .get("display_name", channel),
+                       "pct": round(pct, 6),
+                       "proposed_amount": round(proposed, 2),
+                       "current_amount": round(current_amount, 2),
+                       "rationale": str(item.get("rationale") or "").strip(),
+                       "claims": claims})
+
+    report = {
+        "schema": "weekly_review_v1",
+        "headline": headline,
+        "overall": overall,
+        "per_signal": per_signal,
+        "watchouts": watchouts,
+        "exploratory": exploratory,
+        "sizing": sizing,
+        "prompt_version": WEEKLY_PROMPT_VERSION,
+    }
+    return report, rejected
+
+

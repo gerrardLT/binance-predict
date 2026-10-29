@@ -182,6 +182,29 @@ class Settings(BaseSettings):
     trend_cusum_h: float = 5.0
     trend_min_n: int = 40
 
+    # --- 动态仓位（% 基准本金，2026-10-30）---
+    # 总开关：关=所有通道忽略 amount_pct，金额 100% 按 amount_usdt（零行为变化）。
+    live_amount_pct_enabled: bool = False
+    # 仓位分母：手动固定基准本金（不随实时权益浮动，口径见
+    # docs/WEEKLY_REVIEW_PLAN.md D1）。运行时可经 /api/live/sizing-config 覆盖
+    # （持久化在 live_sizing_config 单行表，重启由 apply_db_overrides 恢复）。
+    live_base_equity_usdt: float = 200.0
+    # pct 合法区间（单笔 = base_equity × pct）；超出拒改，不裁剪。
+    live_amount_pct_min: float = 0.002
+    live_amount_pct_max: float = 0.05
+    # 通道级单笔金额上限默认值（调高必须显式配置；硬上限仍是 MAX_ORDER_AMOUNT_USDT）。
+    live_amount_cap_usdt: float = 20.0
+
+    # --- LLM 每周复盘（2026-10-30）---
+    # 总开关：关=不生成周报（历史行只读保留）。
+    weekly_review_enabled: bool = True
+    # LLM 段开关：关=只产出确定性事实卡 + 注意点（零 token）。
+    weekly_review_llm_enabled: bool = True
+    # 周报模型（provider:model 逗号分隔）。空=默认面板首个模型（单模型控成本）。
+    weekly_review_models: str = ""
+    # 单模型调用超时（秒）。
+    weekly_review_timeout_s: float = 120.0
+
     # --- 告警配置 ---
     agent_alert_enabled: bool = True
     agent_alert_consecutive_failures: int = 3

@@ -356,6 +356,8 @@ async def test_apply_db_overrides_ignores_archived_channels(monkeypatch) -> None
             res = MagicMock()
             res.scalars.return_value.all.return_value = rows
             return res
+        async def get(self, model, pk):
+            return None   # live_sizing_config 单行表：无行 → 回落 env 默认
 
     monkeypatch.setattr(milt, "async_session_factory", lambda: _RowsSession())
     applied = await trader.apply_db_overrides()
@@ -3553,6 +3555,9 @@ class _OverrideSession:
         res = MagicMock()
         res.scalars.return_value.all.return_value = self._rows
         return res
+
+    async def get(self, model, pk):
+        return None   # live_sizing_config：无行（基准本金回落 env 默认）
 
     async def merge(self, row):
         self.merged.append(row)
@@ -8702,3 +8707,156 @@ async def test_cic_disabled_channel_never_fires(monkeypatch) -> None:
                      "z1": 0.3, "eff": 0.1, "touch_up": 0.44, "touch_down": 0.56})
     await _drain(t)
     assert fake.calls == []
+
+
+# ============================================================
+# 组 9：动态仓位（% 基准本金）—— 唯一收口 _exec_with_exclusive
+# ============================================================
+#
+# 口径（docs/WEEKLY_REVIEW_PLAN.md §3.3）：
+#   单笔 = 基准本金 × pct × 调用点乘数 → 向下取整 0.1 → clamp [0.1, min(cap,50)]
+# 交易链路铁律：pct 未启用 / 总开关关闭 / 配置缺失 → 金额一字不改（零行为变化）；
+# 余额或配置算不出来时回落固定金额，绝不放大也绝不停火。
+
+
+async def _exec_amount(t, channel: str, amount: float) -> dict:
+    context = {"patch_values": {"amount_usdt": amount}}
+    await t._exec_with_exclusive(
+        channel,
+        prediction="DOWN",
+        amount_usdt=amount,
+        signal_version=channel,
+        window_start=WINDOW_START,
+        max_exec_price=0.55,
+        market_period="5m",
+        order_type="MARKET",
+        assessment_context=context,
+    )
+    return context
+
+
+@pytest.mark.asyncio
+async def test_sizing_off_keeps_fixed_amount(monkeypatch) -> None:
+    """pct=None（默认）→ 金额与审计都不变。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["firsthit_down_v1"],
+                     overrides={"firsthit_down_v1": {"amount_usdt": 5.0}})
+    monkeypatch.setattr(settings, "live_amount_pct_enabled", True)
+    ctx = await _exec_amount(t, "firsthit_down_v1", 5.0)
+    assert fake.calls[0]["amount_usdt"] == 5.0
+    assert "sizing" not in ctx["patch_values"]
+
+
+@pytest.mark.asyncio
+async def test_sizing_applies_pct_of_base_equity(monkeypatch) -> None:
+    """200 × 1% = 2.0；审计写进 assessment patch。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["firsthit_down_v1"],
+                     overrides={"firsthit_down_v1": {"amount_usdt": 5.0,
+                                                     "amount_pct": 0.01}})
+    monkeypatch.setattr(settings, "live_amount_pct_enabled", True)
+    t.set_base_equity(200.0)
+    ctx = await _exec_amount(t, "firsthit_down_v1", 5.0)
+    assert fake.calls[0]["amount_usdt"] == 2.0
+    assert ctx["patch_values"]["sizing"]["amount"] == 2.0
+    assert ctx["patch_values"]["sizing"]["base_equity"] == 200.0
+
+
+@pytest.mark.asyncio
+async def test_sizing_preserves_highvol_halving(monkeypatch) -> None:
+    """调用点已施加的乘数（高波半仓 0.5）必须保留：200×2%×0.5 = 2.0。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["kdc_s1_96hi_15m_v1"],
+                     overrides={"kdc_s1_96hi_15m_v1": {"amount_usdt": 4.0,
+                                                      "amount_pct": 0.02}})
+    monkeypatch.setattr(settings, "live_amount_pct_enabled", True)
+    t.set_base_equity(200.0)
+    await _exec_amount(t, "kdc_s1_96hi_15m_v1", 2.0)   # 2.0 = 4.0 × 0.5
+    assert fake.calls[0]["amount_usdt"] == 2.0
+
+
+@pytest.mark.asyncio
+async def test_sizing_respects_channel_cap(monkeypatch) -> None:
+    """pct 上限算出来 10U，但通道 cap=3U → 截到 3U。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["firsthit_down_v1"],
+                     overrides={"firsthit_down_v1": {"amount_usdt": 5.0,
+                                                     "amount_pct": 0.05,
+                                                     "amount_cap_usdt": 3.0}})
+    monkeypatch.setattr(settings, "live_amount_pct_enabled", True)
+    t.set_base_equity(200.0)
+    ctx = await _exec_amount(t, "firsthit_down_v1", 5.0)
+    assert fake.calls[0]["amount_usdt"] == 3.0
+    assert ctx["patch_values"]["sizing"]["cap"] == 3.0
+
+
+@pytest.mark.asyncio
+async def test_sizing_global_switch_off(monkeypatch) -> None:
+    """总开关关闭时，即使通道配了 pct 也按固定金额下单（回滚路径）。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["firsthit_down_v1"],
+                     overrides={"firsthit_down_v1": {"amount_usdt": 5.0,
+                                                     "amount_pct": 0.01}})
+    monkeypatch.setattr(settings, "live_amount_pct_enabled", False)
+    t.set_base_equity(200.0)
+    await _exec_amount(t, "firsthit_down_v1", 5.0)
+    assert fake.calls[0]["amount_usdt"] == 5.0
+
+
+@pytest.mark.asyncio
+async def test_sizing_failure_falls_back_to_fixed_amount(monkeypatch) -> None:
+    """仓位模块异常 → 回落传进来的固定金额（绝不放大、也不停火）。"""
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["firsthit_down_v1"],
+                     overrides={"firsthit_down_v1": {"amount_usdt": 5.0,
+                                                     "amount_pct": 0.01}})
+    monkeypatch.setattr(settings, "live_amount_pct_enabled", True)
+    t.set_base_equity(200.0)
+
+    def _boom(**_kw):
+        raise RuntimeError("sizing blew up")
+
+    monkeypatch.setattr(milt, "resolve_amount", _boom)
+    await _exec_amount(t, "firsthit_down_v1", 5.0)
+    assert fake.calls[0]["amount_usdt"] == 5.0
+
+
+def test_set_channel_rejects_out_of_range_pct(monkeypatch) -> None:
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["firsthit_down_v1"])
+    with pytest.raises(ValueError):
+        t.set_channel("firsthit_down_v1", amount_pct=0.5)
+    # 原子性：拒改后原配置不变
+    assert t._configs["firsthit_down_v1"].amount_pct is None
+
+
+def test_set_channel_reset_amount_pct_rolls_back(monkeypatch) -> None:
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["firsthit_down_v1"])
+    t.set_channel("firsthit_down_v1", amount_pct=0.01)
+    assert t._configs["firsthit_down_v1"].amount_pct == 0.01
+    t.set_channel("firsthit_down_v1", reset_amount_pct=True)
+    assert t._configs["firsthit_down_v1"].amount_pct is None
+
+
+def test_set_base_equity_bounds(monkeypatch) -> None:
+    t = _make_trader(monkeypatch, _FakeTrader(), channels=[])
+    assert t.set_base_equity(250) == 250.0
+    for bad in (1, 99999):
+        with pytest.raises(ValueError):
+            t.set_base_equity(bad)
+
+
+def test_status_exposes_sizing_fields(monkeypatch) -> None:
+    fake = _FakeTrader()
+    t = _make_trader(monkeypatch, fake, channels=["firsthit_down_v1"],
+                     overrides={"firsthit_down_v1": {"amount_usdt": 5.0,
+                                                     "amount_pct": 0.01,
+                                                     "amount_cap_usdt": 8.0}})
+    t.set_base_equity(200.0)
+    status = t.status()
+    ch = next(c for c in status["channels"] if c["channel"] == "firsthit_down_v1")
+    assert status["base_equity_usdt"] == 200.0
+    assert ch["amount_pct"] == 0.01
+    assert ch["amount_cap_usdt"] == 8.0
+    assert ch["rule_amount"] == 2.0

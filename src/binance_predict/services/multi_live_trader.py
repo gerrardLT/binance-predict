@@ -62,6 +62,7 @@ from binance_predict.config.settings import settings
 from binance_predict.db.engine import async_session_factory
 from binance_predict.db.models import (
     LiveChannelOverride,
+    LiveSizingConfig,
     MisalignmentSignal,
     SentimentWindow,
     TradeOrderModel,
@@ -76,6 +77,7 @@ from .absorption_shadow_detector import ABSORPTION_SPECS
 from .gap_crowd_shadow_detector import evaluate_gap_crowd
 from .btc_regime import regime_feed
 from .live_execution_policy import config_fingerprint, evaluate_absorption_policy
+from .position_sizing import SizingDecision, resolve_amount, validate_base_equity, validate_pct
 from .shadow_execution_registry import SHADOW_VERSION_SPECS
 from .shadow_execution_store import (
     get_or_create_runtime_assessment,
@@ -346,6 +348,9 @@ class MultiLiveTrader:
                     f"多通道实盘：通道 {ch} 日限 {cfg.max_daily_orders} 超硬上限"
                     f" {MAX_DAILY_ORDERS_CAP}（配置误写拒绝启动）")
         self._enabled_at_startup = {ch: cfg.enabled for ch, cfg in self._configs.items()}
+        # 动态仓位分母（手动固定基准本金；真实值由 apply_db_overrides 从
+        # live_sizing_config 单行表恢复，缺行时回落 env 默认）
+        self._base_equity = float(settings.live_base_equity_usdt)
         self._tasks: set[asyncio.Task] = set()   # 在途任务（下单/核验/回填/自愈/轮询）
         # 余额缓存作废钩子（main 装配区注入：services 层不反向 import main，用回调解耦）
         self._on_balance_change = None
@@ -1324,6 +1329,21 @@ class MultiLiveTrader:
             )
             if context is not None:
                 trade_kwargs["assessment_context"] = context
+
+        # 动态仓位（% 基准本金）：全部 10+ 开火点的唯一收口。
+        # 未启用返回 None → 金额一字不改（零行为变化）；审计写进 assessment
+        # patch_values，事后可对「实付 vs 规则」逐单核对。
+        sizing = self._sizing_amount(
+            channel, float(trade_kwargs.get("amount_usdt") or 0.0))
+        if sizing is not None:
+            requested = float(trade_kwargs.get("amount_usdt") or 0.0)
+            trade_kwargs["amount_usdt"] = sizing.amount
+            if context is not None and isinstance(context.get("patch_values"), dict):
+                context["patch_values"] = {
+                    **context["patch_values"], "sizing": sizing.as_dict()}
+            logger.info(
+                "多通道实盘：仓位裁决 | {} | 请求 {:.2f}U → 实下 {:.2f}U | {}",
+                channel, requested, sizing.amount, sizing.rule)
 
         async def _mark_operational_pass() -> None:
             if context is not None:
@@ -2478,7 +2498,10 @@ class MultiLiveTrader:
                     amount_usdt: float | None = None,
                     max_daily_orders: int | None = None,
                     max_exec_price: float | None = None,
-                    reset_max_exec: bool = False) -> None:
+                    reset_max_exec: bool = False,
+                    amount_pct: float | None = None,
+                    amount_cap_usdt: float | None = None,
+                    reset_amount_pct: bool = False) -> None:
         """运行时热调单通道（toggle 端点调用）。
 
         白名单/数值校验同启动配置（不靠自律靠拒改）；在途任务不受影响。
@@ -2508,10 +2531,28 @@ class MultiLiveTrader:
             raise ValueError(
                 f"多通道实盘：通道 {channel} 护栏 {max_exec_price} 超界"
                 f" [0.01, 0.99]")
+        pct_v: float | None = None
+        if amount_pct is not None and not reset_amount_pct:
+            pct_v = validate_pct(
+                amount_pct, settings.live_amount_pct_min, settings.live_amount_pct_max)
+        cap_v: float | None = None
+        if amount_cap_usdt is not None:
+            if not (0.1 <= amount_cap_usdt <= MAX_ORDER_AMOUNT_USDT):
+                raise ValueError(
+                    f"多通道实盘：通道 {channel} 金额上限 {amount_cap_usdt} 超界"
+                    f" [0.1, {MAX_ORDER_AMOUNT_USDT}]")
+            cap_v = round(float(amount_cap_usdt), 2)
         if enabled is not None:
             cfg.enabled = bool(enabled)
         if amount_usdt is not None:
             cfg.amount_usdt = float(amount_usdt)
+        if pct_v is not None:
+            cfg.amount_pct = pct_v
+        if cap_v is not None:
+            cfg.amount_cap_usdt = cap_v
+        if reset_amount_pct:
+            # 关 % 模式：立即回落固定金额（回滚路径必须是一步操作）
+            cfg.amount_pct = None
         if max_daily_orders is not None:
             cfg.max_daily_orders = int(max_daily_orders)
         if reset_max_exec:
@@ -2530,6 +2571,13 @@ class MultiLiveTrader:
             rows = list((await session.execute(
                 sa_select(LiveChannelOverride)
             )).scalars().all())
+            # 仓位分母（单行表）：缺失/非法 → 回落 env 默认，不阻启动
+            sizing_row = await session.get(LiveSizingConfig, 1)
+        if sizing_row is not None:
+            try:
+                self._base_equity = validate_base_equity(sizing_row.base_equity_usdt)
+            except ValueError as exc:
+                logger.warning("多通道实盘：基准本金非法已忽略（回落 env 默认）| {}", exc)
         applied: list[str] = []
         retired_skipped: list[str] = []
         for row in rows:
@@ -2544,7 +2592,9 @@ class MultiLiveTrader:
                     row.channel, enabled=row.enabled,
                     amount_usdt=row.amount_usdt,
                     max_daily_orders=row.max_daily_orders,
-                    max_exec_price=getattr(row, "max_exec_price", None))
+                    max_exec_price=getattr(row, "max_exec_price", None),
+                    amount_pct=getattr(row, "amount_pct", None),
+                    amount_cap_usdt=getattr(row, "amount_cap_usdt", None))
             except ValueError as exc:
                 logger.warning("多通道实盘：DB 覆盖行非法已跳过 | {}", exc)
                 continue
@@ -2574,11 +2624,73 @@ class MultiLiveTrader:
             amount_usdt=cfg.amount_usdt,
             max_daily_orders=cfg.max_daily_orders,
             max_exec_price=cfg.max_exec_price,
+            amount_pct=cfg.amount_pct,
+            amount_cap_usdt=cfg.amount_cap_usdt,
             updated_at=datetime.now(timezone.utc),
         )
         async with async_session_factory() as session:
             await session.merge(row)
             await session.commit()
+
+    def set_base_equity(self, value: float) -> float:
+        """设置仓位分母（基准本金）。越界拒改；本方法不碰 DB。"""
+        self._base_equity = validate_base_equity(value)
+        return self._base_equity
+
+    async def persist_sizing_config(self) -> None:
+        """仓位分母落库（单行表 id=1）。失败由端点告警不抛（运行时已生效）。"""
+        async with async_session_factory() as session:
+            row = await session.get(LiveSizingConfig, 1)
+            if row is None:
+                session.add(LiveSizingConfig(
+                    id=1, base_equity_usdt=self._base_equity,
+                    updated_at=datetime.now(timezone.utc)))
+            else:
+                row.base_equity_usdt = self._base_equity
+                row.updated_at = datetime.now(timezone.utc)
+            await session.commit()
+
+    def _sizing_amount(self, channel: str, requested: float) -> SizingDecision | None:
+        """% 模式决定本单金额；未启用（或总开关关）返回 None = 不改。
+
+        失败语义：“算不出来就不改”——任何异常都回落传进来的固定金额，
+        绝不因仓位模块故障放大敏口或停火。
+        """
+        if not settings.live_amount_pct_enabled:
+            return None
+        cfg = self._configs.get(channel)
+        if cfg is None or cfg.amount_pct is None:
+            return None
+        try:
+            decision = resolve_amount(
+                pct=cfg.amount_pct,
+                base_equity=self._base_equity,
+                requested_amount=requested,
+                base_amount=cfg.amount_usdt,
+                cap_usdt=(cfg.amount_cap_usdt
+                          if cfg.amount_cap_usdt is not None
+                          else settings.live_amount_cap_usdt),
+            )
+        except Exception as exc:  # pragma: no cover - 纯函数不会抛，双保险
+            logger.warning("多通道实盘：仓位裁决异常（回落固定金额）| {} | {}", channel, exc)
+            return None
+        if decision is not None and decision.below_floor:
+            logger.info(
+                "多通道实盘：仓位低于最小粒度并抬到 0.1U | {} | rule={} raw={}",
+                channel, decision.rule, decision.raw)
+        return decision
+
+    def _rule_amount(self, ch: str) -> float | None:
+        """% 模式下的规则单笔金额（面板展示用；固定金额通道返回 None）。"""
+        cfg = self._configs.get(ch)
+        if cfg is None or cfg.amount_pct is None:
+            return None
+        decision = resolve_amount(
+            pct=cfg.amount_pct, base_equity=self._base_equity,
+            requested_amount=1.0, base_amount=1.0,
+            cap_usdt=(cfg.amount_cap_usdt if cfg.amount_cap_usdt is not None
+                      else settings.live_amount_cap_usdt))
+        return decision.amount if decision is not None else None
 
     def is_enabled(self, channel: str) -> bool:
         """该通道当前是否已开实盘开火（运行时含 toggle 热调）；未知通道 False。
@@ -2593,6 +2705,11 @@ class MultiLiveTrader:
         return {
             "enabled_any": any(cfg.enabled for cfg in self._configs.values()),
             "amount_cap": MAX_ORDER_AMOUNT_USDT,
+            "base_equity_usdt": self._base_equity,
+            "amount_pct_enabled": bool(settings.live_amount_pct_enabled),
+            "amount_pct_range": [settings.live_amount_pct_min,
+                                 settings.live_amount_pct_max],
+            "amount_cap_default": settings.live_amount_cap_usdt,
             "defaults": {
                 "amount_usdt": settings.live_default_amount_usdt,
                 "max_daily_orders": settings.live_default_max_daily_orders,
@@ -2614,6 +2731,11 @@ class MultiLiveTrader:
             "enabled": cfg.enabled,
             "enabled_at_startup": self._enabled_at_startup[ch],
             "amount_usdt": cfg.amount_usdt,
+            "amount_pct": cfg.amount_pct,
+            "amount_cap_usdt": (cfg.amount_cap_usdt
+                                if cfg.amount_cap_usdt is not None
+                                else settings.live_amount_cap_usdt),
+            "rule_amount": self._rule_amount(ch),
             "max_daily_orders": cfg.max_daily_orders,
             "max_exec_price": resolve_max_exec(spec, cfg),
             "auto_max_exec": spec.auto_max_exec,

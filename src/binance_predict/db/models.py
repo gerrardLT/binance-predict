@@ -1704,6 +1704,14 @@ class LiveChannelOverride(Base):
         Float, nullable=True,
         comment="执行价护栏自定义覆盖（NULL=回落通道预设 auto_max_exec）"
     )
+    amount_pct: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+        comment="动态仓位百分比（NULL=用固定 amount_usdt；单笔=基准本金×pct）"
+    )
+    amount_cap_usdt: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+        comment="% 模式下的单笔金额上限（NULL=全局默认 live_amount_cap_usdt）"
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(),
         comment="最后一次 toggle 生效时刻（配置变更审计）"
@@ -2059,3 +2067,62 @@ class StrategyAdvice(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class LiveSizingConfig(Base):
+    """动态仓位全局配置（单行表，id=1）：基准本金。
+
+    分母是**人为设定的固定基准**（docs/WEEKLY_REVIEW_PLAN.md D1），不随实时权益
+    浮动——否则下单后余额下降会自动缩仓，同一周的金额无法复现。实时权益只用于
+    周报里的「基准是否该复核」提示（EQUITY_DRIFT 注意点），绝不参与下单算术。
+    """
+
+    __tablename__ = "live_sizing_config"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    base_equity_usdt: Mapped[float] = mapped_column(
+        Float, nullable=False, default=200.0, comment="仓位分母（$10~$5000，手动设定）")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+        onupdate=func.now(), comment="最后人工修改时刻（审计）")
+
+
+class WeeklyReview(Base):
+    """LLM 每周复盘（2026-10-30）：组合级报告 + 单信号 + 注意点 + 仓位建议。
+
+    只读分析层：不被下单/结算路径引用；报告里的一切「改钱」建议都必须经
+    POST /api/weekly/reviews/{id}/apply-sizing 人工应用。
+
+    status: RUNNING | DONE | FAILED | SKIPPED
+    facts: collect_facts 产出的确定性事实卡（LLM 唯一数字来源）
+    report: verify_weekly_review 过闸后的结构化报告（含 rejected 审计在 rejected 列）
+    """
+
+    __tablename__ = "weekly_reviews"
+    __table_args__ = (
+        Index("ix_weekly_reviews_week_key", "week_key"),
+        Index("ix_weekly_reviews_created", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    week_key: Mapped[str] = mapped_column(String(16), nullable=False, comment="ISO 周，如 2026-W44")
+    period_start_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    period_end_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    trigger_type: Mapped[str] = mapped_column(String(12), nullable=False,
+                                              comment="WEEKLY|MANUAL")
+    status: Mapped[str] = mapped_column(String(12), nullable=False, default="RUNNING")
+    verdict: Mapped[str | None] = mapped_column(
+        String(24), nullable=True, comment="OK|INSUFFICIENT_DATA|LLM_ONLY_FAILED")
+    facts: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    report: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    rejected: Mapped[list] = mapped_column(JSONB, nullable=False,
+                                           server_default=text("'[]'::jsonb"))
+    models: Mapped[list] = mapped_column(JSONB, nullable=False,
+                                         server_default=text("'[]'::jsonb"),
+                                         comment="本次调用的模型与 token 用量")
+    llm_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    application_log: Mapped[list] = mapped_column(JSONB, nullable=False,
+                                                  server_default=text("'[]'::jsonb"))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

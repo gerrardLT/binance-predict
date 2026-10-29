@@ -866,12 +866,18 @@ def exclusive_group(channel: str) -> frozenset[str] | None:
 
 @dataclass
 class ChannelConfig:
-    """通道运行时配置（toggle/热调可变；重启回落 live_channels_json 解析结果）。"""
+    """通道运行时配置（toggle/热调可变；重启回落 live_channels_json 解析结果）。
+
+    amount_pct（动态仓位，2026-10-30）：None=用固定 amount_usdt（默认，零行为变化）；
+    非 None 时单笔金额 = 基准本金 × amount_pct（规则见 services/position_sizing.py）。
+    """
 
     enabled: bool = False
     amount_usdt: float = 2.0
     max_daily_orders: int = 100
     max_exec_price: float | None = None   # None → ChannelSpec.auto_max_exec
+    amount_pct: float | None = None       # None → 固定金额；非 None → % 基准本金
+    amount_cap_usdt: float | None = None  # None → settings.live_amount_cap_usdt
     fired: set[int] = field(default_factory=set, repr=False)  # 本进程已开火 window_start（防同窗重单）
     fire_total: int = 0
 
@@ -962,7 +968,39 @@ def parse_channel_config() -> dict[str, ChannelConfig]:
             if not (0.01 <= exec_price <= 0.99):
                 raise ValueError(f"多通道实盘：通道 {ch} 护栏 {exec_price} 超界 [0.01, 0.99]")
             cfg.max_exec_price = exec_price
+        if ov.get("amount_pct") is not None:
+            cfg.amount_pct = _validate_amount_pct(ch, ov["amount_pct"])
+        if ov.get("amount_cap_usdt") is not None:
+            cfg.amount_cap_usdt = _validate_amount_cap(ch, ov["amount_cap_usdt"])
     return configs
+
+
+def _validate_amount_pct(ch: str, raw: object) -> float:
+    """仓位百分比校验（越界拒绝启动，不静默裁剪）。"""
+    try:
+        value = float(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"多通道实盘：通道 {ch} amount_pct 非法：{raw!r}（需为数值）") from exc
+    lo, hi = settings.live_amount_pct_min, settings.live_amount_pct_max
+    if not (lo <= value <= hi):
+        raise ValueError(
+            f"多通道实盘：通道 {ch} amount_pct {value} 超界 [{lo}, {hi}]")
+    return round(value, 6)
+
+
+def _validate_amount_cap(ch: str, raw: object) -> float:
+    """% 模式单笔金额上限校验（不得超过全局硬上限）。"""
+    try:
+        value = float(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"多通道实盘：通道 {ch} amount_cap_usdt 非法：{raw!r}（需为数值）") from exc
+    if not (0.1 <= value <= MAX_ORDER_AMOUNT_USDT):
+        raise ValueError(
+            f"多通道实盘：通道 {ch} amount_cap_usdt {value} 超界"
+            f" [0.1, {MAX_ORDER_AMOUNT_USDT}]")
+    return round(value, 2)
 
 
 def scene_pattern_to_channel(pattern_type: str) -> str | None:
