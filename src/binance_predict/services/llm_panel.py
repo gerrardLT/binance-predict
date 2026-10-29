@@ -542,20 +542,32 @@ class LLMPanel:
     """跨家族多模型并行分析。单模型失败/超时只记 error，不影响其他模型。"""
 
     def __init__(self, panel: list[dict] | None = None,
-                 timeout_s: float | None = None) -> None:
+                 timeout_s: float | None = None,
+                 max_tokens: int = 16000) -> None:
         self.panel: list[dict] = panel if panel is not None else default_panel()
         # 单次调用超时：None → 全局归因默认值（周报等自有节奏的场景可单独设）
         self.timeout_s: float = float(timeout_s or settings.attribution_llm_timeout_s)
+        # 输出预算：归因 16000（2026-10-20 拍板）；周报一次要写 15 个通道，单独放宽
+        self.max_tokens: int = int(max_tokens)
 
-    async def analyze(self, user_prompt: str) -> list[dict]:
+    async def analyze(self, user_prompt: str,
+                      system_prompt: str | None = None) -> list[dict]:
+        """并行调用面板。system_prompt 缺省=归因系统提示词。
+
+        ⚠️ 周报/其它场景必须显式传自己的 system prompt——只换 user prompt 会得到
+        按归因 schema 输出的 JSON（2026-10-30 线上首跑事故：模型输出
+        hypotheses/narrative，周报 verify 判 schema_mismatch）。
+        """
         if not self.panel:
             return [{"provider": "none", "model": "none", "family": "none",
                      "hypotheses": [], "rejected_claims": [], "error": "panel_empty"}]
+        sys_prompt = system_prompt or SYSTEM_PROMPT
         results = await asyncio.gather(*[
-            self._call_one(p, user_prompt) for p in self.panel])
+            self._call_one(p, user_prompt, sys_prompt) for p in self.panel])
         return list(results)
 
-    async def _call_one(self, p: dict, user_prompt: str) -> dict:
+    async def _call_one(self, p: dict, user_prompt: str,
+                        system_prompt: str = SYSTEM_PROMPT) -> dict:
         out: dict[str, Any] = {"provider": p["provider"], "model": p["model"],
                                "family": p["family"], "hypotheses": [],
                                "rejected_claims": [], "error": None}
@@ -566,13 +578,14 @@ class LLMPanel:
                     client.chat.completions.create(
                         model=p["model"],
                         messages=[
-                            {"role": "system", "content": SYSTEM_PROMPT},
+                            {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_prompt},
                         ],
                         temperature=0.2,
                         # 思考模型（deepseek-flash/qwen3.8 等）思考消耗输出预算：
-                        # 16000 保证思考 + JSON 正文都放得下（不禁思考，2026-10-20 拍板）
-                        max_tokens=16000,
+                        # 归因默认 16000（2026-10-20 拍板）；周报正文更长，由调用方放宽。
+                        # ⚠️ 撞上限会被截断成非法 JSON（2026-10-30 周报首跑真实发生）
+                        max_tokens=self.max_tokens,
                     ),
                     timeout=self.timeout_s,
                 )
@@ -583,9 +596,9 @@ class LLMPanel:
             out["prompt_tokens"] = getattr(usage, "prompt_tokens", None)
             out["output_tokens"] = getattr(usage, "completion_tokens", None)
             parsed = _extract_json(text)
+            out["raw_text_head"] = text[:500]   # 过闸失败时的诊断证据（不入库）
             if parsed is None:
                 out["error"] = "json_parse_failed"
-                out["raw_text_head"] = text[:500]
                 return out
             out["parsed"] = parsed
             return out
@@ -670,7 +683,14 @@ WEEKLY_SYSTEM_PROMPT = """你是量化预测市场系统的周度复盘分析师
 }
 
 探索性研究只写方案，不写脚本、不假装跑过数据；没有 falsifiable_test 或
-stop_condition 的条目会被服务端剔除。"""
+stop_condition 的条目会被服务端剔除。
+
+输出预算（硬约束；超预算会被截断成非法 JSON，整份报告作废）：
+- 只输出一个 JSON 对象，不要 markdown 围栏、不要解释、不要复述事实卡；
+- overall.narrative ≤ 3 句；per_signal 每通道 ≤ 1 句诊断 + ≤ 2 条 claims + ≤ 1 条 improvement；
+- watchouts ≤ 6 条（事实卡已有的不要重抄）；exploratory ≤ 3 条；sizing ≤ 6 条；
+- 本周零成交的通道只在 portfolio.idle_channels 里有名字，**不要为它们写数字断言**（服务端会以 evidence_id_not_in_facts 剔除）；
+- 总输出 ≤ 7000 tokens。"""
 
 
 def build_weekly_prompt(facts: dict) -> str:

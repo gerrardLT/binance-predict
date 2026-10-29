@@ -391,6 +391,10 @@ async def collect_facts(
         for ch in channels
     ]
     channels_out.sort(key=lambda c: (c["pnl"], c["cost"]), reverse=True)
+    # 本周零成交的通道不展开事实块（20 个空块≈40k 字符纯噪声）；只留一行名单，
+    # 保留“它本周没开火”这个信息，同时把 prompt 从 ~97k 降到 ~55k 字符。
+    idle_channels = [c["channel"] for c in channels_out if not c["n"]]
+    channels_out = [c for c in channels_out if c["n"]]
 
     portfolio = _portfolio_metrics(rows)
     prev_portfolio = _portfolio_metrics(prev_rows)
@@ -405,6 +409,7 @@ async def collect_facts(
     }
     portfolio["daily"] = _daily_series(rows)
     portfolio["concentration"] = _concentration(channels_out)
+    portfolio["idle_channels"] = {"n": len(idle_channels), "channels": idle_channels[:40]}
 
     base_eq = float(base_equity if base_equity is not None
                     else settings.live_base_equity_usdt)
@@ -578,10 +583,15 @@ def derive_watchouts(facts: dict) -> list[dict]:
 # ======================================================================
 
 def weekly_panel():
-    """周报模型面板：默认单模型（控成本），settings 可覆盖；超时用周报专用值。"""
+    """周报模型面板：默认单模型（控成本），settings 可覆盖。
+
+    超时/输出预算都用周报专用值：15 个通道的报告比归因一组长，16000 输出会在
+    思考模型上被截断成非法 JSON（2026-10-30 线上真实发生）。
+    """
     from .llm_panel import LLMPanel, _provider_entry, default_panel
 
     timeout_s = settings.weekly_review_timeout_s
+    max_tokens = settings.weekly_review_max_tokens
     override = settings.weekly_review_models.strip()
     if override:
         out = []
@@ -593,19 +603,21 @@ def weekly_panel():
             if entry:
                 out.append(entry)
         if out:
-            return LLMPanel(out, timeout_s=timeout_s)
+            return LLMPanel(out, timeout_s=timeout_s, max_tokens=max_tokens)
     full = default_panel()
-    return LLMPanel(full[:1] if full else [], timeout_s=timeout_s)
+    return LLMPanel(full[:1] if full else [], timeout_s=timeout_s,
+                    max_tokens=max_tokens)
 
 
 async def _run_llm(facts: dict, channel_meta: dict[str, dict],
                    base_equity: float) -> tuple[dict | None, list[dict], list[dict], str | None]:
     """调用周报模型并过闸。返回 (report, rejected, models, error)。"""
-    from .llm_panel import build_weekly_prompt, verify_weekly_review
+    from .llm_panel import WEEKLY_SYSTEM_PROMPT, build_weekly_prompt, verify_weekly_review
 
     panel = weekly_panel()
     prompt = build_weekly_prompt(facts)
-    outputs = await panel.analyze(prompt)
+    # 必须传周报自己的 system prompt：只换 user prompt 会让模型按归因 schema 输出
+    outputs = await panel.analyze(prompt, system_prompt=WEEKLY_SYSTEM_PROMPT)
     models: list[dict] = []
     rejected: list[dict] = []
     for mo in outputs:
@@ -620,6 +632,16 @@ async def _run_llm(facts: dict, channel_meta: dict[str, dict],
             mo["parsed"], facts, set(facts.get("evidence_ids") or []),
             channel_meta=channel_meta, base_equity=base_equity)
         rejected.extend(rej)
+        if report is None:
+            # 过闸失败必须留可诊断证据（否则线上只能重跑一次才知道为什么）
+            parsed = mo["parsed"] if isinstance(mo["parsed"], dict) else {}
+            rejected.append({
+                "reason": "report_rejected",
+                "model": f"{mo.get('provider')}:{mo.get('model')}",
+                "schema": parsed.get("schema"),
+                "top_keys": list(parsed.keys())[:10],
+                "raw_text_head": (mo.get("raw_text_head") or "")[:500],
+            })
         if report is not None:
             return report, rejected, models, None
     error = next((m["error"] for m in models if m.get("error")), None) or "no_usable_output"

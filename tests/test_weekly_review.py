@@ -378,10 +378,68 @@ async def test_collect_facts_empty_week():
     assert facts["schema"] == "weekly_review_facts_v1"
     assert facts["portfolio"]["n"] == 0
     assert facts["coverage"]["channels"] == 1
-    assert facts["ch"]["c1"]["n"] == 0
+    # 零成交通道不展开事实块（控 prompt 体积），只进 idle 名单
+    assert facts["ch"] == {} and facts["channels"] == []
+    assert facts["portfolio"]["idle_channels"]["channels"] == ["c1"]
     assert "portfolio.n" in facts["evidence_ids"]
-    assert "ch.c1.amount_usdt" in facts["evidence_ids"]
     assert facts["portfolio"]["equity"]["base_equity_usdt"] == 200.0
+
+
+@pytest.mark.asyncio
+async def test_llm_panel_uses_given_system_prompt(monkeypatch):
+    """周报必须用自己的 system prompt（2026-10-30 线上事故回归）。"""
+    from types import SimpleNamespace
+
+    from binance_predict.services import llm_panel as lp
+
+    seen: list[list[dict]] = []
+
+    class _Completions:
+        async def create(self, **kw):
+            seen.append(kw["messages"])
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content='{"schema":"x"}'))],
+                usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1))
+
+    class _Client:
+        def __init__(self, *a, **kw):
+            self.chat = SimpleNamespace(completions=_Completions())
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(lp.openai, "AsyncOpenAI", _Client)
+    entry = [{"provider": "p", "model": "m", "family": "f",
+              "api_key": "k", "base_url": "b"}]
+
+    await lp.LLMPanel(entry).analyze("u", system_prompt=lp.WEEKLY_SYSTEM_PROMPT)
+    assert seen[0][0] == {"role": "system", "content": lp.WEEKLY_SYSTEM_PROMPT}
+    assert seen[0][1] == {"role": "user", "content": "u"}
+
+    await lp.LLMPanel(entry).analyze("u2")
+    assert seen[1][0]["content"] == lp.SYSTEM_PROMPT   # 缺省仍是归因 prompt
+
+
+@pytest.mark.asyncio
+async def test_run_llm_keeps_diagnostic_when_report_rejected(monkeypatch):
+    """过闸失败必须留证据（schema/顶层键/raw head），否则线上不可诊断。"""
+    from binance_predict.services import weekly_review as wr
+
+    class _Panel:
+        async def analyze(self, prompt, system_prompt=None):
+            return [{"provider": "p", "model": "m", "family": "f", "error": None,
+                     "raw_text_head": '{"hypotheses": []}',
+                     "parsed": {"hypotheses": [], "narrative": "x"}}]
+
+    monkeypatch.setattr(wr, "weekly_panel", lambda: _Panel())
+    facts = {"portfolio": {"equity": {"base_equity_usdt": 200.0}},
+             "ch": {}, "watchouts": [], "evidence_ids": []}
+    report, rejected, models, error = await wr._run_llm(facts, {}, 200.0)
+    assert report is None and error == "no_usable_output"
+    diag = [r for r in rejected if r.get("reason") == "report_rejected"]
+    assert diag and diag[0]["top_keys"] == ["hypotheses", "narrative"]
+    assert diag[0]["raw_text_head"].startswith("{\"hypotheses\"")
+    assert models[0]["model"] == "p:m"
 
 
 @pytest.mark.asyncio
@@ -495,3 +553,14 @@ async def test_load_orders_buckets_by_window_start():
     sql = sess.stmts[0].lower()
     assert "window_start >=" in sql and "window_start <" in sql
     assert "created_at >=" in sql          # 仅 NULL 回落分支
+
+
+def test_weekly_panel_wires_timeout_and_max_tokens(monkeypatch):
+    """回归：面板参数曾因编辑错文件静默不生效（max_tokens 仍为归因的 16000）。"""
+    from binance_predict.services import weekly_review as wr
+
+    monkeypatch.setattr(wr.settings, "weekly_review_max_tokens", 24000)
+    monkeypatch.setattr(wr.settings, "weekly_review_timeout_s", 120.0)
+    panel = wr.weekly_panel()
+    assert panel.max_tokens == 24000
+    assert panel.timeout_s == 120.0

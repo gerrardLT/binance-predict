@@ -204,6 +204,9 @@ class Settings(BaseSettings):
     weekly_review_models: str = ""
     # 单模型调用超时（秒）。
     weekly_review_timeout_s: float = 120.0
+    # 单次输出 token 上限：周报要逐个通道写诊断+建议，16000 在思考模型上
+    # 会被截断成非法 JSON（2026-10-30 线上事故），默认放宽到 24000。
+    weekly_review_max_tokens: int = 24000
 
     # --- 告警配置 ---
     agent_alert_enabled: bool = True
