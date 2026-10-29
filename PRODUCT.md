@@ -35,7 +35,8 @@ web
 
 - 后端 FastAPI（`src/binance_predict/main.py`，~4150 行），56 个 `/api/*` 端点
 - 前端 React 19 + Vite 8 + TypeScript 6 + Tailwind CSS v4 + recharts 3，纯 CSR，无路由库
-- 5 个 tab：`market` 市场情绪 / `agent` Agent自进化 / `monitor` 运行监控 / `analysis` 信号分析 / `live` 实盘交易（`TAB_IDS`，`App.tsx:2138`）
+- 7 个 tab：`market` 市场情绪 / `agent` LLM 归因·自进化 / `weekly` 每周复盘 / `monitor` 运行监控 / `analysis` 信号分析 / `live` 实盘交易 / `notify` 通知配置（`TAB_IDS`）
+- 信息密度约定（2026-10-30）：主视图一屏只放「一眼判断」的字段；下钻、全量列表、曲线与分桶表一律进右侧模态抽屉 `DetailDrawer`（`App.tsx`；与常驻侧栏 `ChartDrawer` 职责不同），不再用长页面堆卡片 + 卡片内二次滚动
 - 轮询驱动：分析面板 60s，行情采样 15s
 - 部署：`push main` → CI（lint + test）→ 构建镜像 → SSH 部署 VPS。**前端改动一旦推 main 就上线**
 - 市场节奏：5m 与 15m 两种预测市场，资金日内快速循环（今日 `todayTotalCost` 可超过钱包余额）

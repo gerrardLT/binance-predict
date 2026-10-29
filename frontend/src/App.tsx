@@ -486,6 +486,29 @@ const api = {
     }).then(r => r.json()),
   dismissAdvice: (id: number) =>
     authFetch(`/api/attribution/advices/${id}/dismiss`, { method: 'POST' }).then(r => r.json()),
+  // 每周复盘（2026-10-30）：组合报告 + 单信号 + 注意点 + 探索性研究 + 仓位建议
+  getWeeklyReviews: (limit = 12) =>
+    authFetch(`/api/weekly/reviews?limit=${limit}`).then(r => r.json()),
+  getWeeklyReview: (id: number) => authFetch(`/api/weekly/reviews/${id}`).then(r => r.json()),
+  triggerWeeklyReview: (weekOffset = -1) =>
+    authFetch('/api/weekly/reviews/trigger', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ week_offset: weekOffset }),
+    }).then(r => r.json()),
+  applyWeeklySizing: (reviewId: number, channel: string, pct: number) =>
+    authFetch(`/api/weekly/reviews/${reviewId}/apply-sizing`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ channel, pct }),
+    }).then(r => r.json()),
+  getSizingConfig: () => authFetch('/api/live/sizing-config').then(r => r.json()),
+  setSizingConfig: (baseEquity: number) =>
+    authFetch('/api/live/sizing-config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ base_equity_usdt: baseEquity }),
+    }).then(r => r.json()),
   // 实盘面板（2026-08-22）：钱包/实盘状态/下单/订单历史
   getPredictionWallet: () => authFetch('/api/prediction-wallet').then(r => r.json()),
   getLiveStatus: () => authFetch('/api/misalignment/signals').then(r => r.json()),
@@ -1378,6 +1401,52 @@ function Card({ title, children, className = '' }: { title: string; children: Re
       </div>
       <div className="ds-card-body">{children}</div>
     </div>
+  )
+}
+
+// 详情抽屉（模态层）：一屏放不下的下钻内容。
+// 与 `ChartDrawer`（常驻右侧图表栈、无遮罩、可反复开合）职责不同：
+// 本组件是「看完即关」的模态层——带遮罩、ESC、焦点与 body 滚动锁。
+// 叠在模态（如 PackDetailModal）下面时传 `escape={false}`，避免一次 ESC 关两层。
+function DetailDrawer({ title, subtitle, onClose, children, escape = true }: {
+  title: string
+  subtitle?: string
+  onClose: () => void
+  children: React.ReactNode
+  escape?: boolean
+}) {
+  const closeRef = useRef<HTMLButtonElement>(null)
+  useEffect(() => {
+    const prev = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    closeRef.current?.focus({ preventScroll: true })
+    return () => { document.body.style.overflow = prev }
+  }, [])
+  useEffect(() => {
+    if (!escape) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose, escape])
+  return createPortal(
+    <div className="fixed inset-0 z-50 bg-overlay" onClick={onClose}>
+      <div
+        className="absolute right-0 top-0 h-full w-full max-w-[min(780px,100%)] bg-card border-l border-line overflow-y-auto"
+        onClick={e => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+      >
+        <div className="sticky top-0 z-10 bg-card/95 backdrop-blur border-b border-line px-4 py-2 flex items-center gap-2">
+          <span className="font-bold text-sm text-ink-95">{title}</span>
+          {subtitle && <span className="text-[11px] text-ink-55 font-mono">{subtitle}</span>}
+          <button ref={closeRef} onClick={onClose}
+            className="ml-auto px-2 py-0.5 rounded-pill border border-line text-[11px] text-ink-70 hover:text-ink-95 focus-visible:outline-2 focus-visible:outline-brand">关闭</button>
+        </div>
+        <div className="p-3 space-y-3">{children}</div>
+      </div>
+    </div>,
+    document.body,
   )
 }
 
@@ -4412,13 +4481,14 @@ function LiveTradeTab() {
 // Main App
 // ============================================================
 
-const TAB_IDS = ['market', 'agent', 'monitor', 'analysis', 'live', 'notify'] as const
+const TAB_IDS = ['market', 'agent', 'weekly', 'monitor', 'analysis', 'live', 'notify'] as const
 type TabId = (typeof TAB_IDS)[number]
 
 /* tab 中文名。此前内联在 5 个按钮里重复 5 次，收敛为单一事实源。 */
 const TAB_LABELS: Record<TabId, string> = {
   market: '市场情绪',
   agent: 'LLM 归因·自进化',
+  weekly: '每周复盘',
   monitor: '运行监控',
   analysis: '信号分析',
   live: '实盘交易',
@@ -4688,6 +4758,7 @@ export default function App() {
         )}
 
         {tab === 'agent' && <AttributionTab />}
+        {tab === 'weekly' && <WeeklyReviewTab />}
 
         {tab === 'monitor' && <MonitorTab />}
 
@@ -5025,16 +5096,22 @@ function AttrVerdictBadge({ verdict }: { verdict: string | null }) {
 function AttributionTab() {
   const [status, setStatus] = useState<AttributionStatus | null>(null)
   const [runs, setRuns] = useState<AttributionRunRow[]>([])
-  const [openRunId, setOpenRunId] = useState<number | null>(null)
-  const [runDetail, setRunDetail] = useState<AttributionRunDetail | null>(null)
   const [hypotheses, setHypotheses] = useState<HypothesisRow[]>([])
   const [hypFilter, setHypFilter] = useState<string>('')
   const [packs, setPacks] = useState<PackListRow[]>([])
+  // 一屏只放摘要；明细/全量/证据包全部进右侧抽屉（Drawer）
+  const [runView, setRunView] = useState<{ mode: 'list' | 'detail'; id?: number } | null>(null)
+  const [runDetail, setRunDetail] = useState<AttributionRunDetail | null>(null)
   const [openPackOrderId, setOpenPackOrderId] = useState<number | null>(null)
   const [packDetail, setPackDetail] = useState<PackDetail | null>(null)
+  const [hypDrawer, setHypDrawer] = useState(false)
+  const [packDrawer, setPackDrawer] = useState(false)
   const [triggerChannel, setTriggerChannel] = useState('')
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState('')
+  // 明细请求序号：“最后点击为准”。否则连点 A→B 时先发的 A 响应后到，
+  // 会把 B 的标题配上 A 的事实卡（诊断屏显示错数据）。
+  const reqSeq = useRef({ run: 0, pack: 0 })
 
   const channels = useMemo(() => Object.keys(SIGNAL_INFO), [])
   const refreshCore = useCallback(async () => {
@@ -5059,15 +5136,19 @@ function AttributionTab() {
     api.getAttributionPacks(undefined, 50).then(r => { if (r?.packs) setPacks(r.packs) }).catch(() => {})
   }, [msg])
 
-  const openRun = async (id: number) => {
-    if (openRunId === id) { setOpenRunId(null); return }
-    setOpenRunId(id); setRunDetail(null)
+  const openRunDetail = async (id: number) => {
+    const seq = ++reqSeq.current.run
+    setRunView({ mode: 'detail', id })
+    setRunDetail(null)
     const d = await api.getAttributionRun(id).catch(() => null)
+    if (seq !== reqSeq.current.run) return   // 已有更新的请求，丢弃过期响应
     if (d && !d.error) setRunDetail(d)
   }
   const openPack = async (orderId: number) => {
+    const seq = ++reqSeq.current.pack
     setOpenPackOrderId(orderId); setPackDetail(null)
     const d = await api.getAttributionPack(orderId).catch(() => null)
+    if (seq !== reqSeq.current.pack) return
     if (d && !d.error) setPackDetail(d)
   }
   const doTrigger = async () => {
@@ -5083,29 +5164,33 @@ function AttributionTab() {
     refreshCore()
   }
 
+  const panelText = (status?.panel ?? []).map(m => `${m.provider}·${m.model}（${m.family}）`).join('；') || '--'
+  const latest = runs[0]
+  const supportedN = hypotheses.filter(h => h.status === 'SUPPORTED').length
+  const rejectedN = hypotheses.filter(h => h.status === 'REJECTED').length
+  const pendingHypN = hypotheses.filter(h => h.action_status === 'PENDING').length
+
   return (
-    <div className="space-y-4">
-      {/* 状态卡 + 手动触发 */}
-      <div className="bg-card rounded-card border border-line px-5 py-4 space-y-3">
-        <div className="flex items-center justify-between flex-wrap gap-2">
-          <div className="flex items-center gap-2">
-            <span className="font-bold text-ink-95">归因引擎</span>
-            <HelpHint text="闭环：每单结算后建证据包；连败/红灯/周报触发深归因。先做随机性检验，与随机一致即止（防叙事谬误）；异常才让多家族 LLM 提假设，假设必须过统计检验才算数。LLM 永无执行权，一切参数调整由人工操作。" />
-          </div>
-          <div className="flex items-center gap-2 text-[11px] text-ink-55">
+    <div className="space-y-3">
+      {/* ============ 一屏第 1 行：引擎状态 + 手动触发（压缩成 2 行） ============ */}
+      <div className="bg-card rounded-card border border-line px-4 py-2.5 space-y-2">
+        <div className="flex items-center gap-x-3 gap-y-1 flex-wrap text-[11px] text-ink-70">
+          <span className="font-bold text-sm text-ink-95">归因引擎</span>
+          <span className="flex items-center gap-1">
             <span className={`inline-block w-2 h-2 rounded-full ${status?.enabled ? 'bg-positive' : 'bg-ink-55'}`} />
-            {status ? `${status.enabled ? '启用' : '停用'}｜LLM ${status.llm_enabled ? '开' : '关'}｜阈值 p<${status.streak_p}｜窗口 ${status.streak_window_n} 笔｜日限 ${status.max_daily_runs} 次/通道` : '加载中…'}
-          </div>
-        </div>
-        <div className="flex items-center gap-2 text-[11px] text-ink-55 flex-wrap">
-          <span>模型面板（跨家族）：</span>
-          {status?.panel?.map(m => (
-            <span key={m.model} className="px-1.5 py-0.5 bg-sunken border border-line rounded-pill">{m.provider}·{m.model}（{m.family}）</span>
-          )) ?? <span>--</span>}
-          <HelpHint text="共识≠正确（同源模型约 60% 同错）；分歧是路由信号而非投票，最终裁决权在统计检验。" />
+            {status ? (status.enabled ? '启用' : '停用') : '…'}
+          </span>
+          <span className={status?.llm_enabled ? 'text-ink-80' : 'text-warning'}>LLM {status ? (status.llm_enabled ? '开' : '关') : '--'}</span>
+          <span className="font-mono">p&lt;{status?.streak_p ?? '--'}</span>
+          <span className="font-mono">窗口 {status?.streak_window_n ?? '--'}</span>
+          <span className="font-mono">日限 {status?.max_daily_runs ?? '--'}/通道</span>
+          <span className="flex items-center gap-1">模型 {status?.panel?.length ?? 0}
+            <HelpHint text={`跨家族面板：${panelText}。共识≠正确（同源模型约 60% 同错）；分歧是路由信号而非投票，最终裁决权在统计检验。闭环：结算建证据包 → 连败/红灯/周报触发深归因 → 随机性检验先行（与随机一致即止）→ 多 LLM 提假设 → 假设必须过统计检验才算数。LLM 永无执行权。`} />
+          </span>
+          {msg && <span className="ml-auto text-[11px] text-ink-70">{msg}</span>}
         </div>
         <div className="flex items-center gap-2 flex-wrap">
-          <select className="px-2 py-1 rounded-sm border border-line bg-sunken text-[12px]" value={triggerChannel} onChange={e => setTriggerChannel(e.target.value)}>
+          <select className="px-2 py-1 rounded-sm border border-line bg-sunken text-[12px] max-w-[220px]" value={triggerChannel} onChange={e => setTriggerChannel(e.target.value)}>
             <option value="">选择通道…</option>
             {channels.map(c => <option key={c} value={c}>{SIGNAL_INFO[c]?.name ?? c}</option>)}
           </select>
@@ -5113,108 +5198,188 @@ function AttributionTab() {
             className="px-3 py-1 rounded-pill bg-brand text-white text-[12px] font-semibold disabled:opacity-50">
             {busy ? '归因中…' : '手动触发归因'}
           </button>
-          {msg && <span className="text-[11px] text-ink-70">{msg}</span>}
+          <span className="text-[10px] text-ink-55">手动触发不受日预算限制；与随机一致时会直接落事实卡、不调模型。</span>
         </div>
       </div>
 
-      {/* 归因运行列表 */}
-      <div className="bg-card rounded-card border border-line px-5 py-4 space-y-2">
-        <div className="flex items-center gap-2">
-          <span className="font-bold text-ink-95">归因运行</span>
-          <HelpHint text="每次事件（连败检测/红灯/周报/手动）一条记录。verdict 由随机性检验先行给出：与随机一致 = 无归因证据，深归因被前置门拦截。" />
-        </div>
-        {runs.length === 0 && <div className="text-[12px] text-ink-55 py-3">暂无运行——等待事件触发或手动触发一次。</div>}
-        {runs.map(r => (
-          <div key={r.id} className="border border-line-soft rounded-sm">
-            <button className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-sunken/50" onClick={() => openRun(r.id)}>
-              <span className="font-mono text-[11px] text-ink-55">#{r.id}</span>
-              <span className="px-1.5 py-0.5 bg-sunken border border-line rounded-pill text-[10px]">{ATTR_TRIGGER_META[r.trigger_type] ?? r.trigger_type}</span>
-              <span className="text-[12px] font-semibold text-ink-95">{SIGNAL_INFO[r.channel]?.name ?? r.channel}</span>
-              <AttrVerdictBadge verdict={r.verdict} />
-              <span className={`text-[10px] ${r.status === 'FAILED' ? 'text-negative' : 'text-ink-55'}`}>{r.status}</span>
-              <span className="ml-auto text-[11px] text-ink-55 font-mono">{r.created_at?.slice(5, 16).replace('T', ' ')}</span>
-            </button>
-            {openRunId === r.id && (
-              <div className="px-3 pb-3 space-y-3 border-t border-line-soft pt-2">
-                {r.summary && <pre className="text-[11px] text-ink-70 whitespace-pre-wrap bg-sunken rounded-sm px-2 py-1.5">{r.summary}</pre>}
-                {!runDetail && <div className="text-[11px] text-ink-55">加载详情…</div>}
-                {runDetail?.error && <div className="text-[11px] text-negative">错误：{runDetail.error}</div>}
-                {runDetail && <RunDetailBody detail={runDetail} />}
-              </div>
-            )}
+      {/* ============ 一屏第 2 行：运行 + 假设（两列，各 6 条） ============ */}
+      <div className="grid gap-3 lg:grid-cols-2 items-start">
+        <div className="bg-card rounded-card border border-line">
+          <div className="flex items-center gap-2 px-4 pt-3 pb-1.5">
+            <span className="font-bold text-ink-95">归因运行</span>
+            <span className="text-[10px] text-ink-55 font-mono">{runs.length}</span>
+            {latest && <span className="text-[10px] text-ink-55">最近 #{latest.id} · {latest.created_at?.slice(5, 16).replace('T', ' ')}</span>}
+            <HelpHint text="每次事件（连败检测/红灯/周报/手动）一条记录。verdict 由随机性检验先行给出：与随机一致 = 无归因证据，深归因被前置门拦截。" />
+            <button onClick={() => setRunView({ mode: 'list' })} disabled={!runs.length}
+              className="ml-auto px-2 py-0.5 rounded-pill border border-line text-[10px] text-ink-55 disabled:opacity-40">全部</button>
           </div>
-        ))}
-      </div>
-
-      {/* 假设台账 */}
-      <div className="bg-card rounded-card border border-line px-5 py-4 space-y-2">
-        <div className="flex items-center gap-2 flex-wrap">
-          <span className="font-bold text-ink-95">假设台账</span>
-          <HelpHint text="LLM 提出的假设经统计检验后的台账：SUPPORTED=检验显著支持；REJECTED=被证伪并进错误记忆（后续 prompt 自动注入，防止重复讲故事）；候选=尚未可检验或检验不显著。" />
-          <div className="flex gap-1 ml-auto">
-            {['', 'CANDIDATE', 'SUPPORTED', 'REJECTED'].map(f => (
-              <button key={f || 'all'} onClick={() => setHypFilter(f)}
-                className={`px-2 py-0.5 rounded-pill text-[11px] border ${hypFilter === f ? 'bg-brand text-white border-brand' : 'border-line text-ink-55'}`}>
-                {f ? HYP_STATUS_META[f].label : '全部'}
+          <div className="max-h-[240px] overflow-y-auto">
+            {runs.length === 0 && <div className="px-4 py-6 text-[12px] text-ink-55">暂无运行——等待事件触发或手动触发一次。</div>}
+            {runs.slice(0, 6).map(r => (
+              <button key={r.id} onClick={() => openRunDetail(r.id)}
+                className="w-full grid grid-cols-[auto_1fr_auto_auto] items-center gap-2 px-4 py-1.5 text-left border-t border-line-soft hover:bg-sunken/50">
+                <span className="font-mono text-[10px] text-ink-55">#{r.id}</span>
+                <span className="flex items-center gap-1.5 min-w-0">
+                  <span className="px-1.5 py-0.5 bg-sunken border border-line rounded-pill text-[9px] shrink-0">{ATTR_TRIGGER_META[r.trigger_type] ?? r.trigger_type}</span>
+                  <span className="text-[12px] font-medium text-ink-95 truncate">{SIGNAL_INFO[r.channel]?.name ?? r.channel}</span>
+                  {r.status === 'FAILED' && <span className="text-[9px] text-negative shrink-0">FAILED</span>}
+                </span>
+                <AttrVerdictBadge verdict={r.verdict} />
+                <span className="text-[10px] text-ink-55 font-mono whitespace-nowrap">{r.created_at?.slice(5, 16).replace('T', ' ')}</span>
               </button>
             ))}
           </div>
         </div>
-        {hypotheses.length === 0 && <div className="text-[12px] text-ink-55 py-3">暂无假设。</div>}
-        <div className="space-y-1.5 max-h-96 overflow-y-auto">
-          {hypotheses.map(h => (
-            <div key={h.id} className="border border-line-soft rounded-sm px-3 py-2 space-y-1">
-              <div className="flex items-center gap-2 flex-wrap">
-                <span className={`px-1.5 py-0.5 rounded-pill border text-[10px] font-semibold ${HYP_STATUS_META[h.status]?.cls ?? ''}`}>{HYP_STATUS_META[h.status]?.label ?? h.status}</span>
-                <span className="px-1.5 py-0.5 bg-sunken border border-line rounded-pill text-[10px]">{ATTR_CATEGORY_META[h.category] ?? h.category}</span>
-                {h.channel && <span className="text-[11px] text-ink-55">{SIGNAL_INFO[h.channel]?.name ?? h.channel}</span>}
-                {h.in_error_memory && <span className="text-[10px] text-negative">⚠ 错误记忆</span>}
-                <span className="ml-auto text-[10px] text-ink-55 font-mono">支持{h.support_count}·证伪{h.reject_count}</span>
-              </div>
-              <div className="text-[12px] text-ink-90">{h.statement}</div>
-              {h.last_test && 'name' in (h.last_test as Record<string, unknown>) && (
-                <div className="text-[11px] text-ink-55">检验：{String((h.last_test as Record<string, unknown>).name)} → {String((h.last_test as Record<string, unknown>).verdict ?? '')}</div>
-              )}
-              {h.action_suggestion && (
-                <div className="flex items-center gap-2 flex-wrap">
-                  <span className="text-[11px] text-warning">建议：{h.action_suggestion}</span>
-                  {h.action_status === 'PENDING' && (
-                    <>
-                      <button onClick={() => actHyp(h.id, 'APPLIED')} className="px-2 py-0.5 rounded-pill bg-positive text-white text-[10px]">已人工执行</button>
-                      <button onClick={() => actHyp(h.id, 'DISMISSED')} className="px-2 py-0.5 rounded-pill border border-line text-ink-55 text-[10px]">否决</button>
-                    </>
-                  )}
-                  {h.action_status && h.action_status !== 'PENDING' && <span className="text-[10px] text-ink-55">（已处置：{h.action_status === 'APPLIED' ? '执行' : '否决'}）</span>}
-                </div>
-              )}
+
+        <div className="bg-card rounded-card border border-line">
+          <div className="flex items-center gap-2 px-4 pt-3 pb-1.5 flex-wrap">
+            <span className="font-bold text-ink-95">假设台账</span>
+            {!hypFilter && (
+              <span className="text-[10px] font-mono">
+                <span className="text-positive">支持{supportedN}</span> · <span className="text-negative">证伪{rejectedN}</span>
+                {pendingHypN > 0 && <span className="text-warning"> · 待处置{pendingHypN}</span>}
+              </span>
+            )}
+            <HelpHint text="LLM 提出的假设经统计检验后的台账：SUPPORTED=检验显著支持；REJECTED=被证伪并进错误记忆（后续 prompt 自动注入，防止重复讲故事）；候选=尚未可检验或检验不显著。" />
+            <div className="flex gap-1 ml-auto">
+              {['', 'CANDIDATE', 'SUPPORTED', 'REJECTED'].map(f => (
+                <button key={f || 'all'} onClick={() => setHypFilter(f)}
+                  className={`px-2 py-0.5 rounded-pill text-[10px] border ${hypFilter === f ? 'bg-brand text-white border-brand' : 'border-line text-ink-55'}`}>
+                  {f ? HYP_STATUS_META[f].label : '全部'}
+                </button>
+              ))}
+              <button onClick={() => setHypDrawer(true)}
+                className="px-2 py-0.5 rounded-pill border border-line text-[10px] text-ink-55">展开 {hypotheses.length}</button>
             </div>
-          ))}
+          </div>
+          {/* 不设内层 max-h：4 条最坏 ≈430px，宁可使卡片高一点，
+              也不在卡片里再造一个滚动区（本次改造的目的之一）。 */}
+          <div>
+            {hypotheses.length === 0 && <div className="px-4 py-6 text-[12px] text-ink-55">暂无假设。</div>}
+            {hypotheses.slice(0, 4).map(h => <HypothesisItem key={h.id} h={h} onAct={actHyp} />)}
+          </div>
         </div>
       </div>
 
-      {/* 证据包 */}
-      <div className="bg-card rounded-card border border-line px-5 py-4 space-y-2">
-        <div className="flex items-center gap-2">
-          <span className="font-bold text-ink-95">订单证据包</span>
-          <HelpHint text="每笔实盘订单结算后自动组装的前/中/后全场景上下文（K线冻结、报价轨迹、执行链路、结算路径）。它是事实卡与 LLM 归因的唯一证据来源。" />
-        </div>
-        {packs.length === 0 && <div className="text-[12px] text-ink-55 py-3">暂无证据包（可先跑 scripts/order_context_backfill.py 回填历史订单）。</div>}
-        <div className="space-y-1">
+      {/* ============ 一屏第 3 行：证据包（只留计数 + 最近 3 个） ============ */}
+      <div className="bg-card rounded-card border border-line px-4 py-2.5 flex items-center gap-x-3 gap-y-1.5 flex-wrap">
+        <span className="font-bold text-ink-95">订单证据包</span>
+        <span className="text-[11px] text-ink-55 font-mono">{packs.length}</span>
+        <HelpHint text="每笔实盘订单结算后自动组装的前/中/后全场景上下文（K线冻结、报价轨迹、执行链路、结算路径）。它是事实卡与 LLM 归因的唯一证据来源。" />
+        {packs.slice(0, 3).map(pk => (
+          <button key={pk.id} onClick={() => openPack(pk.order_id)}
+            className="px-2 py-0.5 rounded-pill border border-line-soft bg-sunken text-[10px] text-ink-70 hover:border-brand hover:text-ink-95">
+            <span className="font-mono">#{pk.order_id}</span> {SIGNAL_INFO[pk.channel]?.name ?? pk.channel}
+            {pk.status !== 'BUILT' && <span className="text-warning"> ·缺维度</span>}
+          </button>
+        ))}
+        {packs.length === 0 && <span className="text-[11px] text-ink-55">暂无（可先跑 scripts/order_context_backfill.py 回填）。</span>}
+        <button onClick={() => setPackDrawer(true)} disabled={!packs.length}
+          className="ml-auto px-2 py-0.5 rounded-pill border border-line text-[10px] text-ink-55 disabled:opacity-40">全部 {packs.length}</button>
+      </div>
+
+      {/* ============ 抽屉：运行全量 / 运行详情 ============ */}
+      {runView && (
+        <DetailDrawer
+          title={runView.mode === 'detail' ? `归因运行 #${runView.id}` : '全部归因运行'}
+          subtitle={runView.mode === 'detail' ? runs.find(r => r.id === runView.id)?.channel : `${runs.length} 条`}
+          onClose={() => { setRunView(null); setRunDetail(null) }}
+          escape={openPackOrderId === null}
+        >
+          {runView.mode === 'detail' ? (
+            <>
+              <button onClick={() => setRunView({ mode: 'list' })} className="text-[11px] text-ink-55 hover:text-ink-95">← 返回运行列表</button>
+              {(() => {
+                const row = runs.find(r => r.id === runView.id)
+                return row?.summary ? <pre className="text-[11px] text-ink-70 whitespace-pre-wrap bg-sunken rounded-sm px-2 py-1.5">{row.summary}</pre> : null
+              })()}
+              {!runDetail && <div className="text-[11px] text-ink-55">加载详情…</div>}
+              {runDetail?.error && <div className="text-[11px] text-negative">错误：{runDetail.error}</div>}
+              {runDetail && <RunDetailBody detail={runDetail} />}
+            </>
+          ) : (
+            <div>
+              {runs.map(r => (
+                <button key={r.id} onClick={() => openRunDetail(r.id)}
+                  className="w-full grid grid-cols-[auto_1fr_auto_auto_auto] items-center gap-2 px-1 py-1.5 text-left border-b border-line-soft hover:bg-sunken/50">
+                  <span className="font-mono text-[10px] text-ink-55">#{r.id}</span>
+                  <span className="flex items-center gap-1.5 min-w-0">
+                    <span className="px-1.5 py-0.5 bg-sunken border border-line rounded-pill text-[9px] shrink-0">{ATTR_TRIGGER_META[r.trigger_type] ?? r.trigger_type}</span>
+                    <span className="text-[12px] font-medium text-ink-95 truncate">{SIGNAL_INFO[r.channel]?.name ?? r.channel}</span>
+                  </span>
+                  <AttrVerdictBadge verdict={r.verdict} />
+                  <span className="text-[10px] text-ink-55">{r.status}</span>
+                  <span className="text-[10px] text-ink-55 font-mono whitespace-nowrap">{r.created_at?.slice(5, 16).replace('T', ' ')}</span>
+                </button>
+              ))}
+            </div>
+          )}
+        </DetailDrawer>
+      )}
+
+      {/* ============ 抽屉：假设全量 ============ */}
+      {hypDrawer && (
+        <DetailDrawer title="假设台账" subtitle={`${hypotheses.length} 条${hypFilter ? ` · ${HYP_STATUS_META[hypFilter]?.label ?? hypFilter}` : ''}`}
+          onClose={() => setHypDrawer(false)} escape={openPackOrderId === null}>
+          {hypotheses.length === 0 && <div className="text-[12px] text-ink-55">暂无假设。</div>}
+          {hypotheses.map(h => <HypothesisItem key={h.id} h={h} onAct={actHyp} />)}
+        </DetailDrawer>
+      )}
+
+      {/* ============ 抽屉：证据包全量 ============ */}
+      {packDrawer && (
+        <DetailDrawer title="订单证据包" subtitle={`${packs.length} 条`} onClose={() => setPackDrawer(false)}
+          escape={openPackOrderId === null}>
           {packs.map(pk => (
             <button key={pk.id} onClick={() => openPack(pk.order_id)}
-              className="w-full flex items-center gap-2 px-3 py-1.5 border border-line-soft rounded-sm text-left hover:bg-sunken/50">
+              className="w-full flex items-center gap-2 px-1 py-1.5 border-b border-line-soft text-left hover:bg-sunken/50">
               <span className="font-mono text-[11px] text-ink-55">#{pk.order_id}</span>
-              <span className="text-[12px]">{SIGNAL_INFO[pk.channel]?.name ?? pk.channel}</span>
+              <span className="text-[12px] truncate">{SIGNAL_INFO[pk.channel]?.name ?? pk.channel}</span>
               <span className="text-[11px] text-ink-55">{pk.direction}</span>
               <span className={`text-[10px] px-1 rounded ${pk.status === 'BUILT' ? 'text-positive' : 'text-warning'}`}>{pk.status === 'BUILT' ? '完整' : '缺维度'}</span>
               <span className="ml-auto text-[11px] text-ink-55 font-mono">{fmtMs(pk.window_start)}</span>
             </button>
           ))}
-        </div>
-      </div>
+        </DetailDrawer>
+      )}
 
       {openPackOrderId !== null && (
         <PackDetailModal orderId={openPackOrderId} detail={packDetail} onClose={() => { setOpenPackOrderId(null); setPackDetail(null) }} />
+      )}
+    </div>
+  )
+}
+
+// 台账单条（列表与抽屉共用，保证两处口径一致）
+function HypothesisItem({ h, onAct }: {
+  h: HypothesisRow
+  onAct: (id: number, action: 'APPLIED' | 'DISMISSED') => void
+}) {
+  const test = h.last_test as Record<string, unknown> | null
+  return (
+    <div className="px-4 py-2 border-t border-line-soft space-y-1">
+      <div className="flex items-center gap-1.5 flex-wrap text-[10px]">
+        <span className={`px-1.5 py-0.5 rounded-pill border font-semibold ${HYP_STATUS_META[h.status]?.cls ?? ''}`}>{HYP_STATUS_META[h.status]?.label ?? h.status}</span>
+        <span className="px-1.5 py-0.5 bg-sunken border border-line rounded-pill">{ATTR_CATEGORY_META[h.category] ?? h.category}</span>
+        {h.channel && <span className="text-ink-55">{SIGNAL_INFO[h.channel]?.name ?? h.channel}</span>}
+        {h.in_error_memory && <span className="text-negative">⚠ 错误记忆</span>}
+        <span className="ml-auto text-ink-55 font-mono">支持{h.support_count}·证伪{h.reject_count}</span>
+      </div>
+      <div className="text-[12px] text-ink-90 line-clamp-2" title={h.statement}>{h.statement}</div>
+      {test && 'name' in test && (
+        <div className="text-[10px] text-ink-55">检验：{String(test.name)} → {String(test.verdict ?? '')}</div>
+      )}
+      {h.action_suggestion && (
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-[10px] text-warning line-clamp-1" title={h.action_suggestion}>建议：{h.action_suggestion}</span>
+          {h.action_status === 'PENDING' && (
+            <>
+              <button onClick={() => onAct(h.id, 'APPLIED')} className="px-2 py-0.5 rounded-pill bg-positive text-white text-[10px]">已人工执行</button>
+              <button onClick={() => onAct(h.id, 'DISMISSED')} className="px-2 py-0.5 rounded-pill border border-line text-ink-55 text-[10px]">否决</button>
+            </>
+          )}
+          {h.action_status && h.action_status !== 'PENDING' && <span className="text-[10px] text-ink-55">（已处置：{h.action_status === 'APPLIED' ? '执行' : '否决'}）</span>}
+        </div>
       )}
     </div>
   )
@@ -5373,6 +5538,13 @@ function SceneCard({ pre, post, win }: {
 }
 
 function PackDetailModal({ orderId, detail, onClose }: { orderId: number; detail: PackDetail | null; onClose: () => void }) {
+  // ESC 关自己（叠在 DetailDrawer 上时，Drawer 已由 escape=false 让位，
+  // 否则一次 ESC 会关错层——见 DetailDrawer 注释）
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
   if (!detail) {
     return createPortal(
       <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={onClose}>
@@ -5656,14 +5828,13 @@ function SignalHealthDrill({ scope, keyName, onClose }: { scope: string; keyName
   const m = d?.metrics
   const cp = d?.change_point
   return (
-    <div className="bg-card rounded-card border border-line p-4 space-y-3">
+    <div className="space-y-3">
       <div className="flex items-center gap-2 flex-wrap">
         {d && <LightDot light={d.light} />}
-        <span className="font-bold text-sm text-ink-95">{SIGNAL_INFO[keyName]?.name ?? keyName}</span>
-        <span className="text-[11px] text-ink-55 font-mono">{scope === 'live' ? '实盘' : '影子'} · {keyName}</span>
         {d?.death_status && d.death_status !== 'ALIVE' && (
           <DeathBadge status={d.death_status} reason={d.death_reason} />
         )}
+        <span className="text-[11px] text-ink-55 font-mono">{scope === 'live' ? '实盘' : '影子'} · {keyName}</span>
         <button onClick={onClose} className="ml-auto px-2 py-0.5 text-[11px] rounded-pill bg-sunken text-ink-80 hover:bg-sunken-hover transition">收起</button>
       </div>
       {!d && <div className="text-center text-ink-55 py-6 text-sm">{err || '加载下钻中...'}</div>}
@@ -5806,7 +5977,7 @@ function CalibrationMonitorCard({ cal }: { cal: CalibrationReport }) {
     [cal, lens, onlyEnabled],
   )
   return (
-    <div className="bg-card rounded-card border border-line p-4 space-y-2">
+    <div className="space-y-2">
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <div className="flex items-center gap-2 text-sm">
           <span className="font-bold text-ink-95">买贵校准监控</span>
@@ -5824,7 +5995,7 @@ function CalibrationMonitorCard({ cal }: { cal: CalibrationReport }) {
           </label>
         </div>
       </div>
-      <div className="overflow-x-auto max-h-96 overflow-y-auto">
+      <div className="overflow-x-auto">
         <table className="w-full min-w-[880px] text-xs">
           <thead><tr className="text-ink-55 border-b border-line">
             <th className="py-1.5 px-2 text-left">对象</th><th className="py-1.5 px-2 text-left">行情档</th>
@@ -5863,6 +6034,375 @@ function CalibrationMonitorCard({ cal }: { cal: CalibrationReport }) {
   )
 }
 
+// ============================================================
+// 每周复盘（2026-10-30）
+// 口径：事实卡由确定性代码算，LLM 只解释与建议；仓位建议只能人工应用，
+// 且服务端重算「不放大敞口」。详见 docs/WEEKLY_REVIEW_PLAN.md。
+// ============================================================
+
+interface WeeklyClaim {
+  text: string
+  evidence_ids: string[]
+  numbers: { name: string; value: number }[]
+}
+
+interface WeeklyWatchout {
+  code: string
+  severity: 'P0' | 'P1' | 'P2'
+  channel: string | null
+  statement: string
+}
+
+interface WeeklyImprovement {
+  change: string
+  mechanism: string
+  test: { name: string; params?: Record<string, unknown> }
+  expected_effect: string
+  kill_criteria: string
+  priority: string
+}
+
+interface WeeklyPerSignal {
+  channel: string
+  display_name: string
+  verdict: 'KEEP' | 'WATCH' | 'TIGHTEN' | 'PAUSE' | 'ESCALATE'
+  diagnosis: string
+  claims: WeeklyClaim[]
+  improvements: WeeklyImprovement[]
+}
+
+interface WeeklyExploratory {
+  question: string
+  mechanism: string
+  data_source: string
+  falsifiable_test: string
+  split: string
+  n_estimate: number
+  multiplicity: string
+  stop_condition: string
+  priority: string
+}
+
+interface WeeklySizingItem {
+  channel: string
+  display_name: string
+  pct: number
+  proposed_amount: number
+  current_amount: number
+  rationale: string
+}
+
+interface WeeklyReviewSummary {
+  id: number
+  week_key: string
+  status: string
+  verdict: string | null
+  trigger_type: string
+  headline?: string | null
+  watchouts?: number
+  created_at?: string | null
+}
+
+interface WeeklyReviewFull extends WeeklyReviewSummary {
+  facts: Record<string, unknown>
+  report: {
+    verdict?: string
+    week?: { key: string; start_date: string; end_date: string }
+    deterministic?: {
+      watchouts?: WeeklyWatchout[]
+      portfolio?: {
+        n?: number; cost?: number; pnl?: number; roi?: number
+        win_rate?: number; edge?: number
+        equity?: { base_equity_usdt?: number; available_usdt?: number | null; drift_ratio?: number | null }
+        delta?: Record<string, number | null>
+      }
+    }
+    llm?: {
+      headline?: string
+      overall?: { narrative?: string; claims?: WeeklyClaim[] }
+      per_signal?: WeeklyPerSignal[]
+      watchouts?: WeeklyWatchout[]
+      exploratory?: WeeklyExploratory[]
+      sizing?: WeeklySizingItem[]
+    } | null
+  }
+  rejected: unknown[]
+  application_log: { channel?: string; applied_at?: string; to_value?: number }[]
+}
+
+const WEEKLY_VERDICT_META: Record<string, { label: string; cls: string }> = {
+  KEEP: { label: '保持', cls: 'bg-positive-soft text-positive border-positive/30' },
+  WATCH: { label: '观察', cls: 'bg-sunken text-ink-70 border-line' },
+  TIGHTEN: { label: '收紧', cls: 'bg-warning-soft text-warning border-warning/30' },
+  PAUSE: { label: '建议停火', cls: 'bg-negative-soft text-negative border-negative/30' },
+  ESCALATE: { label: '转人工', cls: 'bg-brand-soft text-brand border-brand/30' },
+}
+
+const WEEKLY_SEVERITY_META: Record<string, { cls: string }> = {
+  P0: { cls: 'bg-negative-soft text-negative border-negative/30' },
+  P1: { cls: 'bg-warning-soft text-warning border-warning/30' },
+  P2: { cls: 'bg-sunken text-ink-70 border-line' },
+}
+
+function WeeklyReviewTab() {
+  const [list, setList] = useState<WeeklyReviewSummary[]>([])
+  const [sel, setSel] = useState<number | null>(null)
+  const [full, setFull] = useState<WeeklyReviewFull | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [msg, setMsg] = useState('')
+  const [err, setErr] = useState('')
+  const [baseDraft, setBaseDraft] = useState('')
+
+  const loadList = useCallback(() => {
+    api.getWeeklyReviews(12).then((d: { reviews?: WeeklyReviewSummary[] }) => {
+      const rows = d.reviews ?? []
+      setList(rows)
+      setSel(prev => prev ?? rows[0]?.id ?? null)
+    }).catch(() => setErr('周报列表加载失败'))
+  }, [])
+
+  useEffect(() => { loadList() }, [loadList])
+
+  useEffect(() => {
+    if (sel == null) return
+    api.getWeeklyReview(sel).then((d: WeeklyReviewFull) => {
+      setFull(d)
+      const eq = d.report?.deterministic?.portfolio?.equity
+      setBaseDraft(eq?.base_equity_usdt != null ? String(eq.base_equity_usdt) : '')
+    }).catch(() => setErr('周报详情加载失败'))
+  }, [sel])
+
+  const runReview = async () => {
+    setBusy(true); setMsg('生成中（事实卡 → LLM → 过闸）…')
+    try {
+      const res = await api.triggerWeeklyReview(-1)
+      if (!res?.id) {
+        setMsg('')
+        setErr(res?.error || '生成失败（后端未返回周报，详见服务日志）')
+      } else { setMsg('已生成'); setSel(res.id); loadList() }
+    } catch (e) {
+      setMsg(''); setErr(`生成失败：${(e as Error).message}`)
+    } finally { setBusy(false) }
+  }
+
+  const applySizing = async (item: WeeklySizingItem) => {
+    if (!full) return
+    if (!window.confirm(`把 ${item.display_name} 的仓位改为基准本金 ${(item.pct * 100).toFixed(2)}%（约 ${item.proposed_amount}U/单）？\n当前约 ${item.current_amount}U/单。`)) return
+    setErr('')
+    const res = await api.applyWeeklySizing(full.id, item.channel, item.pct)
+    if (res?.error) setErr(res.error)
+    else {
+      setMsg(res?.message || `已应用：${item.display_name} → ${(item.pct * 100).toFixed(2)}%`)
+      api.getWeeklyReview(full.id).then(setFull).catch(() => {})
+    }
+  }
+
+  const saveBase = async () => {
+    const v = Number(baseDraft)
+    if (!Number.isFinite(v)) { setErr('基准本金需为数值'); return }
+    setErr('')
+    const res = await api.setSizingConfig(v)
+    if (res?.error) setErr(res.error)
+    else setMsg(`基准本金已更新为 ${v} U（下次生成周报时生效）`)
+  }
+
+  const det = full?.report?.deterministic
+  const llm = full?.report?.llm ?? null
+  const watchouts = [...(det?.watchouts ?? []), ...(llm?.watchouts ?? [])]
+  const portfolio = det?.portfolio
+
+  return (
+    <div className="space-y-3">
+      <Card title="每周复盘">
+        <div className="flex flex-wrap items-center gap-2 text-xs">
+          <span className="text-ink-55">口径：事实卡确定性计算，LLM 只解释与建议；仓位只能人工应用。</span>
+          <HelpHint text="报告分四层：确定性事实（这周到底发生了什么）、注意点（规则判定，不靠模型）、LLM 诊断与改进（每句断言需引用事实卡字段并数值精确匹配）、探索性研究方案（只出方案不跑回测）。" />
+          <button onClick={runReview} disabled={busy}
+            className="ml-auto px-3 py-1 rounded-sm bg-brand text-white text-xs font-semibold disabled:opacity-50">
+            {busy ? '生成中…' : '生成上一周复盘'}
+          </button>
+        </div>
+        {(msg || err) && <div className={`mt-2 text-xs ${err ? 'text-negative' : 'text-positive'}`}>{err || msg}</div>}
+        {list.length > 0 && (
+          <div className="mt-3 flex flex-wrap gap-1.5">
+            {list.map(r => (
+              <button key={r.id} onClick={() => setSel(r.id)}
+                className={`px-2 py-0.5 rounded-pill border text-[11px] ${sel === r.id ? 'bg-brand text-white border-brand' : 'bg-card text-ink-70 border-line hover:border-brand'}`}
+                title={`${r.trigger_type} · ${r.status} · ${r.created_at ?? ''}`}>
+                {r.week_key}{r.verdict && r.verdict !== 'OK' ? ` · ${r.verdict}` : ''}
+              </button>
+            ))}
+          </div>
+        )}
+        {list.length === 0 && !busy && (
+          <div className="mt-3 text-xs text-ink-55">还没有周报。点击右上按钮生成上一完整周（周一 00:30 UTC 会自动生成）。</div>
+        )}
+      </Card>
+
+      {full && (
+        <>
+          <Card title={`总体报告 · ${full.week_key}`}>
+            <div className="text-sm font-semibold text-ink-95 mb-1">
+              {llm?.headline || (full.report.verdict === 'INSUFFICIENT_DATA' ? '本周样本不足，无结论' : '（无 LLM 结论）')}
+            </div>
+            <div className="flex flex-wrap gap-4 text-xs text-ink-70 mb-2">
+              <span>样本 <b className="font-mono">{portfolio?.n ?? '--'}</b></span>
+              <span>投入 <b className="font-mono">{portfolio?.cost ?? '--'}</b> U</span>
+              <span>PnL <b className={'font-mono ' + signClass(portfolio?.pnl)}>{performanceSigned(portfolio?.pnl, ' U')}</b></span>
+              <span>ROI <b className={'font-mono ' + signClass(portfolio?.roi)}>{performancePct(portfolio?.roi)}</b></span>
+              <span>胜率 <b className="font-mono">{performancePct(portfolio?.win_rate)}</b></span>
+              <span>Edge <b className={'font-mono ' + signClass(portfolio?.edge)}>{performanceSigned(portfolio?.edge == null ? null : portfolio.edge * 100, 'pp', 1)}</b></span>
+              {portfolio?.delta?.pnl != null && <span>PnL 同比上周 <b className={'font-mono ' + signClass(portfolio.delta.pnl)}>{performanceSigned(portfolio.delta.pnl, ' U')}</b></span>}
+              {full.report.verdict && full.report.verdict !== 'OK' && <span className="text-warning">verdict={full.report.verdict}</span>}
+            </div>
+            {llm?.overall?.narrative && <div className="text-xs text-ink-80 whitespace-pre-wrap">{llm.overall.narrative}</div>}
+            {!!llm?.overall?.claims?.length && (
+              <ul className="mt-2 space-y-1 text-[11px] text-ink-70 list-disc pl-4">
+                {llm.overall.claims.map((c, i) => <li key={i}>{c.text}</li>)}
+              </ul>
+            )}
+            {full.rejected.length > 0 && (
+              <div className="mt-2 text-[10px] text-ink-55">被过闸剔除 {full.rejected.length} 条断言（证据 ID 不存在或数值不匹配），可在接口详情中审计。</div>
+            )}
+          </Card>
+
+          <Card title={`注意点 · ${watchouts.length} 条`}>
+            {watchouts.length === 0 && <div className="text-xs text-ink-55">本周无规则命中的注意点。</div>}
+            <div className="space-y-1.5">
+              {watchouts.map((w, i) => (
+                <div key={i} className="flex items-start gap-2 text-xs">
+                  <span className={`shrink-0 px-1.5 py-0.5 rounded-pill border text-[10px] font-bold ${WEEKLY_SEVERITY_META[w.severity]?.cls ?? ''}`}>{w.severity}</span>
+                  <span className="shrink-0 font-mono text-[10px] text-ink-55 w-[150px] truncate" title={w.code}>{w.code}</span>
+                  <span className="text-ink-80">{w.statement}{w.channel ? `（${w.channel}）` : ''}</span>
+                </div>
+              ))}
+            </div>
+          </Card>
+
+          <Card title="单信号报告">
+            {!llm?.per_signal?.length && <div className="text-xs text-ink-55">本次没有单信号诊断（LLM 段关闭或降级）。</div>}
+            {!!llm?.per_signal?.length && (
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[760px] text-xs">
+                  <thead><tr className="text-ink-55 border-b border-line-soft">
+                    <th className="text-left py-1.5 px-2">通道</th>
+                    <th className="text-left px-2">结论</th>
+                    <th className="text-left px-2">诊断</th>
+                    <th className="text-right px-2">改进项</th>
+                  </tr></thead>
+                  <tbody>
+                    {llm.per_signal.map(s => (
+                      <tr key={s.channel} className="border-b border-line-soft align-top">
+                        <td className="py-1.5 px-2 whitespace-nowrap">
+                          <div className="font-medium">{s.display_name}</div>
+                          <div className="font-mono text-[10px] text-ink-55">{s.channel}</div>
+                        </td>
+                        <td className="py-1.5 px-2 whitespace-nowrap">
+                          <span className={`px-1.5 py-0.5 rounded-pill border text-[10px] font-semibold ${WEEKLY_VERDICT_META[s.verdict]?.cls ?? ''}`}>
+                            {WEEKLY_VERDICT_META[s.verdict]?.label ?? s.verdict}
+                          </span>
+                        </td>
+                        <td className="py-1.5 px-2 text-ink-80">{s.diagnosis}</td>
+                        <td className="py-1.5 px-2 text-right font-mono">{s.improvements.length}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </Card>
+
+          <Card title="改进报告">
+            {!llm?.per_signal?.some(s => s.improvements.length) && (
+              <div className="text-xs text-ink-55">没有通过校验的改进建议（每条必须绑定检验菜单中的检验并写明撤回条件）。</div>
+            )}
+            <div className="space-y-3">
+              {(llm?.per_signal ?? []).filter(s => s.improvements.length).map(s => (
+                <div key={s.channel}>
+                  <div className="text-xs font-semibold text-ink-90 mb-1">{s.display_name} <span className="font-mono text-[10px] text-ink-55">{s.channel}</span></div>
+                  {s.improvements.map((imp, i) => (
+                    <div key={i} className="mb-2 pl-3 border-l-2 border-line">
+                      <div className="text-xs text-ink-85"><b className="text-ink-95">[{imp.priority}] {imp.change}</b></div>
+                      {imp.mechanism && <div className="text-[11px] text-ink-70">机制：{imp.mechanism}</div>}
+                      <div className="text-[11px] text-ink-55">
+                        检验 <span className="font-mono">{imp.test.name}</span>
+                        {imp.expected_effect ? ` · 预期：${imp.expected_effect}` : ''}
+                      </div>
+                      <div className="text-[11px] text-warning">撤回条件：{imp.kill_criteria}</div>
+                    </div>
+                  ))}
+                </div>
+              ))}
+            </div>
+          </Card>
+
+          <Card title="探索性研究方案">
+            {!llm?.exploratory?.length && (
+              <div className="text-xs text-ink-55">本周没有候选研究方案。方案只是选题，不自动跑回测。</div>
+            )}
+            <div className="space-y-2">
+              {(llm?.exploratory ?? []).map((e, i) => (
+                <div key={i} className="text-xs border border-line-soft rounded-sm p-2">
+                  <div className="flex items-center gap-2">
+                    <span className="px-1.5 py-0.5 rounded-pill bg-sunken text-[10px] font-semibold">{e.priority}</span>
+                    <span className="font-medium text-ink-90">{e.question}</span>
+                  </div>
+                  <div className="mt-1 text-[11px] text-ink-70">
+                    数据源 <span className="font-mono">{e.data_source}</span>
+                    {e.n_estimate ? ` · 预估样本 ${e.n_estimate}` : ''}
+                    {e.split ? ` · 切分：${e.split}` : ''}
+                  </div>
+                  <div className="text-[11px] text-ink-70">证伪：{e.falsifiable_test}</div>
+                  <div className="text-[11px] text-ink-55">停止条件：{e.stop_condition}</div>
+                </div>
+              ))}
+            </div>
+          </Card>
+
+          <Card title="仓位建议（% 基准本金）">
+            <div className="flex flex-wrap items-center gap-2 text-xs mb-2">
+              <span className="text-ink-55">基准本金</span>
+              <input value={baseDraft} onChange={e => setBaseDraft(e.target.value)}
+                className="w-24 bg-card border border-line rounded-sm px-2 py-0.5 font-mono text-xs"
+                title="仓位分母（10~5000 U，手动设定，不随余额浮动）" />
+              <span className="text-ink-55">U</span>
+              <button onClick={saveBase} className="px-2 py-0.5 rounded-pill border border-line text-[11px]">保存</button>
+              <HelpHint text="分母是人工设定的固定值：不随权益浮动，保证同一周金额可复现。报告会提示余额与基准偏离 >20% 时复核。" />
+              {portfolio?.equity?.available_usdt != null && (
+                <span className="text-ink-55 ml-auto">可用余额 {portfolio.equity.available_usdt} U
+                  {portfolio.equity.drift_ratio != null ? ` · 偏离 ${(portfolio.equity.drift_ratio * 100).toFixed(0)}%` : ''}</span>
+              )}
+            </div>
+            {!llm?.sizing?.length && (
+              <div className="text-xs text-ink-55">本次没有仓位建议（只允许不放大敞口的建议，放大一律被服务端拒绝）。</div>
+            )}
+            <div className="space-y-1.5">
+              {(llm?.sizing ?? []).map(s => (
+                <div key={s.channel} className="flex flex-wrap items-center gap-2 text-xs">
+                  <span className="font-medium w-[180px] truncate" title={s.channel}>{s.display_name}</span>
+                  <span className="font-mono">{(s.pct * 100).toFixed(2)}%</span>
+                  <span className="text-ink-55">≈ {s.proposed_amount} U / 单（当前 {s.current_amount} U）</span>
+                  <span className="text-ink-55 flex-1 min-w-[160px] truncate" title={s.rationale}>{s.rationale}</span>
+                  <button onClick={() => applySizing(s)}
+                    disabled={s.proposed_amount > s.current_amount + 1e-9}
+                    className="px-2 py-0.5 rounded-pill bg-warning text-white text-[10px] font-semibold disabled:opacity-40">
+                    一键应用
+                  </button>
+                </div>
+              ))}
+            </div>
+            {!!full.application_log.length && (
+              <div className="mt-2 text-[10px] text-ink-55">
+                已应用：{full.application_log.map(e => `${e.channel}→${e.to_value != null ? (e.to_value * 100).toFixed(2) + '%' : '--'}`).join('，')}
+              </div>
+            )}
+          </Card>
+        </>
+      )}
+    </div>
+  )
+}
+
 function MonitorTab() {
   const [report, setReport] = useState<SignalHealthReport | null>(null)
   const [err, setErr] = useState('')
@@ -5871,7 +6411,8 @@ function MonitorTab() {
   const [onlyActive, setOnlyActive] = useState(true)
   const [lightFilter, setLightFilter] = useState<'all' | HealthLight>('all')
   const [sel, setSel] = useState<{ scope: string; key: string } | null>(null)
-  const [showCorrelations, setShowCorrelations] = useState(false)
+  const [calDrawer, setCalDrawer] = useState(false)
+  const [corrDrawer, setCorrDrawer] = useState(false)
 
   const load = useCallback((force = false) => {
     setLoading(true)
@@ -5904,143 +6445,162 @@ function MonitorTab() {
 
   return (
     <div className="space-y-3">
-          <div className="bg-card rounded-card border border-line px-5 py-3 space-y-2">
-            <div className="flex items-center justify-between gap-3 flex-wrap">
-              <div className="flex items-center gap-4 flex-wrap text-sm">
-                <span className="font-bold text-ink-95">在线通道体检</span>
-                {tally && (['RED', 'YELLOW', 'GREEN', 'GRAY'] as HealthLight[]).map(l => (
-                  <button key={l} onClick={() => setLightFilter(f => (f === l ? 'all' : l))}
-                    className={'flex items-center gap-1.5 text-xs ' + (lightFilter === l ? 'font-bold underline' : '')}>
-                    <LightDot light={l} />{HEALTH_LIGHT[l].label} <span className="font-mono">{tally[l]}</span>
-                  </button>
-                ))}
-                <HelpHint text={'红灯=优势已变负的后验概率≥' + redPct + '%且样本≥' + minN + '；黄灯=优势疑似变负/前向显著低于冻结基准/收益靠右尾（剔除最赚5单后≤0）；灰=样本不足不下结论。统计仅计「在线」通道（影子开启或实盘开启）。系统只给建议，不会自动关闭任何通道。'} />
-              </div>
-              <div className="flex items-center gap-2 text-[11px] text-ink-55">
-                {report && <span className="font-mono">{new Date(report.generated_at).toLocaleString('zh-CN')}</span>}
-                <button onClick={() => load(true)} disabled={loading}
-                  className="px-2 py-0.5 rounded-pill bg-sunken text-ink-80 hover:bg-sunken-hover transition disabled:opacity-40">
-                  {loading ? '计算中…' : '立即重算'}
-                </button>
-              </div>
-            </div>
-            <div className="flex items-center gap-3 flex-wrap text-[11px] text-ink-55">
-              <div className="flex items-center gap-0.5 bg-sunken rounded-pill p-0.5 border border-line-soft">
-                {([['all', '全部'], ['live', '实盘'], ['shadow', '影子']] as const).map(([k, l]) => (
-                  <button key={k} className={chip(scope === k)} onClick={() => setScope(k)}>{l}</button>
-                ))}
-              </div>
-              <label className="flex items-center gap-1 cursor-pointer">
-                <input type="checkbox" checked={onlyActive} onChange={e => setOnlyActive(e.target.checked)} />仅在线通道
-              </label>
-              {corrs.length > 0 && (
-                <button
-                  onClick={() => setShowCorrelations(s => !s)}
-                  className={`px-2 py-0.5 rounded-pill border transition ${showCorrelations ? 'bg-brand text-white border-brand' : 'border-line text-ink-80 hover:border-brand'}`}
-                >
-                  {showCorrelations ? '收起组合共振' : `查看通道共振 (${corrs.length}对)`}
-                </button>
-              )}
-              <span>共 {rows.length} 行 · 点行下钻</span>
-            </div>
+      {/* ============ 一屏第 1 行：体检总览（灯色计数 = 最重要的 4 个数字） ============ */}
+      <div className="bg-card rounded-card border border-line px-4 py-2.5 space-y-2">
+        <div className="flex items-center gap-x-4 gap-y-2 flex-wrap">
+          <span className="font-bold text-sm text-ink-95">在线通道体检</span>
+          {(['RED', 'YELLOW', 'GREEN', 'GRAY'] as HealthLight[]).map(l => (
+            <button key={l} onClick={() => setLightFilter(f => (f === l ? 'all' : l))}
+              className={'flex items-baseline gap-1.5 ' + (lightFilter === l ? 'underline decoration-2 underline-offset-2' : '')}
+              title={`只看${HEALTH_LIGHT[l].label}通道`}>
+              <LightDot light={l} />
+              <span className="text-[11px] text-ink-70">{HEALTH_LIGHT[l].label}</span>
+              <span className="font-mono text-sm font-bold text-ink-95">{tally ? tally[l] : '--'}</span>
+            </button>
+          ))}
+          <HelpHint text={'红灯=优势已变负的后验概率≥' + redPct + '%且样本≥' + minN + '；黄灯=优势疑似变负/前向显著低于冻结基准/收益靠右尾（剔除最赚5单后≤0）；灰=样本不足不下结论。统计仅计「在线」通道（影子开启或实盘开启）。系统只给建议，不会自动关闭任何通道。'} />
+          <div className="ml-auto flex items-center gap-2 text-[11px] text-ink-55">
+            {report && <span className="font-mono">{new Date(report.generated_at).toLocaleString('zh-CN')}</span>}
+            <button onClick={() => load(true)} disabled={loading}
+              className="px-2 py-0.5 rounded-pill bg-sunken text-ink-80 hover:bg-sunken-hover transition disabled:opacity-40">
+              {loading ? '计算中…' : '立即重算'}
+            </button>
           </div>
+        </div>
+        <div className="flex items-center gap-x-3 gap-y-1.5 flex-wrap text-[11px] text-ink-55">
+          <div className="flex items-center gap-0.5 bg-sunken rounded-pill p-0.5 border border-line-soft">
+            {([['all', '全部'], ['live', '实盘'], ['shadow', '影子']] as const).map(([k, l]) => (
+              <button key={k} className={chip(scope === k)} onClick={() => setScope(k)}>{l}</button>
+            ))}
+          </div>
+          <label className="flex items-center gap-1 cursor-pointer">
+            <input type="checkbox" checked={onlyActive} onChange={e => setOnlyActive(e.target.checked)} />仅在线通道
+          </label>
+          <span>共 {rows.length} 行 · 点行下钻</span>
+          <div className="ml-auto flex items-center gap-1.5">
+            {report?.calibration && (
+              <button onClick={() => setCalDrawer(true)}
+                className="px-2 py-0.5 rounded-pill border border-line text-ink-80 hover:border-brand">买贵校准监控</button>
+            )}
+            {corrs.length > 0 && (
+              <button onClick={() => setCorrDrawer(true)}
+                className="px-2 py-0.5 rounded-pill border border-line text-ink-80 hover:border-brand">通道共振 ({corrs.length}对)</button>
+            )}
+          </div>
+        </div>
+      </div>
 
-          {/* 组合相关性与同窗共振卡片 (P3) */}
-          {showCorrelations && corrs.length > 0 && (
-            <div className="bg-card rounded-card border border-line p-4 space-y-2">
-              <div className="flex items-center justify-between">
-                <div className="text-xs font-bold text-ink-95">
-                  通道间同窗共振分析 (Top 20 重叠通道对)
-                  <HelpHint text="展示在同一 5m/15m 窗口同时触发的不同通道。Jaccard 越高说明两个通道在同一个赌注上同时押注，组合风险集中；同向率表示两通道同时触发时方向相同比例。" />
-                </div>
-                <button onClick={() => setShowCorrelations(false)} className="text-xs text-ink-55 hover:text-ink-95">关闭</button>
-              </div>
-              <div className="overflow-x-auto max-h-56 overflow-y-auto">
-                <table className="w-full text-[11px]">
-                  <thead>
-                    <tr className="text-ink-55 border-b border-line-soft">
-                      <th className="py-1 text-left">通道 A</th>
-                      <th className="py-1 text-left">通道 B</th>
-                      <th className="py-1 text-right">同窗触发数</th>
-                      <th className="py-1 text-right">Jaccard 重叠度</th>
-                      <th className="py-1 text-right">同向一致率</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {corrs.map((c, idx) => (
-                      <tr key={idx} className="border-b border-line-soft hover:bg-card-hover">
-                        <td className="py-1 font-medium">{SIGNAL_INFO[c.channel_a.split(':')[1]]?.name ?? c.channel_a}</td>
-                        <td className="py-1 font-medium">{SIGNAL_INFO[c.channel_b.split(':')[1]]?.name ?? c.channel_b}</td>
-                        <td className="py-1 text-right font-mono">{c.shared_windows}</td>
-                        <td className="py-1 text-right font-mono font-bold text-brand">{(c.jaccard * 100).toFixed(1)}%</td>
-                        <td className="py-1 text-right font-mono">{performancePct(c.agreement_rate)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )}
+      {!report && <div className="text-center text-ink-55 py-12 text-sm">{err || '加载信号体检中...'}</div>}
 
-          {!report && <div className="text-center text-ink-55 py-12 text-sm">{err || '加载信号体检中...'}</div>}
-
-          {report && (
-            <div className="bg-card rounded-card border border-line overflow-x-auto">
-              <table className="w-full min-w-[980px] text-xs">
-                <thead><tr className="text-ink-55 border-b border-line">
-                  <th className="py-2 px-2 text-left">通道</th><th className="py-2 px-2 text-left">来源</th>
-                  <th className="py-2 px-2 text-right">n</th><th className="py-2 px-2 text-right">胜率</th>
-                  <th className="py-2 px-2 text-right">保本</th><th className="py-2 px-2 text-right">优势</th>
-                  <th className="py-2 px-2 text-right">均EV</th><th className="py-2 px-2 text-right">剔Top5</th>
-                  <th className="py-2 px-2 text-right">变负概率</th>
+      {report && (
+        <div className="bg-card rounded-card border border-line overflow-hidden">
+          <div className="overflow-auto max-h-[calc(100vh-210px)]">
+            <table className="w-full min-w-[720px] text-xs">
+              <thead className="sticky top-0 z-10 bg-card">
+                <tr className="text-ink-55 border-b border-line">
+                  <th className="py-2 px-2 text-left">通道</th>
+                  <th className="py-2 px-2 text-left">来源</th>
+                  <th className="py-2 px-2 text-right">n</th>
+                  <th className="py-2 px-2 text-right">胜率</th>
+                  <th className="py-2 px-2 text-right">优势 <HelpHint text="优势 = 胜率 − 保本率（含费）。负值代表当前入场价下不赚钱。" /></th>
+                  <th className="py-2 px-2 text-right">变负概率 <HelpHint text="优势≤0 的后验概率。≥90% 且 n≥30 判红灯，≥75% 判黄灯。" /></th>
                   <th className="py-2 px-2 text-center">状态</th>
                   <th className="py-2 px-2 text-left">提示</th>
-                </tr></thead>
-                <tbody>
-                  {rows.map(r => {
-                    const m = r.metrics
-                    const on = sel?.scope === r.scope && sel.key === r.key
-                    const cp = r.change_point
-                    return (
-                      <tr key={r.scope + ':' + r.key} onClick={() => setSel(on ? null : { scope: r.scope, key: r.key })}
-                        className={'border-b border-line-soft cursor-pointer ' + (on ? 'bg-brand-soft' : 'hover:bg-card-hover')}>
-                        <td className="py-1.5 px-2 whitespace-nowrap">
-                          <span className="inline-flex items-center gap-1.5">
-                            <LightDot light={r.light} />
-                            <span className="font-medium">{SIGNAL_INFO[r.key]?.name ?? r.key}</span>
-                            {!r.active && <span className="rounded-pill bg-sunken px-1.5 py-0.5 text-[9px] text-ink-55">{r.retired ? '已退役' : '已下线'}</span>}
-                          </span>
-                        </td>
-                        <td className="py-1.5 px-2 text-ink-55 whitespace-nowrap">{r.scope === 'live' ? '实盘' : '影子'}{r.market_period ? ' · ' + r.market_period : ''}</td>
-                        <td className="py-1.5 px-2 text-right font-mono">{m.n}</td>
-                        <td className="py-1.5 px-2 text-right font-mono">{performancePct(m.win_rate)}</td>
-                        <td className="py-1.5 px-2 text-right font-mono">{performancePct(m.mean_breakeven)}</td>
-                        <td className={'py-1.5 px-2 text-right font-mono ' + signClass(m.edge)}>{performanceSigned(m.edge == null ? null : m.edge * 100, '%', 1)}</td>
-                        <td className={'py-1.5 px-2 text-right font-mono ' + signClass(m.avg_ev)}>{performanceSigned(m.avg_ev, '', 3)}</td>
-                        <td className={'py-1.5 px-2 text-right font-mono ' + signClass(m.ev_ex_top5)}>{performanceSigned(m.ev_ex_top5, '', 3)}</td>
-                        <td className="py-1.5 px-2 text-right font-mono">{performancePct(m.p_edge_negative, 0)}</td>
-                        <td className="py-1.5 px-2 text-center whitespace-nowrap">
-                          {r.death_status && r.death_status !== 'ALIVE' ? (
-                            <DeathBadge status={r.death_status} reason={r.death_reason} />
-                          ) : cp?.is_declining ? (
-                            <span className="rounded-pill px-1.5 py-0.5 text-[9px] font-bold bg-warning-soft text-warning" title={`拐折回撤 -${cp.drawdown_ev} EV`}>拐折</span>
-                          ) : (
-                            <span className="text-[10px] text-ink-55 font-mono">正常</span>
-                          )}
-                        </td>
-                        <td className="py-1.5 px-2 text-ink-80 max-w-[280px] truncate" title={r.reasons.join('；')}>{r.reasons[0] ?? ''}</td>
-                      </tr>
-                    )
-                  })}
-                  {rows.length === 0 && <tr><td colSpan={11} className="py-8 text-center text-ink-55">当前筛选下无通道</td></tr>}
-                </tbody>
-              </table>
-            </div>
-          )}
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map(r => {
+                  const m = r.metrics
+                  const on = sel?.scope === r.scope && sel.key === r.key
+                  const cp = r.change_point
+                  return (
+                    <tr key={r.scope + ':' + r.key}
+                      onClick={() => setSel(on ? null : { scope: r.scope, key: r.key })}
+                      className={'border-b border-line-soft cursor-pointer ' + (on ? 'bg-brand-soft' : 'hover:bg-card-hover')}>
+                      <td className="py-1.5 px-2 whitespace-nowrap">
+                        <span className="inline-flex items-center gap-1.5">
+                          <LightDot light={r.light} />
+                          {/* 行 onclick 服务鼠标；这里给真 button，键盘/读屏等价可达，
+                              且不破坏 <tr> 的表格语义（不用 role=button 覆盖行） */}
+                          <button
+                            onClick={e => { e.stopPropagation(); setSel(on ? null : { scope: r.scope, key: r.key }) }}
+                            aria-expanded={on}
+                            className="font-medium text-left rounded-sm focus-visible:outline-2 focus-visible:outline-brand"
+                          >{SIGNAL_INFO[r.key]?.name ?? r.key}</button>
+                          {!r.active && <span className="rounded-pill bg-sunken px-1.5 py-0.5 text-[9px] text-ink-55">{r.retired ? '已退役' : '已下线'}</span>}
+                        </span>
+                      </td>
+                      <td className="py-1.5 px-2 text-ink-55 whitespace-nowrap">{r.scope === 'live' ? '实盘' : '影子'}{r.market_period ? ' · ' + r.market_period : ''}</td>
+                      <td className="py-1.5 px-2 text-right font-mono">{m.n}</td>
+                      <td className="py-1.5 px-2 text-right font-mono">{performancePct(m.win_rate)}</td>
+                      <td className={'py-1.5 px-2 text-right font-mono ' + signClass(m.edge)}>{performanceSigned(m.edge == null ? null : m.edge * 100, '%', 1)}</td>
+                      <td className="py-1.5 px-2 text-right font-mono">{performancePct(m.p_edge_negative, 0)}</td>
+                      <td className="py-1.5 px-2 text-center whitespace-nowrap">
+                        {r.death_status && r.death_status !== 'ALIVE' ? (
+                          <DeathBadge status={r.death_status} reason={r.death_reason} />
+                        ) : cp?.is_declining ? (
+                          <span className="rounded-pill px-1.5 py-0.5 text-[9px] font-bold bg-warning-soft text-warning" title={`拐折回撤 -${cp.drawdown_ev} EV`}>拐折</span>
+                        ) : (
+                          <span className="text-[10px] text-ink-55 font-mono">正常</span>
+                        )}
+                      </td>
+                      <td className="py-1.5 px-2 text-ink-80 max-w-[240px] truncate" title={r.reasons.join('；')}>{r.reasons[0] ?? ''}</td>
+                    </tr>
+                  )
+                })}
+                {rows.length === 0 && <tr><td colSpan={8} className="py-8 text-center text-ink-55">当前筛选下无通道</td></tr>}
+              </tbody>
+            </table>
+          </div>
+          <div className="px-3 py-1.5 border-t border-line-soft text-[10px] text-ink-55">
+            表内只留「一眼判断」的列；保本率 / 均EV / 剔Top5 / 分桶 / 曲线 / CUSUM / 快照历史都在点行后的抽屉里。
+          </div>
+        </div>
+      )}
 
-          {report?.calibration && <CalibrationMonitorCard cal={report.calibration} />}
+      {sel && (
+        <DetailDrawer
+          title={SIGNAL_INFO[sel.key]?.name ?? sel.key}
+          subtitle={`${sel.scope === 'live' ? '实盘' : '影子'} · ${sel.key}`}
+          onClose={() => setSel(null)}
+        >
+          <SignalHealthDrill scope={sel.scope} keyName={sel.key} onClose={() => setSel(null)} />
+        </DetailDrawer>
+      )}
 
-          {sel && <SignalHealthDrill scope={sel.scope} keyName={sel.key} onClose={() => setSel(null)} />}
+      {calDrawer && report?.calibration && (
+        <DetailDrawer title="买贵校准监控" subtitle="胜率 vs 保本线（含费）" onClose={() => setCalDrawer(false)}>
+          <CalibrationMonitorCard cal={report.calibration} />
+        </DetailDrawer>
+      )}
+
+      {corrDrawer && corrs.length > 0 && (
+        <DetailDrawer title="通道间同窗共振" subtitle={`${corrs.length} 对（Top 20）`} onClose={() => setCorrDrawer(false)}>
+          <div className="text-[11px] text-ink-55">同一 5m/15m 窗口同时触发的不同通道。Jaccard 越高 = 同一个赌注上重复押注，组合风险集中；同向率 = 同时触发时方向相同的比例。</div>
+          <table className="w-full text-[11px]">
+            <thead>
+              <tr className="text-ink-55 border-b border-line-soft">
+                <th className="py-1 text-left">通道 A</th>
+                <th className="py-1 text-left">通道 B</th>
+                <th className="py-1 text-right">同窗触发</th>
+                <th className="py-1 text-right">Jaccard</th>
+                <th className="py-1 text-right">同向率</th>
+              </tr>
+            </thead>
+            <tbody>
+              {corrs.map((c, idx) => (
+                <tr key={idx} className="border-b border-line-soft">
+                  <td className="py-1 font-medium">{SIGNAL_INFO[c.channel_a.split(':')[1]]?.name ?? c.channel_a}</td>
+                  <td className="py-1 font-medium">{SIGNAL_INFO[c.channel_b.split(':')[1]]?.name ?? c.channel_b}</td>
+                  <td className="py-1 text-right font-mono">{c.shared_windows}</td>
+                  <td className="py-1 text-right font-mono font-bold text-brand">{(c.jaccard * 100).toFixed(1)}%</td>
+                  <td className="py-1 text-right font-mono">{performancePct(c.agreement_rate)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </DetailDrawer>
+      )}
     </div>
   )
 }

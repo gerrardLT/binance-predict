@@ -484,6 +484,7 @@ live tab 有 9 个填充蓝块，纵向分布 `-108 / -16 / 0 / 0 / 0 / 10 / 356
 | **stock 圆角名重映射守卫** | 仅清代码不够——Tailwind 默认 md=6px/xl=12px 会回归。@theme 里把 xs/md/lg→sm、xl→card、2xl/3xl→panel，使 off-spec 圆角无法用 stock 类名表达。 |
 | **每个语义色补 `*-hover` 档** | 单档 token 会让 `bg-positive hover:bg-positive` 塌缩掉 24 个按钮的悬停反馈。色值取自 design.json tonal ramp（亮色深一档 / 暗色浅一档），与既有 `brand-hover` 同一推导。 |
 | **`.ds-input-sm` 紧凑变体** | 通道行的护栏/金额输入框处于 13 行密集列表，标准 `6px 12px` 会撑高溢出。只覆写几何，其余继承 `.ds-input`。 |
+| **贴边抽屉不取 `rounded-panel`** | `DetailDrawer`（`App.tsx`）从右侧贴边满高，圆角会把内容裁在屏幕外、且贴边抽屉的“从边缘滑出”语义靠直角。仅该组件例外：仍需遮罩（`bg-overlay`）、ESC、焦点与 body 滚动锁。常驻侧栏 `ChartDrawer` 同属直角贴边。 2026-10-30 决策。 |
 
 ### 迁移方法上的教训
 
