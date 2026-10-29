@@ -1550,8 +1550,9 @@ def test_scene_s2_entry_whitelist_registered() -> None:
     by = {**RETIRED_CHANNEL_SPECS, **LIVE_CHANNELS}  # 归档 spec 仍在台账内
     assert by["scene_bear_exhaust"].entry_band_whitelist == ((0.50, 0.65),)
     assert not hasattr(by["scene_bear_exhaust"], "max_low24_gap_pct")
+    assert by["scene_momentum_fade"].entry_band_whitelist == ((0.45, 0.65),)
     for other in ("scene_bull_exhaust", "scene_bear_exhaust_opt_v1",
-                  "scene_bull_exhaust_confirm", "scene_momentum_fade"):
+                  "scene_bull_exhaust_confirm"):
         assert by[other].entry_band_whitelist is None
 
 
@@ -1611,6 +1612,68 @@ async def test_scene_s2_whitelist_band_050_065_matrix(monkeypatch) -> None:
         confirms=[])
     order = await trader.execute_signal_trade(
         "UP", 5.0, "scene_bear_exhaust", WINDOW_START,
+        max_exec_price=0.65, market_period="15m", entry_band_whitelist=bands)
+    assert order["status"] == "FAILED"
+    assert "执行价护栏弃单" in updates[0][1]["error_message"]
+    assert place_calls == []
+
+
+@pytest.mark.asyncio
+async def test_scene_s4_whitelist_band_045_065_matrix(monkeypatch) -> None:
+    """S4 2026-10-28 白名单 [0.45,0.65)（左闭右开）边界矩阵（押 DOWN）：
+
+    0.4499（越下界）→ 白名单弃单且币安零请求；
+    0.45（贴下界，左闭）与 0.6499（上界内侧）→ 放行成交；
+    0.65 贴护栏线 → 执行价护栏先拦（护栏文案，白名单不触达；护栏 0.65 为
+    生产 DB 覆盖值，spec 预设 0.55 不影响本用例显式传参）。
+    依据：全周期实盘分桶 [0.35,0.45) n=9 全亏 −110.8U，[0.45,0.65) 全带
+    为正（见 live_channels 注释）；前向裁决线=被挖除带无护栏口径 ≥30 笔
+    费后 EV>0 复盘重开。
+    """
+    trader = _make_real_trader(monkeypatch)
+    from binance_predict.services.live_channels import LIVE_CHANNELS
+    bands = LIVE_CHANNELS["scene_momentum_fade"].entry_band_whitelist
+    assert bands == ((0.45, 0.65),)
+
+    # 1. 带外（0.4499 越下界）：白名单拦下，币安零请求
+    updates, place_calls = _stub_whitelist_trade(
+        monkeypatch, trader,
+        quotes=[{"averagePrice": 0.4499, "amountIn": "5", "amountOut": "11",
+                 "quoteId": "Q-0.4499"}],
+        confirms=[])
+    order = await trader.execute_signal_trade(
+        "DOWN", 5.0, "scene_momentum_fade", WINDOW_START,
+        max_exec_price=0.65, market_period="15m", entry_band_whitelist=bands)
+    assert order["status"] == "FAILED"
+    assert "入场价白名单弃单" in updates[0][1]["error_message"]
+    assert place_calls == []
+
+    # 2. 带内放行：0.45（左闭贴线）/ 0.6499（上界内侧）
+    for q, amount_out in ((0.45, "11"), (0.6499, "7.69")):
+        trader._15m_markets[WINDOW_START] = {
+            "end_date": WINDOW_START + 900_000,
+            "up_token": "T-S4W-UP", "down_token": "T-S4W-DOWN",
+            "up_price": round(1 - q, 4), "down_price": q,
+        }
+        updates, place_calls = _stub_whitelist_trade(
+            monkeypatch, trader,
+            quotes=[{"averagePrice": q, "amountIn": "5", "amountOut": amount_out,
+                     "quoteId": f"Q-{q}"}],
+            confirms=[{"orderId": "ORD-1", "status": "FILLED", "price": f"{q}"}])
+        order = await trader.execute_signal_trade(
+            "DOWN", 5.0, "scene_momentum_fade", WINDOW_START,
+            max_exec_price=0.65, market_period="15m", entry_band_whitelist=bands)
+        assert order["status"] == "FILLED"
+        assert place_calls == [f"Q-{q}"]
+
+    # 3. 0.65 贴护栏线：执行价护栏先拦（avg >= 0.65 贴线弃单），白名单不触达
+    updates, place_calls = _stub_whitelist_trade(
+        monkeypatch, trader,
+        quotes=[{"averagePrice": 0.65, "amountIn": "5", "amountOut": "7.69",
+                 "quoteId": "Q-0.65"}],
+        confirms=[])
+    order = await trader.execute_signal_trade(
+        "DOWN", 5.0, "scene_momentum_fade", WINDOW_START,
         max_exec_price=0.65, market_period="15m", entry_band_whitelist=bands)
     assert order["status"] == "FAILED"
     assert "执行价护栏弃单" in updates[0][1]["error_message"]
