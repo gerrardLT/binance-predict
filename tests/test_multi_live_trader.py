@@ -4156,6 +4156,54 @@ async def test_signal_trade_market_success_external_call_baseline(monkeypatch) -
 
 
 @pytest.mark.asyncio
+async def test_signal_trade_logs_latency_breakdown(monkeypatch) -> None:
+    """下单关键路径必须输出分段时延（等锁/占位/列表/锚定/预检/报价/下单）。
+
+    背景：尾盘热门规则的 edge 在延迟 1s 时只剩 68%、2s 只剩 48%
+    （SIGNAL_SCORECARD §2.1）。没有分段计时就无法知道 1.8s 花在哪，
+    所以这里把日志字段固定下来，防止日后被重构默默删掉。
+    """
+    from binance_predict.services import prediction_trading as pt
+
+    trader = _make_real_trader(monkeypatch)
+    log = _FakeLogger()
+    monkeypatch.setattr(pt, "logger", log)
+
+    async def _reserve(_v, _ws, direction=None, market_period="5m", scene_signal_id=None):
+        return _pending_order()
+
+    async def _update(order, status, **kwargs):
+        return {**order, "status": status, **kwargs}
+
+    async def _quote(_token, _side, amount_usdt=None):
+        return {"averagePrice": 0.25, "amountIn": "5", "amountOut": "19", "quoteId": "Q-LAT"}
+
+    async def _place(_q, slippage_bps=1200):
+        return {"orderId": "ORD-LAT"}
+
+    async def _confirm(_oid, attempts=CONFIRM_ATTEMPTS, delay=CONFIRM_DELAY_S):
+        return {"orderId": _oid, "status": "FILLED", "price": "0.25"}
+
+    monkeypatch.setattr(trader, "_reserve_order_slot", _reserve)
+    monkeypatch.setattr(trader, "_update_signal_order", _update)
+    monkeypatch.setattr(trader, "get_quote", _quote)
+    monkeypatch.setattr(trader, "place_order", _place)
+    monkeypatch.setattr(trader, "confirm_order_status", _confirm)
+
+    order = await trader.execute_signal_trade(
+        "DOWN", 5.0, "x4_v2", WINDOW_START, max_exec_price=0.50,
+    )
+    assert order["status"] == "FILLED"
+
+    lines = [m for m in log.infos if "下单时延" in m]
+    assert len(lines) == 1, log.infos
+    line = lines[0]
+    for seg in ("等锁", "占位", "列表", "锚定", "预检", "报价", "下单", "合计"):
+        assert seg in line, (seg, line)
+    assert "x4_v2" in line
+
+
+@pytest.mark.asyncio
 async def test_reserve_order_slot_creates_and_binds_assessment_in_same_transaction(
         monkeypatch) -> None:
     """assessment 建账与订单占位复用同一 session，并在一次外层 commit 中绑定。"""
@@ -6113,6 +6161,7 @@ class _FakeLogger:
     def __init__(self) -> None:
         self.errors: list[str] = []
         self.warnings: list[str] = []
+        self.infos: list[str] = []
 
     def _fmt(self, msg, args) -> str:
         try:
@@ -6127,6 +6176,9 @@ class _FakeLogger:
         self.warnings.append(self._fmt(msg, a))
 
     def info(self, msg, *a) -> None:
+        self.infos.append(self._fmt(msg, a))
+
+    def debug(self, msg, *a) -> None:
         pass
 
 
@@ -6253,6 +6305,22 @@ async def test_signal_trade_quote_error_classifies_insufficient_balance(
     assert order2["status"] == "FAILED"
     msg2 = updates[-1][1]["error_message"]
     assert "余额不足" not in msg2 and "HTTP 500" in msg2
+
+    # 反例：-9000 但文案是金额超限（2026-10-30 生产实证，账户下单额度被清零）
+    # → 不得误标「余额不足」，应标「下单金额超限」
+    async def _quote_9000_too_large(_token, _side, amount_usdt=None):
+        trader.last_api_error = (
+            'HTTP 400: {"code":-9000,"msg":"Your order amount is too '
+            'large. Please decrease it to meet the market threshold."}')
+        return None
+
+    monkeypatch.setattr(trader, "get_quote", _quote_9000_too_large)
+    order3 = await trader.execute_signal_trade(
+        "DOWN", 5.0, "quote_contrarian_v2", WINDOW_START, max_exec_price=0.78)
+    assert order3["status"] == "FAILED"
+    msg3 = updates[-1][1]["error_message"]
+    assert "下单金额超限（币安 -9000）" in msg3
+    assert "余额不足" not in msg3 and "amount is too large" in msg3
 
 
 # ============================================================

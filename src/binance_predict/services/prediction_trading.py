@@ -1614,7 +1614,10 @@ class BinancePredictionTrader:
         markets: list[dict] = []
         offset = 0
         limit = 100  # 官方上限 100
+        _t_list = time.monotonic()
+        _pages = 0
         for _page in range(5):  # 最多翻 5 页兑底
+            _pages += 1
             data = await self._list_page(limit, offset)
             if data is None:
                 break
@@ -1624,6 +1627,13 @@ class BinancePredictionTrader:
             if not data.get("hasMore") or len(page) == 0:
                 break
             offset += limit
+
+        # 下单关键路径上的耗时观测：这条日志是压缩时延的唯一依据（见 SIGNAL_SCORECARD §2.5）
+        _list_ms = (time.monotonic() - _t_list) * 1000
+        if _list_ms >= 300:
+            logger.warning("市场列表拉取较慢 | {:.0f}ms | pages={}", _list_ms, _pages)
+        else:
+            logger.debug("市场列表 | {:.0f}ms | pages={}", _list_ms, _pages)
 
         btc_markets = []
         # 未来窗市场表每次 list_markets 重建（list 含未来窗，与 App 同源）
@@ -2107,7 +2117,31 @@ class BinancePredictionTrader:
                            signal_version)
             return None
 
+        # 分段计时：下单关键路径时延（等锁/占位/列表/锚定/预检/报价/下单）
+        _lat: dict[str, float] = {"t0": time.monotonic()}
+        _lat_labels = (
+            ("lock", "等锁"), ("reserve", "占位"), ("list", "列表"),
+            ("token", "锚定"), ("balance", "预检"), ("quote", "报价"), ("place", "下单"),
+        )
+
+        def _mark(name: str) -> None:
+            _lat[name] = time.monotonic()
+
+        def _log_latency(outcome: str) -> None:
+            prev = _lat["t0"]
+            parts = []
+            for key, label in _lat_labels:
+                if key in _lat:
+                    parts.append(f"{label} {(_lat[key] - prev) * 1000:.0f}ms")
+                    prev = _lat[key]
+            total = (time.monotonic() - _lat["t0"]) * 1000
+            logger.info(
+                "下单时延 | {} | {} | {} | 合计 {:.0f}ms",
+                signal_version, outcome, " | ".join(parts), total,
+            )
+
         async with self._trade_lock:
+            _mark("lock")
             # 先占位后下单：PENDING 行占住唯一键；重复窗口（含重启/并发）在花钱前拒绝。
             reserve_kwargs = {
                 "direction": prediction,
@@ -2124,8 +2158,10 @@ class BinancePredictionTrader:
                 logger.info("信号实盘：窗口 {} 已有订单占位，跳过（每窗一单）", window_start)
                 return None
             assessment_id = getattr(pending, "assessment_id", assessment_id)
+            _mark("reserve")
 
             await self.list_markets()
+            _mark("list")
 
             if prediction not in ("UP", "DOWN"):
                 logger.warning("未知预测方向: {}", prediction)
@@ -2220,6 +2256,7 @@ class BinancePredictionTrader:
                     pending, "FAILED", direction=prediction,
                     error_message=f"未找到 {market_period} 市场 {prediction} 方向的 token")
 
+            _mark("token")
             market_id = ((entry or {}).get("market_id") if entry else None)
             if market_id is None and market_period == "5m" and self._active_market:
                 market_id = self._active_market.get("marketTopicId")
@@ -2228,6 +2265,7 @@ class BinancePredictionTrader:
             # 阶段才回 -9000，文案泛化难归因（2026-09-04 12:45 生产实证）。
             # 预检不过即弃单（未提交币安，不产生废单）；查询失败保守放行。
             bal_ok, bal_free, bal_why = await self._preflight_balance(amount_usdt)
+            _mark("balance")
             if not bal_ok:
                 await self._patch_signal_assessment(
                     assessment_id,
@@ -2257,14 +2295,21 @@ class BinancePredictionTrader:
                 )
             else:
                 quote = await self.get_quote(token_id, "BUY", amount_usdt=amount_usdt)
+            _mark("quote")
             if not quote:
                 detail = self.last_api_error or "无详情（网络异常？）"
-                # 错误分类（P1）：-9000 是币安的余额不足文案，预检放行但下单时
-                # 余额被并发手工单抽走时会走到这里，归因文案直接点名余额。
+                # 错误分类（P1）：-9000 是币安通用码，须按文案分——
+                # 「enough USDT」＝余额不足（预检放行后被并发手工单抽走）；
+                # 「amount is too large ... market threshold」＝单笔金额超市场/
+                # 账户上限（2026-10-30 生产实证：账户下单额度被清零，任何金额
+                # 都报此文案，曾被裸 code 匹配误标「余额不足」）。
                 quote_reason = ReasonCode.QUOTE_UNAVAILABLE
-                if "-9000" in detail or "enough USDT" in detail:
+                if "enough USDT" in detail:
                     detail = f"余额不足（币安 -9000）| {detail}"
                     quote_reason = ReasonCode.BALANCE_INSUFFICIENT
+                elif ("amount is too large" in detail
+                      or "market threshold" in detail):
+                    detail = f"下单金额超限（币安 -9000）| {detail}"
                 await self._patch_signal_assessment(
                     assessment_id,
                     TerminalStage.EXECUTION,
@@ -2314,6 +2359,7 @@ class BinancePredictionTrader:
                     **assessment_quote_values,
                 )
                 if quote_policy.reason == ReasonCode.EXEC_PRICE_GUARD.value:
+                    _log_latency("护栏弃单")
                     wechat_notifier.notify_order_abandoned(
                         channel=signal_version,
                         direction=prediction,
@@ -2326,6 +2372,7 @@ class BinancePredictionTrader:
                         pending, "FAILED", direction=prediction, market_id=market_id,
                         error_message=f"执行价护栏弃单 | averagePrice={avg_price} >= {max_exec_price}（贴线无滑点空间）",
                         quote_json=quote)
+                _log_latency("白名单弃单")
                 wechat_notifier.notify_order_abandoned(
                     channel=signal_version,
                     direction=prediction,
@@ -2352,6 +2399,8 @@ class BinancePredictionTrader:
                 )
             else:
                 order_result = await self.place_order(quote, slippage_bps=slippage_bps)
+            _mark("place")
+            _log_latency("下单" if order_result else "下单失败")
             if not order_result:
                 snapshot = await self._update_signal_order(
                     pending, "FAILED", direction=prediction, market_id=market_id,
