@@ -2152,7 +2152,7 @@ ${names}
     <>
       <button
         onClick={() => setOpen(o => !o)}
-        className="fixed bottom-6 right-6 z-40 px-4 py-3 rounded-pill font-bold text-white text-sm transition bg-brand hover:bg-brand-hover"
+        className="fixed bottom-4 right-3 sm:bottom-6 sm:right-6 z-40 px-3 py-2 sm:px-4 sm:py-3 rounded-pill font-bold text-white text-xs sm:text-sm transition bg-brand hover:bg-brand-hover"
         title="一键下单（5m/15m 多周期窗口，真实订单）"
       >
         {busy ? '下单中…' : '⚡ 下单'}
@@ -2165,13 +2165,13 @@ ${names}
             role="dialog"
             aria-modal="true"
             aria-label="一键下单与BTC实时行情"
-            className="fixed bottom-20 right-4 sm:right-6 z-50 w-[1180px] max-w-[96vw] max-h-[90vh] overflow-y-auto bg-card rounded-card border border-line p-5 space-y-3 text-sm shadow-2xl"
+            className="fixed bottom-20 left-2 right-2 sm:left-auto sm:right-6 z-50 sm:w-[1180px] sm:max-w-[96vw] max-h-[90vh] overflow-y-auto bg-card rounded-card border border-line p-3 sm:p-5 space-y-3 text-sm shadow-2xl flex flex-col"
           >
             {/* 标题 + 周期切换 */}
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <span className="font-bold text-base text-ink-95">⚡ 一键下单</span>
-                <span className="text-xs text-ink-55">下单目标周期:</span>
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 min-w-0 flex-wrap">
+                <span className="font-bold text-base text-ink-95 whitespace-nowrap">⚡ 一键下单</span>
+                <span className="text-xs text-ink-55 whitespace-nowrap hidden sm:inline">下单目标周期:</span>
                 <div className="flex items-center gap-1">
                   {(['5m', '15m'] as const).map(p => (
                     <button key={p} onClick={() => { setPeriod(p); setPicked(['current']) }}
@@ -2202,8 +2202,11 @@ ${names}
               </span>
             </div>
 
-            {/* 实时 K 线：币安 BTC 现货，支持长历史缩放与同源实盘候选预警 */}
-            <KlineMini period={period} nowMs={nowMs} radarSignals={radarSignals} />
+            {/* 实时 K 线：币安 BTC 现货，支持长历史缩放与同源实盘候选预警。
+                窄屏 order-3：K 线排到表单之后，一键下单不用先划过 320px 图表。 */}
+            <div className="order-3 sm:order-none">
+              <KlineMini period={period} nowMs={nowMs} radarSignals={radarSignals} />
+            </div>
 
             {/* 窗口多选（核心）：当前 + 未来窗，点选高亮；
                 另提供「下期起连选 N 窗」快捷钮——自动选中从下一周期起往后 N 个可用窗 */}
@@ -2832,7 +2835,8 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance, liveChannelKey
         </p>
       ) : orderTab !== 'failed' ? (
         <>
-        <table className="w-full text-xs">
+        <div className="overflow-x-auto ds-sticky-col">
+        <table className="w-full min-w-[880px] text-xs">
           <thead>
             <tr className="text-left text-ink-55 border-b border-line-soft select-none">
               <th className="py-1 pr-2 cursor-pointer hover:text-brand" onClick={() => toggleSort('time')}>
@@ -2901,11 +2905,13 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance, liveChannelKey
             </tfoot>
           )}
         </table>
+        </div>
         {pager}
         </>
       ) : (
         <>
-        <table className="w-full text-xs">
+        <div className="overflow-x-auto ds-sticky-col">
+        <table className="w-full min-w-[760px] text-xs">
           <thead>
             <tr className="text-left text-ink-55 border-b border-line-soft select-none">
               <th className="py-1 pr-2 cursor-pointer hover:text-brand" onClick={() => toggleSort('time')}>
@@ -2946,6 +2952,7 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance, liveChannelKey
             })}
           </tbody>
         </table>
+        </div>
         {pager}
         </>
       )}
@@ -3389,8 +3396,7 @@ function ChartDrawer({ orders }: { orders: Record<string, unknown>[] }) {
       {!open && (
         <button
           onClick={() => setOpen(true)}
-          className="fixed right-0 top-[62%] -translate-y-1/2 z-40 bg-brand text-white text-xs font-bold px-2 py-3 rounded-l-sm hover:bg-brand-hover transition"
-          style={{ writingMode: 'vertical-rl' }}
+          className="fixed z-40 bg-brand text-white text-xs font-bold px-3 py-2 rounded-pill hover:bg-brand-hover transition bottom-4 left-3 sm:bottom-auto sm:left-auto sm:right-0 sm:top-[62%] sm:-translate-y-1/2 sm:px-2 sm:py-3 sm:text-[11px] sm:rounded-l-sm sm:rounded-r-none sm:[writing-mode:vertical-rl]"
           title="查看盈利表现 / 资金变化"
         >
           📊 表现
@@ -3976,8 +3982,9 @@ function LiveTradeTab() {
 
   return (
     <>
-    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-      {/* 下单使用右下角悬浮 FAB；表现诊断与资金变化进入右侧抽屉。 */}
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 pb-20 sm:pb-0">
+      {/* 下单使用右下角悬浮 FAB；表现诊断与资金变化进入右侧抽屉。
+          窄屏两个 FAB 停靠底部左右两侧 → 内容底部留 80px 让最后一张卡不被压住。 */}
       <div className="lg:col-span-2">
       <Card title="账户状态">
         <div className="space-y-2 text-sm">
@@ -4262,7 +4269,7 @@ function LiveTradeTab() {
           {liveChannels.length > 0 && (
             <div className="bg-card border border-line rounded-sm px-2.5 py-2 space-y-1.5">
               <div className="flex items-center gap-2 text-[11px]">
-                <span className="font-semibold text-ink-95">AI 策略顾问</span>
+                <span className="font-semibold text-ink-95 whitespace-nowrap">AI 策略顾问</span>
                 <HelpHint text="趋势分级 L1 观察 / L2 预警 / L3 红灯（与体检红灯同口径）。汇总卡只答两个问题：当前最坏单窗敏口是多少；若只能改一个通道改哪个。LLM 只给建议，一键应用需你确认，应用后 30 单自动评估。" />
                 <span className="ml-auto text-[10px] text-ink-55 font-mono">
                   数据截止 {advisor ? fmtMs(advisor.as_of) : '--'} · 口径：已结算单
@@ -4317,18 +4324,20 @@ function LiveTradeTab() {
                     role="button" tabIndex={0} aria-expanded={expandedLiveChannel === ch.channel}
                     onClick={() => toggleLiveDetails(ch.channel)}
                     onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggleLiveDetails(ch.channel) } }}
-                    className="flex items-center gap-2 px-2 py-1.5 text-xs cursor-pointer"
+                    className="flex flex-wrap items-center gap-x-2 gap-y-1.5 px-2 py-1.5 text-xs cursor-pointer"
                   >
-                    <span className="flex items-center gap-1.5 min-w-0 flex-1">
+                    <span className="flex items-center gap-1.5 min-w-0 w-full sm:w-auto sm:flex-1">
                       <span className="ds-badge ds-badge-up shrink-0">实盘通道</span>
                       <span className="text-ink-95 font-medium truncate">{info?.name ?? ch.display_name}</span>
                       <HelpHint text={info?.desc ?? ch.display_name} />
+                      <span className="ml-auto shrink-0 text-ink-55 sm:hidden" aria-hidden="true">{expandedLiveChannel === ch.channel ? '▲' : '▼'}</span>
                     </span>
                     <span className="shrink-0 flex items-center gap-2 font-mono text-[11px]" title="按已结算实盘订单统计；信号EV为每笔 PnL/投入的等权平均">
                       <span>胜率 <b>{metrics?.winRate == null ? '--' : `${(metrics.winRate * 100).toFixed(1)}%`}</b></span>
                       <span className={metrics?.signalEv == null ? 'text-ink-55' : metrics.signalEv >= 0 ? 'text-positive' : 'text-negative'}>信号EV <b>{metrics?.signalEv == null ? '--' : `${metrics.signalEv >= 0 ? '+' : ''}${(metrics.signalEv * 100).toFixed(1)}%`}</b></span>
                     </span>
                     {renderTrendCell(ch.channel)}
+                    <span className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
                     <span className="shrink-0 flex items-center gap-1" onClick={event => event.stopPropagation()}>
                       <span className="text-[10px] text-ink-55">护栏</span>
                       <input
@@ -4407,7 +4416,8 @@ function LiveTradeTab() {
                       disabled={togglingLive}
                       className={`shrink-0 px-2 py-0.5 rounded-pill font-bold text-white disabled:opacity-50 ${ch.enabled ? 'bg-negative' : 'bg-positive'}`}
                     >{ch.enabled ? '停火' : '开火'}</button>
-                    <span className="shrink-0 text-ink-55" aria-hidden="true">{expandedLiveChannel === ch.channel ? '▲' : '▼'}</span>
+                    <span className="hidden sm:inline shrink-0 text-ink-55" aria-hidden="true">{expandedLiveChannel === ch.channel ? '▲' : '▼'}</span>
+                    </span>
                   </div>
                   {expandedLiveChannel === ch.channel && liveDetails(ch)}
                   </div>
@@ -4435,18 +4445,20 @@ function LiveTradeTab() {
                             role="button" tabIndex={0} aria-expanded={expandedLiveChannel === ch.channel}
                             onClick={() => toggleLiveDetails(ch.channel)}
                             onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggleLiveDetails(ch.channel) } }}
-                            className="flex items-center gap-2 px-2 py-1.5 text-xs cursor-pointer"
+                            className="flex flex-wrap items-center gap-x-2 gap-y-1.5 px-2 py-1.5 text-xs cursor-pointer"
                           >
-                            <span className="flex items-center gap-1.5 min-w-0 flex-1">
+                            <span className="flex items-center gap-1.5 min-w-0 w-full sm:w-auto sm:flex-1">
                               <span className="ds-badge ds-badge-neutral shrink-0">已停火</span>
                               <span className="text-ink-95 font-medium truncate">{info?.name ?? ch.display_name}</span>
                               <HelpHint text={info?.desc ?? ch.display_name} />
+                              <span className="ml-auto shrink-0 text-ink-55 sm:hidden" aria-hidden="true">{expandedLiveChannel === ch.channel ? '▲' : '▼'}</span>
                             </span>
                             <span className="shrink-0 flex items-center gap-2 font-mono text-[11px]" title="按已结算实盘订单统计；信号EV为每笔 PnL/投入的等权平均">
                               <span>胜率 <b>{metrics?.winRate == null ? '--' : `${(metrics.winRate * 100).toFixed(1)}%`}</b></span>
                               <span className={metrics?.signalEv == null ? 'text-ink-55' : metrics.signalEv >= 0 ? 'text-positive' : 'text-negative'}>信号EV <b>{metrics?.signalEv == null ? '--' : `${metrics.signalEv >= 0 ? '+' : ''}${(metrics.signalEv * 100).toFixed(1)}%`}</b></span>
                             </span>
                             {renderTrendCell(ch.channel)}
+                            <span className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
                             <span className="shrink-0 flex items-center gap-1" onClick={event => event.stopPropagation()}>
                               <span className="text-[10px] text-ink-55">护栏</span>
                               <input
@@ -4481,7 +4493,8 @@ function LiveTradeTab() {
                               disabled={togglingLive}
                               className="shrink-0 px-2 py-0.5 rounded-pill font-bold text-white bg-positive disabled:opacity-50"
                             >开火</button>
-                            <span className="shrink-0 text-ink-55" aria-hidden="true">{expandedLiveChannel === ch.channel ? '▲' : '▼'}</span>
+                            <span className="hidden sm:inline shrink-0 text-ink-55" aria-hidden="true">{expandedLiveChannel === ch.channel ? '▲' : '▼'}</span>
+                            </span>
                           </div>
                           {expandedLiveChannel === ch.channel && liveDetails(ch)}
                           </div>
@@ -4660,10 +4673,11 @@ export default function App() {
   return (
     <div className="min-h-screen bg-canvas flex flex-col">
       <header className="bg-card/95 border-b border-line sticky top-0 z-10">
-        <div className="max-w-6xl mx-auto px-4 py-1.5 flex justify-center">
+        <div className="relative max-w-6xl mx-auto pl-2 pr-12 sm:pl-4 sm:pr-14 py-1.5 flex sm:justify-center">
           {/* TabBar — 选中态白底墨 95，不用蓝色填充
-              （One Blue Rule：蓝色只表示「可操作」与「当前选中」） */}
-          <div className="ds-tabs">
+              （One Blue Rule：蓝色只表示「可操作」与「当前选中」）
+              窄屏：横向滚动条带；退出按钮占右侧 44px（pr-12 留白），不叠在 tab 上 */}
+          <div className="ds-tabs min-w-0">
             {TAB_IDS.map(id => (
               <button
                 key={id}
@@ -4677,14 +4691,14 @@ export default function App() {
           <button
             onClick={handleLogout}
             title="退出登录"
-            className="absolute right-4 top-1/2 -translate-y-1/2 text-[11px] text-ink-55 hover:text-negative transition"
+            className="absolute right-2 sm:right-4 top-1/2 -translate-y-1/2 text-[11px] text-ink-55 hover:text-negative transition"
           >
             退出
           </button>
         </div>
       </header>
 
-      <main className="max-w-6xl w-full mx-auto px-4 py-4 flex-1">
+      <main className="max-w-6xl w-full mx-auto px-3 sm:px-4 pt-3 sm:pt-4 pb-4 sm:pb-6 flex-1">
         {tab === 'market' && (
           <div className="space-y-6">
             <Card title="BTC 5分钟内涨或跌（Binance Prediction Markets）">
@@ -4706,7 +4720,8 @@ export default function App() {
               )}
               {pmPoints.length > 0 ? (
                 <>
-                  <ResponsiveContainer width="100%" height={520}>
+                  <div className="h-[300px] sm:h-[520px]">
+                  <ResponsiveContainer width="100%" height="100%">
                     <AreaChart data={pmPoints.map(d => ({
                       time: new Date(d.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
                       up_pct: d.up_pct,
@@ -4724,6 +4739,7 @@ export default function App() {
                       <ReferenceLine y={50} stroke="var(--ink-55)" strokeDasharray="4 4" />
                     </AreaChart>
                   </ResponsiveContainer>
+                  </div>
                   <div className="flex justify-center gap-6 mt-2 text-xs text-ink-55">
                     <span>当前: <span className="text-positive font-medium num">{pmPoints[pmPoints.length - 1]?.up_pct?.toFixed(1)}% 看涨</span> / <span className="text-negative font-medium num">{pmPoints[pmPoints.length - 1]?.down_pct?.toFixed(1)}% 看跌</span></span>
                     <span>共 {pmPoints.length} 个采样点</span>
@@ -5817,6 +5833,7 @@ function BucketTable({ title, rows, hint }: { title: string; rows: HealthBucket[
   return (
     <div>
       <div className="text-xs font-bold text-ink-95 mb-1">{title} <HelpHint text={hint} /></div>
+      <div className="overflow-x-auto">
       <table className="w-full text-[11px]">
         <thead><tr className="text-ink-55 border-b border-line-soft">
           <th className="py-1 text-left">区间</th><th className="py-1 text-right">n</th>
@@ -5832,6 +5849,7 @@ function BucketTable({ title, rows, hint }: { title: string; rows: HealthBucket[
           </tr>))}
         </tbody>
       </table>
+      </div>
     </div>
   )
 }
@@ -6308,10 +6326,10 @@ function WeeklyReviewTab() {
             {watchouts.length === 0 && <div className="text-xs text-ink-55">本周无规则命中的注意点。</div>}
             <div className="space-y-1.5">
               {watchouts.map((w, i) => (
-                <div key={i} className="flex items-start gap-2 text-xs">
+                <div key={i} className="flex items-start gap-2 text-xs flex-wrap sm:flex-nowrap">
                   <span className={`shrink-0 px-1.5 py-0.5 rounded-pill border text-[10px] font-bold ${WEEKLY_SEVERITY_META[w.severity]?.cls ?? ''}`}>{w.severity}</span>
                   <span className="shrink-0 font-mono text-[10px] text-ink-55 w-[150px] truncate" title={w.code}>{w.code}</span>
-                  <span className="text-ink-80">{w.statement}{w.channel ? `（${w.channel}）` : ''}</span>
+                  <span className="text-ink-80 break-words min-w-0">{w.statement}{w.channel ? `（${w.channel}）` : ''}</span>
                 </div>
               ))}
             </div>
@@ -6532,7 +6550,7 @@ function MonitorTab() {
 
       {report && (
         <div className="bg-card rounded-card border border-line overflow-hidden">
-          <div className="overflow-auto max-h-[calc(100vh-210px)]">
+          <div className="overflow-auto max-h-[calc(100vh-210px)] ds-sticky-col">
             <table className="w-full min-w-[720px] text-xs">
               <thead className="sticky top-0 z-10 bg-card">
                 <tr className="text-ink-55 border-b border-line">
@@ -6615,6 +6633,7 @@ function MonitorTab() {
       {corrDrawer && corrs.length > 0 && (
         <DetailDrawer title="通道间同窗共振" subtitle={`${corrs.length} 对（Top 20）`} onClose={() => setCorrDrawer(false)}>
           <div className="text-[11px] text-ink-55">同一 5m/15m 窗口同时触发的不同通道。Jaccard 越高 = 同一个赌注上重复押注，组合风险集中；同向率 = 同时触发时方向相同的比例。</div>
+          <div className="overflow-x-auto">
           <table className="w-full text-[11px]">
             <thead>
               <tr className="text-ink-55 border-b border-line-soft">
@@ -6637,6 +6656,7 @@ function MonitorTab() {
               ))}
             </tbody>
           </table>
+          </div>
         </DetailDrawer>
       )}
     </div>
@@ -6728,7 +6748,7 @@ function FakeBreakoutPanel() {
 
       {/* 三级别位势 */}
       {Object.keys(levels).length > 0 && (
-        <div className="grid grid-cols-3 gap-2 mb-3 text-xs">
+        <div className="flex flex-wrap gap-2 mb-3 text-xs">
           {levelOrder.filter(l => levels[l]).map(l => {
             const lv = levels[l]
             const mid = status?.btc_mid || 0
@@ -6737,7 +6757,7 @@ function FakeBreakoutPanel() {
             const brokeRes = distRes !== null && distRes > 0
             const brokeSup = distSup !== null && distSup < 0
             return (
-              <div key={l} className="px-2.5 py-2 bg-sunken border border-line rounded-sm">
+              <div key={l} className="flex-1 min-w-[118px] px-2.5 py-2 bg-sunken border border-line rounded-sm">
                 <div className="font-bold text-ink-80 mb-1">{l === 'daily' ? '日线' : l} <span className="text-ink-55 font-normal">（{l === 'daily' ? 288 : l === '4h' ? 48 : 12} 窗）</span></div>
                 <div className={`font-mono ${brokeRes ? 'text-negative font-bold' : 'text-ink-55'}`}>
                   阻力 {lv.resistance.toFixed(0)}{distRes !== null && <span className="ml-1">({distRes >= 0 ? '+' : ''}{distRes.toFixed(2)}%){brokeRes && ' ⚠️'}</span>}
@@ -9271,10 +9291,10 @@ function SceneSignalsCard({
       </div>
 
       {/* 仅保留一个总览入口：类型统计替代重复的 BTC 背景图；实时 K 线集中在下单弹窗。 */}
-      {analytics && <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-        <div className="ds-card p-3"><div className="text-xs text-ink-55">实盘执行中</div><div className="text-xl font-bold font-mono text-positive">{[...Object.values(analytics.shadow), ...Object.values(analytics.scene)].filter(block => block.summary.execution_mode === 'LIVE_ACTIVE').length}</div></div>
-        <div className="ds-card p-3"><div className="text-xs text-ink-55">仅影子 / 研究</div><div className="text-xl font-bold font-mono text-violet">{[...Object.values(analytics.shadow), ...Object.values(analytics.scene)].filter(block => ['SHADOW_ONLY', 'RESEARCH_ONLY'].includes(block.summary.execution_mode ?? '')).length}</div></div>
-        <div className="ds-card p-3"><div className="text-xs text-ink-55">蜡烛反转逻辑版本</div><div className="text-xl font-bold font-mono text-brand">{Object.values(analytics.shadow).filter(block => block.summary.family === 'candlestick_reversal').length}</div><div className="text-[10px] text-ink-55">同窗按单事件多标签去重</div></div>
+      {analytics && <div className="grid grid-cols-3 gap-2">
+        <div className="ds-card p-2 sm:p-3"><div className="text-[10px] sm:text-xs text-ink-55">实盘执行中</div><div className="text-base sm:text-xl font-bold font-mono text-positive">{[...Object.values(analytics.shadow), ...Object.values(analytics.scene)].filter(block => block.summary.execution_mode === 'LIVE_ACTIVE').length}</div></div>
+        <div className="ds-card p-2 sm:p-3"><div className="text-[10px] sm:text-xs text-ink-55">仅影子 / 研究</div><div className="text-base sm:text-xl font-bold font-mono text-violet">{[...Object.values(analytics.shadow), ...Object.values(analytics.scene)].filter(block => ['SHADOW_ONLY', 'RESEARCH_ONLY'].includes(block.summary.execution_mode ?? '')).length}</div></div>
+        <div className="ds-card p-2 sm:p-3"><div className="text-[10px] sm:text-xs text-ink-55">蜡烛反转逻辑版本</div><div className="text-base sm:text-xl font-bold font-mono text-brand">{Object.values(analytics.shadow).filter(block => block.summary.family === 'candlestick_reversal').length}</div><div className="text-[9px] sm:text-[10px] text-ink-55">同窗按单事件多标签去重</div></div>
       </div>}
 
 

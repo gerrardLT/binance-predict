@@ -277,6 +277,11 @@
   display: flex;
   flex-direction: column;
   box-sizing: border-box;
+
+  /* 窄屏：左右描边贴着屏幕边缘只浪费 2px 内容宽度 */
+  @media (max-width: 640px) {
+    border-inline: none;
+  }
 }
 
 body {
@@ -391,13 +396,22 @@ code {
     box-shadow: 0 0 0 2px var(--brand-soft);
   }
 
-  /* ---- Tabs：选中态白底墨 95，不用蓝色填充（One Blue Rule） ---- */
+  /* ---- Tabs：选中态白底墨 95，不用蓝色填充（One Blue Rule） ----
+     窄屏：7 个 tab 放不下 → 横向滚动而不是折行。此前 flex 收缩把
+     中文压成竖排（每字一行），整条导航高 340px、占掉半屏。 */
   .ds-tabs {
     display: flex;
     gap: 4px;
     padding: 4px;
     background: var(--canvas);
     border-radius: var(--radius-pill);
+    max-width: 100%;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none; /* Firefox：隐藏滚动条，保留滑动 */
+  }
+  .ds-tabs::-webkit-scrollbar {
+    display: none;
   }
   .ds-tab {
     background: transparent;
@@ -410,9 +424,18 @@ code {
     border: none;
     border-radius: var(--radius-pill);
     cursor: pointer;
+    white-space: nowrap; /* 关键：永不折行 */
+    flex: 0 0 auto; /* 关键：不参与收缩 */
     transition:
       color var(--duration-control) var(--ease-standard),
       background-color var(--duration-control) var(--ease-standard);
+  }
+  @media (max-width: 640px) {
+    .ds-tab {
+      padding: 5px 11px;
+      font-size: 13px;
+      line-height: 22px;
+    }
   }
   .ds-tab:hover {
     color: var(--ink-40);
@@ -735,6 +758,32 @@ code {
     line-height: 1.4;
     font-variant-numeric: tabular-nums;
     color: var(--ink-95);
+  }
+}
+
+/* ==========================================================================
+   窄屏：表格不压列
+   ------------------------------------------------------------------------
+   18 张数据表的列语义（n / 胜率 / 95%区间 / 均EV …）在 390px 下会被压成
+   逐字竖排，不可读。声明了 overflow-* 的滚动容器里，表格按内容取最小宽度，
+   溢出交给容器横向滚动；桌面端（>640px）不受影响。
+   ========================================================================== */
+@media (max-width: 640px) {
+  .overflow-x-auto > table,
+  .overflow-auto > table,
+  .overflow-y-auto > table {
+    min-width: max-content;
+  }
+
+  /* 首列吸附：横向滚动时始终看得见「这是哪一行」（订单时间 / 通道名）。
+     不加在全部表格上——只在显式声明 ds-sticky-col 的容器生效。 */
+  .ds-sticky-col > table > thead > tr > th:first-child,
+  .ds-sticky-col > table > tbody > tr > td:first-child {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    background: var(--card);
+    box-shadow: 1px 0 0 var(--line-soft);
   }
 }
 
