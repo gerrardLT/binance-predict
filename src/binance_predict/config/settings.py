@@ -600,6 +600,13 @@ class Settings(BaseSettings):
     # 运行时设定重启不丢（存 DB）；删 DB 覆盖行才回落到本层。
     live_channels_json: str = ""
 
+    # --- 下单关键路径市场缓存快路（2026-10-30）---
+    # True：本窗 token 已缓存且未过期 → 跳过 list_markets()，省约 2.0s
+    # （线上实测列表段 p50 2,022ms，占下单总延迟 73%）；
+    # 未命中仍走原 list_markets()，下单语义零变化。
+    # 回退：.env 设 LIVE_MARKET_CACHE_FASTPATH=false 重启（或 git revert）。
+    live_market_cache_fastpath: bool = True
+
     # --- 场景研究（LLM 研究员，M2 2026-08-16）---
     # 总开关：False 时不启动研究调度循环
     scene_research_enabled: bool = True

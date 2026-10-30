@@ -1748,6 +1748,42 @@ class BinancePredictionTrader:
         async with self._trade_lock:
             await self.list_markets()
 
+    def _market_cache_ready(self, window_start: int, market_period: str) -> bool:
+        """下单关键路径：本窗 token 缓存能否直接复用（跳过 list_markets 的 ~2s 拉取）。
+
+        只判“够不够用”，不改缓存本身：
+        - 15m：`_15m_markets` 有 window_start±2s（与锚定守卫同口径）且 end_date 未过、
+          两侧 token 齐全；
+        - 5m：`_5m_start_date` ±2s 命中且两侧 token 齐全。
+
+        未命中一律返回 False → 调用方照旧 `list_markets()`，行为与改造前完全一致。
+        tokenId 在市场生命周期内不变（非易腐数据），15m 市场又提前数小时创建，
+        所以 60s 预热的缓存已含下一个窗口。开关见 settings.live_market_cache_fastpath。
+        """
+        if not settings.live_market_cache_fastpath:
+            return False
+        now_ms = int(time.time() * 1000)
+        if market_period == "15m":
+            entry = self._15m_markets.get(window_start)
+            if entry is None:
+                for s, e in self._15m_markets.items():
+                    if abs(int(s) - window_start) <= 2000:
+                        entry = e
+                        break
+            if not entry:
+                return False
+            end = entry.get("end_date")
+            return bool(end and int(end) > now_ms
+                        and entry.get("up_token") and entry.get("down_token"))
+        cache_start = self._5m_start_date
+        try:
+            cache_start = int(cache_start) if cache_start else None
+        except (TypeError, ValueError):
+            cache_start = None
+        if cache_start is None or abs(cache_start - window_start) > 2000:
+            return False
+        return bool(self._up_token_id and self._down_token_id)
+
     async def get_quote(
         self,
         token_id: str,
@@ -2119,6 +2155,7 @@ class BinancePredictionTrader:
 
         # 分段计时：下单关键路径时延（等锁/占位/列表/锚定/预检/报价/下单）
         _lat: dict[str, float] = {"t0": time.monotonic()}
+        _list_skipped = False
         _lat_labels = (
             ("lock", "等锁"), ("reserve", "占位"), ("list", "列表"),
             ("token", "锚定"), ("balance", "预检"), ("quote", "报价"), ("place", "下单"),
@@ -2132,7 +2169,10 @@ class BinancePredictionTrader:
             parts = []
             for key, label in _lat_labels:
                 if key in _lat:
-                    parts.append(f"{label} {(_lat[key] - prev) * 1000:.0f}ms")
+                    if key == "list" and _list_skipped:
+                        parts.append(f"{label} 0ms(skip)")
+                    else:
+                        parts.append(f"{label} {(_lat[key] - prev) * 1000:.0f}ms")
                     prev = _lat[key]
             total = (time.monotonic() - _lat["t0"]) * 1000
             logger.info(
@@ -2160,7 +2200,11 @@ class BinancePredictionTrader:
             assessment_id = getattr(pending, "assessment_id", assessment_id)
             _mark("reserve")
 
-            await self.list_markets()
+            # 快路（2026-10-30）：本窗 token 已缓存就跳过 list_markets（省 ~2.0s）；
+            # 未命中/开关关闭 → 原逻辑（照旧拉列表），下单语义不变。
+            _list_skipped = self._market_cache_ready(window_start, market_period)
+            if not _list_skipped:
+                await self.list_markets()
             _mark("list")
 
             if prediction not in ("UP", "DOWN"):

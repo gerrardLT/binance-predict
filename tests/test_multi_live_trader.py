@@ -4297,6 +4297,123 @@ async def test_endgame_fire_skips_when_too_late(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_market_cache_fastpath_skips_list_when_15m_hit(monkeypatch) -> None:
+    """缓存命中（本窗 15m token 已预热且未过期）→ 跳过 list_markets，省 ~2s。"""
+    from binance_predict.services import prediction_trading as pt
+
+    trader = _make_real_trader(monkeypatch)
+    now = int(time.time() * 1000)
+    ws = (now // 900_000) * 900_000
+    trader._15m_markets = {ws: {
+        "market_id": 1, "end_date": ws + 900_000,
+        "up_token": "T-UP", "down_token": "T-DOWN",
+        "up_price": 0.45, "down_price": 0.55,
+    }}
+    calls = {"list": 0}
+
+    async def _list():
+        calls["list"] += 1
+        return []
+
+    async def _reserve(_v, _ws, direction=None, market_period="5m", scene_signal_id=None):
+        return _pending_order()
+
+    async def _update(order, status, **kwargs):
+        return {**order, "status": status, **kwargs}
+
+    async def _quote(_t, _s, amount_usdt=None):
+        return {"averagePrice": 0.25, "amountIn": "5", "amountOut": "19", "quoteId": "Q"}
+
+    async def _place(_q, slippage_bps=1200):
+        return {"orderId": "O"}
+
+    async def _confirm(_oid, attempts=CONFIRM_ATTEMPTS, delay=CONFIRM_DELAY_S):
+        return {"orderId": _oid, "status": "FILLED", "price": "0.25"}
+
+    monkeypatch.setattr(trader, "list_markets", _list)
+    monkeypatch.setattr(trader, "_reserve_order_slot", _reserve)
+    monkeypatch.setattr(trader, "_update_signal_order", _update)
+    monkeypatch.setattr(trader, "get_quote", _quote)
+    monkeypatch.setattr(trader, "place_order", _place)
+    monkeypatch.setattr(trader, "confirm_order_status", _confirm)
+
+    order = await trader.execute_signal_trade(
+        "UP", 5.0, "scene_bull_exhaust", ws, max_exec_price=0.50, market_period="15m")
+    assert order["status"] == "FILLED"
+    assert calls["list"] == 0          # 命中缓存：零次列表拉取
+
+
+@pytest.mark.asyncio
+async def test_market_cache_fastpath_falls_back_on_miss(monkeypatch) -> None:
+    """缓存未命中（无本窗）/已过期 → 照旧 list_markets，行为与改造前一致。"""
+    trader = _make_real_trader(monkeypatch)
+    now = int(time.time() * 1000)
+    ws = (now // 900_000) * 900_000
+    calls = {"list": 0}
+
+    async def _list():
+        calls["list"] += 1
+        return []
+
+    async def _reserve(_v, _ws, direction=None, market_period="5m", scene_signal_id=None):
+        return _pending_order()
+
+    async def _update(order, status, **kwargs):
+        return {**order, "status": status, **kwargs}
+
+    monkeypatch.setattr(trader, "list_markets", _list)
+    monkeypatch.setattr(trader, "_reserve_order_slot", _reserve)
+    monkeypatch.setattr(trader, "_update_signal_order", _update)
+
+    # 空缓存 → miss（下游因无 token 返回 FAILED，但 list 必须被调用）
+    trader._15m_markets = {}
+    await trader.execute_signal_trade(
+        "UP", 5.0, "scene_bull_exhaust", ws, max_exec_price=0.50, market_period="15m")
+    assert calls["list"] == 1
+
+    # 过期条目（end_date 已过）→ 仍算 miss
+    calls["list"] = 0
+    trader._15m_markets = {ws: {"market_id": 1, "end_date": ws - 1,
+                                "up_token": "T", "down_token": "T"}}
+    await trader.execute_signal_trade(
+        "UP", 5.0, "scene_bull_exhaust", ws, max_exec_price=0.50, market_period="15m")
+    assert calls["list"] == 1
+
+
+@pytest.mark.asyncio
+async def test_market_cache_fastpath_switch_off_restores_old_path(monkeypatch) -> None:
+    """回退开关：LIVE_MARKET_CACHE_FASTPATH=false → 即使命中也不跳过（完全回原行为）。"""
+    from binance_predict.config.settings import settings
+
+    trader = _make_real_trader(monkeypatch)
+    now = int(time.time() * 1000)
+    ws = (now // 900_000) * 900_000
+    trader._15m_markets = {ws: {"market_id": 1, "end_date": ws + 900_000,
+                                "up_token": "T", "down_token": "T"}}
+    monkeypatch.setattr(settings, "live_market_cache_fastpath", False)
+    assert trader._market_cache_ready(ws, "15m") is False
+
+    monkeypatch.setattr(settings, "live_market_cache_fastpath", True)
+    assert trader._market_cache_ready(ws, "15m") is True
+    # 窗口外（±2s 之外）不命中
+    assert trader._market_cache_ready(ws + 60_000, "15m") is False
+
+
+@pytest.mark.asyncio
+async def test_market_cache_fastpath_5m_anchor(monkeypatch) -> None:
+    """5m 锚定：start_date 匹配且两侧 token 齐 → 命中；缺 token → 回退 list。"""
+    trader = _make_real_trader(monkeypatch)
+    now = int(time.time() * 1000)
+    ws = (now // 300_000) * 300_000
+    trader._5m_start_date = ws
+    trader._up_token_id = "U"
+    trader._down_token_id = "D"
+    assert trader._market_cache_ready(ws, "5m") is True
+    trader._down_token_id = None
+    assert trader._market_cache_ready(ws, "5m") is False
+
+
+@pytest.mark.asyncio
 async def test_reserve_order_slot_creates_and_binds_assessment_in_same_transaction(
         monkeypatch) -> None:
     """assessment 建账与订单占位复用同一 session，并在一次外层 commit 中绑定。"""
