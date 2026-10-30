@@ -2495,13 +2495,14 @@ const channelRowLabel = (ver: string) => ver.startsWith(MANUAL_CHAIN_PREFIX)
 
 const DEFAULT_ORDERS_PAGE_SIZE = 20
 
-function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
+function OrdersCard({ orders, syncing, syncResult, onSyncBinance, liveChannelKeys }: {
   orders: Record<string, unknown>[]
   syncing: boolean
   syncResult: Record<string, unknown> | null
   onSyncBinance: () => void
+  liveChannelKeys: Set<string> | null   // 当前实盘在跑的通道 key；null＝实盘状态拉取失败
 }) {
-  const [orderTab, setOrderTab] = useState<'active' | 'failed'>('active')
+  const [orderTab, setOrderTab] = useState<'active' | 'failed' | 'retired'>('active')
   const [fStatus, setFStatus] = useState('ALL')
   const [fChannel, setFChannel] = useState('ALL')
   const [fDirection, setFDirection] = useState('ALL')
@@ -2511,16 +2512,29 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
   const [sortField, setSortField] = useState<'time' | 'amount' | 'pnl'>('time')
   const [sortAsc, setSortAsc] = useState(false)
 
+  // 已停用通道分流（2026-10-30 用户要求）：还在实盘下单的通道进「最近/失败」两个 Tab，
+  // 已停用、退役版本、手动测试、复利链的单全部进「已停用通道」Tab，两边不混。
+  // liveChannelKeys=null（实盘状态拉取失败）时全部归实盘，退化为原来的双 Tab 行为。
+  const isLiveChannelOrder = (o: Record<string, unknown>) =>
+    !liveChannelKeys || liveChannelKeys.has(channelFilterKey(String(o.signal_version ?? '')))
+  const liveOrders = orders.filter(isLiveChannelOrder)
+  const retiredOrders = orders.filter(o => !isLiveChannelOrder(o))
+
   // 失败单严格分流：主 Tab 只留非 FAILED（FILLED / PENDING / 未知状态都在），失败 Tab 只留 FAILED
-  const activeOrders = orders.filter(o => String(o.status ?? '') !== 'FAILED')
-  const failedOrders = orders.filter(o => String(o.status ?? '') === 'FAILED')
-  const base = orderTab === 'active' ? activeOrders : failedOrders
+  const activeOrders = liveOrders.filter(o => String(o.status ?? '') !== 'FAILED')
+  const failedOrders = liveOrders.filter(o => String(o.status ?? '') === 'FAILED')
+  const base = orderTab === 'active' ? activeOrders : orderTab === 'failed' ? failedOrders : retiredOrders
 
   const channels = Array.from(new Set(
     base.map(o => channelFilterKey(String(o.signal_version ?? ''))).filter(v => v && v !== '--'))).sort()
+  // 通道筛选分组（2026-10-30 用户要求）：主组只留还在实盘下单的通道；
+  // 已停用/退役版本/手动测试/复利链等非实盘数据收进第二组另展示，不混排。
+  // liveChannelKeys=null（实盘状态拉取失败）退化为不分组的平铺，避免全部误标「已停用」。
+  const liveChs = liveChannelKeys ? channels.filter(v => liveChannelKeys.has(v)) : channels
+  const otherChs = liveChannelKeys ? channels.filter(v => !liveChannelKeys.has(v)) : []
   const kw = fKeyword.trim().toLowerCase()
   const filtered = base.filter(o => {
-    if (orderTab === 'active' && fStatus !== 'ALL' && String(o.status ?? '') !== fStatus) return false
+    if (orderTab !== 'failed' && fStatus !== 'ALL' && String(o.status ?? '') !== fStatus) return false
     if (fChannel !== 'ALL' && channelFilterKey(String(o.signal_version ?? '')) !== fChannel) return false
     if (fDirection !== 'ALL' && String(o.direction ?? '') !== fDirection) return false
     if (kw) {
@@ -2579,7 +2593,7 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
     return <span className="text-brand ml-0.5 text-[10px]">{sortAsc ? '▲' : '▼'}</span>
   }
 
-  const tabBtn = (t: 'active' | 'failed', label: string, count: number) => (
+  const tabBtn = (t: 'active' | 'failed' | 'retired', label: string, count: number) => (
     <button
       onClick={() => setOrderTab(t)}
       className={`px-3 py-1 text-xs font-semibold rounded-sm border transition ${orderTab === t ? 'bg-brand text-white border-brand' : 'bg-card text-ink-80 border-line hover:border-brand'}`}
@@ -2730,20 +2744,34 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
       <div className="flex items-center gap-2 mb-2">
         {tabBtn('active', '最近订单', activeOrders.length)}
         {tabBtn('failed', '失败订单', failedOrders.length)}
-        <HelpHint text="失败单（FAILED）已从主列表剥离：这类单未提交成功或未成交，amount_in=0、均价只是委托报价，混在一起会污染盈亏阅读" />
+        {tabBtn('retired', '已停用通道', retiredOrders.length)}
+        <HelpHint text="失败单（FAILED）已从主列表剥离：这类单未提交成功或未成交，amount_in=0、均价只是委托报价，混在一起会污染盈亏阅读。另：已停用通道（含退役版本、手动测试、复利链）的订单全部归入第三个 Tab，与实盘在跑通道完全分开统计" />
       </div>
       <div className="flex items-center justify-between mb-2 gap-2 flex-wrap">
         <div className="flex items-center gap-1.5 flex-wrap">
-          {orderTab === 'active' && (
+          {orderTab !== 'failed' && (
             <select value={fStatus} onChange={e => setFStatus(e.target.value)} className={selectCls} title="按订单状态筛选">
               <option value="ALL">全部状态</option>
               <option value="FILLED">已成交 FILLED</option>
               <option value="PENDING">待定 PENDING</option>
             </select>
           )}
-          <select value={fChannel} onChange={e => setFChannel(e.target.value)} className={selectCls} title="按信号通道筛选">
+          <select value={fChannel} onChange={e => setFChannel(e.target.value)} className={selectCls} title="按信号通道筛选：主组为实盘在跑通道，已停用/非实盘通道另列一组">
             <option value="ALL">全部通道</option>
-            {channels.map(v => (
+            {liveChannelKeys ? (
+              <>
+                {liveChs.length > 0 && (
+                  <optgroup label="实盘通道">
+                    {liveChs.map(v => <option key={v} value={v}>{channelFilterLabel(v)}</option>)}
+                  </optgroup>
+                )}
+                {otherChs.length > 0 && (
+                  <optgroup label="已停用 / 非实盘">
+                    {otherChs.map(v => <option key={v} value={v}>{channelFilterLabel(v)}</option>)}
+                  </optgroup>
+                )}
+              </>
+            ) : channels.map(v => (
               <option key={v} value={v}>{channelFilterLabel(v)}</option>
             ))}
           </select>
@@ -2795,10 +2823,14 @@ function OrdersCard({ orders, syncing, syncResult, onSyncBinance }: {
       {filtered.length === 0 ? (
         <p className="text-sm text-ink-55">
           {base.length === 0
-            ? (orderTab === 'active' ? '暂无订单记录' : '暂无失败订单')
-            : (orderTab === 'active' ? '当前筛选条件下无订单' : '当前筛选条件下无失败订单')}
+            ? (orderTab === 'active' ? '暂无订单记录'
+              : orderTab === 'failed' ? '暂无失败订单'
+                : liveChannelKeys ? '暂无已停用通道的订单' : '实盘通道状态未取到，暂时无法区分已停用通道')
+            : (orderTab === 'active' ? '当前筛选条件下无订单'
+              : orderTab === 'failed' ? '当前筛选条件下无失败订单'
+                : '当前筛选条件下无已停用通道订单')}
         </p>
-      ) : orderTab === 'active' ? (
+      ) : orderTab !== 'failed' ? (
         <>
         <table className="w-full text-xs">
           <thead>
@@ -3525,6 +3557,8 @@ function LiveTradeTab() {
   }
   const activeLiveChannels = liveChannels.filter(c => c.enabled).sort(byLivePerformance)
   const stoppedLiveChannels = liveChannels.filter(c => !c.enabled).sort(byLivePerformance)
+  // 订单记录筛选分组用：实盘在跑通道 key 集；实盘状态未取到时传 null（退化为平铺）
+  const liveChannelKeys = live ? new Set(activeLiveChannels.map(c => c.channel)) : null
   const enabledCount = activeLiveChannels.length
   const toggleLiveDetails = (channel: string) => setExpandedLiveChannel(current => current === channel ? null : channel)
 
@@ -4469,7 +4503,7 @@ function LiveTradeTab() {
       {/* 订单记录保留在主区；表现诊断与资金变化通过右侧抽屉查看。 */}
       {/* 最近订单：主区账户状态下方 */}
       <div className="lg:col-span-2">
-        <OrdersCard orders={orders} syncing={syncing} syncResult={syncResult} onSyncBinance={handleSyncBinance} />
+        <OrdersCard orders={orders} syncing={syncing} syncResult={syncResult} onSyncBinance={handleSyncBinance} liveChannelKeys={liveChannelKeys} />
       </div>
     </div>
 
