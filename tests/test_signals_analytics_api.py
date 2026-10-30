@@ -548,6 +548,7 @@ async def test_analytics_empty_db() -> None:
             "excur_bid30_15m_v1", "prebar_dn_bull_bid30_15m_v1",
             # 2026-10-27 cic 反向格（注册即登记）
             "cic_shallow_15m_v1",
+            "endgame_fav_15m_v1",
         }
     from binance_predict.services.candlestick_shadow_detector import CANDLESTICK_SIGNAL_IDS
     from binance_predict.services.live_channels import RETIRED_CHANNELS

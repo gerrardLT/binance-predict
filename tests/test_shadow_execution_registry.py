@@ -70,12 +70,13 @@ EXPECTED_ANALYTICS_VERSIONS = (
     "excur_bid30_15m_v1",
     "prebar_dn_bull_bid30_15m_v1",  # 2026-10-28 阶段5候选
     "cic_shallow_15m_v1",   # 2026-10-27 cic 反向格（注册即登记）
+    "endgame_fav_15m_v1",    # 2026-10-30 尾盘买热门（注册即登记）
 )
 
 
 def test_registry_matches_all_physical_shadow_versions_in_order() -> None:
     assert SHADOW_VERSIONS == EXPECTED_ANALYTICS_VERSIONS
-    assert len(SHADOW_VERSION_SPECS) == 113  # 2026-10-28 +阶段5候选
+    assert len(SHADOW_VERSION_SPECS) == 114  # 2026-10-30 +endgame 尾盘买热门
     for version in ("candle_hm_bull_5m_event_v1", "candle_hm_bull_15m_event_v1"):
         spec = SHADOW_VERSION_SPECS[version]
         assert spec.family == "candlestick_reversal"
