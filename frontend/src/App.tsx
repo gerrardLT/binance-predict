@@ -7145,6 +7145,8 @@ const TOOLTIP_ITEM_STYLE = { color: 'var(--on-ink)' } as const
    第 11 条起与第 1..10 条同色，靠渲染层的「淡色 + 细线」区分（见 shadowEntries.map）。
    label 是 recharts 的 dataKey 本身，改 label 会同时改曲线与图例，故一字未动。 */
 const SHADOW_META: Record<string, { label: string; color: string }> = {
+  // 尾盘买热门（2026-10-30）：15m 窗口最后 45s 买热门侧，影子默认开、实盘默认关。
+  endgame_fav_15m_v1: { label: '尾盘买热门·最后45s买热门侧', color: 'var(--chart-1)' },
   // 长影短实体反转：主事件只落一次，下列逻辑版本由标签还原。
   candle_hm_bull_5m_consensus2_shadow_v1: { label: '5m 长下影·至少2趋势→DOWN', color: 'var(--chart-1)' },
   candle_hm_bull_5m_consensus3_shadow_v1: { label: '5m 长下影·三趋势对照→DOWN', color: 'var(--chart-2)' },
