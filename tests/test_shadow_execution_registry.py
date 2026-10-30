@@ -74,6 +74,31 @@ EXPECTED_ANALYTICS_VERSIONS = (
 )
 
 
+def test_all_live_channels_registered_in_shadow_registry() -> None:
+    """硬门禁：每个实盘通道必须登记进 SHADOW_VERSIONS。
+
+    2026-10-30 endgame 事故：影子写数据但没进注册表 → 前端
+    `/api/signals/analytics?active_only=true` 用注册表白名单，面板静默看不到。
+    这里在 CI 就拦下来，不让它靠人工发现。
+    """
+    from binance_predict.services.live_channels import LIVE_CHANNELS
+    from binance_predict.services.shadow_execution_registry import SHADOW_VERSIONS
+
+    missing = sorted(set(LIVE_CHANNELS) - set(SHADOW_VERSIONS))
+    assert not missing, f"实盘通道未登记影子版本（面板将看不到）: {missing}"
+
+
+def test_warn_unregistered_shadow_channels_detects_drift(monkeypatch, caplog=None) -> None:
+    """自检本身要能抓到漏登（否则就是个永远返回空列表的摆设）。"""
+    from binance_predict.services import live_channels as lc
+
+    fake = dict(lc.LIVE_CHANNELS)
+    fake["__ghost_channel_v1"] = lc.LIVE_CHANNELS["endgame_fav_15m_v1"]
+    monkeypatch.setattr(lc, "LIVE_CHANNELS", fake)
+    missing = lc.warn_unregistered_shadow_channels()
+    assert missing == ["__ghost_channel_v1"]
+
+
 def test_registry_matches_all_physical_shadow_versions_in_order() -> None:
     assert SHADOW_VERSIONS == EXPECTED_ANALYTICS_VERSIONS
     assert len(SHADOW_VERSION_SPECS) == 114  # 2026-10-30 +endgame 尾盘买热门

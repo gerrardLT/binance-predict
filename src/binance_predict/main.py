@@ -1164,6 +1164,13 @@ async def lifespan(app: FastAPI):
         # 通道配置非法（未知通道名/金额超硬上限/护栏非法）：拒实盘不拖垮其他服务
         logger.error("多通道实盘执行器装配失败：{}", exc)
     else:
+        # 影子注册表自检（2026-10-30）：实盘通道漏登 SHADOW_VERSIONS 时
+        # 面板会静默看不到影子（数据仍在写）——启动即告警，不阻断。
+        try:
+            from .services.live_channels import warn_unregistered_shadow_channels
+            warn_unregistered_shadow_channels()
+        except Exception as exc:
+            logger.warning("影子注册表自检异常（不影响启动）| {}", exc)
         # DB 覆盖层（用户最后一次 toggle 的设定，优先级高于 env）；
         # fail-safe：DB 异常回落 env 层配置，不阻塞服务启动
         try:

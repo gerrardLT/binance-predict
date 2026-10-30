@@ -1017,6 +1017,30 @@ def scene_pattern_to_channel(pattern_type: str) -> str | None:
     return ch if ch in LIVE_CHANNELS else None
 
 
+def warn_unregistered_shadow_channels() -> list[str]:
+    """启动自检：实盘通道未登记进影子执行注册表 → WARNING（不阻断）。
+
+    2026-10-30 endgame 事故：影子照常写 kline_shadow_signals、面板却看不到——
+    因为分析页带 `?active_only=true`，后端只用 `SHADOW_VERSIONS` 做白名单。
+    注册表靠人工同步，漏登不报错也不影响交易，只在面板静默消失，
+    所以启动时把差异打出来（硬门禁另由 test_all_live_channels_registered_in_shadow_registry 把守）。
+
+    延迟导入避开循环依赖（shadow_execution_registry 顶层 import 本模块）。
+    """
+    try:
+        from .shadow_execution_registry import SHADOW_VERSIONS
+    except Exception as exc:  # 半初始化/循环导入：自检让位于启动
+        logger.warning("影子注册表自检跳过（导入失败）| {}: {}", type(exc).__name__, exc)
+        return []
+    missing = sorted(set(LIVE_CHANNELS) - set(SHADOW_VERSIONS))
+    if missing:
+        logger.warning(
+            "影子注册表自检：{} 个实盘通道未登记进 SHADOW_VERSIONS，"
+            "信号分析页（active_only=true）将看不到其影子 → {}",
+            len(missing), ", ".join(missing))
+    return missing
+
+
 def format_channel_title(channel: str | None) -> str:
     """将策略通道英文标识转换为中文+英文展示格式。
 
