@@ -1778,6 +1778,77 @@ class MultiLiveTrader:
         except Exception as exc:
             logger.warning("多通道实盘：excur 钩子异常（不影响检测循环）| {}", exc)
 
+    def on_endgame_signal(self, sig: dict) -> None:
+        """EndgameFavShadowDetector 尾盘买热门钩子（同步接口，fire-and-forget）。
+
+        payload：{version, market_start, market_end, direction, favored_price, t_rel}。
+        在窗口最后 45 秒买入当前热门侧（UP 或 DOWN 由信号决定）；
+        延迟 1s 剥 32%、2s 剥 52% 的 edge，故剩余 <15s 直接弃单。默认 OFF。
+        """
+        try:
+            channel = str(sig.get("version") or "")
+            market_start = int(sig["market_start"])
+            if not self._hook_gate(channel, "endgame", market_start):
+                return
+            task = asyncio.create_task(
+                self._fire_endgame(channel, sig),
+                name=f"live_endgame_{channel}_{market_start}",
+            )
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+        except Exception as exc:
+            logger.warning("多通道实盘：endgame 钩子异常（不影响检测循环）| {}", exc)
+
+    async def _fire_endgame(self, channel: str, sig: dict) -> None:
+        """尾盘买热门下单任务：当前 15m 窗口市价买热门侧（护栏 0.86）。
+
+        硬门：进入末段后剩余 <15s 不再下单——实测生产链路中位 1.8s，
+        剩余太短时成交价已追平/超过边际（研究 2s 延迟只剩 +1.9%）。"""
+        spec = self._specs[channel]
+        cfg = self._configs[channel]
+        market_start = int(sig["market_start"])
+        market_end = int(sig["market_end"])
+        prediction = str(sig.get("direction") or "UP")
+        try:
+            if time.time() * 1000 >= market_end - 15_000:
+                logger.info(
+                    "多通道实盘：{} 下单时刻剩余≤15s，弃单 | 窗口 {}",
+                    channel, _fmt_win(market_start))
+                await self._record_strategy_outcome(
+                    channel, market_start, reason="endgame_late_skip",
+                    rejected=True,
+                    input_snapshot={"t_rel": sig.get("t_rel")},
+                )
+                return
+            assessment_context, proceed = await self._prepare_runtime_execution(
+                channel, market_start, prediction,
+                input_snapshot={"favored_price": sig.get("favored_price"),
+                                "t_rel": sig.get("t_rel")},
+            )
+            if not proceed:
+                return
+            logger.info(
+                "多通道实盘开火 | {} | 尾盘买热门押 {} | 窗口 {} | t=+{}s 价={} | "
+                "金额 {} | 护栏 {}",
+                channel, prediction, _fmt_win(market_start), sig.get("t_rel"),
+                sig.get("favored_price"), cfg.amount_usdt,
+                resolve_max_exec(spec, cfg))
+            order = await self._exec_with_exclusive(
+                channel,
+                prediction=prediction,
+                amount_usdt=cfg.amount_usdt,
+                signal_version=channel,
+                window_start=market_start,
+                max_exec_price=resolve_max_exec(spec, cfg),
+                market_period="15m",
+                order_type=spec.order_type,
+                assessment_context=assessment_context,
+            )
+            await self._after_fill(order, channel, cfg)
+        except Exception as exc:
+            logger.warning("多通道实盘：endgame 下单任务异常 | {} | {} | {}",
+                           channel, _fmt_win(market_start), exc)
+
     def on_prebar_dn_bull_signal(self, sig: dict) -> None:
         """阶段5评分+前5分钟0.30触价钩子；默认OFF，延迟1秒后MARKET护栏0.32。"""
         try:

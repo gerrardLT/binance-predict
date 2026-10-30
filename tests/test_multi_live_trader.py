@@ -236,7 +236,8 @@ def test_parse_defaults_all_off(monkeypatch) -> None:
     # 2026-10-23：两个新通道 default_enabled=True（用户拍板注册即开启），其余全 OFF。
     default_on = {"hm_quality_5m_v1", "hm_moderate_5m_v1"}
     assert all(c.enabled == (ch in default_on) for ch, c in cfgs.items())
-    assert all(c.amount_usdt == (10.0 if ch == "prebar_dn_bull_bid30_15m_v1" else 2.0)
+    amount10 = {"prebar_dn_bull_bid30_15m_v1", "endgame_fav_15m_v1"}
+    assert all(c.amount_usdt == (10.0 if ch in amount10 else 2.0)
                for ch, c in cfgs.items())
     assert all(c.max_daily_orders == 100 for c in cfgs.values())
     assert all(c.max_exec_price is None for c in cfgs.values())  # 缺省回落 auto
@@ -469,7 +470,7 @@ def test_channels_registry_shape(monkeypatch) -> None:
             "firsthit_down_g7_v1", "g7_t270_v1",
             "gap_crowd_5m_v1", "gap_crowd_15m_v1"} <= set(RETIRED_CHANNELS)
     # 2026-10-27：+1（cic 反向格，默认 OFF）→ 34 + 61
-    assert len(LIVE_CHANNELS) + len(RETIRED_CHANNELS) == 35 + 61
+    assert len(LIVE_CHANNELS) + len(RETIRED_CHANNELS) == 36 + 61
     assert not (set(LIVE_CHANNELS) & set(RETIRED_CHANNELS))
     by = {**RETIRED_CHANNEL_SPECS, **LIVE_CHANNELS}
     # 在线通道：市场周期/方向/护栏逐项对齐
@@ -3461,7 +3462,7 @@ def test_status_shape(monkeypatch) -> None:
     # 2026-10-24：新增 wbid 窗口内接盘四通道（默认 OFF）→ 71→75；
     # 2026-10-24：再增 excur 布防接盘一通道（默认 OFF）→ 75→76
     # 2026-10-27：再增 cic 反向格一通道（默认 OFF）→ 76→77
-    assert len(s["channels"]) == 78 + len(CANDLESTICK_SIGNAL_IDS)
+    assert len(s["channels"]) == 79 + len(CANDLESTICK_SIGNAL_IDS)
     by = {c["channel"]: c for c in s["channels"]}
     c = by["quote_contrarian_v1"]
     assert c["enabled"] is True and c["enabled_at_startup"] is True
@@ -4201,6 +4202,98 @@ async def test_signal_trade_logs_latency_breakdown(monkeypatch) -> None:
     for seg in ("等锁", "占位", "列表", "锚定", "预检", "报价", "下单", "合计"):
         assert seg in line, (seg, line)
     assert "x4_v2" in line
+
+
+@pytest.mark.asyncio
+async def test_endgame_channel_registered_disabled_by_default() -> None:
+    """endgame 通道已注册、family 对齐、默认关闭（用户明确要求实盘不开启）。"""
+    from binance_predict.services.live_channels import LIVE_CHANNELS, parse_channel_config
+
+    ch = "endgame_fav_15m_v1"
+    assert ch in LIVE_CHANNELS
+    spec = LIVE_CHANNELS[ch]
+    assert spec.family == "endgame"
+    assert spec.market_period == "15m"
+    assert spec.auto_max_exec == 0.86      # 价带上界 0.85 + 滑点余量
+    assert spec.order_type == "MARKET"     # 限价单已被逆向选择否决
+    assert spec.default_enabled is False
+    cfgs = parse_channel_config()
+    assert cfgs[ch].enabled is False
+
+
+@pytest.mark.asyncio
+async def test_endgame_hook_respects_disabled_then_fires(monkeypatch) -> None:
+    """钩子：通道未启用 → 不下单；启用后 → 按信号方向市价押 15m 热门侧。"""
+    from binance_predict.services import multi_live_trader as mlt
+
+    class _Trader(mlt.MultiLiveTrader):
+        def __init__(self) -> None:  # 跳过重初始化，只测钩子分流
+            self._specs = mlt.LIVE_CHANNELS
+            from binance_predict.services.live_channels import parse_channel_config
+            self._configs = parse_channel_config()
+            self._stopped = False
+            self._tasks = set()
+            self.calls: list[dict] = []
+
+        async def _fire_endgame(self, channel, sig):  # 直接同步记录，不起后台任务
+            self.calls.append({"channel": channel, **sig})
+
+    trader = _Trader()
+    sig = {"version": "endgame_fav_15m_v1", "market_start": WINDOW_START,
+           "market_end": WINDOW_START + 900_000, "direction": "DOWN",
+           "favored_price": 0.72, "t_rel": 860.0}
+
+    trader.on_endgame_signal(sig)
+    for t in list(trader._tasks):
+        await t
+    assert trader.calls == []              # 默认关闭
+
+    trader._configs["endgame_fav_15m_v1"].enabled = True
+    trader.on_endgame_signal(sig)
+    for t in list(trader._tasks):
+        await t
+    assert len(trader.calls) == 1
+    assert trader.calls[0]["direction"] == "DOWN"
+    assert trader.calls[0]["channel"] == "endgame_fav_15m_v1"
+
+
+@pytest.mark.asyncio
+async def test_endgame_fire_skips_when_too_late(monkeypatch) -> None:
+    """剩余 ≤15s 不下单：延迟已把边际吃光（实测 2s 只剩 48%）。"""
+    from binance_predict.services import multi_live_trader as mlt
+
+    recorded: list[dict] = []
+
+    class _Trader(mlt.MultiLiveTrader):
+        def __init__(self) -> None:
+            self._specs = mlt.LIVE_CHANNELS
+            from binance_predict.services.live_channels import parse_channel_config
+            self._configs = parse_channel_config()
+            self._configs["endgame_fav_15m_v1"].enabled = True
+            self._stopped = False
+            self._tasks = set()
+            self.execs: list[dict] = []
+
+        async def _record_strategy_outcome(self, channel, window_start, *, reason,
+                                           rejected, input_snapshot=None):
+            recorded.append({"reason": reason, "rejected": rejected})
+
+        async def _prepare_runtime_execution(self, *a, **kw):
+            raise AssertionError("晚到单不应进入下单准备")
+
+        async def _exec_with_exclusive(self, *a, **kw):
+            self.execs.append(kw)
+            return None
+
+    trader = _Trader()
+    now_ms = int(time.time() * 1000)
+    # 窗口结束只剩 10s → 必须弃单
+    sig = {"version": "endgame_fav_15m_v1", "market_start": now_ms - 890_000,
+           "market_end": now_ms + 10_000, "direction": "UP",
+           "favored_price": 0.72, "t_rel": 890.0}
+    await trader._fire_endgame("endgame_fav_15m_v1", sig)
+    assert trader.execs == []
+    assert recorded and recorded[0]["reason"] == "endgame_late_skip"
 
 
 @pytest.mark.asyncio

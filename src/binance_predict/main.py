@@ -86,6 +86,7 @@ from .services.multi_live_trader import MultiLiveTrader
 from .services.nextbar_shadow_detector import NextbarShadowDetector
 from .services.wbid_shadow_detector import WbidShadowDetector
 from .services.excur_shadow_detector import ExcurBidShadowDetector
+from .services.endgame_shadow_detector import EndgameFavShadowDetector
 from .services.prebar_dn_bull_detector import PrebarDnBullDetector
 from .services.cic_shadow_detector import CicCounterInertiaShadowDetector
 from .services.quote_edge_detector import QuoteEdgeDetector
@@ -216,6 +217,8 @@ nextbar_shadow_detector: NextbarShadowDetector | None = None
 wbid_shadow_detector: WbidShadowDetector | None = None
 # 布防接盘影子检测器全局实例（excur 族：15m 布防+报价触发，影子落表 + 实盘默认 OFF）
 excur_shadow_detector: ExcurBidShadowDetector | None = None
+# 尾盘买热门影子检测器（endgame 族：本窗最后 45s 买热门侧，影子落表 + 实盘默认 OFF）
+endgame_shadow_detector: EndgameFavShadowDetector | None = None
 # 阶段5候选：前根HGB命中 + 当前15m前5分钟UP≤0.30；影子默认 ON，实盘默认 OFF。
 prebar_dn_bull_detector: PrebarDnBullDetector | None = None
 # 反向格影子检测器全局实例（cic 族：15m 第8分钟反向格，影子落表 + 实盘默认 OFF）
@@ -374,6 +377,16 @@ async def _handle_15m_quote(quote_15m, ts_ms: int, *, persist: bool) -> None:
                 quote_15m.up_price, quote_15m.down_price)
         except Exception as e:
             logger.warning("excur 布防接盘判定异常: {}", e)
+    # 尾盘买热门（endgame 族）：本窗最后 45 秒、热门侧 ∈[0.65,0.85) 即触发。
+    # 与 excur 同用 15m 对齐采样路径（persist=True），不依赖 down_chance。
+    if (endgame_shadow_detector is not None
+            and quote_15m.start_date and quote_15m.end_date):
+        try:
+            await endgame_shadow_detector.observe_sample(
+                int(quote_15m.start_date), int(quote_15m.end_date), ts_ms,
+                quote_15m.up_price, quote_15m.down_price)
+        except Exception as e:
+            logger.warning("endgame 尾盘买热门判定异常: {}", e)
     # 阶段5前根评分 + 当前窗前5分钟0.30触价；影子默认开启。
     if (prebar_dn_bull_detector is not None
             and quote_15m.start_date and quote_15m.end_date):
@@ -1332,6 +1345,15 @@ async def lifespan(app: FastAPI):
         await excur_shadow_detector.start()
         logger.info("excur 布防接盘检测器已启动（15m 布防+0.30 触发；影子落表 + 实盘默认 OFF）")
 
+    # 尾盘买热门（endgame 族，2026-10-30）：15m 窗口最后 45 秒、热门侧报价
+    # ∈[0.65,0.85) → 买热门。研究胜率 81%/净+3.9%（实际费率 +5.2%）、t=2.97；
+    # 但幅度定义敏感且延迟 1s 剥 32%，故只做影子前向验证，实盘 default_enabled=False。
+    global endgame_shadow_detector
+    endgame_shadow_detector = EndgameFavShadowDetector(collector=collector)
+    if multi_live_trader is not None:
+        endgame_shadow_detector._on_live_fire = multi_live_trader.on_endgame_signal
+    await endgame_shadow_detector.start()
+
     # 阶段5候选（2026-10-28）：冻结HGB评分命中后，当前窗前300秒UP≤0.30。
     # detector 始终装配；shadow_gate 无覆盖时默认开启，实盘默认OFF。
     global prebar_dn_bull_detector
@@ -1670,6 +1692,8 @@ async def lifespan(app: FastAPI):
         await wbid_shadow_detector.stop()
     if excur_shadow_detector is not None:
         await excur_shadow_detector.stop()
+    if endgame_shadow_detector is not None:
+        await endgame_shadow_detector.stop()
     if prebar_dn_bull_detector is not None:
         await prebar_dn_bull_detector.stop()
     if cic_shadow_detector is not None:

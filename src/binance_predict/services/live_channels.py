@@ -65,7 +65,7 @@ class ChannelSpec:
     """通道静态描述（冻结，运行时不可变）。"""
 
     channel: str
-    family: str                   # quote_edge | x4 | scene | s2_cond | nextbar | absorption | firsthit | wbid
+    family: str                   # quote_edge | x4 | scene | s2_cond | nextbar | absorption | firsthit | wbid | excur | endgame
     market_period: str            # 5m | 15m
     direction: str                # 典型下单方向（scene/s2_cond 族由信号 side 决定；
                                   # absorption 族由 BTC 位移符号动态决定，此处为基准方向）
@@ -607,6 +607,12 @@ LIVE_CHANNELS["excur_bid30_15m_v1"] = ChannelSpec(
     "布防接盘·前跌贴低买UP（0.30档）",
 )
 
+LIVE_CHANNELS["endgame_fav_15m_v1"] = ChannelSpec(
+    "endgame_fav_15m_v1", "endgame", "15m", "UP", 0.86,
+    "尾盘买热门·本窗最后45秒（报价冻结）", default_amount_usdt=10.0,
+)
+
+
 # 阶段5候选（2026-10-28）：上一根15m及更早44维HGB评分命中后，只观察
 # 目标窗前300秒；UP展示价首次≤0.30时触发MARKET单，真实五档执行均价须<0.32
 # （prediction_trading 护栏含贴线弃单）。研究月份已污染，影子默认ON，实盘默认OFF。
@@ -757,6 +763,8 @@ KEPT_CHANNELS_20261022: frozenset[str] = frozenset({
     "wbid_d03_k2_fast_5m_v1",
     # excur / 阶段5深价候选（default_enabled=False）
     "excur_bid30_15m_v1", "prebar_dn_bull_bid30_15m_v1",
+    # endgame 尾盘买热门（2026-10-30 注册，default_enabled=False）
+    "endgame_fav_15m_v1",
     # cic 反向格（2026-10-27 注册，default_enabled=False）
     "cic_shallow_15m_v1",
     # firsthit D/E（实盘 ON，观察期）
